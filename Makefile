@@ -1,5 +1,26 @@
 # Building
+ARCH ?= riscv64
+ifeq ($(ARCH), riscv64)
 TARGET := riscv64gc-unknown-none-elf
+QEMU_BIN := qemu-system-riscv64
+QEMU_BLK_DEV0 := virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+QEMU_NET_DEV := virtio-net-device,netdev=net
+DISK_DEV := virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+QEMU_BIOS_ARGS := -bios default
+GDB_ARCH := riscv:rv64
+CARGO_CONFIG := ../cargo-config/config.toml
+else ifeq ($(ARCH), loongarch64)
+TARGET := loongarch64-unknown-none
+QEMU_BIN := qemu-system-loongarch64
+QEMU_BLK_DEV0 := virtio-blk-pci,drive=x0
+QEMU_NET_DEV := virtio-net-pci,netdev=net
+DISK_DEV := virtio-blk-pci,drive=x1
+QEMU_BIOS_ARGS :=
+GDB_ARCH := loongarch
+CARGO_CONFIG := ../cargo-config/config_loongarch64.toml
+else
+$(error "Unsupported architecture: $(ARCH), Use riscv64 or loongarch64")
+endif
 MODE := release
 APP_DIR = ./results
 KERNEL_ELF := target/$(TARGET)/$(MODE)/os
@@ -19,22 +40,31 @@ USER_FEATURES := --features submit
 endif
 # Optional OpenSBI fw_dynamic for HSM-enabled boot
 FW_DYNAMIC ?=../firmware/fw_dynamic.bin
+QEMU_BASE_ARGS := -machine virt -kernel $(KERNEL_ELF) -m $(MEM) -smp $(SMP) -nographic -rtc base=utc -no-reboot
+QEMU_DISK0_ARGS := -drive file=$(EXT4_IMG),if=none,format=raw,id=x0 -device $(QEMU_BLK_DEV0)
+QEMU_NET_ARGS := -device $(QEMU_NET_DEV) -netdev user,id=net
+
 # Only append the extra virtio disk if the file exists
 ifneq (,$(wildcard $(DISK_IMG)))
-DISK_ARGS := -drive file=$(DISK_IMG),if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+DISK_ARGS := -drive file=$(DISK_IMG),if=none,format=raw,id=x1 -device $(DISK_DEV)
 else
 DISK_ARGS :=
 endif
 
 ifeq ($(QEMU_TIMEOUT),0)
-QEMU_RUN := qemu-system-riscv64
+QEMU_RUN := $(QEMU_BIN)
 else
-QEMU_RUN := timeout $(QEMU_TIMEOUT) qemu-system-riscv64
+QEMU_RUN := timeout $(QEMU_TIMEOUT) $(QEMU_BIN)
 endif
 
+prepare-cargo:
+	@mkdir -p .cargo ../user/.cargo
+	@cp $(CARGO_CONFIG) .cargo/config.toml
+	@cp $(CARGO_CONFIG) ../user/.cargo/config.toml
+
 # build kernel and copy it to save_dir 
-KERNEL:USER_APPS 
-	@cargo build --$(MODE)
+KERNEL: prepare-cargo USER_APPS 
+	@cargo build --$(MODE) --target $(TARGET)
 	@# `rust-objcopy` is optional; QEMU boots the ELF directly.
 	@OBJCOPY=$$(command -v rust-objcopy || command -v llvm-objcopy || true); \
 	if [ -n "$$OBJCOPY" ]; then \
@@ -46,8 +76,8 @@ KERNEL:USER_APPS
 	@cp $(KERNEL_ELF) kernel_$(MODE).elf
 
 # find all excutable in the user's target dir strip it and copy to the os_str
-USER_APPS:
-	@cd ../user  && cargo build --$(MODE) $(USER_FEATURES)
+USER_APPS: prepare-cargo
+	@cd ../user  && cargo build --$(MODE) $(USER_FEATURES) --target $(TARGET)
 	@mkdir -p $(APP_DIR)
 	@for f in ../user/target/$(TARGET)/$(MODE)/*; do \
 		if [ -f "$$f" ] && [ -x "$$f" ]; then \
@@ -69,42 +99,20 @@ clean:
 	@rm -f *.bin *.elf
 	@cd ../user && cargo clean
 # if stuck use CTRL-A X to exit QEMU
-run: KERNEL 
+run: KERNEL ext4_img
 # now address
 	echo "🔍 Running QEMU with VirtIO block device..."
-	echo "   ➜ File System Image: $(FS_IMG)"
+	echo "   ➜ File System Image: $(EXT4_IMG)"
 	echo "pwd is $(shell pwd)"
-	$(QEMU_RUN) \
-		-machine virt \
-		-kernel $(KERNEL_ELF) \
-		-m $(MEM) \
-		-smp $(SMP) \
-		-nographic \
-		-bios default \
-		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
-		-no-reboot \
-		-device virtio-net-device,netdev=net \
-		-netdev user,id=net \
-		-rtc base=utc \
-		$(DISK_ARGS)
+	$(QEMU_RUN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_DISK0_ARGS) $(QEMU_NET_ARGS) $(DISK_ARGS)
 
 
 
 test:KERNEL
 	@cd ../tests && cargo test -- --nocapture
 
-debug:KERNEL
-	@qemu-system-riscv64 \
-		-machine virt \
-		-kernel $(KERNEL_ELF) \
-		-nographic \
-		-s -S \
-		-bios default \
-		-m $(MEM) \
-		-smp $(SMP) \
-		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+debug:KERNEL ext4_img
+	@$(QEMU_BIN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_DISK0_ARGS) -s -S
 
 # ===========================
 # Ext4 Support
@@ -171,56 +179,15 @@ ext4_base_img:
 run_ext4: KERNEL ext4_img
 	@echo "🔍 Running QEMU with ext4 VirtIO block device..."
 	@echo "   ➜ File System Image: $(EXT4_IMG)"
-	$(QEMU_RUN) \
-		-machine virt \
-		-kernel $(KERNEL_ELF) \
-		-m $(MEM) \
-		-smp $(SMP) \
-		-nographic \
-		-bios default \
-		-drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
-		-no-reboot \
-		-device virtio-net-device,netdev=net \
-		-netdev user,id=net \
-		-rtc base=utc \
-		$(DISK_ARGS)
-run_ext4_hsm: KERNEL ext4_img
-	@echo "🔍 Running QEMU with ext4 VirtIO block device..."
-	@echo "   ➜ File System Image: $(EXT4_IMG)"
-	@test -f $(FW_DYNAMIC) || (echo "❌ fw_dynamic not found at $(FW_DYNAMIC). Set FW_DYNAMIC=path/to/fw_dynamic.bin"; exit 1)
-	$(QEMU_RUN) \
-		-machine virt \
-		-kernel $(KERNEL_ELF) \
-		-m $(MEM) \
-		-smp $(SMP) \
-		-nographic \
-		-bios $(FW_DYNAMIC) \
-		-drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
-		-no-reboot \
-		-device virtio-net-device,netdev=net \
-		-netdev user,id=net \
-		-rtc base=utc \
-		$(DISK_ARGS)
-
+	$(QEMU_RUN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_DISK0_ARGS) $(QEMU_NET_ARGS) $(DISK_ARGS)
 # Debug with ext4 filesystem
 debug_ext4: KERNEL ext4_img
 	@echo "🐛 Debugging with ext4 filesystem..."
-	@qemu-system-riscv64 \
-		-machine virt \
-		-kernel $(KERNEL_ELF) \
-		-nographic \
-		-s -S \
-		-bios default \
-		-m $(MEM) \
-		-smp $(SMP) \
-		-drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
-		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+	@$(QEMU_BIN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_DISK0_ARGS) -s -S
 
 client_gdb:
 	@./elf-gdb \
 		-ex 'file $(KERNEL_ELF)' \
-		-ex 'set arch riscv:rv64' \
+		-ex 'set arch $(GDB_ARCH)' \
 		-ex 'target remote localhost:1234'
 		-ex 'display/10i $pc' 
