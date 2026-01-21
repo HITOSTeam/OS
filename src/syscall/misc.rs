@@ -1,11 +1,11 @@
 use crate::{
+    arch,
     debug_config::DEBUG_PTHREAD,
     fs::ext4_lock,
     mm::{
         MapPermission, read_user_value, translated_byte_buffer, translated_str,
         try_write_user_value, write_user_value,
     },
-    sbi::shutdown,
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
@@ -183,7 +183,7 @@ pub fn syscall_reboot(_magic1: usize, _magic2: usize, _cmd: usize, _arg: usize) 
     if current_process().borrow_mut().euid != 0 {
         return EPERM;
     }
-    shutdown();
+    arch::shutdown();
 }
 
 pub fn syscall_getppid() -> isize {

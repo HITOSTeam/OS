@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-riscv = "0.15.0"
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 buddy_system_allocator = "0.6"
 bitflags = "1.2.1"
@@ -13,7 +12,6 @@ fdt = "0.1.5"
 virtio-drivers = { path = "../vendor/virtio-drivers" }
 ext4-fs = { path = "../ext4-fs" }
 log = "0.4"
-sbi-rt = { version = "0.0.2", features = ["legacy"] }
 spin = "0.7.0"
 smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
     "alloc",
@@ -23,6 +21,16 @@ smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
     "socket-tcp",
     "socket-udp",
 ] }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+riscv = "0.15.0"
+sbi-rt = { version = "0.0.2", features = ["legacy"] }
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = "0.2.4"
+
+[features]
+loongarch_board = []
 
 [profile.dev]
 panic = "abort"

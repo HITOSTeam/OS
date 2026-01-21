@@ -15,10 +15,6 @@ use crate::{
 };
 use alloc::sync::Arc;
 use lazy_static::lazy_static;
-use riscv::{
-    interrupt::Trap,
-    register::{sepc, sstatus::Sstatus},
-};
 pub mod block_sleep;
 pub mod condvar;
 mod id;

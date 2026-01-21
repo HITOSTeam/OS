@@ -12,10 +12,10 @@ use bitflags::bitflags;
 use alloc::sync::Arc;
 
 use crate::{
+    arch,
     debug_config::DEBUG_UNIXBENCH,
     mm::{read_user_value, translated_single_address, write_user_value},
     println,
-    sbi::send_ipi,
     task::processor::current_process,
     task::{
         manager::{pid2process, wakeup_task},
@@ -377,7 +377,7 @@ pub fn queue_process_signal(pid: usize, signum: usize) {
     if queued {
         wakeup_task(task.clone());
         if on_cpu != TaskControlBlock::OFF_CPU {
-            send_ipi(on_cpu);
+            arch::send_ipi(on_cpu);
         }
     }
 }

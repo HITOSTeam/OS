@@ -1,6 +1,5 @@
-use crate::sbi::console_putchar;
+use crate::arch::{console_putchar, disable_interrupts, restore_interrupts};
 use core::fmt::{self, Write};
-use riscv::register::sstatus;
 use spin::Mutex;
 
 struct Stdout;
@@ -27,15 +26,12 @@ pub fn print(args: fmt::Arguments) {
     // Make console output readable under SMP:
     // - Serialize writers across harts.
     // - Disable interrupts to avoid deadlocking on re-entrant printing (e.g. timer IRQ).
-    let prev_sie = sstatus::read().sie();
-    unsafe { sstatus::clear_sie() };
+    let prev_sie = disable_interrupts();
     {
         let _guard = CONSOLE_LOCK.lock();
         Stdout.write_fmt(args).unwrap();
     }
-    if prev_sie {
-        unsafe { sstatus::set_sie() };
-    }
+    restore_interrupts(prev_sie);
 }
 
 #[macro_export]

@@ -3,6 +3,7 @@
 use alloc::sync::Arc;
 
 use crate::{
+    arch,
     mm::kernel_token,
     time::get_time_ms,
     task::{
@@ -161,8 +162,7 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     // Prevent "lost wakeup": make the enqueue+block sequence atomic w.r.t. timer interrupts.
     // Keep interrupts disabled in kernel code paths; restore the previous SIE state after we
     // resume from sleep. (The trap return path controls interrupt enabling for user mode.)
-    let prev_sie = riscv::register::sstatus::read().sie();
-    unsafe { riscv::register::sstatus::clear_sie() };
+    let prev_sie = arch::disable_interrupts();
     {
         let mut inner = task.borrow_mut();
         inner.task_status = crate::task::task_block::TaskStatus::Blocked;
@@ -170,9 +170,7 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     add_timer(Arc::clone(&task), time_ms);
     // This will take the task out of PROCESSOR and switch to idle, letting the scheduler run.
     block_current_and_run_next();
-    if prev_sie {
-        unsafe { riscv::register::sstatus::set_sie() };
-    }
+    arch::restore_interrupts(prev_sie);
     const EINTR: isize = -4;
     let interrupted = {
         let inner = task.borrow_mut();

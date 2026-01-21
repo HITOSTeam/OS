@@ -1,8 +1,8 @@
 use crate::{
+    arch,
     config::MAX_HARTS,
     mm::try_write_user_value,
     println,
-    sbi::shutdown,
     syscall::futex::futex_wake,
     task::{
         INITPROC,
@@ -179,9 +179,7 @@ pub fn idle_task() {
         // Disable interrupts while accessing TASK_MANAGER to prevent
         // timer interrupt from calling check_timer -> wakeup_task -> add_task
         // while we hold the TASK_MANAGER lock in fetch_task
-        unsafe {
-            riscv::register::sstatus::clear_sie();
-        }
+        let _ = arch::disable_interrupts();
 
         // Finalize a task that just switched away and wanted to become Blocked.
         if let Some(task) = local_processor().lock().take_pending_blocked() {
@@ -273,10 +271,8 @@ pub fn idle_task() {
             //
             // IMPORTANT: We must loop back to check fetch_task() after wfi returns
             // because the interrupt handler may have woken up a task
-            unsafe {
-                riscv::register::sstatus::set_sie();
-                core::arch::asm!("wfi");
-            }
+            arch::enable_interrupts();
+            arch::wait_for_interrupt();
             // crate::println!("[idle] Woke up from wfi");
             // Loop back immediately to check for newly ready tasks
         }
@@ -286,15 +282,11 @@ pub fn idle_task() {
 // ...existing code...
 #[inline(always)]
 pub fn set_tp(hart_id: usize) {
-    unsafe { core::arch::asm!("mv tp, {}", in(reg) hart_id) };
+    arch::set_tp(hart_id);
 }
 
 pub fn hart_id() -> usize {
-    let mut id: usize;
-    unsafe {
-        core::arch::asm!("mv {}, tp", out(reg) id);
-    }
-    id
+    arch::hart_id()
 }
 
 fn local_processor() -> &'static Mutex<Processor> {
@@ -516,10 +508,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             );
             if exit_code != 0 {
                 //crate::sbi::shutdown(255); //255 == -1 for err hint
-                shutdown();
+                arch::shutdown();
             } else {
                 //crate::sbi::shutdown(0); //0 for success hint
-                shutdown();
+                arch::shutdown();
             }
         }
         // Mark zombie and capture parent pointer first...
@@ -682,9 +674,9 @@ pub fn exit_group_and_run_next(exit_code: i32) {
             exit_code
         );
         if exit_code != 0 {
-            shutdown();
+            arch::shutdown();
         } else {
-            shutdown();
+            arch::shutdown();
         }
     }
 

@@ -5,6 +5,7 @@ use lazy_static::*;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::arch;
 use crate::debug_config::DEBUG_SCHED;
 use crate::config::MAX_HARTS;
 use crate::task::block_sleep::{TIMERS, TimeWrap};
@@ -230,8 +231,7 @@ lazy_static! {
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
     // Protect the ready queue from timer interrupt re-entrancy, but restore the previous SIE state.
-    let prev_sie = riscv::register::sstatus::read().sie();
-    unsafe { riscv::register::sstatus::clear_sie() };
+    let prev_sie = arch::disable_interrupts();
     let desired = task.get_cpu_id() % MAX_HARTS;
     let mask = online_hart_mask();
     let cur = crate::task::processor::hart_id() % MAX_HARTS;
@@ -250,11 +250,9 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.lock().add(task, hart_id);
     // Linux-style: if we queued to a remote hart, kick it out of `wfi` via IPI.
     if cur < MAX_HARTS && cur != hart_id {
-        crate::sbi::send_ipi(hart_id);
+        arch::send_ipi(hart_id);
     }
-    if prev_sie {
-        unsafe { riscv::register::sstatus::set_sie() };
-    }
+    arch::restore_interrupts(prev_sie);
 }
 
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
@@ -293,22 +291,16 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
 }
 
 pub fn remove_task(task: Arc<TaskControlBlock>) {
-    let prev_sie = riscv::register::sstatus::read().sie();
-    unsafe { riscv::register::sstatus::clear_sie() };
+    let prev_sie = arch::disable_interrupts();
     TASK_MANAGER.lock().remove(task);
-    if prev_sie {
-        unsafe { riscv::register::sstatus::set_sie() };
-    }
+    arch::restore_interrupts(prev_sie);
 }
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    let prev_sie = riscv::register::sstatus::read().sie();
-    unsafe { riscv::register::sstatus::clear_sie() };
+    let prev_sie = arch::disable_interrupts();
     let hart_id = crate::task::processor::hart_id();
     let t = TASK_MANAGER.lock().fetch(hart_id);
-    if prev_sie {
-        unsafe { riscv::register::sstatus::set_sie() };
-    }
+    arch::restore_interrupts(prev_sie);
     t
 }
 

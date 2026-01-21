@@ -8,6 +8,7 @@ extern crate alloc;
 use crate::fs::list_apps;
 use core::sync::atomic::{AtomicBool, Ordering};
 mod config;
+mod arch;
 mod console;
 mod debug_config;
 mod drivers;
@@ -24,7 +25,10 @@ mod time;
 mod trap;
 mod utils;
 
+#[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("entry.asm"));
+#[cfg(target_arch = "loongarch64")]
+global_asm!(include_str!("entry_loongarch.S"));
 global_asm!(include_str!("link_app.asm"));
 
 // Keep this flag in .data so clearing .bss doesn't reset it after the
@@ -51,6 +55,7 @@ fn clear_bss() {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
     // Mark boot hart online; secondary harts will be marked online after successful HSM start.
     task::manager::mark_hart_online(boot_hart_id);
@@ -59,12 +64,13 @@ fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
             continue;
         }
         // Only consider harts that OpenSBI successfully started as online.
-        if sbi::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa) == 0 {
+        if arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa) == 0 {
             task::manager::mark_hart_online(hart_id);
         }
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
     // Wait until the boot hart clears .bss and completes global initialization.
     while !BOOT_BSS_CLEARED.load(Ordering::SeqCst) {
@@ -86,12 +92,13 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
     task::task_start_secondary();
 }
 
+#[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
     // Avoid timer interrupts preempting early-boot code that may hold spin::Mutex locks
     // (e.g., heap allocator, ext4, ready queue). We'll re-enable interrupts in the
     // scheduler/idle loop and on sret back to user.
-    unsafe { riscv::register::sstatus::clear_sie() };
+    let _ = arch::disable_interrupts();
 
     unsafe extern "C" {
         fn num_user_apps();
@@ -131,4 +138,20 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         secondary_main(hart_id, dtb_pa);
     }
     panic!("shouldn't be here");
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[unsafe(no_mangle)]
+fn rust_main(hart_id: usize) -> ! {
+    if BOOT_HART_INITED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        clear_bss();
+        BOOT_BSS_CLEARED.store(true, Ordering::SeqCst);
+        println!("[kernel] loongarch64 boot hart {}", hart_id);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
 }

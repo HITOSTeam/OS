@@ -16,11 +16,11 @@ use alloc::vec::Vec;
 use crate::debug_config::{DEBUG_TIMER, DEBUG_UNIXBENCH};
 use crate::task::process_block::ProcessControlBlock;
 use crate::{
+    arch,
     mm::write_user_value,
     syscall::futex::futex_wake,
     task::manager::pid2process,
 };
-use crate::sbi::send_ipi;
 pub struct TimeWrap {
     pub task: Arc<TaskControlBlock>,
     pub tid: usize,
@@ -213,7 +213,7 @@ fn deliver_alarm(pid: usize) {
     );
     wakeup_task(task.clone());
     if on_cpu != TaskControlBlock::OFF_CPU {
-        send_ipi(on_cpu);
+        arch::send_ipi(on_cpu);
     }
 }
 

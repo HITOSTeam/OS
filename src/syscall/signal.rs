@@ -3,9 +3,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::SIGRETURN_TRAMPOLINE;
 use crate::{
+    arch,
     debug_config::{DEBUG_PTHREAD, DEBUG_UNIXBENCH},
     mm::{read_user_value, try_read_user_value, write_user_value},
-    sbi::send_ipi,
     syscall::misc::decode_linux_tid,
     task::{
         block_sleep::add_timer,
@@ -103,7 +103,7 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
     let on_cpu = task.on_cpu.load(Ordering::Acquire);
     wakeup_task(task);
     if on_cpu != TaskControlBlock::OFF_CPU {
-        send_ipi(on_cpu);
+        arch::send_ipi(on_cpu);
     }
     0
 }
