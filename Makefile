@@ -1,4 +1,4 @@
-# Building
+# arch related configurations 
 ARCH ?= riscv64
 ifeq ($(ARCH), riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -21,6 +21,7 @@ CARGO_CONFIG := ../cargo-config/config_loongarch64.toml
 else
 $(error "Unsupported architecture: $(ARCH), Use riscv64 or loongarch64")
 endif
+# build configurations 
 MODE := release
 APP_DIR = ./results
 KERNEL_ELF := target/$(TARGET)/$(MODE)/os
@@ -38,13 +39,12 @@ USER_FEATURES :=
 ifeq ($(SUBMIT),1)
 USER_FEATURES := --features submit
 endif
-# Optional OpenSBI fw_dynamic for HSM-enabled boot
-FW_DYNAMIC ?=../firmware/fw_dynamic.bin
-QEMU_BASE_ARGS := -machine virt -kernel $(KERNEL_ELF) -m $(MEM) -smp $(SMP) -nographic -rtc base=utc -no-reboot
-QEMU_DISK0_ARGS := -drive file=$(EXT4_IMG),if=none,format=raw,id=x0 -device $(QEMU_BLK_DEV0)
-QEMU_NET_ARGS := -device $(QEMU_NET_DEV) -netdev user,id=net
+# dont change this. used to final qemu start 
+QEMU_BASE_ARGS = -machine virt -kernel $(KERNEL_ELF) -m $(MEM) -smp $(SMP) -nographic -rtc base=utc -no-reboot
+QEMU_DISK0_ARGS = -drive file=$(EXT4_IMG),if=none,format=raw,id=x0 -device $(QEMU_BLK_DEV0)
+QEMU_NET_ARGS = -device $(QEMU_NET_DEV) -netdev user,id=net
 
-# Only append the extra virtio disk if the file exists
+# Only append the extra virtio disk if the file exists(tset card)
 ifneq (,$(wildcard $(DISK_IMG)))
 DISK_ARGS := -drive file=$(DISK_IMG),if=none,format=raw,id=x1 -device $(DISK_DEV)
 else
@@ -57,6 +57,7 @@ else
 QEMU_RUN := timeout $(QEMU_TIMEOUT) $(QEMU_BIN)
 endif
 
+# according to the cargo config prepare .cargo dir for both os and user app
 prepare-cargo:
 	@mkdir -p .cargo ../user/.cargo
 	@cp $(CARGO_CONFIG) .cargo/config.toml
@@ -108,8 +109,6 @@ run: KERNEL ext4_img
 
 
 
-test:KERNEL
-	@cd ../tests && cargo test -- --nocapture
 
 debug:KERNEL ext4_img
 	@$(QEMU_BIN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_DISK0_ARGS) -s -S
