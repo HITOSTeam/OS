@@ -1,5 +1,3 @@
-use alloc::sync::Arc;
-use core::cmp::min;
 use crate::{
     config::PAGE_SIZE,
     fs::{File, OSInode, PseudoShmFile, ext4_lock},
@@ -7,6 +5,8 @@ use crate::{
     task::processor::current_process,
     trap::get_current_token,
 };
+use alloc::sync::Arc;
+use core::cmp::min;
 
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
@@ -43,14 +43,12 @@ fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
 
 fn get_fd_inode(fd: usize) -> Option<Arc<ext4_fs::Inode>> {
     let file = get_fd_file(fd)?;
-    file.as_any()
-        .downcast_ref::<OSInode>()
-        .map(|o| {
-            // Ensure data written via buffered `write(2)` is visible to file-backed `mmap(2)`.
-            // This keeps simple tests (write -> fstat -> mmap -> read) working.
-            let _ = o.flush();
-            o.ext4_inode()
-        })
+    file.as_any().downcast_ref::<OSInode>().map(|o| {
+        // Ensure data written via buffered `write(2)` is visible to file-backed `mmap(2)`.
+        // This keeps simple tests (write -> fstat -> mmap -> read) working.
+        let _ = o.flush();
+        o.ext4_inode()
+    })
 }
 
 pub fn syscall_brk(addr: usize) -> isize {
@@ -69,9 +67,17 @@ pub fn syscall_brk(addr: usize) -> isize {
     let old_end = align_up(old_brk, PAGE_SIZE);
     let new_end = align_up(new_brk, PAGE_SIZE);
     let ok = if new_end > old_end {
-        inner
+        let mut ok = inner
             .memory_set
-            .append_to(heap_start.into(), new_end.into())
+            .append_to(heap_start.into(), new_end.into());
+        if !ok {
+            // fix posssible error that happends in the cloud env
+            let perm = MapPermission::R | MapPermission::W | MapPermission::U;
+            ok = inner
+                .memory_set
+                .try_insert_lazy_area(heap_start.into(), new_end.into(), perm);
+        }
+        ok
     } else if new_end < old_end {
         inner
             .memory_set
@@ -178,9 +184,7 @@ pub fn syscall_mmap(
         }
 
         // Linux MAP_FIXED replaces any existing mappings in the range.
-        inner
-            .memory_set
-            .unmap_user_range(start.into(), end.into());
+        inner.memory_set.unmap_user_range(start.into(), end.into());
 
         // Keep `mmap_areas` bookkeeping consistent (split/trim overlaps).
         let mut new_areas = alloc::vec::Vec::new();
@@ -265,12 +269,8 @@ pub fn syscall_mmap(
                 if read == 0 {
                     break;
                 }
-                if try_copy_to_user_unchecked(
-                    token,
-                    (start + pos) as *mut u8,
-                    &tmp[..read],
-                )
-                .is_err()
+                if try_copy_to_user_unchecked(token, (start + pos) as *mut u8, &tmp[..read])
+                    .is_err()
                 {
                     return ENOMEM;
                 }
@@ -297,9 +297,7 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
     };
     let end = align_up(end, PAGE_SIZE);
 
-    inner
-        .memory_set
-        .unmap_user_range(start.into(), end.into());
+    inner.memory_set.unmap_user_range(start.into(), end.into());
 
     // Update `mmap_areas` bookkeeping: remove/split any overlapping entries.
     let mut new_areas = alloc::vec::Vec::new();
@@ -356,7 +354,9 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         return ENOMEM;
     }
     // Ensure permission changes take effect immediately.
-    unsafe { core::arch::asm!("sfence.vma"); }
+    unsafe {
+        core::arch::asm!("sfence.vma");
+    }
     0
 }
 
