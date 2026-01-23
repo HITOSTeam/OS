@@ -24,6 +24,9 @@ pub const DEBUG_TRAP: bool = true;
 /// Verbose syscall trace (very noisy).
 pub const DEBUG_SYSCALL: bool = false;
 
+/// Targeted execve/path resolution logs (useful for busybox/OSComp scripts).
+pub const DEBUG_EXEC: bool = true;
+
 /// Verbose pthread/clone lifecycle logs.
 pub const DEBUG_PTHREAD: bool = false;
 

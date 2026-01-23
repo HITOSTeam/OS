@@ -18,11 +18,13 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 const MAP_STACK: usize = 0x20000;
+const MAP_FIXED_NOREPLACE: usize = 0x100000;
 
 const LARGE_ANON_MMAP: usize = 1 * 1024 * 1024;
 
 const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
+const EEXIST: isize = -17;
 
 fn align_down(x: usize, align: usize) -> usize {
     x & !(align - 1)
@@ -129,7 +131,8 @@ pub fn syscall_mmap(
     // - only honor `addr` when `MAP_FIXED` is set;
     // - otherwise treat `addr` as a hint and allocate from `mmap_next`;
     // - never move `mmap_next` backwards (important for glibc/ld.so).
-    let start = if (flags & MAP_FIXED) != 0 {
+    let is_fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
+    let start = if is_fixed {
         if addr == 0 {
             return EINVAL;
         }
@@ -168,6 +171,15 @@ pub fn syscall_mmap(
     }
     if (prot & PROT_EXEC) != 0 {
         perm |= MapPermission::X;
+    }
+
+    if (flags & MAP_FIXED_NOREPLACE) != 0 {
+        if inner
+            .memory_set
+            .range_overlaps(map_start.into(), map_end.into())
+        {
+            return EEXIST;
+        }
     }
 
     if (flags & MAP_FIXED) != 0 {

@@ -619,6 +619,64 @@ impl MemorySet {
         memory_set
     }
 
+    /// Fork a user address space by copying all mapped pages (no COW).
+    ///
+    /// This is slower than COW but avoids COW corner cases on some platforms.
+    pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
+        let mut memory_set = Self::new_bare();
+        memory_set.map_trampoline();
+        memory_set.map_sigreturn_trampoline_user();
+
+        for area in user_space.areas.iter() {
+            let mut new_area = MapArea::from_another(area);
+
+            for vpn in area.vpn_range {
+                match area.map_type {
+                    MapType::Identical => {
+                        let Some(src_pte) = user_space.translate(vpn) else {
+                            continue;
+                        };
+                        if !src_pte.is_valid() {
+                            continue;
+                        }
+                        let src_ppn = src_pte.ppn();
+                        let src_flags = src_pte.flags();
+                        memory_set.page_table.map(vpn, src_ppn, src_flags);
+                    }
+                    MapType::Framed | MapType::Lazy => {
+                        let Some(src_pte) = user_space.translate(vpn) else {
+                            if area.map_type == MapType::Lazy {
+                                continue;
+                            }
+                            continue;
+                        };
+                        if !src_pte.is_valid() {
+                            if area.map_type == MapType::Lazy {
+                                continue;
+                            }
+                            continue;
+                        }
+                        let src_ppn = src_pte.ppn();
+                        let Some(frame) = frame_alloc() else {
+                            continue;
+                        };
+                        frame
+                            .ppn
+                            .get_bytes_array()
+                            .copy_from_slice(src_ppn.get_bytes_array());
+                        let pte_flags = PTEFlags::from(area.map_perm);
+                        memory_set.page_table.map(vpn, frame.ppn, pte_flags);
+                        new_area.data_frames.insert(vpn, frame);
+                    }
+                }
+            }
+
+            memory_set.push_mapped(new_area);
+        }
+
+        memory_set
+    }
+
     /// Insert a user-mapped framed area backed by the provided physical frames.
     ///
     /// Used by System V shared memory (`shmat`) to map the same physical pages
@@ -965,6 +1023,17 @@ impl MemorySet {
         }
         self.areas = new_areas;
         true
+    }
+
+    /// Returns true if any existing mapping overlaps the range.
+    pub fn range_overlaps(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        self.areas.iter().any(|area| {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            end_vpn > area_start && start_vpn < area_end
+        })
     }
     pub fn remove_area_with_start_vpn(&mut self, start_va: VirtAddr) {
         if let Some((idx, area)) = self

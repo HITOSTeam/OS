@@ -1,16 +1,16 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{
-    mem::size_of,
-    sync::atomic::Ordering,
-};
+use core::{mem::size_of, sync::atomic::Ordering};
 
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
-    debug_config::{DEBUG_PTHREAD, DEBUG_UNIXBENCH},
-    fs::ext4_lock,
+    debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_UNIXBENCH},
+    fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
     mm::{kernel_token, translated_single_address, translated_str, write_user_value},
-    syscall::misc::encode_linux_tid,
-    syscall::filesystem::resolve_exec_inode,
+    println,
+    syscall::{
+        filesystem::{normalize_path, resolve_exec_inode, resolve_read_inode},
+        misc::encode_linux_tid,
+    },
     task::{
         manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_process, current_task},
@@ -21,6 +21,7 @@ use crate::{
 };
 
 const ENOENT: isize = -2;
+const EACCES: isize = -13;
 
 fn read_usize_user(token: usize, ptr: usize) -> usize {
     let mut raw = [0u8; size_of::<usize>()];
@@ -30,6 +31,7 @@ fn read_usize_user(token: usize, ptr: usize) -> usize {
     usize::from_ne_bytes(raw)
 }
 
+/// This function tries to load a file from the given path.
 fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
     match resolve_exec_inode(path) {
         Ok(inode) => {
@@ -38,6 +40,19 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
         }
         Err(e) if e != ENOENT => return Err(e),
         Err(_) => {}
+    }
+    if path == "busybox" || path == "./busybox" {
+        let fallbacks = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+        for cand in fallbacks {
+            match resolve_exec_inode(cand) {
+                Ok(inode) => {
+                    let _ext4_guard = ext4_lock();
+                    return Ok(inode.read_all());
+                }
+                Err(ENOENT) => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
     if !path.ends_with(".bin") {
         let mut with_bin = String::from(path);
@@ -51,6 +66,16 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
         };
     }
     Err(ENOENT)
+}
+
+fn load_file_readonly(path: &str) -> Result<Vec<u8>, isize> {
+    match resolve_read_inode(path) {
+        Ok(inode) => {
+            let _ext4_guard = ext4_lock();
+            Ok(inode.read_all())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn find_shell_interpreter() -> Result<Option<(String, Vec<u8>, bool)>, isize> {
@@ -78,9 +103,55 @@ fn find_shell_interpreter() -> Result<Option<(String, Vec<u8>, bool)>, isize> {
     Ok(None)
 }
 
+fn is_system_shell_path(path: &str) -> bool {
+    matches!(path, "/bin/sh" | "/bin/dash" | "/usr/bin/sh" | "/usr/bin/dash")
+}
+
+fn find_busybox_shell() -> Result<Option<(String, Vec<u8>)>, isize> {
+    let candidates = [
+        "/musl/busybox",
+        "/glibc/busybox",
+        "/riscv/musl/busybox",
+        "/riscv/glibc/busybox",
+        "/bin/busybox",
+        "/busybox",
+    ];
+    for cand in candidates {
+        match load_file_from_path(cand) {
+            Ok(data) => return Ok(Some((String::from(cand), data))),
+            Err(ENOENT) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+fn exec_interpreter(
+    interp_data: Vec<u8>,
+    args: Vec<String>,
+    envs: Vec<String>,
+) -> isize {
+    let process = current_process();
+    if let Some(interp_interp) = elf_interp_path(&interp_data) {
+        let interp_interp_data = match load_interp_data(&interp_interp) {
+            Ok(data) => data,
+            Err(e) => return e,
+        };
+        process.exec_dyn(&interp_data, &interp_interp_data, args, envs);
+    } else {
+        process.exec(&interp_data, args, envs);
+    }
+    0
+}
+
 fn load_interp_data(interp: &str) -> Result<Vec<u8>, isize> {
     match load_file_from_path(interp) {
         Ok(data) => return Ok(data),
+        Err(EACCES) => {
+            if let Ok(data) = load_file_readonly(interp) {
+                return Ok(data);
+            }
+        }
         Err(ENOENT) => {}
         Err(e) => return Err(e),
     }
@@ -92,16 +163,26 @@ fn load_interp_data(interp: &str) -> Result<Vec<u8>, isize> {
             "/musl/lib/libc.so",
             "/riscv/musl/lib/libc.so",
         ]);
-    } else if interp.starts_with("/lib/ld-linux") {
-        candidates.extend([
-            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
-            "/glibc/lib/ld-linux-riscv64-lp64.so.1",
-            "/glibc/lib/libc.so.6",
-            "/glibc/lib/libc.so",
-        ]);
+    } else if interp.starts_with("/lib/ld-linux") || interp.starts_with("/lib64/ld-linux") {
+        if interp.contains("loongarch") {
+            candidates.extend([
+                "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+                "/lib64/ld-linux-loongarch-lp64d.so.1",
+                "/glibc/lib/libc.so.6",
+                "/glibc/lib/libc.so",
+            ]);
+        } else {
+            candidates.extend([
+                "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+                "/glibc/lib/ld-linux-riscv64-lp64.so.1",
+                "/glibc/lib/libc.so.6",
+                "/glibc/lib/libc.so",
+            ]);
+        }
     } else {
         candidates.extend([
             "/musl/lib/libc.so",
+            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
             "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
             "/glibc/lib/libc.so.6",
         ]);
@@ -110,6 +191,11 @@ fn load_interp_data(interp: &str) -> Result<Vec<u8>, isize> {
     for cand in candidates {
         match load_file_from_path(cand) {
             Ok(data) => return Ok(data),
+            Err(EACCES) => {
+                if let Ok(data) = load_file_readonly(cand) {
+                    return Ok(data);
+                }
+            }
             Err(ENOENT) => {}
             Err(e) => return Err(e),
         }
@@ -144,10 +230,7 @@ fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
     if data.len() < 2 || &data[0..2] != b"#!" {
         return None;
     }
-    let line_end = data
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(data.len());
+    let line_end = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
     let mut line = &data[2..line_end];
     // Trim leading spaces/tabs.
     while !line.is_empty() && (line[0] == b' ' || line[0] == b'\t') {
@@ -187,8 +270,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             *inner.get_trap_cx()
         };
         let process = current_process();
-        let Some(new_task) = TaskControlBlock::try_new_linux_thread(Arc::clone(&process))
-            .map(Arc::new) else {
+        let Some(new_task) =
+            TaskControlBlock::try_new_linux_thread(Arc::clone(&process)).map(Arc::new)
+        else {
             return ENOMEM;
         };
         new_task.set_cpu_id(select_hart_for_new_task());
@@ -315,9 +399,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
         };
         let mut process_inner = cur_process.borrow_mut();
         if pending_unmasked {
-            process_inner
-                .wait_queue
-                .retain(|t| !Arc::ptr_eq(t, &task));
+            process_inner.wait_queue.retain(|t| !Arc::ptr_eq(t, &task));
             drop(process_inner);
             return EINTR;
         }
@@ -339,10 +421,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                 }
                 if matches && child_inner.is_zombie {
                     temp_exit_code = child_inner.exit_code;
-                    temp_signal = child_inner
-                        .signals
-                        .check_error()
-                        .map(|(code, _)| -code);
+                    temp_signal = child_inner.signals.check_error().map(|(code, _)| -code);
                     temp_coredump = temp_signal
                         .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
                         .unwrap_or(false);
@@ -446,9 +525,43 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         }
     }
 
+    if is_system_shell_path(&path) {
+        if let Ok(Some((bb_path, bb_data))) = find_busybox_shell() {
+            let mut new_args: Vec<String> = Vec::new();
+            new_args.push(bb_path);
+            new_args.push(String::from("sh"));
+            for a in args_vec.iter().skip(1) {
+                new_args.push(a.clone());
+            }
+            return exec_interpreter(bb_data, new_args, envs_vec);
+        }
+    }
+
     let file_data = match load_file_from_path(&path) {
         Ok(data) => data,
-        Err(e) => return e,
+        Err(e) => {
+            if DEBUG_EXEC {
+                let cwd = { current_process().borrow_mut().cwd.clone() };
+                let abs = if path.starts_with('/') {
+                    normalize_path("/", &path)
+                } else {
+                    normalize_path(&cwd, &path)
+                };
+                let (primary_hit, secondary_hit) = {
+                    let _ext4_guard = ext4_lock();
+                    let primary_hit = root_inode_for_path(&abs).find_path(&abs).is_some();
+                    let secondary_hit = secondary_root_inode()
+                        .and_then(|root| root.find_path(&abs))
+                        .is_some();
+                    (primary_hit, secondary_hit)
+                };
+                println!(
+                    "[exec] path='{}' abs='{}' cwd='{}' err={} primary_hit={} secondary_hit={}",
+                    path, abs, cwd, e, primary_hit, secondary_hit
+                );
+            }
+            return e;
+        }
     };
 
     // ELF binary: normal exec.
@@ -476,11 +589,45 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     // busybox/ash can run `./script.sh` directly.
     if let Some((interp, opt_arg)) = parse_shebang(&file_data) {
         let interp_name = interp.rsplit('/').next().unwrap_or(interp.as_str());
-        let env_shell = interp_name == "env"
-            && matches!(opt_arg.as_deref(), Some("sh") | Some("bash"));
-        let wants_shell =
-            matches!(interp_name, "sh" | "bash" | "busybox") || env_shell;
+        let env_shell =
+            interp_name == "env" && matches!(opt_arg.as_deref(), Some("sh") | Some("bash"));
+        let wants_shell = matches!(interp_name, "sh" | "bash" | "busybox") || env_shell;
         let opt_arg_ref = opt_arg.as_deref();
+        if wants_shell && is_system_shell_path(&interp) {
+            if let Ok(Some((bb_path, bb_data))) = find_busybox_shell() {
+                let mut new_args: Vec<String> = Vec::new();
+                new_args.push(bb_path);
+                new_args.push(String::from("sh"));
+                if let Some(a) = opt_arg_ref {
+                    new_args.push(String::from(a));
+                }
+                new_args.push(path.clone());
+                for a in args_vec.iter().skip(1) {
+                    new_args.push(a.clone());
+                }
+                return exec_interpreter(bb_data, new_args, envs_vec);
+            }
+        }
+        if wants_shell {
+            if let Ok(Some((interp_path, interp_data, needs_sh_arg))) = find_shell_interpreter() {
+                if !is_elf(&interp_data) {
+                    return ENOEXEC;
+                }
+                let mut new_args: Vec<String> = Vec::new();
+                new_args.push(interp_path.clone());
+                if needs_sh_arg && opt_arg_ref != Some("sh") {
+                    new_args.push(String::from("sh"));
+                }
+                if let Some(a) = opt_arg_ref {
+                    new_args.push(String::from(a));
+                }
+                new_args.push(path.clone());
+                for a in args_vec.iter().skip(1) {
+                    new_args.push(a.clone());
+                }
+                return exec_interpreter(interp_data, new_args, envs_vec);
+            }
+        }
         match load_file_from_path(&interp) {
             Ok(interp_data) => {
                 if is_elf(&interp_data) {
@@ -495,9 +642,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
                     for a in args_vec.iter().skip(1) {
                         new_args.push(a.clone());
                     }
-                    let process = current_process();
-                    process.exec(&interp_data, new_args, envs_vec);
-                    return 0;
+                    return exec_interpreter(interp_data, new_args, envs_vec);
                 }
                 if !wants_shell {
                     return ENOEXEC;
@@ -533,7 +678,15 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
                 new_args.push(a.clone());
             }
             let process = current_process();
-            process.exec(&interp_data, new_args, envs_vec);
+            if let Some(interp_interp) = elf_interp_path(&interp_data) {
+                let interp_interp_data = match load_interp_data(&interp_interp) {
+                    Ok(data) => data,
+                    Err(e) => return e,
+                };
+                process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec);
+            } else {
+                process.exec(&interp_data, new_args, envs_vec);
+            }
             return 0;
         }
         return ENOEXEC;
@@ -563,7 +716,15 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
             new_args.push(a.clone());
         }
         let process = current_process();
-        process.exec(&interp_data, new_args, envs_vec);
+        if let Some(interp_interp) = elf_interp_path(&interp_data) {
+            let interp_interp_data = match load_interp_data(&interp_interp) {
+                Ok(data) => data,
+                Err(e) => return e,
+            };
+            process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec);
+        } else {
+            process.exec(&interp_data, new_args, envs_vec);
+        }
         return 0;
     }
 
@@ -574,10 +735,5 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
 }
 
 pub fn syscall_getpid() -> isize {
-    current_task()
-        .unwrap()
-        .process
-        .upgrade()
-        .unwrap()
-        .getpid() as isize
+    current_task().unwrap().process.upgrade().unwrap().getpid() as isize
 }

@@ -566,6 +566,23 @@ pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
     Ok(inode)
 }
 
+pub(crate) fn resolve_read_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    let at = resolve_at_path(AT_FDCWD, path)?;
+    if let AtPath::PseudoAbs(_) = &at {
+        return Err(ENOENT);
+    }
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+    if !inode.is_file() {
+        return Err(EACCES);
+    }
+    if !inode_mode_allows_uid_gid(&inode, 4, fsuid, fsgid) {
+        return Err(EACCES);
+    }
+    Ok(inode)
+}
+
 fn resolve_parent_and_name(
     at: &AtPath,
     uid: u32,
@@ -1392,6 +1409,20 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, uid, gid, true) {
         Ok(v) => v,
+        Err(ENOENT) if matches!(path.as_str(), "busybox" | "./busybox") => {
+            let candidates = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+            let mut found = None;
+            for cand in candidates {
+                if let Some(inode) = find_path_in_roots(cand) {
+                    found = Some(inode);
+                    break;
+                }
+            }
+            match found {
+                Some(v) => v,
+                None => return ENOENT,
+            }
+        }
         Err(e) => return e,
     };
 
@@ -2873,7 +2904,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     }
 
     let _ext4_guard = ext4_lock();
-    let inode = match at {
+    let mut inode = match at {
         AtPath::Ext4Abs(abs) => find_path_in_roots(&abs),
         AtPath::Ext4Rel { base, rel } => {
             if rel.is_empty() {
@@ -2884,6 +2915,15 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         }
         AtPath::PseudoAbs(_) => unreachable!(),
     };
+    if inode.is_none() && matches!(path.as_str(), "busybox" | "./busybox") {
+        let candidates = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+        for cand in candidates {
+            if let Some(found) = find_path_in_roots(cand) {
+                inode = Some(found);
+                break;
+            }
+        }
+    }
 
     let Some(inode) = inode else {
         return ENOENT;

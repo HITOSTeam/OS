@@ -264,6 +264,12 @@ fn build_linux_stack(
     at_entry: usize,
     at_base: usize,
 ) -> (usize, usize, usize, usize) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        return build_linux_stack_loongarch(token, sp, args, envs, elf_aux, at_entry, at_base);
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
     fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
         for (i, b) in bytes.iter().enumerate() {
             *translated_mutref(token, (addr + i) as *mut u8) = *b;
@@ -300,8 +306,10 @@ fn build_linux_stack(
     env_ptrs.reverse();
 
     // AT_PLATFORM: a small string describing the CPU architecture.
-    // glibc's dynamic loader expects this to be present.
-    // Keep consistent with many Linux RISC-V userlands.
+    // Keep consistent with the userland ABI expectations per-arch.
+    #[cfg(target_arch = "loongarch64")]
+    let platform = "loongarch64";
+    #[cfg(not(target_arch = "loongarch64"))]
     let platform = "RISC-V64";
     sp -= platform.len() + 1;
     write_bytes(token, sp, platform.as_bytes());
@@ -387,6 +395,127 @@ fn build_linux_stack(
     let argv_base = sp;
 
     // argc.
+    push_usize(token, &mut sp, argc);
+
+    (sp, argv_base, envp_base, auxv_base)
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn build_linux_stack_loongarch(
+    token: usize,
+    mut sp: usize,
+    args: &[String],
+    envs: &[String],
+    elf_aux: crate::mm::ElfAux,
+    at_entry: usize,
+    at_base: usize,
+) -> (usize, usize, usize, usize) {
+    fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            *translated_mutref(token, (addr + i) as *mut u8) = *b;
+        }
+    }
+
+    fn push_usize(token: usize, sp: &mut usize, value: usize) {
+        *sp -= core::mem::size_of::<usize>();
+        write_user_value(token, *sp as *mut usize, &value);
+    }
+
+    fn align_down(value: usize, align: usize) -> usize {
+        value & !(align - 1)
+    }
+
+    let argc = args.len();
+    let envc = envs.len();
+
+    let mut env_ptrs: Vec<usize> = Vec::with_capacity(envc);
+    for env in envs.iter().rev() {
+        let bytes = env.as_bytes();
+        sp -= bytes.len() + 1;
+        sp = align_down(sp, core::mem::size_of::<usize>());
+        write_bytes(token, sp, bytes);
+        *translated_mutref(token, (sp + bytes.len()) as *mut u8) = 0;
+        env_ptrs.push(sp);
+    }
+    env_ptrs.reverse();
+
+    let mut arg_ptrs: Vec<usize> = Vec::with_capacity(argc);
+    for arg in args.iter().rev() {
+        let bytes = arg.as_bytes();
+        sp -= bytes.len() + 1;
+        sp = align_down(sp, core::mem::size_of::<usize>());
+        write_bytes(token, sp, bytes);
+        *translated_mutref(token, (sp + bytes.len()) as *mut u8) = 0;
+        arg_ptrs.push(sp);
+    }
+    arg_ptrs.reverse();
+
+    let platform = "loongarch64";
+    sp -= platform.len() + 1;
+    sp = align_down(sp, core::mem::size_of::<usize>());
+    write_bytes(token, sp, platform.as_bytes());
+    *translated_mutref(token, (sp + platform.len()) as *mut u8) = 0;
+    let platform_ptr = sp;
+
+    // AT_RANDOM: 16 bytes.
+    sp -= 16;
+    let random_ptr = sp;
+    let mut x = (at_entry as u64) ^ (sp as u64).rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+    for i in 0..16usize {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *translated_mutref(token, (random_ptr + i) as *mut u8) = (x >> 56) as u8;
+    }
+
+    // Align stack to 16 bytes.
+    sp = align_down(sp, 16);
+
+    let mut auxv: Vec<(usize, usize)> = vec![
+        (AT_HWCAP, 0),
+        (AT_HWCAP2, 0),
+        (AT_PHDR, elf_aux.phdr),
+        (AT_PHENT, elf_aux.phent),
+        (AT_PHNUM, elf_aux.phnum),
+        (AT_PAGESZ, crate::config::PAGE_SIZE),
+        (AT_ENTRY, at_entry),
+        (AT_FLAGS, 0),
+        (AT_CLKTCK, 100),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
+        (AT_SECURE, 0),
+        (AT_PLATFORM, platform_ptr),
+        (AT_BASE_PLATFORM, platform_ptr),
+        (AT_RANDOM, random_ptr),
+    ];
+    if let Some(execfn_ptr) = arg_ptrs.first().copied() {
+        auxv.push((AT_EXECFN, execfn_ptr));
+    }
+    if at_base != 0 {
+        auxv.push((AT_BASE, at_base));
+    }
+
+    push_usize(token, &mut sp, 0);
+    push_usize(token, &mut sp, AT_NULL);
+    for (t, v) in auxv.iter().rev() {
+        push_usize(token, &mut sp, *v);
+        push_usize(token, &mut sp, *t);
+    }
+    let auxv_base = sp;
+
+    push_usize(token, &mut sp, 0);
+    for p in env_ptrs.iter().rev() {
+        push_usize(token, &mut sp, *p);
+    }
+    let envp_base = sp;
+
+    push_usize(token, &mut sp, 0);
+    for p in arg_ptrs.iter().rev() {
+        push_usize(token, &mut sp, *p);
+    }
+    let argv_base = sp;
+
     push_usize(token, &mut sp, argc);
 
     (sp, argv_base, envp_base, auxv_base)
@@ -885,11 +1014,13 @@ impl ProcessControlBlock {
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.sysv_shm_attaches.clone();
-        // Fork address space using copy-on-write for user pages to avoid huge copies
-        // when spawning many processes (e.g., rt-tests hackbench).
+        // Fork address space (COW by default, full copy on LoongArch).
         let caller_tid = crate::task::processor::current_task()
             .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.tid))
             .unwrap_or(0);
+        #[cfg(target_arch = "loongarch64")]
+        let mut memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        #[cfg(not(target_arch = "loongarch64"))]
         let mut memory_set = MemorySet::from_existed_user_cow(&mut parent.memory_set);
         if thread_count > 1 {
             for task in parent.tasks.iter().filter_map(|t| t.as_ref()) {
