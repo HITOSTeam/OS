@@ -1,7 +1,9 @@
 use alloc::{sync::Arc, sync::Weak};
 
 use crate::{
-    config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
+    config::{
+        KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE,
+    },
     mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr},
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
@@ -36,6 +38,9 @@ impl KernelStack {
 }
 /// Return (bottom, top) of a kernel stack in kernel space.
 pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
+    #[cfg(target_arch = "loongarch64")]
+    let top = crate::config::KERNEL_STACK_TOP - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
+    #[cfg(not(target_arch = "loongarch64"))]
     let top = TRAMPOLINE - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
     let bottom = top - KERNEL_STACK_SIZE;
     (bottom, top)

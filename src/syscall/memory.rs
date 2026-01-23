@@ -354,8 +354,13 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         return ENOMEM;
     }
     // Ensure permission changes take effect immediately.
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma");
+    }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("invtlb 0x1, $r0, $r0");
     }
     0
 }

@@ -32,7 +32,12 @@ KERNEL_ENTRY_PA = 0x80200000
 SMP ?= 4
 MEM ?= 512M
 QEMU_TIMEOUT ?= 0
+# choose disk-img according to the ARCH if riscv sdcard-rv if loongarch sdcard-la
+ifeq ($(ARCH), riscv64)
 DISK_IMG ?= ../sdcard-rv.img
+else ifeq ($(ARCH), loongarch64)
+DISK_IMG ?= ../sdcard-la.img
+endif
 EXT4_REBUILD ?= 0
 SUBMIT ?= 0
 USER_FEATURES :=
@@ -118,9 +123,16 @@ debug:KERNEL ext4_img
 # ===========================
 EXT4_IMG := ../ext4-fs-packer/target/fs.ext4
 EXT4_SIZE?= 1G 
+# change this according to the arch
+ifeq ($(ARCH), riscv64)
 EXT4_BASE_IMG ?= ../img/disk.img
 EXT4_BASE_TAR ?= ../img/disk.tar
 EXT4_BASE_TAR_XZ ?= ../img/disk.tar.xz
+else ifeq ($(ARCH), loongarch64)
+EXT4_BASE_IMG ?= ../img/disk-la.img
+EXT4_BASE_TAR ?= ../img/disk-la.tar
+EXT4_BASE_TAR_XZ ?= ../img/disk-la.tar.xz
+endif
 EXT4_BASE_ARG :=
 ifneq ($(strip $(EXT4_BASE_IMG)),)
 EXT4_BASE_ARG := -b $(abspath $(EXT4_BASE_IMG))

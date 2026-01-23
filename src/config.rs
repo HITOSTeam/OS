@@ -10,15 +10,34 @@ pub const KERNEL_HEAP_SIZE: usize = 0x400_0000; // 64 MiB
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 
+#[cfg(not(target_arch = "loongarch64"))]
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 /// User-accessible sigreturn trampoline page (separate from kernel trap trampoline).
+#[cfg(not(target_arch = "loongarch64"))]
 pub const SIGRETURN_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
+#[cfg(not(target_arch = "loongarch64"))]
 pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
+
+// LoongArch64 uses split PGDL/PGDH and a 3-level (Sv39-style) page walk here,
+// so the user-range VA width is 39 bits. Keep trap-related pages inside the
+// low canonical range (max 0x0000_003f_ffff_ffff) so PGDL can translate them.
+#[cfg(target_arch = "loongarch64")]
+pub const TRAMPOLINE: usize = 0x0000_003f_ffff_f000;
+/// User-accessible sigreturn trampoline page (separate from kernel trap trampoline).
+#[cfg(target_arch = "loongarch64")]
+pub const SIGRETURN_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
+#[cfg(target_arch = "loongarch64")]
+pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
+#[cfg(target_arch = "loongarch64")]
+pub const KERNEL_STACK_TOP: usize = 0xffff_ffff_ffff_f000;
 pub const MAX_HARTS: usize = 4;
 pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;
 /// Return (bottom, top) of a kernel stack in kernel space. Bottom is smaller while top is bigger.
 /// and we use top - xx to push data...
 pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
+    #[cfg(target_arch = "loongarch64")]
+    let top = KERNEL_STACK_TOP - app_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
+    #[cfg(not(target_arch = "loongarch64"))]
     let top = TRAMPOLINE - app_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
     let bottom = top - KERNEL_STACK_SIZE;
     (bottom, top)
@@ -29,6 +48,11 @@ pub const CLOCK_FREQ: usize = 12500000;
 // QEMU virt RAM starts at 0x8000_0000. Default to 512MiB to match common `-m 512M`.
 pub const DEFAULT_MEMORY_START: usize = 0x8000_0000;
 pub const DEFAULT_MEMORY_END: usize = 0xA000_0000;
+
+#[cfg(target_arch = "loongarch64")]
+pub const DEVICE_TREE_ADDR: usize = 0x100000;
+#[cfg(target_arch = "loongarch64")]
+pub const DEVICE_TREE_MAX_SIZE: usize = 0x200000;
 
 static PHYS_MEM_START: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_START);
 static PHYS_MEM_END: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_END);
@@ -48,10 +72,23 @@ pub fn phys_mem_end() -> usize {
     PHYS_MEM_END.load(Ordering::SeqCst)
 }
 
+#[cfg(not(target_arch = "loongarch64"))]
 pub const MMIO: &[(usize, usize)] = &[
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
     (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
     (0x1000_2000, 0x00_1000), // Virtio Block (bus 1) in virt machine
+];
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
+const UART_MMIO_BASE: usize = 0x8000_0000_1fe2_0000;
+#[cfg(all(target_arch = "loongarch64", not(feature = "loongarch_board")))]
+const UART_MMIO_BASE: usize = 0x1fe0_01e0;
+#[cfg(target_arch = "loongarch64")]
+pub const MMIO: &[(usize, usize)] = &[
+    (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
+    (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
+    (0x1000_2000, 0x00_1000), // Virtio Block (bus 1) in virt machine
+    (0x100e_0000, 0x00_1000), // QEMU virt poweroff device (shutdown register)
+    (UART_MMIO_BASE, 0x1000), // UART for console output
 ];
 
 pub const TRAP_CONTEXT_BASE: usize = TRAP_CONTEXT;

@@ -1,6 +1,27 @@
+pub mod mm;
+pub mod trap;
+
 use core::arch::asm;
 
 use riscv::register::sstatus;
+
+pub const REG_SP: usize = 2;
+pub const REG_RA: usize = 1;
+pub const REG_GP: usize = 3;
+pub const REG_TP: usize = 4;
+pub const REG_T0: usize = 5;
+pub const REG_T1: usize = 6;
+pub const REG_T2: usize = 7;
+pub const REG_S0: usize = 8;
+pub const REG_S1: usize = 9;
+pub const REG_A0: usize = 10;
+pub const REG_A1: usize = 11;
+pub const REG_A2: usize = 12;
+pub const REG_A3: usize = 13;
+pub const REG_A4: usize = 14;
+pub const REG_A5: usize = 15;
+pub const REG_A6: usize = 16;
+pub const REG_A7: usize = 17;
 
 pub fn disable_interrupts() -> bool {
     let prev = sstatus::read().sie();

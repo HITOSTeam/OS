@@ -22,6 +22,7 @@ SECTIONS
         *(.srodata .srodata.*)
     }
     . = ALIGN(4K);
+    erodata = .;
     sdata = .;
     .data : {
         *(.data .data.*)

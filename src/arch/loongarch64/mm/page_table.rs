@@ -1,32 +1,95 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
-use crate::{config::PAGE_SIZE, mm::PhysAddr};
-
-use super::{FrameTracker, MapPermission, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, frame_alloc};
+use crate::config::PAGE_SIZE;
+use crate::mm::{
+    FrameTracker, MapPermission, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
+    frame_alloc,
+};
 use crate::task::processor::current_task;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
-use core::{cmp::min, mem::MaybeUninit};
+use core::{arch::asm, cmp::min, mem::MaybeUninit};
 
 bitflags! {
     /// page table entry flags
-    pub struct PTEFlags: u16 {
+    pub struct PTEFlags: usize {
         const V = 1 << 0;
-        const R = 1 << 1;
-        const W = 1 << 2;
-        const X = 1 << 3;
-        const U = 1 << 4;
-        const G = 1 << 5;
-        const A = 1 << 6;
-        const D = 1 << 7;
-        /// Software-managed copy-on-write marker (Sv39 PTE RSW bit 0).
-        const COW = 1 << 8;
-        /// Software-managed shared mapping marker (Sv39 PTE RSW bit 1).
-        ///
-        /// Used to preserve System V shared memory mappings across `fork()`.
-        const SHARED = 1 << 9;
+        const D = 1 << 1;
+        const PLV0 = 0 << 2;
+        const PLV1 = 1 << 2;
+        const PLV2 = 2 << 2;
+        const PLV3 = 3 << 2;
+        const U = 3 << 2;
+        const MAT_SUC = 0 << 4;
+        const MAT_CC = 1 << 4;
+        const MAT_WUC = 2 << 4;
+        const G = 1 << 6;
+        const P = 1 << 7;
+        const W = 1 << 8;
+        /// Software-managed copy-on-write marker.
+        const COW = 1 << 9;
+        /// Software-managed shared mapping marker.
+        const SHARED = 1 << 10;
+        /// Not readable.
+        const NR = 1 << (usize::BITS - 3);
+        /// Not executable.
+        const NX = 1 << (usize::BITS - 2);
+        /// Restricted privilege level enable.
+        const RPLV = 1 << (usize::BITS - 1);
+    }
+}
+
+const PALEN: usize = 48;
+
+#[inline(always)]
+fn flush_tlb_vaddr(vaddr: usize) {
+    unsafe {
+        asm!("invtlb 0x4, $r0, {}", in(reg) vaddr);
+    }
+}
+
+#[inline(always)]
+fn flush_tlb_all() {
+    unsafe {
+        asm!("invtlb 0x1, $r0, $r0");
+    }
+}
+
+#[inline(always)]
+fn write_pgdl(base: usize) {
+    unsafe {
+        asm!("csrwr {}, 0x19", in(reg) base);
+    }
+}
+
+#[inline(always)]
+fn write_pgdh(base: usize) {
+    unsafe {
+        asm!("csrwr {}, 0x1a", in(reg) base);
+    }
+}
+
+impl From<MapPermission> for PTEFlags {
+    fn from(perm: MapPermission) -> Self {
+        let mut flags = PTEFlags::V | PTEFlags::P;
+        if !perm.contains(MapPermission::IO) {
+            flags |= PTEFlags::MAT_CC;
+        }
+        if !perm.contains(MapPermission::R) && !perm.contains(MapPermission::X) {
+            flags |= PTEFlags::NR;
+        }
+        if !perm.contains(MapPermission::X) {
+            flags |= PTEFlags::NX;
+        }
+        if perm.contains(MapPermission::W) {
+            flags |= PTEFlags::W | PTEFlags::D;
+        }
+        if perm.contains(MapPermission::U) {
+            flags |= PTEFlags::U;
+        }
+        flags
     }
 }
 
@@ -39,31 +102,43 @@ pub struct PageTableEntry {
 
 impl PageTableEntry {
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
+        let mut flags = flags;
+        flags.insert(PTEFlags::P);
         PageTableEntry {
-            bits: ppn.0 << 10 | flags.bits as usize,
+            bits: (ppn.0 << 12) | flags.bits,
         }
     }
     pub fn empty() -> Self {
         PageTableEntry { bits: 0 }
     }
     pub fn ppn(&self) -> PhysPageNum {
-        (self.bits >> 10 & ((1usize << 44) - 1)).into()
+        let ppn_mask = ((1usize << PALEN) - 1) << 12;
+        PhysPageNum((self.bits & ppn_mask) >> 12)
     }
     pub fn flags(&self) -> PTEFlags {
-        // Low 10 bits are flags (including the 2 software RSW bits).
-        PTEFlags::from_bits((self.bits & 0x3ff) as u16).unwrap()
+        let ppn_mask = ((1usize << PALEN) - 1) << 12;
+        PTEFlags::from_bits(self.bits & !ppn_mask).unwrap()
     }
     pub fn is_valid(&self) -> bool {
         (self.flags() & PTEFlags::V) != PTEFlags::empty()
     }
     pub fn readable(&self) -> bool {
-        (self.flags() & PTEFlags::R) != PTEFlags::empty()
+        !self.flags().contains(PTEFlags::NR)
     }
     pub fn writable(&self) -> bool {
-        (self.flags() & PTEFlags::W) != PTEFlags::empty()
+        self.flags().contains(PTEFlags::W)
     }
     pub fn executable(&self) -> bool {
-        (self.flags() & PTEFlags::X) != PTEFlags::empty()
+        !self.flags().contains(PTEFlags::NX)
+    }
+    pub fn is_user(&self) -> bool {
+        self.flags().contains(PTEFlags::PLV3)
+    }
+    pub fn is_cow(&self) -> bool {
+        self.flags().contains(PTEFlags::COW)
+    }
+    pub fn is_shared(&self) -> bool {
+        self.flags().contains(PTEFlags::SHARED)
     }
 }
 
@@ -83,9 +158,9 @@ impl PageTable {
         }
     }
     /// Temporarily used to get arguments from user space.
-    pub fn from_token(satp: usize) -> Self {
+    pub fn from_token(token: usize) -> Self {
         Self {
-            root_ppn: PhysPageNum::from(satp & ((1usize << 44) - 1)),
+            root_ppn: PhysPageNum::from(token),
             frames: Vec::new(),
         }
     }
@@ -129,14 +204,16 @@ impl PageTable {
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
         let pte = self.find_pte_create(vpn).unwrap();
-        assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
+        debug_assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        flush_tlb_vaddr(vpn.0 << 12);
     }
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
+        flush_tlb_vaddr(vpn.0 << 12);
     }
 
     /// Unmap an existing leaf PTE if it is present and valid.
@@ -150,6 +227,7 @@ impl PageTable {
             return false;
         }
         *pte = PageTableEntry::empty();
+        flush_tlb_vaddr(vpn.0 << 12);
         true
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
@@ -168,6 +246,7 @@ impl PageTable {
         }
         let ppn = pte.ppn();
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        flush_tlb_vaddr(vpn.0 << 12);
         true
     }
 
@@ -182,6 +261,7 @@ impl PageTable {
             return false;
         }
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        flush_tlb_vaddr(vpn.0 << 12);
         true
     }
     /// Translate `VirtAddr` to `PhysAddr`
@@ -194,7 +274,16 @@ impl PageTable {
         })
     }
     pub fn token(&self) -> usize {
-        8usize << 60 | self.root_ppn.0
+        self.root_ppn.0
+    }
+    pub fn activate(&self) {
+        let base = self.root_ppn.0 << 12;
+        let kernel_token = crate::mm::cached_kernel_token();
+        if kernel_token == 0 || self.root_ppn.0 == kernel_token {
+            write_pgdh(base);
+        }
+        write_pgdl(base);
+        flush_tlb_all();
     }
     pub fn clone(&self) -> Self {
         //todo:alloc new frames...
@@ -268,22 +357,22 @@ fn resolve_user_pte(token: usize, va: usize, access: MapPermission) -> Result<Pa
         }
     };
     let mut flags = pte.flags();
-    if access.contains(MapPermission::W) && !flags.contains(PTEFlags::W) {
+    if access.contains(MapPermission::W) && !pte.writable() {
         if flags.contains(PTEFlags::COW) && try_resolve_user_page(token, va, access) {
             pte = page_table.translate(vpn).ok_or(())?;
             flags = pte.flags();
         }
     }
-    if !flags.contains(PTEFlags::U) {
+    if !pte.is_user() {
         return Err(());
     }
-    if access.contains(MapPermission::R) && !flags.contains(PTEFlags::R) {
+    if access.contains(MapPermission::R) && !pte.readable() {
         return Err(());
     }
-    if access.contains(MapPermission::W) && !flags.contains(PTEFlags::W) {
+    if access.contains(MapPermission::W) && !pte.writable() {
         return Err(());
     }
-    if access.contains(MapPermission::X) && !flags.contains(PTEFlags::X) {
+    if access.contains(MapPermission::X) && !pte.executable() {
         return Err(());
     }
     Ok(pte)

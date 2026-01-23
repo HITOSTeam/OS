@@ -332,6 +332,19 @@ fn resolve_ext4_abs_path(
     depth: &mut usize,
     seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    // Prefer the secondary disk for OSComp test roots when available.
+    if (path == "/musl" || path.starts_with("/musl/") || path == "/glibc" || path.starts_with("/glibc/")) {
+        if let Some(secondary) = secondary_root_inode() {
+            let mut sec_depth = 0usize;
+            let mut sec_seen = Vec::new();
+            match resolve_ext4_path(secondary, path, uid, gid, follow_final, &mut sec_depth, &mut sec_seen) {
+                Ok(v) => return Ok(v),
+                Err(ENOENT) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     let primary = crate::fs::root_inode_for_path(path);
     match resolve_ext4_path(primary, path, uid, gid, follow_final, depth, seen_symlinks) {
         Ok(v) => Ok(v),
@@ -339,7 +352,9 @@ fn resolve_ext4_abs_path(
             let Some(secondary) = secondary_root_inode() else {
                 return Err(ENOENT);
             };
-            resolve_ext4_path(secondary, path, uid, gid, follow_final, depth, seen_symlinks)
+            let mut sec_depth = 0usize;
+            let mut sec_seen = Vec::new();
+            resolve_ext4_path(secondary, path, uid, gid, follow_final, &mut sec_depth, &mut sec_seen)
         }
         Err(e) => Err(e),
     }

@@ -2,6 +2,10 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::SIGRETURN_TRAMPOLINE;
+use crate::arch::{
+    REG_A0, REG_A1, REG_A2, REG_A3, REG_A4, REG_A5, REG_A6, REG_A7, REG_GP, REG_RA, REG_S0,
+    REG_S1, REG_SP, REG_T0, REG_T1, REG_T2, REG_TP,
+};
 use crate::{
     arch,
     debug_config::{DEBUG_PTHREAD, DEBUG_UNIXBENCH},
@@ -334,13 +338,13 @@ pub fn syscall_rt_sigreturn() -> isize {
     };
     if saved.uses_ucontext && saved.ucontext_ptr != 0 {
         let token = get_current_token();
-        let sp = inner.get_trap_cx().x[2];
-        let a2 = inner.get_trap_cx().x[12];
+        let sp = inner.get_trap_cx().x[REG_SP];
+        let a2 = inner.get_trap_cx().x[REG_A2];
         let uc = try_read_user_value(token, saved.ucontext_ptr as *const UContext)
             .or_else(|| try_read_user_value(token, sp as *const UContext));
         if let Some(uc) = uc {
             if DEBUG_PTHREAD && saved.signum == 33 {
-                let tp = saved.trap_cx.x[4];
+                let tp = saved.trap_cx.x[REG_TP];
                 let cancel = try_read_user_value(token, tp.wrapping_sub(156) as *const i32);
                 let canceldisable = try_read_user_value(token, tp.wrapping_sub(152) as *const u8);
                 let cancelasync = try_read_user_value(token, tp.wrapping_sub(151) as *const u8);
@@ -352,11 +356,11 @@ pub fn syscall_rt_sigreturn() -> isize {
                     a2,
                     saved.trap_cx.sepc,
                     sig_ctx.regs.pc,
-                    saved.trap_cx.x[10],
+                    saved.trap_cx.x[REG_A0],
                     sig_ctx.regs.a0,
                     saved.mask,
                     uc.uc_sigmask,
-                    saved.trap_cx.x[4],
+                    saved.trap_cx.x[REG_TP],
                     sig_ctx.regs.tp,
                     cancel,
                     canceldisable,
@@ -368,12 +372,12 @@ pub fn syscall_rt_sigreturn() -> isize {
             sig_ctx.regs.write_to_trap(&mut restored);
             *inner.get_trap_cx() = restored;
             inner.signal_mask = uc.uc_sigmask;
-            return restored.x[10] as isize;
+            return restored.x[REG_A0] as isize;
         }
     }
     *inner.get_trap_cx() = saved.trap_cx;
     inner.signal_mask = saved.mask;
-    saved.trap_cx.x[10] as isize
+    saved.trap_cx.x[REG_A0] as isize
 }
 
 #[repr(C, align(16))]
@@ -436,23 +440,23 @@ impl UserRegsStruct {
     fn from_trap(cx: &crate::trap::context::TrapContext) -> Self {
         Self {
             pc: cx.sepc,
-            ra: cx.x[1],
-            sp: cx.x[2],
-            gp: cx.x[3],
-            tp: cx.x[4],
-            t0: cx.x[5],
-            t1: cx.x[6],
-            t2: cx.x[7],
-            s0: cx.x[8],
-            s1: cx.x[9],
-            a0: cx.x[10],
-            a1: cx.x[11],
-            a2: cx.x[12],
-            a3: cx.x[13],
-            a4: cx.x[14],
-            a5: cx.x[15],
-            a6: cx.x[16],
-            a7: cx.x[17],
+            ra: cx.x[REG_RA],
+            sp: cx.x[REG_SP],
+            gp: cx.x[REG_GP],
+            tp: cx.x[REG_TP],
+            t0: cx.x[REG_T0],
+            t1: cx.x[REG_T1],
+            t2: cx.x[REG_T2],
+            s0: cx.x[REG_S0],
+            s1: cx.x[REG_S1],
+            a0: cx.x[REG_A0],
+            a1: cx.x[REG_A1],
+            a2: cx.x[REG_A2],
+            a3: cx.x[REG_A3],
+            a4: cx.x[REG_A4],
+            a5: cx.x[REG_A5],
+            a6: cx.x[REG_A6],
+            a7: cx.x[REG_A7],
             s2: cx.x[18],
             s3: cx.x[19],
             s4: cx.x[20],
@@ -473,23 +477,23 @@ impl UserRegsStruct {
     fn write_to_trap(&self, cx: &mut crate::trap::context::TrapContext) {
         cx.sepc = self.pc;
         cx.x[0] = 0;
-        cx.x[1] = self.ra;
-        cx.x[2] = self.sp;
-        cx.x[3] = self.gp;
-        cx.x[4] = self.tp;
-        cx.x[5] = self.t0;
-        cx.x[6] = self.t1;
-        cx.x[7] = self.t2;
-        cx.x[8] = self.s0;
-        cx.x[9] = self.s1;
-        cx.x[10] = self.a0;
-        cx.x[11] = self.a1;
-        cx.x[12] = self.a2;
-        cx.x[13] = self.a3;
-        cx.x[14] = self.a4;
-        cx.x[15] = self.a5;
-        cx.x[16] = self.a6;
-        cx.x[17] = self.a7;
+        cx.x[REG_RA] = self.ra;
+        cx.x[REG_SP] = self.sp;
+        cx.x[REG_GP] = self.gp;
+        cx.x[REG_TP] = self.tp;
+        cx.x[REG_T0] = self.t0;
+        cx.x[REG_T1] = self.t1;
+        cx.x[REG_T2] = self.t2;
+        cx.x[REG_S0] = self.s0;
+        cx.x[REG_S1] = self.s1;
+        cx.x[REG_A0] = self.a0;
+        cx.x[REG_A1] = self.a1;
+        cx.x[REG_A2] = self.a2;
+        cx.x[REG_A3] = self.a3;
+        cx.x[REG_A4] = self.a4;
+        cx.x[REG_A5] = self.a5;
+        cx.x[REG_A6] = self.a6;
+        cx.x[REG_A7] = self.a7;
         cx.x[18] = self.s2;
         cx.x[19] = self.s3;
         cx.x[20] = self.s4;
@@ -771,7 +775,7 @@ pub fn maybe_deliver_signal() {
     }
     if DEBUG_PTHREAD && signum == 33 {
         let token = get_current_token();
-        let tp = task.borrow_mut().get_trap_cx().x[4];
+        let tp = task.borrow_mut().get_trap_cx().x[REG_TP];
         let cancel = try_read_user_value(token, tp.wrapping_sub(156) as *const i32);
         let canceldisable = try_read_user_value(token, tp.wrapping_sub(152) as *const u8);
         let cancelasync = try_read_user_value(token, tp.wrapping_sub(151) as *const u8);
@@ -847,7 +851,7 @@ pub fn maybe_deliver_signal() {
     }
     inner.signal_mask = new_mask;
 
-    let mut user_sp = cx.x[2];
+    let mut user_sp = cx.x[REG_SP];
     let mut siginfo_ptr = 0usize;
     let mut ucontext_ptr = 0usize;
     if (action.flags & SA_SIGINFO) != 0 {
@@ -886,9 +890,9 @@ pub fn maybe_deliver_signal() {
             saved.uses_ucontext = true;
         }
 
-        cx.x[11] = siginfo_ptr;
-        cx.x[12] = ucontext_ptr;
-        cx.x[2] = user_sp;
+        cx.x[REG_A1] = siginfo_ptr;
+        cx.x[REG_A2] = ucontext_ptr;
+        cx.x[REG_SP] = user_sp;
         if DEBUG_PTHREAD && signum == 33 {
             log::debug!(
                 "[sigcancel] frame sp={:#x} siginfo={:#x} ucontext={:#x}",
@@ -898,15 +902,15 @@ pub fn maybe_deliver_signal() {
             );
         }
     } else {
-        cx.x[11] = 0;
-        cx.x[12] = 0;
+        cx.x[REG_A1] = 0;
+        cx.x[REG_A2] = 0;
     }
 
     cx.sepc = action.handler;
-    cx.x[10] = signum;
+    cx.x[REG_A0] = signum;
     // Always use the kernel-provided rt_sigreturn trampoline to avoid invalid
     // user restorer pointers causing instruction page faults.
-    cx.x[1] = sigreturn_trampoline_va();
+    cx.x[REG_RA] = sigreturn_trampoline_va();
 }
 
 pub fn try_sigreturn_from_fault() -> bool {

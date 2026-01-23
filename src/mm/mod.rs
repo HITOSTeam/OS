@@ -11,19 +11,27 @@ mod dtb;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
-mod page_table;
+#[cfg(target_arch = "riscv64")]
+pub use crate::arch::riscv64::mm::page_table;
+#[cfg(target_arch = "loongarch64")]
+pub use crate::arch::loongarch64::mm::page_table;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::println;
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
-use address::{StepByOne, VPNRange};
+pub use address::StepByOne;
+use address::VPNRange;
 use alloc::vec::Vec;
 pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_contiguous, frame_dealloc};
 pub use dtb::init_phys_mem_from_dtb;
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn cached_kernel_token() -> usize {
+    KERNEL_SATP.load(Ordering::SeqCst)
+}
 pub fn activate_kernel_space() {
     let cached = KERNEL_SATP.load(Ordering::SeqCst);
     if cached != 0 {

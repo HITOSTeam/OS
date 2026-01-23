@@ -16,10 +16,10 @@ pub const DEFAULT_LOG_LEVEL: log::LevelFilter = if DEBUG_UNIXBENCH {
 pub const DEBUG_TIMER: bool = false;
 
 /// Verbose scheduler debug logs (ready queue push/pop, idle switches).
-pub const DEBUG_SCHED: bool = false;
+pub const DEBUG_SCHED: bool = true;
 
 /// Verbose trap logs (timer/software interrupts, user exceptions).
-pub const DEBUG_TRAP: bool = false;
+pub const DEBUG_TRAP: bool = true;
 
 /// Verbose syscall trace (very noisy).
 pub const DEBUG_SYSCALL: bool = false;
@@ -46,7 +46,7 @@ pub const DEBUG_UNIXBENCH: bool = false;
 pub const DEBUG_CYCLICTEST: bool = false;
 
 /// Print a periodic diagnostic dump when the system has no runnable tasks.
-pub const DEBUG_WATCHDOG: bool = false;
+pub const DEBUG_WATCHDOG: bool = true;
 
 /// Run `log::test()` at boot (very noisy).
 pub const DEBUG_LOG_TEST: bool = false;

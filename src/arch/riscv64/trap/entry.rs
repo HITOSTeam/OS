@@ -2,8 +2,6 @@ use core::arch::global_asm;
 
 use riscv::register::sie;
 
-use crate::trap::context::TrapContext;
-
 global_asm!(include_str!("trap.asm"));
 
 unsafe extern "C" {

@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use bitflags::*;
 use core::arch::asm;
 use lazy_static::*;
+#[cfg(target_arch = "riscv64")]
 use riscv::register::satp::{self, Satp};
 use spin::Mutex;
 unsafe extern "C" {
@@ -97,6 +98,48 @@ impl MemorySet {
         )
     }
 
+    /// Map an identical (VA=PA) range into the address space.
+    pub fn map_identical_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        permission: MapPermission,
+    ) -> bool {
+        if end <= start {
+            return true;
+        }
+        self.try_push(
+            MapArea::new(start.into(), end.into(), MapType::Identical, permission),
+            None,
+        )
+    }
+
+    /// Map an identical (VA=PA) range, skipping pages already mapped.
+    pub fn map_identical_range_skip_mapped(
+        &mut self,
+        start: usize,
+        end: usize,
+        permission: MapPermission,
+    ) {
+        if end <= start {
+            return;
+        }
+        let mut vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).ceil();
+        while vpn < end_vpn {
+            let mapped = self
+                .page_table
+                .translate(vpn)
+                .map(|pte| pte.is_valid())
+                .unwrap_or(false);
+            if !mapped {
+                let ppn = PhysPageNum(vpn.0);
+                self.page_table.map(vpn, ppn, PTEFlags::from(permission));
+            }
+            vpn.step();
+        }
+    }
+
     fn push(&mut self, map_area: MapArea, data: Option<&[u8]>) {
         assert!(self.try_push(map_area, data), "OOM: mapping area failed");
     }
@@ -121,7 +164,7 @@ impl MemorySet {
         self.page_table.map(
             VirtAddr::from(TRAMPOLINE).into(),
             PhysAddr::from(strampoline as usize).into(),
-            PTEFlags::R | PTEFlags::X,
+            PTEFlags::from(MapPermission::R | MapPermission::X),
         );
     }
 
@@ -129,7 +172,7 @@ impl MemorySet {
         self.page_table.map(
             VirtAddr::from(SIGRETURN_TRAMPOLINE).into(),
             PhysAddr::from(strampoline as usize).into(),
-            PTEFlags::R | PTEFlags::X | PTEFlags::U,
+            PTEFlags::from(MapPermission::R | MapPermission::X | MapPermission::U),
         );
     }
     /// Without kernel stacks.
@@ -202,9 +245,19 @@ impl MemorySet {
                     (*pair).0.into(),
                     ((*pair).0 + (*pair).1).into(),
                     MapType::Identical,
-                    MapPermission::R | MapPermission::W,
+                    MapPermission::R | MapPermission::W | MapPermission::IO,
                 ),
                 None,
+            );
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let dtb_start = crate::config::DEVICE_TREE_ADDR;
+            let dtb_end = dtb_start + crate::config::DEVICE_TREE_MAX_SIZE;
+            memory_set.map_identical_range_skip_mapped(
+                dtb_start,
+                dtb_end,
+                MapPermission::R,
             );
         }
         memory_set
@@ -578,7 +631,7 @@ impl MemorySet {
         frames: Vec<FrameTracker>,
     ) {
         let mut area = MapArea::new(start_va, end_va, MapType::Framed, permission);
-        let pte_flags = PTEFlags::from_bits(area.map_perm.bits as u16).unwrap() | PTEFlags::SHARED;
+        let pte_flags = PTEFlags::from(area.map_perm) | PTEFlags::SHARED;
         for (vpn, frame) in area.vpn_range.into_iter().zip(frames.into_iter()) {
             self.page_table.map(vpn, frame.ppn, pte_flags);
             area.data_frames.insert(vpn, frame);
@@ -625,8 +678,13 @@ impl MemorySet {
         }
 
         // Flush TLB for this address.
+        #[cfg(target_arch = "riscv64")]
         unsafe {
             core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
         }
         true
     }
@@ -653,21 +711,33 @@ impl MemorySet {
                 crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
                 return false;
             };
-            let pte_flags = PTEFlags::from_bits(area.map_perm.bits as u16).unwrap();
+            let pte_flags = PTEFlags::from(area.map_perm);
             self.page_table.map(vpn, frame.ppn, pte_flags);
             area.data_frames.insert(vpn, frame);
+            #[cfg(target_arch = "riscv64")]
             unsafe {
                 core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
+            }
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
             }
             return true;
         }
         false
     }
     pub fn activate(&self) {
-        let satp = self.page_table.token();
-        unsafe {
-            satp::write(Satp::from_bits(satp));
-            asm!("sfence.vma");
+        #[cfg(target_arch = "riscv64")]
+        {
+            let satp = self.page_table.token();
+            unsafe {
+                satp::write(Satp::from_bits(satp));
+                asm!("sfence.vma");
+            }
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            self.page_table.activate();
         }
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
@@ -848,7 +918,7 @@ impl MemorySet {
                             self.page_table.unmap(vpn);
                             continue;
                         }
-                        let mut pte_flags = PTEFlags::from_bits(new_perm.bits as u16).unwrap();
+                        let mut pte_flags = PTEFlags::from(new_perm);
                         let old_flags = pte.flags();
                         if old_flags.contains(PTEFlags::COW) {
                             pte_flags.insert(PTEFlags::COW);
@@ -863,7 +933,7 @@ impl MemorySet {
                 }
                 if new_perm != MapPermission::U {
                     if let Some(frame) = mid_frames.get(&vpn) {
-                        let pte_flags = PTEFlags::from_bits(new_perm.bits as u16).unwrap();
+                        let pte_flags = PTEFlags::from(new_perm);
                         self.page_table.map(vpn, frame.ppn, pte_flags);
                     }
                 }
@@ -926,7 +996,7 @@ impl MemorySet {
                 area.map_perm,
             );
             if area.map_type == MapType::Lazy {
-                let pte_flags = PTEFlags::from_bits(new_area.map_perm.bits as u16).unwrap();
+                let pte_flags = PTEFlags::from(new_area.map_perm);
                 for vpn in area.vpn_range {
                     let Some(src_pte) = self.page_table.translate(vpn) else {
                         continue;
@@ -1022,7 +1092,7 @@ impl MapArea {
             }
             MapType::Lazy => unreachable!(),
         };
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits as u16).unwrap();
+        let pte_flags = PTEFlags::from(self.map_perm);
         page_table.map(vpn, ppn, pte_flags);
         true
     }
@@ -1138,6 +1208,8 @@ bitflags! {
         const W = 1 << 2;
         const X = 1 << 3;
         const U = 1 << 4;
+        /// Device/IO memory mapping (non-cacheable on loongarch64).
+        const IO = 1 << 5;
     }
 }
 pub fn kernel_token() -> usize {
@@ -1145,9 +1217,15 @@ pub fn kernel_token() -> usize {
 }
 
 pub fn activate_token(token: usize) {
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         satp::write(Satp::from_bits(token));
         asm!("sfence.vma");
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let page_table = PageTable::from_token(token);
+        page_table.activate();
     }
 }
 #[allow(unused)]

@@ -498,9 +498,13 @@ impl RootSelection {
 pub fn list_apps() {
     let _fs_guard = ext4_lock();
     println!("/**** APPS ****");
+    println!("[ext4] list_apps start");
+    let mut count = 0usize;
     for app in USER_INODE.ls() {
         println!("{}", app);
+        count += 1;
     }
+    println!("[ext4] list_apps done count={}", count);
     println!("**************/");
 }
 

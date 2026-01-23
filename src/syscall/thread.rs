@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use crate::{
     arch,
     mm::kernel_token,
+    arch::REG_A0,
     time::get_time_ms,
     task::{
         block_sleep::add_timer,
@@ -56,7 +57,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
             new_task.kstack.get_top(),
             trap_handler as usize,
         );
-        (*new_task_trap_cx).x[10] = arg;
+        (*new_task_trap_cx).x[REG_A0] = arg;
         new_task_tid
     };
 

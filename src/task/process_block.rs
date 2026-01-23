@@ -23,6 +23,7 @@ use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
 use crate::debug_config::DEBUG_SYSCALL;
+use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use spin::{Mutex as SpinMutex, MutexGuard};
 
 fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
@@ -703,10 +704,10 @@ impl ProcessControlBlock {
             kstack_top,
             trap_handler as usize,
         );
-        tcx.x[10] = args.len();
-        tcx.x[11] = argv_base;
-        tcx.x[12] = envp_base;
-        tcx.x[13] = auxv_base;
+        tcx.x[REG_A0] = args.len();
+        tcx.x[REG_A1] = argv_base;
+        tcx.x[REG_A2] = envp_base;
+        tcx.x[REG_A3] = auxv_base;
         *trap_cx = tcx;
         // println!(
         //     "[DEBUG] ProcessControlBlock::new - entry_point={:#x}, ustack_top={:#x}, kstack_top={:#x}",
@@ -725,8 +726,9 @@ impl ProcessControlBlock {
             ustack_base + USER_STACK_SIZE,
             kstack_top
         );
-        // Bootstrap initproc onto hart 0 for determinism.
-        task.set_cpu_id(0);
+        // Bootstrap initproc onto the current hart (loongarch64 may not start hart 0).
+        let boot_hart = crate::task::processor::hart_id();
+        task.set_cpu_id(boot_hart);
         add_task(task);
         process
     }
@@ -789,10 +791,10 @@ impl ProcessControlBlock {
             task.kstack.get_top(),
             trap_handler as usize,
         );
-        trap_cx.x[10] = args.len();
-        trap_cx.x[11] = argv_base;
-        trap_cx.x[12] = envp_base;
-        trap_cx.x[13] = auxv_base;
+        trap_cx.x[REG_A0] = args.len();
+        trap_cx.x[REG_A1] = argv_base;
+        trap_cx.x[REG_A2] = envp_base;
+        trap_cx.x[REG_A3] = auxv_base;
         *task_inner.get_trap_cx() = trap_cx;
     }
 
@@ -861,10 +863,10 @@ impl ProcessControlBlock {
             task.kstack.get_top(),
             trap_handler as usize,
         );
-        trap_cx.x[10] = args.len();
-        trap_cx.x[11] = argv_base;
-        trap_cx.x[12] = envp_base;
-        trap_cx.x[13] = auxv_base;
+        trap_cx.x[REG_A0] = args.len();
+        trap_cx.x[REG_A1] = argv_base;
+        trap_cx.x[REG_A2] = envp_base;
+        trap_cx.x[REG_A3] = auxv_base;
         *task_inner.get_trap_cx() = trap_cx;
     }
 
@@ -1008,7 +1010,7 @@ impl ProcessControlBlock {
         }
         trap_cx.kernel_sp = task.kstack.get_top();
         // set return value for child process
-        trap_cx.x[10] = 0;
+        trap_cx.x[REG_A0] = 0;
         if caller_tid != 0 {
             if let Some(res) = task_inner.res.as_mut() {
                 let caller_stack_bottom =

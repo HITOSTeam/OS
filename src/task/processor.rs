@@ -19,6 +19,7 @@ use crate::{
     trap::init_trap,
 };
 use alloc::{sync::Arc, task, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::lazy_static;
 use log;
 use spin::Mutex;
@@ -173,9 +174,18 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
 pub fn idle_task() {
     #[allow(dead_code)]
     static EMPTY_SPINS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static IDLE_FIRST_LOG: AtomicBool = AtomicBool::new(true);
+    static IDLE_FIRST_SWITCH_LOG: AtomicBool = AtomicBool::new(true);
     loop {
         // Ensure kernel-mode traps use the kernel handler (stvec points to alltraps_k)
         init_trap();
+        if IDLE_FIRST_LOG.swap(false, Ordering::SeqCst) {
+            let hart = hart_id();
+            let mgr = crate::task::manager::TASK_MANAGER.lock();
+            let lens = mgr.ready_queue_lengths();
+            drop(mgr);
+            println!("[idle] enter hart={} ready_queues={:?}", hart, lens);
+        }
         // Disable interrupts while accessing TASK_MANAGER to prevent
         // timer interrupt from calling check_timer -> wakeup_task -> add_task
         // while we hold the TASK_MANAGER lock in fetch_task
@@ -220,6 +230,19 @@ pub fn idle_task() {
             // access coming task TCB exclusively
             let mut task_inner = task.borrow_mut();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
+            if IDLE_FIRST_SWITCH_LOG.swap(false, Ordering::SeqCst) {
+                let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+                let trap_cx = task_inner.res.as_ref().map(|r| r.trap_cx_user_va()).unwrap_or(0);
+                println!(
+                    "[idle] switch hart={} tid={} ra={:#x} sp={:#x} trap_cx_va={:#x} trap_return={:#x}",
+                    hart_id(),
+                    tid,
+                    task_inner.task_cx.ra,
+                    task_inner.task_cx.sp,
+                    trap_cx,
+                    crate::trap::trap_return as usize
+                );
+            }
             if DEBUG_SCHED {
                 let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 log::debug!(

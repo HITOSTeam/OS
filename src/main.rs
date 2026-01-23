@@ -18,6 +18,7 @@ mod lang_items;
 mod log;
 mod mm;
 mod net;
+#[cfg(target_arch = "riscv64")]
 mod sbi;
 mod syscall;
 mod task;
@@ -143,13 +144,27 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
 #[cfg(target_arch = "loongarch64")]
 #[unsafe(no_mangle)]
 fn rust_main(hart_id: usize) -> ! {
+    arch::set_tp(hart_id);
+    let _ = arch::disable_interrupts();
     if BOOT_HART_INITED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
         clear_bss();
         BOOT_BSS_CLEARED.store(true, Ordering::SeqCst);
+        // Ensure the boot hart is marked online so tasks stay on the running hart.
+        task::manager::mark_hart_online(hart_id);
         println!("[kernel] loongarch64 boot hart {}", hart_id);
+        arch::bootstrap_init();
+        mm::init();
+        arch::disable_direct_map_windows();
+        log::init();
+        trap::init_trap();
+        trap::trap::enable_timer_interrupt();
+        time::set_next_trigger();
+        list_apps();
+        fs::init_procfs();
+        task::task_start();
     }
     loop {
         core::hint::spin_loop();

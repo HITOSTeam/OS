@@ -5,6 +5,7 @@ use core::{
 };
 
 use crate::{
+    arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_PTHREAD, DEBUG_UNIXBENCH},
     fs::ext4_lock,
     mm::{kernel_token, translated_single_address, translated_str, write_user_value},
@@ -211,12 +212,12 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             new_inner.signal_mask = parent_mask;
             let trap_cx = new_inner.get_trap_cx();
             *trap_cx = parent_cx;
-            trap_cx.x[10] = 0; // child returns 0 from syscall
+            trap_cx.x[REG_A0] = 0; // child returns 0 from syscall
             if stack != 0 {
-                trap_cx.x[2] = stack;
+                trap_cx.x[REG_SP] = stack;
             }
             if (flags & CLONE_SETTLS) != 0 {
-                trap_cx.x[4] = _tls; // tp (TLS)
+                trap_cx.x[REG_TP] = _tls; // tp (TLS)
             }
             trap_cx.kernel_satp = kernel_token();
             trap_cx.kernel_sp = new_task.kstack.get_top();
@@ -268,9 +269,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let mut task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
         *trap_cx = parent_cx;
-        trap_cx.x[10] = 0; // child returns 0 from syscall
+        trap_cx.x[REG_A0] = 0; // child returns 0 from syscall
         if stack != 0 {
-            trap_cx.x[2] = stack;
+            trap_cx.x[REG_SP] = stack;
         }
         trap_cx.kernel_satp = kernel_token();
         trap_cx.kernel_sp = task.kstack.get_top();

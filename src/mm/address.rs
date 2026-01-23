@@ -4,11 +4,17 @@ use super::PageTableEntry;
 use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use core::fmt::{self, Debug, Formatter};
 
-/// physical address
-const PA_WIDTH_SV39: usize = 56;
-const VA_WIDTH_SV39: usize = 39;
-const PPN_WIDTH_SV39: usize = PA_WIDTH_SV39 - PAGE_SIZE_BITS;
-const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS;
+/// physical/virtual address width (per-arch).
+#[cfg(target_arch = "loongarch64")]
+const PA_WIDTH: usize = 48;
+#[cfg(target_arch = "loongarch64")]
+const VA_WIDTH: usize = 48;
+#[cfg(not(target_arch = "loongarch64"))]
+const PA_WIDTH: usize = 56;
+#[cfg(not(target_arch = "loongarch64"))]
+const VA_WIDTH: usize = 39;
+const PPN_WIDTH: usize = PA_WIDTH - PAGE_SIZE_BITS;
+const VPN_WIDTH: usize = VA_WIDTH - PAGE_SIZE_BITS;
 
 /// Definitions
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
@@ -55,22 +61,22 @@ impl Debug for PhysPageNum {
 
 impl From<usize> for PhysAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PA_WIDTH_SV39) - 1))
+        Self(v & ((1 << PA_WIDTH) - 1))
     }
 }
 impl From<usize> for PhysPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PPN_WIDTH_SV39) - 1))
+        Self(v & ((1 << PPN_WIDTH) - 1))
     }
 }
 impl From<usize> for VirtAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VA_WIDTH_SV39) - 1))
+        Self(v & ((1 << VA_WIDTH) - 1))
     }
 }
 impl From<usize> for VirtPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VPN_WIDTH_SV39) - 1))
+        Self(v & ((1 << VPN_WIDTH) - 1))
     }
 }
 impl From<PhysAddr> for usize {
@@ -85,8 +91,8 @@ impl From<PhysPageNum> for usize {
 }
 impl From<VirtAddr> for usize {
     fn from(v: VirtAddr) -> Self {
-        if v.0 >= (1 << (VA_WIDTH_SV39 - 1)) {
-            v.0 | (!((1 << VA_WIDTH_SV39) - 1))
+        if v.0 >= (1 << (VA_WIDTH - 1)) {
+            v.0 | (!((1 << VA_WIDTH) - 1))
         } else {
             v.0
         }

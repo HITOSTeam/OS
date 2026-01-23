@@ -221,6 +221,10 @@ impl TaskManager {
         task.in_ready_queue
             .store(false, core::sync::atomic::Ordering::Release);
     }
+
+    pub fn ready_queue_lengths(&self) -> alloc::vec::Vec<usize> {
+        self.ready_queues.iter().map(|q| q.len()).collect()
+    }
 }
 
 lazy_static! {
