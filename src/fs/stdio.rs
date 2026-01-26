@@ -1,7 +1,7 @@
 //!Stdin & Stdout
 use super::File;
 use crate::mm::UserBuffer;
-use crate::arch::{console_getchar, console_putchar};
+use crate::arch::{console_flush, console_getchar, console_putchar};
 use crate::task::processor::suspend_current_and_run_next;
 ///Standard input
 pub struct Stdin;
@@ -62,9 +62,29 @@ impl File for Stdout {
         0
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
-        for buffer in user_buf.buffers.iter() {
-            for &b in buffer.iter() {
-                console_putchar(b as usize);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let mut pending = 0usize;
+            for buffer in user_buf.buffers.iter() {
+                for &b in buffer.iter() {
+                    console_putchar(b as usize);
+                    pending += 1;
+                    if pending >= 4 {
+                        console_flush();
+                        pending = 0;
+                    }
+                }
+            }
+            if pending != 0 {
+                console_flush();
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            for buffer in user_buf.buffers.iter() {
+                for &b in buffer.iter() {
+                    console_putchar(b as usize);
+                }
             }
         }
         user_buf.len()

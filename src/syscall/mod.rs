@@ -64,6 +64,7 @@ const SYSCALL_SYNC: usize = 81;
 const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_FDATASYNC: usize = 83;
 const SYSCALL_TIMERFD_CREATE: usize = 85;
+const SYSCALL_STATX: usize = 291;
 // riscv64 Linux syscall numbers (match upstream): statfs=43, fstatfs=44.
 const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
@@ -249,6 +250,13 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_READLINKAT => filesystem::syscall_readlinkat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_NEWFSTATAT => filesystem::syscall_newfstatat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_FSTAT => filesystem::syscall_fstat(args[0], args[1]),
+        SYSCALL_STATX => filesystem::syscall_statx(
+            args[0] as isize,
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+        ),
         SYSCALL_SYNC => filesystem::syscall_sync(),
         SYSCALL_FSYNC => filesystem::syscall_fsync(args[0]),
         SYSCALL_FDATASYNC => filesystem::syscall_fsync(args[0]),

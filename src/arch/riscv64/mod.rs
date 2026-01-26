@@ -59,6 +59,10 @@ pub fn console_putchar(c: usize) {
     crate::sbi::console_putchar(c);
 }
 
+pub fn console_flush() {
+    // SBI console doesn't need an explicit flush.
+}
+
 pub fn console_getchar() -> usize {
     crate::sbi::console_getchar()
 }

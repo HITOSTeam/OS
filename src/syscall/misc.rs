@@ -112,7 +112,12 @@ pub fn syscall_uname(buf: usize) -> isize {
     // Report a modern Linux-like release string for compatibility.
     write_cstr(&mut un.release, "5.15.0");
     write_cstr(&mut un.version, "CongCore");
-    write_cstr(&mut un.machine, "riscv64");
+    let machine = if cfg!(target_arch = "loongarch64") {
+        "loongarch64"
+    } else {
+        "riscv64"
+    };
+    write_cstr(&mut un.machine, machine);
     write_cstr(&mut un.domainname, "localdomain");
 
     let token = get_current_token();

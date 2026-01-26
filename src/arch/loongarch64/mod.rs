@@ -3,6 +3,7 @@ pub mod trap;
 
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 global_asm!(include_str!("tlb_refill.S"));
 
@@ -30,16 +31,41 @@ const UART_BASE: usize = 0x8000_0000_1fe2_0000;
 const UART_BASE: usize = 0x1fe0_01e0;
 
 const UART_RBR_THR: usize = UART_BASE + 0x0;
+const UART_FCR: usize = UART_BASE + 0x2;
+const UART_LCR: usize = UART_BASE + 0x3;
 const UART_LSR: usize = UART_BASE + 0x5;
 
+static UART_INITED: AtomicBool = AtomicBool::new(false);
+
+fn uart_init_once() {
+    if UART_INITED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        unsafe {
+            // 8N1 + enable FIFO, clear RX/TX queues.
+            write_volatile(UART_LCR as *mut u8, 0x03);
+            write_volatile(UART_FCR as *mut u8, 0x07);
+        }
+    }
+}
+
 pub fn console_putchar(c: usize) {
+    uart_init_once();
     unsafe {
-        while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {}
         write_volatile(UART_RBR_THR as *mut u8, c as u8);
     }
 }
 
+pub fn console_flush() {
+    uart_init_once();
+    unsafe {
+        while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {}
+    }
+}
+
 pub fn console_getchar() -> usize {
+    uart_init_once();
     unsafe {
         if read_volatile(UART_LSR as *const u8) & 0x01 == 0 {
             return usize::MAX;

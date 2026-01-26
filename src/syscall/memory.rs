@@ -55,11 +55,29 @@ fn get_fd_inode(fd: usize) -> Option<Arc<ext4_fs::Inode>> {
 
 pub fn syscall_brk(addr: usize) -> isize {
     let process = current_process();
+    let pid = process.getpid();
     let mut inner = process.borrow_mut();
     if addr == 0 {
+        if crate::debug_config::DEBUG_SYSCALL {
+            crate::println!(
+                "[brk] pid={} query brk={:#x} heap_start={:#x}",
+                pid,
+                inner.brk,
+                inner.heap_start
+            );
+        }
         return inner.brk as isize;
     }
     if addr < inner.heap_start {
+        if crate::debug_config::DEBUG_SYSCALL {
+            crate::println!(
+                "[brk] pid={} reject addr={:#x} heap_start={:#x} brk={:#x}",
+                pid,
+                addr,
+                inner.heap_start,
+                inner.brk
+            );
+        }
         return inner.brk as isize;
     }
 
@@ -68,29 +86,56 @@ pub fn syscall_brk(addr: usize) -> isize {
     let heap_start = inner.heap_start;
     let old_end = align_up(old_brk, PAGE_SIZE);
     let new_end = align_up(new_brk, PAGE_SIZE);
+    if crate::debug_config::DEBUG_SYSCALL {
+        crate::println!(
+            "[brk] pid={} heap_start={:#x} old_brk={:#x} new_brk={:#x} old_end={:#x} new_end={:#x}",
+            pid,
+            heap_start,
+            old_brk,
+            new_brk,
+            old_end,
+            new_end
+        );
+    }
     let ok = if new_end > old_end {
         let mut ok = inner
             .memory_set
             .append_to(heap_start.into(), new_end.into());
+        if crate::debug_config::DEBUG_SYSCALL {
+            crate::println!("[brk] pid={} append_to ok={}", pid, ok);
+        }
         if !ok {
             // fix posssible error that happends in the cloud env
             let perm = MapPermission::R | MapPermission::W | MapPermission::U;
             ok = inner
                 .memory_set
                 .try_insert_lazy_area(heap_start.into(), new_end.into(), perm);
+            if crate::debug_config::DEBUG_SYSCALL {
+                crate::println!("[brk] pid={} insert_lazy ok={}", pid, ok);
+            }
         }
         ok
     } else if new_end < old_end {
-        inner
+        let ok = inner
             .memory_set
-            .shrink_to(heap_start.into(), new_end.into())
+            .shrink_to(heap_start.into(), new_end.into());
+        if crate::debug_config::DEBUG_SYSCALL {
+            crate::println!("[brk] pid={} shrink_to ok={}", pid, ok);
+        }
+        ok
     } else {
         true
     };
     if !ok {
+        if crate::debug_config::DEBUG_SYSCALL {
+            crate::println!("[brk] pid={} failed, brk stays {:#x}", pid, old_brk);
+        }
         return old_brk as isize;
     }
     inner.brk = new_brk;
+    if crate::debug_config::DEBUG_SYSCALL {
+        crate::println!("[brk] pid={} updated brk={:#x}", pid, inner.brk);
+    }
     inner.brk as isize
 }
 

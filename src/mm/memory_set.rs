@@ -474,12 +474,13 @@ impl MemorySet {
             _ => 0,
         };
         // Keep the interpreter at a different base to avoid overlap with the main program.
+        // For LoongArch, keep it under 2GiB so brk stays in 32-bit range for oscomp musl tests.
+        #[cfg(target_arch = "loongarch64")]
+        let interp_bias = 0x4000_0000;
         // Match exampleOS layout: put the interpreter high (but still within Sv39 user range)
         // to reduce collisions with the main program/heap/mmap allocations.
-        let interp_bias = match interp.header.pt2.type_().as_type() {
-            xmas_elf::header::Type::SharedObject => 0x30_0000_0000,
-            _ => 0x30_0000_0000,
-        };
+        #[cfg(not(target_arch = "loongarch64"))]
+        let interp_bias = 0x30_0000_0000;
 
         let mut max_end_vpn = VirtPageNum(0);
         let (main_entry, main_aux) =
