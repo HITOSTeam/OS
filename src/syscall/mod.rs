@@ -184,6 +184,53 @@ const SYSCALL_CONDVAR_WAIT: usize = 1032;
 const SYSCALL_GET_HARTID: usize = 998;
 
 pub fn syscall(id: usize, args: [usize; 6]) -> isize {
+    if crate::debug_config::DEBUG_SIGNAL {
+        let is_sleep = {
+            let proc = crate::task::processor::current_process();
+            let inner = proc.borrow_mut();
+            inner.argv.first().map(|s| s.as_str() == "sleep").unwrap_or(false)
+        };
+        if is_sleep {
+            let now_ms = crate::time::get_time_ms();
+            crate::log_if!(
+                crate::debug_config::DEBUG_SIGNAL,
+                info,
+                "[sleep_syscall] now_ms={} id={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                now_ms,
+                id,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5]
+            );
+        }
+    }
+    if crate::debug_config::DEBUG_SIGNAL {
+        let pid = crate::task::processor::current_process().getpid();
+        match id {
+            SYSCALL_PSELECT6
+            | SYSCALL_PPOLL
+            | SYSCALL_NANOSLEEP
+            | SYSCALL_SETITIMER
+            | SYSCALL_CLOCK_NANOSLEEP
+            | SYSCALL_SIGTIMEDWAIT => {
+                crate::log_if!(
+                    crate::debug_config::DEBUG_SIGNAL,
+                    info,
+                    "[time_syscall] pid={} id={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                    pid,
+                    id,
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3]
+                );
+            }
+            _ => {}
+        }
+    }
     // Lightweight syscall trace for debugging glibc/busybox startup.
     // Keep disabled for normal runs.
     static TRACE_LEFT: AtomicUsize = AtomicUsize::new(256);

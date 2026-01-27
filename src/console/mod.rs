@@ -11,23 +11,32 @@ impl Write for Stdout {
         crate::klog::append_str(s);
         #[cfg(target_arch = "loongarch64")]
         {
+            let flush_threshold = crate::arch::UART_FIFO_DEPTH.saturating_sub(2).max(4);
             let mut pending = 0usize;
+            let mut total = 0usize;
             for c in s.chars() {
                 // QEMU's UART expects CRLF for proper newlines.
                 if c == '\n' {
                     console_putchar('\r' as usize);
                     pending += 1;
+                    total += 1;
                 }
                 console_putchar(c as usize);
                 pending += 1;
-                if pending >= 4 {
+                total += 1;
+                if pending >= flush_threshold {
+                    let start = crate::perf::uart_flush_begin();
                     console_flush();
+                    crate::perf::uart_flush_end(start);
                     pending = 0;
                 }
             }
             if pending != 0 {
+                let start = crate::perf::uart_flush_begin();
                 console_flush();
+                crate::perf::uart_flush_end(start);
             }
+            crate::perf::record_uart_bytes(total);
             return Ok(());
         }
         #[cfg(not(target_arch = "loongarch64"))]

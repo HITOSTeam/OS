@@ -126,7 +126,7 @@ impl PageTableEntry {
         !self.flags().contains(PTEFlags::NR)
     }
     pub fn writable(&self) -> bool {
-        self.flags().contains(PTEFlags::W)
+        self.flags().contains(PTEFlags::D)
     }
     pub fn executable(&self) -> bool {
         !self.flags().contains(PTEFlags::NX)

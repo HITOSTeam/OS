@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 
 use crate::{
     arch,
-    debug_config::DEBUG_UNIXBENCH,
+    debug_config::{DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     mm::{read_user_value, translated_single_address, write_user_value},
     println,
     task::processor::current_process,
@@ -22,6 +22,7 @@ use crate::{
         processor::suspend_current_and_run_next,
         task_block::TaskControlBlock,
     },
+    time::get_time_ms,
     trap::{context::TrapContext, get_current_token},
 };
 
@@ -144,6 +145,8 @@ impl SignalFlags {
             Some((-11, "Segmentation Fault, SIGSEGV=11"))
         } else if self.contains(Self::SIGPIPE) {
             Some((-13, "Broken pipe, SIGPIPE=13"))
+        } else if self.contains(Self::SIGTERM) {
+            Some((-15, "Terminated, SIGTERM=15"))
         } else {
             //println!("[K] signalflags check_error  {:?}", self);
             None
@@ -260,6 +263,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
     let Some(flag) = SignalFlags::from_bits(1u32 << signum) else {
         return -22; // EINVAL
     };
+    let sig_bit = signal_bit(signum as usize).unwrap_or(0);
     let (tasks, child_pids) = {
         let mut process_ref = process.borrow_mut();
         process_ref.signals.insert(flag);
@@ -279,6 +283,35 @@ pub fn kill(pid: usize, signum: i32) -> isize {
         };
         (tasks, child_pids)
     };
+    crate::log_if!(
+        DEBUG_SIGNAL,
+        info,
+        "[signal] kill pid={} sig={} tasks={} now_ms={}",
+        pid,
+        signum,
+        tasks.len(),
+        get_time_ms()
+    );
+    if sig_bit != 0 {
+        for t in &tasks {
+            let (tid, pending, mask) = {
+                let mut inner = t.borrow_mut();
+                inner.pending_signals |= sig_bit;
+                let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+                (tid, inner.pending_signals, inner.signal_mask)
+            };
+            crate::log_if!(
+                DEBUG_SIGNAL,
+                debug,
+                "[signal] kill pid={} tid={} set_pending sig={} pending={:#x} mask={:#x}",
+                pid,
+                tid,
+                signum,
+                pending,
+                mask
+            );
+        }
+    }
     for t in tasks {
         wakeup_task(t);
     }

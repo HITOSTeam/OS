@@ -33,22 +33,32 @@ mod virtio_mmio {
 
     impl BlockDevice for VirtIOBlock {
         fn read_block(&self, block_id: usize, buf: &mut [u8]) {
-            assert_eq!(buf.len() % 512, 0, "read_block buf must be 512B-aligned size");
-            let sectors_per_block = buf.len() / 512;
+            self.read_blocks(block_id, buf);
+        }
+        fn write_block(&self, block_id: usize, buf: &[u8]) {
+            self.write_blocks(block_id, buf);
+        }
+        fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
+            assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
+            let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
+            let start = crate::perf::block_read_begin();
             self.0
                 .lock()
                 .read_blocks(base_sector, buf)
                 .expect("Error when reading VirtIOBlk");
+            crate::perf::block_read_end(start, buf.len());
         }
-        fn write_block(&self, block_id: usize, buf: &[u8]) {
-            assert_eq!(buf.len() % 512, 0, "write_block buf must be 512B-aligned size");
-            let sectors_per_block = buf.len() / 512;
+        fn write_blocks(&self, block_id: usize, buf: &[u8]) {
+            assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
+            let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
+            let start = crate::perf::block_write_begin();
             self.0
                 .lock()
                 .write_blocks(base_sector, buf)
                 .expect("Error when writing VirtIOBlk");
+            crate::perf::block_write_end(start, buf.len());
         }
     }
 
@@ -166,7 +176,7 @@ mod virtio_pci {
     static PCI_ECAM_MAPPED: AtomicBool = AtomicBool::new(false);
     static READ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
     static WRITE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-    const FORCE_DMA_CACHEABLE: bool = false;
+    const FORCE_DMA_CACHEABLE: bool = true;
 
     pub struct VirtIOBlock(Mutex<VirtIOBlk<HalImpl, PciTransport>>);
 
@@ -180,6 +190,17 @@ mod virtio_pci {
     }
 
     pub struct HalImpl;
+
+    fn direct_dma_ok(vaddr: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = match vaddr.checked_add(len) {
+            Some(v) => v,
+            None => return false,
+        };
+        vaddr >= phys_mem_start() && end <= phys_mem_end()
+    }
 
     fn set_dma_page_flags(paddr: usize, pages: usize, io: bool) {
         if FORCE_DMA_CACHEABLE {
@@ -225,6 +246,10 @@ mod virtio_pci {
 
         unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> usize {
             assert_ne!(buffer.len(), 0);
+            let vaddr = buffer.as_ptr() as *const u8 as usize;
+            if direct_dma_ok(vaddr, buffer.len()) {
+                return vaddr;
+            }
             let pages = (buffer.len() + PAGE_SIZE - 1) / PAGE_SIZE;
             let frames = frame_alloc_contiguous(pages).expect("VirtIO share: OOM");
             let paddr: PhysAddr = frames[0].ppn.into();
@@ -250,22 +275,21 @@ mod virtio_pci {
         unsafe fn unshare(paddr: usize, buffer: NonNull<[u8]>, direction: BufferDirection) {
             assert_ne!(buffer.len(), 0);
             assert_ne!(paddr, 0);
+            let frames = SHARED_FRAMES.lock().remove(&paddr);
+            if frames.is_none() {
+                return;
+            }
             if let BufferDirection::DeviceToDriver | BufferDirection::Both = direction {
-                unsafe {
-                    let src = core::slice::from_raw_parts(
-                        paddr as *const u8,
-                        buffer.len(),
-                    );
-                    let dst = core::slice::from_raw_parts_mut(
-                        buffer.as_ptr() as *mut u8,
-                        buffer.len(),
-                    );
-                    dst.copy_from_slice(src);
-                }
+                let src =
+                    core::slice::from_raw_parts(paddr as *const u8, buffer.len());
+                let dst = core::slice::from_raw_parts_mut(
+                    buffer.as_ptr() as *mut u8,
+                    buffer.len(),
+                );
+                dst.copy_from_slice(src);
             }
             let pages = (buffer.len() + PAGE_SIZE - 1) / PAGE_SIZE;
             set_dma_page_flags(paddr, pages, false);
-            SHARED_FRAMES.lock().remove(&paddr);
         }
     }
 
@@ -275,8 +299,14 @@ mod virtio_pci {
 
     impl BlockDevice for VirtIOBlock {
         fn read_block(&self, block_id: usize, buf: &mut [u8]) {
-            assert_eq!(buf.len() % 512, 0, "read_block buf must be 512B-aligned size");
-            let sectors_per_block = buf.len() / 512;
+            self.read_blocks(block_id, buf);
+        }
+        fn write_block(&self, block_id: usize, buf: &[u8]) {
+            self.write_blocks(block_id, buf);
+        }
+        fn read_blocks(&self, block_id: usize, buf: &mut [u8]) {
+            assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
+            let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
             let idx = READ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
             if idx < 8 {
@@ -284,14 +314,16 @@ mod virtio_pci {
                     "[virtio_pci] read block_id={} sector={} sectors={} bytes={}",
                     block_id,
                     base_sector,
-                    sectors_per_block,
+                    buf.len() / 512,
                     buf.len()
                 );
             }
+            let start = crate::perf::block_read_begin();
             self.0
                 .lock()
                 .read_blocks(base_sector, buf)
                 .expect("Error when reading VirtIOBlk");
+            crate::perf::block_read_end(start, buf.len());
             if idx < 8 {
                 println!(
                     "[virtio_pci] read done block_id={} sector={} bytes={}",
@@ -299,9 +331,9 @@ mod virtio_pci {
                 );
             }
         }
-        fn write_block(&self, block_id: usize, buf: &[u8]) {
-            assert_eq!(buf.len() % 512, 0, "write_block buf must be 512B-aligned size");
-            let sectors_per_block = buf.len() / 512;
+        fn write_blocks(&self, block_id: usize, buf: &[u8]) {
+            assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
+            let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
             let idx = WRITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
             if idx < 8 {
@@ -309,14 +341,16 @@ mod virtio_pci {
                     "[virtio_pci] write block_id={} sector={} sectors={} bytes={}",
                     block_id,
                     base_sector,
-                    sectors_per_block,
+                    buf.len() / 512,
                     buf.len()
                 );
             }
+            let start = crate::perf::block_write_begin();
             self.0
                 .lock()
                 .write_blocks(base_sector, buf)
                 .expect("Error when writing VirtIOBlk");
+            crate::perf::block_write_end(start, buf.len());
             if idx < 8 {
                 println!(
                     "[virtio_pci] write done block_id={} sector={} bytes={}",

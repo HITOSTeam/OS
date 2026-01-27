@@ -64,20 +64,28 @@ impl File for Stdout {
     fn write(&self, user_buf: UserBuffer) -> usize {
         #[cfg(target_arch = "loongarch64")]
         {
+            let flush_threshold = crate::arch::UART_FIFO_DEPTH.saturating_sub(2).max(4);
             let mut pending = 0usize;
+            let mut total = 0usize;
             for buffer in user_buf.buffers.iter() {
                 for &b in buffer.iter() {
                     console_putchar(b as usize);
                     pending += 1;
-                    if pending >= 4 {
+                    total += 1;
+                    if pending >= flush_threshold {
+                        let start = crate::perf::uart_flush_begin();
                         console_flush();
+                        crate::perf::uart_flush_end(start);
                         pending = 0;
                     }
                 }
             }
             if pending != 0 {
+                let start = crate::perf::uart_flush_begin();
                 console_flush();
+                crate::perf::uart_flush_end(start);
             }
+            crate::perf::record_uart_bytes(total);
         }
         #[cfg(not(target_arch = "loongarch64"))]
         {

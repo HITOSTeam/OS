@@ -3,7 +3,7 @@ use core::{mem::size_of, sync::atomic::Ordering};
 
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
-    debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_UNIXBENCH},
+    debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
     mm::{kernel_token, translated_single_address, translated_str, write_user_value},
     println,
@@ -362,6 +362,15 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         trap_cx.trap_handler = trap_handler as usize;
     }
     add_task(task);
+    crate::log_if!(
+        DEBUG_SIGNAL,
+        info,
+        "[fork] parent_pid={} child_pid={} flags={:#x} stack={:#x}",
+        process.getpid(),
+        child.getpid(),
+        flags,
+        stack
+    );
     child.getpid() as isize
 }
 
@@ -373,7 +382,16 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
 pub fn syscall_vfork() -> isize {
     let process = current_process();
     match process.fork() {
-        Some(child) => child.getpid() as isize,
+        Some(child) => {
+            crate::log_if!(
+                DEBUG_SIGNAL,
+                info,
+                "[vfork] parent_pid={} child_pid={}",
+                process.getpid(),
+                child.getpid()
+            );
+            child.getpid() as isize
+        }
         None => -12,
     }
 }
@@ -511,6 +529,15 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     if args_vec.is_empty() {
         args_vec.push(path.clone());
     }
+    crate::log_if!(
+        DEBUG_SIGNAL,
+        info,
+        "[execve] pid={} path='{}' argv0='{}' argv1='{}'",
+        current_process().getpid(),
+        path,
+        args_vec.get(0).map(|s| s.as_str()).unwrap_or(""),
+        args_vec.get(1).map(|s| s.as_str()).unwrap_or("")
+    );
 
     let mut envs_vec: Vec<String> = Vec::new();
     if envp_ptr != 0 {

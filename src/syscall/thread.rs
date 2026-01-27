@@ -16,7 +16,7 @@ use crate::{
     },
     trap::{context::TrapContext, trap_handler},
 };
-use crate::debug_config::{DEBUG_CYCLICTEST, DEBUG_TIMER};
+use crate::debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_TIMER};
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     const ENOMEM: isize = -12;
@@ -149,6 +149,7 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     } else {
         usize::MAX
     };
+    let start_ms = if DEBUG_SIGNAL { Some(get_time_ms()) } else { None };
     if DEBUG_TIMER {
         crate::println!(
             "[sleep] tid={} request_ms={} now_ms={}",
@@ -178,7 +179,39 @@ pub fn sys_sleep(time_ms: usize) -> isize {
         has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
     };
     if interrupted {
+        let (tid, pending, mask) = {
+            let inner = task.borrow_mut();
+            (
+                inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
+                inner.pending_signals,
+                inner.signal_mask,
+            )
+        };
+        crate::log_if!(
+            DEBUG_SIGNAL,
+            info,
+            "[sleep] tid={} interrupted now_ms={} pending={:#x} mask={:#x}",
+            tid,
+            get_time_ms(),
+            pending,
+            mask
+        );
         return EINTR;
+    }
+    if let Some(start_ms) = start_ms {
+        crate::log_if!(
+            DEBUG_SIGNAL,
+            info,
+            "[sleep] tid={} woke now_ms={} elapsed_ms={} req_ms={}",
+            task.borrow_mut()
+                .res
+                .as_ref()
+                .map(|r| r.tid)
+                .unwrap_or(usize::MAX),
+            get_time_ms(),
+            get_time_ms().saturating_sub(start_ms),
+            time_ms
+        );
     }
     if DEBUG_TIMER {
         let tid = task

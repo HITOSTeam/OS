@@ -8,7 +8,7 @@ use crate::arch::{
 };
 use crate::{
     arch,
-    debug_config::{DEBUG_PTHREAD, DEBUG_UNIXBENCH},
+    debug_config::{DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     mm::{read_user_value, try_read_user_value, write_user_value},
     syscall::misc::decode_linux_tid,
     task::{
@@ -767,6 +767,24 @@ pub fn maybe_deliver_signal() {
             pid,
             tid,
             signum
+        );
+    }
+    if DEBUG_SIGNAL {
+        let pid = current_process().getpid();
+        let tid = task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
+        crate::log_if!(
+            DEBUG_SIGNAL,
+            info,
+            "[signal] deliver pid={} tid={} sig={} now_ms={}",
+            pid,
+            tid,
+            signum,
+            get_time_ms()
         );
     }
     if DEBUG_PTHREAD {

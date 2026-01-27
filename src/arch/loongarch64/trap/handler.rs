@@ -176,8 +176,30 @@ pub fn trap_handler() {
     if ecode == 0 {
         if (estat & (1 << ESTAT_TIMER_BIT)) != 0 {
             super::super::clear_timer_interrupt();
+            crate::time::loongarch_record_timer_tick();
             set_next_trigger();
             check_timer();
+            if crate::debug_config::DEBUG_SIGNAL {
+                static LAST_SLEEP_TIMER_LOG: AtomicUsize = AtomicUsize::new(0);
+                let proc = crate::task::processor::current_process();
+                let inner = proc.borrow_mut();
+                let argv0 = inner.argv.first().map(|s| s.as_str()).unwrap_or("");
+                if argv0 == "sleep" {
+                    let now_ms = crate::time::get_time_ms();
+                    let last = LAST_SLEEP_TIMER_LOG.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) >= 200 {
+                        LAST_SLEEP_TIMER_LOG.store(now_ms, Ordering::Relaxed);
+                        crate::log_if!(
+                            crate::debug_config::DEBUG_SIGNAL,
+                            info,
+                            "[timer_irq_sleep] pid={} now_ms={}",
+                            proc.getpid(),
+                            now_ms
+                        );
+                    }
+                }
+            }
+            crate::syscall::signal::maybe_deliver_signal();
             if let Some((errno, msg)) = check_if_current_signals_error() {
                 println!("[kernel] {}", msg);
                 exit_current_and_run_next(errno);

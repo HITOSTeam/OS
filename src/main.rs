@@ -18,6 +18,7 @@ mod lang_items;
 mod log;
 mod mm;
 mod net;
+mod perf;
 #[cfg(target_arch = "riscv64")]
 mod sbi;
 mod syscall;

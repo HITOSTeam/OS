@@ -1,6 +1,6 @@
 use crate::{
-    config::CLOCK_FREQ,
-    debug_config::{DEBUG_CYCLICTEST, DEBUG_UNIXBENCH},
+    config::clock_freq,
+    debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     mm::{read_user_value, write_user_value},
     syscall::thread,
     task::block_sleep::{alarm_remaining_ms, set_alarm_timer},
@@ -23,7 +23,8 @@ const EOPNOTSUPP: isize = -95;
 const EINTR: isize = -4;
 
 fn ticks_to_ns(ticks: u64) -> u64 {
-    ((ticks as u128).saturating_mul(NSEC_PER_SEC as u128) / CLOCK_FREQ as u128) as u64
+    let freq = clock_freq() as u128;
+    ((ticks as u128).saturating_mul(NSEC_PER_SEC as u128) / freq) as u64
 }
 
 fn now_ns() -> u64 {
@@ -90,7 +91,7 @@ pub fn syscall_gettimeofday(tv_ptr: usize, _tz: usize) -> isize {
         return 0;
     }
     let ticks = get_time() as u64;
-    let us = ticks.saturating_mul(1_000_000) / CLOCK_FREQ as u64;
+    let us = ticks.saturating_mul(1_000_000) / clock_freq() as u64;
     let tv = TimeVal {
         sec: us / 1_000_000,
         usec: us % 1_000_000,
@@ -114,8 +115,39 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
     }
     let start_ns = now_ns();
     let ms = ((req_ns + 999_999) / 1_000_000) as usize;
+    if DEBUG_SIGNAL {
+        let pid = crate::task::processor::current_process().getpid();
+        let tid = current_task()
+            .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.tid))
+            .unwrap_or(usize::MAX);
+        let now_ms = (get_time() as u64)
+            .saturating_mul(1_000)
+            .saturating_div(clock_freq() as u64);
+        crate::log_if!(
+            DEBUG_SIGNAL,
+            info,
+            "[nanosleep] pid={} tid={} req_ns={} ms={} now_ms={}",
+            pid,
+            tid,
+            req_ns,
+            ms,
+            now_ms
+        );
+    }
     let ret = thread::sys_sleep(ms);
     if ret == EINTR {
+        if DEBUG_SIGNAL {
+            let now_ms = (get_time() as u64)
+                .saturating_mul(1_000)
+                .saturating_div(clock_freq() as u64);
+            crate::log_if!(
+                DEBUG_SIGNAL,
+                info,
+                "[nanosleep] ret=EINTR now_ms={} elapsed_ns={}",
+                now_ms,
+                now_ns().saturating_sub(start_ns)
+            );
+        }
         if _rem_ptr != 0 {
             let elapsed = now_ns().saturating_sub(start_ns);
             let remaining = req_ns.saturating_sub(elapsed);
@@ -124,6 +156,18 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
             write_user_value(token, _rem_ptr as *mut TimeSpec, &rem);
         }
         return EINTR;
+    }
+    if DEBUG_SIGNAL {
+        let now_ms = (get_time() as u64)
+            .saturating_mul(1_000)
+            .saturating_div(clock_freq() as u64);
+        crate::log_if!(
+            DEBUG_SIGNAL,
+            info,
+            "[nanosleep] ret=0 now_ms={} elapsed_ns={}",
+            now_ms,
+            now_ns().saturating_sub(start_ns)
+        );
     }
     0
 }
@@ -159,6 +203,25 @@ pub fn syscall_clock_nanosleep(clk_id: usize, flags: usize, req_ptr: usize, rem_
         return EINVAL;
     };
     let start_ns = now_ns();
+    if DEBUG_SIGNAL {
+        let pid = crate::task::processor::current_process().getpid();
+        let tid = current_task()
+            .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.tid))
+            .unwrap_or(usize::MAX);
+        let now_ms = (get_time() as u64)
+            .saturating_mul(1_000)
+            .saturating_div(clock_freq() as u64);
+        crate::log_if!(
+            DEBUG_SIGNAL,
+            info,
+            "[clock_nanosleep] pid={} tid={} flags={:#x} req_ns={} now_ms={}",
+            pid,
+            tid,
+            flags,
+            req_ns,
+            now_ms
+        );
+    }
     let target_ns = if (flags & TIMER_ABSTIME) != 0 {
         req_ns
     } else {
@@ -167,6 +230,18 @@ pub fn syscall_clock_nanosleep(clk_id: usize, flags: usize, req_ptr: usize, rem_
     loop {
         let current_ns = now_ns();
         if target_ns <= current_ns {
+            if DEBUG_SIGNAL {
+                let now_ms = (get_time() as u64)
+                    .saturating_mul(1_000)
+                    .saturating_div(clock_freq() as u64);
+                crate::log_if!(
+                    DEBUG_SIGNAL,
+                    info,
+                    "[clock_nanosleep] ret=0 now_ms={} elapsed_ns={}",
+                    now_ms,
+                    now_ns().saturating_sub(start_ns)
+                );
+            }
             return 0;
         }
         let delta_ns = target_ns - current_ns;
@@ -195,6 +270,18 @@ pub fn syscall_clock_nanosleep(clk_id: usize, flags: usize, req_ptr: usize, rem_
         }
         let ret = thread::sys_sleep(ms);
         if ret == EINTR {
+            if DEBUG_SIGNAL {
+                let now_ms = (get_time() as u64)
+                    .saturating_mul(1_000)
+                    .saturating_div(clock_freq() as u64);
+                crate::log_if!(
+                    DEBUG_SIGNAL,
+                    info,
+                    "[clock_nanosleep] ret=EINTR now_ms={} elapsed_ns={}",
+                    now_ms,
+                    now_ns().saturating_sub(start_ns)
+                );
+            }
             if rem_ptr != 0 {
                 let remaining = target_ns.saturating_sub(now_ns());
                 let rem = ns_to_timespec(remaining);

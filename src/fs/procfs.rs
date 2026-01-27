@@ -19,6 +19,7 @@ pub enum ProcFileKind {
     Loadavg,
     Uptime,
     Stat,
+    Perf,
     PidStat(u32),
     PidCmdline(u32),
     PidStatus(u32),
@@ -64,6 +65,7 @@ pub fn init_procfs() {
     let _ = ensure_proc_file(&proc_inode, "loadavg", ProcFileKind::Loadavg, 0o444);
     let _ = ensure_proc_file(&proc_inode, "uptime", ProcFileKind::Uptime, 0o444);
     let _ = ensure_proc_file(&proc_inode, "stat", ProcFileKind::Stat, 0o444);
+    let _ = ensure_proc_file(&proc_inode, "perf", ProcFileKind::Perf, 0o444);
 
     let sys_dir = ensure_dir(&proc_inode, "sys", 0o555);
     if let Some(sys_dir) = sys_dir {
@@ -150,6 +152,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::Loadavg => String::from("0.00 0.00 0.00 1/1 1\n"),
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
+        ProcFileKind::Perf => proc_perf(),
         ProcFileKind::PidStat(pid) => proc_pid_stat(*pid),
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
         ProcFileKind::PidStatus(pid) => proc_pid_status(*pid),
@@ -256,6 +259,10 @@ fn proc_stat() -> String {
     String::from(
         "cpu  0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n",
     )
+}
+
+fn proc_perf() -> String {
+    crate::perf::dump()
 }
 
 fn proc_pid_cmdline(pid: u32) -> String {

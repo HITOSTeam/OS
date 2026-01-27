@@ -34,6 +34,7 @@ const UART_RBR_THR: usize = UART_BASE + 0x0;
 const UART_FCR: usize = UART_BASE + 0x2;
 const UART_LCR: usize = UART_BASE + 0x3;
 const UART_LSR: usize = UART_BASE + 0x5;
+pub const UART_FIFO_DEPTH: usize = 16;
 
 static UART_INITED: AtomicBool = AtomicBool::new(false);
 
@@ -136,6 +137,8 @@ pub fn shutdown() -> ! {
 pub fn enable_timer_interrupt() {
     let mut ecfg: usize;
     unsafe { asm!("csrrd {}, 0x4", out(reg) ecfg) };
+    // Ensure vector spacing (VS) is zero so timer interrupts use the base entry.
+    ecfg &= !(0x7 << 16);
     ecfg |= 1 << 11;
     unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
 }
@@ -147,8 +150,8 @@ pub fn clear_timer_interrupt() {
 }
 
 pub fn set_timer(timer: usize) {
-    let now = read_time();
-    let delta = timer.saturating_sub(now).max(4);
+    // For LoongArch, TCFG holds a relative countdown value in bits [2..].
+    let delta = timer.max(4);
     let tcfg = (delta & !0x3) | 0x1;
     unsafe {
         asm!("csrwr {}, 0x41", in(reg) tcfg);
@@ -163,12 +166,40 @@ pub fn read_time() -> usize {
     counter
 }
 
+fn read_cpucfg(index: u32) -> u32 {
+    let mut value = index;
+    unsafe {
+        asm!("cpucfg {}, {}", out(reg) value, in(reg) value);
+    }
+    value
+}
+
+fn detect_clock_freq() -> Option<usize> {
+    let base = read_cpucfg(4) as u64;
+    let cfg5 = read_cpucfg(5) as u64;
+    let mul = (cfg5 & 0xffff) as u64;
+    let div = (cfg5 >> 16) as u64;
+    if base == 0 || mul == 0 || div == 0 {
+        return None;
+    }
+    base.checked_mul(mul)
+        .map(|freq| freq / div)
+        .filter(|freq| *freq != 0)
+        .map(|freq| freq as usize)
+}
+
 pub fn bootstrap_init() {
     unsafe extern "C" {
         fn __rfill();
     }
     // Configure paging and TLB refill to match the Sv39-style page tables we build.
     unsafe {
+        // Enable base floating-point instructions for user programs (needed by busybox/musl).
+        let mut euen: usize;
+        asm!("csrrd {}, 0x2", out(reg) euen);
+        euen |= 1 << 0;
+        asm!("csrwr {}, 0x2", in(reg) euen);
+
         // Clear pending timer interrupt and disable timer while bootstrapping.
         asm!("csrwr {}, 0x44", in(reg) 1usize); // TIClr
         asm!("csrwr {}, 0x41", in(reg) 0usize); // TCFG
@@ -207,5 +238,9 @@ pub fn bootstrap_init() {
         asm!("csrwr {}, 0x1d", in(reg) 0usize);
 
         asm!("invtlb 0x0, $r0, $r0");
+    }
+
+    if let Some(freq) = detect_clock_freq() {
+        crate::config::set_clock_freq(freq);
     }
 }

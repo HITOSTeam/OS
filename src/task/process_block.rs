@@ -22,7 +22,7 @@ use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
-use crate::debug_config::DEBUG_SYSCALL;
+use crate::debug_config::{DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use spin::{Mutex as SpinMutex, MutexGuard};
 
@@ -1019,7 +1019,11 @@ impl ProcessControlBlock {
             .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.tid))
             .unwrap_or(0);
         #[cfg(target_arch = "loongarch64")]
-        let mut memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let mut memory_set = if DEBUG_LOONGARCH_FULL_COPY_FORK {
+            MemorySet::from_existed_user(&parent.memory_set)
+        } else {
+            MemorySet::from_existed_user_cow(&mut parent.memory_set)
+        };
         #[cfg(not(target_arch = "loongarch64"))]
         let mut memory_set = MemorySet::from_existed_user_cow(&mut parent.memory_set);
         if thread_count > 1 {

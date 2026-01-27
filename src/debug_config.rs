@@ -48,8 +48,17 @@ pub const DEBUG_UNIXBENCH: bool = false;
 /// Targeted logs for cyclictest hangs (clock_nanosleep/affinity/sleep).
 pub const DEBUG_CYCLICTEST: bool = false;
 
+/// Verbose signal delivery/kill debug logs.
+pub const DEBUG_SIGNAL: bool = false;
+
 /// Print a periodic diagnostic dump when the system has no runnable tasks.
 pub const DEBUG_WATCHDOG: bool = false;
 
 /// Run `log::test()` at boot (very noisy).
 pub const DEBUG_LOG_TEST: bool = false;
+
+/// Lightweight performance counters for diagnosing bottlenecks.
+pub const DEBUG_PERF: bool = true;
+
+/// Use full-copy fork on LoongArch instead of COW (slower but safer).
+pub const DEBUG_LOONGARCH_FULL_COPY_FORK: bool = false;

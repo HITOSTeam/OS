@@ -8,7 +8,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::{
-    config::CLOCK_FREQ,
+    config::clock_freq,
     fs::{
         File, OSInode, OpenFlags, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile,
         RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode,
@@ -125,7 +125,7 @@ fn path_is_rofs(abs: &str) -> bool {
 
 fn current_timespec() -> (i64, i64) {
     let ticks = get_time() as u64;
-    let ns = ticks.saturating_mul(1_000_000_000) / CLOCK_FREQ as u64;
+    let ns = ticks.saturating_mul(1_000_000_000) / clock_freq() as u64;
     ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
 }
 

@@ -595,9 +595,11 @@ impl MemorySet {
                         }
 
                         // Share the physical page.
-                        if src_flags.contains(PTEFlags::W) && !src_flags.contains(PTEFlags::SHARED)
-                        {
+                        let writable = src_flags.contains(PTEFlags::W)
+                            || src_flags.contains(PTEFlags::D);
+                        if writable && !src_flags.contains(PTEFlags::SHARED) {
                             src_flags.remove(PTEFlags::W);
+                            src_flags.remove(PTEFlags::D);
                             src_flags.insert(PTEFlags::COW);
                             parent_updates.push((vpn, src_flags));
                         }
@@ -720,6 +722,7 @@ impl MemorySet {
         let mut new_flags = flags;
         new_flags.remove(PTEFlags::COW);
         new_flags.insert(PTEFlags::W);
+        new_flags.insert(PTEFlags::D);
         if !self.page_table.remap(vpn, frame.ppn, new_flags) {
             return false;
         }
