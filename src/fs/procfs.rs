@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::config;
@@ -28,6 +28,7 @@ pub enum ProcFileKind {
 }
 
 static PROC_ROOT_INO: AtomicU32 = AtomicU32::new(0);
+static PROC_ROOT_DEV: AtomicUsize = AtomicUsize::new(0);
 static PROC_FILES: Mutex<BTreeMap<u32, ProcFileKind>> = Mutex::new(BTreeMap::new());
 
 pub fn proc_root_inode_num() -> Option<u32> {
@@ -35,8 +36,10 @@ pub fn proc_root_inode_num() -> Option<u32> {
     if ino == 0 { None } else { Some(ino) }
 }
 
-pub fn is_proc_root(inode_num: u32) -> bool {
-    proc_root_inode_num() == Some(inode_num)
+pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
+    let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
+    let dev = PROC_ROOT_DEV.load(Ordering::Relaxed);
+    ino != 0 && dev != 0 && inode.inode_num() == ino && inode.device_id() == dev
 }
 
 pub fn proc_file_kind(inode_num: u32) -> Option<ProcFileKind> {
@@ -59,6 +62,7 @@ pub fn init_procfs() {
     };
     proc_inode.set_mode(0o555);
     PROC_ROOT_INO.store(proc_inode.inode_num(), Ordering::Relaxed);
+    PROC_ROOT_DEV.store(proc_inode.device_id(), Ordering::Relaxed);
 
     let _ = ensure_proc_file(&proc_inode, "mounts", ProcFileKind::Mounts, 0o444);
     let _ = ensure_proc_file(&proc_inode, "meminfo", ProcFileKind::Meminfo, 0o444);
@@ -90,6 +94,9 @@ pub fn sync_proc_path(abs: &str) {
         Some(v) => v,
         None => return,
     };
+    if pid == 0 {
+        return;
+    }
     sync_proc_pid(pid);
 }
 
@@ -139,7 +146,7 @@ pub fn build_proc_root_entries(
 pub fn collect_pids() -> Vec<usize> {
     let mut pids: Vec<usize> = {
         let map = PID2PCB.lock();
-        map.keys().copied().collect()
+        map.keys().copied().filter(|pid| *pid != 0).collect()
     };
     pids.sort_unstable();
     pids
@@ -173,6 +180,9 @@ fn proc_pid_from_path(path: &str) -> Option<usize> {
 }
 
 fn sync_proc_pid(pid: usize) {
+    if crate::debug_config::DEBUG_PROCFS {
+        crate::println!("[procfs] sync pid={} begin", pid);
+    }
     let _guard = ext4_lock();
     let proc_inode = match find_path_in_roots("/proc") {
         Some(v) => v,
@@ -194,6 +204,9 @@ fn sync_proc_pid(pid: usize) {
     let _ = ensure_proc_file(&pid_dir, "status", ProcFileKind::PidStatus(pid_u32), 0o444);
     let _ = ensure_proc_file(&pid_dir, "maps", ProcFileKind::PidMaps(pid_u32), 0o444);
     let _ = ensure_proc_file(&pid_dir, "mounts", ProcFileKind::PidMounts(pid_u32), 0o444);
+    if crate::debug_config::DEBUG_PROCFS {
+        crate::println!("[procfs] sync pid={} end", pid);
+    }
 }
 
 fn ensure_dir(parent: &Arc<ext4_fs::Inode>, name: &str, mode: u16) -> Option<Arc<ext4_fs::Inode>> {
@@ -269,7 +282,13 @@ fn proc_pid_cmdline(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let argv = { proc.borrow_mut().argv.clone() };
+    let Some(inner) = proc.try_borrow_mut() else {
+        if crate::debug_config::DEBUG_PROCFS {
+            crate::println!("[procfs] cmdline pid={} lock busy", pid);
+        }
+        return String::new();
+    };
+    let argv = inner.argv.clone();
     let mut s = String::new();
     for arg in argv.iter() {
         s.push_str(arg);
@@ -282,33 +301,34 @@ fn proc_pid_status(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let (ppid, argv, num_threads, main_state, vsize_kb) = {
-        let inner = proc.borrow_mut();
-        let ppid = inner
-            .parent
-            .as_ref()
-            .and_then(|w| w.upgrade())
-            .map(|p| p.getpid())
-            .unwrap_or(0);
-        let argv = inner.argv.clone();
-        let num_threads = inner.thread_count();
-        let main_state = inner
-            .tasks
-            .iter()
-            .flatten()
-            .next()
-            .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
-            .unwrap_or(TaskStatus::Ready);
-        let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-        let mmap_bytes: usize = inner
-            .mmap_areas
-            .iter()
-            .map(|(s, e)| e.saturating_sub(*s))
-            .sum();
-        let vsize_kb: usize =
-            (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
-        (ppid, argv, num_threads, main_state, vsize_kb)
+    let Some(inner) = proc.try_borrow_mut() else {
+        if crate::debug_config::DEBUG_PROCFS {
+            crate::println!("[procfs] status pid={} lock busy", pid);
+        }
+        return String::new();
     };
+    let ppid = inner
+        .parent
+        .as_ref()
+        .and_then(|w| w.upgrade())
+        .map(|p| p.getpid())
+        .unwrap_or(0);
+    let argv = inner.argv.clone();
+    let num_threads = inner.thread_count();
+    let main_state = inner
+        .tasks
+        .iter()
+        .flatten()
+        .next()
+        .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
+        .unwrap_or(TaskStatus::Ready);
+    let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
+    let mmap_bytes: usize = inner
+        .mmap_areas
+        .iter()
+        .map(|(s, e)| e.saturating_sub(*s))
+        .sum();
+    let vsize_kb: usize = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
 
     let comm = argv
         .first()
@@ -335,34 +355,35 @@ fn proc_pid_stat(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let (ppid, argv, start_time_ms, num_threads, main_state, vsize) = {
-        let inner = proc.borrow_mut();
-        let ppid = inner
-            .parent
-            .as_ref()
-            .and_then(|w| w.upgrade())
-            .map(|p| p.getpid())
-            .unwrap_or(0);
-        let argv = inner.argv.clone();
-        let start_time_ms = inner.start_time_ms;
-        let num_threads = inner.thread_count();
-        let main_state = inner
-            .tasks
-            .iter()
-            .flatten()
-            .next()
-            .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
-            .unwrap_or(TaskStatus::Ready);
-        let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-        let mmap_bytes: usize = inner
-            .mmap_areas
-            .iter()
-            .map(|(s, e)| e.saturating_sub(*s))
-            .sum();
-        let vsize: u64 =
-            (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
-        (ppid, argv, start_time_ms, num_threads, main_state, vsize)
+    let Some(inner) = proc.try_borrow_mut() else {
+        if crate::debug_config::DEBUG_PROCFS {
+            crate::println!("[procfs] stat pid={} lock busy", pid);
+        }
+        return String::new();
     };
+    let ppid = inner
+        .parent
+        .as_ref()
+        .and_then(|w| w.upgrade())
+        .map(|p| p.getpid())
+        .unwrap_or(0);
+    let argv = inner.argv.clone();
+    let start_time_ms = inner.start_time_ms;
+    let num_threads = inner.thread_count();
+    let main_state = inner
+        .tasks
+        .iter()
+        .flatten()
+        .next()
+        .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
+        .unwrap_or(TaskStatus::Ready);
+    let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
+    let mmap_bytes: usize = inner
+        .mmap_areas
+        .iter()
+        .map(|(s, e)| e.saturating_sub(*s))
+        .sum();
+    let vsize: u64 = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
 
     let comm = argv
         .first()

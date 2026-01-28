@@ -51,6 +51,9 @@ pub const DEBUG_CYCLICTEST: bool = false;
 /// Verbose signal delivery/kill debug logs.
 pub const DEBUG_SIGNAL: bool = false;
 
+/// Verbose procfs debug logs (/proc traversal, stat/status).
+pub const DEBUG_PROCFS: bool = false;
+
 /// Print a periodic diagnostic dump when the system has no runnable tasks.
 pub const DEBUG_WATCHDOG: bool = false;
 
@@ -58,7 +61,7 @@ pub const DEBUG_WATCHDOG: bool = false;
 pub const DEBUG_LOG_TEST: bool = false;
 
 /// Lightweight performance counters for diagnosing bottlenecks.
-pub const DEBUG_PERF: bool = true;
+pub const DEBUG_PERF: bool = false;
 
 /// Use full-copy fork on LoongArch instead of COW (slower but safer).
 pub const DEBUG_LOONGARCH_FULL_COPY_FORK: bool = false;

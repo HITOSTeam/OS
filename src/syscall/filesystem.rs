@@ -314,7 +314,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
             return Err(ENOTDIR);
         }
         let rel = normalize_relative_path(path);
-        if !rel.is_empty() && crate::fs::is_proc_root(base.inode_num()) {
+        if !rel.is_empty() && crate::fs::is_proc_root(base.as_ref()) {
             let abs = alloc::format!("/proc/{}", rel);
             crate::fs::sync_proc_path(&abs);
         }
@@ -332,12 +332,22 @@ fn resolve_ext4_abs_path(
     depth: &mut usize,
     seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    let abs = rewrite_proc_self(path);
+
     // Prefer the secondary disk for OSComp test roots when available.
-    if (path == "/musl" || path.starts_with("/musl/") || path == "/glibc" || path.starts_with("/glibc/")) {
+    if (abs == "/musl" || abs.starts_with("/musl/") || abs == "/glibc" || abs.starts_with("/glibc/")) {
         if let Some(secondary) = secondary_root_inode() {
             let mut sec_depth = 0usize;
             let mut sec_seen = Vec::new();
-            match resolve_ext4_path(secondary, path, uid, gid, follow_final, &mut sec_depth, &mut sec_seen) {
+            match resolve_ext4_path(
+                secondary,
+                &abs,
+                uid,
+                gid,
+                follow_final,
+                &mut sec_depth,
+                &mut sec_seen,
+            ) {
                 Ok(v) => return Ok(v),
                 Err(ENOENT) => {}
                 Err(e) => return Err(e),
@@ -345,8 +355,8 @@ fn resolve_ext4_abs_path(
         }
     }
 
-    let primary = crate::fs::root_inode_for_path(path);
-    match resolve_ext4_path(primary, path, uid, gid, follow_final, depth, seen_symlinks) {
+    let primary = crate::fs::root_inode_for_path(&abs);
+    match resolve_ext4_path(primary, &abs, uid, gid, follow_final, depth, seen_symlinks) {
         Ok(v) => Ok(v),
         Err(ENOENT) => {
             let Some(secondary) = secondary_root_inode() else {
@@ -354,7 +364,15 @@ fn resolve_ext4_abs_path(
             };
             let mut sec_depth = 0usize;
             let mut sec_seen = Vec::new();
-            resolve_ext4_path(secondary, path, uid, gid, follow_final, &mut sec_depth, &mut sec_seen)
+            resolve_ext4_path(
+                secondary,
+                &abs,
+                uid,
+                gid,
+                follow_final,
+                &mut sec_depth,
+                &mut sec_seen,
+            )
         }
         Err(e) => Err(e),
     }
@@ -3515,7 +3533,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         return ENOTDIR;
     };
     let inode = os_inode.ext4_inode();
-    if crate::fs::is_proc_root(inode.inode_num()) {
+    if crate::fs::is_proc_root(inode.as_ref()) {
         let pids = crate::fs::collect_pids();
         let ext4_guard = ext4_lock();
         let static_entries = inode.dir_entries();
@@ -3575,7 +3593,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     //
     // This avoids rebuilding `inode.dir_entries()` on every `getdents64` call, which
     // becomes O(n^2) for large directories (busybox `du`/`find`).
-    const BLOCK_SIZE: usize = 4096;
+    let block_size = inode.block_size();
     const EXT4_DIRENT_HDR: usize = 8; // u32 ino, u16 rec_len, u8 name_len, u8 file_type
 
     let dir_size = inode.size() as usize;
@@ -3601,11 +3619,11 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     let mut kbuf = alloc::vec![0u8; len];
     let mut written = 0usize;
 
-    let mut scratch = alloc::vec![0u8; BLOCK_SIZE];
+    let mut scratch = alloc::vec![0u8; block_size];
     while off < dir_size && written + 24 <= len {
-        let block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
+        let block_start = (off / block_size) * block_size;
         let within = off - block_start;
-        let to_read = core::cmp::min(BLOCK_SIZE, dir_size - block_start);
+        let to_read = core::cmp::min(block_size, dir_size - block_start);
         if to_read < EXT4_DIRENT_HDR || within >= to_read {
             break;
         }

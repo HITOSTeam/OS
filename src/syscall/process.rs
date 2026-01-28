@@ -551,6 +551,15 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
             i += 1;
         }
     }
+    if envs_vec.is_empty() {
+        envs_vec.push(String::from(
+            "PATH=/user:/:/bin:/usr/bin:/musl:/glibc",
+        ));
+    } else if !envs_vec.iter().any(|e| e.starts_with("PATH=")) {
+        envs_vec.push(String::from(
+            "PATH=/user:/:/bin:/usr/bin:/musl:/glibc",
+        ));
+    }
 
     if is_system_shell_path(&path) {
         if let Ok(Some((bb_path, bb_data))) = find_busybox_shell() {
