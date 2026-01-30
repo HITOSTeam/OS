@@ -269,7 +269,9 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     // Absolute path: ignore dirfd.
     if path.starts_with('/') {
         let abs = rewrite_proc_self(&normalize_path("/", path));
-        crate::fs::sync_proc_path(&abs);
+        if crate::fs::is_proc_pseudo_path(&abs) {
+            return Ok(AtPath::PseudoAbs(abs));
+        }
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
@@ -282,7 +284,9 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         let process = current_process();
         let cwd = { process.borrow_mut().cwd.clone() };
         let abs = rewrite_proc_self(&normalize_path(&cwd, path));
-        crate::fs::sync_proc_path(&abs);
+        if crate::fs::is_proc_pseudo_path(&abs) {
+            return Ok(AtPath::PseudoAbs(abs));
+        }
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
@@ -300,7 +304,9 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         let abs = rewrite_proc_self(&normalize_path(pdir.path(), path));
-        crate::fs::sync_proc_path(&abs);
+        if crate::fs::is_proc_pseudo_path(&abs) {
+            return Ok(AtPath::PseudoAbs(abs));
+        }
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
@@ -316,7 +322,9 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         let rel = normalize_relative_path(path);
         if !rel.is_empty() && crate::fs::is_proc_root(base.as_ref()) {
             let abs = alloc::format!("/proc/{}", rel);
-            crate::fs::sync_proc_path(&abs);
+            if crate::fs::is_proc_pseudo_path(&abs) {
+                return Ok(AtPath::PseudoAbs(abs));
+            }
         }
         return Ok(AtPath::Ext4Rel { base, rel });
     }
@@ -1260,6 +1268,9 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 }
 
 fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
+    if let Some(node) = crate::fs::open_proc_pseudo(path) {
+        return Some(node);
+    }
     if path == "/sys" || path == "/sys/" {
         let entries = alloc::vec![
             PseudoDirent {
@@ -3477,6 +3488,10 @@ pub fn syscall_statx(
 }
 
 pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
+    // Avoid unbounded kernel heap allocations from user-provided buffer sizes.
+    // Returning fewer bytes is allowed; callers will retry with the remaining entries.
+    const MAX_DIRENT_BUF: usize = 256 * 1024;
+    let len = len.min(MAX_DIRENT_BUF);
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };

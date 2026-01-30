@@ -44,6 +44,7 @@ pub fn activate_kernel_space() {
 }
 pub use memory_set::remap_test;
 pub use memory_set::{ElfAux, KERNEL_SPACE, MapPermission, MemorySet};
+pub(crate) use memory_set::elf_interp_path_from_reader;
 pub use page_table::{PTEFlags, PageTable};
 pub use page_table::{
     PageTableEntry, copy_from_user, copy_to_user, read_user_value, translated_byte_buffer,

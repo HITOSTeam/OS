@@ -4,13 +4,16 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::config;
-use crate::fs::{ext4_lock, find_path_in_roots, root_inode_for_path, PseudoDirent};
+use crate::fs::{ext4_lock, find_path_in_roots, root_inode_for_path, File, PseudoDir, PseudoDirent};
+use crate::mm::UserBuffer;
 use crate::task::manager::{pid2process, PID2PCB};
 use crate::task::task_block::TaskStatus;
+use crate::task::processor::current_process;
 
 #[derive(Clone, Debug)]
 pub enum ProcFileKind {
@@ -30,6 +33,65 @@ pub enum ProcFileKind {
 static PROC_ROOT_INO: AtomicU32 = AtomicU32::new(0);
 static PROC_ROOT_DEV: AtomicUsize = AtomicUsize::new(0);
 static PROC_FILES: Mutex<BTreeMap<u32, ProcFileKind>> = Mutex::new(BTreeMap::new());
+
+struct ProcPseudoInner {
+    offset: usize,
+}
+
+pub struct ProcPseudoFile {
+    kind: ProcFileKind,
+    inner: Mutex<ProcPseudoInner>,
+}
+
+impl ProcPseudoFile {
+    pub fn new(kind: ProcFileKind) -> Arc<Self> {
+        Arc::new(Self {
+            kind,
+            inner: Mutex::new(ProcPseudoInner { offset: 0 }),
+        })
+    }
+}
+
+impl File for ProcPseudoFile {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        false
+    }
+
+    fn read(&self, mut buf: UserBuffer) -> usize {
+        let mut inner = self.inner.lock();
+        let data = proc_file_content(&self.kind);
+        let bytes = data.as_bytes();
+        if inner.offset >= bytes.len() {
+            return 0;
+        }
+        let mut total = 0usize;
+        for slice in buf.buffers.iter_mut() {
+            if inner.offset >= bytes.len() {
+                break;
+            }
+            let n = core::cmp::min(slice.len(), bytes.len() - inner.offset);
+            slice[..n].copy_from_slice(&bytes[inner.offset..inner.offset + n]);
+            inner.offset += n;
+            total += n;
+            if n < slice.len() {
+                break;
+            }
+        }
+        total
+    }
+
+    fn write(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
@@ -98,6 +160,136 @@ pub fn sync_proc_path(abs: &str) {
         return;
     }
     sync_proc_pid(pid);
+}
+
+pub fn is_proc_pseudo_path(abs: &str) -> bool {
+    if abs == "/proc" || abs.starts_with("/proc/") {
+        return !(abs == "/proc/sys" || abs.starts_with("/proc/sys/"));
+    }
+    false
+}
+
+fn proc_root_entries() -> Vec<PseudoDirent> {
+    let mut entries = Vec::new();
+    entries.push(PseudoDirent {
+        name: String::from("."),
+        ino: 1,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from(".."),
+        ino: 1,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("self"),
+        ino: 1,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("sys"),
+        ino: 1,
+        dtype: 4,
+    });
+    for name in ["mounts", "meminfo", "loadavg", "uptime", "stat", "perf"] {
+        entries.push(PseudoDirent {
+            name: String::from(name),
+            ino: 1,
+            dtype: 8,
+        });
+    }
+    for pid in collect_pids() {
+        entries.push(PseudoDirent {
+            name: alloc::format!("{}", pid),
+            ino: pid as u64,
+            dtype: 4,
+        });
+    }
+    entries
+}
+
+fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
+    let mut entries = Vec::new();
+    entries.push(PseudoDirent {
+        name: String::from("."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from(".."),
+        ino: 1,
+        dtype: 4,
+    });
+    for name in ["stat", "cmdline", "status", "maps", "mounts"] {
+        entries.push(PseudoDirent {
+            name: String::from(name),
+            ino: pid as u64,
+            dtype: 8,
+        });
+    }
+    entries
+}
+
+fn proc_pid_from_path_with_rest(path: &str) -> Option<(u32, &str)> {
+    let rest = path.strip_prefix("/proc/")?;
+    let rest = rest.trim_start_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    let mut parts = rest.splitn(2, '/');
+    let first = parts.next().unwrap_or("");
+    if first.is_empty() {
+        return None;
+    }
+    if !first.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let pid = first.parse::<u32>().ok()?;
+    let tail = parts.next().unwrap_or("");
+    Some((pid, tail))
+}
+
+pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    let trimmed = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+    if trimmed == "/proc" {
+        return Some(Arc::new(PseudoDir::new("/proc", proc_root_entries())));
+    }
+    if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
+        let pid = current_process().getpid();
+        let suffix = &trimmed["/proc/self".len()..];
+        let mapped = alloc::format!("/proc/{pid}{suffix}");
+        return open_proc_pseudo(&mapped);
+    }
+
+    match trimmed {
+        "/proc/mounts" => return Some(ProcPseudoFile::new(ProcFileKind::Mounts)),
+        "/proc/meminfo" => return Some(ProcPseudoFile::new(ProcFileKind::Meminfo)),
+        "/proc/loadavg" => return Some(ProcPseudoFile::new(ProcFileKind::Loadavg)),
+        "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
+        "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
+        "/proc/perf" => return Some(ProcPseudoFile::new(ProcFileKind::Perf)),
+        _ => {}
+    }
+
+    let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
+    if rest.is_empty() {
+        return Some(Arc::new(PseudoDir::new(
+            &alloc::format!("/proc/{pid}"),
+            proc_pid_entries(pid),
+        )));
+    }
+    match rest {
+        "stat" => Some(ProcPseudoFile::new(ProcFileKind::PidStat(pid))),
+        "cmdline" => Some(ProcPseudoFile::new(ProcFileKind::PidCmdline(pid))),
+        "status" => Some(ProcPseudoFile::new(ProcFileKind::PidStatus(pid))),
+        "maps" => Some(ProcPseudoFile::new(ProcFileKind::PidMaps(pid))),
+        "mounts" => Some(ProcPseudoFile::new(ProcFileKind::PidMounts(pid))),
+        _ => None,
+    }
 }
 
 pub fn build_proc_root_entries(

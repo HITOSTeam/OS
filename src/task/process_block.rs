@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use super::mutex::Mutex;
 use crate::fs::{File, Stdin, Stdout};
 use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value};
+use crate::mm::{ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value};
 use crate::println;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidHandle, pid_alloc};
@@ -864,6 +864,44 @@ impl ProcessControlBlock {
 
     /// Only support processes with a single thread.
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
+        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
+        self.exec_with_memory_set(memory_set, ustack_base, entry_point, args, envs, elf_aux);
+    }
+
+    /// Exec a dynamically-linked ELF (with PT_INTERP) in a Linux-like way:
+    /// map both the main program and the interpreter, then start at the interpreter entry
+    /// while exposing the main program metadata via auxv (AT_PHDR/AT_ENTRY) and AT_BASE.
+    pub fn exec_dyn(
+        self: &Arc<Self>,
+        elf_data: &[u8],
+        interp_data: &[u8],
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) {
+        let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
+            MemorySet::from_elf_with_interp(elf_data, interp_data);
+        self.exec_dyn_with_memory_set(
+            memory_set,
+            ustack_base,
+            interp_entry,
+            main_entry,
+            main_aux,
+            interp_base,
+            interp_data,
+            args,
+            envs,
+        );
+    }
+
+    pub fn exec_with_memory_set(
+        self: &Arc<Self>,
+        memory_set: MemorySet,
+        ustack_base: usize,
+        entry_point: usize,
+        args: Vec<String>,
+        envs: Vec<String>,
+        elf_aux: ElfAux,
+    ) {
         let thread_count = { self.borrow_mut().thread_count() };
         if thread_count != 1 {
             log::warn!(
@@ -873,11 +911,8 @@ impl ProcessControlBlock {
             );
             self.terminate_other_threads();
         }
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE;
-        // substitute memory_set
         {
             let mut inner = self.borrow_mut();
             inner.close_cloexec_fds();
@@ -891,18 +926,11 @@ impl ProcessControlBlock {
             inner.mmap_areas.clear();
             inner.argv = args.clone();
         }
-        // then we need to update the task's user resource
-        // Note: from_elf already created both the user stack and trap_cx area,
-        // so we don't call alloc_user_res() which would cause double-mapping
         let task = self.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
         let res = task_inner.res.as_mut().unwrap();
         res.ustack_base = ustack_base;
-        // Update trap_cx_ppn from the new memory_set
         task_inner.trap_cx_ppn = res.trap_cx_ppn();
-        // Build a Linux-like initial stack layout so both:
-        // - C runtime can read argc/argv from `sp` (as in oscomp ulib), and
-        // - Rust runtime can read argc/argv from a0/a1.
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
             new_token,
             task_inner.res.as_mut().unwrap().ustack_top(),
@@ -912,7 +940,6 @@ impl ProcessControlBlock {
             entry_point,
             0,
         );
-        // initialize trap_cx
         let mut trap_cx = TrapContext::app_init_context(
             entry_point,
             user_sp,
@@ -927,12 +954,14 @@ impl ProcessControlBlock {
         *task_inner.get_trap_cx() = trap_cx;
     }
 
-    /// Exec a dynamically-linked ELF (with PT_INTERP) in a Linux-like way:
-    /// map both the main program and the interpreter, then start at the interpreter entry
-    /// while exposing the main program metadata via auxv (AT_PHDR/AT_ENTRY) and AT_BASE.
-    pub fn exec_dyn(
+    pub fn exec_dyn_with_memory_set(
         self: &Arc<Self>,
-        elf_data: &[u8],
+        memory_set: MemorySet,
+        ustack_base: usize,
+        interp_entry: usize,
+        main_entry: usize,
+        main_aux: ElfAux,
+        interp_base: usize,
         interp_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
@@ -946,8 +975,6 @@ impl ProcessControlBlock {
             );
             self.terminate_other_threads();
         }
-        let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
-            MemorySet::from_elf_with_interp(elf_data, interp_data);
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE;
         {

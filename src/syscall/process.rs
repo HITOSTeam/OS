@@ -5,7 +5,7 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
-    mm::{kernel_token, translated_single_address, translated_str, write_user_value},
+    mm::{kernel_token, translated_single_address, translated_str, write_user_value, MemorySet},
     println,
     syscall::{
         filesystem::{normalize_path, resolve_exec_inode, resolve_read_inode},
@@ -76,6 +76,30 @@ fn load_file_readonly(path: &str) -> Result<Vec<u8>, isize> {
         }
         Err(e) => Err(e),
     }
+}
+
+fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, isize> {
+    match resolve_exec_inode(path) {
+        Ok(inode) => return Ok(inode),
+        Err(e) if e != ENOENT => return Err(e),
+        Err(_) => {}
+    }
+    if path == "busybox" || path == "./busybox" {
+        let fallbacks = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+        for cand in fallbacks {
+            match resolve_exec_inode(cand) {
+                Ok(inode) => return Ok(inode),
+                Err(ENOENT) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    if !path.ends_with(".bin") {
+        let mut with_bin = String::from(path);
+        with_bin.push_str(".bin");
+        return resolve_exec_inode(&with_bin);
+    }
+    Err(ENOENT)
 }
 
 fn find_shell_interpreter() -> Result<Option<(String, Vec<u8>, bool)>, isize> {
@@ -251,14 +275,22 @@ fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
 
 pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
+    const CLONE_SIGHAND: usize = 0x0000_0800;
     const CLONE_THREAD: usize = 0x0001_0000;
     const CLONE_SETTLS: usize = 0x0008_0000;
     const CLONE_PARENT_SETTID: usize = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
 
+    // LoongArch syscall ABI uses a different argument order:
+    // clone(flags, stack, ptid, ctid, tls). Swap tls/ctid here.
+    #[cfg(target_arch = "loongarch64")]
+    let (_tls, _ctid) = (_ctid, _tls);
+
     // Thread-like clone: share address space (glibc pthreads).
-    if (flags & CLONE_VM) != 0 && (flags & CLONE_THREAD) != 0 {
+    let is_thread_like =
+        (flags & CLONE_VM) != 0 && ((flags & CLONE_THREAD) != 0 || (flags & CLONE_SIGHAND) != 0);
+    if is_thread_like {
         const ENOMEM: isize = -12;
         let task = current_task().unwrap();
         let parent_mask = {
@@ -573,8 +605,8 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         }
     }
 
-    let file_data = match load_file_from_path(&path) {
-        Ok(data) => data,
+    let inode = match resolve_exec_inode_with_fallback(&path) {
+        Ok(inode) => inode,
         Err(e) => {
             if DEBUG_EXEC {
                 let cwd = { current_process().borrow_mut().cwd.clone() };
@@ -600,30 +632,85 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         }
     };
 
-    // ELF binary: normal exec.
-    if is_elf(&file_data) {
-        // Dynamic ELF: map both main program and interpreter, and start at the
-        // interpreter entry with a Linux-like auxv (AT_PHDR/AT_ENTRY/AT_BASE).
-        if let Some(interp) = elf_interp_path(&file_data) {
-            let interp_data = match load_interp_data(&interp) {
-                Ok(data) => data,
+    // Try lazy ELF loading to avoid reading large binaries into kernel heap.
+    let interp = {
+        let inode = Arc::clone(&inode);
+        let mut read_at = |offset: usize, buf: &mut [u8]| {
+            let _ext4_guard = ext4_lock();
+            inode.read_at(offset, buf)
+        };
+        match crate::mm::elf_interp_path_from_reader(&mut read_at) {
+            Ok(v) => Some(v),
+            Err(ENOEXEC) => None,
+            Err(e) => return e,
+        }
+    };
+    if let Some(Some(interp)) = interp {
+        let interp_data = match load_interp_data(&interp) {
+            Ok(data) => data,
+            Err(e) => return e,
+        };
+        if !is_elf(&interp_data) {
+            return ENOEXEC;
+        }
+        let inode = Arc::clone(&inode);
+        let loader = |offset: usize, buf: &mut [u8]| {
+            let _ext4_guard = ext4_lock();
+            inode.read_at(offset, buf)
+        };
+        let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
+            match MemorySet::from_elf_with_interp_reader(loader, &interp_data) {
+                Ok(v) => v,
                 Err(e) => return e,
             };
-            if !is_elf(&interp_data) {
-                return ENOEXEC;
-            }
-            let process = current_process();
-            process.exec_dyn(&file_data, &interp_data, args_vec, envs_vec);
-            return 0;
-        }
         let process = current_process();
-        process.exec(&file_data, args_vec, envs_vec);
+        process.exec_dyn_with_memory_set(
+            memory_set,
+            ustack_base,
+            interp_entry,
+            main_entry,
+            main_aux,
+            interp_base,
+            &interp_data,
+            args_vec,
+            envs_vec,
+        );
+        return 0;
+    }
+    if let Some(None) = interp {
+        let inode = Arc::clone(&inode);
+        let loader = |offset: usize, buf: &mut [u8]| {
+            let _ext4_guard = ext4_lock();
+            inode.read_at(offset, buf)
+        };
+        let (memory_set, ustack_base, entry_point, elf_aux) =
+            match MemorySet::from_elf_reader(loader) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+        let process = current_process();
+        process.exec_with_memory_set(
+            memory_set,
+            ustack_base,
+            entry_point,
+            args_vec,
+            envs_vec,
+            elf_aux,
+        );
         return 0;
     }
 
+    // Not an ELF: check for shebang using a small prefix to avoid big allocations.
+    let mut head = [0u8; 256];
+    let head_len = {
+        let _ext4_guard = ext4_lock();
+        inode.read_at(0, &mut head)
+    };
+    let head = &head[..head_len];
+
     // Script with shebang: emulate Linux `#!` handling in-kernel so that
     // busybox/ash can run `./script.sh` directly.
-    if let Some((interp, opt_arg)) = parse_shebang(&file_data) {
+    if let Some((interp, opt_arg)) = parse_shebang(head) {
         let interp_name = interp.rsplit('/').next().unwrap_or(interp.as_str());
         let env_shell =
             interp_name == "env" && matches!(opt_arg.as_deref(), Some("sh") | Some("bash"));

@@ -437,19 +437,31 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
     // Extract tid in a separate scope to release the borrow early.
     // Also drop TaskUserRes *after* releasing the TCB lock to avoid deadlocks with sys_waittid.
-    let (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head) = {
+    let (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head, is_linux_thread) = {
         let mut task_inner = task.borrow_mut();
         task_inner.exit_code = Some(exit_code);
         let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+        let is_linux_thread = task_inner
+            .res
+            .as_ref()
+            .map(|r| r.is_linux_thread())
+            .unwrap_or(false);
         let res_to_drop = task_inner.res.take();
         let clear_child_tid = task_inner.clear_child_tid.take();
         let robust_list_head = task_inner.robust_list_head;
         let join_waiters = task_inner.join_waiters.drain(..).collect::<Vec<_>>();
-        (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head)
+        (
+            tid,
+            res_to_drop,
+            join_waiters,
+            clear_child_tid,
+            robust_list_head,
+            is_linux_thread,
+        )
     }; // task_inner dropped here
 
     let clear_child_tid_addr = clear_child_tid;
-    let is_linux_thread = clear_child_tid_addr.is_some();
+    let is_linux_thread = is_linux_thread || clear_child_tid_addr.is_some();
 
     let token = {
         let inner = process.borrow_mut();

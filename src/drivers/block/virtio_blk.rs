@@ -1,6 +1,8 @@
 #[cfg(target_arch = "riscv64")]
 mod virtio_mmio {
-    use alloc::{collections::BTreeMap, vec::Vec};
+    use alloc::vec;
+    use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+
     use core::ptr::NonNull;
     use ext4_fs::BlockDevice;
     use lazy_static::lazy_static;
@@ -15,7 +17,6 @@ mod virtio_mmio {
     };
 
     use crate::{
-        config::PAGE_SIZE,
         mm::{FrameTracker, PhysAddr, frame_alloc_contiguous},
         println,
     };
@@ -26,8 +27,7 @@ mod virtio_mmio {
     pub struct VirtIOBlock(Mutex<VirtIOBlk<VirtioHal, MmioTransport>>);
 
     lazy_static! {
-        static ref DMA_FRAMES: Mutex<BTreeMap<usize, Vec<FrameTracker>>> = Mutex::new(BTreeMap::new());
-        static ref SHARED_FRAMES: Mutex<BTreeMap<usize, Vec<FrameTracker>>> =
+        static ref DMA_FRAMES: Mutex<BTreeMap<usize, Vec<FrameTracker>>> =
             Mutex::new(BTreeMap::new());
     }
 
@@ -111,36 +111,42 @@ mod virtio_mmio {
 
         unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> usize {
             assert_ne!(buffer.len(), 0);
-            let pages = (buffer.len() + PAGE_SIZE - 1) / PAGE_SIZE;
-            let frames = frame_alloc_contiguous(pages).expect("VirtIO share: OOM");
-            let paddr: PhysAddr = frames[0].ppn.into();
-            let paddr = paddr.0;
+            let mut shared = vec![0u8; buffer.len()].into_boxed_slice();
             if let BufferDirection::DriverToDevice | BufferDirection::Both = direction {
                 let src = core::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len());
-                let dst =
-                    core::slice::from_raw_parts_mut(paddr as *mut u8, buffer.len());
-                dst.copy_from_slice(src);
+                core::ptr::copy_nonoverlapping(src.as_ptr(), shared.as_mut_ptr(), buffer.len());
             }
-            SHARED_FRAMES.lock().insert(paddr, frames);
-            paddr
+            Box::into_raw(shared) as *mut u8 as usize
         }
 
         unsafe fn unshare(paddr: usize, buffer: NonNull<[u8]>, direction: BufferDirection) {
             assert_ne!(buffer.len(), 0);
             if let BufferDirection::DeviceToDriver | BufferDirection::Both = direction {
                 let src = core::slice::from_raw_parts(paddr as *const u8, buffer.len());
-                let dst =
-                    core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
+                let dst = core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
                 dst.copy_from_slice(src);
             }
-            SHARED_FRAMES.lock().remove(&paddr);
+            let _shared = Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                paddr as *mut u8,
+                buffer.len(),
+            ));
         }
     }
 }
 
 #[cfg(target_arch = "loongarch64")]
 mod virtio_pci {
+    use crate::{
+        config::{DEVICE_TREE_ADDR, PAGE_SIZE, phys_mem_end, phys_mem_start},
+        mm::{
+            FrameTracker, KERNEL_SPACE, MapPermission, PTEFlags, PhysAddr, VirtAddr,
+            frame_alloc_contiguous,
+        },
+        println,
+    };
+    use alloc::vec;
     use alloc::{
+        boxed::Box,
         collections::{BTreeMap, BTreeSet},
         vec::Vec,
     };
@@ -164,14 +170,6 @@ mod virtio_pci {
             },
         },
     };
-    use crate::{
-        config::{DEVICE_TREE_ADDR, PAGE_SIZE, phys_mem_end, phys_mem_start},
-        mm::{
-            FrameTracker, KERNEL_SPACE, MapPermission, PhysAddr, PTEFlags, VirtAddr,
-            frame_alloc_contiguous,
-        },
-        println,
-    };
 
     static PCI_ECAM_MAPPED: AtomicBool = AtomicBool::new(false);
     static READ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -182,8 +180,6 @@ mod virtio_pci {
 
     lazy_static! {
         static ref DMA_FRAMES: Mutex<BTreeMap<usize, Vec<FrameTracker>>> =
-            Mutex::new(BTreeMap::new());
-        static ref SHARED_FRAMES: Mutex<BTreeMap<usize, Vec<FrameTracker>>> =
             Mutex::new(BTreeMap::new());
         static ref PCI_ALLOCATOR: Mutex<Option<PciMemory32Allocator>> = Mutex::new(None);
         static ref ALLOCATED_BARS: Mutex<BTreeSet<(u8, u8, u8)>> = Mutex::new(BTreeSet::new());
@@ -250,46 +246,33 @@ mod virtio_pci {
             if direct_dma_ok(vaddr, buffer.len()) {
                 return vaddr;
             }
-            let pages = (buffer.len() + PAGE_SIZE - 1) / PAGE_SIZE;
-            let frames = frame_alloc_contiguous(pages).expect("VirtIO share: OOM");
-            let paddr: PhysAddr = frames[0].ppn.into();
-            let paddr = paddr.0;
-            set_dma_page_flags(paddr, pages, true);
+            let mut shared = vec![0u8; buffer.len()].into_boxed_slice();
             if let BufferDirection::DriverToDevice | BufferDirection::Both = direction {
                 unsafe {
-                    let src = core::slice::from_raw_parts(
-                        buffer.as_ptr() as *const u8,
-                        buffer.len(),
-                    );
-                    let dst = core::slice::from_raw_parts_mut(
-                        paddr as *mut u8,
-                        buffer.len(),
-                    );
-                    dst.copy_from_slice(src);
+                    let src =
+                        core::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len());
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), shared.as_mut_ptr(), buffer.len());
                 }
             }
-            SHARED_FRAMES.lock().insert(paddr, frames);
-            paddr
+            Box::into_raw(shared) as *mut u8 as usize
         }
 
         unsafe fn unshare(paddr: usize, buffer: NonNull<[u8]>, direction: BufferDirection) {
             assert_ne!(buffer.len(), 0);
             assert_ne!(paddr, 0);
-            let frames = SHARED_FRAMES.lock().remove(&paddr);
-            if frames.is_none() {
+            let vaddr = buffer.as_ptr() as *const u8 as usize;
+            if direct_dma_ok(vaddr, buffer.len()) {
                 return;
             }
             if let BufferDirection::DeviceToDriver | BufferDirection::Both = direction {
-                let src =
-                    core::slice::from_raw_parts(paddr as *const u8, buffer.len());
-                let dst = core::slice::from_raw_parts_mut(
-                    buffer.as_ptr() as *mut u8,
-                    buffer.len(),
-                );
+                let src = core::slice::from_raw_parts(paddr as *const u8, buffer.len());
+                let dst = core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
                 dst.copy_from_slice(src);
             }
-            let pages = (buffer.len() + PAGE_SIZE - 1) / PAGE_SIZE;
-            set_dma_page_flags(paddr, pages, false);
+            let _shared = Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                paddr as *mut u8,
+                buffer.len(),
+            ));
         }
     }
 
@@ -327,7 +310,9 @@ mod virtio_pci {
             if idx < 8 {
                 println!(
                     "[virtio_pci] read done block_id={} sector={} bytes={}",
-                    block_id, base_sector, buf.len()
+                    block_id,
+                    base_sector,
+                    buf.len()
                 );
             }
         }
@@ -354,7 +339,9 @@ mod virtio_pci {
             if idx < 8 {
                 println!(
                     "[virtio_pci] write done block_id={} sector={} bytes={}",
-                    block_id, base_sector, buf.len()
+                    block_id,
+                    base_sector,
+                    buf.len()
                 );
             }
         }
@@ -493,17 +480,12 @@ mod virtio_pci {
         let mem_end = phys_mem_end();
         println!(
             "[virtio_pci] {} [{:#x}, {:#x}) size={:#x}",
-            label,
-            start,
-            end,
-            size
+            label, start, end, size
         );
         if start < mem_end && end > mem_start {
             println!(
                 "[virtio_pci][warn] {} overlaps RAM [{:#x}, {:#x})",
-                label,
-                mem_start,
-                mem_end
+                label, mem_start, mem_end
             );
         }
     }
@@ -584,8 +566,11 @@ mod virtio_pci {
                     if virtio_type != DeviceType::Block {
                         continue;
                     }
-                    let device_key =
-                        (device_function.bus, device_function.device, device_function.function);
+                    let device_key = (
+                        device_function.bus,
+                        device_function.device,
+                        device_function.function,
+                    );
                     let need_alloc = {
                         let mut allocated = ALLOCATED_BARS.lock();
                         if allocated.contains(&device_key) {
@@ -597,9 +582,7 @@ mod virtio_pci {
                     };
                     if need_alloc {
                         let mut allocator = PCI_ALLOCATOR.lock();
-                        let allocator = allocator
-                            .as_mut()
-                            .expect("PCI allocator not initialized");
+                        let allocator = allocator.as_mut().expect("PCI allocator not initialized");
                         allocate_bars(&mut pci_root, device_function, allocator);
                     }
                     map_device_bars(&mut pci_root, device_function);

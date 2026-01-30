@@ -19,6 +19,28 @@ pub(crate) mod robust_list;
 pub(crate) mod futex;
 pub(crate) mod sysv_shm;
 mod dummy;
+static CYCLIC_SYSCALL_LOGS: AtomicUsize = AtomicUsize::new(1024);
+static LAST_SYSCALL_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LAST_SYSCALL_A0: AtomicUsize = AtomicUsize::new(0);
+static LAST_SYSCALL_A1: AtomicUsize = AtomicUsize::new(0);
+static LAST_SYSCALL_A2: AtomicUsize = AtomicUsize::new(0);
+static LAST_SYSCALL_A3: AtomicUsize = AtomicUsize::new(0);
+static LAST_SYSCALL_A4: AtomicUsize = AtomicUsize::new(0);
+static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
+
+pub fn last_syscall_snapshot() -> (usize, [usize; 6]) {
+    (
+        LAST_SYSCALL_ID.load(Ordering::Relaxed),
+        [
+            LAST_SYSCALL_A0.load(Ordering::Relaxed),
+            LAST_SYSCALL_A1.load(Ordering::Relaxed),
+            LAST_SYSCALL_A2.load(Ordering::Relaxed),
+            LAST_SYSCALL_A3.load(Ordering::Relaxed),
+            LAST_SYSCALL_A4.load(Ordering::Relaxed),
+            LAST_SYSCALL_A5.load(Ordering::Relaxed),
+        ],
+    )
+}
 const SYSCALL_EVENTFD2: usize = 19;
 const SYSCALL_EPOLL_CREATE1: usize = 20;
 const SYSCALL_EPOLL_CTL: usize = 21;
@@ -91,6 +113,8 @@ const SYSCALL_YIELD: usize = 124;
 const SYSCALL_SCHED_GET_PRIORITY_MAX: usize = 125;
 const SYSCALL_SCHED_GET_PRIORITY_MIN: usize = 126;
 const SYSCALL_SCHED_RR_GET_INTERVAL: usize = 127;
+const SYSCALL_SCHED_SETATTR: usize = 274;
+const SYSCALL_SCHED_GETATTR: usize = 275;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETSID: usize = 156;
@@ -109,6 +133,7 @@ const SYSCALL_SETFSUID: usize = 151;
 const SYSCALL_SETFSGID: usize = 152;
 const SYSCALL_REBOOT: usize = 142;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
+const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
 const SYSCALL_GETUID: usize = 174;
@@ -184,6 +209,65 @@ const SYSCALL_CONDVAR_WAIT: usize = 1032;
 const SYSCALL_GET_HARTID: usize = 998;
 
 pub fn syscall(id: usize, args: [usize; 6]) -> isize {
+    LAST_SYSCALL_ID.store(id, Ordering::Relaxed);
+    LAST_SYSCALL_A0.store(args[0], Ordering::Relaxed);
+    LAST_SYSCALL_A1.store(args[1], Ordering::Relaxed);
+    LAST_SYSCALL_A2.store(args[2], Ordering::Relaxed);
+    LAST_SYSCALL_A3.store(args[3], Ordering::Relaxed);
+    LAST_SYSCALL_A4.store(args[4], Ordering::Relaxed);
+    LAST_SYSCALL_A5.store(args[5], Ordering::Relaxed);
+    if crate::debug_config::DEBUG_CYCLICTEST {
+        let proc = crate::task::processor::current_process();
+        let is_cyclic = {
+            let inner = proc.borrow_mut();
+            inner
+                .argv
+                .first()
+                .map(|s| s.contains("cyclictest"))
+                .unwrap_or(false)
+        };
+        if is_cyclic {
+            let left = CYCLIC_SYSCALL_LOGS
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                    if val == 0 {
+                        None
+                    } else {
+                        Some(val - 1)
+                    }
+                })
+                .unwrap_or(0);
+            if left > 0 {
+                crate::println!(
+                    "[cyclic_syscall] id={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                    id,
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3],
+                    args[4],
+                    args[5]
+                );
+            }
+        }
+    }
+    if crate::debug_config::DEBUG_CYCLICTEST {
+        match id {
+            118 | 119 | 120 | 121 | 122 | 123 | 124 | 125 | 126 | 127 | 142 | 143 | 144 | 145
+            | 146 | 147 | 148 | 274 | 275 => {
+                let pid = crate::task::processor::current_process().getpid();
+                crate::println!(
+                    "[sched_syscall] pid={} id={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                    pid,
+                    id,
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3]
+                );
+            }
+            _ => {}
+        }
+    }
     if crate::debug_config::DEBUG_SIGNAL {
         let is_sleep = {
             let proc = crate::task::processor::current_process();
@@ -333,6 +417,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SCHED_GET_PRIORITY_MAX => sched::syscall_sched_get_priority_max(args[0]),
         SYSCALL_SCHED_GET_PRIORITY_MIN => sched::syscall_sched_get_priority_min(args[0]),
         SYSCALL_SCHED_RR_GET_INTERVAL => sched::syscall_sched_rr_get_interval(args[0], args[1]),
+        SYSCALL_SCHED_SETATTR => sched::syscall_sched_setattr(args[0], args[1], args[2], args[3]),
+        SYSCALL_SCHED_GETATTR => sched::syscall_sched_getattr(args[0], args[1], args[2], args[3]),
         SYSCALL_TIMES => time_sys::syscall_times(args[0]),
         SYSCALL_SETPGID => misc::syscall_setpgid(args[0], args[1]),
         SYSCALL_GETSID => misc::syscall_getsid(args[0]),
@@ -381,6 +467,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MUNMAP => memory::syscall_munmap(args[0], args[1]),
         SYSCALL_MMAP => memory::syscall_mmap(args[0], args[1], args[2], args[3], args[4] as isize, args[5]),
         SYSCALL_MPROTECT => memory::syscall_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MADVISE => memory::syscall_madvise(args[0], args[1], args[2]),
         SYSCALL_MLOCK => memory::syscall_mlock(args[0], args[1]),
         SYSCALL_MUNLOCK => memory::syscall_munlock(args[0], args[1]),
         SYSCALL_MLOCKALL => memory::syscall_mlockall(args[0]),

@@ -422,6 +422,36 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     0
 }
 
+/// Linux `madvise(2)` (syscall 233 on riscv64).
+///
+/// We only implement MADV_DONTNEED/MADV_FREE for anonymous lazy mappings.
+pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
+    if addr % PAGE_SIZE != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = addr.checked_add(len) else {
+        return EINVAL;
+    };
+    let end = align_up(end, PAGE_SIZE);
+
+    const MADV_DONTNEED: usize = 4;
+    const MADV_FREE: usize = 8;
+    match advice {
+        MADV_DONTNEED | MADV_FREE => {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            inner
+                .memory_set
+                .discard_lazy_user_range(addr.into(), end.into());
+            0
+        }
+        _ => EINVAL,
+    }
+}
+
 /// Linux `mlock` (syscall 228).
 ///
 /// We do not implement page pinning; accept the call so rt-tests can proceed.

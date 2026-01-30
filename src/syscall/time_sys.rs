@@ -392,6 +392,7 @@ pub fn syscall_pselect6(
     _sigmask: usize,
 ) -> isize {
     const EBADF: isize = -9;
+    const MAX_FDSET_BYTES: usize = 256 * 1024;
 
     let nfds = _nfds;
     let readfds = _readfds;
@@ -413,7 +414,9 @@ pub fn syscall_pselect6(
     let process = crate::task::processor::current_process();
 
     // Use a byte-sized bitmap (nfds bits).
-    let bytes_len = (nfds + 7) / 8;
+    let bytes_len_full = (nfds + 7) / 8;
+    let bytes_len = bytes_len_full.min(MAX_FDSET_BYTES);
+    let max_fds = bytes_len * 8;
     let mut in_r = alloc::vec![0u8; bytes_len];
     let mut in_w = alloc::vec![0u8; bytes_len];
     let mut out_r = alloc::vec![0u8; bytes_len];
@@ -443,7 +446,8 @@ pub fn syscall_pselect6(
         out_r.fill(0);
         out_w.fill(0);
 
-        for fd in 0..nfds {
+        let limit = core::cmp::min(nfds, max_fds);
+        for fd in 0..limit {
             let byte = fd / 8;
             let bit = fd % 8;
             let mask = 1u8 << bit;

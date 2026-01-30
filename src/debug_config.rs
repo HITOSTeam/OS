@@ -8,8 +8,10 @@
 /// You can override it by building with `LOG=error|warn|info|debug|trace`.
 pub const DEFAULT_LOG_LEVEL: log::LevelFilter = if DEBUG_UNIXBENCH {
     log::LevelFilter::Info
-} else {
+} else if DEBUG_CYCLICTEST {
     log::LevelFilter::Warn
+} else {
+    log::LevelFilter::Off
 };
 
 /// Verbose timer debug logs (sleep timers, expiration, wakeups).
@@ -61,7 +63,7 @@ pub const DEBUG_WATCHDOG: bool = false;
 pub const DEBUG_LOG_TEST: bool = false;
 
 /// Lightweight performance counters for diagnosing bottlenecks.
-pub const DEBUG_PERF: bool = false;
+pub const DEBUG_PERF: bool = true;
 
 /// Use full-copy fork on LoongArch instead of COW (slower but safer).
 pub const DEBUG_LOONGARCH_FULL_COPY_FORK: bool = false;

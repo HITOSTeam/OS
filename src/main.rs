@@ -157,6 +157,7 @@ fn rust_main(hart_id: usize) -> ! {
         task::manager::mark_hart_online(hart_id);
         println!("[kernel] loongarch64 boot hart {}", hart_id);
         arch::bootstrap_init();
+        mm::init_phys_mem_from_dtb(crate::config::DEVICE_TREE_ADDR);
         mm::init();
         arch::disable_direct_map_windows();
         log::init();

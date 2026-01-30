@@ -36,7 +36,7 @@ pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFi
 pub use pseudo::PseudoBlock;
 pub use dummy::DummyFile;
 pub use procfs::{
-    build_proc_root_entries, collect_pids, init_procfs, is_proc_root, proc_file_kind,
-    proc_file_len, proc_file_content, sync_proc_path,
+    build_proc_root_entries, collect_pids, init_procfs, is_proc_pseudo_path, is_proc_root,
+    open_proc_pseudo, proc_file_content, proc_file_kind, proc_file_len, sync_proc_path,
 };
 pub(crate) use pseudo::{shm_create, shm_get, shm_list, shm_remove};

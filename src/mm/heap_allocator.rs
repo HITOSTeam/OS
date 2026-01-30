@@ -11,6 +11,18 @@ static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
 #[alloc_error_handler]
 /// panic when heap allocation error occurs
 pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
+    let (id, args) = crate::syscall::last_syscall_snapshot();
+    crate::println!(
+        "[oom] heap alloc failed: layout={:?} last_syscall={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        layout,
+        id,
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5]
+    );
     panic!("Heap allocation error, layout = {:?}", layout);
 }
 

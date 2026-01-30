@@ -250,6 +250,11 @@ impl TaskUserRes {
     pub fn ustack_top(&self) -> usize {
         ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE
     }
+
+    /// Whether this thread uses a user-managed stack (Linux CLONE_VM threads do).
+    pub fn is_linux_thread(&self) -> bool {
+        !self.owns_ustack
+    }
 }
 
 impl Drop for TaskUserRes {

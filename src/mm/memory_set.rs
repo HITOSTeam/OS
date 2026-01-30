@@ -1,6 +1,6 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
-use super::{FrameTracker, frame_alloc};
+use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -9,6 +9,8 @@ use crate::config::{
 };
 use crate::println;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
 use core::arch::asm;
@@ -27,6 +29,133 @@ unsafe extern "C" {
     safe fn ebss();
     safe fn ekernel();
     safe fn strampoline();
+}
+
+const ENOEXEC: isize = -8;
+const ENOMEM: isize = -12;
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1;
+const ET_DYN: u16 = 3;
+const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+const PT_PHDR: u32 = 6;
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
+#[derive(Clone, Copy)]
+struct ElfHeader64 {
+    e_type: u16,
+    e_entry: u64,
+    e_phoff: u64,
+    e_phentsize: u16,
+    e_phnum: u16,
+}
+
+#[derive(Clone, Copy)]
+struct ElfPhdr64 {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+}
+
+fn read_exact_with<F>(read_at: &mut F, offset: usize, buf: &mut [u8]) -> Result<(), isize>
+where
+    F: FnMut(usize, &mut [u8]) -> usize,
+{
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = read_at(offset + done, &mut buf[done..]);
+        if n == 0 {
+            return Err(ENOEXEC);
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+fn parse_elf_headers<F>(read_at: &mut F) -> Result<(ElfHeader64, Vec<ElfPhdr64>), isize>
+where
+    F: FnMut(usize, &mut [u8]) -> usize,
+{
+    let mut hdr = [0u8; 64];
+    read_exact_with(read_at, 0, &mut hdr)?;
+    if hdr[0..4] != ELF_MAGIC {
+        return Err(ENOEXEC);
+    }
+    if hdr[4] != ELFCLASS64 || hdr[5] != ELFDATA2LSB {
+        return Err(ENOEXEC);
+    }
+    let e_type = u16::from_le_bytes([hdr[16], hdr[17]]);
+    let e_entry = u64::from_le_bytes([
+        hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31],
+    ]);
+    let e_phoff = u64::from_le_bytes([
+        hdr[32], hdr[33], hdr[34], hdr[35], hdr[36], hdr[37], hdr[38], hdr[39],
+    ]);
+    let e_phentsize = u16::from_le_bytes([hdr[54], hdr[55]]);
+    let e_phnum = u16::from_le_bytes([hdr[56], hdr[57]]);
+    if e_phentsize < 56 {
+        return Err(ENOEXEC);
+    }
+    let header = ElfHeader64 {
+        e_type,
+        e_entry,
+        e_phoff,
+        e_phentsize,
+        e_phnum,
+    };
+    let mut phdrs = Vec::with_capacity(e_phnum as usize);
+    let mut ph_buf = [0u8; 56];
+    for idx in 0..e_phnum as usize {
+        let off = e_phoff as usize + idx * e_phentsize as usize;
+        read_exact_with(read_at, off, &mut ph_buf)?;
+        let ph = ElfPhdr64 {
+            p_type: u32::from_le_bytes([ph_buf[0], ph_buf[1], ph_buf[2], ph_buf[3]]),
+            p_flags: u32::from_le_bytes([ph_buf[4], ph_buf[5], ph_buf[6], ph_buf[7]]),
+            p_offset: u64::from_le_bytes([
+                ph_buf[8], ph_buf[9], ph_buf[10], ph_buf[11], ph_buf[12], ph_buf[13], ph_buf[14],
+                ph_buf[15],
+            ]),
+            p_vaddr: u64::from_le_bytes([
+                ph_buf[16], ph_buf[17], ph_buf[18], ph_buf[19], ph_buf[20], ph_buf[21], ph_buf[22],
+                ph_buf[23],
+            ]),
+            p_filesz: u64::from_le_bytes([
+                ph_buf[32], ph_buf[33], ph_buf[34], ph_buf[35], ph_buf[36], ph_buf[37], ph_buf[38],
+                ph_buf[39],
+            ]),
+            p_memsz: u64::from_le_bytes([
+                ph_buf[40], ph_buf[41], ph_buf[42], ph_buf[43], ph_buf[44], ph_buf[45], ph_buf[46],
+                ph_buf[47],
+            ]),
+        };
+        phdrs.push(ph);
+    }
+    Ok((header, phdrs))
+}
+
+pub(crate) fn elf_interp_path_from_reader<F>(mut read_at: F) -> Result<Option<String>, isize>
+where
+    F: FnMut(usize, &mut [u8]) -> usize,
+{
+    let (_hdr, phdrs) = parse_elf_headers(&mut read_at)?;
+    for ph in phdrs {
+        if ph.p_type != PT_INTERP {
+            continue;
+        }
+        let mut buf = vec![0u8; ph.p_filesz as usize];
+        read_exact_with(&mut read_at, ph.p_offset as usize, &mut buf)?;
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let s = core::str::from_utf8(&buf[..end]).map_err(|_| ENOEXEC)?;
+        return Ok(Some(String::from(s)));
+    }
+    Ok(None)
 }
 
 lazy_static! {
@@ -254,11 +383,7 @@ impl MemorySet {
         {
             let dtb_start = crate::config::DEVICE_TREE_ADDR;
             let dtb_end = dtb_start + crate::config::DEVICE_TREE_MAX_SIZE;
-            memory_set.map_identical_range_skip_mapped(
-                dtb_start,
-                dtb_end,
-                MapPermission::R,
-            );
+            memory_set.map_identical_range_skip_mapped(dtb_start, dtb_end, MapPermission::R);
         }
         memory_set
     }
@@ -386,6 +511,74 @@ impl MemorySet {
         )
     }
 
+    /// Build a user address space from an ELF reader to avoid loading the full file into memory.
+    pub fn from_elf_reader<F>(mut read_at: F) -> Result<(Self, usize, usize, ElfAux), isize>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
+        let mut memory_set = Self::new_bare();
+        memory_set.map_trampoline();
+        memory_set.map_sigreturn_trampoline_user();
+
+        let load_bias = if hdr.e_type == ET_DYN { 0x2000_0000 } else { 0 };
+        let mut max_end_vpn = VirtPageNum(0);
+        let elf_aux = Self::map_elf_segments_from_reader(
+            &mut memory_set,
+            &mut read_at,
+            &hdr,
+            &phdrs,
+            load_bias,
+            &mut max_end_vpn,
+        )?;
+
+        let max_end_va: VirtAddr = max_end_vpn.into();
+        let mut user_stack_bottom: usize = max_end_va.into();
+        user_stack_bottom += PAGE_SIZE;
+        let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
+
+        if !memory_set.try_push(
+            MapArea::new(
+                user_stack_bottom.into(),
+                user_stack_top.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+        ) {
+            return Err(ENOMEM);
+        }
+        if !memory_set.try_push(
+            MapArea::new(
+                user_stack_top.into(),
+                user_stack_top.into(),
+                MapType::Lazy,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+        ) {
+            return Err(ENOMEM);
+        }
+        if !memory_set.try_push(
+            MapArea::new(
+                TRAP_CONTEXT.into(),
+                SIGRETURN_TRAMPOLINE.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W,
+            ),
+            None,
+        ) {
+            return Err(ENOMEM);
+        }
+
+        Ok((
+            memory_set,
+            user_stack_bottom,
+            load_bias + hdr.e_entry as usize,
+            elf_aux,
+        ))
+    }
+
     fn map_elf_segments_into(
         memory_set: &mut MemorySet,
         elf_data: &[u8],
@@ -453,6 +646,92 @@ impl MemorySet {
                 phnum: ph_count as usize,
             },
         )
+    }
+
+    fn map_elf_segments_from_reader<F>(
+        memory_set: &mut MemorySet,
+        read_at: &mut F,
+        hdr: &ElfHeader64,
+        phdrs: &[ElfPhdr64],
+        load_bias: usize,
+        max_end_vpn: &mut VirtPageNum,
+    ) -> Result<ElfAux, isize>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        let ph_entry_size = hdr.e_phentsize as usize;
+        let ph_count = hdr.e_phnum as usize;
+        let ph_offset = hdr.e_phoff as usize;
+        let ph_table_size = ph_entry_size.saturating_mul(ph_count);
+
+        let mut phdr_vaddr: usize = 0;
+        for ph in phdrs {
+            if ph.p_type == PT_PHDR && phdr_vaddr == 0 {
+                phdr_vaddr = load_bias + ph.p_vaddr as usize;
+            }
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
+            let start_va: VirtAddr = (load_bias + ph.p_vaddr as usize).into();
+            let end_va: VirtAddr = (load_bias + (ph.p_vaddr + ph.p_memsz) as usize).into();
+            let mut map_perm = MapPermission::U;
+            if (ph.p_flags & PF_R) != 0 {
+                map_perm |= MapPermission::R;
+            }
+            if (ph.p_flags & PF_W) != 0 {
+                map_perm |= MapPermission::W;
+            }
+            if (ph.p_flags & PF_X) != 0 {
+                map_perm |= MapPermission::X;
+            }
+            let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
+            let seg_end = map_area.vpn_range.get_end();
+            if seg_end > *max_end_vpn {
+                *max_end_vpn = seg_end;
+            }
+            if !memory_set.try_push(map_area, None) {
+                return Err(ENOMEM);
+            }
+
+            // Populate segment data from the file.
+            let file_size = ph.p_filesz as usize;
+            if file_size > 0 {
+                let token = memory_set.token();
+                let mut offset = 0usize;
+                let mut tmp = [0u8; PAGE_SIZE];
+                while offset < file_size {
+                    let to_read = core::cmp::min(PAGE_SIZE, file_size - offset);
+                    read_exact_with(read_at, ph.p_offset as usize + offset, &mut tmp[..to_read])?;
+                    if try_copy_to_user_unchecked(
+                        token,
+                        (load_bias + ph.p_vaddr as usize + offset) as *mut u8,
+                        &tmp[..to_read],
+                    )
+                    .is_err()
+                    {
+                        return Err(ENOMEM);
+                    }
+                    offset += to_read;
+                }
+            }
+
+            // Best-effort: compute AT_PHDR when PHDR table bytes live in this segment.
+            if phdr_vaddr == 0 {
+                let seg_off = ph.p_offset as usize;
+                let seg_filesz = ph.p_filesz as usize;
+                if ph_offset >= seg_off
+                    && ph_offset.saturating_add(ph_table_size) <= seg_off.saturating_add(seg_filesz)
+                {
+                    phdr_vaddr = load_bias + ph.p_vaddr as usize + (ph_offset - seg_off);
+                }
+            }
+        }
+
+        Ok(ElfAux {
+            phdr: phdr_vaddr,
+            phent: ph_entry_size,
+            phnum: ph_count,
+        })
     }
 
     /// Map a dynamically-linked main ELF together with its interpreter (PT_INTERP) in
@@ -534,6 +813,86 @@ impl MemorySet {
             interp_bias,
         )
     }
+
+    /// Build a user address space from a main ELF reader and an in-memory interpreter.
+    pub fn from_elf_with_interp_reader<F>(
+        mut read_at: F,
+        interp_elf: &[u8],
+    ) -> Result<(Self, usize, usize, usize, ElfAux, usize), isize>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
+        let mut memory_set = Self::new_bare();
+        memory_set.map_trampoline();
+        memory_set.map_sigreturn_trampoline_user();
+
+        let main_bias = if hdr.e_type == ET_DYN { 0x2000_0000 } else { 0 };
+        #[cfg(target_arch = "loongarch64")]
+        let interp_bias = 0x4000_0000;
+        #[cfg(not(target_arch = "loongarch64"))]
+        let interp_bias = 0x30_0000_0000;
+
+        let mut max_end_vpn = VirtPageNum(0);
+        let main_aux = Self::map_elf_segments_from_reader(
+            &mut memory_set,
+            &mut read_at,
+            &hdr,
+            &phdrs,
+            main_bias,
+            &mut max_end_vpn,
+        )?;
+        let (interp_entry, _interp_aux) =
+            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn);
+
+        let max_end_va: VirtAddr = max_end_vpn.into();
+        let mut user_stack_bottom: usize = max_end_va.into();
+        user_stack_bottom += PAGE_SIZE;
+        let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
+
+        if !memory_set.try_push(
+            MapArea::new(
+                user_stack_bottom.into(),
+                user_stack_top.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+        ) {
+            return Err(ENOMEM);
+        }
+        if !memory_set.try_push(
+            MapArea::new(
+                user_stack_top.into(),
+                user_stack_top.into(),
+                MapType::Lazy,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+            None,
+        ) {
+            return Err(ENOMEM);
+        }
+        if !memory_set.try_push(
+            MapArea::new(
+                TRAP_CONTEXT.into(),
+                SIGRETURN_TRAMPOLINE.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W,
+            ),
+            None,
+        ) {
+            return Err(ENOMEM);
+        }
+
+        Ok((
+            memory_set,
+            user_stack_bottom,
+            interp_entry,
+            main_bias + hdr.e_entry as usize,
+            main_aux,
+            interp_bias,
+        ))
+    }
     /// Fork a user address space using copy-on-write for user pages.
     ///
     /// - User pages (PTE.U) that were writable are remapped read-only and tagged with `PTEFlags::COW`
@@ -595,8 +954,8 @@ impl MemorySet {
                         }
 
                         // Share the physical page.
-                        let writable = src_flags.contains(PTEFlags::W)
-                            || src_flags.contains(PTEFlags::D);
+                        let writable =
+                            src_flags.contains(PTEFlags::W) || src_flags.contains(PTEFlags::D);
                         if writable && !src_flags.contains(PTEFlags::SHARED) {
                             src_flags.remove(PTEFlags::W);
                             src_flags.remove(PTEFlags::D);
@@ -1027,6 +1386,36 @@ impl MemorySet {
         }
         self.areas = new_areas;
         true
+    }
+
+    /// Discard mapped pages in lazy user areas within `[start_va, end_va)`.
+    ///
+    /// This keeps the virtual ranges intact but frees any physical frames
+    /// so they will be re-allocated on the next fault.
+    pub fn discard_lazy_user_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if start_vpn >= end_vpn {
+            return;
+        }
+        for area in self.areas.iter_mut() {
+            if area.map_type != MapType::Lazy {
+                continue;
+            }
+            if !area.map_perm.contains(MapPermission::U) {
+                continue;
+            }
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if end_vpn <= area_start || start_vpn >= area_end {
+                continue;
+            }
+            let ov_start = core::cmp::max(start_vpn, area_start);
+            let ov_end = core::cmp::min(end_vpn, area_end);
+            for vpn in VPNRange::new(ov_start, ov_end) {
+                area.unmap_one_maybe(&mut self.page_table, vpn);
+            }
+        }
     }
 
     /// Returns true if any existing mapping overlaps the range.
