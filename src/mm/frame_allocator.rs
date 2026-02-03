@@ -2,7 +2,7 @@
 //! controls all the frames in the operating system.
 
 use super::{PhysAddr, PhysPageNum};
-use crate::{config::phys_mem_end, println};
+use crate::{config::{phys_mem_end, phys_mem_start}, println};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Formatter};
@@ -85,6 +85,15 @@ impl StackFrameAllocator {
         self.end = r.0;
     }
 
+    pub fn add_range(&mut self, l: PhysPageNum, r: PhysPageNum) {
+        if r <= l {
+            return;
+        }
+        for ppn in l.0..r.0 {
+            self.recycled.push(ppn);
+        }
+    }
+
     pub fn alloc_contiguous(&mut self, pages: usize) -> Option<PhysPageNum> {
         if pages == 0 {
             return None;
@@ -137,11 +146,17 @@ lazy_static! {
 pub fn init_frame_allocator() {
     unsafe extern "C" {
         safe fn ekernel();
+        safe fn stext();
     }
-    FRAME_ALLOCATOR.lock().init(
-        PhysAddr::from(ekernel as usize).ceil(),
-        PhysAddr::from(phys_mem_end()).floor(),
-    );
+    let kernel_end = PhysAddr::from(ekernel as usize).ceil();
+    let mut allocator = FRAME_ALLOCATOR.lock();
+    allocator.init(kernel_end, PhysAddr::from(phys_mem_end()).floor());
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let low_start = PhysAddr::from(phys_mem_start()).ceil();
+        let kernel_start = PhysAddr::from(stext as usize).floor();
+        allocator.add_range(low_start, kernel_start);
+    }
 }
 
 /// allocate a frame

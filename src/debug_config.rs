@@ -45,7 +45,7 @@ pub const DEBUG_IOZONE_FS: bool = false;
 pub const DEBUG_NET: bool = false;
 
 /// Targeted logs for UnixBench hangs (alarm/pipe/signal).
-pub const DEBUG_UNIXBENCH: bool = false;
+pub const DEBUG_UNIXBENCH: bool = true;
 
 /// Targeted logs for cyclictest hangs (clock_nanosleep/affinity/sleep).
 pub const DEBUG_CYCLICTEST: bool = false;

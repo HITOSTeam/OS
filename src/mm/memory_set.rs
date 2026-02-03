@@ -357,6 +357,16 @@ impl MemorySet {
             ),
             None,
         );
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // Map low physical memory below the kernel image so the frame allocator
+            // can safely use it on LoongArch.
+            memory_set.map_identical_range(
+                crate::config::phys_mem_start(),
+                stext as usize,
+                MapPermission::R | MapPermission::W,
+            );
+        }
         println!("mapping physical memory");
         memory_set.push(
             MapArea::new(

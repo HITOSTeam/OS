@@ -1,5 +1,5 @@
 use crate::{
-    config::PAGE_SIZE,
+    config::{PAGE_SIZE, TRAP_CONTEXT},
     fs::{File, OSInode, PseudoShmFile, ext4_lock},
     mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user_unchecked},
     task::processor::current_process,
@@ -26,12 +26,18 @@ const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
 const EEXIST: isize = -17;
 
+const USER_VA_TOP: usize = TRAP_CONTEXT;
+
 fn align_down(x: usize, align: usize) -> usize {
     x & !(align - 1)
 }
 
 fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
+}
+
+fn user_range_valid(start: usize, end: usize) -> bool {
+    start < end && end <= USER_VA_TOP
 }
 
 fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
@@ -76,6 +82,17 @@ pub fn syscall_brk(addr: usize) -> isize {
                 addr,
                 inner.heap_start,
                 inner.brk
+            );
+        }
+        return inner.brk as isize;
+    }
+    if addr > USER_VA_TOP || align_up(addr, PAGE_SIZE) > USER_VA_TOP {
+        if crate::debug_config::DEBUG_SYSCALL {
+            crate::println!(
+                "[brk] pid={} reject addr={:#x} above user top={:#x}",
+                pid,
+                addr,
+                USER_VA_TOP
             );
         }
         return inner.brk as isize;
@@ -188,6 +205,9 @@ pub fn syscall_mmap(
     let Some(end) = start.checked_add(map_len) else {
         return ENOMEM;
     };
+    if !user_range_valid(start, end) {
+        return if is_fixed { EINVAL } else { ENOMEM };
+    }
     let map_start = start;
     let map_end = end;
     if is_anon && len >= LARGE_ANON_MMAP {
@@ -307,7 +327,7 @@ pub fn syscall_mmap(
             return ENOMEM;
         }
     }
-    if end > inner.mmap_next {
+    if !is_fixed && end > inner.mmap_next {
         inner.mmap_next = end;
     }
     inner.mmap_areas.push((start, map_len));
@@ -353,6 +373,9 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
         return EINVAL;
     };
     let end = align_up(end, PAGE_SIZE);
+    if !user_range_valid(start, end) {
+        return EINVAL;
+    }
 
     inner.memory_set.unmap_user_range(start.into(), end.into());
 
@@ -390,6 +413,9 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         return EINVAL;
     };
     let end = align_up(end, PAGE_SIZE);
+    if !user_range_valid(addr, end) {
+        return EINVAL;
+    }
 
     let mut perm = MapPermission::U;
     if (prot & PROT_READ) != 0 {

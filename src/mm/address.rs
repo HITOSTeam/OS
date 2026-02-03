@@ -7,8 +7,9 @@ use core::fmt::{self, Debug, Formatter};
 /// physical/virtual address width (per-arch).
 #[cfg(target_arch = "loongarch64")]
 const PA_WIDTH: usize = 48;
+// LoongArch page tables here are Sv39-style (3 levels), so only 39-bit VAs are valid.
 #[cfg(target_arch = "loongarch64")]
-const VA_WIDTH: usize = 48;
+const VA_WIDTH: usize = 39;
 #[cfg(not(target_arch = "loongarch64"))]
 const PA_WIDTH: usize = 56;
 #[cfg(not(target_arch = "loongarch64"))]
