@@ -1,5 +1,5 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
-mod filesystem;
+pub(crate) mod filesystem;
 
 mod condvar;
 mod flow;
@@ -27,6 +27,12 @@ static LAST_SYSCALL_A2: AtomicUsize = AtomicUsize::new(0);
 static LAST_SYSCALL_A3: AtomicUsize = AtomicUsize::new(0);
 static LAST_SYSCALL_A4: AtomicUsize = AtomicUsize::new(0);
 static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
+
+const BUSYBOX_APPLET_ALLOWLIST: [&str; 1] = ["zcat"];
+
+pub(crate) fn busybox_applet_allowed(name: &str) -> bool {
+    BUSYBOX_APPLET_ALLOWLIST.iter().any(|&allowed| allowed == name)
+}
 
 pub fn last_syscall_snapshot() -> (usize, [usize; 6]) {
     (
@@ -91,6 +97,7 @@ const SYSCALL_STATX: usize = 291;
 const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
 const SYSCALL_UTIMENSAT: usize = 88;
+const SYSCALL_ACCT: usize = 89;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_SET_TID_ADDRESS: usize = 96;
@@ -395,6 +402,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_STATFS => filesystem::syscall_statfs(args[0], args[1]),
         SYSCALL_TIMERFD_CREATE => dummy::syscall_timerfd_create(args[0], args[1]),
         SYSCALL_UTIMENSAT => filesystem::syscall_utimensat(args[0] as isize, args[1], args[2], args[3]),
+        SYSCALL_ACCT => filesystem::syscall_acct(args[0]),
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_EXIT_GROUP => flow::syscall_exit_group(args[0]),
         SYSCALL_SET_TID_ADDRESS => misc::syscall_set_tid_address(args[0]),

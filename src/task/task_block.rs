@@ -432,6 +432,10 @@ pub struct TaskControlBlockInner {
     pub sigsuspend_old_mask: Option<u64>,
     /// Saved user contexts when running nested signal handlers (stack).
     pub sig_saved_ctx: alloc::vec::Vec<SigSavedContext>,
+    /// Last syscall info for restartable syscalls (SA_RESTART).
+    pub last_syscall_id: usize,
+    pub last_syscall_args: [usize; 6],
+    pub last_syscall_valid: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -485,6 +489,9 @@ impl TaskControlBlock {
                 signal_mask: 0,
                 sigsuspend_old_mask: None,
                 sig_saved_ctx: alloc::vec::Vec::new(),
+                last_syscall_id: 0,
+                last_syscall_args: [0; 6],
+                last_syscall_valid: false,
             }),
         })
     }
@@ -530,6 +537,9 @@ impl TaskControlBlock {
                 signal_mask: 0,
                 sigsuspend_old_mask: None,
                 sig_saved_ctx: alloc::vec::Vec::new(),
+                last_syscall_id: 0,
+                last_syscall_args: [0; 6],
+                last_syscall_valid: false,
             }),
         })
     }

@@ -10,11 +10,12 @@ use crate::{
     syscall::{
         filesystem::{normalize_path, resolve_exec_inode, resolve_read_inode},
         misc::encode_linux_tid,
+        signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
         manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::has_unmasked_pending,
+        signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
         task_block::TaskControlBlock,
     },
     trap::{get_current_token, trap_handler},
@@ -133,10 +134,14 @@ fn is_system_shell_path(path: &str) -> bool {
 
 fn find_busybox_shell() -> Result<Option<(String, Vec<u8>)>, isize> {
     let candidates = [
+        "./busybox",
+        "busybox",
         "/musl/busybox",
         "/glibc/busybox",
         "/riscv/musl/busybox",
         "/riscv/glibc/busybox",
+        "/extra/riscv/musl/busybox",
+        "/extra/riscv/glibc/busybox",
         "/bin/busybox",
         "/busybox",
     ];
@@ -432,10 +437,126 @@ fn is_core_dump_signal(sig: i32) -> bool {
     matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31)
 }
 
+fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
+    const EINTR: isize = -4;
+    let (pending, mask) = {
+        let inner = task.borrow_mut();
+        (inner.pending_signals, inner.signal_mask)
+    };
+    let mut bits = pending_unmasked_bits(pending, mask, true);
+    if bits == 0 {
+        return None;
+    }
+    let mut clear_bits = 0u64;
+    let mut saw_restart = false;
+    let mut saw_interrupt = false;
+    let mut first_sig = None;
+    let process = current_process();
+    let inner = process.borrow_mut();
+    while bits != 0 {
+        let signum = bits.trailing_zeros() as usize + 1;
+        let bit = 1u64 << (signum - 1);
+        bits &= bits - 1;
+        if first_sig.is_none() {
+            first_sig = Some(signum);
+        }
+        let action = inner
+            .rt_sig_handlers
+            .get(signum)
+            .copied()
+            .unwrap_or_default();
+        if action.handler == SIG_IGN {
+            clear_bits |= bit;
+            continue;
+        }
+        if action.handler == SIG_DFL {
+            if signum <= MAX_SIG {
+                if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
+                    if flag.check_error().is_none() {
+                        clear_bits |= bit;
+                        continue;
+                    }
+                }
+            }
+            saw_interrupt = true;
+            break;
+        }
+        if (action.flags & SA_RESTART) != 0 {
+            saw_restart = true;
+        } else {
+            saw_interrupt = true;
+            break;
+        }
+    }
+    drop(inner);
+    if clear_bits != 0 {
+        let mut inner = task.borrow_mut();
+        inner.pending_signals &= !clear_bits;
+    }
+    if saw_interrupt || saw_restart {
+        let pid = current_process().getpid();
+        let tid = task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
+        crate::log_if!(
+            DEBUG_SIGNAL,
+            info,
+            "[wait4] pid={} tid={} pending={:#x} mask={:#x} sig={:?} action={}",
+            pid,
+            tid,
+            pending,
+            mask,
+            first_sig,
+            if saw_interrupt { "eintr" } else { "restart" }
+        );
+    }
+    if saw_interrupt {
+        Some(EINTR)
+    } else if saw_restart {
+        Some(ERESTARTSYS)
+    } else {
+        None
+    }
+}
+
+fn path_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn try_exec_busybox_applet(
+    path: &str,
+    args: &[String],
+    envs: &[String],
+) -> Option<isize> {
+    let applet_src = args.get(0).map(|s| s.as_str()).unwrap_or(path);
+    let applet = path_basename(applet_src);
+    if applet.is_empty() || applet == "busybox" {
+        return None;
+    }
+    if applet.ends_with(".sh") {
+        return None;
+    }
+    if !super::busybox_applet_allowed(applet) {
+        return None;
+    }
+    let Ok(Some((bb_path, bb_data))) = find_busybox_shell() else {
+        return None;
+    };
+    let mut new_args: Vec<String> = Vec::new();
+    new_args.push(bb_path);
+    new_args.push(String::from(applet));
+    for a in args.iter().skip(1) {
+        new_args.push(a.clone());
+    }
+    Some(exec_interpreter(bb_data, new_args, envs.to_vec()))
+}
+
 pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: usize) -> isize {
     const WNOHANG: usize = 0x00000001;
     const ECHILD: isize = -10;
-    const EINTR: isize = -4;
     let token = get_current_token();
     let mut temp_exit_code: i32 = 0;
     let mut temp_signal: Option<i32> = None;
@@ -443,16 +564,13 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
     loop {
         let cur_process = current_process();
         let task = current_task().unwrap();
-        let pending_unmasked = {
-            let inner = task.borrow_mut();
-            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
-        };
-        let mut process_inner = cur_process.borrow_mut();
-        if pending_unmasked {
+        if let Some(action) = wait4_pending_action(&task) {
+            let mut process_inner = cur_process.borrow_mut();
             process_inner.wait_queue.retain(|t| !Arc::ptr_eq(t, &task));
             drop(process_inner);
-            return EINTR;
+            return action;
         }
+        let mut process_inner = cur_process.borrow_mut();
         let (has_matching_child, zombie_pid) = if process_inner.children.is_empty() {
             (false, None)
         } else {
@@ -584,12 +702,15 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         }
     }
     if envs_vec.is_empty() {
+        // Include LTP testcases bin dirs so helper binaries (e.g. acct02_helper)
+        // can be resolved via tst_get_path() in LTP.
         envs_vec.push(String::from(
-            "PATH=/user:/:/bin:/usr/bin:/musl:/glibc",
+            "PATH=/user:/:/bin:/usr/bin:/musl:/glibc:/musl/ltp/testcases/bin:/glibc/ltp/testcases/bin",
         ));
     } else if !envs_vec.iter().any(|e| e.starts_with("PATH=")) {
+        // Ensure PATH contains LTP testcases bin dirs for helper lookups.
         envs_vec.push(String::from(
-            "PATH=/user:/:/bin:/usr/bin:/musl:/glibc",
+            "PATH=/user:/:/bin:/usr/bin:/musl:/glibc:/musl/ltp/testcases/bin:/glibc/ltp/testcases/bin",
         ));
     }
 
@@ -608,6 +729,11 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     let inode = match resolve_exec_inode_with_fallback(&path) {
         Ok(inode) => inode,
         Err(e) => {
+            if e == ENOENT {
+                if let Some(ret) = try_exec_busybox_applet(&path, &args_vec, &envs_vec) {
+                    return ret;
+                }
+            }
             if DEBUG_EXEC {
                 let cwd = { current_process().borrow_mut().cwd.clone() };
                 let abs = if path.starts_with('/') {

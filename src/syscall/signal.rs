@@ -42,6 +42,8 @@ const ESRCH: isize = -3;
 const SIGCHLD: usize = 17;
 const SA_SIGINFO: usize = 0x4;
 const SA_NODEFER: usize = 0x40000000;
+pub const SA_RESTART: usize = 0x10000000;
+pub const ERESTARTSYS: isize = -512;
 
 // pub fn syscall_sigreturn() -> isize {
 //     sigreturn()
@@ -853,8 +855,20 @@ pub fn maybe_deliver_signal() {
     let cx = inner.get_trap_cx();
     let cur_mask = inner.signal_mask;
     let saved_mask = inner.sigsuspend_old_mask.take().unwrap_or(cur_mask);
+    let mut saved_trap = *cx;
+    let restart_syscall = saved_trap.x[REG_A0] == ERESTARTSYS as usize;
+    if restart_syscall && inner.last_syscall_valid {
+        saved_trap.sepc = saved_trap.sepc.wrapping_sub(4);
+        saved_trap.x[REG_A0] = inner.last_syscall_args[0];
+        saved_trap.x[REG_A1] = inner.last_syscall_args[1];
+        saved_trap.x[REG_A2] = inner.last_syscall_args[2];
+        saved_trap.x[REG_A3] = inner.last_syscall_args[3];
+        saved_trap.x[REG_A4] = inner.last_syscall_args[4];
+        saved_trap.x[REG_A5] = inner.last_syscall_args[5];
+        saved_trap.x[REG_A7] = inner.last_syscall_id;
+    }
     inner.sig_saved_ctx.push(SigSavedContext {
-        trap_cx: *cx,
+        trap_cx: saved_trap,
         mask: saved_mask,
         ucontext_ptr: 0,
         uses_ucontext: false,
@@ -888,7 +902,7 @@ pub fn maybe_deliver_signal() {
         siginfo.field[1] = 0; // uid
 
         let sig_context = SigContext {
-            regs: UserRegsStruct::from_trap(cx),
+            regs: UserRegsStruct::from_trap(&saved_trap),
             ..Default::default()
         };
         let ucontext = UContext {

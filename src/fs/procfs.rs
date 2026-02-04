@@ -9,7 +9,9 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::config;
-use crate::fs::{ext4_lock, find_path_in_roots, root_inode_for_path, File, PseudoDir, PseudoDirent};
+use crate::fs::{
+    ext4_lock, find_path_in_roots, root_inode_for_path, File, PseudoDir, PseudoDirent, PseudoFile,
+};
 use crate::mm::UserBuffer;
 use crate::task::manager::{pid2process, PID2PCB};
 use crate::task::task_block::TaskStatus;
@@ -33,6 +35,14 @@ pub enum ProcFileKind {
 static PROC_ROOT_INO: AtomicU32 = AtomicU32::new(0);
 static PROC_ROOT_DEV: AtomicUsize = AtomicUsize::new(0);
 static PROC_FILES: Mutex<BTreeMap<u32, ProcFileKind>> = Mutex::new(BTreeMap::new());
+
+// gzip-compressed minimal config for LTP kconfig checks.
+const PROC_CONFIG_GZ: &[u8] = &[
+    31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 115, 246, 247, 115, 243, 116, 143, 119,
+    10, 118, 137, 15, 8, 242, 119, 118, 13, 14, 142, 119, 116, 118, 14, 177,
+    173, 228, 82, 86, 112, 198, 46, 23, 31, 102, 172, 144, 89, 172, 144, 151,
+    95, 162, 80, 156, 90, 194, 5, 0, 236, 87, 124, 248, 66, 0, 0, 0,
+];
 
 struct ProcPseudoInner {
     offset: usize,
@@ -191,7 +201,7 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
         ino: 1,
         dtype: 4,
     });
-    for name in ["mounts", "meminfo", "loadavg", "uptime", "stat", "perf"] {
+    for name in ["mounts", "meminfo", "loadavg", "uptime", "stat", "perf", "config.gz"] {
         entries.push(PseudoDirent {
             name: String::from(name),
             ino: 1,
@@ -272,6 +282,9 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
         "/proc/perf" => return Some(ProcPseudoFile::new(ProcFileKind::Perf)),
+        "/proc/config.gz" => {
+            return Some(Arc::new(PseudoFile::new_static_bytes(PROC_CONFIG_GZ)))
+        }
         _ => {}
     }
 

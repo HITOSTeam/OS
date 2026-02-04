@@ -399,6 +399,17 @@ impl PseudoFile {
         }
     }
 
+    pub fn new_static_bytes(data: &[u8]) -> Self {
+        Self {
+            readable: true,
+            writable: false,
+            inner: Mutex::new(PseudoInner {
+                offset: 0,
+                kind: PseudoKind::Static(data.to_vec()),
+            }),
+        }
+    }
+
     pub fn new_urandom(seed: u64) -> Self {
         Self {
             readable: true,

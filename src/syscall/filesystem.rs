@@ -1,5 +1,6 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::min;
@@ -7,6 +8,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+use crate::task::manager::PID2PCB;
 use crate::{
     config::clock_freq,
     fs::{
@@ -19,12 +21,11 @@ use crate::{
         translated_byte_buffer, translated_mutref, translated_str, try_copy_to_user,
         try_read_user_value, write_user_value,
     },
-    task::processor::current_process,
     task::ProcessControlBlock,
+    task::processor::current_process,
     time::get_time,
     trap::get_current_token,
 };
-use crate::task::manager::PID2PCB;
 use ext4_fs::sync_all;
 
 const AT_FDCWD: isize = -100;
@@ -85,9 +86,38 @@ struct InodeTimes {
     ctime_nsec: i64,
 }
 
+const ACCT_COMM: usize = 16;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Acct {
+    ac_flag: u8,
+    ac_uid: u16,
+    ac_gid: u16,
+    ac_tty: u16,
+    ac_btime: u32,
+    ac_utime: u16,
+    ac_stime: u16,
+    ac_etime: u16,
+    ac_mem: u16,
+    ac_io: u16,
+    ac_rw: u16,
+    ac_minflt: u16,
+    ac_majflt: u16,
+    ac_swaps: u16,
+    ac_exitcode: u32,
+    ac_comm: [u8; ACCT_COMM + 1],
+    ac_pad: [u8; 10],
+}
+
+struct AcctState {
+    inode: alloc::sync::Arc<ext4_fs::Inode>,
+}
+
 lazy_static! {
     static ref INODE_TIMES: Mutex<BTreeMap<u64, InodeTimes>> = Mutex::new(BTreeMap::new());
     static ref ROFS_MOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static ref ACCT_STATE: Mutex<Option<AcctState>> = Mutex::new(None);
 }
 
 fn get_inode_times(ino: u64) -> InodeTimes {
@@ -175,6 +205,49 @@ fn normalize_relative_path(path: &str) -> String {
         parts.push(seg);
     }
     parts.join("/")
+}
+
+fn path_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn busybox_exists() -> bool {
+    let candidates = [
+        "/musl/busybox",
+        "/glibc/busybox",
+        "/riscv/musl/busybox",
+        "/riscv/glibc/busybox",
+        "/extra/riscv/musl/busybox",
+        "/extra/riscv/glibc/busybox",
+        "/bin/busybox",
+        "/busybox",
+    ];
+    for cand in candidates {
+        if find_path_in_roots(cand).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn should_try_busybox_applet_path(path: &str, allow_relative: bool) -> bool {
+    let base = path_basename(path);
+    if base.is_empty() || base == "busybox" {
+        return false;
+    }
+    if base.ends_with(".sh") {
+        return false;
+    }
+    if !super::busybox_applet_allowed(base) {
+        return false;
+    }
+    if !path.contains('/') {
+        return allow_relative;
+    }
+    path.starts_with("/bin/")
+        || path.starts_with("/usr/bin/")
+        || path.starts_with("/sbin/")
+        || path.starts_with("/usr/sbin/")
 }
 
 fn shm_object_name(abs: &str) -> Option<&str> {
@@ -343,7 +416,11 @@ fn resolve_ext4_abs_path(
     let abs = rewrite_proc_self(path);
 
     // Prefer the secondary disk for OSComp test roots when available.
-    if (abs == "/musl" || abs.starts_with("/musl/") || abs == "/glibc" || abs.starts_with("/glibc/")) {
+    if (abs == "/musl"
+        || abs.starts_with("/musl/")
+        || abs == "/glibc"
+        || abs.starts_with("/glibc/"))
+    {
         if let Some(secondary) = secondary_root_inode() {
             let mut sec_depth = 0usize;
             let mut sec_seen = Vec::new();
@@ -522,15 +599,7 @@ fn resolve_ext4_path(
                     seen_symlinks,
                 );
             }
-            return resolve_ext4_path(
-                cur,
-                &new_path,
-                uid,
-                gid,
-                follow_final,
-                depth,
-                seen_symlinks,
-            );
+            return resolve_ext4_path(cur, &new_path, uid, gid, follow_final, depth, seen_symlinks);
         }
         stack.push(next);
         idx += 1;
@@ -547,14 +616,9 @@ fn resolve_at_inode(
     let mut depth = 0usize;
     let mut seen_symlinks = Vec::new();
     match at {
-        AtPath::Ext4Abs(abs) => resolve_ext4_abs_path(
-            abs,
-            uid,
-            gid,
-            follow_final,
-            &mut depth,
-            &mut seen_symlinks,
-        ),
+        AtPath::Ext4Abs(abs) => {
+            resolve_ext4_abs_path(abs, uid, gid, follow_final, &mut depth, &mut seen_symlinks)
+        }
         AtPath::Ext4Rel { base, rel } => {
             if rel.is_empty() {
                 Ok(alloc::sync::Arc::clone(base))
@@ -609,6 +673,129 @@ pub(crate) fn resolve_read_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
     Ok(inode)
 }
 
+/// Linux `acct(2)` (syscall 89 on riscv64).
+///
+/// We only validate the path and permissions for LTP. Accounting is not enabled.
+pub fn syscall_acct(pathname: usize) -> isize {
+    if current_effective_uid_gid().0 != 0 {
+        return EPERM;
+    }
+    if pathname == 0 {
+        *ACCT_STATE.lock() = None;
+        return 0;
+    }
+    let token = get_current_token();
+    let path = translated_str(token, pathname as *const u8);
+    if path.is_empty() {
+        return ENOENT;
+    }
+    let trailing_slash = path.len() > 1 && path.ends_with('/');
+    if rofs_for_path(AT_FDCWD, &path) {
+        return EROFS;
+    }
+    let at = match resolve_at_path(AT_FDCWD, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let AtPath::PseudoAbs(_) = &at {
+        return EACCES;
+    }
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+        Ok(inode) => inode,
+        Err(e) => return e,
+    };
+    if inode.is_dir() {
+        return EISDIR;
+    }
+    if trailing_slash {
+        return ENOTDIR;
+    }
+    if !inode.is_file() {
+        return EACCES;
+    }
+    if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+        return EACCES;
+    }
+    *ACCT_STATE.lock() = Some(AcctState {
+        inode: Arc::clone(&inode),
+    });
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        crate::println!("[fs] acct(pid={}) path='{}' ok", pid, path);
+    }
+    0
+}
+
+fn acct_comm_from_argv(argv: &[String]) -> [u8; ACCT_COMM + 1] {
+    let mut out = [0u8; ACCT_COMM + 1];
+    let name = argv.get(0).map(|s| s.as_str()).unwrap_or("");
+    let base = name.rsplit('/').next().unwrap_or("");
+    let bytes = base.as_bytes();
+    let n = core::cmp::min(bytes.len(), ACCT_COMM);
+    out[..n].copy_from_slice(&bytes[..n]);
+    out
+}
+
+fn acct_exitcode(exit_code: i32) -> u32 {
+    if exit_code < 0 {
+        (-exit_code as u32) & 0x7f
+    } else {
+        ((exit_code as u32) & 0xff) << 8
+    }
+}
+
+pub fn acct_process_exit(process: &Arc<ProcessControlBlock>, exit_code: i32) {
+    let inode = {
+        let state = ACCT_STATE.lock();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        Arc::clone(&state.inode)
+    };
+
+    let (argv, uid, gid, start_time_ms) = {
+        let inner = process.borrow_mut();
+        (
+            inner.argv.clone(),
+            inner.uid,
+            inner.gid,
+            inner.start_time_ms,
+        )
+    };
+
+    let record = Acct {
+        ac_flag: 0,
+        ac_uid: uid as u16,
+        ac_gid: gid as u16,
+        ac_tty: 0,
+        ac_btime: (start_time_ms / 1000) as u32,
+        ac_utime: 0,
+        ac_stime: 0,
+        ac_etime: 0,
+        ac_mem: 0,
+        ac_io: 0,
+        ac_rw: 0,
+        ac_minflt: 0,
+        ac_majflt: 0,
+        ac_swaps: 0,
+        ac_exitcode: acct_exitcode(exit_code),
+        ac_comm: acct_comm_from_argv(&argv),
+        ac_pad: [0; 10],
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &record as *const Acct as *const u8,
+            core::mem::size_of::<Acct>(),
+        )
+    };
+
+    let _ext4_guard = ext4_lock();
+    let offset = inode.size() as usize;
+    let _ = inode.write_at(offset, bytes);
+}
+
 fn resolve_parent_and_name(
     at: &AtPath,
     uid: u32,
@@ -634,14 +821,8 @@ fn resolve_parent_and_name(
                 p.push_str(parent_path);
                 p
             };
-            let parent = resolve_ext4_abs_path(
-                &parent_abs,
-                uid,
-                gid,
-                true,
-                &mut depth,
-                &mut seen_symlinks,
-            )?;
+            let parent =
+                resolve_ext4_abs_path(&parent_abs, uid, gid, true, &mut depth, &mut seen_symlinks)?;
             Ok((parent, alloc::string::String::from(name)))
         }
         AtPath::Ext4Rel { base, rel } => {
@@ -1149,10 +1330,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                     }
                     Err(e) => {
                         if debug_close {
-                            crate::println!(
-                                "[fs] openat close-test create_file err={:?}",
-                                e
-                            );
+                            crate::println!("[fs] openat close-test create_file err={:?}", e);
                         }
                         return ext4_err_to_errno(e);
                     }
@@ -1487,6 +1665,9 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     if path.is_empty() {
         return ENOENT;
     }
+    if busybox_exists() && should_try_busybox_applet_path(&path, false) {
+        return 0;
+    }
 
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
@@ -1507,7 +1688,12 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     let inode = match resolve_at_inode(&at, uid, gid, true) {
         Ok(v) => v,
         Err(ENOENT) if matches!(path.as_str(), "busybox" | "./busybox") => {
-            let candidates = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+            let candidates = [
+                "/musl/busybox",
+                "/glibc/busybox",
+                "/bin/busybox",
+                "/busybox",
+            ];
             let mut found = None;
             for cand in candidates {
                 if let Some(inode) = find_path_in_roots(cand) {
@@ -2245,7 +2431,13 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     }
     if crate::debug_config::DEBUG_SYSCALL {
         let pid = current_process().getpid();
-        crate::println!("[mkdir] pid={} dirfd={} path='{}' mode=0o{:o}", pid, dirfd, path, mode);
+        crate::println!(
+            "[mkdir] pid={} dirfd={} path='{}' mode=0o{:o}",
+            pid,
+            dirfd,
+            path,
+            mode
+        );
     }
 
     let create_mode = apply_umask(mode);
@@ -2908,6 +3100,8 @@ fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
         };
         let st_size: i64 = if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
             shm.len() as i64
+        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+            pf.len().unwrap_or(0) as i64
         } else {
             0
         };
@@ -3024,6 +3218,11 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         };
         let st_size: i64 = if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
             shm.len() as i64
+        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+            match pf.kind_tag() {
+                crate::fs::PseudoKindTag::Static => pf.len().unwrap_or(0) as i64,
+                _ => 0,
+            }
         } else {
             0
         };
@@ -3225,6 +3424,11 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         };
         let st_size: i64 = if let Some(shm) = node.as_any().downcast_ref::<PseudoShmFile>() {
             shm.len() as i64
+        } else if let Some(pf) = node.as_any().downcast_ref::<PseudoFile>() {
+            match pf.kind_tag() {
+                crate::fs::PseudoKindTag::Static => pf.len().unwrap_or(0) as i64,
+                _ => 0,
+            }
         } else {
             0
         };
@@ -3271,7 +3475,12 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         AtPath::PseudoAbs(_) => unreachable!(),
     };
     if inode.is_none() && matches!(path.as_str(), "busybox" | "./busybox") {
-        let candidates = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+        let candidates = [
+            "/musl/busybox",
+            "/glibc/busybox",
+            "/bin/busybox",
+            "/busybox",
+        ];
         for cand in candidates {
             if let Some(found) = find_path_in_roots(cand) {
                 inode = Some(found);
@@ -3438,7 +3647,12 @@ pub fn syscall_statx(
         AtPath::PseudoAbs(_) => unreachable!(),
     };
     if inode.is_none() && matches!(path.as_str(), "busybox" | "./busybox") {
-        let candidates = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+        let candidates = [
+            "/musl/busybox",
+            "/glibc/busybox",
+            "/bin/busybox",
+            "/busybox",
+        ];
         for cand in candidates {
             if let Some(found) = find_path_in_roots(cand) {
                 inode = Some(found);

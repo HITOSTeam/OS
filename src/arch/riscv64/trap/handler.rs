@@ -249,6 +249,12 @@ pub fn trap_handler() {
                     [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
                 )
             }; // cx is dropped here, releasing the borrow
+            if let Some(task) = crate::task::processor::current_task() {
+                let mut inner = task.borrow_mut();
+                inner.last_syscall_id = syscall_id;
+                inner.last_syscall_args = args;
+                inner.last_syscall_valid = true;
+            }
 
             // NOTE: Do NOT enable interrupts during syscall execution.
             // This is because syscalls may acquire spin::Mutex locks (e.g., heap allocator,
