@@ -437,6 +437,40 @@ fn is_core_dump_signal(sig: i32) -> bool {
     matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31)
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SigInfo {
+    si_signo: i32,
+    si_errno: i32,
+    si_code: i32,
+    _pad0: i32,
+    si_pid: i32,
+    si_uid: u32,
+    si_status: i32,
+    _pad1: i32,
+    si_utime: i64,
+    si_stime: i64,
+    _pad2: [u8; 80],
+}
+
+impl Default for SigInfo {
+    fn default() -> Self {
+        Self {
+            si_signo: 0,
+            si_errno: 0,
+            si_code: 0,
+            _pad0: 0,
+            si_pid: 0,
+            si_uid: 0,
+            si_status: 0,
+            _pad1: 0,
+            si_utime: 0,
+            si_stime: 0,
+            _pad2: [0u8; 80],
+        }
+    }
+}
+
 fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
     const EINTR: isize = -4;
     let (pending, mask) = {
@@ -554,9 +588,20 @@ fn try_exec_busybox_applet(
     Some(exec_interpreter(bb_data, new_args, envs.to_vec()))
 }
 
-pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: usize) -> isize {
+pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: usize) -> isize {
     const WNOHANG: usize = 0x00000001;
+    const WUNTRACED: usize = 0x00000002;
+    const WCONTINUED: usize = 0x00000008;
     const ECHILD: isize = -10;
+    const EINVAL: isize = -22;
+    const ESRCH: isize = -3;
+    let allowed = WNOHANG | WUNTRACED | WCONTINUED;
+    if (options & !allowed) != 0 {
+        return EINVAL;
+    }
+    if pid == isize::MIN || pid == (i32::MIN as isize) {
+        return ESRCH;
+    }
     let token = get_current_token();
     let mut temp_exit_code: i32 = 0;
     let mut temp_signal: Option<i32> = None;
@@ -571,6 +616,9 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
             return action;
         }
         let mut process_inner = cur_process.borrow_mut();
+        let parent_pgid = process_inner.pgid;
+        let mut stop_event: Option<(usize, i32)> = None;
+        let mut cont_event: Option<usize> = None;
         let (has_matching_child, zombie_pid) = if process_inner.children.is_empty() {
             (false, None)
         } else {
@@ -580,20 +628,41 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                 let child_inner = child.borrow_mut();
                 let matches = match pid {
                     -1 => true, // any child
-                    0 => true,  // treat as any (pgid not modeled)
+                    0 => child_inner.pgid == parent_pgid,
                     p if p > 0 => child.pid.0 == p as usize,
-                    _ => true, // negative pgid not modeled; treat as any
+                    p => child_inner.pgid == (-p) as usize,
                 };
                 if matches {
                     has_match = true;
                 }
                 if matches && child_inner.is_zombie {
                     temp_exit_code = child_inner.exit_code;
-                    temp_signal = child_inner.signals.check_error().map(|(code, _)| -code);
+                    temp_signal = if temp_exit_code < 0 {
+                        Some(-temp_exit_code)
+                    } else {
+                        None
+                    };
                     temp_coredump = temp_signal
                         .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
                         .unwrap_or(false);
                     found = Some((index, child.pid.0));
+                    break;
+                }
+                if matches
+                    && (options & WUNTRACED) != 0
+                    && child_inner.stopped
+                    && child_inner.stop_pending
+                {
+                    let sig = if child_inner.stop_signal != 0 {
+                        child_inner.stop_signal
+                    } else {
+                        crate::task::signal::SIGSTOP_NUM as i32
+                    };
+                    stop_event = Some((child.pid.0, sig));
+                    break;
+                }
+                if matches && (options & WCONTINUED) != 0 && child_inner.continued {
+                    cont_event = Some(child.pid.0);
                     break;
                 }
             }
@@ -604,6 +673,42 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
                 (has_match, None)
             }
         };
+
+        if let Some((pid, sig)) = stop_event {
+            let child = process_inner
+                .children
+                .iter()
+                .find(|c| c.getpid() == pid)
+                .cloned();
+            if let Some(child) = child {
+                let mut child_inner = child.borrow_mut();
+                child_inner.stop_pending = false;
+                child_inner.stop_signal = sig;
+            }
+            drop(process_inner);
+            if wstatus_ptr != 0 {
+                let status = ((sig & 0xff) << 8) | 0x7f;
+                write_user_value(token, wstatus_ptr as *mut i32, &status);
+            }
+            return pid as isize;
+        }
+        if let Some(pid) = cont_event {
+            let child = process_inner
+                .children
+                .iter()
+                .find(|c| c.getpid() == pid)
+                .cloned();
+            if let Some(child) = child {
+                let mut child_inner = child.borrow_mut();
+                child_inner.continued = false;
+            }
+            drop(process_inner);
+            if wstatus_ptr != 0 {
+                let status = 0xffff;
+                write_user_value(token, wstatus_ptr as *mut i32, &status);
+            }
+            return pid as isize;
+        }
 
         if let Some(pid) = zombie_pid {
             drop(process_inner);
@@ -647,12 +752,183 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, _options: usize, _rusage: u
         }
 
         // Non-blocking wait: return immediately if no child has exited yet.
-        if (_options & WNOHANG) != 0 {
+        if (options & WNOHANG) != 0 {
             drop(process_inner);
             return 0;
         }
 
-        // Block until a child exits.
+        // Block until a child exits or changes state.
+        process_inner.wait_queue.push_back(task);
+        drop(process_inner);
+        block_current_and_run_next();
+    }
+}
+
+pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
+    const P_ALL: usize = 0;
+    const P_PID: usize = 1;
+    const P_PGID: usize = 2;
+    const WNOHANG: usize = 0x00000001;
+    const WSTOPPED: usize = 0x00000002;
+    const WEXITED: usize = 0x00000004;
+    const WCONTINUED: usize = 0x00000008;
+    const WNOWAIT: usize = 0x01000000;
+    const SIGCHLD: i32 = 17;
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    const CLD_STOPPED: i32 = 5;
+    const CLD_CONTINUED: i32 = 6;
+    const ECHILD: isize = -10;
+    const EINVAL: isize = -22;
+    const EFAULT: isize = -14;
+
+    let allowed = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT;
+    if (options & !allowed) != 0 {
+        return EINVAL;
+    }
+    if (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0 {
+        return EINVAL;
+    }
+    if infop == 0 {
+        return EFAULT;
+    }
+    if matches!(idtype, P_PID) && id == 0 {
+        return EINVAL;
+    }
+
+    let token = get_current_token();
+    loop {
+        let cur_process = current_process();
+        let task = current_task().unwrap();
+        if let Some(action) = wait4_pending_action(&task) {
+            let mut process_inner = cur_process.borrow_mut();
+            process_inner.wait_queue.retain(|t| !Arc::ptr_eq(t, &task));
+            drop(process_inner);
+            return action;
+        }
+
+        let mut process_inner = cur_process.borrow_mut();
+        let parent_pgid = process_inner.pgid;
+        let mut has_match = false;
+        let mut found_zombie: Option<(usize, i32, Option<i32>, bool, u32)> = None;
+        let mut found_stop: Option<(usize, i32, u32)> = None;
+        let mut found_cont: Option<(usize, u32)> = None;
+
+        for (index, child) in process_inner.children.iter().enumerate() {
+            let child_inner = child.borrow_mut();
+            let matches = match idtype {
+                P_ALL => true,
+                P_PID => child.pid.0 == id,
+                P_PGID => {
+                    let target = if id == 0 { parent_pgid } else { id };
+                    child_inner.pgid == target
+                }
+                _ => return EINVAL,
+            };
+            if !matches {
+                continue;
+            }
+            has_match = true;
+            if (options & WEXITED) != 0 && child_inner.is_zombie {
+                let exit_code = child_inner.exit_code;
+                let signal = if exit_code < 0 { Some(-exit_code) } else { None };
+                let coredump = signal
+                    .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
+                    .unwrap_or(false);
+                found_zombie = Some((index, exit_code, signal, coredump, child_inner.uid));
+                break;
+            }
+            if (options & WSTOPPED) != 0 && child_inner.stopped && child_inner.stop_pending {
+                let sig = if child_inner.stop_signal != 0 {
+                    child_inner.stop_signal
+                } else {
+                    crate::task::signal::SIGSTOP_NUM as i32
+                };
+                found_stop = Some((child.pid.0, sig, child_inner.uid));
+                break;
+            }
+            if (options & WCONTINUED) != 0 && child_inner.continued {
+                found_cont = Some((child.pid.0, child_inner.uid));
+                break;
+            }
+        }
+
+        if let Some((index, exit_code, signal, coredump, uid)) = found_zombie {
+            let child_pid = process_inner.children[index].pid.0;
+            if (options & WNOWAIT) == 0 {
+                process_inner.children.remove(index);
+            }
+            drop(process_inner);
+            if (options & WNOWAIT) == 0 {
+                crate::task::manager::remove_from_pid2process(child_pid);
+            }
+            let (si_status, si_code) = if let Some(sig) = signal {
+                (
+                    sig,
+                    if coredump { CLD_DUMPED } else { CLD_KILLED },
+                )
+            } else {
+                (exit_code & 0xff, CLD_EXITED)
+            };
+            let mut info = SigInfo::default();
+            info.si_signo = SIGCHLD;
+            info.si_code = si_code;
+            info.si_pid = child_pid as i32;
+            info.si_uid = uid;
+            info.si_status = si_status;
+            write_user_value(token, infop as *mut SigInfo, &info);
+            return 0;
+        }
+
+        if let Some((pid, sig, uid)) = found_stop {
+            if (options & WNOWAIT) == 0 {
+                if let Some(child) = process_inner.children.iter().find(|c| c.getpid() == pid) {
+                    let mut child_inner = child.borrow_mut();
+                    child_inner.stop_pending = false;
+                }
+            }
+            drop(process_inner);
+            let mut info = SigInfo::default();
+            info.si_signo = SIGCHLD;
+            info.si_code = CLD_STOPPED;
+            info.si_pid = pid as i32;
+            info.si_uid = uid;
+            info.si_status = sig;
+            write_user_value(token, infop as *mut SigInfo, &info);
+            return 0;
+        }
+
+        if let Some((pid, uid)) = found_cont {
+            if (options & WNOWAIT) == 0 {
+                if let Some(child) = process_inner.children.iter().find(|c| c.getpid() == pid) {
+                    let mut child_inner = child.borrow_mut();
+                    child_inner.continued = false;
+                }
+            }
+            drop(process_inner);
+            let mut info = SigInfo::default();
+            info.si_signo = SIGCHLD;
+            info.si_code = CLD_CONTINUED;
+            info.si_pid = pid as i32;
+            info.si_uid = uid;
+            info.si_status = crate::task::signal::SIGCONT_NUM as i32;
+            write_user_value(token, infop as *mut SigInfo, &info);
+            return 0;
+        }
+
+        if !has_match {
+            drop(process_inner);
+            return ECHILD;
+        }
+
+        if (options & WNOHANG) != 0 {
+            drop(process_inner);
+            let info = SigInfo::default();
+            write_user_value(token, infop as *mut SigInfo, &info);
+            return 0;
+        }
+
         process_inner.wait_queue.push_back(task);
         drop(process_inner);
         block_current_and_run_next();

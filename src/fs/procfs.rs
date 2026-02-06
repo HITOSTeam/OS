@@ -145,6 +145,13 @@ pub fn init_procfs() {
 
     let sys_dir = ensure_dir(&proc_inode, "sys", 0o555);
     if let Some(sys_dir) = sys_dir {
+        let kernel_dir = ensure_dir(&sys_dir, "kernel", 0o555);
+        if let Some(kernel_dir) = kernel_dir {
+            let core_pattern = ensure_file(&kernel_dir, "core_pattern", 0o644);
+            if let Some(core_pattern) = core_pattern {
+                let _ = core_pattern.write_at(0, b"core\n");
+            }
+        }
         let fs_dir = ensure_dir(&sys_dir, "fs", 0o555);
         if let Some(fs_dir) = fs_dir {
             let pipe_max = ensure_file(&fs_dir, "pipe-max-size", 0o444);
@@ -541,14 +548,19 @@ fn proc_pid_status(pid: u32) -> String {
         .unwrap_or("CongCore")
         .replace(')', "_");
 
-    let state_char = match main_state {
-        TaskStatus::Running => 'R',
-        TaskStatus::Ready => 'R',
-        TaskStatus::Blocked => 'S',
+    let state_char = if inner.stopped {
+        'T'
+    } else {
+        match main_state {
+            TaskStatus::Running => 'R',
+            TaskStatus::Ready => 'R',
+            TaskStatus::Blocked => 'S',
+        }
     };
     let state_desc = match state_char {
         'R' => "R (running)",
         'S' => "S (sleeping)",
+        'T' => "T (stopped)",
         _ => "R (running)",
     };
     alloc::format!(
@@ -596,10 +608,14 @@ fn proc_pid_stat(pid: u32) -> String {
         .unwrap_or("CongCore")
         .replace(')', "_");
 
-    let state_char = match main_state {
-        TaskStatus::Running => 'R',
-        TaskStatus::Ready => 'R',
-        TaskStatus::Blocked => 'S',
+    let state_char = if inner.stopped {
+        'T'
+    } else {
+        match main_state {
+            TaskStatus::Running => 'R',
+            TaskStatus::Ready => 'R',
+            TaskStatus::Blocked => 'S',
+        }
     };
 
     const HZ: u64 = 100;
@@ -610,7 +626,7 @@ fn proc_pid_stat(pid: u32) -> String {
         (vsize + config::PAGE_SIZE as u64 - 1) / config::PAGE_SIZE as u64
     };
 
-    let pgrp = pid;
+    let pgrp = inner.pgid as u32;
     let session = pid;
     let tty_nr = 0;
     let tpgid = 0;

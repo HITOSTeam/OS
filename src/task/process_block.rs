@@ -583,6 +583,13 @@ pub struct ProcessControlBlock {
 // 里面存放线程共用的 资源
 pub struct ProcessControlBlockInner {
     pub is_zombie: bool,
+    /// Process group ID (PGID).
+    pub pgid: usize,
+    /// Stop/continue state for waitpid job-control.
+    pub stopped: bool,
+    pub stop_signal: i32,
+    pub stop_pending: bool,
+    pub continued: bool,
     pub memory_set: MemorySet,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
@@ -750,6 +757,7 @@ impl ProcessControlBlock {
         let heap_start = ustack_base + USER_STACK_SIZE;
         // allocate a pid
         let pid_handle = pid_alloc();
+        let pid = pid_handle.0;
         let args = vec![String::from("init_proc")];
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
             new_token,
@@ -764,6 +772,11 @@ impl ProcessControlBlock {
             pid: pid_handle,
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
+                pgid: pid,
+                stopped: false,
+                stop_signal: 0,
+                stop_pending: false,
+                continued: false,
                 memory_set,
                 parent: None,
                 children: Vec::new(),
@@ -1100,6 +1113,11 @@ impl ProcessControlBlock {
             pid,
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
+                pgid: parent.pgid,
+                stopped: false,
+                stop_signal: 0,
+                stop_pending: false,
+                continued: false,
                 memory_set,
                 parent: Some(Arc::downgrade(self)),
                 children: Vec::new(),

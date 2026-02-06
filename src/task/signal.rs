@@ -5,8 +5,12 @@ pub const SIG_IGN: usize = 1;
 pub const SIGPIPE_NUM: usize = 13;
 pub const SIGALRM_NUM: usize = 14;
 pub const SIGCHLD_NUM: usize = 17;
+pub const SIGCONT_NUM: usize = 18;
 pub const SIGKILL_NUM: usize = 9;
 pub const SIGSTOP_NUM: usize = 19;
+pub const SIGTSTP_NUM: usize = 20;
+pub const SIGTTIN_NUM: usize = 21;
+pub const SIGTTOU_NUM: usize = 22;
 use bitflags::bitflags;
 
 use alloc::sync::Arc;
@@ -19,7 +23,7 @@ use crate::{
     task::processor::current_process,
     task::{
         manager::{pid2process, wakeup_task},
-        processor::suspend_current_and_run_next,
+        processor::{current_task, suspend_current_and_run_next},
         task_block::TaskControlBlock,
     },
     time::get_time_ms,
@@ -131,22 +135,49 @@ bitflags! {
 }
 impl SignalFlags {
     pub fn check_error(&self) -> Option<(i32, &'static str)> {
-        if self.contains(Self::SIGINT) {
+        // Linux default actions: terminate (with/without core) for these signals.
+        if self.contains(Self::SIGHUP) {
+            Some((-1, "Hangup, SIGHUP=1"))
+        } else if self.contains(Self::SIGINT) {
             Some((-2, "Killed, SIGINT=2"))
+        } else if self.contains(Self::SIGQUIT) {
+            Some((-3, "Quit, SIGQUIT=3"))
         } else if self.contains(Self::SIGILL) {
             Some((-4, "Illegal Instruction, SIGILL=4"))
+        } else if self.contains(Self::SIGTRAP) {
+            Some((-5, "Trace/breakpoint trap, SIGTRAP=5"))
         } else if self.contains(Self::SIGABRT) {
             Some((-6, "Aborted, SIGABRT=6"))
+        } else if self.contains(Self::SIGBUS) {
+            Some((-7, "Bus error, SIGBUS=7"))
         } else if self.contains(Self::SIGFPE) {
             Some((-8, "Erroneous Arithmetic Operation, SIGFPE=8"))
         } else if self.contains(Self::SIGKILL) {
             Some((-9, "Killed, SIGKILL=9"))
+        } else if self.contains(Self::SIGUSR1) {
+            Some((-10, "User-defined signal 1, SIGUSR1=10"))
         } else if self.contains(Self::SIGSEGV) {
             Some((-11, "Segmentation Fault, SIGSEGV=11"))
+        } else if self.contains(Self::SIGUSR2) {
+            Some((-12, "User-defined signal 2, SIGUSR2=12"))
         } else if self.contains(Self::SIGPIPE) {
             Some((-13, "Broken pipe, SIGPIPE=13"))
+        } else if self.contains(Self::SIGALRM) {
+            Some((-14, "Alarm clock, SIGALRM=14"))
         } else if self.contains(Self::SIGTERM) {
             Some((-15, "Terminated, SIGTERM=15"))
+        } else if self.contains(Self::SIGXCPU) {
+            Some((-24, "CPU time limit exceeded, SIGXCPU=24"))
+        } else if self.contains(Self::SIGXFSZ) {
+            Some((-25, "File size limit exceeded, SIGXFSZ=25"))
+        } else if self.contains(Self::SIGVTALRM) {
+            Some((-26, "Virtual alarm clock, SIGVTALRM=26"))
+        } else if self.contains(Self::SIGPROF) {
+            Some((-27, "Profiling timer expired, SIGPROF=27"))
+        } else if self.contains(Self::SIGIO) {
+            Some((-29, "I/O possible, SIGIO/SIGPOLL=29"))
+        } else if self.contains(Self::SIGSYS) {
+            Some((-31, "Bad system call, SIGSYS=31"))
         } else {
             //println!("[K] signalflags check_error  {:?}", self);
             None
@@ -154,9 +185,64 @@ impl SignalFlags {
     }
 }
 pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
-    let process = current_process();
-    let process_inner = process.borrow_mut();
-    process_inner.signals.check_error()
+    let Some(task) = current_task() else {
+        return None;
+    };
+    let (pending, mask) = {
+        let inner = task.borrow_mut();
+        (inner.pending_signals, inner.signal_mask)
+    };
+    let mut ready = pending_unmasked_bits(pending, mask, false);
+    if ready == 0 {
+        return None;
+    }
+    while ready != 0 {
+        let signum = ready.trailing_zeros() as usize + 1;
+        ready &= ready - 1;
+        let Some(bit) = signal_bit(signum) else {
+            continue;
+        };
+        let handler = {
+            let process = current_process();
+            let inner = process.borrow_mut();
+            if signum <= MAX_SIG {
+                let legacy = inner.signals_actions.table[signum].handler;
+                if legacy != 0 {
+                    legacy
+                } else {
+                    inner
+                        .rt_sig_handlers
+                        .get(signum)
+                        .map(|a| a.handler)
+                        .unwrap_or(SIG_DFL)
+                }
+            } else {
+                inner
+                    .rt_sig_handlers
+                    .get(signum)
+                    .map(|a| a.handler)
+                    .unwrap_or(SIG_DFL)
+            }
+        };
+        if handler == SIG_IGN {
+            // Ignored signals are discarded.
+            let mut inner = task.borrow_mut();
+            inner.pending_signals &= !bit;
+            continue;
+        }
+        if handler != SIG_DFL {
+            // User handler present: let normal delivery handle it.
+            continue;
+        }
+        if signum <= MAX_SIG {
+            if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
+                if let Some((errno, msg)) = flag.check_error() {
+                    return Some((errno, msg));
+                }
+            }
+        }
+    }
+    None
 }
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
@@ -241,8 +327,19 @@ pub fn set_signal(
         }
         let prev_action = inner.signals_actions.table[signum as usize];
         write_user_value(token, old_action, &prev_action);
-        inner.signals_actions.table[signum as usize] =
-            read_user_value(token, action as *const SignalAction);
+        let new_action = read_user_value(token, action as *const SignalAction);
+        inner.signals_actions.table[signum as usize] = new_action;
+        // Keep rt_sigaction table in sync so delivery uses the latest handler.
+        if (signum as usize) <= RT_SIG_MAX
+            && (signum as usize) < inner.rt_sig_handlers.len()
+        {
+            inner.rt_sig_handlers[signum as usize] = RtSigAction {
+                handler: new_action.handler,
+                flags: 0,
+                restorer: 0,
+                mask: new_action.mask.bits() as u64,
+            };
+        }
         0
     } else {
         -1

@@ -1,11 +1,12 @@
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::config::SIGRETURN_TRAMPOLINE;
 use crate::arch::{
-    REG_A0, REG_A1, REG_A2, REG_A3, REG_A4, REG_A5, REG_A6, REG_A7, REG_GP, REG_RA, REG_S0,
-    REG_S1, REG_SP, REG_T0, REG_T1, REG_T2, REG_TP,
+    REG_A0, REG_A1, REG_A2, REG_A3, REG_A4, REG_A5, REG_A6, REG_A7, REG_GP, REG_RA, REG_S0, REG_S1,
+    REG_SP, REG_T0, REG_T1, REG_T2, REG_TP,
 };
+use crate::config::SIGRETURN_TRAMPOLINE;
 use crate::{
     arch,
     debug_config::{DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
@@ -18,11 +19,12 @@ use crate::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
         signal::{
-            has_unmasked_pending, kill, kill_current, pending_unmasked_bits, set_signal,
-            set_signal_mask, signal_bit, take_first_unmasked, RT_SIG_MAX, RtSigAction, SIGALRM_NUM,
-            SIG_DFL, SIG_IGN, SignalAction, SignalFlags,
+            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM,
+            SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags, has_unmasked_pending,
+            kill, kill_current, pending_unmasked_bits, set_signal, set_signal_mask, signal_bit,
+            take_first_unmasked,
         },
-        task_block::{SigSavedContext, TaskControlBlock},
+        task_block::{SigSavedContext, TaskControlBlock, TaskStatus},
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -44,6 +46,32 @@ const SA_SIGINFO: usize = 0x4;
 const SA_NODEFER: usize = 0x40000000;
 pub const SA_RESTART: usize = 0x10000000;
 pub const ERESTARTSYS: isize = -512;
+
+fn is_stop_signal(signum: usize) -> bool {
+    matches!(
+        signum,
+        SIGSTOP_NUM | SIGTSTP_NUM | SIGTTIN_NUM | SIGTTOU_NUM
+    )
+}
+
+fn wake_parent_waiters() {
+    let child = current_process();
+    let parent = {
+        let inner = child.borrow_mut();
+        inner.parent.as_ref().and_then(|p| p.upgrade())
+    };
+    let Some(parent) = parent else {
+        return;
+    };
+    crate::task::signal::queue_process_signal(parent.getpid(), SIGCHLD);
+    let waiters = {
+        let mut parent_inner = parent.borrow_mut();
+        parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
+    };
+    for waiter in waiters {
+        wakeup_task(waiter);
+    }
+}
 
 // pub fn syscall_sigreturn() -> isize {
 //     sigreturn()
@@ -228,10 +256,7 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
         };
         updated &= !(sigkill_bit | sigstop_bit);
         inner.signal_mask = updated;
-        if DEBUG_UNIXBENCH
-            && sigalrm_bit != 0
-            && ((old_mask ^ updated) & sigalrm_bit) != 0
-        {
+        if DEBUG_UNIXBENCH && sigalrm_bit != 0 && ((old_mask ^ updated) & sigalrm_bit) != 0 {
             let pid = current_process().getpid();
             let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
             crate::log_if!(
@@ -817,6 +842,12 @@ pub fn maybe_deliver_signal() {
             .copied()
             .unwrap_or_default()
     };
+    let restore_sigsuspend_mask = |task: &Arc<TaskControlBlock>| {
+        let mut inner = task.borrow_mut();
+        if let Some(saved) = inner.sigsuspend_old_mask.take() {
+            inner.signal_mask = saved;
+        }
+    };
     if DEBUG_PTHREAD {
         crate::println!(
             "[signal] action signo={} handler={:#x} flags={:#x} restorer={:#x} mask={:#x}",
@@ -827,11 +858,81 @@ pub fn maybe_deliver_signal() {
             action.mask
         );
     }
-    if action.handler == SIG_IGN {
-        let mut inner = task.borrow_mut();
-        if let Some(saved) = inner.sigsuspend_old_mask.take() {
-            inner.signal_mask = saved;
+    if signum == SIGCONT_NUM {
+        let was_stopped = {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            if inner.stopped {
+                inner.stopped = false;
+                inner.continued = true;
+                inner.stop_pending = false;
+                true
+            } else {
+                false
+            }
+        };
+        if was_stopped {
+            let tasks = {
+                let process = current_process();
+                let inner = process.borrow_mut();
+                inner
+                    .tasks
+                    .iter()
+                    .filter_map(|t| t.as_ref().cloned())
+                    .collect::<Vec<_>>()
+            };
+            for t in tasks {
+                let mut t_inner = t.borrow_mut();
+                if !t_inner.stopped_by_signal {
+                    continue;
+                }
+                t_inner.stopped_by_signal = false;
+                drop(t_inner);
+                wakeup_task(t);
+            }
+            wake_parent_waiters();
         }
+        if action.handler == SIG_IGN || action.handler == SIG_DFL {
+            restore_sigsuspend_mask(&task);
+            return;
+        }
+    }
+    if is_stop_signal(signum) {
+        if signum != SIGSTOP_NUM && action.handler == SIG_IGN {
+            restore_sigsuspend_mask(&task);
+            return;
+        }
+        if action.handler == SIG_DFL || signum == SIGSTOP_NUM {
+            let tasks = {
+                let process = current_process();
+                let mut inner = process.borrow_mut();
+                if !inner.stopped {
+                    inner.stopped = true;
+                    inner.stop_signal = signum as i32;
+                    inner.stop_pending = true;
+                    inner.continued = false;
+                }
+                inner
+                    .tasks
+                    .iter()
+                    .filter_map(|t| t.as_ref().cloned())
+                    .collect::<Vec<_>>()
+            };
+            for t in tasks {
+                let mut t_inner = t.borrow_mut();
+                if t_inner.task_status != TaskStatus::Blocked {
+                    t_inner.task_status = TaskStatus::Blocked;
+                    t_inner.stopped_by_signal = true;
+                }
+            }
+            wake_parent_waiters();
+            restore_sigsuspend_mask(&task);
+            block_current_and_run_next();
+            return;
+        }
+    }
+    if action.handler == SIG_IGN {
+        restore_sigsuspend_mask(&task);
         return;
     }
     if action.handler == SIG_DFL {
@@ -844,10 +945,7 @@ pub fn maybe_deliver_signal() {
                 }
             }
         }
-        let mut inner = task.borrow_mut();
-        if let Some(saved) = inner.sigsuspend_old_mask.take() {
-            inner.signal_mask = saved;
-        }
+        restore_sigsuspend_mask(&task);
         return;
     }
 

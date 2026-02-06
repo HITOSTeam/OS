@@ -436,6 +436,8 @@ pub struct TaskControlBlockInner {
     pub last_syscall_id: usize,
     pub last_syscall_args: [usize; 6],
     pub last_syscall_valid: bool,
+    /// Task was blocked due to a job-control stop signal.
+    pub stopped_by_signal: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -492,6 +494,7 @@ impl TaskControlBlock {
                 last_syscall_id: 0,
                 last_syscall_args: [0; 6],
                 last_syscall_valid: false,
+                stopped_by_signal: false,
             }),
         })
     }
@@ -540,6 +543,7 @@ impl TaskControlBlock {
                 last_syscall_id: 0,
                 last_syscall_args: [0; 6],
                 last_syscall_valid: false,
+                stopped_by_signal: false,
             }),
         })
     }

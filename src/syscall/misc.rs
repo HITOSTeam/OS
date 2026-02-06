@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use crate::{
     arch,
     debug_config::DEBUG_PTHREAD,
@@ -10,7 +11,11 @@ use crate::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
-    task::processor::{current_process, current_task},
+    task::{
+        manager::pid2process,
+        processor::{block_current_and_run_next, current_process, current_task},
+        signal::has_unmasked_pending,
+    },
     time::get_time,
     trap::get_current_token,
 };
@@ -38,6 +43,7 @@ const EFAULT: isize = -14;
 const ENOENT: isize = -2;
 const ENODEV: isize = -19;
 const ENOTDIR: isize = -20;
+const ESRCH: isize = -3;
 
 pub(crate) fn encode_linux_tid(tgid: usize, tid_index: usize) -> usize {
     if tid_index == 0 {
@@ -205,9 +211,48 @@ pub fn syscall_getppid() -> isize {
 
 /// Linux `setpgid(2)` (syscall 154 on riscv64).
 ///
-/// Process groups are not modeled; accept and return success for compatibility.
-pub fn syscall_setpgid(_pid: usize, _pgid: usize) -> isize {
+/// Minimal process-group support for waitpid job-control tests.
+pub fn syscall_setpgid(pid: usize, pgid: usize) -> isize {
+    let cur = current_process();
+    let cur_pid = cur.getpid();
+    let target_pid = if pid == 0 { cur_pid } else { pid };
+    let new_pgid = if pgid == 0 { target_pid } else { pgid };
+
+    let target = if target_pid == cur_pid {
+        Some(Arc::clone(&cur))
+    } else {
+        let child = {
+            let inner = cur.borrow_mut();
+            inner
+                .children
+                .iter()
+                .find(|c| c.getpid() == target_pid)
+                .cloned()
+        };
+        child
+    };
+
+    let Some(target) = target else {
+        return ESRCH;
+    };
+
+    let mut inner = target.borrow_mut();
+    inner.pgid = new_pgid;
     0
+}
+
+/// Linux `getpgid(2)` (syscall 155 on riscv64).
+pub fn syscall_getpgid(pid: usize) -> isize {
+    let cur = current_process();
+    let cur_pid = cur.getpid();
+    let target_pid = if pid == 0 { cur_pid } else { pid };
+    if target_pid == cur_pid {
+        return cur.borrow_mut().pgid as isize;
+    }
+    let Some(target) = pid2process(target_pid) else {
+        return ESRCH;
+    };
+    target.borrow_mut().pgid as isize
 }
 
 /// Linux `getsid(2)` (syscall 156 on riscv64).
@@ -223,7 +268,10 @@ pub fn syscall_getsid(pid: usize) -> isize {
 ///
 /// We don't model sessions; treat the process PID as SID and return it.
 pub fn syscall_setsid() -> isize {
-    current_process().getpid() as isize
+    let process = current_process();
+    let pid = process.getpid();
+    process.borrow_mut().pgid = pid;
+    pid as isize
 }
 
 /// Linux `set_tid_address(2)` (syscall 96 on riscv64).
@@ -745,9 +793,29 @@ pub fn syscall_ppoll(
     const POLLIN: i16 = 0x0001;
     const POLLOUT: i16 = 0x0004;
     const EBADF: isize = -9;
+    const EINTR: isize = -4;
 
-    if nfds == 0 || fds_ptr == 0 {
-        return 0;
+    if nfds == 0 {
+        if _tmo_p != 0 {
+            return crate::syscall::time_sys::syscall_nanosleep(_tmo_p, 0);
+        }
+        if _sigmask != 0 {
+            return crate::syscall::signal::syscall_rt_sigsuspend(_sigmask, _sigsetsize);
+        }
+        loop {
+            let task = current_task().unwrap();
+            let (pending, mask) = {
+                let inner = task.borrow_mut();
+                (inner.pending_signals, inner.signal_mask)
+            };
+            if has_unmasked_pending(pending, mask, false) {
+                return EINTR;
+            }
+            block_current_and_run_next();
+        }
+    }
+    if fds_ptr == 0 {
+        return EFAULT;
     }
 
     let token = get_current_token();

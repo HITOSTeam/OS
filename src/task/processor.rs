@@ -31,7 +31,9 @@ fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
         return;
     }
     let _ = try_write_user_value(token, ctid as *mut i32, &0);
-    let _ = futex_wake(pid, ctid, 1);
+    // Wake both private/shared futex keys; tid-clears don't encode the flag.
+    let _ = futex_wake((pid, ctid), ctid, 1);
+    let _ = futex_wake((0, ctid), ctid, 1);
 }
 pub struct Processor {
     now_task_block: Option<Arc<TaskControlBlock>>,
@@ -336,15 +338,9 @@ pub fn suspend_current_and_run_next() {
     // trap handler's "check signal then return to user" path).
     //
     // Use `try_borrow_mut` to avoid deadlocking if the caller already holds the PCB lock.
-    {
-        let process = current_process();
-        let fatal = process
-            .try_borrow_mut()
-            .and_then(|inner| inner.signals.check_error());
-        if let Some((errno, msg)) = fatal {
-            crate::println!("[kernel] {}", msg);
-            exit_current_and_run_next(errno);
-        }
+    if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
+        crate::println!("[kernel] {}", msg);
+        exit_current_and_run_next(errno);
     }
     // There must be an application running.
     let task = take_current_task().unwrap();
@@ -369,15 +365,9 @@ pub fn suspend_current_and_run_next() {
 pub fn block_current_and_run_next() {
     // Same rationale as in `suspend_current_and_run_next()`: a task can be stuck
     // yielding within a syscall (interrupts disabled), so handle fatal signals here.
-    {
-        let process = current_process();
-        let fatal = process
-            .try_borrow_mut()
-            .and_then(|inner| inner.signals.check_error());
-        if let Some((errno, msg)) = fatal {
-            crate::println!("[kernel] {}", msg);
-            exit_current_and_run_next(errno);
-        }
+    if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
+        crate::println!("[kernel] {}", msg);
+        exit_current_and_run_next(errno);
     }
     // There must be an application running.
     let task = take_current_task().unwrap();

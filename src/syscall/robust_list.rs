@@ -36,7 +36,10 @@ fn handle_futex_death(token: usize, pid: usize, node: *mut RobustList, offset: u
     let new_val = (futex_word & FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
     let _ = try_write_user_value(token, futex_addr, &new_val);
     if (futex_word & FUTEX_WAITERS) != 0 {
-        let _ = futex_wake(pid, futex_addr as usize, 1);
+        // The robust list does not encode whether the futex is private or shared.
+        // Wake both key variants to match Linux behavior for robust mutexes.
+        let _ = futex_wake((pid, futex_addr as usize), futex_addr as usize, 1);
+        let _ = futex_wake((0, futex_addr as usize), futex_addr as usize, 1);
     }
 }
 

@@ -116,7 +116,9 @@ fn process_delayed_tid_clears(current_ms: usize) {
         };
         let token = proc.borrow_mut().get_user_token();
         let _ = crate::mm::try_write_user_value(token, entry.ctid as *mut i32, &0);
-        let _ = futex_wake(entry.pid, entry.ctid, 1);
+        // Wake both private/shared futex keys; tid-clears don't encode the flag.
+        let _ = futex_wake((entry.pid, entry.ctid), entry.ctid, 1);
+        let _ = futex_wake((0, entry.ctid), entry.ctid, 1);
     }
 }
 

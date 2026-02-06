@@ -61,12 +61,14 @@ pub fn syscall_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 }
 
 pub fn syscall_exit(_code: usize) -> isize {
-    exit_current_and_run_next(_code as i32);
+    let code = ((_code as i32) & 0xff) as i32;
+    exit_current_and_run_next(code);
     return 0;
 }
 
 pub fn syscall_exit_group(_code: usize) -> isize {
-    exit_group_and_run_next(_code as i32);
+    let code = ((_code as i32) & 0xff) as i32;
+    exit_group_and_run_next(code);
     0
 }
 // the below one is just for testing

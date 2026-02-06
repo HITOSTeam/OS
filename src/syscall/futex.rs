@@ -36,7 +36,7 @@ const FUTEX_PRIVATE_FLAG: usize = 128;
 const FUTEX_CLOCK_REALTIME: usize = 256;
 const FUTEX_CMD_MASK: usize = 0x7f;
 
-type FutexKey = (usize, usize); // (pid, uaddr)
+type FutexKey = (usize, usize); // (key_pid, uaddr)
 
 lazy_static! {
     static ref FUTEX_QUEUES: Mutex<BTreeMap<FutexKey, VecDeque<Arc<TaskControlBlock>>>> =
@@ -66,8 +66,16 @@ fn pending_unmasked_signal() -> bool {
     has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
 }
 
-fn remove_waiter(pid: usize, uaddr: usize, task: &Arc<TaskControlBlock>) {
-    let key = (pid, uaddr);
+fn futex_key(pid: usize, uaddr: usize, private: bool) -> FutexKey {
+    if private {
+        (pid, uaddr)
+    } else {
+        // Process-shared futex: key by address only.
+        (0, uaddr)
+    }
+}
+
+fn remove_waiter(key: FutexKey, task: &Arc<TaskControlBlock>) {
     let mut map = FUTEX_QUEUES.lock();
     let Some(queue) = map.get_mut(&key) else {
         return;
@@ -86,14 +94,18 @@ pub fn remove_futex_waiters(task: &Arc<TaskControlBlock>) {
     });
 }
 
-pub(crate) fn futex_wake(pid: usize, uaddr: usize, nr_wake: usize) -> isize {
+pub(crate) fn futex_wake(key: FutexKey, uaddr: usize, nr_wake: usize) -> isize {
     if uaddr == 0 {
         return EINVAL;
     }
     if DEBUG_FUTEX {
-        log::debug!("[futex_wake] pid={} uaddr={:#x} nr={}", pid, uaddr, nr_wake);
+        log::debug!(
+            "[futex_wake] key_pid={} uaddr={:#x} nr={}",
+            key.0,
+            uaddr,
+            nr_wake
+        );
     }
-    let key = (pid, uaddr);
     let mut map = FUTEX_QUEUES.lock();
     let Some(queue) = map.get_mut(&key) else {
         return 0;
@@ -130,6 +142,7 @@ pub fn syscall_futex(
             }
             let task = current_task().unwrap();
             let pid = current_process().getpid();
+            let key = futex_key(pid, uaddr, _private);
             let token = get_current_token();
             let mut map = FUTEX_QUEUES.lock();
             let cur = read_user_value(token, uaddr as *const i32);
@@ -214,7 +227,7 @@ pub fn syscall_futex(
                     Some(now_ms.saturating_add(timeout_ms))
                 }
             };
-            map.entry((pid, uaddr))
+            map.entry(key)
                 .or_insert_with(VecDeque::new)
                 .push_back(Arc::clone(&task));
             drop(map);
@@ -222,7 +235,7 @@ pub fn syscall_futex(
                 let now_ms = get_time_ms();
                 let wait_ms = deadline_ms.saturating_sub(now_ms);
                 if wait_ms == 0 {
-                    remove_waiter(pid, uaddr, &task);
+                    remove_waiter(key, &task);
                     return ETIMEDOUT;
                 }
                 add_timer(Arc::clone(&task), wait_ms);
@@ -246,14 +259,14 @@ pub fn syscall_futex(
                 );
             }
             if pending_unmasked_signal() {
-                remove_waiter(pid, uaddr, &task);
+                remove_waiter(key, &task);
                 return EINTR;
             }
             if let Some(deadline_ms) = deadline_ms {
                 let now_ms = get_time_ms();
                 if now_ms >= deadline_ms {
                     let task = current_task().unwrap();
-                    remove_waiter(pid, uaddr, &task);
+                    remove_waiter(key, &task);
                     return ETIMEDOUT;
                 }
             }
@@ -261,13 +274,16 @@ pub fn syscall_futex(
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let pid = current_process().getpid();
-            futex_wake(pid, uaddr, val)
+            let key = futex_key(pid, uaddr, _private);
+            futex_wake(key, uaddr, val)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if uaddr == 0 || _uaddr2 == 0 {
                 return EINVAL;
             }
             let pid = current_process().getpid();
+            let key1 = futex_key(pid, uaddr, _private);
+            let key2 = futex_key(pid, _uaddr2, _private);
             if cmd == FUTEX_CMP_REQUEUE {
                 let token = get_current_token();
                 let cur = read_user_value(token, uaddr as *const i32);
@@ -276,8 +292,6 @@ pub fn syscall_futex(
                 }
             }
             let val2 = _timeout;
-            let key1 = (pid, uaddr);
-            let key2 = (pid, _uaddr2);
             let mut map = FUTEX_QUEUES.lock();
             let Some(mut queue1) = map.remove(&key1) else {
                 return 0;
