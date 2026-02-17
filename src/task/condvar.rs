@@ -1,12 +1,10 @@
 use alloc::{collections::VecDeque, sync::Arc};
 
-use crate::{
-    task::{
-        manager::wakeup_task,
-        mutex::Mutex,
-        processor::{block_current_and_run_next, current_task},
-        task_block::TaskControlBlock,
-    },
+use crate::task::{
+    manager::wakeup_task,
+    mutex::Mutex,
+    processor::{block_current_and_run_next, current_task},
+    task_block::TaskControlBlock,
 };
 use spin::Mutex as SpinLock;
 

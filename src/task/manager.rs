@@ -6,9 +6,9 @@ use lazy_static::*;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch;
-use crate::debug_config::DEBUG_SCHED;
 use crate::config::MAX_HARTS;
-use crate::task::block_sleep::{TIMERS, TimeWrap};
+use crate::debug_config::DEBUG_SCHED;
+use crate::task::block_sleep::{TimeWrap, TIMERS};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use spin::Mutex;
@@ -25,7 +25,11 @@ pub fn mark_hart_online(hart_id: usize) {
 fn online_hart_mask() -> usize {
     let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
     // Fallback: at least hart0 exists.
-    if mask == 0 { 1 } else { mask }
+    if mask == 0 {
+        1
+    } else {
+        mask
+    }
 }
 
 fn pick_online_hart(start: usize) -> usize {
@@ -51,7 +55,10 @@ pub fn dump_system_state() {
     log::warn!(
         "[watchdog] ready_queues_total_len={} per_hart={:?}",
         total_ready,
-        mgr.ready_queues.iter().map(|q| q.len()).collect::<alloc::vec::Vec<_>>()
+        mgr.ready_queues
+            .iter()
+            .map(|q| q.len())
+            .collect::<alloc::vec::Vec<_>>()
     );
     drop(mgr);
     let map = PID2PCB.lock();
@@ -314,13 +321,22 @@ pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
 }
 
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
-    PID2PCB.lock().insert(pid, process);
+    let mut map = PID2PCB.lock();
+    map.insert(pid, process);
+    let len = map.len();
+    if crate::debug_config::DEBUG_PID_MAP && len >= 64 && (len & (len - 1)) == 0 {
+        crate::println!("[pid-debug] insert pid={} map_len={}", pid, len);
+    }
 }
 
 pub fn remove_from_pid2process(pid: usize) {
     let mut map = PID2PCB.lock();
     if map.remove(&pid).is_none() {
         panic!("cannot find pid {} in pid2task!", pid);
+    }
+    let len = map.len();
+    if crate::debug_config::DEBUG_PID_MAP && len >= 64 && (len & (len - 1)) == 0 {
+        crate::println!("[pid-debug] remove pid={} map_len={}", pid, len);
     }
 }
 

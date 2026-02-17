@@ -330,9 +330,7 @@ pub fn set_signal(
         let new_action = read_user_value(token, action as *const SignalAction);
         inner.signals_actions.table[signum as usize] = new_action;
         // Keep rt_sigaction table in sync so delivery uses the latest handler.
-        if (signum as usize) <= RT_SIG_MAX
-            && (signum as usize) < inner.rt_sig_handlers.len()
-        {
+        if (signum as usize) <= RT_SIG_MAX && (signum as usize) < inner.rt_sig_handlers.len() {
             inner.rt_sig_handlers[signum as usize] = RtSigAction {
                 handler: new_action.handler,
                 flags: 0,

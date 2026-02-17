@@ -1,6 +1,6 @@
 //! Centralized debug switches.
 //!
-//! Keep these `false` for normal runs. Flip to `false` temporarily when diagnosing
+//! Keep these `false` for normal runs. Flip to `true` temporarily when diagnosing
 //! hangs or scheduler/timer issues.
 
 /// Default kernel log level when `LOG` is not set at build time.
@@ -19,6 +19,12 @@ pub const DEBUG_TIMER: bool = false;
 
 /// Verbose scheduler debug logs (ready queue push/pop, idle switches).
 pub const DEBUG_SCHED: bool = false;
+
+/// Debug lifecycle counters for kernel stacks and deferred task drops.
+pub const DEBUG_TASK_LIFECYCLE: bool = false;
+
+/// Debug PID table growth/shrink logs (`[pid-debug]`).
+pub const DEBUG_PID_MAP: bool = false;
 
 /// Verbose trap logs (timer/software interrupts, user exceptions).
 pub const DEBUG_TRAP: bool = false;

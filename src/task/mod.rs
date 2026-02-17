@@ -4,10 +4,10 @@ use core::{arch::asm, cell::RefCell, fmt::Display, task};
 
 use crate::{
     console::print,
-    fs::{OpenFlags, open_file},
+    fs::{open_file, OpenFlags},
     println,
     task::{
-        manager::{TASK_MANAGER, add_task},
+        manager::{add_task, TASK_MANAGER},
         processor::{current_task, go_to_first_task},
         task_context::TaskContext,
     },
@@ -18,6 +18,7 @@ use lazy_static::lazy_static;
 pub mod block_sleep;
 pub mod condvar;
 mod id;
+pub(crate) use id::{pid_max, set_pid_max};
 pub mod manager;
 pub mod mutex;
 mod process_block;

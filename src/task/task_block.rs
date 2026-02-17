@@ -339,15 +339,15 @@
 // //     }
 // // }
 
-use alloc::sync::{Arc, Weak};
 use alloc::collections::VecDeque;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 
 use crate::{
     mm::PhysPageNum,
     task::{
-        id::{KernelStack, TaskUserRes, kstack_alloc},
+        id::{kstack_alloc, KernelStack, TaskUserRes},
         process_block::ProcessControlBlock,
         task_context::TaskContext,
     },
@@ -358,7 +358,9 @@ pub struct TaskControlBlock {
     // immutable
     // 对于所有的线程,共享一个父进程
     pub process: Weak<ProcessControlBlock>,
-    pub kstack: KernelStack,
+    // Keep kernel-stack ownership separate so exited tasks can release stack
+    // pages even if some metadata Arc references linger for a while.
+    pub kstack: Mutex<Option<KernelStack>>,
     /// Preferred CPU (hart) to run this task on.
     ///
     /// This is used by the scheduler to decide which per-hart run queue the task should be
@@ -398,6 +400,18 @@ impl TaskControlBlock {
 
     pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
         self.inner.lock()
+    }
+
+    pub fn kstack_top(&self) -> usize {
+        self.kstack
+            .lock()
+            .as_ref()
+            .expect("kernel stack already released")
+            .get_top()
+    }
+
+    pub fn take_kstack(&self) -> Option<KernelStack> {
+        self.kstack.lock().take()
     }
 
     pub fn try_borrow_mut(&self) -> Option<MutexGuard<'_, TaskControlBlockInner>> {
@@ -472,7 +486,7 @@ impl TaskControlBlock {
         let kstack_top = kstack.get_top();
         Some(Self {
             process: Arc::downgrade(&process),
-            kstack,
+            kstack: Mutex::new(Some(kstack)),
             cpu_id: AtomicUsize::new(0),
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             wakeup_pending: AtomicBool::new(false),
@@ -507,12 +521,12 @@ impl TaskControlBlock {
         Self::try_new(process, ustack_base, alloc_user_res).expect("OOM: TaskControlBlock::new")
     }
 
-        // Debug output
-        // use crate::println;
-        // println!(
-        //     "[DEBUG] TaskControlBlock::new - trap_return={:#x}, kstack_top={:#x}, trap_cx_ppn={:#x}",
-        //     trap_return as usize, kstack_top, trap_cx_ppn.0
-        // );
+    // Debug output
+    // use crate::println;
+    // println!(
+    //     "[DEBUG] TaskControlBlock::new - trap_return={:#x}, kstack_top={:#x}, trap_cx_ppn={:#x}",
+    //     trap_return as usize, kstack_top, trap_cx_ppn.0
+    // );
 
     pub fn try_new_linux_thread(process: Arc<ProcessControlBlock>) -> Option<Self> {
         let res = TaskUserRes::try_new_trap_cx_only(Arc::clone(&process))?;
@@ -521,7 +535,7 @@ impl TaskControlBlock {
         let kstack_top = kstack.get_top();
         Some(Self {
             process: Arc::downgrade(&process),
-            kstack,
+            kstack: Mutex::new(Some(kstack)),
             cpu_id: AtomicUsize::new(0),
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             wakeup_pending: AtomicBool::new(false),

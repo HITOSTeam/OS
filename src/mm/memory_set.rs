@@ -1,11 +1,11 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
-use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
+use super::{frame_alloc, try_copy_to_user_unchecked, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
-    MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE, phys_mem_end,
+    phys_mem_end, MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE,
 };
 use crate::println;
 use alloc::collections::BTreeMap;
@@ -221,6 +221,23 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if start_vpn >= end_vpn {
+            return true;
+        }
+
+        // Linux merges adjacent anonymous VMAs with identical attributes.
+        // Do the same so repeated mmap() doesn't explode VMA count.
+        if let Some(last) = self.areas.last_mut() {
+            if last.map_type == MapType::Lazy
+                && last.map_perm == permission
+                && last.vpn_range.get_end() == start_vpn
+            {
+                return last.append_to(&mut self.page_table, end_vpn);
+            }
+        }
+
         self.try_push(
             MapArea::new(start_va, end_va, MapType::Lazy, permission),
             None,
@@ -918,9 +935,9 @@ impl MemorySet {
         for area in user_space.areas.iter() {
             let mut new_area = MapArea::from_another(area);
 
-            for vpn in area.vpn_range {
-                match area.map_type {
-                    MapType::Identical => {
+            match area.map_type {
+                MapType::Identical => {
+                    for vpn in area.vpn_range {
                         let Some(src_pte) = user_space.translate(vpn) else {
                             continue;
                         };
@@ -931,19 +948,15 @@ impl MemorySet {
                         let src_flags = src_pte.flags();
                         memory_set.page_table.map(vpn, src_ppn, src_flags);
                     }
-                    MapType::Framed | MapType::Lazy => {
+                }
+                // For Framed/Lazy areas we only walk materialized pages.
+                // This avoids O(vma_len) scans for huge untouched lazy mappings.
+                MapType::Framed | MapType::Lazy => {
+                    for (&vpn, frame_tracker) in area.data_frames.iter() {
                         let Some(src_pte) = user_space.translate(vpn) else {
-                            // this is for clarifing that we dont map lazy area here
-
-                            if area.map_type == MapType::Lazy {
-                                continue;
-                            }
                             continue;
                         };
                         if !src_pte.is_valid() {
-                            if area.map_type == MapType::Lazy {
-                                continue;
-                            }
                             continue;
                         }
                         let src_ppn = src_pte.ppn();
@@ -973,9 +986,7 @@ impl MemorySet {
                             parent_updates.push((vpn, src_flags));
                         }
                         memory_set.page_table.map(vpn, src_ppn, src_flags);
-                        if let Some(ft) = area.data_frames.get(&vpn) {
-                            new_area.data_frames.insert(vpn, ft.clone());
-                        }
+                        new_area.data_frames.insert(vpn, frame_tracker.clone());
                     }
                 }
             }
@@ -1002,9 +1013,9 @@ impl MemorySet {
         for area in user_space.areas.iter() {
             let mut new_area = MapArea::from_another(area);
 
-            for vpn in area.vpn_range {
-                match area.map_type {
-                    MapType::Identical => {
+            match area.map_type {
+                MapType::Identical => {
+                    for vpn in area.vpn_range {
                         let Some(src_pte) = user_space.translate(vpn) else {
                             continue;
                         };
@@ -1015,17 +1026,15 @@ impl MemorySet {
                         let src_flags = src_pte.flags();
                         memory_set.page_table.map(vpn, src_ppn, src_flags);
                     }
-                    MapType::Framed | MapType::Lazy => {
+                }
+                // Lazy areas can span terabytes with no materialized pages.
+                // Copy only present pages tracked in data_frames.
+                MapType::Framed | MapType::Lazy => {
+                    for (&vpn, _) in area.data_frames.iter() {
                         let Some(src_pte) = user_space.translate(vpn) else {
-                            if area.map_type == MapType::Lazy {
-                                continue;
-                            }
                             continue;
                         };
                         if !src_pte.is_valid() {
-                            if area.map_type == MapType::Lazy {
-                                continue;
-                            }
                             continue;
                         }
                         let src_ppn = src_pte.ppn();
@@ -1706,26 +1715,20 @@ pub fn remap_test() {
     let mid_text: VirtAddr = ((stext as usize + etext as usize) / 2).into();
     let mid_rodata: VirtAddr = ((srodata as usize + erodata as usize) / 2).into();
     let mid_data: VirtAddr = ((sdata as usize + edata as usize) / 2).into();
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_text.floor())
-            .unwrap()
-            .writable(),
-    );
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_rodata.floor())
-            .unwrap()
-            .writable(),
-    );
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_data.floor())
-            .unwrap()
-            .executable(),
-    );
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_text.floor())
+        .unwrap()
+        .writable(),);
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_rodata.floor())
+        .unwrap()
+        .writable(),);
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_data.floor())
+        .unwrap()
+        .executable(),);
     println!("remap_test passed!");
 }

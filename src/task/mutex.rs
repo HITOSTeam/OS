@@ -1,14 +1,10 @@
 use alloc::{collections::vec_deque::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{
-    task::{
-        manager::wakeup_task,
-        processor::{
-            block_current_and_run_next, current_task, suspend_current_and_run_next,
-        },
-        task_block::TaskControlBlock,
-    },
+use crate::task::{
+    manager::wakeup_task,
+    processor::{block_current_and_run_next, current_task, suspend_current_and_run_next},
+    task_block::TaskControlBlock,
 };
 use spin::Mutex as SpinLock;
 

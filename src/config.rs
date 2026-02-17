@@ -5,9 +5,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 // Linux userland (busybox/glibc) expects a large initial stack.
 pub const USER_STACK_SIZE: usize = 4096 * 256; // 1 MiB
 pub const KERNEL_STACK_SIZE: usize = 4096 * 8;  // 32KB
-// Kernel heap must be large enough to buffer big user ELFs and pthread-heavy glibc benches.
-// 128 MiB matches the example OS 2025 baseline for virt targets.
-pub const KERNEL_HEAP_SIZE: usize = 0x800_0000; // 128 MiB
+// Kernel heap must be large enough for fork-heavy LTP runs on glibc.
+// 256 MiB reduces allocator OOMs in long `fork13` stress loops.
+pub const KERNEL_HEAP_SIZE: usize = 0x1000_0000; // 256 MiB
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 

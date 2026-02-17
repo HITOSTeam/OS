@@ -13,10 +13,11 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        manager::{add_task, select_hart_for_new_task},
+        manager::{add_task, remove_inactive_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_process, current_task},
         signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
         task_block::TaskControlBlock,
+        ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
@@ -43,7 +44,12 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
         Err(_) => {}
     }
     if path == "busybox" || path == "./busybox" {
-        let fallbacks = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+        let fallbacks = [
+            "/musl/busybox",
+            "/glibc/busybox",
+            "/bin/busybox",
+            "/busybox",
+        ];
         for cand in fallbacks {
             match resolve_exec_inode(cand) {
                 Ok(inode) => {
@@ -86,7 +92,12 @@ fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, i
         Err(_) => {}
     }
     if path == "busybox" || path == "./busybox" {
-        let fallbacks = ["/musl/busybox", "/glibc/busybox", "/bin/busybox", "/busybox"];
+        let fallbacks = [
+            "/musl/busybox",
+            "/glibc/busybox",
+            "/bin/busybox",
+            "/busybox",
+        ];
         for cand in fallbacks {
             match resolve_exec_inode(cand) {
                 Ok(inode) => return Ok(inode),
@@ -129,7 +140,10 @@ fn find_shell_interpreter() -> Result<Option<(String, Vec<u8>, bool)>, isize> {
 }
 
 fn is_system_shell_path(path: &str) -> bool {
-    matches!(path, "/bin/sh" | "/bin/dash" | "/usr/bin/sh" | "/usr/bin/dash")
+    matches!(
+        path,
+        "/bin/sh" | "/bin/dash" | "/usr/bin/sh" | "/usr/bin/dash"
+    )
 }
 
 fn find_busybox_shell() -> Result<Option<(String, Vec<u8>)>, isize> {
@@ -155,11 +169,7 @@ fn find_busybox_shell() -> Result<Option<(String, Vec<u8>)>, isize> {
     Ok(None)
 }
 
-fn exec_interpreter(
-    interp_data: Vec<u8>,
-    args: Vec<String>,
-    envs: Vec<String>,
-) -> isize {
+fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) -> isize {
     let process = current_process();
     if let Some(interp_interp) = elf_interp_path(&interp_data) {
         let interp_interp_data = match load_interp_data(&interp_interp) {
@@ -341,7 +351,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
                 trap_cx.x[REG_TP] = _tls; // tp (TLS)
             }
             trap_cx.kernel_satp = kernel_token();
-            trap_cx.kernel_sp = new_task.kstack.get_top();
+            trap_cx.kernel_sp = new_task.kstack_top();
             trap_cx.trap_handler = trap_handler as usize;
             if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
                 new_inner.clear_child_tid = Some(_ctid);
@@ -395,7 +405,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             trap_cx.x[REG_SP] = stack;
         }
         trap_cx.kernel_satp = kernel_token();
-        trap_cx.kernel_sp = task.kstack.get_top();
+        trap_cx.kernel_sp = task.kstack_top();
         trap_cx.trap_handler = trap_handler as usize;
     }
     add_task(task);
@@ -468,6 +478,37 @@ impl Default for SigInfo {
             si_stime: 0,
             _pad2: [0u8; 80],
         }
+    }
+}
+
+fn remove_wait_queue_entry(
+    queue: &mut alloc::collections::VecDeque<Arc<TaskControlBlock>>,
+    task: &Arc<TaskControlBlock>,
+) {
+    queue.retain(|t| !Arc::ptr_eq(t, task));
+}
+
+fn enqueue_waiter_once(
+    queue: &mut alloc::collections::VecDeque<Arc<TaskControlBlock>>,
+    task: &Arc<TaskControlBlock>,
+) -> bool {
+    if queue.iter().any(|t| Arc::ptr_eq(t, task)) {
+        return false;
+    }
+    queue.push_back(task.clone());
+    true
+}
+
+fn reap_zombie_child(child: &Arc<ProcessControlBlock>) {
+    // Main-thread resources are already detached in exit path; this aggressively
+    // drops lingering task Arcs so kernel stacks are reclaimed on reap.
+    let tasks = {
+        let mut inner = child.borrow_mut();
+        core::mem::take(&mut inner.tasks)
+    };
+    for task in tasks.into_iter().flatten() {
+        remove_inactive_task(task.clone());
+        drop(task);
     }
 }
 
@@ -560,11 +601,7 @@ fn path_basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn try_exec_busybox_applet(
-    path: &str,
-    args: &[String],
-    envs: &[String],
-) -> Option<isize> {
+fn try_exec_busybox_applet(path: &str, args: &[String], envs: &[String]) -> Option<isize> {
     let applet_src = args.get(0).map(|s| s.as_str()).unwrap_or(path);
     let applet = path_basename(applet_src);
     if applet.is_empty() || applet == "busybox" {
@@ -611,18 +648,19 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
         let task = current_task().unwrap();
         if let Some(action) = wait4_pending_action(&task) {
             let mut process_inner = cur_process.borrow_mut();
-            process_inner.wait_queue.retain(|t| !Arc::ptr_eq(t, &task));
+            remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
             drop(process_inner);
             return action;
         }
         let mut process_inner = cur_process.borrow_mut();
+        remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
         let parent_pgid = process_inner.pgid;
         let mut stop_event: Option<(usize, i32)> = None;
         let mut cont_event: Option<usize> = None;
-        let (has_matching_child, zombie_pid) = if process_inner.children.is_empty() {
+        let (has_matching_child, zombie_child) = if process_inner.children.is_empty() {
             (false, None)
         } else {
-            let mut found: Option<(usize, usize)> = None; // (index, pid)
+            let mut found: Option<usize> = None;
             let mut has_match = false;
             for (index, child) in process_inner.children.iter().enumerate() {
                 let child_inner = child.borrow_mut();
@@ -645,7 +683,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                     temp_coredump = temp_signal
                         .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
                         .unwrap_or(false);
-                    found = Some((index, child.pid.0));
+                    found = Some(index);
                     break;
                 }
                 if matches
@@ -666,9 +704,9 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                     break;
                 }
             }
-            if let Some((index, pid)) = found {
-                process_inner.children.remove(index);
-                (true, Some(pid))
+            if let Some(index) = found {
+                let child = process_inner.children.remove(index);
+                (true, Some(child))
             } else {
                 (has_match, None)
             }
@@ -710,11 +748,14 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             return pid as isize;
         }
 
-        if let Some(pid) = zombie_pid {
+        if let Some(child) = zombie_child {
+            let pid = child.getpid();
             drop(process_inner);
             // Keep exited processes visible (e.g., for `kill $!`) until they are reaped.
             // Reaping happens here (wait4), so remove it from the global PID table now.
             crate::task::manager::remove_from_pid2process(pid);
+            reap_zombie_child(&child);
+            drop(child);
             if wstatus_ptr != 0 {
                 // Linux wait status encoding:
                 // - normal exit: (code & 0xff) << 8
@@ -758,7 +799,20 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
         }
 
         // Block until a child exits or changes state.
-        process_inner.wait_queue.push_back(task);
+        let inserted = enqueue_waiter_once(&mut process_inner.wait_queue, &task);
+        if inserted {
+            let qlen = process_inner.wait_queue.len();
+            if qlen >= 64 && (qlen & (qlen - 1)) == 0 {
+                crate::println!(
+                    "[wait4-debug] pid={} wait_queue_len={} children={} wait_pid={} options=0x{:x}",
+                    cur_process.getpid(),
+                    qlen,
+                    process_inner.children.len(),
+                    pid,
+                    options
+                );
+            }
+        }
         drop(process_inner);
         block_current_and_run_next();
     }
@@ -803,12 +857,13 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
         let task = current_task().unwrap();
         if let Some(action) = wait4_pending_action(&task) {
             let mut process_inner = cur_process.borrow_mut();
-            process_inner.wait_queue.retain(|t| !Arc::ptr_eq(t, &task));
+            remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
             drop(process_inner);
             return action;
         }
 
         let mut process_inner = cur_process.borrow_mut();
+        remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
         let parent_pgid = process_inner.pgid;
         let mut has_match = false;
         let mut found_zombie: Option<(usize, i32, Option<i32>, bool, u32)> = None;
@@ -832,7 +887,11 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             has_match = true;
             if (options & WEXITED) != 0 && child_inner.is_zombie {
                 let exit_code = child_inner.exit_code;
-                let signal = if exit_code < 0 { Some(-exit_code) } else { None };
+                let signal = if exit_code < 0 {
+                    Some(-exit_code)
+                } else {
+                    None
+                };
                 let coredump = signal
                     .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
                     .unwrap_or(false);
@@ -856,18 +915,20 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
 
         if let Some((index, exit_code, signal, coredump, uid)) = found_zombie {
             let child_pid = process_inner.children[index].pid.0;
-            if (options & WNOWAIT) == 0 {
-                process_inner.children.remove(index);
-            }
+            let child = if (options & WNOWAIT) == 0 {
+                Some(process_inner.children.remove(index))
+            } else {
+                None
+            };
             drop(process_inner);
             if (options & WNOWAIT) == 0 {
                 crate::task::manager::remove_from_pid2process(child_pid);
+                if let Some(child) = child.as_ref() {
+                    reap_zombie_child(child);
+                }
             }
             let (si_status, si_code) = if let Some(sig) = signal {
-                (
-                    sig,
-                    if coredump { CLD_DUMPED } else { CLD_KILLED },
-                )
+                (sig, if coredump { CLD_DUMPED } else { CLD_KILLED })
             } else {
                 (exit_code & 0xff, CLD_EXITED)
             };
@@ -929,7 +990,21 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             return 0;
         }
 
-        process_inner.wait_queue.push_back(task);
+        let inserted = enqueue_waiter_once(&mut process_inner.wait_queue, &task);
+        if inserted {
+            let qlen = process_inner.wait_queue.len();
+            if qlen >= 64 && (qlen & (qlen - 1)) == 0 {
+                crate::println!(
+                    "[waitid-debug] pid={} wait_queue_len={} children={} idtype={} id={} options=0x{:x}",
+                    cur_process.getpid(),
+                    qlen,
+                    process_inner.children.len(),
+                    idtype,
+                    id,
+                    options
+                );
+            }
+        }
         drop(process_inner);
         block_current_and_run_next();
     }
@@ -989,7 +1064,6 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
             "PATH=/user:/:/bin:/usr/bin:/musl:/glibc:/musl/ltp/testcases/bin:/glibc/ltp/testcases/bin",
         ));
     }
-
     if is_system_shell_path(&path) {
         if let Ok(Some((bb_path, bb_data))) = find_busybox_shell() {
             let mut new_args: Vec<String> = Vec::new();

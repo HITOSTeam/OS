@@ -26,7 +26,12 @@ const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
 const EEXIST: isize = -17;
 
+#[cfg(target_arch = "loongarch64")]
 const USER_VA_TOP: usize = TRAP_CONTEXT;
+// Sv39 user-space low canonical range is [0, 2^38).
+// Reject higher addresses so mmap() can't wrap/alias via VirtAddr masking.
+#[cfg(not(target_arch = "loongarch64"))]
+const USER_VA_TOP: usize = 1usize << 38;
 
 fn align_down(x: usize, align: usize) -> usize {
     x & !(align - 1)
@@ -330,7 +335,18 @@ pub fn syscall_mmap(
     if !is_fixed && end > inner.mmap_next {
         inner.mmap_next = end;
     }
-    inner.mmap_areas.push((start, map_len));
+    // Keep mmap bookkeeping compact: adjacent regions can be represented
+    // as one interval, which avoids O(n^2) growth in fork-heavy tests.
+    if let Some((last_start, last_len)) = inner.mmap_areas.last_mut() {
+        let last_end = *last_start + *last_len;
+        if last_end == start {
+            *last_len += map_len;
+        } else {
+            inner.mmap_areas.push((start, map_len));
+        }
+    } else {
+        inner.mmap_areas.push((start, map_len));
+    }
     drop(inner);
 
     // Best-effort: file-backed initial population.

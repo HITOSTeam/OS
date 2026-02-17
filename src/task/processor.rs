@@ -1,30 +1,66 @@
 use crate::{
     arch,
     config::MAX_HARTS,
-    mm::try_write_user_value,
+    mm::{try_write_user_value, MemorySet},
     println,
     syscall::futex::futex_wake,
     task::{
-        INITPROC,
-        id::TaskUserRes,
-        manager::{
-            TASK_MANAGER, add_task, fetch_task, remove_inactive_task,
-            wakeup_task,
-        },
+        id::{KernelStack, TaskUserRes},
+        manager::{add_task, fetch_task, remove_inactive_task, wakeup_task, TASK_MANAGER},
         process_block::ProcessControlBlock,
         switch,
         task_block::{TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
+        INITPROC,
     },
     trap::init_trap,
 };
-use alloc::{sync::Arc, task, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, task, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::lazy_static;
 use log;
 use spin::Mutex;
 
 use crate::debug_config::{DEBUG_PTHREAD, DEBUG_SCHED};
+
+static TASK_DROP_QUEUED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TASK_DROP_DONE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn should_log_pow2(v: usize) -> bool {
+    v >= 64 && (v & (v - 1)) == 0
+}
+
+fn maybe_log_task_drop(event: &str) {
+    if !crate::debug_config::DEBUG_TASK_LIFECYCLE {
+        return;
+    }
+    let queued = TASK_DROP_QUEUED.load(core::sync::atomic::Ordering::Relaxed);
+    let done = TASK_DROP_DONE.load(core::sync::atomic::Ordering::Relaxed);
+    let inflight = queued.saturating_sub(done);
+    if should_log_pow2(inflight) || should_log_pow2(queued) || should_log_pow2(done) {
+        crate::println!(
+            "[task-drop] event={} inflight={} queued={} done={}",
+            event,
+            inflight,
+            queued,
+            done
+        );
+    }
+}
+
+fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
+    // Detach the kernel stack now, but free it only after switching to idle.
+    // This keeps stack reclamation independent from lingering task Arc refs.
+    let kstack = task.take_kstack();
+    let mut processor = local_processor().lock();
+    if let Some(kstack) = kstack {
+        processor.set_pending_kstack_drop(kstack);
+    }
+    processor.set_pending_drop(task);
+    drop(processor);
+    TASK_DROP_QUEUED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    maybe_log_task_drop("queue");
+}
 
 fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
     if ctid == 0 {
@@ -47,7 +83,9 @@ pub struct Processor {
     /// A task that is transitioning into Blocked state; finalized after switching to idle.
     pending_blocked: Option<Arc<TaskControlBlock>>,
     /// A task to drop after switching to idle (safe to free its kernel stack).
-    pending_drop: Option<Arc<TaskControlBlock>>,
+    pending_drop: VecDeque<Arc<TaskControlBlock>>,
+    /// Kernel stacks to drop after switching to idle.
+    pending_kstack_drop: VecDeque<KernelStack>,
 }
 impl Processor {
     pub fn new() -> Self {
@@ -56,7 +94,8 @@ impl Processor {
             idle_task_context: TaskContext::new(),
             pending_ready: None,
             pending_blocked: None,
-            pending_drop: None,
+            pending_drop: VecDeque::new(),
+            pending_kstack_drop: VecDeque::new(),
         }
     }
     pub fn get_idle_task_ptr(&mut self) -> *mut TaskContext {
@@ -87,11 +126,19 @@ impl Processor {
     }
 
     pub fn take_pending_drop(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.pending_drop.take()
+        self.pending_drop.pop_front()
     }
 
     pub fn set_pending_drop(&mut self, task: Arc<TaskControlBlock>) {
-        self.pending_drop = Some(task);
+        self.pending_drop.push_back(task);
+    }
+
+    pub fn take_pending_kstack_drop(&mut self) -> Option<KernelStack> {
+        self.pending_kstack_drop.pop_front()
+    }
+
+    pub fn set_pending_kstack_drop(&mut self, kstack: KernelStack) {
+        self.pending_kstack_drop.push_back(kstack);
     }
 }
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
@@ -218,9 +265,37 @@ pub fn idle_task() {
             add_task(task);
         }
 
-        if let Some(task) = local_processor().lock().take_pending_drop() {
+        while let Some(task) = local_processor().lock().take_pending_drop() {
             task.clear_on_cpu();
+            // Best-effort cleanup in process task tables.
+            //
+            // For zombie processes we prefer Linux-like eager release (clear slot now),
+            // but if there are unexpected extra refs we keep the slot so wait4() can
+            // still reap and drop the task deterministically.
+            if let Some(process) = task.process.upgrade() {
+                if let Some(mut inner) = process.try_borrow_mut() {
+                    let keep_for_reap = inner.is_zombie && Arc::strong_count(&task) > 2;
+                    if !keep_for_reap {
+                        for slot in inner.tasks.iter_mut() {
+                            if slot
+                                .as_ref()
+                                .map(|t| Arc::ptr_eq(t, &task))
+                                .unwrap_or(false)
+                            {
+                                *slot = None;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             drop(task);
+            TASK_DROP_DONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            maybe_log_task_drop("done");
+        }
+
+        while let Some(kstack) = local_processor().lock().take_pending_kstack_drop() {
+            drop(kstack);
         }
 
         if let Some(task) = fetch_task() {
@@ -234,7 +309,11 @@ pub fn idle_task() {
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             if IDLE_FIRST_SWITCH_LOG.swap(false, Ordering::SeqCst) {
                 let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-                let trap_cx = task_inner.res.as_ref().map(|r| r.trap_cx_user_va()).unwrap_or(0);
+                let trap_cx = task_inner
+                    .res
+                    .as_ref()
+                    .map(|r| r.trap_cx_user_va())
+                    .unwrap_or(0);
                 println!(
                     "[idle] switch hart={} tid={} ra={:#x} sp={:#x} trap_cx_va={:#x} trap_return={:#x}",
                     hart_id(),
@@ -417,9 +496,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         if DEBUG_SCHED {
             log::warn!("[exit] task lost process; dropping task and scheduling idle");
         }
-        // Defer dropping the task until after switching to idle to avoid freeing
-        // its kernel stack while still running on it.
-        local_processor().lock().set_pending_drop(task);
+        queue_exiting_task_drop(task);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
         return;
@@ -502,9 +579,6 @@ pub fn exit_current_and_run_next(exit_code: i32) {
                 }
             }
         }
-        // Defer dropping the exiting task until after we switch to idle so its
-        // kernel stack is no longer in use.
-        local_processor().lock().set_pending_drop(task);
     }
 
     log::debug!(
@@ -605,27 +679,28 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         process_inner.children.clear();
         let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
         crate::syscall::sysv_shm::exit_cleanup(&old_shm);
-        // deallocate other data in user space i.e. program code/data section
-        process_inner.memory_set.recycle_data_pages();
+        // Linux releases `mm_struct` at exit and keeps only zombie metadata.
+        // Drop the full user address space here so unreaped zombies do not pin
+        // page-table pages (and COW refs) during fork-heavy workloads.
+        process_inner.memory_set = MemorySet::new_bare();
         // drop file descriptors
         process_inner.fd_table.clear();
         process_inner.fd_flags.clear();
-        // Remove all tasks except for the main thread itself.
-        // This is because we are still using the kstack under the TCB
-        // of the main thread. This TCB, including its kstack, will be
-        // deallocated when the process is reaped via waitpid.
-        //
-        while process_inner.tasks.len() > 1 {
-            process_inner.tasks.pop();
-        }
+        // Keep zombie `tasks[]` until wait4() reaps the process so reaping has
+        // a deterministic place to drop any lingering task Arcs.
     }
 
     if tid != 0 {
+        // This path never returns after schedule(); move `task` out now so it can be dropped on idle.
+        queue_exiting_task_drop(task);
         drop(process);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
         return;
     }
+    // Drop the current task after switching to idle to avoid leaking the final
+    // strong Arc from this never-returning exit path.
+    queue_exiting_task_drop(task);
     drop(process);
     // we do not have to save task context
     // println!(
@@ -644,7 +719,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         if DEBUG_SCHED {
             log::warn!("[exit_group] task lost process; dropping task and scheduling idle");
         }
-        local_processor().lock().set_pending_drop(task);
+        queue_exiting_task_drop(task);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
         return;
@@ -658,7 +733,13 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         let clear_child_tid = task_inner.clear_child_tid.take();
         let robust_list_head = task_inner.robust_list_head;
         let join_waiters = task_inner.join_waiters.drain(..).collect::<Vec<_>>();
-        (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head)
+        (
+            tid,
+            res_to_drop,
+            join_waiters,
+            clear_child_tid,
+            robust_list_head,
+        )
     };
 
     let clear_child_tid_addr = clear_child_tid;
@@ -753,22 +834,17 @@ pub fn exit_group_and_run_next(exit_code: i32) {
     process_inner.children.clear();
     let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
     crate::syscall::sysv_shm::exit_cleanup(&old_shm);
-    process_inner.memory_set.recycle_data_pages();
+    // Same as exit_current_and_run_next(): release the whole user address
+    // space eagerly and keep only zombie bookkeeping in the PCB.
+    process_inner.memory_set = MemorySet::new_bare();
     process_inner.fd_table.clear();
     process_inner.fd_flags.clear();
 
-    if tid != usize::MAX {
-        for (idx, slot) in process_inner.tasks.iter_mut().enumerate() {
-            if idx == tid {
-                continue;
-            }
-            *slot = None;
-        }
-    } else {
-        process_inner.tasks.clear();
-    }
+    // Same as `exit_current_and_run_next()`: keep zombie `tasks[]` until wait4().
 
     drop(process_inner);
+    // Same as exit_current_and_run_next(): defer drop until we are on idle stack.
+    queue_exiting_task_drop(task);
     drop(process);
     let mut _unused = TaskContext::new();
     schedule(&mut _unused as *mut _);

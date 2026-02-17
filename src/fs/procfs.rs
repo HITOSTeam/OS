@@ -14,8 +14,8 @@ use crate::fs::{
 };
 use crate::mm::UserBuffer;
 use crate::task::manager::{pid2process, PID2PCB};
-use crate::task::task_block::TaskStatus;
 use crate::task::processor::current_process;
+use crate::task::task_block::TaskStatus;
 
 #[derive(Clone, Debug)]
 pub enum ProcFileKind {
@@ -38,10 +38,10 @@ static PROC_FILES: Mutex<BTreeMap<u32, ProcFileKind>> = Mutex::new(BTreeMap::new
 
 // gzip-compressed minimal config for LTP kconfig checks.
 const PROC_CONFIG_GZ: &[u8] = &[
-    31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 115, 246, 247, 115, 243, 116, 143, 119,
-    10, 118, 137, 15, 8, 242, 119, 118, 13, 14, 142, 119, 116, 118, 14, 177,
-    173, 228, 82, 86, 112, 198, 46, 23, 31, 102, 172, 144, 89, 172, 144, 151,
-    95, 162, 80, 156, 90, 194, 5, 0, 236, 87, 124, 248, 66, 0, 0, 0,
+    31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 115, 246, 247, 115, 243, 116, 143, 119, 10, 118, 137, 15, 8,
+    242, 119, 118, 13, 14, 142, 119, 116, 118, 14, 177, 173, 228, 82, 86, 112, 198, 46, 23, 31,
+    102, 172, 144, 89, 172, 144, 151, 95, 162, 80, 156, 90, 194, 5, 0, 236, 87, 124, 248, 66, 0, 0,
+    0,
 ];
 
 struct ProcPseudoInner {
@@ -105,7 +105,11 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 { None } else { Some(ino) }
+    if ino == 0 {
+        None
+    } else {
+        Some(ino)
+    }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
@@ -150,6 +154,11 @@ pub fn init_procfs() {
             let core_pattern = ensure_file(&kernel_dir, "core_pattern", 0o644);
             if let Some(core_pattern) = core_pattern {
                 let _ = core_pattern.write_at(0, b"core\n");
+            }
+            let pid_max_file = ensure_file(&kernel_dir, "pid_max", 0o644);
+            if let Some(pid_max_file) = pid_max_file {
+                let value = alloc::format!("{}\n", crate::task::pid_max());
+                let _ = pid_max_file.write_at(0, value.as_bytes());
             }
         }
         let fs_dir = ensure_dir(&sys_dir, "fs", 0o555);
@@ -208,7 +217,15 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
         ino: 1,
         dtype: 4,
     });
-    for name in ["mounts", "meminfo", "loadavg", "uptime", "stat", "perf", "config.gz"] {
+    for name in [
+        "mounts",
+        "meminfo",
+        "loadavg",
+        "uptime",
+        "stat",
+        "perf",
+        "config.gz",
+    ] {
         entries.push(PseudoDirent {
             name: String::from(name),
             ino: 1,
@@ -289,9 +306,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
         "/proc/perf" => return Some(ProcPseudoFile::new(ProcFileKind::Perf)),
-        "/proc/config.gz" => {
-            return Some(Arc::new(PseudoFile::new_static_bytes(PROC_CONFIG_GZ)))
-        }
+        "/proc/config.gz" => return Some(Arc::new(PseudoFile::new_static_bytes(PROC_CONFIG_GZ))),
         _ => {}
     }
 
@@ -412,7 +427,12 @@ fn sync_proc_pid(pid: usize) {
 
     let pid_u32 = pid as u32;
     let _ = ensure_proc_file(&pid_dir, "stat", ProcFileKind::PidStat(pid_u32), 0o444);
-    let _ = ensure_proc_file(&pid_dir, "cmdline", ProcFileKind::PidCmdline(pid_u32), 0o444);
+    let _ = ensure_proc_file(
+        &pid_dir,
+        "cmdline",
+        ProcFileKind::PidCmdline(pid_u32),
+        0o444,
+    );
     let _ = ensure_proc_file(&pid_dir, "status", ProcFileKind::PidStatus(pid_u32), 0o444);
     let _ = ensure_proc_file(&pid_dir, "maps", ProcFileKind::PidMaps(pid_u32), 0o444);
     let _ = ensure_proc_file(&pid_dir, "mounts", ProcFileKind::PidMounts(pid_u32), 0o444);
@@ -464,8 +484,7 @@ fn proc_mounts() -> String {
 }
 
 fn proc_meminfo() -> String {
-    let mem_total_kb =
-        ((config::phys_mem_end() - config::phys_mem_start()) / 1024) as u64;
+    let mem_total_kb = ((config::phys_mem_end() - config::phys_mem_start()) / 1024) as u64;
     alloc::format!(
         "MemTotal:       {} kB\nMemFree:        {} kB\nBuffers:        0 kB\nCached:         0 kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n",
         mem_total_kb,

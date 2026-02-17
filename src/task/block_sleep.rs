@@ -1,26 +1,21 @@
 // this is used for sleep (blocked) threads
-use core::{cmp::Ordering, time};
 use core::sync::atomic::Ordering as AtomicOrdering;
+use core::{cmp::Ordering, time};
 
+use crate::task::signal::{pick_task_for_signal, signal_bit, SIGALRM_NUM};
 use crate::{
     task::{manager::wakeup_task, task_block::TaskControlBlock},
     time::get_time_ms,
 };
-use crate::task::signal::{pick_task_for_signal, signal_bit, SIGALRM_NUM};
 use lazy_static::*;
 use spin::Mutex;
 
-use alloc::{collections::BinaryHeap, sync::Arc};
 use alloc::vec::Vec;
+use alloc::{collections::BinaryHeap, sync::Arc};
 
 use crate::debug_config::{DEBUG_TIMER, DEBUG_UNIXBENCH};
 use crate::task::process_block::ProcessControlBlock;
-use crate::{
-    arch,
-    mm::write_user_value,
-    syscall::futex::futex_wake,
-    task::manager::pid2process,
-};
+use crate::{arch, mm::write_user_value, syscall::futex::futex_wake, task::manager::pid2process};
 pub struct TimeWrap {
     pub task: Arc<TaskControlBlock>,
     pub tid: usize,
@@ -62,7 +57,7 @@ impl Ord for TimeWrap {
 }
 
 lazy_static! {
-pub static ref TIMERS: Mutex<BinaryHeap<TimeWrap>> = Mutex::new(BinaryHeap::<TimeWrap>::new());
+    pub static ref TIMERS: Mutex<BinaryHeap<TimeWrap>> = Mutex::new(BinaryHeap::<TimeWrap>::new());
 }
 
 #[derive(Clone, Copy)]
@@ -91,9 +86,11 @@ pub fn schedule_tid_clear(pid: usize, ctid: usize, delay_ms: usize) {
         return;
     }
     let deadline_ms = get_time_ms().saturating_add(delay_ms);
-    DELAYED_TID_CLEARS
-        .lock()
-        .push(DelayedTidClear { pid, ctid, deadline_ms });
+    DELAYED_TID_CLEARS.lock().push(DelayedTidClear {
+        pid,
+        ctid,
+        deadline_ms,
+    });
 }
 
 fn process_delayed_tid_clears(current_ms: usize) {
@@ -167,7 +164,12 @@ pub fn alarm_remaining_ms(pid: usize) -> usize {
 
 fn deliver_alarm(pid: usize) {
     let Some(proc) = pid2process(pid) else {
-        crate::log_if!(DEBUG_UNIXBENCH, info, "[alarm] drop pid={} (no process)", pid);
+        crate::log_if!(
+            DEBUG_UNIXBENCH,
+            info,
+            "[alarm] drop pid={} (no process)",
+            pid
+        );
         return;
     };
     let Some(bit) = signal_bit(SIGALRM_NUM) else {
@@ -264,7 +266,11 @@ pub fn check_timer() {
             if let Some(head) = timers.peek() {
                 let expire = head.time_expired;
                 if DEBUG_TIMER {
-                    let status = if expire <= current_ms { "ready" } else { "future" };
+                    let status = if expire <= current_ms {
+                        "ready"
+                    } else {
+                        "future"
+                    };
                     log::debug!(
                         "[timer] peek tid={} expire_ms={} now_ms={} status={}",
                         head.tid,

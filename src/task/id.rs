@@ -1,20 +1,94 @@
-use alloc::{sync::Arc, sync::Weak};
+use alloc::{collections::BTreeSet, sync::Arc, sync::Weak};
 
 use crate::{
-    config::{
-        KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE,
-    },
-    mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr},
+    config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
+    mm::{MapPermission, PhysPageNum, VirtAddr, KERNEL_SPACE},
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
 };
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
+const PID_MAX_DEFAULT: usize = 32768;
+const PID_MAX_HARD_LIMIT: usize = 4 * 1024 * 1024;
+
+static PID_MAX_VALUE: AtomicUsize = AtomicUsize::new(PID_MAX_DEFAULT);
+static KSTACK_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static KSTACK_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn maybe_log_kstack_inflight(event: &str) {
+    if !crate::debug_config::DEBUG_TASK_LIFECYCLE {
+        return;
+    }
+    let allocs = KSTACK_ALLOC_COUNT.load(Ordering::Relaxed);
+    let drops = KSTACK_DROP_COUNT.load(Ordering::Relaxed);
+    let inflight = allocs.saturating_sub(drops);
+    if inflight >= 64 && (inflight & (inflight - 1)) == 0 {
+        crate::println!(
+            "[kstack-debug] event={} inflight={} allocs={} drops={}",
+            event,
+            inflight,
+            allocs,
+            drops
+        );
+    }
+}
+
+fn clamp_pid_max(pid_max: usize) -> usize {
+    pid_max.clamp(2, PID_MAX_HARD_LIMIT)
+}
+
+struct PidAllocator {
+    next: usize,
+    active: BTreeSet<usize>,
+}
+
+impl PidAllocator {
+    fn new() -> Self {
+        Self {
+            // Keep pid=0 for the bootstrap task, then rotate in [1, pid_max).
+            next: 0,
+            active: BTreeSet::new(),
+        }
+    }
+
+    fn alloc(&mut self) -> usize {
+        let pid_max = pid_max();
+        if self.next >= pid_max {
+            self.next = 1;
+        }
+
+        for _ in 0..pid_max {
+            let pid = self.next;
+            self.next = if pid + 1 >= pid_max { 1 } else { pid + 1 };
+            if self.active.insert(pid) {
+                return pid;
+            }
+        }
+
+        panic!("pid allocator exhausted (pid_max={pid_max})");
+    }
+
+    fn dealloc(&mut self, pid: usize) {
+        assert!(self.active.remove(&pid), "pid {pid} has been deallocated!");
+    }
+}
+
 lazy_static! {
-    static ref PID_ALLOCATOR: Mutex<RecycleAllocator> = Mutex::new(RecycleAllocator::new());
+    static ref PID_ALLOCATOR: Mutex<PidAllocator> = Mutex::new(PidAllocator::new());
 }
 
 pub struct PidHandle(pub usize);
+
+pub fn pid_max() -> usize {
+    clamp_pid_max(PID_MAX_VALUE.load(Ordering::Relaxed))
+}
+
+pub fn set_pid_max(pid_max: usize) -> usize {
+    let clamped = clamp_pid_max(pid_max);
+    PID_MAX_VALUE.store(clamped, Ordering::Relaxed);
+    clamped
+}
 
 pub fn pid_alloc() -> PidHandle {
     PidHandle(PID_ALLOCATOR.lock().alloc())
@@ -58,6 +132,8 @@ pub fn kstack_alloc() -> Option<KernelStack> {
         KSTACK_ALLOCATOR.lock().dealloc(kstack_id);
         return None;
     }
+    KSTACK_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    maybe_log_kstack_inflight("alloc");
     Some(KernelStack(kstack_id))
 }
 
@@ -70,6 +146,8 @@ impl Drop for KernelStack {
             .lock()
             .remove_area(kernel_stack_bottom_va.into(), kernel_stack_top_va.into());
         KSTACK_ALLOCATOR.lock().dealloc(self.0);
+        KSTACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        maybe_log_kstack_inflight("drop");
     }
 }
 
@@ -154,7 +232,10 @@ impl TaskUserRes {
 
     // 具体的 插入 用户资源 ,如 用户栈 和 trap_cx
     pub fn alloc_user_res(&self) {
-        assert!(self.try_alloc_user_res(), "OOM: TaskUserRes::alloc_user_res");
+        assert!(
+            self.try_alloc_user_res(),
+            "OOM: TaskUserRes::alloc_user_res"
+        );
     }
 
     fn try_alloc_user_res(&self) -> bool {

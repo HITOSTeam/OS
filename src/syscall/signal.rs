@@ -14,7 +14,7 @@ use crate::{
     syscall::misc::decode_linux_tid,
     task::{
         block_sleep::add_timer,
-        manager::{pid2process, wakeup_task},
+        manager::{PID2PCB, pid2process, wakeup_task},
         processor::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
@@ -78,7 +78,66 @@ fn wake_parent_waiters() {
 // }
 
 pub fn syscall_kill(pid: usize, signum: i32) -> isize {
-    kill(pid, signum)
+    let pid = pid as isize;
+    if pid > 0 {
+        return kill(pid as usize, signum);
+    }
+
+    let targets: Vec<usize> = match pid {
+        0 => {
+            let pgid = current_process().borrow_mut().pgid;
+            let procs: Vec<_> = {
+                let map = PID2PCB.lock();
+                map.values().cloned().collect()
+            };
+            procs
+                .into_iter()
+                .filter_map(|p| {
+                    let inner = p.borrow_mut();
+                    if inner.pgid == pgid {
+                        Some(p.getpid())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        -1 => {
+            let self_pid = current_process().getpid();
+            let map = PID2PCB.lock();
+            map.keys()
+                .copied()
+                .filter(|pid| *pid != 0 && *pid != self_pid)
+                .collect()
+        }
+        p if p < -1 => {
+            let target_pgid = (-p) as usize;
+            let procs: Vec<_> = {
+                let map = PID2PCB.lock();
+                map.values().cloned().collect()
+            };
+            procs
+                .into_iter()
+                .filter_map(|p| {
+                    let inner = p.borrow_mut();
+                    if inner.pgid == target_pgid {
+                        Some(p.getpid())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+
+    let mut delivered = false;
+    for target in targets {
+        if kill(target, signum) == 0 {
+            delivered = true;
+        }
+    }
+    if delivered { 0 } else { ESRCH }
 }
 
 /// Linux `tgkill` (syscall 131).

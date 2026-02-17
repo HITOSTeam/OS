@@ -2,10 +2,16 @@
 //! controls all the frames in the operating system.
 
 use super::{PhysAddr, PhysPageNum};
-use crate::{config::{phys_mem_end, phys_mem_start}, println};
+use crate::{
+    config::{phys_mem_end, phys_mem_start},
+    println,
+};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::fmt::{self, Debug, Formatter};
+use core::{
+    fmt::{self, Debug, Formatter},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use lazy_static::*;
 use spin::Mutex;
 
@@ -13,6 +19,8 @@ lazy_static! {
     /// Reference counts for physical frames (for COW/shared mappings).
     static ref FRAME_REFCOUNTS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 }
+
+static FRAME_ALLOC_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// manage a frame which has the same lifecycle as the tracker
 pub struct FrameTracker {
@@ -161,7 +169,27 @@ pub fn init_frame_allocator() {
 
 /// allocate a frame
 pub fn frame_alloc() -> Option<FrameTracker> {
-    FRAME_ALLOCATOR.lock().alloc().map(FrameTracker::new)
+    let mut allocator = FRAME_ALLOCATOR.lock();
+    let Some(ppn) = allocator.alloc() else {
+        let fails = FRAME_ALLOC_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if fails <= 8 || (fails & (fails - 1)) == 0 {
+            let current = allocator.current;
+            let end = allocator.end;
+            let recycled = allocator.recycled.len();
+            drop(allocator);
+            let refcnt_entries = FRAME_REFCOUNTS.lock().len();
+            println!(
+                "[mm-debug] frame_alloc failed count={} current={:#x} end={:#x} recycled={} refcnt_entries={}",
+                fails,
+                current,
+                end,
+                recycled,
+                refcnt_entries
+            );
+        }
+        return None;
+    };
+    Some(FrameTracker::new(ppn))
 }
 
 pub fn frame_alloc_contiguous(pages: usize) -> Option<Vec<FrameTracker>> {

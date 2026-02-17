@@ -1,30 +1,35 @@
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use super::mutex::Mutex;
-use crate::fs::{File, Stdin, Stdout};
+use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::mm::{ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value};
+use crate::debug_config::{DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
+use crate::fs::{File, Stdin, Stdout};
+use crate::mm::{
+    read_user_value, translated_mutref, write_user_value, ElfAux, MemorySet, KERNEL_SPACE,
+};
 use crate::println;
 use crate::task::condvar::Condvar;
-use crate::task::id::{PidHandle, pid_alloc};
+use crate::task::id::{pid_alloc, PidHandle};
 use crate::task::manager::{
-    add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task,
-    wakeup_task,
+    add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
-use crate::task::signal::{RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN};
+use crate::task::signal::{
+    RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN,
+};
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
-use crate::debug_config::{DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
-use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use spin::{Mutex as SpinMutex, MutexGuard};
+
+const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 
 fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
     for (signum, action) in inner.rt_sig_handlers.iter_mut().enumerate() {
@@ -45,11 +50,7 @@ fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
     }
 }
 
-fn patch_glibc_ld_linux_symtab_dyn(
-    token: usize,
-    interp_base: usize,
-    interp_data: &[u8],
-) {
+fn patch_glibc_ld_linux_symtab_dyn(token: usize, interp_base: usize, interp_data: &[u8]) {
     // Workaround for early ld-linux crash on some setups: glibc's rtld expects a
     // non-null DT_SYMTAB dynamic entry pointer cached in `_rtld_global`.
     //
@@ -91,7 +92,9 @@ fn patch_glibc_ld_linux_symtab_dyn(
     let mut dyn_size: Option<usize> = None;
     let ph_count = elf.header.pt2.ph_count();
     for i in 0..ph_count {
-        let Ok(ph) = elf.program_header(i) else { continue };
+        let Ok(ph) = elf.program_header(i) else {
+            continue;
+        };
         if ph.get_type() == Ok(xmas_elf::program::Type::Dynamic) {
             dyn_off = Some(ph.offset() as usize);
             dyn_vaddr = Some(ph.virtual_addr() as usize);
@@ -221,7 +224,11 @@ fn patch_glibc_ld_linux_symtab_dyn(
 
     let symtab_dyn_ptr = interp_base + dyn_vaddr + symtab_dyn_index * 16;
     let rtld_global_symtab_slot = interp_base + 0x21b70;
-    write_user_value(token, rtld_global_symtab_slot as *mut usize, &symtab_dyn_ptr);
+    write_user_value(
+        token,
+        rtld_global_symtab_slot as *mut usize,
+        &symtab_dyn_ptr,
+    );
     let verify = read_user_value(token, rtld_global_symtab_slot as *const usize);
 
     if DEBUG_SYSCALL {
@@ -270,134 +277,134 @@ fn build_linux_stack(
     }
     #[cfg(not(target_arch = "loongarch64"))]
     {
-    fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
-        for (i, b) in bytes.iter().enumerate() {
-            *translated_mutref(token, (addr + i) as *mut u8) = *b;
+        fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
+            for (i, b) in bytes.iter().enumerate() {
+                *translated_mutref(token, (addr + i) as *mut u8) = *b;
+            }
         }
-    }
 
-    fn push_usize(token: usize, sp: &mut usize, value: usize) {
-        *sp -= core::mem::size_of::<usize>();
-        write_user_value(token, *sp as *mut usize, &value);
-    }
+        fn push_usize(token: usize, sp: &mut usize, value: usize) {
+            *sp -= core::mem::size_of::<usize>();
+            write_user_value(token, *sp as *mut usize, &value);
+        }
 
-    let argc = args.len();
-    let envc = envs.len();
+        let argc = args.len();
+        let envc = envs.len();
 
-    // Push argument and environment strings (top-down).
-    let mut arg_ptrs: Vec<usize> = Vec::with_capacity(argc);
-    for arg in args.iter().rev() {
-        let bytes = arg.as_bytes();
-        sp -= bytes.len() + 1;
-        write_bytes(token, sp, bytes);
-        *translated_mutref(token, (sp + bytes.len()) as *mut u8) = 0;
-        arg_ptrs.push(sp);
-    }
-    arg_ptrs.reverse();
+        // Push argument and environment strings (top-down).
+        let mut arg_ptrs: Vec<usize> = Vec::with_capacity(argc);
+        for arg in args.iter().rev() {
+            let bytes = arg.as_bytes();
+            sp -= bytes.len() + 1;
+            write_bytes(token, sp, bytes);
+            *translated_mutref(token, (sp + bytes.len()) as *mut u8) = 0;
+            arg_ptrs.push(sp);
+        }
+        arg_ptrs.reverse();
 
-    let mut env_ptrs: Vec<usize> = Vec::with_capacity(envc);
-    for env in envs.iter().rev() {
-        let bytes = env.as_bytes();
-        sp -= bytes.len() + 1;
-        write_bytes(token, sp, bytes);
-        *translated_mutref(token, (sp + bytes.len()) as *mut u8) = 0;
-        env_ptrs.push(sp);
-    }
-    env_ptrs.reverse();
+        let mut env_ptrs: Vec<usize> = Vec::with_capacity(envc);
+        for env in envs.iter().rev() {
+            let bytes = env.as_bytes();
+            sp -= bytes.len() + 1;
+            write_bytes(token, sp, bytes);
+            *translated_mutref(token, (sp + bytes.len()) as *mut u8) = 0;
+            env_ptrs.push(sp);
+        }
+        env_ptrs.reverse();
 
-    // AT_PLATFORM: a small string describing the CPU architecture.
-    // Keep consistent with the userland ABI expectations per-arch.
-    #[cfg(target_arch = "loongarch64")]
-    let platform = "loongarch64";
-    #[cfg(not(target_arch = "loongarch64"))]
-    let platform = "RISC-V64";
-    sp -= platform.len() + 1;
-    write_bytes(token, sp, platform.as_bytes());
-    *translated_mutref(token, (sp + platform.len()) as *mut u8) = 0;
-    let platform_ptr = sp;
+        // AT_PLATFORM: a small string describing the CPU architecture.
+        // Keep consistent with the userland ABI expectations per-arch.
+        #[cfg(target_arch = "loongarch64")]
+        let platform = "loongarch64";
+        #[cfg(not(target_arch = "loongarch64"))]
+        let platform = "RISC-V64";
+        sp -= platform.len() + 1;
+        write_bytes(token, sp, platform.as_bytes());
+        *translated_mutref(token, (sp + platform.len()) as *mut u8) = 0;
+        let platform_ptr = sp;
 
-    // AT_EXECFN: filename of the executed program.
-    // Best-effort: use argv[0] (should match the execve path in most cases).
-    let execfn = args.first().map(|s| s.as_str()).unwrap_or("");
-    if !execfn.is_empty() {
-        sp -= execfn.len() + 1;
-        write_bytes(token, sp, execfn.as_bytes());
-        *translated_mutref(token, (sp + execfn.len()) as *mut u8) = 0;
-    }
-    let execfn_ptr = sp;
+        // AT_EXECFN: filename of the executed program.
+        // Best-effort: use argv[0] (should match the execve path in most cases).
+        let execfn = args.first().map(|s| s.as_str()).unwrap_or("");
+        if !execfn.is_empty() {
+            sp -= execfn.len() + 1;
+            write_bytes(token, sp, execfn.as_bytes());
+            *translated_mutref(token, (sp + execfn.len()) as *mut u8) = 0;
+        }
+        let execfn_ptr = sp;
 
-    // AT_RANDOM: 16 bytes.
-    sp -= 16;
-    let random_ptr = sp;
-    let mut x = (at_entry as u64) ^ (sp as u64).rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
-    for i in 0..16usize {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-        *translated_mutref(token, (random_ptr + i) as *mut u8) = (x >> 56) as u8;
-    }
+        // AT_RANDOM: 16 bytes.
+        sp -= 16;
+        let random_ptr = sp;
+        let mut x = (at_entry as u64) ^ (sp as u64).rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+        for i in 0..16usize {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *translated_mutref(token, (random_ptr + i) as *mut u8) = (x >> 56) as u8;
+        }
 
-    let mut auxv: Vec<(usize, usize)> = vec![
-        (AT_HWCAP, 0),
-        (AT_HWCAP2, 0),
-        (AT_PHDR, elf_aux.phdr),
-        (AT_PHENT, elf_aux.phent),
-        (AT_PHNUM, elf_aux.phnum),
-        (AT_PAGESZ, crate::config::PAGE_SIZE),
-        (AT_ENTRY, at_entry),
-        (AT_FLAGS, 0),
-        (AT_CLKTCK, 100),
-        (AT_UID, 0),
-        (AT_EUID, 0),
-        (AT_GID, 0),
-        (AT_EGID, 0),
-        (AT_SECURE, 0),
-        (AT_PLATFORM, platform_ptr),
-        (AT_BASE_PLATFORM, platform_ptr),
-        (AT_EXECFN, execfn_ptr),
-        (AT_RANDOM, random_ptr),
-    ];
-    // We do not provide a VDSO (AT_SYSINFO_EHDR). glibc should fall back to syscalls.
-    if at_base != 0 {
-        auxv.push((AT_BASE, at_base));
-    }
+        let mut auxv: Vec<(usize, usize)> = vec![
+            (AT_HWCAP, 0),
+            (AT_HWCAP2, 0),
+            (AT_PHDR, elf_aux.phdr),
+            (AT_PHENT, elf_aux.phent),
+            (AT_PHNUM, elf_aux.phnum),
+            (AT_PAGESZ, crate::config::PAGE_SIZE),
+            (AT_ENTRY, at_entry),
+            (AT_FLAGS, 0),
+            (AT_CLKTCK, 100),
+            (AT_UID, 0),
+            (AT_EUID, 0),
+            (AT_GID, 0),
+            (AT_EGID, 0),
+            (AT_SECURE, 0),
+            (AT_PLATFORM, platform_ptr),
+            (AT_BASE_PLATFORM, platform_ptr),
+            (AT_EXECFN, execfn_ptr),
+            (AT_RANDOM, random_ptr),
+        ];
+        // We do not provide a VDSO (AT_SYSINFO_EHDR). glibc should fall back to syscalls.
+        if at_base != 0 {
+            auxv.push((AT_BASE, at_base));
+        }
 
-    // Make the final entry stack pointer 16-byte aligned.
-    // Starting from a 16-byte boundary, pushing an odd number of usize words flips alignment.
-    let aux_words = (auxv.len() + 1) * 2; // + AT_NULL
-    let envp_words = envc + 1; // NULL-terminated
-    let argv_words = argc + 1; // NULL-terminated
-    let total_words = aux_words + envp_words + argv_words + 1; // + argc
-    sp &= !0xf;
-    if total_words % 2 == 1 {
-        sp -= core::mem::size_of::<usize>();
-    }
+        // Make the final entry stack pointer 16-byte aligned.
+        // Starting from a 16-byte boundary, pushing an odd number of usize words flips alignment.
+        let aux_words = (auxv.len() + 1) * 2; // + AT_NULL
+        let envp_words = envc + 1; // NULL-terminated
+        let argv_words = argc + 1; // NULL-terminated
+        let total_words = aux_words + envp_words + argv_words + 1; // + argc
+        sp &= !0xf;
+        if total_words % 2 == 1 {
+            sp -= core::mem::size_of::<usize>();
+        }
 
-    // auxv (type, val) pairs, ends with AT_NULL.
-    push_usize(token, &mut sp, 0);
-    push_usize(token, &mut sp, AT_NULL);
-    for (t, v) in auxv.iter().rev() {
-        push_usize(token, &mut sp, *v);
-        push_usize(token, &mut sp, *t);
-    }
-    let auxv_base = sp;
+        // auxv (type, val) pairs, ends with AT_NULL.
+        push_usize(token, &mut sp, 0);
+        push_usize(token, &mut sp, AT_NULL);
+        for (t, v) in auxv.iter().rev() {
+            push_usize(token, &mut sp, *v);
+            push_usize(token, &mut sp, *t);
+        }
+        let auxv_base = sp;
 
-    // envp pointers array (envc + 1), with trailing NULL.
-    push_usize(token, &mut sp, 0);
-    for p in env_ptrs.iter().rev() {
-        push_usize(token, &mut sp, *p);
-    }
-    let envp_base = sp;
+        // envp pointers array (envc + 1), with trailing NULL.
+        push_usize(token, &mut sp, 0);
+        for p in env_ptrs.iter().rev() {
+            push_usize(token, &mut sp, *p);
+        }
+        let envp_base = sp;
 
-    // argv pointers array (argc + 1), with trailing NULL.
-    push_usize(token, &mut sp, 0);
-    for p in arg_ptrs.iter().rev() {
-        push_usize(token, &mut sp, *p);
-    }
-    let argv_base = sp;
+        // argv pointers array (argc + 1), with trailing NULL.
+        push_usize(token, &mut sp, 0);
+        for p in arg_ptrs.iter().rev() {
+            push_usize(token, &mut sp, *p);
+        }
+        let argv_base = sp;
 
-    // argc.
-    push_usize(token, &mut sp, argc);
+        // argc.
+        push_usize(token, &mut sp, argc);
 
-    (sp, argv_base, envp_base, auxv_base)
+        (sp, argv_base, envp_base, auxv_base)
     }
 }
 
@@ -527,8 +534,7 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     }
     // Best-effort stack dump for diagnosing glibc/ld-linux startup issues.
     let argc = read_user_value(token, sp as *const usize);
-    let argv0_ptr =
-        read_user_value(token, (sp + core::mem::size_of::<usize>()) as *const usize);
+    let argv0_ptr = read_user_value(token, (sp + core::mem::size_of::<usize>()) as *const usize);
     let mut argv0 = alloc::string::String::new();
     if argv0_ptr != 0 {
         for i in 0..64usize {
@@ -550,7 +556,7 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     // Walk argv/envp to find auxv.
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-    // Skip envp pointers (NULL terminated).
+                                                                        // Skip envp pointers (NULL terminated).
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();
@@ -562,12 +568,27 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     let mut aux_p = p;
     for _ in 0..64usize {
         let t = read_user_value(token, aux_p as *const usize);
-        let v = read_user_value(token, (aux_p + core::mem::size_of::<usize>()) as *const usize);
+        let v = read_user_value(
+            token,
+            (aux_p + core::mem::size_of::<usize>()) as *const usize,
+        );
         aux_p += 2 * core::mem::size_of::<usize>();
         if t == AT_NULL {
             break;
         }
-        if matches!(t, AT_PHDR | AT_PHENT | AT_PHNUM | AT_PAGESZ | AT_BASE | AT_ENTRY | AT_PLATFORM | AT_EXECFN | AT_RANDOM | AT_HWCAP) {
+        if matches!(
+            t,
+            AT_PHDR
+                | AT_PHENT
+                | AT_PHNUM
+                | AT_PAGESZ
+                | AT_BASE
+                | AT_ENTRY
+                | AT_PLATFORM
+                | AT_EXECFN
+                | AT_RANDOM
+                | AT_HWCAP
+        ) {
             crate::println!("[exec_dyn] auxv type={} val={:#x}", t, v);
         }
     }
@@ -696,7 +717,11 @@ impl ProcessControlBlockInner {
     pub fn thread_count(&self) -> usize {
         self.tasks
             .iter()
-            .filter(|t| t.as_ref().map(|t| t.borrow_mut().res.is_some()).unwrap_or(false))
+            .filter(|t| {
+                t.as_ref()
+                    .map(|t| t.borrow_mut().res.is_some())
+                    .unwrap_or(false)
+            })
             .count()
     }
 
@@ -808,7 +833,7 @@ impl ProcessControlBlock {
                 heap_start,
                 brk: heap_start,
                 // Keep anonymous/file mmaps high to avoid colliding with ELF segments.
-                mmap_next: 0x20_0000_0000,
+                mmap_next: DEFAULT_MMAP_BASE,
                 mmap_areas: Vec::new(),
                 sysv_shm_attaches: Vec::new(),
                 signals: SignalFlags::empty(),
@@ -837,7 +862,7 @@ impl ProcessControlBlock {
         // prepare trap_cx of main thread
         let task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
-        let kstack_top = task.kstack.get_top();
+        let kstack_top = task.kstack_top();
         drop(task_inner);
         let mut tcx = TrapContext::app_init_context(
             entry_point,
@@ -935,7 +960,7 @@ impl ProcessControlBlock {
             inner.memory_set = memory_set;
             inner.heap_start = heap_start;
             inner.brk = heap_start;
-            inner.mmap_next = 0x20_0000_0000;
+            inner.mmap_next = DEFAULT_MMAP_BASE;
             inner.mmap_areas.clear();
             inner.argv = args.clone();
         }
@@ -957,7 +982,7 @@ impl ProcessControlBlock {
             entry_point,
             user_sp,
             KERNEL_SPACE.lock().token(),
-            task.kstack.get_top(),
+            task.kstack_top(),
             trap_handler as usize,
         );
         trap_cx.x[REG_A0] = args.len();
@@ -999,7 +1024,7 @@ impl ProcessControlBlock {
             inner.memory_set = memory_set;
             inner.heap_start = heap_start;
             inner.brk = heap_start;
-            inner.mmap_next = 0x20_0000_0000;
+            inner.mmap_next = DEFAULT_MMAP_BASE;
             inner.mmap_areas.clear();
             inner.argv = args.clone();
         }
@@ -1029,7 +1054,7 @@ impl ProcessControlBlock {
             interp_entry,
             user_sp,
             KERNEL_SPACE.lock().token(),
-            task.kstack.get_top(),
+            task.kstack_top(),
             trap_handler as usize,
         );
         trap_cx.x[REG_A0] = args.len();
@@ -1180,15 +1205,15 @@ impl ProcessControlBlock {
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
         // Seed trap context from the calling thread when available.
-        let parent_trap_cx = crate::task::processor::current_task()
-            .map(|t| *t.borrow_mut().get_trap_cx());
+        let parent_trap_cx =
+            crate::task::processor::current_task().map(|t| *t.borrow_mut().get_trap_cx());
         // modify kstack_top in trap_cx of this thread
         let mut task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
         if let Some(parent_trap_cx) = parent_trap_cx {
             *trap_cx = parent_trap_cx;
         }
-        trap_cx.kernel_sp = task.kstack.get_top();
+        trap_cx.kernel_sp = task.kstack_top();
         // set return value for child process
         trap_cx.x[REG_A0] = 0;
         if caller_tid != 0 {
