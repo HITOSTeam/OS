@@ -16,6 +16,12 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 const CLOCK_REALTIME: usize = 0;
 const CLOCK_MONOTONIC: usize = 1;
+const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+const CLOCK_THREAD_CPUTIME_ID: usize = 3;
+const CLOCK_MONOTONIC_RAW: usize = 4;
+const CLOCK_REALTIME_COARSE: usize = 5;
+const CLOCK_MONOTONIC_COARSE: usize = 6;
+const CLOCK_BOOTTIME: usize = 7;
 
 const EINVAL: isize = -22;
 const EFAULT: isize = -14;
@@ -117,7 +123,9 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
         return EFAULT;
     }
     let token = get_current_token();
-    let ts = read_user_value(token, req_ptr as *const TimeSpec);
+    let Some(ts) = try_read_user_value(token, req_ptr as *const TimeSpec) else {
+        return EFAULT;
+    };
     let Some(req_ns) = timespec_to_ns(ts) else {
         return EINVAL;
     };
@@ -125,7 +133,7 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
         return 0;
     }
     let start_ns = now_ns();
-    let ms = ((req_ns + 999_999) / 1_000_000) as usize;
+    let deadline_ns = start_ns.saturating_add(req_ns);
     if DEBUG_SIGNAL {
         let pid = crate::task::processor::current_process().getpid();
         let tid = current_task()
@@ -137,36 +145,42 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
         crate::log_if!(
             DEBUG_SIGNAL,
             info,
-            "[nanosleep] pid={} tid={} req_ns={} ms={} now_ms={}",
+            "[nanosleep] pid={} tid={} req_ns={} now_ms={}",
             pid,
             tid,
             req_ns,
-            ms,
             now_ms
         );
     }
-    let ret = thread::sys_sleep(ms);
-    if ret == EINTR {
-        if DEBUG_SIGNAL {
-            let now_ms = (get_time() as u64)
-                .saturating_mul(1_000)
-                .saturating_div(clock_freq() as u64);
-            crate::log_if!(
-                DEBUG_SIGNAL,
-                info,
-                "[nanosleep] ret=EINTR now_ms={} elapsed_ns={}",
-                now_ms,
-                now_ns().saturating_sub(start_ns)
-            );
+    loop {
+        let current = now_ns();
+        if current >= deadline_ns {
+            break;
         }
-        if _rem_ptr != 0 {
-            let elapsed = now_ns().saturating_sub(start_ns);
-            let remaining = req_ns.saturating_sub(elapsed);
-            let rem = ns_to_timespec(remaining);
-            let token = get_current_token();
-            write_user_value(token, _rem_ptr as *mut TimeSpec, &rem);
+        let remaining = deadline_ns.saturating_sub(current);
+        let ms = ((remaining + 999_999) / 1_000_000) as usize;
+        let ret = thread::sys_sleep(ms.max(1));
+        if ret == EINTR {
+            if DEBUG_SIGNAL {
+                let now_ms = (get_time() as u64)
+                    .saturating_mul(1_000)
+                    .saturating_div(clock_freq() as u64);
+                crate::log_if!(
+                    DEBUG_SIGNAL,
+                    info,
+                    "[nanosleep] ret=EINTR now_ms={} elapsed_ns={}",
+                    now_ms,
+                    now_ns().saturating_sub(start_ns)
+                );
+            }
+            if _rem_ptr != 0 {
+                let now = now_ns();
+                let rem = ns_to_timespec(deadline_ns.saturating_sub(now));
+                let token = get_current_token();
+                write_user_value(token, _rem_ptr as *mut TimeSpec, &rem);
+            }
+            return EINTR;
         }
-        return EINTR;
     }
     if DEBUG_SIGNAL {
         let now_ms = (get_time() as u64)
@@ -183,9 +197,20 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
     0
 }
 
-pub fn syscall_clock_gettime(_clk_id: usize, tp_ptr: usize) -> isize {
+pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
     if tp_ptr == 0 {
         return EFAULT;
+    }
+    match clk_id {
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME => {}
+        _ => return EINVAL,
     }
     let ns = now_ns();
     let ts = TimeSpec {
@@ -193,7 +218,9 @@ pub fn syscall_clock_gettime(_clk_id: usize, tp_ptr: usize) -> isize {
         nsec: (ns % NSEC_PER_SEC) as i64,
     };
     let token = get_current_token();
-    write_user_value(token, tp_ptr as *mut TimeSpec, &ts);
+    if try_write_user_value(token, tp_ptr as *mut TimeSpec, &ts).is_err() {
+        return EFAULT;
+    }
     0
 }
 
@@ -214,7 +241,9 @@ pub fn syscall_clock_nanosleep(
         return EOPNOTSUPP;
     }
     let token = get_current_token();
-    let ts = read_user_value(token, req_ptr as *const TimeSpec);
+    let Some(ts) = try_read_user_value(token, req_ptr as *const TimeSpec) else {
+        return EFAULT;
+    };
     let Some(req_ns) = timespec_to_ns(ts) else {
         return EINVAL;
     };
@@ -302,7 +331,9 @@ pub fn syscall_clock_nanosleep(
                 let remaining = target_ns.saturating_sub(now_ns());
                 let rem = ns_to_timespec(remaining);
                 let token = get_current_token();
-                write_user_value(token, rem_ptr as *mut TimeSpec, &rem);
+                if try_write_user_value(token, rem_ptr as *mut TimeSpec, &rem).is_err() {
+                    return EFAULT;
+                }
             }
             return EINTR;
         }

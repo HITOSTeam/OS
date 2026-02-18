@@ -21,6 +21,7 @@ use crate::task::task_block::TaskStatus;
 pub enum ProcFileKind {
     Mounts,
     Meminfo,
+    Cpuinfo,
     Loadavg,
     Uptime,
     Stat,
@@ -142,6 +143,7 @@ pub fn init_procfs() {
 
     let _ = ensure_proc_file(&proc_inode, "mounts", ProcFileKind::Mounts, 0o444);
     let _ = ensure_proc_file(&proc_inode, "meminfo", ProcFileKind::Meminfo, 0o444);
+    let _ = ensure_proc_file(&proc_inode, "cpuinfo", ProcFileKind::Cpuinfo, 0o444);
     let _ = ensure_proc_file(&proc_inode, "loadavg", ProcFileKind::Loadavg, 0o444);
     let _ = ensure_proc_file(&proc_inode, "uptime", ProcFileKind::Uptime, 0o444);
     let _ = ensure_proc_file(&proc_inode, "stat", ProcFileKind::Stat, 0o444);
@@ -220,6 +222,7 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
     for name in [
         "mounts",
         "meminfo",
+        "cpuinfo",
         "loadavg",
         "uptime",
         "stat",
@@ -302,6 +305,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     match trimmed {
         "/proc/mounts" => return Some(ProcPseudoFile::new(ProcFileKind::Mounts)),
         "/proc/meminfo" => return Some(ProcPseudoFile::new(ProcFileKind::Meminfo)),
+        "/proc/cpuinfo" => return Some(ProcPseudoFile::new(ProcFileKind::Cpuinfo)),
         "/proc/loadavg" => return Some(ProcPseudoFile::new(ProcFileKind::Loadavg)),
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
@@ -383,6 +387,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
     match kind {
         ProcFileKind::Mounts | ProcFileKind::PidMounts(_) => proc_mounts(),
         ProcFileKind::Meminfo => proc_meminfo(),
+        ProcFileKind::Cpuinfo => proc_cpuinfo(),
         ProcFileKind::Loadavg => String::from("0.00 0.00 0.00 1/1 1\n"),
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
@@ -489,6 +494,12 @@ fn proc_meminfo() -> String {
         "MemTotal:       {} kB\nMemFree:        {} kB\nBuffers:        0 kB\nCached:         0 kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n",
         mem_total_kb,
         mem_total_kb / 2
+    )
+}
+
+fn proc_cpuinfo() -> String {
+    String::from(
+        "processor\t: 0\nvendor_id\t: QEMU\nmodel name\t: QEMU Virtual CPU\ncpu MHz\t\t: 1000.000\n",
     )
 }
 
@@ -662,7 +673,12 @@ fn proc_pid_stat(pid: u32) -> String {
     let cminflt = 0;
     let majflt = 0;
     let cmajflt = 0;
-    let utime = 0;
+    let now_ms = crate::time::get_time_ms() as u64;
+    let elapsed_ticks = now_ms
+        .saturating_mul(HZ)
+        .saturating_div(1000)
+        .saturating_sub(starttime);
+    let utime = core::cmp::max(elapsed_ticks, 1);
     let stime = 0;
     let cutime = 0;
     let cstime = 0;
