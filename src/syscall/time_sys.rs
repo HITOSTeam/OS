@@ -1,7 +1,7 @@
 use crate::{
     config::clock_freq,
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    mm::{read_user_value, write_user_value},
+    mm::{read_user_value, try_read_user_value, try_write_user_value, write_user_value},
     syscall::thread,
     task::block_sleep::{alarm_remaining_ms, set_alarm_timer},
     task::processor::current_task,
@@ -58,6 +58,13 @@ struct TimeVal {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct TimeZone {
+    minuteswest: i32,
+    dsttime: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct TimeSpec {
     sec: i64,
     nsec: i64,
@@ -86,18 +93,22 @@ struct ITimerVal {
     it_value: TimeVal64,
 }
 
-pub fn syscall_gettimeofday(tv_ptr: usize, _tz: usize) -> isize {
-    if tv_ptr == 0 {
-        return 0;
-    }
-    let ticks = get_time() as u64;
-    let us = ticks.saturating_mul(1_000_000) / clock_freq() as u64;
-    let tv = TimeVal {
-        sec: us / 1_000_000,
-        usec: us % 1_000_000,
-    };
+pub fn syscall_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
     let token = get_current_token();
-    write_user_value(token, tv_ptr as *mut TimeVal, &tv);
+    if tv_ptr != 0 {
+        let ticks = get_time() as u64;
+        let us = ticks.saturating_mul(1_000_000) / clock_freq() as u64;
+        let tv = TimeVal {
+            sec: us / 1_000_000,
+            usec: us % 1_000_000,
+        };
+        if try_write_user_value(token, tv_ptr as *mut TimeVal, &tv).is_err() {
+            return EFAULT;
+        }
+    }
+    if tz_ptr != 0 && try_read_user_value::<TimeZone>(token, tz_ptr as *const TimeZone).is_none() {
+        return EFAULT;
+    }
     0
 }
 
@@ -189,7 +200,12 @@ pub fn syscall_clock_gettime(_clk_id: usize, tp_ptr: usize) -> isize {
 /// Linux `clock_nanosleep` (syscall 115 on riscv64).
 ///
 /// rt-tests (cyclictest) uses this for periodic sleeps (often with TIMER_ABSTIME).
-pub fn syscall_clock_nanosleep(clk_id: usize, flags: usize, req_ptr: usize, rem_ptr: usize) -> isize {
+pub fn syscall_clock_nanosleep(
+    clk_id: usize,
+    flags: usize,
+    req_ptr: usize,
+    rem_ptr: usize,
+) -> isize {
     const TIMER_ABSTIME: usize = 1;
     if req_ptr == 0 {
         return EFAULT;
@@ -512,13 +528,13 @@ pub fn syscall_pselect6(
 
         if let Some(deadline) = deadline_ms {
             if crate::time::get_time_ms() >= deadline {
-            if readfds != 0 {
-                crate::mm::copy_to_user(token, readfds as *mut u8, out_r.as_slice());
-            }
-            if writefds != 0 {
-                crate::mm::copy_to_user(token, writefds as *mut u8, out_w.as_slice());
-            }
-            return 0;
+                if readfds != 0 {
+                    crate::mm::copy_to_user(token, readfds as *mut u8, out_r.as_slice());
+                }
+                if writefds != 0 {
+                    crate::mm::copy_to_user(token, writefds as *mut u8, out_w.as_slice());
+                }
+                return 0;
             }
         }
 

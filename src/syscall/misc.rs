@@ -1,11 +1,10 @@
-use alloc::sync::Arc;
 use crate::{
     arch,
     debug_config::DEBUG_PTHREAD,
     fs::ext4_lock,
     mm::{
-        MapPermission, read_user_value, translated_byte_buffer, translated_str,
-        try_write_user_value, write_user_value,
+        read_user_value, translated_byte_buffer, translated_str, try_write_user_value,
+        write_user_value, MapPermission,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
@@ -19,6 +18,7 @@ use crate::{
     time::get_time,
     trap::get_current_token,
 };
+use alloc::sync::Arc;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -102,7 +102,7 @@ fn write_cstr(dst: &mut [u8; 65], s: &str) {
 
 pub fn syscall_uname(buf: usize) -> isize {
     if buf == 0 {
-        return -1;
+        return EFAULT;
     }
     let mut un = UtsName {
         sysname: [0; 65],
@@ -112,7 +112,7 @@ pub fn syscall_uname(buf: usize) -> isize {
         machine: [0; 65],
         domainname: [0; 65],
     };
-    write_cstr(&mut un.sysname, "CongCore");
+    write_cstr(&mut un.sysname, "Linux");
     write_cstr(&mut un.nodename, "localhost");
     // glibc/busybox may abort early if the reported kernel release is "too old".
     // Report a modern Linux-like release string for compatibility.
@@ -127,7 +127,9 @@ pub fn syscall_uname(buf: usize) -> isize {
     write_cstr(&mut un.domainname, "localdomain");
 
     let token = get_current_token();
-    write_user_value(token, buf as *mut UtsName, &un);
+    if try_write_user_value(token, buf as *mut UtsName, &un).is_err() {
+        return EFAULT;
+    }
     0
 }
 
@@ -257,11 +259,16 @@ pub fn syscall_getpgid(pid: usize) -> isize {
 
 /// Linux `getsid(2)` (syscall 156 on riscv64).
 pub fn syscall_getsid(pid: usize) -> isize {
-    if pid == 0 {
-        current_process().getpid() as isize
-    } else {
-        pid as isize
+    let cur = current_process();
+    let cur_pid = cur.getpid();
+    let target_pid = if pid == 0 { cur_pid } else { pid };
+    if target_pid == cur_pid {
+        return cur.borrow_mut().pgid as isize;
     }
+    let Some(target) = pid2process(target_pid) else {
+        return ESRCH;
+    };
+    target.borrow_mut().pgid as isize
 }
 
 /// Linux `setsid(2)` (syscall 157 on riscv64).

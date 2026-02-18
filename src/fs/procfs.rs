@@ -560,6 +560,14 @@ fn proc_pid_status(pid: u32) -> String {
         .map(|(s, e)| e.saturating_sub(*s))
         .sum();
     let vsize_kb: usize = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
+    let uid = inner.uid;
+    let euid = inner.euid;
+    let suid = inner.suid;
+    let fsuid = inner.fsuid;
+    let gid = inner.gid;
+    let egid = inner.egid;
+    let sgid = inner.sgid;
+    let fsgid = inner.fsgid;
 
     let comm = argv
         .first()
@@ -583,7 +591,7 @@ fn proc_pid_status(pid: u32) -> String {
         _ => "R (running)",
     };
     alloc::format!(
-        "Name:\t{comm}\nState:\t{state_desc}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{num_threads}\nVmSize:\t{vsize_kb} kB\n"
+        "Name:\t{comm}\nState:\t{state_desc}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{euid}\t{suid}\t{fsuid}\nGid:\t{gid}\t{egid}\t{sgid}\t{fsgid}\nThreads:\t{num_threads}\nVmSize:\t{vsize_kb} kB\n"
     )
 }
 
