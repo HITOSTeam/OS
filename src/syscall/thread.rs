@@ -2,11 +2,11 @@
 
 use alloc::sync::Arc;
 
+use crate::debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_TIMER};
 use crate::{
     arch,
-    mm::kernel_token,
     arch::REG_A0,
-    time::get_time_ms,
+    mm::kernel_token,
     task::{
         block_sleep::add_timer,
         manager::{add_task, select_hart_for_new_task},
@@ -14,9 +14,9 @@ use crate::{
         signal::has_unmasked_pending,
         task_block::TaskControlBlock,
     },
+    time::get_time_ms,
     trap::{context::TrapContext, trap_handler},
 };
-use crate::debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_TIMER};
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     const ENOMEM: isize = -12;
@@ -99,7 +99,11 @@ pub fn sys_waittid(tid: usize) -> i32 {
     // - waited thread holds its TCB lock and drops TaskUserRes (needs PCB lock)
     let waited_task = {
         let process_inner = process.borrow_mut();
-        process_inner.tasks.get(tid).and_then(|t| t.as_ref()).cloned()
+        process_inner
+            .tasks
+            .get(tid)
+            .and_then(|t| t.as_ref())
+            .cloned()
     };
     let waited_task = match waited_task {
         Some(t) => t,
@@ -149,7 +153,11 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     } else {
         usize::MAX
     };
-    let start_ms = if DEBUG_SIGNAL { Some(get_time_ms()) } else { None };
+    let start_ms = if DEBUG_SIGNAL {
+        Some(get_time_ms())
+    } else {
+        None
+    };
     if DEBUG_TIMER {
         crate::println!(
             "[sleep] tid={} request_ms={} now_ms={}",

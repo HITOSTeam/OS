@@ -1,9 +1,7 @@
 use core::mem::size_of;
 
 use crate::{
-    fs::make_socketpair,
-    mm::write_user_value,
-    task::processor::current_process,
+    fs::make_socketpair, mm::write_user_value, task::processor::current_process,
     trap::get_current_token,
 };
 

@@ -3,7 +3,7 @@ use crate::{
     config::MAX_HARTS,
     mm::{try_write_user_value, MemorySet},
     println,
-    syscall::futex::futex_wake,
+    syscall::futex::futex_wake_private_and_shared,
     task::{
         id::{KernelStack, TaskUserRes},
         manager::{add_task, fetch_task, remove_inactive_task, wakeup_task, TASK_MANAGER},
@@ -67,9 +67,7 @@ fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
         return;
     }
     let _ = try_write_user_value(token, ctid as *mut i32, &0);
-    // Wake both private/shared futex keys; tid-clears don't encode the flag.
-    let _ = futex_wake((pid, ctid), ctid, 1);
-    let _ = futex_wake((0, ctid), ctid, 1);
+    let _ = futex_wake_private_and_shared(pid, token, ctid, 1);
 }
 pub struct Processor {
     now_task_block: Option<Arc<TaskControlBlock>>,

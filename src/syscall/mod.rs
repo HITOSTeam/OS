@@ -2,23 +2,23 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) mod filesystem;
 
 mod condvar;
+mod dummy;
 mod flow;
-mod mutex;
-mod process;
-mod semaphore;
-mod smp;
-pub(crate) mod signal;
-mod thread;
+pub(crate) mod futex;
 mod memory;
 pub(crate) mod misc;
-mod socket;
+mod mutex;
 mod net;
-mod time_sys;
-mod sched;
+mod process;
 pub(crate) mod robust_list;
-pub(crate) mod futex;
+mod sched;
+mod semaphore;
+pub(crate) mod signal;
+mod smp;
+mod socket;
 pub(crate) mod sysv_shm;
-mod dummy;
+mod thread;
+mod time_sys;
 static CYCLIC_SYSCALL_LOGS: AtomicUsize = AtomicUsize::new(1024);
 static LAST_SYSCALL_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static LAST_SYSCALL_A0: AtomicUsize = AtomicUsize::new(0);
@@ -31,7 +31,9 @@ static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
 const BUSYBOX_APPLET_ALLOWLIST: [&str; 1] = ["zcat"];
 
 pub(crate) fn busybox_applet_allowed(name: &str) -> bool {
-    BUSYBOX_APPLET_ALLOWLIST.iter().any(|&allowed| allowed == name)
+    BUSYBOX_APPLET_ALLOWLIST
+        .iter()
+        .any(|&allowed| allowed == name)
 }
 
 pub fn last_syscall_snapshot() -> (usize, [usize; 6]) {
@@ -70,6 +72,7 @@ const SYSCALL_FACCESSAT: usize = 48;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_CHDIR: usize = 49;
+const SYSCALL_FCHDIR: usize = 50;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_VFORK: usize = 58;
@@ -108,8 +111,15 @@ const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
+const SYSCALL_TIMER_CREATE: usize = 107;
+const SYSCALL_TIMER_GETTIME: usize = 108;
+const SYSCALL_TIMER_GETOVERRUN: usize = 109;
+const SYSCALL_TIMER_SETTIME: usize = 110;
+const SYSCALL_TIMER_DELETE: usize = 111;
 const SYSCALL_SYSLOG: usize = 116;
+const SYSCALL_CLOCK_SETTIME: usize = 112;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
+const SYSCALL_CLOCK_GETRES: usize = 114;
 const SYSCALL_CLOCK_NANOSLEEP: usize = 115;
 const SYSCALL_SCHED_SETPARAM: usize = 118;
 const SYSCALL_SCHED_SETSCHEDULER: usize = 119;
@@ -128,7 +138,13 @@ const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETPGID: usize = 155;
 const SYSCALL_GETSID: usize = 156;
 const SYSCALL_SETSID: usize = 157;
+const SYSCALL_GETGROUPS: usize = 158;
+const SYSCALL_SETGROUPS: usize = 159;
 const SYSCALL_UNAME: usize = 160;
+const SYSCALL_SETHOSTNAME: usize = 161;
+const SYSCALL_SETDOMAINNAME: usize = 162;
+const SYSCALL_SETPRIORITY: usize = 140;
+const SYSCALL_GETPRIORITY: usize = 141;
 const SYSCALL_UMASK: usize = 166;
 const SYSCALL_SETREGID: usize = 143;
 const SYSCALL_SETGID: usize = 144;
@@ -179,6 +195,7 @@ const SYSCALL_MLOCKALL: usize = 230;
 const SYSCALL_MUNLOCKALL: usize = 231;
 const SYSCALL_GETRLIMIT: usize = 163;
 const SYSCALL_SETRLIMIT: usize = 164;
+const SYSCALL_GETRUSAGE: usize = 165;
 const SYSCALL_WAIT4: usize = 260;
 const SYSCALL_PRLIMIT64: usize = 261;
 const SYSCALL_RENAMEAT2: usize = 276;
@@ -281,7 +298,11 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         let is_sleep = {
             let proc = crate::task::processor::current_process();
             let inner = proc.borrow_mut();
-            inner.argv.first().map(|s| s.as_str() == "sleep").unwrap_or(false)
+            inner
+                .argv
+                .first()
+                .map(|s| s.as_str() == "sleep")
+                .unwrap_or(false)
         };
         if is_sleep {
             let now_ms = crate::time::get_time_ms();
@@ -365,45 +386,60 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MKDIRAT => filesystem::syscall_mkdirat(args[0] as isize, args[1], args[2]),
         SYSCALL_UNLINKAT => filesystem::syscall_unlinkat(args[0] as isize, args[1], args[2]),
         SYSCALL_FCHMOD => filesystem::syscall_fchmod(args[0], args[1]),
-        SYSCALL_FCHMODAT => filesystem::syscall_fchmodat(args[0] as isize, args[1], args[2], args[3]),
-        SYSCALL_FCHOWNAT => filesystem::syscall_fchownat(args[0] as isize, args[1], args[2], args[3], args[4]),
+        SYSCALL_FCHMODAT => {
+            filesystem::syscall_fchmodat(args[0] as isize, args[1], args[2], args[3])
+        }
+        SYSCALL_FCHOWNAT => {
+            filesystem::syscall_fchownat(args[0] as isize, args[1], args[2], args[3], args[4])
+        }
         SYSCALL_FCHOWN => filesystem::syscall_fchown(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => filesystem::syscall_ftruncate(args[0], args[1]),
-        SYSCALL_RENAMEAT => filesystem::syscall_renameat(args[0] as isize, args[1], args[2] as isize, args[3]),
+        SYSCALL_RENAMEAT => {
+            filesystem::syscall_renameat(args[0] as isize, args[1], args[2] as isize, args[3])
+        }
         SYSCALL_SYMLINKAT => filesystem::syscall_symlinkat(args[0], args[1] as isize, args[2]),
         SYSCALL_UMOUNT2 => misc::syscall_umount2(args[0], args[1]),
         SYSCALL_MOUNT => misc::syscall_mount(args[0], args[1], args[2], args[3], args[4]),
-        SYSCALL_FACCESSAT => filesystem::syscall_faccessat(args[0] as isize, args[1], args[2], args[3]),
+        SYSCALL_FACCESSAT => {
+            filesystem::syscall_faccessat(args[0] as isize, args[1], args[2], args[3])
+        }
         SYSCALL_CHDIR => filesystem::syscall_chdir(args[0]),
+        SYSCALL_FCHDIR => filesystem::syscall_fchdir(args[0]),
         SYSCALL_OPENAT => filesystem::syscall_openat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_READ => flow::syscall_read(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_WRITE => flow::syscall_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_READV => flow::syscall_readv(args[0], args[1], args[2]),
         SYSCALL_WRITEV => flow::syscall_writev(args[0], args[1], args[2]),
         SYSCALL_PREAD64 => filesystem::syscall_pread64(args[0], args[1], args[2], args[3] as isize),
-        SYSCALL_PWRITE64 => filesystem::syscall_pwrite64(args[0], args[1], args[2], args[3] as isize),
-        SYSCALL_PSELECT6 => time_sys::syscall_pselect6(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_PWRITE64 => {
+            filesystem::syscall_pwrite64(args[0], args[1], args[2], args[3] as isize)
+        }
+        SYSCALL_PSELECT6 => {
+            time_sys::syscall_pselect6(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
         SYSCALL_PPOLL => misc::syscall_ppoll(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_SIGNALFD4 => dummy::syscall_signalfd4(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_GETDENTS64 => filesystem::syscall_getdents64(args[0], args[1], args[2]),
         SYSCALL_LSEEK => filesystem::syscall_lseek(args[0], args[1] as isize, args[2]),
-        SYSCALL_READLINKAT => filesystem::syscall_readlinkat(args[0] as isize, args[1], args[2], args[3]),
-        SYSCALL_NEWFSTATAT => filesystem::syscall_newfstatat(args[0] as isize, args[1], args[2], args[3]),
+        SYSCALL_READLINKAT => {
+            filesystem::syscall_readlinkat(args[0] as isize, args[1], args[2], args[3])
+        }
+        SYSCALL_NEWFSTATAT => {
+            filesystem::syscall_newfstatat(args[0] as isize, args[1], args[2], args[3])
+        }
         SYSCALL_FSTAT => filesystem::syscall_fstat(args[0], args[1]),
-        SYSCALL_STATX => filesystem::syscall_statx(
-            args[0] as isize,
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-        ),
+        SYSCALL_STATX => {
+            filesystem::syscall_statx(args[0] as isize, args[1], args[2], args[3], args[4])
+        }
         SYSCALL_SYNC => filesystem::syscall_sync(),
         SYSCALL_FSYNC => filesystem::syscall_fsync(args[0]),
         SYSCALL_FDATASYNC => filesystem::syscall_fsync(args[0]),
         SYSCALL_FSTATFS => filesystem::syscall_fstatfs(args[0], args[1]),
         SYSCALL_STATFS => filesystem::syscall_statfs(args[0], args[1]),
         SYSCALL_TIMERFD_CREATE => dummy::syscall_timerfd_create(args[0], args[1]),
-        SYSCALL_UTIMENSAT => filesystem::syscall_utimensat(args[0] as isize, args[1], args[2], args[3]),
+        SYSCALL_UTIMENSAT => {
+            filesystem::syscall_utimensat(args[0] as isize, args[1], args[2], args[3])
+        }
         SYSCALL_ACCT => filesystem::syscall_acct(args[0]),
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_EXIT_GROUP => flow::syscall_exit_group(args[0]),
@@ -414,8 +450,19 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_NANOSLEEP => time_sys::syscall_nanosleep(args[0], args[1]),
         SYSCALL_GETITIMER => time_sys::syscall_getitimer(args[0], args[1]),
         SYSCALL_SETITIMER => time_sys::syscall_setitimer(args[0], args[1], args[2]),
+        SYSCALL_TIMER_CREATE => time_sys::syscall_timer_create(args[0], args[1], args[2]),
+        SYSCALL_TIMER_GETTIME => time_sys::syscall_timer_gettime(args[0] as isize, args[1]),
+        SYSCALL_TIMER_GETOVERRUN => time_sys::syscall_timer_getoverrun(args[0] as isize),
+        SYSCALL_TIMER_SETTIME => {
+            time_sys::syscall_timer_settime(args[0] as isize, args[1], args[2], args[3])
+        }
+        SYSCALL_TIMER_DELETE => time_sys::syscall_timer_delete(args[0] as isize),
+        SYSCALL_CLOCK_SETTIME => time_sys::syscall_clock_settime(args[0], args[1]),
         SYSCALL_CLOCK_GETTIME => time_sys::syscall_clock_gettime(args[0], args[1]),
-        SYSCALL_CLOCK_NANOSLEEP => time_sys::syscall_clock_nanosleep(args[0], args[1], args[2], args[3]),
+        SYSCALL_CLOCK_GETRES => time_sys::syscall_clock_getres(args[0], args[1]),
+        SYSCALL_CLOCK_NANOSLEEP => {
+            time_sys::syscall_clock_nanosleep(args[0], args[1], args[2], args[3])
+        }
         SYSCALL_SYSLOG => misc::syscall_syslog(args[0], args[1], args[2]),
         SYSCALL_SCHED_SETPARAM => sched::syscall_sched_setparam(args[0], args[1]),
         SYSCALL_SCHED_SETSCHEDULER => sched::syscall_sched_setscheduler(args[0], args[1], args[2]),
@@ -434,7 +481,15 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETPGID => misc::syscall_getpgid(args[0]),
         SYSCALL_GETSID => misc::syscall_getsid(args[0]),
         SYSCALL_SETSID => misc::syscall_setsid(),
+        SYSCALL_GETGROUPS => misc::syscall_getgroups(args[0], args[1]),
+        SYSCALL_SETGROUPS => misc::syscall_setgroups(args[0], args[1]),
         SYSCALL_UNAME => misc::syscall_uname(args[0]),
+        SYSCALL_SETHOSTNAME => misc::syscall_sethostname(args[0], args[1]),
+        SYSCALL_SETDOMAINNAME => misc::syscall_setdomainname(args[0], args[1]),
+        SYSCALL_SETPRIORITY => {
+            misc::syscall_setpriority(args[0] as isize, args[1] as isize, args[2] as isize)
+        }
+        SYSCALL_GETPRIORITY => misc::syscall_getpriority(args[0] as isize, args[1] as isize),
         SYSCALL_UMASK => misc::syscall_umask(args[0]),
         SYSCALL_SETREGID => misc::syscall_setregid(args[0], args[1]),
         SYSCALL_SETGID => misc::syscall_setgid(args[0]),
@@ -471,13 +526,22 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETSOCKNAME => net::syscall_getsockname(args[0], args[1], args[2]),
         SYSCALL_GETPEERNAME => net::syscall_getpeername(args[0], args[1], args[2]),
         SYSCALL_SENDTO => net::syscall_sendto(args[0], args[1], args[2], args[3], args[4], args[5]),
-        SYSCALL_RECVFROM => net::syscall_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_RECVFROM => {
+            net::syscall_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
         SYSCALL_SETSOCKOPT => net::syscall_setsockopt(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETSOCKOPT => net::syscall_getsockopt(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_SHUTDOWN => net::syscall_shutdown(args[0], args[1]),
         SYSCALL_BRK => memory::syscall_brk(args[0]),
         SYSCALL_MUNMAP => memory::syscall_munmap(args[0], args[1]),
-        SYSCALL_MMAP => memory::syscall_mmap(args[0], args[1], args[2], args[3], args[4] as isize, args[5]),
+        SYSCALL_MMAP => memory::syscall_mmap(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4] as isize,
+            args[5],
+        ),
         SYSCALL_MPROTECT => memory::syscall_mprotect(args[0], args[1], args[2]),
         SYSCALL_MADVISE => memory::syscall_madvise(args[0], args[1], args[2]),
         SYSCALL_MLOCK => memory::syscall_mlock(args[0], args[1]),
@@ -486,13 +550,26 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MUNLOCKALL => memory::syscall_munlockall(),
         SYSCALL_GETRLIMIT => misc::syscall_getrlimit(args[0], args[1]),
         SYSCALL_SETRLIMIT => misc::syscall_setrlimit(args[0], args[1]),
+        SYSCALL_GETRUSAGE => misc::syscall_getrusage(args[0] as isize, args[1]),
         SYSCALL_PRLIMIT64 => misc::syscall_prlimit64(args[0], args[1], args[2], args[3]),
-        SYSCALL_RENAMEAT2 => filesystem::syscall_renameat2(args[0] as isize, args[1], args[2] as isize, args[3], args[4]),
+        SYSCALL_RENAMEAT2 => filesystem::syscall_renameat2(
+            args[0] as isize,
+            args[1],
+            args[2] as isize,
+            args[3],
+            args[4],
+        ),
         SYSCALL_GETRANDOM => misc::syscall_getrandom(args[0], args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => dummy::syscall_memfd_create(args[0], args[1]),
         SYSCALL_BPF => dummy::syscall_bpf(args[0], args[1], args[2]),
         SYSCALL_USERFAULTFD => dummy::syscall_userfaultfd(args[0]),
-        SYSCALL_PERF_EVENT_OPEN => dummy::syscall_perf_event_open(args[0], args[1] as isize, args[2] as isize, args[3] as isize, args[4]),
+        SYSCALL_PERF_EVENT_OPEN => dummy::syscall_perf_event_open(
+            args[0],
+            args[1] as isize,
+            args[2] as isize,
+            args[3] as isize,
+            args[4],
+        ),
         SYSCALL_FANOTIFY_INIT => dummy::syscall_fanotify_init(args[0], args[1]),
         SYSCALL_CLOSE => filesystem::syscall_close(args[0]),
         SYSCALL_VFORK => process::syscall_vfork(),
@@ -512,9 +589,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SIGSUSPEND => signal::syscall_rt_sigsuspend(args[0], args[1]),
         SYSCALL_SIGACTION => signal::syscall_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::syscall_rt_sigprocmask(args[0], args[1], args[2], args[3]),
-        SYSCALL_SIGTIMEDWAIT => {
-            signal::syscall_rt_sigtimedwait(args[0], args[1], args[2], args[3])
-        }
+        SYSCALL_SIGTIMEDWAIT => signal::syscall_rt_sigtimedwait(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGRETURN => signal::syscall_rt_sigreturn(),
         SYSCALL_THREAD_CREATE => thread::sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => thread::sys_gettid(),

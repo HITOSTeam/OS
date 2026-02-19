@@ -1,6 +1,8 @@
 use crate::{
     println,
-    task::processor::{exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next},
+    task::processor::{
+        exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
+    },
     trap::get_current_token,
 };
 

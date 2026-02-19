@@ -1,8 +1,11 @@
 use alloc::sync::Arc;
+use core::any::Any;
 use core::mem::size_of;
 
-use crate::fs::{File, NetSocketFile, make_socketpair};
-use crate::mm::{read_user_value, write_user_value, try_copy_to_user, try_read_user_value};
+use crate::fs::{File, NetSocketFile};
+use crate::mm::{
+    read_user_value, try_copy_to_user, try_read_user_value, write_user_value, UserBuffer,
+};
 use crate::task::processor::current_process;
 use crate::trap::get_current_token;
 
@@ -33,6 +36,36 @@ const EOPNOTSUPP: isize = -95;
 const EISCONN: isize = -106;
 const EMFILE: isize = -24;
 const EADDRNOTAVAIL: isize = -99;
+const ENOENT: isize = -2;
+
+/// Minimal AF_UNIX stream socket placeholder.
+///
+/// We only use this to let libc probe nscd over UNIX sockets and get a
+/// deterministic `ENOENT` from `connect()`, so it falls back to `/etc/passwd`
+/// and `/etc/group`.
+struct UnixSocketStub;
+
+impl File for UnixSocketStub {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn write(&self, buf: UserBuffer) -> usize {
+        buf.len()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -55,7 +88,10 @@ fn get_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
     inner.fd_table[fd].clone().ok_or(EBADF)
 }
 
-fn parse_sockaddr_in(user_ptr: usize, len: usize) -> Result<(smoltcp::wire::Ipv4Address, u16), isize> {
+fn parse_sockaddr_in(
+    user_ptr: usize,
+    len: usize,
+) -> Result<(smoltcp::wire::Ipv4Address, u16), isize> {
     if user_ptr == 0 || len < size_of::<SockAddrIn>() {
         return Err(EINVAL);
     }
@@ -72,7 +108,12 @@ fn parse_sockaddr_in(user_ptr: usize, len: usize) -> Result<(smoltcp::wire::Ipv4
     Ok((ip, port))
 }
 
-fn write_sockaddr_in(user_ptr: usize, user_len_ptr: usize, ip: smoltcp::wire::Ipv4Address, port: u16) {
+fn write_sockaddr_in(
+    user_ptr: usize,
+    user_len_ptr: usize,
+    ip: smoltcp::wire::Ipv4Address,
+    port: u16,
+) {
     if user_ptr == 0 || user_len_ptr == 0 {
         return;
     }
@@ -94,7 +135,11 @@ fn write_sockaddr_in(user_ptr: usize, user_len_ptr: usize, ip: smoltcp::wire::Ip
         sin_zero: [0; 8],
     };
     write_user_value(token, user_ptr as *mut SockAddrIn, &sa);
-    write_user_value(token, user_len_ptr as *mut u32, &(size_of::<SockAddrIn>() as u32));
+    write_user_value(
+        token,
+        user_len_ptr as *mut u32,
+        &(size_of::<SockAddrIn>() as u32),
+    );
 }
 
 pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
@@ -114,8 +159,7 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
             if st != SOCK_STREAM {
                 return EPROTONOSUPPORT;
             }
-            let (end0, _end1) = make_socketpair();
-            end0
+            Arc::new(UnixSocketStub)
         }
         _ => return EAFNOSUPPORT,
     };
@@ -134,7 +178,12 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
     }
     inner.fd_flags[fd] = fd_flags;
     if crate::debug_config::DEBUG_NET {
-        crate::println!("[net] pid={} socket() -> fd={} type={}", process.pid.0, fd, st);
+        crate::println!(
+            "[net] pid={} socket() -> fd={} type={}",
+            process.pid.0,
+            fd,
+            st
+        );
     }
     fd as isize
 }
@@ -163,7 +212,14 @@ pub fn syscall_bind(fd: usize, addr: usize, addrlen: usize) -> isize {
         Err(e) => e,
     };
     if crate::debug_config::DEBUG_NET {
-        crate::println!("[net] pid={} bind(fd={}) -> {}:{} = {}", current_process().pid.0, fd, ip, port, r);
+        crate::println!(
+            "[net] pid={} bind(fd={}) -> {}:{} = {}",
+            current_process().pid.0,
+            fd,
+            ip,
+            port,
+            r
+        );
     }
     r
 }
@@ -272,6 +328,10 @@ pub fn syscall_connect(fd: usize, addr: usize, addrlen: usize) -> isize {
         Ok(f) => f,
         Err(e) => return e,
     };
+    if file.as_any().is::<UnixSocketStub>() {
+        let _ = (addr, addrlen);
+        return ENOENT;
+    }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
         None => return ENOTSOCK,
@@ -281,7 +341,13 @@ pub fn syscall_connect(fd: usize, addr: usize, addrlen: usize) -> isize {
         Err(e) => return e,
     };
     if crate::debug_config::DEBUG_NET {
-        crate::println!("[net] pid={} connect(fd={}) -> {}:{}", current_process().pid.0, fd, ip, port);
+        crate::println!(
+            "[net] pid={} connect(fd={}) -> {}:{}",
+            current_process().pid.0,
+            fd,
+            ip,
+            port
+        );
     }
     match sock.connect_v4(ip, port, None) {
         Ok(()) => 0,
@@ -534,7 +600,13 @@ pub fn syscall_getsockopt(
         0
     };
     if crate::debug_config::DEBUG_NET && (optname == SO_SNDBUF || optname == SO_RCVBUF) {
-        crate::println!("[net] pid={} getsockopt(fd={}, opt={}) -> {}", current_process().pid.0, fd, optname, val);
+        crate::println!(
+            "[net] pid={} getsockopt(fd={}, opt={}) -> {}",
+            current_process().pid.0,
+            fd,
+            optname,
+            val
+        );
     }
     if optval != 0 {
         let v: u32 = val;

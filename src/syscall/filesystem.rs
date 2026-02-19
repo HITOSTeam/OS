@@ -12,17 +12,20 @@ use crate::task::manager::PID2PCB;
 use crate::{
     config::clock_freq,
     fs::{
-        File, OSInode, OpenFlags, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile,
-        RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode,
-        shm_create, shm_get, shm_list, shm_remove,
+        ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode, shm_create,
+        shm_get, shm_list, shm_remove, File, OSInode, OpenFlags, PseudoBlock, PseudoDir,
+        PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
     },
     mm::{
-        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
-        translated_byte_buffer, translated_mutref, translated_str, try_copy_to_user,
-        try_read_user_value, write_user_value,
+        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
+        translated_str, try_copy_to_user, try_read_user_value, write_user_value, MapPermission,
+        UserBuffer,
     },
-    task::ProcessControlBlock,
     task::processor::current_process,
+    task::{
+        signal::{queue_process_signal, SIGXFSZ_NUM},
+        ProcessControlBlock,
+    },
     time::get_time,
     trap::get_current_token,
 };
@@ -51,15 +54,18 @@ const O_TMPFILE: usize = 0x410000;
 
 const FD_CLOEXEC: u32 = 1;
 const PATH_MAX: usize = 4096;
+const NAME_MAX: usize = 255;
 const MAX_SYMLINKS: usize = 40;
 
 // Linux errno (negative return in kernel ABI).
 const EBADF: isize = -9;
 const EFAULT: isize = -14;
+const EFBIG: isize = -27;
 const ELOOP: isize = -40;
 const EPERM: isize = -1;
 const ENOENT: isize = -2;
 const EINVAL: isize = -22;
+const ERANGE: isize = -34;
 const EMFILE: isize = -24;
 const ENOTDIR: isize = -20;
 const EISDIR: isize = -21;
@@ -207,6 +213,15 @@ fn normalize_relative_path(path: &str) -> String {
     parts.join("/")
 }
 
+fn validate_path_components(path: &str) -> Result<(), isize> {
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        if seg.len() > NAME_MAX {
+            return Err(ENAMETOOLONG);
+        }
+    }
+    Ok(())
+}
+
 fn path_basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -274,6 +289,38 @@ fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
     }
 }
 
+fn resolve_final_symlink_abs_path(abs: &str) -> String {
+    let mut current = String::from(abs);
+    for _ in 0..MAX_SYMLINKS {
+        if current == "/" {
+            break;
+        }
+        let Some((parent, name)) = split_parent_and_name(&current) else {
+            break;
+        };
+        let parent_abs = if parent.is_empty() { "/" } else { parent };
+        let Some(parent_inode) = find_path_in_roots(parent_abs) else {
+            break;
+        };
+        let Some(child) = parent_inode.find(name) else {
+            break;
+        };
+        if !child.is_symlink() {
+            break;
+        }
+        let target = String::from_utf8_lossy(&child.read_all()).into_owned();
+        if target.is_empty() {
+            break;
+        }
+        current = if target.starts_with('/') {
+            normalize_path("/", &target)
+        } else {
+            normalize_path(parent_abs, &target)
+        };
+    }
+    current
+}
+
 fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     let process = current_process();
     let inner = process.borrow_mut();
@@ -338,6 +385,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     if path.len() > PATH_MAX {
         return Err(ENAMETOOLONG);
     }
+    validate_path_components(path)?;
 
     // Absolute path: ignore dirfd.
     if path.starts_with('/') {
@@ -911,6 +959,63 @@ fn current_effective_uid_gid() -> (u32, u32) {
 
 fn current_fsuid_gid() -> (u32, u32) {
     crate::syscall::misc::current_fsuid_gid()
+}
+
+fn current_in_group(gid: u32) -> bool {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    gid == inner.fsgid || inner.supplementary_gids.iter().any(|g| *g == gid)
+}
+
+fn parse_chown_id(id: usize) -> Option<u32> {
+    if id == usize::MAX || id == u32::MAX as usize {
+        None
+    } else {
+        Some(id as u32)
+    }
+}
+
+fn maybe_clear_suid_sgid_after_chown(inode: &ext4_fs::Inode, touched_owner: bool) {
+    if !touched_owner || !inode.is_file() {
+        return;
+    }
+    let mut mode = inode.mode();
+    mode &= !0o4000; // Clear setuid on regular files after chown/chgrp.
+    if (mode & 0o0010) != 0 {
+        // Linux preserves setgid on non-group-executable regular files.
+        mode &= !0o2000;
+    }
+    inode.set_mode(mode);
+}
+
+fn apply_chown_to_inode(inode: &ext4_fs::Inode, uid: usize, gid: usize) -> isize {
+    let uid_req = parse_chown_id(uid);
+    let gid_req = parse_chown_id(gid);
+    let (euid, _egid) = current_effective_uid_gid();
+
+    if euid != 0 {
+        if inode.uid() != euid {
+            return EPERM;
+        }
+        if let Some(new_uid) = uid_req {
+            // Unprivileged callers cannot change file owner.
+            if new_uid != inode.uid() {
+                return EPERM;
+            }
+        }
+        if let Some(new_gid) = gid_req {
+            // Unprivileged owner may only chgrp into one of its groups.
+            if new_gid != inode.gid() && !current_in_group(new_gid) {
+                return EPERM;
+            }
+        }
+    }
+
+    let new_uid = uid_req.unwrap_or_else(|| inode.uid());
+    let new_gid = gid_req.unwrap_or_else(|| inode.gid());
+    inode.set_uid_gid(new_uid, new_gid);
+    maybe_clear_suid_sgid_after_chown(inode, uid_req.is_some() || gid_req.is_some());
+    0
 }
 
 fn inode_mode_allows_uid_gid(inode: &ext4_fs::Inode, mask: usize, uid: u32, gid: u32) -> bool {
@@ -1593,7 +1698,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     if path == "/etc/group" {
         return Some(alloc::sync::Arc::new(PseudoFile::new_static(
-            "root:x:0:\nnobody:x:65534:\nnogroup:x:65534:\n",
+            "root:x:0:\ndaemon:x:1:\nusers:x:100:\nnobody:x:65534:\nnogroup:x:65534:\n",
         )));
     }
 
@@ -1675,6 +1780,9 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
+        if crate::fs::proc_readlink(abs).is_some() {
+            return 0;
+        }
         // Treat known pseudo nodes as always accessible.
         return if open_pseudo(abs).is_some() {
             0
@@ -1725,7 +1833,7 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
     };
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return 0;
+            return EROFS;
         }
         let inode = os_inode.ext4_inode();
         let _ext4_guard = ext4_lock();
@@ -1733,7 +1841,12 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
         if uid != 0 && inode.uid() != uid {
             return EPERM;
         }
-        inode.set_mode((mode as u16) & 0o7777);
+        let mut new_mode = (mode as u16) & 0o7777;
+        // Linux clears S_ISGID when an unprivileged caller is outside file group.
+        if uid != 0 && (new_mode & 0o2000) != 0 && !current_in_group(inode.gid()) {
+            new_mode &= !0o2000;
+        }
+        inode.set_mode(new_mode);
     }
     0
 }
@@ -1741,7 +1854,10 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
 /// Linux `fchmodat(2)` (syscall 53 on riscv64).
 pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
     let token = get_current_token();
-    let path = translated_str(token, pathname as *const u8);
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let _ignored_flags = flags;
     if path.is_empty() {
         if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
@@ -1780,7 +1896,11 @@ pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize
     if euid != 0 && inode.uid() != euid {
         return EPERM;
     }
-    inode.set_mode((mode as u16) & 0o7777);
+    let mut new_mode = (mode as u16) & 0o7777;
+    if euid != 0 && (new_mode & 0o2000) != 0 && !current_in_group(inode.gid()) {
+        new_mode &= !0o2000;
+    }
+    inode.set_mode(new_mode);
     0
 }
 
@@ -1791,25 +1911,14 @@ pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     };
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return 0;
+            return EROFS;
         }
         let inode = os_inode.ext4_inode();
-        let (cur_uid, _cur_gid) = current_effective_uid_gid();
-        if cur_uid != 0 {
-            return EPERM;
-        }
         let _ext4_guard = ext4_lock();
-        let new_uid = if uid == usize::MAX {
-            inode.uid()
-        } else {
-            uid as u32
-        };
-        let new_gid = if gid == usize::MAX {
-            inode.gid()
-        } else {
-            gid as u32
-        };
-        inode.set_uid_gid(new_uid, new_gid);
+        let ret = apply_chown_to_inode(&inode, uid, gid);
+        if ret != 0 {
+            return ret;
+        }
     }
     0
 }
@@ -1822,8 +1931,15 @@ pub fn syscall_fchownat(
     gid: usize,
     flags: usize,
 ) -> isize {
+    let valid_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
     let token = get_current_token();
-    let path = translated_str(token, pathname as *const u8);
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
 
     if path.is_empty() {
         if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
@@ -1849,7 +1965,6 @@ pub fn syscall_fchownat(
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
@@ -1859,20 +1974,10 @@ pub fn syscall_fchownat(
     if rofs_for_path(dirfd, &path) {
         return EROFS;
     }
-    if euid != 0 {
-        return EPERM;
+    let ret = apply_chown_to_inode(&inode, uid, gid);
+    if ret != 0 {
+        return ret;
     }
-    let new_uid = if uid == usize::MAX {
-        inode.uid()
-    } else {
-        uid as u32
-    };
-    let new_gid = if gid == usize::MAX {
-        inode.gid()
-    } else {
-        gid as u32
-    };
-    inode.set_uid_gid(new_uid, new_gid);
     0
 }
 
@@ -1895,6 +2000,14 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(target) = crate::fs::proc_readlink(abs) {
+            let bytes = target.as_bytes();
+            let len = min(bytes.len(), bufsiz);
+            if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
+                return EFAULT;
+            }
+            return len as isize;
+        }
         return if open_pseudo(abs).is_some() {
             EINVAL
         } else {
@@ -2090,13 +2203,40 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if !file.writable() {
         return EBADF;
     }
+    let mut write_len = len;
+    let mut hit_fsize_limit = false;
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let fsize_limit = {
+            let process = current_process();
+            let inner = process.borrow_mut();
+            inner.rlimit_fsize_cur
+        };
+        if fsize_limit != u64::MAX {
+            let start = os_inode.offset() as u64;
+            if start >= fsize_limit && len > 0 {
+                let pid = current_process().getpid();
+                queue_process_signal(pid, SIGXFSZ_NUM);
+                return EFBIG;
+            }
+            let remain = (fsize_limit.saturating_sub(start)).min(usize::MAX as u64) as usize;
+            if write_len > remain {
+                write_len = remain;
+                hit_fsize_limit = true;
+            }
+        }
+    }
     let buf = UserBuffer::new(translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
-        len,
+        write_len,
         MapPermission::R,
     ));
-    file.write(buf) as isize
+    let written = file.write(buf) as isize;
+    if hit_fsize_limit {
+        let pid = current_process().getpid();
+        queue_process_signal(pid, SIGXFSZ_NUM);
+    }
+    written
 }
 
 /// Linux `pread64(2)` (syscall 67 on riscv64).
@@ -2206,15 +2346,36 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             return ESPIPE;
         }
 
+        let mut write_len = len;
+        let mut hit_fsize_limit = false;
+        let fsize_limit = {
+            let process = current_process();
+            let inner = process.borrow_mut();
+            inner.rlimit_fsize_cur
+        };
+        if fsize_limit != u64::MAX {
+            let start = pos as u64;
+            if start >= fsize_limit && len > 0 {
+                let pid = current_process().getpid();
+                queue_process_signal(pid, SIGXFSZ_NUM);
+                return EFBIG;
+            }
+            let remain = (fsize_limit.saturating_sub(start)).min(usize::MAX as u64) as usize;
+            if write_len > remain {
+                write_len = remain;
+                hit_fsize_limit = true;
+            }
+        }
+
         let mut total = 0usize;
         let token = get_current_token();
         let mut off = pos as usize;
         let mut user_ptr = buffer;
         const CHUNK_MAX: usize = 16 * 1024;
-        let buf_cap = core::cmp::min(len, CHUNK_MAX);
+        let buf_cap = core::cmp::min(write_len, CHUNK_MAX);
         let mut kbuf = vec![0u8; buf_cap];
-        while total < len {
-            let want = core::cmp::min(len - total, buf_cap);
+        while total < write_len {
+            let want = core::cmp::min(write_len - total, buf_cap);
             copy_from_user(token, user_ptr as *const u8, &mut kbuf[..want]);
             match os_inode.pwrite_at(off, &kbuf[..want]) {
                 Ok(n) => {
@@ -2231,7 +2392,10 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
                 }
             }
         }
-
+        if hit_fsize_limit {
+            let pid = current_process().getpid();
+            queue_process_signal(pid, SIGXFSZ_NUM);
+        }
         return total as isize;
     }
 
@@ -2353,14 +2517,25 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, _flags: usize) -> isize {
 
 pub fn syscall_chdir(pathname: usize) -> isize {
     let token = get_current_token();
-    let path = translated_str(token, pathname as *const u8);
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if path.is_empty() {
         return ENOENT;
     }
+    let at = match resolve_at_path(AT_FDCWD, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
 
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
-    let new_cwd = normalize_path(&cwd, &path);
+    let new_cwd = match &at {
+        AtPath::Ext4Abs(abs) => abs.clone(),
+        AtPath::Ext4Rel { .. } => normalize_path(&cwd, &path),
+        AtPath::PseudoAbs(abs) => abs.clone(),
+    };
     if crate::debug_config::DEBUG_SYSCALL {
         let pid = process.getpid();
         crate::println!(
@@ -2372,14 +2547,9 @@ pub fn syscall_chdir(pathname: usize) -> isize {
         );
     }
 
-    let inode = {
-        let _ext4_guard = ext4_lock();
-        find_path_in_roots(&new_cwd)
-    };
-    if let Some(inode) = inode {
+    let final_cwd = if matches!(at, AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. }) {
         let (fsuid, fsgid) = current_fsuid_gid();
         let _ext4_guard = ext4_lock();
-        let at = AtPath::Ext4Abs(new_cwd.clone());
         let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
             Ok(v) => v,
             Err(e) => {
@@ -2412,14 +2582,60 @@ pub fn syscall_chdir(pathname: usize) -> isize {
         if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
             return EACCES;
         }
+        resolve_final_symlink_abs_path(&new_cwd)
     } else if let Some(node) = open_pseudo(&new_cwd) {
         if node.as_any().downcast_ref::<PseudoDir>().is_none() {
             return ENOTDIR;
         }
+        new_cwd
     } else {
         return ENOENT;
+    };
+
+    process.borrow_mut().cwd = final_cwd;
+    0
+}
+
+/// Linux `fchdir(2)` (syscall 50 on riscv64/loongarch64).
+pub fn syscall_fchdir(fd: usize) -> isize {
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        let new_cwd = String::from(pdir.path());
+        current_process().borrow_mut().cwd = new_cwd;
+        return 0;
     }
-    process.borrow_mut().cwd = new_cwd;
+
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return ENOTDIR;
+    };
+    let inode = os_inode.ext4_inode();
+    let (fsuid, fsgid) = current_fsuid_gid();
+    {
+        let _ext4_guard = ext4_lock();
+        if !inode.is_dir() {
+            return ENOTDIR;
+        }
+        if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
+            return EACCES;
+        }
+    }
+
+    let proc_fd_path = alloc::format!("/proc/self/fd/{}", fd);
+    let fallback_cwd = {
+        let process = current_process();
+        process.borrow_mut().cwd.clone()
+    };
+    let target_path = crate::fs::proc_readlink(&proc_fd_path).unwrap_or(fallback_cwd);
+    let final_cwd = if crate::fs::is_proc_pseudo_path(&target_path) || is_pseudo_path(&target_path)
+    {
+        target_path
+    } else {
+        resolve_final_symlink_abs_path(&target_path)
+    };
+    current_process().borrow_mut().cwd = final_cwd;
     0
 }
 
@@ -2905,25 +3121,20 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
 pub fn syscall_getcwd(buf: usize, size: usize) -> isize {
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
-    if size == 0 {
-        return EINVAL;
+    let need = cwd.len().saturating_add(1);
+    if size < need {
+        return ERANGE;
     }
-    let to_copy = min(cwd.len() + 1, size);
+    if buf == 0 {
+        return EFAULT;
+    }
+    let mut bytes = cwd.into_bytes();
+    bytes.push(0);
     let token = get_current_token();
-    let dst = translated_byte_buffer(token, buf as *mut u8, to_copy, MapPermission::W);
-
-    let mut copied = 0usize;
-    for chunk in dst {
-        for b in chunk {
-            if copied + 1 == to_copy {
-                *b = 0;
-                return buf as isize;
-            }
-            *b = cwd.as_bytes()[copied];
-            copied += 1;
-        }
+    if try_copy_to_user(token, buf as *mut u8, &bytes).is_err() {
+        return EFAULT;
     }
-    buf as isize
+    need as isize
 }
 
 #[repr(C)]
@@ -3378,11 +3589,15 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     if st_ptr == 0 {
         return EINVAL;
     }
+    const AT_EMPTY_PATH: usize = 0x1000;
+    let valid_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
+    if (_flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
     let token = get_current_token();
     let path = translated_str(token, pathname as *const u8);
     // Support `AT_EMPTY_PATH`: operate on `dirfd` itself when pathname is empty.
     // glibc uses this in some directory APIs (e.g., `opendir`) to validate the fd.
-    const AT_EMPTY_PATH: usize = 0x1000;
     if path.is_empty() {
         if (_flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
             return syscall_fstat(dirfd as usize, st_ptr);
@@ -3397,6 +3612,37 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     // Pseudo nodes: return minimal metadata.
     if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(target) = crate::fs::proc_readlink(abs) {
+            let st_size = target.len() as i64;
+            let st_blocks = if st_size <= 0 {
+                0
+            } else {
+                ((st_size as u64 + 511) / 512) as u64
+            };
+            let st = KStat {
+                st_dev: 0,
+                st_ino: 1,
+                st_mode: 0o120777,
+                st_nlink: 1,
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                __pad: 0,
+                st_size,
+                st_blksize: 4096,
+                __pad2: 0,
+                st_blocks,
+                st_atime_sec: 0,
+                st_atime_nsec: 0,
+                st_mtime_sec: 0,
+                st_mtime_nsec: 0,
+                st_ctime_sec: 0,
+                st_ctime_nsec: 0,
+                __unused: [0, 0],
+            };
+            write_user_value(token, st_ptr as *mut KStat, &st);
+            return 0;
+        }
         let Some(node) = open_pseudo(abs) else {
             return ENOENT;
         };
@@ -3462,35 +3708,31 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return 0;
     }
 
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
     let _ext4_guard = ext4_lock();
-    let mut inode = match at {
-        AtPath::Ext4Abs(abs) => find_path_in_roots(&abs),
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                Some(base)
-            } else {
-                base.find_path(&rel)
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(ENOENT) if matches!(path.as_str(), "busybox" | "./busybox") => {
+            let candidates = [
+                "/musl/busybox",
+                "/glibc/busybox",
+                "/bin/busybox",
+                "/busybox",
+            ];
+            let mut found = None;
+            for cand in candidates {
+                if let Some(inode) = find_path_in_roots(cand) {
+                    found = Some(inode);
+                    break;
+                }
+            }
+            match found {
+                Some(v) => v,
+                None => return ENOENT,
             }
         }
-        AtPath::PseudoAbs(_) => unreachable!(),
-    };
-    if inode.is_none() && matches!(path.as_str(), "busybox" | "./busybox") {
-        let candidates = [
-            "/musl/busybox",
-            "/glibc/busybox",
-            "/bin/busybox",
-            "/busybox",
-        ];
-        for cand in candidates {
-            if let Some(found) = find_path_in_roots(cand) {
-                inode = Some(found);
-                break;
-            }
-        }
-    }
-
-    let Some(inode) = inode else {
-        return ENOENT;
+        Err(e) => return e,
     };
 
     let mode = inode.mode() as u32;
@@ -3573,6 +3815,38 @@ pub fn syscall_statx(
 
     // Pseudo nodes: return minimal metadata.
     if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(target) = crate::fs::proc_readlink(abs) {
+            let st_size = target.len() as i64;
+            let st_blocks: u64 = if st_size <= 0 {
+                0
+            } else {
+                ((st_size as u64 + 511) / 512) as u64
+            };
+            let st = KStat {
+                st_dev: 0,
+                st_ino: 1,
+                st_mode: 0o120777,
+                st_nlink: 1,
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                __pad: 0,
+                st_size,
+                st_blksize: 4096,
+                __pad2: 0,
+                st_blocks,
+                st_atime_sec: 0,
+                st_atime_nsec: 0,
+                st_mtime_sec: 0,
+                st_mtime_nsec: 0,
+                st_ctime_sec: 0,
+                st_ctime_nsec: 0,
+                __unused: [0, 0],
+            };
+            let stx = statx_from_kstat(&st);
+            write_user_value(token, stx_ptr as *mut Statx, &stx);
+            return 0;
+        }
         let Some(node) = open_pseudo(abs) else {
             return ENOENT;
         };

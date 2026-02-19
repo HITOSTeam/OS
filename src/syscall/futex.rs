@@ -8,14 +8,14 @@ use spin::Mutex;
 
 use crate::{
     debug_config::DEBUG_FUTEX,
-    mm::read_user_value,
+    mm::{read_user_value, PageTable, VirtAddr},
+    task::block_sleep::add_timer,
     task::{
         manager::wakeup_task,
         processor::{block_current_and_run_next, current_process, current_task},
         signal::has_unmasked_pending,
         task_block::TaskControlBlock,
     },
-    task::block_sleep::add_timer,
     time::get_time_ms,
     trap::get_current_token,
 };
@@ -66,12 +66,24 @@ fn pending_unmasked_signal() -> bool {
     has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
 }
 
-fn futex_key(pid: usize, uaddr: usize, private: bool) -> FutexKey {
+pub(crate) fn shared_futex_addr_key(token: usize, uaddr: usize) -> usize {
+    let page_table = PageTable::from_token(token);
+    page_table
+        .translate_va(VirtAddr::from(uaddr))
+        .map(|pa| {
+            let pa_usize: usize = pa.into();
+            pa_usize
+        })
+        .unwrap_or(uaddr)
+}
+
+fn futex_key(pid: usize, token: usize, uaddr: usize, private: bool) -> FutexKey {
     if private {
         (pid, uaddr)
     } else {
-        // Process-shared futex: key by address only.
-        (0, uaddr)
+        // Process-shared futex: key by physical address to survive exec() where
+        // user virtual addresses often change (notably in glibc test helpers).
+        (0, shared_futex_addr_key(token, uaddr))
     }
 }
 
@@ -124,6 +136,30 @@ pub(crate) fn futex_wake(key: FutexKey, uaddr: usize, nr_wake: usize) -> isize {
     woke as isize
 }
 
+/// Wake futex waiters when caller doesn't know whether the waiter used
+/// `FUTEX_PRIVATE_FLAG`.
+///
+/// We wake both:
+/// - private key: `(pid, uaddr)`
+/// - shared key: `(0, pa(uaddr))`
+pub(crate) fn futex_wake_private_and_shared(
+    pid: usize,
+    token: usize,
+    uaddr: usize,
+    nr_wake: usize,
+) -> isize {
+    let woke_private = futex_wake((pid, uaddr), uaddr, nr_wake);
+    let shared_key = (0, shared_futex_addr_key(token, uaddr));
+    let woke_shared = futex_wake(shared_key, uaddr, nr_wake);
+    if woke_private < 0 {
+        return woke_private;
+    }
+    if woke_shared < 0 {
+        return woke_shared;
+    }
+    woke_private.saturating_add(woke_shared)
+}
+
 pub fn syscall_futex(
     uaddr: usize,
     op: usize,
@@ -142,8 +178,8 @@ pub fn syscall_futex(
             }
             let task = current_task().unwrap();
             let pid = current_process().getpid();
-            let key = futex_key(pid, uaddr, _private);
             let token = get_current_token();
+            let key = futex_key(pid, token, uaddr, _private);
             let mut map = FUTEX_QUEUES.lock();
             let cur = read_user_value(token, uaddr as *const i32);
             if cur != val as i32 {
@@ -274,7 +310,8 @@ pub fn syscall_futex(
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let pid = current_process().getpid();
-            let key = futex_key(pid, uaddr, _private);
+            let token = get_current_token();
+            let key = futex_key(pid, token, uaddr, _private);
             futex_wake(key, uaddr, val)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
@@ -282,10 +319,10 @@ pub fn syscall_futex(
                 return EINVAL;
             }
             let pid = current_process().getpid();
-            let key1 = futex_key(pid, uaddr, _private);
-            let key2 = futex_key(pid, _uaddr2, _private);
+            let token = get_current_token();
+            let key1 = futex_key(pid, token, uaddr, _private);
+            let key2 = futex_key(pid, token, _uaddr2, _private);
             if cmd == FUTEX_CMP_REQUEUE {
-                let token = get_current_token();
                 let cur = read_user_value(token, uaddr as *const i32);
                 if cur != val as i32 {
                     return EAGAIN;

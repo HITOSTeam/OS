@@ -115,11 +115,7 @@ pub fn syscall_sched_getscheduler(pid: usize) -> isize {
 
 pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
     if DEBUG_CYCLICTEST {
-        log::warn!(
-            "[sched_getparam] pid={} param_ptr={:#x}",
-            pid,
-            param_ptr
-        );
+        log::warn!("[sched_getparam] pid={} param_ptr={:#x}", pid, param_ptr);
     }
     if param_ptr == 0 {
         if DEBUG_CYCLICTEST {
@@ -129,7 +125,11 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
     }
     let Some(process) = resolve_process(pid) else {
         if DEBUG_CYCLICTEST {
-            log::warn!("[sched_getparam] ESRCH pid={} param_ptr={:#x}", pid, param_ptr);
+            log::warn!(
+                "[sched_getparam] ESRCH pid={} param_ptr={:#x}",
+                pid,
+                param_ptr
+            );
         }
         return ESRCH;
     };
@@ -138,17 +138,15 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
         inner.sched_priority
     };
     let token = get_current_token();
-    let sp = SchedParam { sched_priority: prio };
-    if try_copy_to_user(
-        token,
-        param_ptr as *mut u8,
-        unsafe {
-            core::slice::from_raw_parts(
-                &sp as *const SchedParam as *const u8,
-                core::mem::size_of::<SchedParam>(),
-            )
-        },
-    )
+    let sp = SchedParam {
+        sched_priority: prio,
+    };
+    if try_copy_to_user(token, param_ptr as *mut u8, unsafe {
+        core::slice::from_raw_parts(
+            &sp as *const SchedParam as *const u8,
+            core::mem::size_of::<SchedParam>(),
+        )
+    })
     .is_err()
     {
         if DEBUG_CYCLICTEST {
@@ -218,12 +216,7 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
         tmp[cpu / 8] |= 1u8 << (cpu % 8);
     }
     let token = get_current_token();
-    let bufs = translated_byte_buffer(
-        token,
-        mask_ptr as *mut u8,
-        cpusetsize,
-        MapPermission::W,
-    );
+    let bufs = translated_byte_buffer(token, mask_ptr as *mut u8, cpusetsize, MapPermission::W);
     let mut off = 0usize;
     for b in bufs {
         let n = core::cmp::min(b.len(), cpusetsize - off);
@@ -281,7 +274,10 @@ pub fn syscall_sched_rr_get_interval(pid: usize, interval_ptr: usize) -> isize {
         return ESRCH;
     };
     let token = get_current_token();
-    let ts = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+    let ts = TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     write_user_value(token, interval_ptr as *mut TimeSpec, &ts);
     0
 }
@@ -303,9 +299,8 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     attr.size = copy_len as u32;
     attr.sched_policy = policy;
     attr.sched_priority = prio;
-    let bytes = unsafe {
-        core::slice::from_raw_parts(&attr as *const SchedAttr as *const u8, copy_len)
-    };
+    let bytes =
+        unsafe { core::slice::from_raw_parts(&attr as *const SchedAttr as *const u8, copy_len) };
     let token = get_current_token();
     if try_copy_to_user(token, attr_ptr as *mut u8, bytes).is_err() {
         return EFAULT;

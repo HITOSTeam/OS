@@ -10,7 +10,8 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    ext4_lock, find_path_in_roots, root_inode_for_path, File, PseudoDir, PseudoDirent, PseudoFile,
+    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, OSInode,
+    PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
 };
 use crate::mm::UserBuffer;
 use crate::task::manager::{pid2process, PID2PCB};
@@ -264,7 +265,185 @@ fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
             dtype: 8,
         });
     }
+    entries.push(PseudoDirent {
+        name: String::from("cwd"),
+        ino: pid as u64,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("fd"),
+        ino: pid as u64,
+        dtype: 4,
+    });
     entries
+}
+
+fn proc_pid_fd_entries(pid: u32) -> Vec<PseudoDirent> {
+    let mut entries = Vec::new();
+    entries.push(PseudoDirent {
+        name: String::from("."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from(".."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    let Some(proc) = pid2process(pid as usize) else {
+        return entries;
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        return entries;
+    };
+    for (fd, file) in inner.fd_table.iter().enumerate() {
+        if file.is_some() {
+            entries.push(PseudoDirent {
+                name: alloc::format!("{fd}"),
+                ino: fd as u64,
+                dtype: 10,
+            });
+        }
+    }
+    entries
+}
+
+fn proc_dir_entry_path(base: &str, name: &str) -> String {
+    if base == "/" {
+        alloc::format!("/{name}")
+    } else {
+        alloc::format!("{base}/{name}")
+    }
+}
+
+fn find_inode_path_in_subtree(
+    dir: &Arc<ext4_fs::Inode>,
+    base: &str,
+    target_dev: usize,
+    target_ino: u32,
+    depth: usize,
+) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    for (name, _ino, _ftype) in dir.dir_entries() {
+        if name == "." || name == ".." {
+            continue;
+        }
+        if base == "/" && name == "proc" {
+            continue;
+        }
+        let Some(child) = dir.find(&name) else {
+            continue;
+        };
+        let path = proc_dir_entry_path(base, &name);
+        if child.device_id() == target_dev && child.inode_num() == target_ino {
+            return Some(path);
+        }
+        if child.is_dir() {
+            if let Some(found) =
+                find_inode_path_in_subtree(&child, &path, target_dev, target_ino, depth - 1)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn find_inode_path_in_roots(target: &Arc<ext4_fs::Inode>) -> Option<String> {
+    let target_dev = target.device_id();
+    let target_ino = target.inode_num();
+    let _guard = ext4_lock();
+
+    let primary = root_inode_for_path("/");
+    if primary.device_id() == target_dev && primary.inode_num() == target_ino {
+        return Some(String::from("/"));
+    }
+    if let Some(found) = find_inode_path_in_subtree(&primary, "/", target_dev, target_ino, 64) {
+        return Some(found);
+    }
+
+    let secondary = secondary_root_inode()?;
+    if secondary.device_id() == target_dev && secondary.inode_num() == target_ino {
+        return Some(String::from("/"));
+    }
+    find_inode_path_in_subtree(&secondary, "/", target_dev, target_ino, 64)
+}
+
+fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
+    let proc = pid2process(pid as usize)?;
+    let (file, cwd) = {
+        let inner = proc.try_borrow_mut()?;
+        if fd >= inner.fd_table.len() {
+            return None;
+        }
+        (inner.fd_table[fd].as_ref()?.clone(), inner.cwd.clone())
+    };
+
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        return Some(String::from(pdir.path()));
+    }
+    if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+        return match pf.kind_tag() {
+            PseudoKindTag::Null => Some(String::from("/dev/null")),
+            PseudoKindTag::Zero => Some(String::from("/dev/zero")),
+            PseudoKindTag::Urandom => Some(String::from("/dev/urandom")),
+            PseudoKindTag::Static => None,
+        };
+    }
+    if file.as_any().downcast_ref::<RtcFile>().is_some() {
+        return Some(String::from("/dev/misc/rtc"));
+    }
+    if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
+        return Some(String::from("/dev/shm"));
+    }
+    if let Some(oinode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = oinode.ext4_inode();
+        if inode.is_dir() {
+            if let Some(cwd_inode) = find_path_in_roots(&cwd) {
+                if cwd_inode.device_id() == inode.device_id()
+                    && cwd_inode.inode_num() == inode.inode_num()
+                {
+                    return Some(cwd);
+                }
+            }
+        }
+        return find_inode_path_in_roots(&inode);
+    }
+    None
+}
+
+fn proc_pid_cwd(pid: u32) -> Option<String> {
+    let proc = pid2process(pid as usize)?;
+    let inner = proc.try_borrow_mut()?;
+    Some(inner.cwd.clone())
+}
+
+pub fn proc_readlink(path: &str) -> Option<String> {
+    let trimmed = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+
+    if trimmed == "/proc/self" {
+        return Some(alloc::format!("{}", current_process().getpid()));
+    }
+
+    let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
+    if rest == "cwd" {
+        return proc_pid_cwd(pid);
+    }
+
+    let Some(fd_name) = rest.strip_prefix("fd/") else {
+        return None;
+    };
+    if fd_name.is_empty() || fd_name.contains('/') || !fd_name.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let fd = fd_name.parse::<usize>().ok()?;
+    proc_fd_target(pid, fd)
 }
 
 fn proc_pid_from_path_with_rest(path: &str) -> Option<(u32, &str)> {
@@ -319,6 +498,12 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         return Some(Arc::new(PseudoDir::new(
             &alloc::format!("/proc/{pid}"),
             proc_pid_entries(pid),
+        )));
+    }
+    if rest == "fd" {
+        return Some(Arc::new(PseudoDir::new(
+            &alloc::format!("/proc/{pid}/fd"),
+            proc_pid_fd_entries(pid),
         )));
     }
     match rest {
@@ -664,8 +849,16 @@ fn proc_pid_stat(pid: u32) -> String {
         (vsize + config::PAGE_SIZE as u64 - 1) / config::PAGE_SIZE as u64
     };
 
-    let pgrp = inner.pgid as u32;
-    let session = pid;
+    let pgrp = (if inner.pgid == 0 {
+        pid as usize
+    } else {
+        inner.pgid
+    }) as u32;
+    let session = if inner.sid == 0 {
+        pgrp
+    } else {
+        inner.sid as u32
+    };
     let tty_nr = 0;
     let tpgid = 0;
     let flags = 0;

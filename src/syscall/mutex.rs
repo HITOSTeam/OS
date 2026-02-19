@@ -10,7 +10,7 @@ pub fn sys_mutex_create(is_block: bool) -> isize {
     if is_block {
         target_mutex = BlockMutex::new();
     } else {
-        target_mutex = SpinMutex::new(); // TODO: replace with BusyWaitMutex 
+        target_mutex = SpinMutex::new(); // TODO: replace with BusyWaitMutex
     }
     let current_task = current_task().expect("sys_mutex_create should be called in task context");
     let pcb = current_task.process.upgrade().unwrap();

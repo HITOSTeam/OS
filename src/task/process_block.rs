@@ -606,6 +606,10 @@ pub struct ProcessControlBlockInner {
     pub is_zombie: bool,
     /// Process group ID (PGID).
     pub pgid: usize,
+    /// Session ID (SID).
+    pub sid: usize,
+    /// True after the process has performed at least one execve().
+    pub did_exec: bool,
     /// Stop/continue state for waitpid job-control.
     pub stopped: bool,
     pub stop_signal: i32,
@@ -629,6 +633,8 @@ pub struct ProcessControlBlockInner {
     pub egid: u32,
     pub sgid: u32,
     pub fsgid: u32,
+    /// Supplementary group IDs.
+    pub supplementary_gids: Vec<u32>,
     //
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     /// Per-fd flags (e.g., FD_CLOEXEC, O_NONBLOCK).
@@ -636,9 +642,53 @@ pub struct ProcessControlBlockInner {
     /// Per-process RLIMIT_NOFILE (soft/hard).
     pub rlimit_nofile_cur: u64,
     pub rlimit_nofile_max: u64,
+    /// Per-process RLIMIT_NPROC (soft/hard).
+    pub rlimit_nproc_cur: u64,
+    pub rlimit_nproc_max: u64,
+    /// Per-process RLIMIT_FSIZE (soft/hard).
+    pub rlimit_fsize_cur: u64,
+    pub rlimit_fsize_max: u64,
+    /// Per-process RLIMIT_DATA (soft/hard).
+    pub rlimit_data_cur: u64,
+    pub rlimit_data_max: u64,
+    /// Per-process RLIMIT_STACK (soft/hard).
+    pub rlimit_stack_cur: u64,
+    pub rlimit_stack_max: u64,
+    /// Per-process RLIMIT_CPU (seconds, soft/hard).
+    pub rlimit_cpu_cur: u64,
+    pub rlimit_cpu_max: u64,
+    pub rlimit_cpu_start_ms: usize,
+    pub rlimit_cpu_soft_sent: bool,
     /// Per-process RLIMIT_CORE (soft/hard).
     pub rlimit_core_cur: u64,
     pub rlimit_core_max: u64,
+    /// Per-process RLIMIT_RSS (soft/hard).
+    pub rlimit_rss_cur: u64,
+    pub rlimit_rss_max: u64,
+    /// Per-process RLIMIT_MEMLOCK (soft/hard).
+    pub rlimit_memlock_cur: u64,
+    pub rlimit_memlock_max: u64,
+    /// Per-process RLIMIT_AS (soft/hard).
+    pub rlimit_as_cur: u64,
+    pub rlimit_as_max: u64,
+    /// Per-process RLIMIT_LOCKS (soft/hard).
+    pub rlimit_locks_cur: u64,
+    pub rlimit_locks_max: u64,
+    /// Per-process RLIMIT_MSGQUEUE (soft/hard).
+    pub rlimit_msgqueue_cur: u64,
+    pub rlimit_msgqueue_max: u64,
+    /// Per-process RLIMIT_NICE (soft/hard).
+    pub rlimit_nice_cur: u64,
+    pub rlimit_nice_max: u64,
+    /// Per-process RLIMIT_RTPRIO (soft/hard).
+    pub rlimit_rtprio_cur: u64,
+    pub rlimit_rtprio_max: u64,
+    /// Per-process RLIMIT_SIGPENDING (soft/hard).
+    pub rlimit_sigpending_cur: u64,
+    pub rlimit_sigpending_max: u64,
+    /// Per-process RLIMIT_RTTIME (soft/hard).
+    pub rlimit_rttime_cur: u64,
+    pub rlimit_rttime_max: u64,
     pub cwd: String,
     pub heap_start: usize,
     pub brk: usize,
@@ -655,6 +705,8 @@ pub struct ProcessControlBlockInner {
     /// Linux-like scheduler state used by rt-tests (cyclictest/hackbench).
     pub sched_policy: i32,
     pub sched_priority: i32,
+    /// POSIX nice value used by getpriority/setpriority.
+    pub nice: i32,
     // TaskControlBlock实际上现在是线程
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     // 进程控制块 有一个分配 线程ID的分配器
@@ -710,8 +762,10 @@ impl ProcessControlBlockInner {
         self.task_res_allocator.alloc()
     }
 
-    pub fn dealloc_tid(&mut self, tid: usize) {
-        self.task_res_allocator.dealloc(tid)
+    pub fn dealloc_tid(&mut self, _tid: usize) {
+        // Keep thread IDs monotonic within a process to avoid immediate reuse.
+        // Linux TIDs are globally unique for a long period; reusing tiny per-process
+        // indexes too early breaks gettid-based uniqueness checks in pthread tests.
     }
 
     pub fn thread_count(&self) -> usize {
@@ -797,7 +851,10 @@ impl ProcessControlBlock {
             pid: pid_handle,
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
-                pgid: pid,
+                // Keep init/user space in a Linux-like non-zero job-control domain.
+                pgid: if pid == 0 { 1 } else { pid },
+                sid: if pid == 0 { 1 } else { pid },
+                did_exec: false,
                 stopped: false,
                 stop_signal: 0,
                 stop_pending: false,
@@ -816,6 +873,7 @@ impl ProcessControlBlock {
                 egid: 0,
                 sgid: 0,
                 fsgid: 0,
+                supplementary_gids: vec![0],
                 fd_table: vec![
                     // 0 -> stdin
                     Some(Arc::new(Stdin)),
@@ -827,8 +885,38 @@ impl ProcessControlBlock {
                 fd_flags: vec![0; 3],
                 rlimit_nofile_cur: 1024,
                 rlimit_nofile_max: 1024,
+                rlimit_nproc_cur: u64::MAX,
+                rlimit_nproc_max: u64::MAX,
+                rlimit_fsize_cur: u64::MAX,
+                rlimit_fsize_max: u64::MAX,
+                rlimit_data_cur: u64::MAX,
+                rlimit_data_max: u64::MAX,
+                rlimit_stack_cur: 1 * 1024 * 1024,
+                rlimit_stack_max: 1 * 1024 * 1024,
+                rlimit_cpu_cur: u64::MAX,
+                rlimit_cpu_max: u64::MAX,
+                rlimit_cpu_start_ms: crate::time::get_time_ms(),
+                rlimit_cpu_soft_sent: false,
                 rlimit_core_cur: 8 * 1024 * 1024,
                 rlimit_core_max: 8 * 1024 * 1024,
+                rlimit_rss_cur: u64::MAX,
+                rlimit_rss_max: u64::MAX,
+                rlimit_memlock_cur: 64 * 1024,
+                rlimit_memlock_max: 64 * 1024,
+                rlimit_as_cur: u64::MAX,
+                rlimit_as_max: u64::MAX,
+                rlimit_locks_cur: u64::MAX,
+                rlimit_locks_max: u64::MAX,
+                rlimit_msgqueue_cur: 819_200,
+                rlimit_msgqueue_max: 819_200,
+                rlimit_nice_cur: 0,
+                rlimit_nice_max: 0,
+                rlimit_rtprio_cur: 0,
+                rlimit_rtprio_max: 0,
+                rlimit_sigpending_cur: u64::MAX,
+                rlimit_sigpending_max: u64::MAX,
+                rlimit_rttime_cur: u64::MAX,
+                rlimit_rttime_max: u64::MAX,
                 cwd: String::from("/user"),
                 heap_start,
                 brk: heap_start,
@@ -843,6 +931,7 @@ impl ProcessControlBlock {
                 rt_sig_handlers: vec![RtSigAction::default(); RT_SIG_MAX + 1],
                 sched_policy: 0,
                 sched_priority: 0,
+                nice: 0,
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),
@@ -963,6 +1052,7 @@ impl ProcessControlBlock {
             inner.mmap_next = DEFAULT_MMAP_BASE;
             inner.mmap_areas.clear();
             inner.argv = args.clone();
+            inner.did_exec = true;
         }
         let task = self.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
@@ -1027,6 +1117,7 @@ impl ProcessControlBlock {
             inner.mmap_next = DEFAULT_MMAP_BASE;
             inner.mmap_areas.clear();
             inner.argv = args.clone();
+            inner.did_exec = true;
         }
 
         // Workaround glibc ld-linux early crash by seeding an internal cached
@@ -1076,6 +1167,7 @@ impl ProcessControlBlock {
         }
         let sched_policy = parent.sched_policy;
         let sched_priority = parent.sched_priority;
+        let nice = parent.nice;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.sysv_shm_attaches.clone();
@@ -1139,6 +1231,8 @@ impl ProcessControlBlock {
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
                 pgid: parent.pgid,
+                sid: parent.sid,
+                did_exec: false,
                 stopped: false,
                 stop_signal: 0,
                 stop_pending: false,
@@ -1157,12 +1251,43 @@ impl ProcessControlBlock {
                 egid: parent.egid,
                 sgid: parent.sgid,
                 fsgid: parent.fsgid,
+                supplementary_gids: parent.supplementary_gids.clone(),
                 fd_table: new_fd_table,
                 fd_flags: new_fd_flags,
                 rlimit_nofile_cur: parent.rlimit_nofile_cur,
                 rlimit_nofile_max: parent.rlimit_nofile_max,
+                rlimit_nproc_cur: parent.rlimit_nproc_cur,
+                rlimit_nproc_max: parent.rlimit_nproc_max,
+                rlimit_fsize_cur: parent.rlimit_fsize_cur,
+                rlimit_fsize_max: parent.rlimit_fsize_max,
+                rlimit_data_cur: parent.rlimit_data_cur,
+                rlimit_data_max: parent.rlimit_data_max,
+                rlimit_stack_cur: parent.rlimit_stack_cur,
+                rlimit_stack_max: parent.rlimit_stack_max,
+                rlimit_cpu_cur: parent.rlimit_cpu_cur,
+                rlimit_cpu_max: parent.rlimit_cpu_max,
+                rlimit_cpu_start_ms: parent.rlimit_cpu_start_ms,
+                rlimit_cpu_soft_sent: parent.rlimit_cpu_soft_sent,
                 rlimit_core_cur: parent.rlimit_core_cur,
                 rlimit_core_max: parent.rlimit_core_max,
+                rlimit_rss_cur: parent.rlimit_rss_cur,
+                rlimit_rss_max: parent.rlimit_rss_max,
+                rlimit_memlock_cur: parent.rlimit_memlock_cur,
+                rlimit_memlock_max: parent.rlimit_memlock_max,
+                rlimit_as_cur: parent.rlimit_as_cur,
+                rlimit_as_max: parent.rlimit_as_max,
+                rlimit_locks_cur: parent.rlimit_locks_cur,
+                rlimit_locks_max: parent.rlimit_locks_max,
+                rlimit_msgqueue_cur: parent.rlimit_msgqueue_cur,
+                rlimit_msgqueue_max: parent.rlimit_msgqueue_max,
+                rlimit_nice_cur: parent.rlimit_nice_cur,
+                rlimit_nice_max: parent.rlimit_nice_max,
+                rlimit_rtprio_cur: parent.rlimit_rtprio_cur,
+                rlimit_rtprio_max: parent.rlimit_rtprio_max,
+                rlimit_sigpending_cur: parent.rlimit_sigpending_cur,
+                rlimit_sigpending_max: parent.rlimit_sigpending_max,
+                rlimit_rttime_cur: parent.rlimit_rttime_cur,
+                rlimit_rttime_max: parent.rlimit_rttime_max,
                 cwd: parent.cwd.clone(),
                 heap_start: parent.heap_start,
                 brk: parent.brk,
@@ -1177,6 +1302,7 @@ impl ProcessControlBlock {
                 rt_sig_handlers,
                 sched_policy,
                 sched_priority,
+                nice,
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),

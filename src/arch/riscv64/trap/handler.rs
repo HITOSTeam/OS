@@ -283,6 +283,7 @@ pub fn trap_handler() {
         Trap::Interrupt(TIME_INTERVAL) => {
             set_next_trigger();
             check_timer();
+            crate::syscall::misc::check_current_rlimit_cpu();
             // Also handle pending fatal signals on timer ticks.
             // Without this, CPU-bound tasks that never enter syscalls would never observe
             // signals like SIGINT/SIGKILL and could run forever.

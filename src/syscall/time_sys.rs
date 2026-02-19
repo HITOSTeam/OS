@@ -3,15 +3,21 @@ use crate::{
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     mm::{read_user_value, try_read_user_value, try_write_user_value, write_user_value},
     syscall::thread,
-    task::block_sleep::{alarm_remaining_ms, set_alarm_timer},
-    task::processor::current_task,
+    task::block_sleep::{
+        create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
+        query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
+    },
+    task::processor::{current_process, current_task},
+    task::signal::SIGALRM_NUM,
     time::get_time,
     trap::get_current_token,
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 const CYCLICTEST_LOG_LIMIT: usize = 32;
 static CLOCK_NS_LOGS: AtomicUsize = AtomicUsize::new(0);
+const DEFAULT_REALTIME_EPOCH_NS: i64 = 1_700_000_000_000_000_000;
+static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(DEFAULT_REALTIME_EPOCH_NS);
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 const CLOCK_REALTIME: usize = 0;
@@ -27,6 +33,8 @@ const EINVAL: isize = -22;
 const EFAULT: isize = -14;
 const EOPNOTSUPP: isize = -95;
 const EINTR: isize = -4;
+const TIMER_ABSTIME: usize = 1;
+const SIGEV_SIGNAL: i32 = 0;
 
 fn ticks_to_ns(ticks: u64) -> u64 {
     let freq = clock_freq() as u128;
@@ -35,6 +43,19 @@ fn ticks_to_ns(ticks: u64) -> u64 {
 
 fn now_ns() -> u64 {
     ticks_to_ns(get_time() as u64)
+}
+
+fn realtime_now_ns() -> u64 {
+    let base = now_ns() as i128;
+    let offset = REALTIME_OFFSET_NS.load(Ordering::Relaxed) as i128;
+    let adjusted = base + offset;
+    if adjusted <= 0 {
+        0
+    } else if adjusted > u64::MAX as i128 {
+        u64::MAX
+    } else {
+        adjusted as u64
+    }
 }
 
 fn timespec_to_ns(ts: TimeSpec) -> Option<u64> {
@@ -53,6 +74,10 @@ fn ns_to_timespec(ns: u64) -> TimeSpec {
         sec: (ns / NSEC_PER_SEC) as i64,
         nsec: (ns % NSEC_PER_SEC) as i64,
     }
+}
+
+fn ns_to_ms_ceil(ns: u64) -> usize {
+    ((ns.saturating_add(999_999)) / 1_000_000) as usize
 }
 
 #[repr(C)]
@@ -99,14 +124,28 @@ struct ITimerVal {
     it_value: TimeVal64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SigEvent {
+    sigev_value: usize,
+    sigev_signo: i32,
+    sigev_notify: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ITimerSpec {
+    it_interval: TimeSpec,
+    it_value: TimeSpec,
+}
+
 pub fn syscall_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
     let token = get_current_token();
     if tv_ptr != 0 {
-        let ticks = get_time() as u64;
-        let us = ticks.saturating_mul(1_000_000) / clock_freq() as u64;
+        let ns = realtime_now_ns();
         let tv = TimeVal {
-            sec: us / 1_000_000,
-            usec: us % 1_000_000,
+            sec: ns / NSEC_PER_SEC,
+            usec: (ns % NSEC_PER_SEC) / 1_000,
         };
         if try_write_user_value(token, tv_ptr as *mut TimeVal, &tv).is_err() {
             return EFAULT;
@@ -212,7 +251,16 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
         | CLOCK_BOOTTIME => {}
         _ => return EINVAL,
     }
-    let ns = now_ns();
+    let ns = match clk_id {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => realtime_now_ns(),
+        CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME => now_ns(),
+        _ => return EINVAL,
+    };
     let ts = TimeSpec {
         sec: (ns / NSEC_PER_SEC) as i64,
         nsec: (ns % NSEC_PER_SEC) as i64,
@@ -222,6 +270,209 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
         return EFAULT;
     }
     0
+}
+
+pub fn syscall_clock_settime(clk_id: usize, tp_ptr: usize) -> isize {
+    if clk_id != CLOCK_REALTIME {
+        return EINVAL;
+    }
+    if tp_ptr == 0 {
+        return EFAULT;
+    }
+    let token = get_current_token();
+    let Some(ts) = try_read_user_value(token, tp_ptr as *const TimeSpec) else {
+        return EFAULT;
+    };
+    let Some(target_ns) = timespec_to_ns(ts) else {
+        return EINVAL;
+    };
+    let current_mono_ns = now_ns();
+    let offset = (target_ns as i128)
+        .saturating_sub(current_mono_ns as i128)
+        .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
+    0
+}
+
+pub fn syscall_clock_getres(clk_id: usize, tp_ptr: usize) -> isize {
+    match clk_id {
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME => {}
+        _ => return EINVAL,
+    }
+    if tp_ptr == 0 {
+        return 0;
+    }
+    let token = get_current_token();
+    let ts = TimeSpec {
+        sec: 0,
+        nsec: 1_000_000,
+    };
+    if try_write_user_value(token, tp_ptr as *mut TimeSpec, &ts).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+pub fn syscall_timer_create(clock_id: usize, sevp_ptr: usize, timerid_ptr: usize) -> isize {
+    match clock_id {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {}
+        _ => return EINVAL,
+    }
+    if timerid_ptr == 0 {
+        return EFAULT;
+    }
+    let token = get_current_token();
+    let signum = if sevp_ptr == 0 {
+        SIGALRM_NUM
+    } else {
+        let Some(sev) = try_read_user_value(token, sevp_ptr as *const SigEvent) else {
+            return EFAULT;
+        };
+        if sev.sigev_notify != SIGEV_SIGNAL {
+            return EINVAL;
+        }
+        if sev.sigev_signo <= 0 || sev.sigev_signo > 64 {
+            return EINVAL;
+        }
+        sev.sigev_signo as usize
+    };
+    let pid = current_process().getpid();
+    let Some(timer_id) = create_posix_timer(pid, clock_id, signum) else {
+        return EINVAL;
+    };
+    let timer_id_i32 = timer_id as i32;
+    if try_write_user_value(token, timerid_ptr as *mut i32, &timer_id_i32).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+pub fn syscall_timer_gettime(timer_id: isize, curr_ptr: usize) -> isize {
+    if timer_id < 0 {
+        return EINVAL;
+    }
+    if curr_ptr == 0 {
+        return EFAULT;
+    }
+    let pid = current_process().getpid();
+    let Ok((_clock_id, deadline_ms, interval_ms)) = query_posix_timer(pid, timer_id as usize)
+    else {
+        return EINVAL;
+    };
+    let now_ms = crate::time::get_time_ms();
+    let value_ms = deadline_ms.map(|d| d.saturating_sub(now_ms)).unwrap_or(0);
+    let spec = ITimerSpec {
+        it_interval: ns_to_timespec((interval_ms as u64).saturating_mul(1_000_000)),
+        it_value: ns_to_timespec((value_ms as u64).saturating_mul(1_000_000)),
+    };
+    let token = get_current_token();
+    if try_write_user_value(token, curr_ptr as *mut ITimerSpec, &spec).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+pub fn syscall_timer_settime(
+    timer_id: isize,
+    flags: usize,
+    new_ptr: usize,
+    old_ptr: usize,
+) -> isize {
+    if timer_id < 0 {
+        return EINVAL;
+    }
+    if new_ptr == 0 {
+        return EINVAL;
+    }
+    if (flags & !TIMER_ABSTIME) != 0 {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let Some(new_spec) = try_read_user_value(token, new_ptr as *const ITimerSpec) else {
+        return EFAULT;
+    };
+    let pid = current_process().getpid();
+    let Ok((clock_id, _, _)) = query_posix_timer(pid, timer_id as usize) else {
+        return EINVAL;
+    };
+    let Some(value_ns) = timespec_to_ns(new_spec.it_value) else {
+        return EINVAL;
+    };
+    let Some(interval_ns) = timespec_to_ns(new_spec.it_interval) else {
+        return EINVAL;
+    };
+    let mut initial_overrun = 0usize;
+    let delay_ms = if value_ns == 0 {
+        None
+    } else if (flags & TIMER_ABSTIME) != 0 {
+        let now_base = match clock_id {
+            CLOCK_REALTIME => realtime_now_ns(),
+            CLOCK_MONOTONIC | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => now_ns(),
+            _ => return EINVAL,
+        };
+        if value_ns <= now_base {
+            if interval_ns > 0 {
+                let overdue_ns = now_base.saturating_sub(value_ns);
+                let expirations = overdue_ns / interval_ns + 1;
+                initial_overrun = expirations.saturating_sub(1).min(i32::MAX as u64) as usize;
+            }
+            Some(0)
+        } else {
+            Some(ns_to_ms_ceil(value_ns - now_base).max(1))
+        }
+    } else {
+        Some(ns_to_ms_ceil(value_ns).max(1))
+    };
+    let interval_ms = if interval_ns == 0 {
+        0
+    } else {
+        ns_to_ms_ceil(interval_ns).max(1)
+    };
+    let Ok((prev_remain_ms, prev_interval_ms)) = set_posix_timer(
+        pid,
+        timer_id as usize,
+        delay_ms,
+        interval_ms,
+        initial_overrun,
+    ) else {
+        return EINVAL;
+    };
+    if old_ptr != 0 {
+        let old_spec = ITimerSpec {
+            it_interval: ns_to_timespec((prev_interval_ms as u64).saturating_mul(1_000_000)),
+            it_value: ns_to_timespec((prev_remain_ms as u64).saturating_mul(1_000_000)),
+        };
+        if try_write_user_value(token, old_ptr as *mut ITimerSpec, &old_spec).is_err() {
+            return EFAULT;
+        }
+    }
+    0
+}
+
+pub fn syscall_timer_delete(timer_id: isize) -> isize {
+    if timer_id < 0 {
+        return EINVAL;
+    }
+    let pid = current_process().getpid();
+    delete_posix_timer(pid, timer_id as usize)
+}
+
+pub fn syscall_timer_getoverrun(timer_id: isize) -> isize {
+    if timer_id < 0 {
+        return EINVAL;
+    }
+    let pid = current_process().getpid();
+    let Ok(overrun) = take_posix_timer_overrun(pid, timer_id as usize) else {
+        return EINVAL;
+    };
+    overrun
 }
 
 /// Linux `clock_nanosleep` (syscall 115 on riscv64).
@@ -247,7 +498,12 @@ pub fn syscall_clock_nanosleep(
     let Some(req_ns) = timespec_to_ns(ts) else {
         return EINVAL;
     };
-    let start_ns = now_ns();
+    let clock_now_ns = || match clk_id {
+        CLOCK_REALTIME => realtime_now_ns(),
+        CLOCK_MONOTONIC => now_ns(),
+        _ => now_ns(),
+    };
+    let start_ns = clock_now_ns();
     if DEBUG_SIGNAL {
         let pid = crate::task::processor::current_process().getpid();
         let tid = current_task()
@@ -273,7 +529,7 @@ pub fn syscall_clock_nanosleep(
         start_ns.saturating_add(req_ns)
     };
     loop {
-        let current_ns = now_ns();
+        let current_ns = clock_now_ns();
         if target_ns <= current_ns {
             if DEBUG_SIGNAL {
                 let now_ms = (get_time() as u64)
@@ -284,7 +540,7 @@ pub fn syscall_clock_nanosleep(
                     info,
                     "[clock_nanosleep] ret=0 now_ms={} elapsed_ns={}",
                     now_ms,
-                    now_ns().saturating_sub(start_ns)
+                    current_ns.saturating_sub(start_ns)
                 );
             }
             return 0;
@@ -324,11 +580,11 @@ pub fn syscall_clock_nanosleep(
                     info,
                     "[clock_nanosleep] ret=EINTR now_ms={} elapsed_ns={}",
                     now_ms,
-                    now_ns().saturating_sub(start_ns)
+                    clock_now_ns().saturating_sub(start_ns)
                 );
             }
             if rem_ptr != 0 {
-                let remaining = target_ns.saturating_sub(now_ns());
+                let remaining = target_ns.saturating_sub(clock_now_ns());
                 let rem = ns_to_timespec(remaining);
                 let token = get_current_token();
                 if try_write_user_value(token, rem_ptr as *mut TimeSpec, &rem).is_err() {
@@ -354,74 +610,114 @@ pub fn syscall_times(tms_ptr: usize) -> isize {
     crate::time::get_time_ms() as isize
 }
 
-fn timeval_to_ms(tv: TimeVal64) -> Option<usize> {
+const ITIMER_REAL: usize = 0;
+const ITIMER_VIRTUAL: usize = 1;
+const ITIMER_PROF: usize = 2;
+const SIGVTALRM_NUM: usize = 26;
+const SIGPROF_NUM: usize = 27;
+
+fn itimer_signum(which: usize) -> Option<usize> {
+    match which {
+        ITIMER_REAL => Some(SIGALRM_NUM),
+        ITIMER_VIRTUAL => Some(SIGVTALRM_NUM),
+        ITIMER_PROF => Some(SIGPROF_NUM),
+        _ => None,
+    }
+}
+
+fn timeval_to_us(tv: TimeVal64) -> Option<u64> {
     if tv.sec < 0 || tv.usec < 0 || tv.usec >= 1_000_000 {
         return None;
     }
-    let ms = (tv.sec as u64)
-        .saturating_mul(1_000)
-        .saturating_add((tv.usec as u64) / 1_000);
-    Some(ms as usize)
+    Some(
+        (tv.sec as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add(tv.usec as u64),
+    )
 }
 
-fn write_itimerval(ptr: usize, remaining_ms: usize) {
-    if ptr == 0 {
-        return;
+fn us_to_ms_ceil(us: u64) -> usize {
+    ((us.saturating_add(999)) / 1_000) as usize
+}
+
+fn ms_to_timeval(ms: usize) -> TimeVal64 {
+    TimeVal64 {
+        sec: (ms / 1_000) as i64,
+        usec: ((ms % 1_000) * 1_000) as i64,
     }
-    let token = get_current_token();
-    let sec = (remaining_ms / 1000) as i64;
-    let usec = ((remaining_ms % 1000) * 1000) as i64;
-    let val = ITimerVal {
-        it_interval: TimeVal64 { sec: 0, usec: 0 },
-        it_value: TimeVal64 { sec, usec },
-    };
-    write_user_value(token, ptr as *mut ITimerVal, &val);
+}
+
+fn build_itimerval(remaining_ms: usize, interval_ms: usize) -> ITimerVal {
+    ITimerVal {
+        it_interval: ms_to_timeval(interval_ms),
+        it_value: ms_to_timeval(remaining_ms),
+    }
 }
 
 pub fn syscall_getitimer(which: usize, curr_ptr: usize) -> isize {
-    const ITIMER_REAL: usize = 0;
-    const EINVAL: isize = -22;
-    const EFAULT: isize = -14;
-    if which != ITIMER_REAL {
+    if itimer_signum(which).is_none() {
         return EINVAL;
     }
     if curr_ptr == 0 {
         return EFAULT;
     }
+    let token = get_current_token();
     let pid = crate::task::processor::current_process().getpid();
-    let remaining_ms = alarm_remaining_ms(pid);
-    write_itimerval(curr_ptr, remaining_ms);
+    let (remaining_ms, interval_ms) = itimer_remaining_and_interval_ms(pid, which);
+    let val = build_itimerval(remaining_ms, interval_ms);
+    if try_write_user_value(token, curr_ptr as *mut ITimerVal, &val).is_err() {
+        return EFAULT;
+    }
     0
 }
 
 pub fn syscall_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
-    const ITIMER_REAL: usize = 0;
-    const EINVAL: isize = -22;
-    const EFAULT: isize = -14;
-    if which != ITIMER_REAL {
+    let Some(signum) = itimer_signum(which) else {
         return EINVAL;
-    }
+    };
     if new_ptr == 0 {
         return EFAULT;
     }
     let token = get_current_token();
-    let new_val = read_user_value(token, new_ptr as *const ITimerVal);
-    let Some(delay_ms) = timeval_to_ms(new_val.it_value) else {
+    let Some(new_val) = try_read_user_value(token, new_ptr as *const ITimerVal) else {
+        return EFAULT;
+    };
+    let Some(delay_us) = timeval_to_us(new_val.it_value) else {
+        return EINVAL;
+    };
+    let Some(interval_us) = timeval_to_us(new_val.it_interval) else {
         return EINVAL;
     };
     let pid = crate::task::processor::current_process().getpid();
-    let prev_ms = set_alarm_timer(pid, if delay_ms == 0 { None } else { Some(delay_ms) });
+    let (prev_ms, prev_interval_ms) = itimer_remaining_and_interval_ms(pid, which);
+    if old_ptr != 0 {
+        let old_val = build_itimerval(prev_ms, prev_interval_ms);
+        if try_write_user_value(token, old_ptr as *mut ITimerVal, &old_val).is_err() {
+            return EFAULT;
+        }
+    }
+    let delay_ms = if delay_us == 0 {
+        None
+    } else {
+        Some(us_to_ms_ceil(delay_us))
+    };
+    let interval_ms = if interval_us == 0 {
+        0
+    } else {
+        us_to_ms_ceil(interval_us).max(1)
+    };
+    set_itimer_timer(pid, which, signum, delay_ms, interval_ms);
     crate::log_if!(
         DEBUG_UNIXBENCH,
         info,
-        "[alarm] set pid={} delay_ms={} prev_ms={}",
+        "[itimer] set pid={} which={} delay_ms={:?} interval_ms={} prev_ms={} prev_interval_ms={}",
         pid,
+        which,
         delay_ms,
-        prev_ms
+        interval_ms,
+        prev_ms,
+        prev_interval_ms
     );
-    if old_ptr != 0 {
-        write_itimerval(old_ptr, prev_ms);
-    }
     0
 }
 

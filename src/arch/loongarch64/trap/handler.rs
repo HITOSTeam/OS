@@ -179,6 +179,7 @@ pub fn trap_handler() {
             crate::time::loongarch_record_timer_tick();
             set_next_trigger();
             check_timer();
+            crate::syscall::misc::check_current_rlimit_cpu();
             if crate::debug_config::DEBUG_SIGNAL {
                 static LAST_SLEEP_TIMER_LOG: AtomicUsize = AtomicUsize::new(0);
                 let proc = crate::task::processor::current_process();

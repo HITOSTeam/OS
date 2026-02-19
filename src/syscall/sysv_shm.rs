@@ -4,7 +4,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
-use crate::mm::{FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc};
+use crate::mm::{frame_alloc, FrameTracker, MapPermission, PTEFlags, VirtAddr};
 use crate::task::processor::current_process;
 
 const IPC_PRIVATE: usize = 0;
@@ -201,9 +201,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
             cur += PAGE_SIZE;
         }
         if (shmflg & SHM_REMAP) != 0 {
-            inner
-                .memory_set
-                .unmap_user_range(start.into(), end.into());
+            inner.memory_set.unmap_user_range(start.into(), end.into());
         }
     }
 
@@ -221,9 +219,11 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     if end > inner.mmap_next {
         inner.mmap_next = end;
     }
-    inner
-        .sysv_shm_attaches
-        .push(ShmAttach { addr: start, shmid, len: map_len });
+    inner.sysv_shm_attaches.push(ShmAttach {
+        addr: start,
+        shmid,
+        len: map_len,
+    });
     start as isize
 }
 
@@ -244,9 +244,7 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
     };
 
     let end = a.addr + a.len;
-    inner
-        .memory_set
-        .unmap_user_range(a.addr.into(), end.into());
+    inner.memory_set.unmap_user_range(a.addr.into(), end.into());
     inner.sysv_shm_attaches.remove(idx);
     drop(inner);
 
@@ -276,4 +274,3 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
     }
     0
 }
-

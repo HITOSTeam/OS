@@ -10,19 +10,19 @@ use crate::config::SIGRETURN_TRAMPOLINE;
 use crate::{
     arch,
     debug_config::{DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    mm::{read_user_value, try_read_user_value, write_user_value},
+    mm::{read_user_value, try_read_user_value, try_write_user_value, write_user_value},
     syscall::misc::decode_linux_tid,
     task::{
         block_sleep::add_timer,
-        manager::{PID2PCB, pid2process, wakeup_task},
+        manager::{pid2process, wakeup_task, PID2PCB},
         processor::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
         signal::{
-            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM,
-            SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags, has_unmasked_pending,
-            kill, kill_current, pending_unmasked_bits, set_signal, set_signal_mask, signal_bit,
-            take_first_unmasked,
+            has_unmasked_pending, kill, kill_current, pending_unmasked_bits, set_signal,
+            set_signal_mask, signal_bit, take_first_unmasked, RtSigAction, SignalAction,
+            SignalFlags, RT_SIG_MAX, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM, SIGTSTP_NUM,
+            SIGTTIN_NUM, SIGTTOU_NUM, SIG_DFL, SIG_IGN,
         },
         task_block::{SigSavedContext, TaskControlBlock, TaskStatus},
     },
@@ -137,7 +137,11 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
             delivered = true;
         }
     }
-    if delivered { 0 } else { ESRCH }
+    if delivered {
+        0
+    } else {
+        ESRCH
+    }
 }
 
 /// Linux `tgkill` (syscall 131).
@@ -648,6 +652,27 @@ struct TimeSpec {
     nsec: i64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SigInfoHead {
+    si_signo: i32,
+    si_errno: i32,
+    si_code: i32,
+}
+
+fn write_siginfo(info_ptr: usize, signum: usize) {
+    if info_ptr == 0 {
+        return;
+    }
+    let token = get_current_token();
+    let si = SigInfoHead {
+        si_signo: signum as i32,
+        si_errno: 0,
+        si_code: 0,
+    };
+    let _ = try_write_user_value(token, info_ptr as *mut SigInfoHead, &si);
+}
+
 fn timespec_to_ms(ts: TimeSpec) -> Option<usize> {
     if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1_000_000_000 {
         return None;
@@ -687,7 +712,6 @@ pub fn syscall_rt_sigtimedwait(
     timeout: usize,
     sigsetsize: usize,
 ) -> isize {
-    let _ = info;
     let _ = sigsetsize;
     if set == 0 {
         return EINVAL;
@@ -716,27 +740,29 @@ pub fn syscall_rt_sigtimedwait(
         }
     };
     if let Some(sig) = pending_sig {
+        write_siginfo(info, sig);
         return sig as isize;
     }
 
     // SIGCHLD via zombie child detection.
     if (mask & sigchld_bit) != 0 && has_zombie_child() {
+        write_siginfo(info, SIGCHLD);
         return SIGCHLD as isize;
     }
 
-    if timeout == 0 {
-        return EAGAIN;
-    }
-
-    let ts = read_user_value(token, timeout as *const TimeSpec);
-    let timeout_ms = match timespec_to_ms(ts) {
-        Some(ms) => ms,
-        None => return EINVAL,
+    let deadline_ms = if timeout == 0 {
+        None
+    } else {
+        let ts = read_user_value(token, timeout as *const TimeSpec);
+        let timeout_ms = match timespec_to_ms(ts) {
+            Some(ms) => ms,
+            None => return EINVAL,
+        };
+        if timeout_ms == 0 {
+            return EAGAIN;
+        }
+        Some(get_time_ms().saturating_add(timeout_ms))
     };
-    if timeout_ms == 0 {
-        return EAGAIN;
-    }
-    let deadline_ms = get_time_ms().saturating_add(timeout_ms);
 
     let mut timer_set = false;
     loop {
@@ -745,15 +771,17 @@ pub fn syscall_rt_sigtimedwait(
             let mut inner = process.borrow_mut();
             inner.wait_queue.push_back(Arc::clone(&task));
         }
-        if !timer_set {
-            let now_ms = get_time_ms();
-            let wait_ms = deadline_ms.saturating_sub(now_ms);
-            if wait_ms == 0 {
-                remove_waiter(&task);
-                return EAGAIN;
+        if let Some(deadline_ms) = deadline_ms {
+            if !timer_set {
+                let now_ms = get_time_ms();
+                let wait_ms = deadline_ms.saturating_sub(now_ms);
+                if wait_ms == 0 {
+                    remove_waiter(&task);
+                    return EAGAIN;
+                }
+                add_timer(Arc::clone(&task), wait_ms);
+                timer_set = true;
             }
-            add_timer(Arc::clone(&task), wait_ms);
-            timer_set = true;
         }
 
         block_current_and_run_next();
@@ -774,14 +802,18 @@ pub fn syscall_rt_sigtimedwait(
             }
         };
         if let Some(sig) = pending_sig {
+            write_siginfo(info, sig);
             return sig as isize;
         }
 
         if (mask & sigchld_bit) != 0 && has_zombie_child() {
+            write_siginfo(info, SIGCHLD);
             return SIGCHLD as isize;
         }
-        if get_time_ms() >= deadline_ms {
-            return EAGAIN;
+        if let Some(deadline_ms) = deadline_ms {
+            if get_time_ms() >= deadline_ms {
+                return EAGAIN;
+            }
         }
     }
 }
