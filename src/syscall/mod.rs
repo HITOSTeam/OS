@@ -60,7 +60,9 @@ const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_RENAMEAT: usize = 38;
 const SYSCALL_SYMLINKAT: usize = 36;
+const SYSCALL_LINKAT: usize = 37;
 const SYSCALL_IOCTL: usize = 29;
+const SYSCALL_MKNODAT: usize = 33;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_FCHMOD: usize = 52;
@@ -75,6 +77,7 @@ const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_FCHDIR: usize = 50;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
+const SYSCALL_CLOSE_RANGE: usize = 436;
 const SYSCALL_VFORK: usize = 58;
 const SYSCALL_PIPE2: usize = 59;
 const SYSCALL_GETDENTS64: usize = 61;
@@ -383,8 +386,16 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EPOLL_CTL => -38,
         SYSCALL_EPOLL_PWAIT => -38,
         SYSCALL_INOTIFY_INIT1 => dummy::syscall_inotify_init1(args[0]),
+        SYSCALL_MKNODAT => filesystem::syscall_mknodat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_MKDIRAT => filesystem::syscall_mkdirat(args[0] as isize, args[1], args[2]),
         SYSCALL_UNLINKAT => filesystem::syscall_unlinkat(args[0] as isize, args[1], args[2]),
+        SYSCALL_LINKAT => filesystem::syscall_linkat(
+            args[0] as isize,
+            args[1],
+            args[2] as isize,
+            args[3],
+            args[4],
+        ),
         SYSCALL_FCHMOD => filesystem::syscall_fchmod(args[0], args[1]),
         SYSCALL_FCHMODAT => {
             filesystem::syscall_fchmodat(args[0] as isize, args[1], args[2], args[3])
@@ -572,6 +583,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_FANOTIFY_INIT => dummy::syscall_fanotify_init(args[0], args[1]),
         SYSCALL_CLOSE => filesystem::syscall_close(args[0]),
+        SYSCALL_CLOSE_RANGE => filesystem::syscall_close_range(args[0], args[1], args[2]),
         SYSCALL_VFORK => process::syscall_vfork(),
         SYSCALL_PIPE2 => filesystem::syscall_pipe2(args[0], args[1]),
         SYSCALL_IO_URING_SETUP => dummy::syscall_io_uring_setup(args[0], args[1]),

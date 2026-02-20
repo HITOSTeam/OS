@@ -721,15 +721,38 @@ pub struct ProcessControlBlockInner {
 impl ProcessControlBlockInner {
     fn close_cloexec_fds(&mut self) {
         const FD_CLOEXEC: u32 = 1;
-        if self.fd_flags.len() < self.fd_table.len() {
-            self.fd_flags.resize(self.fd_table.len(), 0);
-        }
+        self.ensure_fd_flags_len();
         for (idx, flags) in self.fd_flags.iter_mut().enumerate() {
             if (*flags & FD_CLOEXEC) != 0 {
                 self.fd_table[idx] = None;
                 *flags = 0;
             }
         }
+    }
+
+    /// Keep `fd_flags` aligned with `fd_table` length.
+    pub fn ensure_fd_flags_len(&mut self) {
+        if self.fd_flags.len() < self.fd_table.len() {
+            self.fd_flags.resize(self.fd_table.len(), 0);
+        }
+    }
+
+    /// True when `fd` currently refers to an open file descriptor.
+    pub fn is_fd_open(&self, fd: usize) -> bool {
+        fd < self.fd_table.len() && self.fd_table[fd].is_some()
+    }
+
+    /// Close an fd slot and clear its per-fd flags.
+    ///
+    /// Returns `false` if `fd` is out of range.
+    pub fn clear_fd(&mut self, fd: usize) -> bool {
+        if fd >= self.fd_table.len() {
+            return false;
+        }
+        self.fd_table[fd] = None;
+        self.ensure_fd_flags_len();
+        self.fd_flags[fd] = 0;
+        true
     }
 
     #[allow(unused)]
@@ -743,9 +766,7 @@ impl ProcessControlBlockInner {
             if fd >= limit {
                 return None;
             }
-            if fd >= self.fd_flags.len() {
-                self.fd_flags.resize(self.fd_table.len(), 0);
-            }
+            self.ensure_fd_flags_len();
             self.fd_flags[fd] = 0;
             Some(fd)
         } else {
