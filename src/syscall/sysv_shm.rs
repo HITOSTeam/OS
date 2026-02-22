@@ -4,7 +4,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
-use crate::mm::{frame_alloc, FrameTracker, MapPermission, PTEFlags, VirtAddr};
+use crate::mm::{FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc};
 use crate::task::processor::current_process;
 
 const IPC_PRIVATE: usize = 0;

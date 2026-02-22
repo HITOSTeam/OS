@@ -4,11 +4,11 @@ use crate::{
     config::MAX_HARTS,
     debug_config::DEBUG_CYCLICTEST,
     mm::{
-        read_user_value, translated_byte_buffer, try_copy_from_user, try_copy_to_user,
-        write_user_value, MapPermission,
+        MapPermission, read_user_value, translated_byte_buffer, try_copy_from_user,
+        try_copy_to_user, write_user_value,
     },
     syscall::misc::decode_linux_tid,
-    task::{manager::pid2process, processor::current_process, ProcessControlBlock},
+    task::{ProcessControlBlock, manager::pid2process, processor::current_process},
     trap::get_current_token,
 };
 

@@ -413,6 +413,33 @@ pub fn syscall_capset(hdrp: usize, datap: usize) -> isize {
     0
 }
 
+/// Linux `unshare(2)` (syscall 97 on riscv64).
+///
+/// Minimal support:
+/// - `CLONE_FILES`: unshare file descriptor table from CLONE_FILES owner.
+/// - `CLONE_FS`: currently a no-op (cwd/umask are already process-local).
+/// - `CLONE_NEWNS`: requires root and is treated as successful no-op namespace split.
+pub fn syscall_unshare(flags: usize) -> isize {
+    const CLONE_FS: usize = 0x0000_0200;
+    const CLONE_FILES: usize = 0x0000_0400;
+    const CLONE_NEWNS: usize = 0x0002_0000;
+    let valid = CLONE_FILES | CLONE_FS | CLONE_NEWNS;
+    if (flags & !valid) != 0 {
+        return EINVAL;
+    }
+    if (flags & CLONE_NEWNS) != 0 {
+        let process = current_process();
+        if process.borrow_mut().euid != 0 {
+            return EPERM;
+        }
+    }
+    if (flags & CLONE_FILES) != 0 {
+        let process = current_process();
+        process.unshare_files();
+    }
+    0
+}
+
 pub fn syscall_reboot(_magic1: usize, _magic2: usize, _cmd: usize, _arg: usize) -> isize {
     if current_process().borrow_mut().euid != 0 {
         return EPERM;
