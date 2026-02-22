@@ -3,17 +3,19 @@ use crate::{
     debug_config::DEBUG_PTHREAD,
     fs::ext4_lock,
     mm::{
-        read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
-        try_read_user_value, try_write_user_value, write_user_value, MapPermission,
+        MapPermission, read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
+        try_read_user_value, try_write_user_value, write_user_value,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
-        manager::{pid2process, PID2PCB},
-        processor::{block_current_and_run_next, current_process, current_task},
-        signal::{has_unmasked_pending, queue_process_signal, SIGKILL_NUM, SIGXCPU_NUM},
+        manager::{PID2PCB, pid2process},
+        processor::{
+            block_current_and_run_next, current_files_process, current_process, current_task,
+        },
+        signal::{SIGKILL_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal},
     },
     time::{get_time, get_time_ms},
     trap::get_current_token,
@@ -21,7 +23,6 @@ use crate::{
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -38,8 +39,6 @@ use spin::Mutex;
 // futex owner bits (OWNER_DIED/WAITERS) remain usable.
 // (tgid << 15) occupies bits [15..29] for typical OSComp PID ranges (< 32768).
 const LINUX_TID_PID_SHIFT: usize = 15;
-
-static UMASK: AtomicUsize = AtomicUsize::new(0);
 
 const EPERM: isize = -1;
 const EACCES: isize = -13;
@@ -300,6 +299,120 @@ pub fn syscall_umount2(_special: usize, _flags: usize) -> isize {
     0
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapUserHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapUserData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+fn cap_data_u32s(version: u32) -> Option<usize> {
+    match version {
+        LINUX_CAPABILITY_VERSION_1 => Some(1),
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Some(2),
+        _ => None,
+    }
+}
+
+fn cap_pid_matches_current(pid: i32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    if pid < 0 {
+        return false;
+    }
+    let pid = pid as usize;
+    // Linux capability operations are per-thread (TID-based pid field).
+    pid == current_process().getpid() || pid == current_linux_tid()
+}
+
+/// Linux `capget(2)` (syscall 90 on riscv64).
+///
+/// Minimal support used by LTP capability helpers.
+pub fn syscall_capget(hdrp: usize, datap: usize) -> isize {
+    if hdrp == 0 || datap == 0 {
+        return EFAULT;
+    }
+    let token = get_current_token();
+    let mut hdr = match try_read_user_value(token, hdrp as *const CapUserHeader) {
+        Some(v) => v,
+        None => return EFAULT,
+    };
+
+    let Some(n_u32s) = cap_data_u32s(hdr.version) else {
+        hdr.version = LINUX_CAPABILITY_VERSION_3;
+        if try_write_user_value(token, hdrp as *mut CapUserHeader, &hdr).is_err() {
+            return EFAULT;
+        }
+        return EINVAL;
+    };
+
+    if !cap_pid_matches_current(hdr.pid) {
+        return ESRCH;
+    }
+
+    let data = CapUserData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    for i in 0..n_u32s {
+        let ptr = (datap + i * size_of::<CapUserData>()) as *mut CapUserData;
+        if try_write_user_value(token, ptr, &data).is_err() {
+            return EFAULT;
+        }
+    }
+    0
+}
+
+/// Linux `capset(2)` (syscall 91 on riscv64).
+///
+/// Minimal support used by LTP capability helpers.
+pub fn syscall_capset(hdrp: usize, datap: usize) -> isize {
+    if hdrp == 0 || datap == 0 {
+        return EFAULT;
+    }
+    let token = get_current_token();
+    let mut hdr = match try_read_user_value(token, hdrp as *const CapUserHeader) {
+        Some(v) => v,
+        None => return EFAULT,
+    };
+
+    let Some(n_u32s) = cap_data_u32s(hdr.version) else {
+        hdr.version = LINUX_CAPABILITY_VERSION_3;
+        if try_write_user_value(token, hdrp as *mut CapUserHeader, &hdr).is_err() {
+            return EFAULT;
+        }
+        return EINVAL;
+    };
+
+    if !cap_pid_matches_current(hdr.pid) {
+        return EPERM;
+    }
+
+    // Validate user pointers and payload readability; current kernel model does
+    // not enforce fine-grained capabilities yet.
+    for i in 0..n_u32s {
+        let ptr = (datap + i * size_of::<CapUserData>()) as *const CapUserData;
+        if try_read_user_value(token, ptr).is_none() {
+            return EFAULT;
+        }
+    }
+    0
+}
+
 pub fn syscall_reboot(_magic1: usize, _magic2: usize, _cmd: usize, _arg: usize) -> isize {
     if current_process().borrow_mut().euid != 0 {
         return EPERM;
@@ -320,11 +433,7 @@ pub fn syscall_getppid() -> isize {
 }
 
 fn normalized_pgid(pid: usize, pgid: usize) -> usize {
-    if pgid == 0 && pid != 0 {
-        pid
-    } else {
-        pgid
-    }
+    if pgid == 0 && pid != 0 { pid } else { pgid }
 }
 
 fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {
@@ -1478,7 +1587,7 @@ pub fn syscall_ppoll(
     }
 
     let token = get_current_token();
-    let process = current_process();
+    let process = current_files_process();
 
     // `ppoll(NULL)` means "wait forever" (no timeout). Many libc `poll(-1)` wrappers
     // map to `ppoll(..., NULL, ...)`.
@@ -1559,14 +1668,19 @@ pub fn syscall_ppoll(
 }
 
 pub fn current_umask() -> usize {
-    UMASK.load(Ordering::Relaxed)
+    let process = current_process();
+    let inner = process.borrow_mut();
+    inner.umask & 0o777
 }
 
 /// Linux `umask(2)` (syscall 166 on riscv64).
 ///
 /// A minimal implementation for daemon() and common utilities.
 pub fn syscall_umask(mask: usize) -> isize {
-    let prev = UMASK.swap(mask & 0o777, Ordering::Relaxed);
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    let prev = inner.umask & 0o777;
+    inner.umask = mask & 0o777;
     prev as isize
 }
 
@@ -1577,8 +1691,17 @@ pub fn syscall_umask(mask: usize) -> isize {
 pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const EBADF: isize = -9;
     const ENOTTY: isize = -25;
+    const BLKGETSIZE: usize = 0x1260;
+    const BLKSSZGET: usize = 0x1268;
+    const BLKGETSIZE64: usize = 0x8008_1272;
+    // Some libc builds issue BLKGETSIZE64 with a 32-bit size encoding.
+    const BLKGETSIZE64_COMPAT: usize = 0x8004_1272;
+    const BLKPBSZGET: usize = 0x127b;
+    const PSEUDO_ROOT_DEV_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+    const PSEUDO_ROOT_DEV_SECTOR_SIZE: u32 = 512;
+    const PSEUDO_ROOT_DEV_PHYS_BLOCK_SIZE: u32 = 4096;
 
-    let process = current_process();
+    let process = current_files_process();
     let file = {
         let inner = process.borrow_mut();
         if fd >= inner.fd_table.len() {
@@ -1590,6 +1713,54 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     let Some(file) = file else {
         return EBADF;
     };
+
+    // Minimal block-device ioctls so LTP can use /dev/root as LTP_DEV.
+    if file
+        .as_any()
+        .downcast_ref::<crate::fs::PseudoBlock>()
+        .is_some()
+    {
+        if _argp == 0 {
+            return EFAULT;
+        }
+        let token = get_current_token();
+        // Some libcs pass ioctl request as signed int (sign-extended on rv64).
+        // Compare on low 32 bits to accept both calling conventions.
+        let request = _request & 0xffff_ffffusize;
+        match request {
+            BLKGETSIZE64 | BLKGETSIZE64_COMPAT => {
+                if try_write_user_value(token, _argp as *mut u64, &PSEUDO_ROOT_DEV_BYTES).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            BLKGETSIZE => {
+                let sectors: usize =
+                    (PSEUDO_ROOT_DEV_BYTES / PSEUDO_ROOT_DEV_SECTOR_SIZE as u64) as usize;
+                if try_write_user_value(token, _argp as *mut usize, &sectors).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            BLKSSZGET => {
+                if try_write_user_value(token, _argp as *mut u32, &PSEUDO_ROOT_DEV_SECTOR_SIZE)
+                    .is_err()
+                {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            BLKPBSZGET => {
+                if try_write_user_value(token, _argp as *mut u32, &PSEUDO_ROOT_DEV_PHYS_BLOCK_SIZE)
+                    .is_err()
+                {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            _ => return ENOTTY,
+        }
+    }
 
     // Best-effort support for `/dev/misc/rtc` (busybox `hwclock`).
     if file.as_any().downcast_ref::<crate::fs::RtcFile>().is_some() {

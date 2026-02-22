@@ -54,6 +54,7 @@ const SYSCALL_EPOLL_CREATE1: usize = 20;
 const SYSCALL_EPOLL_CTL: usize = 21;
 const SYSCALL_EPOLL_PWAIT: usize = 22;
 const SYSCALL_INOTIFY_INIT1: usize = 26;
+const SYSCALL_FGETXATTR: usize = 10;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_DUP: usize = 23;
@@ -67,6 +68,7 @@ const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_FCHMOD: usize = 52;
 const SYSCALL_FCHMODAT: usize = 53;
+const SYSCALL_FCHMODAT2: usize = 452;
 const SYSCALL_FCHOWNAT: usize = 54;
 const SYSCALL_FCHOWN: usize = 55;
 const SYSCALL_FTRUNCATE: usize = 46;
@@ -104,6 +106,8 @@ const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
 const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_ACCT: usize = 89;
+const SYSCALL_CAPGET: usize = 90;
+const SYSCALL_CAPSET: usize = 91;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
@@ -386,6 +390,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EPOLL_CTL => -38,
         SYSCALL_EPOLL_PWAIT => -38,
         SYSCALL_INOTIFY_INIT1 => dummy::syscall_inotify_init1(args[0]),
+        SYSCALL_FGETXATTR => filesystem::syscall_fgetxattr(args[0], args[1], args[2], args[3]),
         SYSCALL_MKNODAT => filesystem::syscall_mknodat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_MKDIRAT => filesystem::syscall_mkdirat(args[0] as isize, args[1], args[2]),
         SYSCALL_UNLINKAT => filesystem::syscall_unlinkat(args[0] as isize, args[1], args[2]),
@@ -398,6 +403,9 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_FCHMOD => filesystem::syscall_fchmod(args[0], args[1]),
         SYSCALL_FCHMODAT => {
+            filesystem::syscall_fchmodat(args[0] as isize, args[1], args[2], args[3])
+        }
+        SYSCALL_FCHMODAT2 => {
             filesystem::syscall_fchmodat(args[0] as isize, args[1], args[2], args[3])
         }
         SYSCALL_FCHOWNAT => {
@@ -452,6 +460,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             filesystem::syscall_utimensat(args[0] as isize, args[1], args[2], args[3])
         }
         SYSCALL_ACCT => filesystem::syscall_acct(args[0]),
+        SYSCALL_CAPGET => misc::syscall_capget(args[0], args[1]),
+        SYSCALL_CAPSET => misc::syscall_capset(args[0], args[1]),
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_EXIT_GROUP => flow::syscall_exit_group(args[0]),
         SYSCALL_SET_TID_ADDRESS => misc::syscall_set_tid_address(args[0]),

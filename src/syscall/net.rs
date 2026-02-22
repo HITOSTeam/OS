@@ -4,9 +4,9 @@ use core::mem::size_of;
 
 use crate::fs::{File, NetSocketFile};
 use crate::mm::{
-    read_user_value, try_copy_to_user, try_read_user_value, write_user_value, UserBuffer,
+    UserBuffer, read_user_value, try_copy_to_user, try_read_user_value, write_user_value,
 };
-use crate::task::processor::current_process;
+use crate::task::processor::{current_files_process, current_process};
 use crate::trap::get_current_token;
 
 const AF_UNIX: u16 = 1;
@@ -77,7 +77,7 @@ struct SockAddrIn {
 }
 
 fn get_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
-    let process = current_process();
+    let process = current_files_process();
     let inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
         return Err(EBADF);
@@ -163,7 +163,7 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
         }
         _ => return EAFNOSUPPORT,
     };
-    let process = current_process();
+    let process = current_files_process();
     let mut inner = process.borrow_mut();
     let Some(fd) = inner.alloc_fd() else {
         return EMFILE;
@@ -303,7 +303,7 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
         }
     };
     let peer = new_sock.tcp_endpoints_v4();
-    let process = current_process();
+    let process = current_files_process();
     let mut inner = process.borrow_mut();
     if fd >= inner.fd_flags.len() {
         let len = inner.fd_table.len();

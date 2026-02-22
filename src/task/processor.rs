@@ -1,17 +1,17 @@
 use crate::{
     arch,
     config::MAX_HARTS,
-    mm::{try_write_user_value, MemorySet},
+    mm::{MemorySet, try_write_user_value},
     println,
     syscall::futex::futex_wake_private_and_shared,
     task::{
+        INITPROC,
         id::{KernelStack, TaskUserRes},
-        manager::{add_task, fetch_task, remove_inactive_task, wakeup_task, TASK_MANAGER},
+        manager::{TASK_MANAGER, add_task, fetch_task, remove_inactive_task, wakeup_task},
         process_block::ProcessControlBlock,
         switch,
         task_block::{TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
-        INITPROC,
     },
     trap::init_trap,
 };
@@ -154,6 +154,12 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
             }
             INITPROC.clone()
         })
+}
+
+/// Resolve the process that owns the current task's file table.
+pub fn current_files_process() -> Arc<ProcessControlBlock> {
+    let process = current_process();
+    process.files_owner_process()
 }
 
 // todo
@@ -672,6 +678,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         // for now to avoid deadlock/double borrow problem.
         drop(process_inner);
         recycle_res.clear();
+        process.handoff_files_owner_on_exit();
 
         let mut process_inner = process.borrow_mut();
         process_inner.children.clear();
@@ -827,6 +834,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
     }
     drop(process_inner);
     recycle_res.clear();
+    process.handoff_files_owner_on_exit();
 
     let mut process_inner = process.borrow_mut();
     process_inner.children.clear();

@@ -7,7 +7,7 @@ use crate::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
     },
-    task::processor::{current_process, current_task},
+    task::processor::{current_files_process, current_process, current_task},
     task::signal::SIGALRM_NUM,
     time::get_time,
     trap::get_current_token,
@@ -754,7 +754,7 @@ pub fn syscall_pselect6(
     }
 
     let token = crate::trap::get_current_token();
-    let process = crate::task::processor::current_process();
+    let process = current_files_process();
 
     // Use a byte-sized bitmap (nfds bits).
     let bytes_len_full = (nfds + 7) / 8;

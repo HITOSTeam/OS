@@ -4,14 +4,15 @@ use super::File;
 use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
 use crate::mm::UserBuffer;
 use crate::println;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, Ordering};
 use ext4_fs::{Ext4FileSystem, Inode};
 use lazy_static::*;
 use spin::Mutex;
-use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 struct Ext4Lock {
     locked: AtomicBool,
@@ -92,7 +93,13 @@ pub struct OSInode {
     writable: bool,
     append: bool,
     readonly_fs: bool,
+    tmpfile_cleanup: Option<TmpfileCleanup>,
     inner: Mutex<OSInodeInner>,
+}
+
+struct TmpfileCleanup {
+    parent: Arc<Inode>,
+    name: String,
 }
 
 /// The OS inode inner
@@ -133,11 +140,23 @@ impl OSInode {
         inode: Arc<Inode>,
         readonly_fs: bool,
     ) -> Self {
+        Self::new_with_append_rofs_tmp_cleanup(readable, writable, append, inode, readonly_fs, None)
+    }
+
+    pub fn new_with_append_rofs_tmp_cleanup(
+        readable: bool,
+        writable: bool,
+        append: bool,
+        inode: Arc<Inode>,
+        readonly_fs: bool,
+        tmpfile_cleanup: Option<(Arc<Inode>, String)>,
+    ) -> Self {
         Self {
             readable,
             writable,
             append,
             readonly_fs,
+            tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
             inner: Mutex::new(OSInodeInner {
                 offset: 0,
                 dir_offset: 0,
@@ -647,10 +666,7 @@ impl File for OSInode {
 
                 if need_refill {
                     let sequential = inner.read_buf_valid > 0
-                        && inner.offset
-                            == inner
-                                .read_buf_off
-                                .saturating_add(inner.read_buf_valid);
+                        && inner.offset == inner.read_buf_off.saturating_add(inner.read_buf_valid);
                     let refill_len = if sequential {
                         READBUF_MAX
                     } else {
@@ -820,15 +836,21 @@ impl File for OSInode {
 impl Drop for OSInode {
     fn drop(&mut self) {
         let mut inner = self.inner.lock();
-        if inner.write_buf.is_empty() {
-            return;
+        if !inner.write_buf.is_empty() {
+            let off = inner.write_buf_off;
+            let data = core::mem::take(&mut inner.write_buf);
+            let _ = {
+                let _fs_guard = ext4_lock();
+                inner.inode.write_at(off, &data)
+            };
         }
-        let off = inner.write_buf_off;
-        let data = core::mem::take(&mut inner.write_buf);
-        let _ = {
-            let _fs_guard = ext4_lock();
-            inner.inode.write_at(off, &data)
-        };
+        drop(inner);
+        if let Some(cleanup) = self.tmpfile_cleanup.take() {
+            let _ = {
+                let _fs_guard = ext4_lock();
+                cleanup.parent.unlink(&cleanup.name)
+            };
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
-    mm::{kernel_token, translated_single_address, translated_str, write_user_value, MemorySet},
+    mm::{MemorySet, kernel_token, translated_single_address, translated_str, write_user_value},
     println,
     syscall::{
         filesystem::{normalize_path, resolve_exec_inode, resolve_read_inode},
@@ -13,11 +13,11 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
+        ProcessControlBlock,
         manager::{add_task, remove_inactive_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
+        signal::{MAX_SIG, SIG_DFL, SIG_IGN, SignalFlags, pending_unmasked_bits},
         task_block::TaskControlBlock,
-        ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
@@ -290,6 +290,7 @@ fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
 
 pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
+    const CLONE_FILES: usize = 0x0000_0400;
     const CLONE_SIGHAND: usize = 0x0000_0800;
     const CLONE_THREAD: usize = 0x0001_0000;
     const CLONE_SETTLS: usize = 0x0008_0000;
@@ -392,7 +393,8 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         *inner.get_trap_cx()
     };
     let process = current_process();
-    let Some((child, task)) = process.fork_with_task() else {
+    let share_files = (flags & CLONE_FILES) != 0;
+    let Some((child, task)) = process.fork_with_task(share_files) else {
         return -12;
     };
 

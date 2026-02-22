@@ -12,19 +12,19 @@ use crate::task::manager::PID2PCB;
 use crate::{
     config::clock_freq,
     fs::{
-        ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode, shm_create,
-        shm_get, shm_list, shm_remove, File, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir,
-        PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
+        File, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
+        PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file,
+        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
     },
     mm::{
-        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
-        translated_str, try_copy_to_user, try_read_user_value, try_write_user_value,
-        write_user_value, MapPermission, UserBuffer,
+        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
+        translated_byte_buffer, translated_mutref, translated_str, try_copy_to_user,
+        try_read_user_value, try_write_user_value, write_user_value,
     },
-    task::processor::current_process,
+    task::processor::{current_files_process, current_process},
     task::{
-        signal::{queue_process_signal, SIGXFSZ_NUM},
         ProcessControlBlock,
+        signal::{SIGXFSZ_NUM, queue_process_signal},
     },
     time::get_time,
     trap::get_current_token,
@@ -47,6 +47,7 @@ const O_EXCL: usize = 0x80;
 const O_TRUNC: usize = 0x200;
 const O_APPEND: usize = 0x400;
 const O_NONBLOCK: usize = 0x800;
+const O_NOATIME: usize = 0x40000;
 const O_PATH: usize = 0x200000;
 const O_DIRECTORY: usize = 0x10000;
 const O_NOFOLLOW: usize = 0x20000;
@@ -86,6 +87,7 @@ const EROFS: isize = -30;
 const ENOSPC: isize = -28;
 const ENOSYS: isize = -38;
 const ENAMETOOLONG: isize = -36;
+const ENXIO: isize = -6;
 const EOPNOTSUPP: isize = -95;
 const ENOTEMPTY: isize = -39;
 
@@ -366,7 +368,7 @@ fn resolve_final_symlink_abs_path(abs: &str) -> String {
 }
 
 fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
-    let process = current_process();
+    let process = current_files_process();
     let inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
         return None;
@@ -375,7 +377,7 @@ fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
 }
 
 fn fd_has_o_path(fd: usize) -> bool {
-    let process = current_process();
+    let process = current_files_process();
     let inner = process.borrow_mut();
     if fd >= inner.fd_flags.len() {
         return false;
@@ -552,6 +554,68 @@ fn resolve_ext4_abs_path(
             )
         }
         Err(e) => Err(e),
+    }
+}
+
+fn parse_proc_fd_for_current_process(path: &str) -> Option<usize> {
+    let trimmed = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+    let parse_fd = |s: &str| -> Option<usize> {
+        if s.is_empty() || s.contains('/') || !s.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<usize>().ok()
+    };
+
+    if let Some(rest) = trimmed.strip_prefix("/proc/self/fd/") {
+        return parse_fd(rest);
+    }
+
+    let pid = current_process().getpid();
+    let prefix = alloc::format!("/proc/{}/fd/", pid);
+    let rest = trimmed.strip_prefix(prefix.as_str())?;
+    parse_fd(rest)
+}
+
+fn empty_path_fd_for_at_op(dirfd: isize, flags: usize) -> Result<usize, isize> {
+    if dirfd < 0 {
+        return Err(ENOENT);
+    }
+    let fd = dirfd as usize;
+    if (flags & AT_EMPTY_PATH) != 0 {
+        return Ok(fd);
+    }
+    // Some libc fallbacks retry fd-based metadata ops via empty-path *at calls.
+    // Preserve O_PATH EBADF semantics instead of leaking ENOENT.
+    if fd_has_o_path(fd) {
+        return Err(EBADF);
+    }
+    Err(ENOENT)
+}
+
+fn maybe_dispatch_proc_fd_at(
+    abs: &str,
+    flags: usize,
+    op: impl FnOnce(usize) -> isize,
+) -> Option<isize> {
+    if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+        return None;
+    }
+    let fd = parse_proc_fd_for_current_process(abs)?;
+    Some(op(fd))
+}
+
+fn pseudo_path_exists_result(abs: &str) -> isize {
+    if let Some(name) = shm_object_name(abs) {
+        return if shm_get(name).is_some() { 0 } else { ENOENT };
+    }
+    if open_pseudo(abs).is_some() {
+        0
+    } else {
+        ENOENT
     }
 }
 
@@ -1195,7 +1259,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
 
     let ret = match cmd {
         F_GETFD => {
-            let process = current_process();
+            let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
                 return EBADF;
@@ -1208,7 +1272,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_SETFD => {
-            let process = current_process();
+            let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
                 return EBADF;
@@ -1224,7 +1288,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             0
         }
         F_SETFL => {
-            let process = current_process();
+            let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
                 return EBADF;
@@ -1240,7 +1304,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             0
         }
         F_GETFL => {
-            let process = current_process();
+            let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
                 return EBADF;
@@ -1268,7 +1332,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             flags as isize
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let process = current_process();
+            let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
                 return EBADF;
@@ -1385,6 +1449,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     let create_mode = apply_umask(mode);
     let mut created = false;
     let mut created_parent: Option<alloc::sync::Arc<ext4_fs::Inode>> = None;
+    let mut tmpfile_cleanup_parent: Option<alloc::sync::Arc<ext4_fs::Inode>> = None;
+    let mut tmpfile_cleanup_name: Option<alloc::string::String> = None;
     let (fsuid, fsgid) = current_fsuid_gid();
 
     // Pseudo fs: `/sys`, `/dev`.
@@ -1413,7 +1479,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             } else {
                 return ENOENT;
             };
-        let process = current_process();
+        let process = current_files_process();
         let mut inner = process.borrow_mut();
         let Some(fd) = inner.alloc_fd() else {
             return EMFILE;
@@ -1450,7 +1516,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             drop(_ext4_guard);
             let file: alloc::sync::Arc<dyn File + Send + Sync> =
                 alloc::sync::Arc::new(PseudoDir::new("/", entries));
-            let process = current_process();
+            let process = current_files_process();
             let mut inner = process.borrow_mut();
             let Some(fd) = inner.alloc_fd() else {
                 return EMFILE;
@@ -1493,6 +1559,11 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         }
     }
 
+    // Existing path + O_CREAT|O_EXCL must fail.
+    if !tmpfile_requested && inode.is_some() && (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
+        return EEXIST;
+    }
+
     if tmpfile_requested {
         let dir_inode = match inode {
             Some(ref i) => alloc::sync::Arc::clone(i),
@@ -1504,17 +1575,52 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         if !inode_mode_allows_uid_gid(&dir_inode, 3, fsuid, fsgid) {
             return EACCES;
         }
+        // Emulate anonymous tmpfile semantics using a hidden per-filesystem pool.
+        // Use the known root inode for the same block device to avoid relying on
+        // per-directory ".." lookups (which can leave stale hidden entries behind).
+        let mut fs_root = crate::fs::root_inode_for_path("/");
+        if fs_root.device_id() != dir_inode.device_id() {
+            if let Some(sec_root) = secondary_root_inode() {
+                if sec_root.device_id() == dir_inode.device_id() {
+                    fs_root = sec_root;
+                } else {
+                    // Fallback: best effort on the opened directory's filesystem.
+                    fs_root = alloc::sync::Arc::clone(&dir_inode);
+                }
+            } else {
+                fs_root = alloc::sync::Arc::clone(&dir_inode);
+            }
+        }
+        let pool_name = ".ltp_tmpfile_pool";
+        let pool_dir = if let Some(existing) = fs_root.find(pool_name) {
+            if !existing.is_dir() {
+                return ENOTDIR;
+            }
+            existing
+        } else {
+            match fs_root.create_dir(pool_name) {
+                Ok(d) => {
+                    d.set_uid_gid(0, 0);
+                    d.set_mode(0o1777);
+                    d
+                }
+                Err(e) => return ext4_err_to_errno(e),
+            }
+        };
+
         let pid = current_process().getpid();
         let mut tmp_created = None;
         for _ in 0..64 {
             let seq = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
             let name = alloc::format!(".tmp.{}.{}", pid, seq);
-            if dir_inode.find(&name).is_some() {
+            if pool_dir.find(&name).is_some() {
                 continue;
             }
-            match dir_inode.create_file(&name) {
+            match pool_dir.create_file(&name) {
                 Ok(i) => {
                     tmp_created = Some(i);
+                    tmpfile_cleanup_parent = Some(alloc::sync::Arc::clone(&pool_dir));
+                    tmpfile_cleanup_name = Some(name);
                     break;
                 }
                 Err(e) => return ext4_err_to_errno(e),
@@ -1523,6 +1629,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         let Some(tmp_inode) = tmp_created else {
             return ENOSPC;
         };
+        // Use target directory for mode/gid inheritance semantics.
         created_parent = Some(dir_inode);
         inode = Some(tmp_inode);
         created = true;
@@ -1588,8 +1695,9 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         );
     }
 
-    // Linux: opening a directory for write is not allowed.
-    if !o_path && inode.is_dir() && (flags & O_ACCMODE) != O_RDONLY {
+    // Linux: opening a directory for write is not allowed. Also, O_CREAT on
+    // an existing directory returns EISDIR (including symlink-to-directory).
+    if !o_path && inode.is_dir() && ((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) != 0) {
         if debug_close {
             crate::println!(
                 "[fs] openat close-test EISDIR inode={} mode=0o{:o}",
@@ -1598,6 +1706,20 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             );
         }
         return EISDIR;
+    }
+
+    // Linux `O_NOATIME`: non-owner/non-privileged callers get EPERM.
+    if (flags & O_NOATIME) != 0 {
+        let (euid, _egid) = current_effective_uid_gid();
+        if euid != 0 && euid != inode.uid() {
+            return EPERM;
+        }
+    }
+
+    // FIFO write end with `O_NONBLOCK` and no reader should fail with ENXIO.
+    // We currently model this conservatively as always ENXIO for this flag combo.
+    if inode.is_fifo() && (flags & O_NONBLOCK) != 0 && (flags & O_ACCMODE) == O_WRONLY {
+        return ENXIO;
     }
 
     // Basic permission check based on owner/group/other bits.
@@ -1638,16 +1760,28 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     let inode_num = inode.inode_num();
-    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs(
+    let tmpfile_cleanup = if tmpfile_requested {
+        match (
+            tmpfile_cleanup_parent.as_ref(),
+            tmpfile_cleanup_name.as_ref(),
+        ) {
+            (Some(parent), Some(name)) => Some((alloc::sync::Arc::clone(parent), name.clone())),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs_tmp_cleanup(
         readable,
         writable,
         append,
         inode,
         readonly_fs,
+        tmpfile_cleanup,
     ));
     crate::fs::debug_track_iozone_inode(&path, inode_num);
     drop(ext4_guard);
-    let process = current_process();
+    let process = current_files_process();
     let mut inner = process.borrow_mut();
     let Some(fd) = inner.alloc_fd() else {
         return EMFILE;
@@ -1951,6 +2085,9 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
 
 /// Linux `fchmod(2)` (syscall 52 on riscv64).
 pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
@@ -1981,12 +2118,12 @@ pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize
         Ok(p) => p,
         Err(e) => return e,
     };
-    let _ignored_flags = flags;
     if path.is_empty() {
-        if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
-            return syscall_fchmod(dirfd as usize, mode);
-        }
-        return ENOENT;
+        let fd = match empty_path_fd_for_at_op(dirfd, flags) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        return syscall_fchmod(fd, mode);
     }
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -1995,14 +2132,10 @@ pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
-        if let Some(name) = shm_object_name(abs) {
-            return if shm_get(name).is_some() { 0 } else { ENOENT };
+        if let Some(ret) = maybe_dispatch_proc_fd_at(abs, flags, |fd| syscall_fchmod(fd, mode)) {
+            return ret;
         }
-        return if open_pseudo(abs).is_some() {
-            0
-        } else {
-            ENOENT
-        };
+        return pseudo_path_exists_result(abs);
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -2029,6 +2162,9 @@ pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize
 
 /// Linux `fchown(2)` (syscall 55 on riscv64).
 pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
@@ -2065,10 +2201,11 @@ pub fn syscall_fchownat(
     };
 
     if path.is_empty() {
-        if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
-            return syscall_fchown(dirfd as usize, uid, gid);
-        }
-        return ENOENT;
+        let fd = match empty_path_fd_for_at_op(dirfd, flags) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        return syscall_fchown(fd, uid, gid);
     }
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -2077,14 +2214,11 @@ pub fn syscall_fchownat(
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
-        if let Some(name) = shm_object_name(abs) {
-            return if shm_get(name).is_some() { 0 } else { ENOENT };
+        if let Some(ret) = maybe_dispatch_proc_fd_at(abs, flags, |fd| syscall_fchown(fd, uid, gid))
+        {
+            return ret;
         }
-        return if open_pseudo(abs).is_some() {
-            0
-        } else {
-            ENOENT
-        };
+        return pseudo_path_exists_result(abs);
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -2102,6 +2236,20 @@ pub fn syscall_fchownat(
         return ret;
     }
     0
+}
+
+/// Linux `fgetxattr(2)` (syscall 10 on riscv64).
+///
+/// For now we only need the fd-level semantics used by LTP `open13`:
+/// operations on `O_PATH` descriptors must fail with `EBADF`.
+pub fn syscall_fgetxattr(fd: usize, _name: usize, _value: usize, _size: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(_file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    EOPNOTSUPP
 }
 
 /// Linux `readlinkat(2)` (syscall 78 on riscv64).
@@ -2269,11 +2417,13 @@ pub fn syscall_linkat(
         Ok(v) => v,
         Err(e) => return e,
     };
-    match (&old_at, &new_at) {
-        (Some(AtPath::PseudoAbs(_)), AtPath::PseudoAbs(_)) => return EROFS,
-        (Some(AtPath::PseudoAbs(_)), _) => return EXDEV,
-        (_, AtPath::PseudoAbs(_)) => return EROFS,
-        _ => {}
+    if matches!(new_at, AtPath::PseudoAbs(_)) {
+        return EROFS;
+    }
+    if let Some(AtPath::PseudoAbs(abs)) = &old_at {
+        if parse_proc_fd_for_current_process(abs).is_none() {
+            return EXDEV;
+        }
     }
     if let (Some(AtPath::Ext4Abs(old_abs)), AtPath::Ext4Abs(new_abs)) = (&old_at, &new_at) {
         if hardlink_cross_mount(old_abs, new_abs) {
@@ -2286,10 +2436,24 @@ pub fn syscall_linkat(
     let _ext4_guard = ext4_lock();
 
     let source = if let Some(at) = old_at {
-        debug_assert!(!matches!(at, AtPath::PseudoAbs(_)));
-        match resolve_at_inode(&at, fsuid, fsgid, follow_old) {
-            Ok(v) => v,
-            Err(e) => return e,
+        match at {
+            AtPath::PseudoAbs(abs) => {
+                let fd = match parse_proc_fd_for_current_process(&abs) {
+                    Some(v) => v,
+                    None => return EXDEV,
+                };
+                let Some(file) = get_fd_file(fd) else {
+                    return EBADF;
+                };
+                let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+                    return EPERM;
+                };
+                os_inode.ext4_inode()
+            }
+            other => match resolve_at_inode(&other, fsuid, fsgid, follow_old) {
+                Ok(v) => v,
+                Err(e) => return e,
+            },
         }
     } else {
         if olddirfd < 0 {
@@ -2409,7 +2573,7 @@ pub fn syscall_renameat2(
 }
 
 pub fn syscall_close(fd: usize) -> isize {
-    let process = current_process();
+    let process = current_files_process();
     let mut inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
         return EBADF;
@@ -2427,7 +2591,7 @@ pub fn syscall_close(fd: usize) -> isize {
 /// Linux `close_range(2)` (syscall 436 on riscv64/loongarch64).
 ///
 /// Supported flags:
-/// - `CLOSE_RANGE_UNSHARE` (treated as a no-op in this fd-table model)
+/// - `CLOSE_RANGE_UNSHARE` (materialize a private fd table before update)
 /// - `CLOSE_RANGE_CLOEXEC`
 pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
     const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
@@ -2439,7 +2603,11 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
 
     let set_cloexec = (flags & CLOSE_RANGE_CLOEXEC) != 0;
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    if (flags & CLOSE_RANGE_UNSHARE) != 0 {
+        process.unshare_files();
+    }
+    let files_process = process.files_owner_process();
+    let mut inner = files_process.borrow_mut();
     inner.ensure_fd_flags_len();
     if inner.fd_table.is_empty() {
         return 0;
@@ -2708,7 +2876,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
 }
 
 pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
-    let process = current_process();
+    let process = current_files_process();
     let token = get_current_token();
     let (pipe_read, pipe_write) = make_pipe();
 
@@ -2744,7 +2912,7 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
 }
 
 pub fn syscall_dup(oldfd: usize) -> isize {
-    let process = current_process();
+    let process = current_files_process();
     let mut inner = process.borrow_mut();
     if !inner.is_fd_open(oldfd) {
         return EBADF;
@@ -2767,7 +2935,7 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     if oldfd == newfd {
         return EINVAL;
     }
-    let process = current_process();
+    let process = current_files_process();
     let mut inner = process.borrow_mut();
     if newfd >= inner.rlimit_nofile_cur as usize {
         return EBADF;

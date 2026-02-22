@@ -1,7 +1,7 @@
 use core::mem::size_of;
 
 use crate::{
-    fs::make_socketpair, mm::write_user_value, task::processor::current_process,
+    fs::make_socketpair, mm::write_user_value, task::processor::current_files_process,
     trap::get_current_token,
 };
 
@@ -42,7 +42,7 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
 
     let (end0, end1) = make_socketpair();
 
-    let process = current_process();
+    let process = current_files_process();
     let token = get_current_token();
     let mut inner = process.borrow_mut();
     let Some(fd0) = inner.alloc_fd() else {

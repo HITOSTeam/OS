@@ -10,11 +10,11 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, OSInode,
-    PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
+    File, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
+    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode,
 };
 use crate::mm::UserBuffer;
-use crate::task::manager::{pid2process, PID2PCB};
+use crate::task::manager::{PID2PCB, pid2process};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
 
@@ -107,11 +107,7 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 {
-        None
-    } else {
-        Some(ino)
-    }
+    if ino == 0 { None } else { Some(ino) }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
@@ -162,6 +158,10 @@ pub fn init_procfs() {
             if let Some(pid_max_file) = pid_max_file {
                 let value = alloc::format!("{}\n", crate::task::pid_max());
                 let _ = pid_max_file.write_at(0, value.as_bytes());
+            }
+            let tainted_file = ensure_file(&kernel_dir, "tainted", 0o444);
+            if let Some(tainted_file) = tainted_file {
+                let _ = tainted_file.write_at(0, b"0\n");
             }
         }
         let fs_dir = ensure_dir(&sys_dir, "fs", 0o555);
@@ -293,7 +293,8 @@ fn proc_pid_fd_entries(pid: u32) -> Vec<PseudoDirent> {
     let Some(proc) = pid2process(pid as usize) else {
         return entries;
     };
-    let Some(inner) = proc.try_borrow_mut() else {
+    let files_proc = proc.files_owner_process();
+    let Some(inner) = files_proc.try_borrow_mut() else {
         return entries;
     };
     for (fd, file) in inner.fd_table.iter().enumerate() {
@@ -373,8 +374,9 @@ fn find_inode_path_in_roots(target: &Arc<ext4_fs::Inode>) -> Option<String> {
 
 fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     let proc = pid2process(pid as usize)?;
+    let files_proc = proc.files_owner_process();
     let (file, cwd) = {
-        let inner = proc.try_borrow_mut()?;
+        let inner = files_proc.try_borrow_mut()?;
         if fd >= inner.fd_table.len() {
             return None;
         }

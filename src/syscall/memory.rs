@@ -1,8 +1,8 @@
 use crate::{
     config::{PAGE_SIZE, TRAP_CONTEXT},
-    fs::{ext4_lock, File, OSInode, PseudoShmFile},
-    mm::{frame_alloc, try_copy_to_user_unchecked, MapPermission, PTEFlags},
-    task::processor::current_process,
+    fs::{File, OSInode, PseudoShmFile, ext4_lock},
+    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user_unchecked},
+    task::processor::{current_files_process, current_process},
     trap::get_current_token,
 };
 use alloc::sync::Arc;
@@ -46,7 +46,7 @@ fn user_range_valid(start: usize, end: usize) -> bool {
 }
 
 fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
-    let process = current_process();
+    let process = current_files_process();
     let inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
         return None;

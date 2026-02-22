@@ -1,4 +1,4 @@
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -10,26 +10,33 @@ use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
-    read_user_value, translated_mutref, write_user_value, ElfAux, MemorySet, KERNEL_SPACE,
+    ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
 };
 use crate::println;
 use crate::task::condvar::Condvar;
-use crate::task::id::{pid_alloc, PidHandle};
+use crate::task::id::{PidHandle, pid_alloc};
 use crate::task::manager::{
     add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
-    RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN,
+    RT_SIG_MAX, RtSigAction, SIG_IGN, SignalAction, SignalActions, SignalFlags,
 };
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
+use lazy_static::lazy_static;
 use spin::{Mutex as SpinMutex, MutexGuard};
 
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
+
+lazy_static! {
+    /// owner_pid -> processes currently sharing that owner's file table.
+    static ref SHARED_FILES_SHARERS: SpinMutex<BTreeMap<usize, Vec<Weak<ProcessControlBlock>>>> =
+        SpinMutex::new(BTreeMap::new());
+}
 
 fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
     for (signum, action) in inner.rt_sig_handlers.iter_mut().enumerate() {
@@ -556,7 +563,7 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     // Walk argv/envp to find auxv.
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-                                                                        // Skip envp pointers (NULL terminated).
+    // Skip envp pointers (NULL terminated).
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();
@@ -635,10 +642,15 @@ pub struct ProcessControlBlockInner {
     pub fsgid: u32,
     /// Supplementary group IDs.
     pub supplementary_gids: Vec<u32>,
+    /// Per-process file mode creation mask (umask).
+    pub umask: usize,
     //
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     /// Per-fd flags (e.g., FD_CLOEXEC, O_NONBLOCK).
     pub fd_flags: Vec<u32>,
+    /// When set, file-descriptor operations are delegated to this owner process
+    /// (Linux CLONE_FILES-style shared file table).
+    pub files_owner: Option<Weak<ProcessControlBlock>>,
     /// Per-process RLIMIT_NOFILE (soft/hard).
     pub rlimit_nofile_cur: u64,
     pub rlimit_nofile_max: u64,
@@ -719,6 +731,19 @@ pub struct ProcessControlBlockInner {
 }
 
 impl ProcessControlBlockInner {
+    pub fn snapshot_fd_state(&self) -> (Vec<Option<Arc<dyn File + Send + Sync>>>, Vec<u32>) {
+        let fd_table = self
+            .fd_table
+            .iter()
+            .map(|fd| fd.as_ref().map(Arc::clone))
+            .collect::<Vec<_>>();
+        let mut fd_flags = self.fd_flags.clone();
+        if fd_flags.len() < fd_table.len() {
+            fd_flags.resize(fd_table.len(), 0);
+        }
+        (fd_table, fd_flags)
+    }
+
     fn close_cloexec_fds(&mut self) {
         const FD_CLOEXEC: u32 = 1;
         self.ensure_fd_flags_len();
@@ -806,6 +831,93 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    fn register_files_sharer(owner: &Arc<Self>, sharer: &Arc<Self>) {
+        if Arc::ptr_eq(owner, sharer) {
+            return;
+        }
+        let mut map = SHARED_FILES_SHARERS.lock();
+        let entry = map.entry(owner.getpid()).or_default();
+        entry.retain(|w| w.upgrade().is_some());
+        if entry
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|p| Arc::ptr_eq(&p, sharer))
+        {
+            return;
+        }
+        entry.push(Arc::downgrade(sharer));
+    }
+
+    fn unregister_files_sharer(owner_pid: usize, sharer: &Arc<Self>) {
+        let mut map = SHARED_FILES_SHARERS.lock();
+        let Some(entry) = map.get_mut(&owner_pid) else {
+            return;
+        };
+        entry.retain(|w| w.upgrade().is_some_and(|p| !Arc::ptr_eq(&p, sharer)));
+        if entry.is_empty() {
+            map.remove(&owner_pid);
+        }
+    }
+
+    fn clone_fd_table(
+        src: &[Option<Arc<dyn File + Send + Sync>>],
+    ) -> Vec<Option<Arc<dyn File + Send + Sync>>> {
+        src.iter()
+            .map(|fd| fd.as_ref().map(Arc::clone))
+            .collect::<Vec<_>>()
+    }
+
+    /// If this process owns a shared file table and exits, transfer ownership
+    /// to one alive sharer so CLONE_FILES users keep Linux-like semantics.
+    pub fn handoff_files_owner_on_exit(self: &Arc<Self>) {
+        let sharers = {
+            let mut map = SHARED_FILES_SHARERS.lock();
+            map.remove(&self.getpid()).unwrap_or_default()
+        };
+        if sharers.is_empty() {
+            return;
+        }
+        let mut alive = sharers
+            .into_iter()
+            .filter_map(|w| w.upgrade())
+            .filter(|p| !Arc::ptr_eq(p, self))
+            .collect::<Vec<_>>();
+        if alive.is_empty() {
+            return;
+        }
+
+        let (fd_table, fd_flags) = {
+            let inner = self.borrow_mut();
+            inner.snapshot_fd_state()
+        };
+
+        let new_owner = alive.swap_remove(0);
+        {
+            let mut inner = new_owner.borrow_mut();
+            inner.fd_table = Self::clone_fd_table(fd_table.as_slice());
+            inner.fd_flags = fd_flags.clone();
+            inner.files_owner = None;
+        }
+
+        let mut reassigned = Vec::new();
+        for sharer in alive {
+            {
+                let mut inner = sharer.borrow_mut();
+                inner.fd_table = Self::clone_fd_table(fd_table.as_slice());
+                inner.fd_flags = fd_flags.clone();
+                inner.files_owner = Some(Arc::downgrade(&new_owner));
+            }
+            reassigned.push(Arc::downgrade(&sharer));
+        }
+
+        if !reassigned.is_empty() {
+            let mut map = SHARED_FILES_SHARERS.lock();
+            let entry = map.entry(new_owner.getpid()).or_default();
+            entry.retain(|w| w.upgrade().is_some());
+            entry.extend(reassigned);
+        }
+    }
+
     fn terminate_other_threads(&self) {
         let current = current_task();
         let current_ptr = current.as_ref().map(Arc::as_ptr);
@@ -848,6 +960,51 @@ impl ProcessControlBlock {
 
     pub fn try_borrow_mut(&self) -> Option<MutexGuard<'_, ProcessControlBlockInner>> {
         self.inner.try_lock()
+    }
+
+    /// Resolve the process that currently owns this process's file table.
+    pub fn files_owner_process(self: &Arc<Self>) -> Arc<Self> {
+        let direct_owner = {
+            let mut inner = self.borrow_mut();
+            let owner = inner.files_owner.as_ref().and_then(Weak::upgrade);
+            if owner.is_none() {
+                inner.files_owner = None;
+            }
+            owner
+        };
+        if let Some(owner) = direct_owner {
+            if Arc::ptr_eq(&owner, self) {
+                return Arc::clone(self);
+            }
+            return owner;
+        }
+        Arc::clone(self)
+    }
+
+    /// Materialize a private fd table for this process when it currently
+    /// shares another process's table (close_range UNSHARE semantics).
+    pub fn unshare_files(self: &Arc<Self>) {
+        let owner = self.files_owner_process();
+        if Arc::ptr_eq(&owner, self) {
+            return;
+        }
+        let (fd_table, fd_flags) = {
+            let owner_inner = owner.borrow_mut();
+            owner_inner.snapshot_fd_state()
+        };
+        let mut unshared = false;
+        {
+            let mut inner = self.borrow_mut();
+            if inner.files_owner.is_some() {
+                inner.fd_table = fd_table;
+                inner.fd_flags = fd_flags;
+                inner.files_owner = None;
+                unshared = true;
+            }
+        }
+        if unshared {
+            Self::unregister_files_sharer(owner.getpid(), self);
+        }
     }
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
@@ -895,6 +1052,7 @@ impl ProcessControlBlock {
                 sgid: 0,
                 fsgid: 0,
                 supplementary_gids: vec![0],
+                umask: 0,
                 fd_table: vec![
                     // 0 -> stdin
                     Some(Arc::new(Stdin)),
@@ -904,6 +1062,7 @@ impl ProcessControlBlock {
                     Some(Arc::new(Stdout)),
                 ],
                 fd_flags: vec![0; 3],
+                files_owner: None,
                 rlimit_nofile_cur: 1024,
                 rlimit_nofile_max: 1024,
                 rlimit_nproc_cur: u64::MAX,
@@ -1050,6 +1209,8 @@ impl ProcessControlBlock {
         envs: Vec<String>,
         elf_aux: ElfAux,
     ) {
+        // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
+        self.unshare_files();
         let thread_count = { self.borrow_mut().thread_count() };
         if thread_count != 1 {
             log::warn!(
@@ -1115,6 +1276,8 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
     ) {
+        // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
+        self.unshare_files();
         let thread_count = { self.borrow_mut().thread_count() };
         if thread_count != 1 {
             log::warn!(
@@ -1176,7 +1339,10 @@ impl ProcessControlBlock {
         *task_inner.get_trap_cx() = trap_cx;
     }
 
-    fn fork_impl(self: &Arc<Self>) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
+    fn fork_impl(
+        self: &Arc<Self>,
+        share_files: bool,
+    ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
         let mut parent = self.borrow_mut();
         let thread_count = parent.thread_count();
         if thread_count != 1 {
@@ -1219,20 +1385,29 @@ impl ProcessControlBlock {
         }
         // alloc a pid
         let pid = pid_alloc();
-        // copy fd table
-        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
-        let mut new_fd_flags: Vec<u32> = Vec::new();
-        for fd in parent.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
+        let inherited_owner = parent.files_owner.as_ref().and_then(Weak::upgrade);
+        if parent.files_owner.is_some() && inherited_owner.is_none() {
+            parent.files_owner = None;
+        }
+        let (new_fd_table, new_fd_flags) = if let Some(owner) = inherited_owner.as_ref() {
+            if Arc::ptr_eq(owner, self) {
+                parent.snapshot_fd_state()
             } else {
-                new_fd_table.push(None);
+                let owner_inner = owner.borrow_mut();
+                owner_inner.snapshot_fd_state()
             }
-        }
-        new_fd_flags.extend(parent.fd_flags.iter().copied());
-        if new_fd_flags.len() < new_fd_table.len() {
-            new_fd_flags.resize(new_fd_table.len(), 0);
-        }
+        } else {
+            parent.snapshot_fd_state()
+        };
+        let root_files_owner = inherited_owner
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::clone(self));
+        let child_files_owner = if share_files {
+            Some(Arc::downgrade(&root_files_owner))
+        } else {
+            None
+        };
         // Remember parent's user-stack base for the calling thread.
         let parent_ustack_base = crate::task::processor::current_task()
             .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.ustack_base()))
@@ -1273,8 +1448,10 @@ impl ProcessControlBlock {
                 sgid: parent.sgid,
                 fsgid: parent.fsgid,
                 supplementary_gids: parent.supplementary_gids.clone(),
+                umask: parent.umask,
                 fd_table: new_fd_table,
                 fd_flags: new_fd_flags,
+                files_owner: child_files_owner,
                 rlimit_nofile_cur: parent.rlimit_nofile_cur,
                 rlimit_nofile_max: parent.rlimit_nofile_max,
                 rlimit_nproc_cur: parent.rlimit_nproc_cur,
@@ -1332,6 +1509,9 @@ impl ProcessControlBlock {
                 wait_queue: VecDeque::new(),
             }),
         });
+        if share_files {
+            Self::register_files_sharer(&root_files_owner, &child);
+        }
         crate::syscall::sysv_shm::fork_inherit(&inherited_shm);
 
         // Drop parent lock before allocating child task resources.
@@ -1385,15 +1565,18 @@ impl ProcessControlBlock {
 
     /// Only support processes with a single thread.
     pub fn fork(self: &Arc<Self>) -> Option<Arc<Self>> {
-        let (child, task) = self.fork_impl()?;
+        let (child, task) = self.fork_impl(false)?;
         // add this thread to scheduler
         add_task(task);
         Some(child)
     }
 
     /// Fork and return both the child process and its main task, without scheduling it.
-    pub fn fork_with_task(self: &Arc<Self>) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
-        self.fork_impl()
+    pub fn fork_with_task(
+        self: &Arc<Self>,
+        share_files: bool,
+    ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
+        self.fork_impl(share_files)
     }
 
     pub fn getpid(&self) -> usize {
