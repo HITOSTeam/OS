@@ -10,7 +10,6 @@ use spin::Mutex;
 
 use crate::task::manager::PID2PCB;
 use crate::{
-    config::clock_freq,
     fs::{
         ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode, shm_create,
         shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock,
@@ -26,7 +25,7 @@ use crate::{
         signal::{queue_process_signal, SIGXFSZ_NUM},
         ProcessControlBlock,
     },
-    time::{get_time, get_time_ms},
+    time::get_time_ms,
     trap::get_current_token,
 };
 use ext4_fs::sync_all;
@@ -234,9 +233,7 @@ fn hardlink_cross_mount(old_abs: &str, new_abs: &str) -> bool {
 }
 
 fn current_timespec() -> (i64, i64) {
-    let ticks = get_time() as u64;
-    let ns = ticks.saturating_mul(1_000_000_000) / clock_freq() as u64;
-    ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+    crate::syscall::time_sys::realtime_now_timespec()
 }
 
 pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
@@ -3614,7 +3611,9 @@ pub fn syscall_copy_file_range(
     len: usize,
     flags: usize,
 ) -> isize {
-    const COPY_FILE_RANGE_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
+    // Keep an explicit max file-size guard so oversized ranges still report EFBIG
+    // (used by LTP copy_file_range02), but do not cap normal file copies too low.
+    const COPY_FILE_RANGE_MAX_FILE_SIZE: u64 = 1u64 << 40; // 1 TiB
     if flags != 0 {
         return EINVAL;
     }
@@ -3687,7 +3686,7 @@ pub fn syscall_copy_file_range(
         v as usize
     };
 
-    if (out_pos as u64).saturating_add(len as u64) > COPY_FILE_RANGE_MAX_FILE_SIZE {
+    if len > 0 && (out_pos as u64) >= COPY_FILE_RANGE_MAX_FILE_SIZE {
         return EFBIG;
     }
     if in_inode.inode_num() == out_inode.inode_num() {
@@ -3702,7 +3701,14 @@ pub fn syscall_copy_file_range(
     let mut remaining = len;
     let mut buf = vec![0u8; core::cmp::min(remaining, 16 * 1024)];
     while remaining > 0 {
-        let want = core::cmp::min(remaining, buf.len());
+        let room = COPY_FILE_RANGE_MAX_FILE_SIZE.saturating_sub(out_pos as u64) as usize;
+        if room == 0 {
+            if copied == 0 {
+                return EFBIG;
+            }
+            break;
+        }
+        let want = core::cmp::min(remaining, core::cmp::min(buf.len(), room));
         let read = in_os_inode.pread_at(in_pos, &mut buf[..want]);
         if read == 0 {
             break;

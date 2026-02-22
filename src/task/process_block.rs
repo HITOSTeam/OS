@@ -664,6 +664,8 @@ pub struct ProcessControlBlockInner {
     pub cap_inheritable: u64,
     /// Capability bounding set used by PR_CAPBSET_DROP checks.
     pub cap_bounding: u64,
+    /// Linux personality(2) flags (PER_LINUX by default).
+    pub personality: u32,
     /// Per-process file mode creation mask (umask).
     pub umask: usize,
     //
@@ -1082,6 +1084,7 @@ impl ProcessControlBlock {
                 cap_permitted: u64::MAX,
                 cap_inheritable: u64::MAX,
                 cap_bounding: u64::MAX,
+                personality: 0,
                 umask: 0,
                 fd_table: vec![
                     // 0 -> stdin
@@ -1488,6 +1491,7 @@ impl ProcessControlBlock {
                 cap_permitted: parent.cap_permitted,
                 cap_inheritable: parent.cap_inheritable,
                 cap_bounding: parent.cap_bounding,
+                personality: parent.personality,
                 umask: parent.umask,
                 fd_table: new_fd_table,
                 fd_flags: new_fd_flags,

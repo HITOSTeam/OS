@@ -5,6 +5,7 @@ use crate::task::processor::current_files_process;
 
 const EINVAL: isize = -22;
 const EMFILE: isize = -24;
+const EBADF: isize = -9;
 
 const O_NONBLOCK: u32 = 0x800;
 const O_PATH: u32 = 0x200000;
@@ -74,12 +75,30 @@ pub fn syscall_signalfd4(_fd: isize, _mask: usize, _sigsetsize: usize, flags: us
     if (flags & SFD_CLOEXEC) != 0 {
         fd_flags |= FD_CLOEXEC;
     }
+    if _fd >= 0 {
+        let fd = _fd as usize;
+        let process = current_files_process();
+        let mut inner = process.borrow_mut();
+        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+            return EBADF;
+        }
+        inner.fd_flags[fd] = fd_flags;
+        return fd as isize;
+    }
+    if _fd != -1 {
+        return EINVAL;
+    }
     alloc_dummy_fd(fd_flags)
 }
 
-pub fn syscall_timerfd_create(_clockid: usize, flags: usize) -> isize {
+pub fn syscall_timerfd_create(clockid: usize, flags: usize) -> isize {
+    const CLOCK_REALTIME: usize = 0;
+    const CLOCK_MONOTONIC: usize = 1;
     const TFD_NONBLOCK: usize = NONBLOCK_FLAG;
     const TFD_CLOEXEC: usize = CLOEXEC_FLAG;
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return EINVAL;
+    }
     if (flags & !(TFD_NONBLOCK | TFD_CLOEXEC)) != 0 {
         return EINVAL;
     }

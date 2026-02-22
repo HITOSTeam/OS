@@ -110,6 +110,7 @@ const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_ACCT: usize = 89;
 const SYSCALL_CAPGET: usize = 90;
 const SYSCALL_CAPSET: usize = 91;
+const SYSCALL_PERSONALITY: usize = 92;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_EXIT_GROUP: usize = 94;
 const SYSCALL_WAITID: usize = 95;
@@ -480,6 +481,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_ACCT => filesystem::syscall_acct(args[0]),
         SYSCALL_CAPGET => misc::syscall_capget(args[0], args[1]),
         SYSCALL_CAPSET => misc::syscall_capset(args[0], args[1]),
+        SYSCALL_PERSONALITY => misc::syscall_personality(args[0]),
         SYSCALL_PRCTL => misc::syscall_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_EXIT_GROUP => flow::syscall_exit_group(args[0]),

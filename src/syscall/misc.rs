@@ -166,6 +166,20 @@ pub fn syscall_setdomainname(name: usize, len: usize) -> isize {
     0
 }
 
+/// Linux `personality(2)`:
+/// - `persona == -1UL` queries current personality
+/// - otherwise set personality and return previous value
+pub fn syscall_personality(persona: usize) -> isize {
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    let old = inner.personality;
+    if persona == usize::MAX {
+        return old as isize;
+    }
+    inner.personality = persona as u32;
+    old as isize
+}
+
 pub fn syscall_uname(buf: usize) -> isize {
     if buf == 0 {
         return EFAULT;

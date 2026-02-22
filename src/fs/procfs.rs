@@ -779,7 +779,9 @@ fn proc_pid_status(pid: u32) -> String {
         .unwrap_or("CongCore")
         .replace(')', "_");
 
-    let state_char = if inner.stopped {
+    let state_char = if inner.is_zombie {
+        'Z'
+    } else if inner.stopped {
         'T'
     } else {
         match main_state {
@@ -792,6 +794,7 @@ fn proc_pid_status(pid: u32) -> String {
         'R' => "R (running)",
         'S' => "S (sleeping)",
         'T' => "T (stopped)",
+        'Z' => "Z (zombie)",
         _ => "R (running)",
     };
     alloc::format!(
@@ -835,7 +838,9 @@ fn proc_pid_stat(pid: u32) -> String {
         .unwrap_or("CongCore")
         .replace(')', "_");
 
-    let state_char = if inner.stopped {
+    let state_char = if inner.is_zombie {
+        'Z'
+    } else if inner.stopped {
         'T'
     } else {
         match main_state {
