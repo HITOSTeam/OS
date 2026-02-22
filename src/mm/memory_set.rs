@@ -5,7 +5,8 @@ use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
-    phys_mem_end, MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE,
+    phys_mem_end, MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
+    USER_STACK_SIZE,
 };
 use crate::println;
 use alloc::collections::BTreeMap;
@@ -504,11 +505,12 @@ impl MemorySet {
             ),
             None,
         );
+        let heap_base = user_stack_top + USER_HEAP_GAP;
         // used in sbrk (lazy heap to avoid eager page allocation)
         memory_set.push(
             MapArea::new(
-                user_stack_top.into(),
-                user_stack_top.into(),
+                heap_base.into(),
+                heap_base.into(),
                 MapType::Lazy,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
@@ -575,10 +577,11 @@ impl MemorySet {
         ) {
             return Err(ENOMEM);
         }
+        let heap_base = user_stack_top + USER_HEAP_GAP;
         if !memory_set.try_push(
             MapArea::new(
-                user_stack_top.into(),
-                user_stack_top.into(),
+                heap_base.into(),
+                heap_base.into(),
                 MapType::Lazy,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
@@ -810,11 +813,12 @@ impl MemorySet {
             ),
             None,
         );
+        let heap_base = user_stack_top + USER_HEAP_GAP;
         // used in sbrk (lazy heap to avoid eager page allocation)
         memory_set.push(
             MapArea::new(
-                user_stack_top.into(),
-                user_stack_top.into(),
+                heap_base.into(),
+                heap_base.into(),
                 MapType::Lazy,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
@@ -888,10 +892,11 @@ impl MemorySet {
         ) {
             return Err(ENOMEM);
         }
+        let heap_base = user_stack_top + USER_HEAP_GAP;
         if !memory_set.try_push(
             MapArea::new(
-                user_stack_top.into(),
-                user_stack_top.into(),
+                heap_base.into(),
+                heap_base.into(),
                 MapType::Lazy,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ),
@@ -1447,6 +1452,58 @@ impl MemorySet {
             end_vpn > area_start && start_vpn < area_end
         })
     }
+
+    /// Return merged user virtual-memory ranges from current VMAs.
+    pub fn user_mapped_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        for area in self.areas.iter() {
+            if !area.map_perm.contains(MapPermission::U) {
+                continue;
+            }
+            let start = area.vpn_range.get_start().0.saturating_mul(PAGE_SIZE);
+            let end = area.vpn_range.get_end().0.saturating_mul(PAGE_SIZE);
+            if end <= start {
+                continue;
+            }
+            ranges.push((start, end));
+        }
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        merged
+    }
+
+    /// Whether every page in `[start_va, end_va)` belongs to some user VMA.
+    pub fn user_range_fully_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start: usize = start_va.into();
+        let end: usize = end_va.into();
+        if start >= end {
+            return true;
+        }
+        let mut cursor = start;
+        for (range_start, range_end) in self.user_mapped_ranges() {
+            if range_end <= cursor {
+                continue;
+            }
+            if range_start > cursor {
+                return false;
+            }
+            cursor = cursor.max(range_end);
+            if cursor >= end {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn remove_area_with_start_vpn(&mut self, start_va: VirtAddr) {
         if let Some((idx, area)) = self
             .areas

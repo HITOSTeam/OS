@@ -8,7 +8,7 @@ use spin::Mutex;
 
 use crate::{
     debug_config::DEBUG_FUTEX,
-    mm::{PageTable, VirtAddr, read_user_value},
+    mm::{read_user_value, PageTable, VirtAddr},
     task::block_sleep::add_timer,
     task::{
         manager::wakeup_task,

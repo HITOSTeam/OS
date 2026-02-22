@@ -13,8 +13,8 @@ use crate::{
     config::clock_freq,
     fs::{
         ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode, shm_create,
-        shm_get, shm_list, shm_remove, File, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir,
-        PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
+        shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock,
+        PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
     },
     mm::{
         copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
@@ -82,6 +82,7 @@ const EISDIR: isize = -21;
 const EACCES: isize = -13;
 const EEXIST: isize = -17;
 const EXDEV: isize = -18;
+const EIO: isize = -5;
 const ESPIPE: isize = -29;
 const EROFS: isize = -30;
 const ENOSPC: isize = -28;
@@ -90,6 +91,7 @@ const ENAMETOOLONG: isize = -36;
 const ENXIO: isize = -6;
 const EOPNOTSUPP: isize = -95;
 const ENOTEMPTY: isize = -39;
+const EOVERFLOW: isize = -75;
 
 static TMPFILE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -143,6 +145,32 @@ fn get_inode_times(ino: u64) -> InodeTimes {
 
 fn set_inode_times(ino: u64, times: InodeTimes) {
     INODE_TIMES.lock().insert(ino, times);
+}
+
+fn set_inode_all_times_now(inode: &Arc<ext4_fs::Inode>) {
+    let (sec, nsec) = current_timespec();
+    set_inode_times(
+        inode.inode_num() as u64,
+        InodeTimes {
+            atime_sec: sec,
+            atime_nsec: nsec,
+            mtime_sec: sec,
+            mtime_nsec: nsec,
+            ctime_sec: sec,
+            ctime_nsec: nsec,
+        },
+    );
+}
+
+fn touch_inode_mtime_ctime_now(inode: &Arc<ext4_fs::Inode>) {
+    let (sec, nsec) = current_timespec();
+    let ino = inode.inode_num() as u64;
+    let mut times = get_inode_times(ino);
+    times.mtime_sec = sec;
+    times.mtime_nsec = nsec;
+    times.ctime_sec = sec;
+    times.ctime_nsec = nsec;
+    set_inode_times(ino, times);
 }
 
 pub(crate) fn register_rofs_mount(abs: &str) {
@@ -1733,6 +1761,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         let created_mode = mode_for_created_file(create_mode, created_gid);
         inode.set_uid_gid(fsuid, created_gid);
         inode.set_mode(created_mode);
+        set_inode_all_times_now(&inode);
     }
     if debug_close {
         crate::println!(
@@ -1807,6 +1836,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         if let Err(e) = inode.clear() {
             return ext4_err_to_errno(e);
         }
+        touch_inode_mtime_ctime_now(&inode);
     }
 
     let inode_num = inode.inode_num();
@@ -3393,53 +3423,328 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
     }
 }
 
+fn fsize_limit_allows(new_len: usize) -> Result<(), isize> {
+    let limit = {
+        let process = current_process();
+        let inner = process.borrow_mut();
+        inner.rlimit_fsize_cur
+    };
+    if limit != u64::MAX && (new_len as u64) > limit {
+        let pid = current_process().getpid();
+        queue_process_signal(pid, SIGXFSZ_NUM);
+        return Err(EFBIG);
+    }
+    Ok(())
+}
+
+fn flush_open_inode_views(target: &Arc<ext4_fs::Inode>) {
+    let target_ino = target.inode_num();
+    let target_dev = target.device_id();
+    let files = {
+        let process = current_files_process();
+        let inner = process.borrow_mut();
+        inner
+            .fd_table
+            .iter()
+            .filter_map(|f| f.as_ref().map(Arc::clone))
+            .collect::<Vec<_>>()
+    };
+    for file in files {
+        let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+            continue;
+        };
+        let inode = os_inode.ext4_inode();
+        if inode.inode_num() == target_ino && inode.device_id() == target_dev {
+            let _ = os_inode.flush();
+        }
+    }
+}
+
+fn truncate_regular_inode(inode: &Arc<ext4_fs::Inode>, new_len: usize) -> isize {
+    let _ext4_guard = ext4_lock();
+    if inode.is_dir() {
+        return EISDIR;
+    }
+    if !inode.is_file() {
+        return EINVAL;
+    }
+    let old_len = inode.size() as usize;
+    if new_len == old_len {
+        return 0;
+    }
+    if new_len == 0 {
+        return match inode.clear() {
+            Ok(_) => 0,
+            Err(e) => ext4_err_to_errno(e),
+        };
+    }
+    if new_len < old_len {
+        let mut kept = vec![0u8; new_len];
+        let got = inode.read_at(0, &mut kept);
+        if got < new_len {
+            kept[got..].fill(0);
+        }
+        if let Err(e) = inode.clear() {
+            return ext4_err_to_errno(e);
+        }
+        if kept.is_empty() {
+            return 0;
+        }
+        return match inode.write_at(0, &kept) {
+            Ok(written) if written == kept.len() => 0,
+            Ok(_) => EIO,
+            Err(e) => ext4_err_to_errno(e),
+        };
+    }
+
+    let mut off = old_len;
+    let zeros = [0u8; 4096];
+    while off < new_len {
+        let chunk = core::cmp::min(zeros.len(), new_len - off);
+        match inode.write_at(off, &zeros[..chunk]) {
+            Ok(0) => return EIO,
+            Ok(written) => off += written,
+            Err(e) => return ext4_err_to_errno(e),
+        }
+    }
+    0
+}
+
 /// Linux `ftruncate(2)` (syscall 46 on riscv64).
-///
-/// Needed by musl `shm_open` users (e.g., cyclictest).
 pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
+    if (length as i64) < 0 {
+        return EINVAL;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
     if !file.writable() {
-        return EBADF;
+        // Linux reports EINVAL when the descriptor does not permit writing.
+        return EINVAL;
+    }
+    if fsize_limit_allows(length).is_err() {
+        return EFBIG;
     }
 
-    // `/dev/shm/*` backing file.
     if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
         shm.truncate(length);
         return 0;
     }
-
-    // Best-effort ext4 support.
+    if file.as_any().downcast_ref::<NetSocketFile>().is_some() {
+        return EINVAL;
+    }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return 0;
+            return EROFS;
         }
+        let _ = os_inode.flush();
         let inode = os_inode.ext4_inode();
-        let _ext4_guard = ext4_lock();
-        if !inode.is_file() {
-            return EINVAL;
+        let ret = truncate_regular_inode(&inode, length);
+        if ret == 0 {
+            touch_inode_mtime_ctime_now(&inode);
         }
-        let old = inode.size() as usize;
-        if length == 0 {
-            return match inode.clear() {
-                Ok(_) => 0,
-                Err(e) => ext4_err_to_errno(e),
-            };
+        return ret;
+    }
+    EINVAL
+}
+
+/// Linux `truncate(2)` (syscall 45 on riscv64).
+pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
+    if (length as i64) < 0 {
+        return EINVAL;
+    }
+    if fsize_limit_allows(length).is_err() {
+        return EFBIG;
+    }
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+    let trailing_slash = path.len() > 1 && path.ends_with('/');
+    if rofs_for_path(AT_FDCWD, &path) {
+        return EROFS;
+    }
+    let at = match resolve_at_path(AT_FDCWD, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let AtPath::PseudoAbs(_) = &at {
+        return EINVAL;
+    }
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if trailing_slash && !inode.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode.is_file() {
+        if inode.is_dir() {
+            return EISDIR;
         }
-        if length > old {
-            // Extend by writing a single 0 byte at the final position.
-            let buf = [0u8; 1];
-            return match inode.write_at(length - 1, &buf) {
-                Ok(_) => 0,
-                Err(e) => ext4_err_to_errno(e),
-            };
-        }
-        // Shrinking is not supported yet; accept for compatibility.
+        return EINVAL;
+    }
+    if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+        return EACCES;
+    }
+    drop(_ext4_guard);
+    flush_open_inode_views(&inode);
+    let ret = truncate_regular_inode(&inode, length);
+    if ret == 0 {
+        touch_inode_mtime_ctime_now(&inode);
+    }
+    ret
+}
+
+/// Linux `copy_file_range(2)` (syscall 285 on riscv64).
+pub fn syscall_copy_file_range(
+    fd_in: usize,
+    off_in: usize,
+    fd_out: usize,
+    off_out: usize,
+    len: usize,
+    flags: usize,
+) -> isize {
+    const COPY_FILE_RANGE_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
+    if flags != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
         return 0;
     }
+    if len > i64::MAX as usize {
+        return EOVERFLOW;
+    }
+    if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
+        return EBADF;
+    }
+    let Some(in_file) = get_fd_file(fd_in) else {
+        return EBADF;
+    };
+    let Some(out_file) = get_fd_file(fd_out) else {
+        return EBADF;
+    };
+    if !in_file.readable() {
+        return EBADF;
+    }
+    let Some(in_os_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let Some(out_os_inode) = out_file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let in_inode = in_os_inode.ext4_inode();
+    let out_inode = out_os_inode.ext4_inode();
+    if out_inode.is_dir() {
+        return EISDIR;
+    }
+    if !out_file.writable() {
+        return EBADF;
+    }
+    if out_os_inode.append() {
+        return EBADF;
+    }
+    if out_os_inode.readonly_fs() {
+        return EROFS;
+    }
+    if in_inode.device_id() != out_inode.device_id() {
+        return EXDEV;
+    }
+    if !in_inode.is_file() || !out_inode.is_file() {
+        return EINVAL;
+    }
 
-    EINVAL
+    let token = get_current_token();
+    let mut in_pos = if off_in == 0 {
+        in_os_inode.offset()
+    } else {
+        let Some(v) = try_read_user_value(token, off_in as *const i64) else {
+            return EFAULT;
+        };
+        if v < 0 {
+            return EINVAL;
+        }
+        v as usize
+    };
+    let mut out_pos = if off_out == 0 {
+        out_os_inode.offset()
+    } else {
+        let Some(v) = try_read_user_value(token, off_out as *const i64) else {
+            return EFAULT;
+        };
+        if v < 0 {
+            return EINVAL;
+        }
+        v as usize
+    };
+
+    if (out_pos as u64).saturating_add(len as u64) > COPY_FILE_RANGE_MAX_FILE_SIZE {
+        return EFBIG;
+    }
+    if in_inode.inode_num() == out_inode.inode_num() {
+        let in_end = in_pos.saturating_add(len);
+        let out_end = out_pos.saturating_add(len);
+        if in_pos < out_end && out_pos < in_end {
+            return EINVAL;
+        }
+    }
+
+    let mut copied = 0usize;
+    let mut remaining = len;
+    let mut buf = vec![0u8; core::cmp::min(remaining, 16 * 1024)];
+    while remaining > 0 {
+        let want = core::cmp::min(remaining, buf.len());
+        let read = in_os_inode.pread_at(in_pos, &mut buf[..want]);
+        if read == 0 {
+            break;
+        }
+        let written = match out_os_inode.pwrite_at(out_pos, &buf[..read]) {
+            Ok(v) => v,
+            Err(_) => return EIO,
+        };
+        if written == 0 {
+            break;
+        }
+        copied += written;
+        in_pos += written;
+        out_pos += written;
+        remaining -= written;
+        if written < read {
+            break;
+        }
+    }
+    if copied > 0 {
+        let _ = out_os_inode.flush();
+        touch_inode_mtime_ctime_now(&out_inode);
+    }
+
+    if off_in == 0 {
+        in_os_inode.set_offset(in_pos);
+    } else {
+        let next = in_pos as i64;
+        if try_write_user_value(token, off_in as *mut i64, &next).is_err() {
+            return EFAULT;
+        }
+    }
+    if off_out == 0 {
+        out_os_inode.set_offset(out_pos);
+    } else {
+        let next = out_pos as i64;
+        if try_write_user_value(token, off_out as *mut i64, &next).is_err() {
+            return EFAULT;
+        }
+    }
+
+    copied as isize
 }
 
 #[repr(C)]

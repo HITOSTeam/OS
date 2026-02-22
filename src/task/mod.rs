@@ -22,7 +22,7 @@ pub(crate) use id::{pid_max, set_pid_max};
 pub mod manager;
 pub mod mutex;
 mod process_block;
-pub(crate) use process_block::ProcessControlBlock;
+pub(crate) use process_block::{MmapRegion, ProcessControlBlock};
 pub mod processor;
 pub mod semaphore;
 pub mod signal;

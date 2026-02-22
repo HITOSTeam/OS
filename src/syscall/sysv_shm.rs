@@ -4,7 +4,9 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
-use crate::mm::{FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc};
+use crate::mm::{
+    frame_alloc, try_write_user_value, FrameTracker, MapPermission, PTEFlags, VirtAddr,
+};
 use crate::task::processor::current_process;
 
 const IPC_PRIVATE: usize = 0;
@@ -18,11 +20,15 @@ const SHM_REMAP: usize = 0x4000;
 
 // `shmctl(2)` operations (subset).
 const IPC_RMID: usize = 0;
+const IPC_STAT: usize = 2;
 
+const EACCES: isize = -13;
+const EFAULT: isize = -14;
 const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
 const ENOENT: isize = -2;
 const EEXIST: isize = -17;
+const EPERM: isize = -1;
 
 fn align_down(x: usize, align: usize) -> usize {
     x & !(align - 1)
@@ -44,6 +50,16 @@ struct ShmSegment {
     id: usize,
     key: Option<usize>,
     size: usize,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    ctime: i64,
+    atime: i64,
+    dtime: i64,
+    cpid: u32,
+    lpid: u32,
     frames: Vec<FrameTracker>,
     nattch: usize,
     marked_for_deletion: bool,
@@ -82,6 +98,81 @@ impl ShmManager {
 
 lazy_static! {
     static ref SHM_MANAGER: Mutex<ShmManager> = Mutex::new(ShmManager::default());
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct IpcPermUser {
+    __key: u32,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    mode: u16,
+    __pad1: u16,
+    __seq: u16,
+    __pad2: u16,
+    __unused1: u64,
+    __unused2: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ShmidDsUser {
+    shm_perm: IpcPermUser,
+    shm_segsz: u64,
+    shm_atime: i64,
+    shm_dtime: i64,
+    shm_ctime: i64,
+    shm_cpid: u32,
+    shm_lpid: u32,
+    shm_nattch: u64,
+    __unused4: u64,
+    __unused5: u64,
+}
+
+fn now_secs() -> i64 {
+    crate::syscall::time_sys::realtime_now_seconds() as i64
+}
+
+fn current_ids() -> (u32, u32, u32, Vec<u32>) {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    (
+        inner.euid,
+        inner.egid,
+        process.getpid() as u32,
+        inner.supplementary_gids.clone(),
+    )
+}
+
+fn check_perm(
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    mode: u16,
+    req: u16,
+    caller_uid: u32,
+    caller_gid: u32,
+    groups: &[u32],
+) -> bool {
+    if req == 0 || caller_uid == 0 {
+        return true;
+    }
+    let class_shift = if caller_uid == uid || caller_uid == cuid {
+        6
+    } else if caller_gid == gid
+        || caller_gid == cgid
+        || groups.iter().any(|g| *g == gid || *g == cgid)
+    {
+        3
+    } else {
+        0
+    };
+    let need = ((req as usize) >> 6) & 0x7;
+    let allow = ((mode as usize) >> class_shift) & 0x7;
+    (allow & need) == need
 }
 
 pub fn fork_inherit(attaches: &[ShmAttach]) {
@@ -138,6 +229,7 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
     }
 
     let id = mgr.alloc_id();
+    let (uid, gid, pid, _) = current_ids();
     let pages = size_aligned / PAGE_SIZE;
     let mut frames = Vec::with_capacity(pages);
     for _ in 0..pages {
@@ -151,6 +243,16 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
         id,
         key: if key == IPC_PRIVATE { None } else { Some(key) },
         size,
+        mode: (shmflg & 0o777) as u16,
+        uid,
+        gid,
+        cuid: uid,
+        cgid: gid,
+        ctime: now_secs(),
+        atime: 0,
+        dtime: 0,
+        cpid: pid,
+        lpid: 0,
         frames,
         nattch: 0,
         marked_for_deletion: false,
@@ -170,6 +272,19 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     let Some(seg) = mgr.segments.get_mut(&shmid) else {
         return EINVAL;
     };
+    let (uid, gid, pid, groups) = current_ids();
+    if !check_perm(
+        seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, 0o400, uid, gid, &groups,
+    ) {
+        return EACCES;
+    }
+    if (shmflg & SHM_RDONLY) == 0
+        && !check_perm(
+            seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, 0o200, uid, gid, &groups,
+        )
+    {
+        return EACCES;
+    }
 
     let map_len = align_up(seg.size, PAGE_SIZE);
     let process = current_process();
@@ -216,6 +331,8 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
         .insert_shared_frames_area(start.into(), end.into(), perm, frames);
 
     seg.nattch += 1;
+    seg.atime = now_secs();
+    seg.lpid = pid;
     if end > inner.mmap_next {
         inner.mmap_next = end;
     }
@@ -248,11 +365,14 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
     inner.sysv_shm_attaches.remove(idx);
     drop(inner);
 
+    let (_, _, pid, _) = current_ids();
     let mut mgr = SHM_MANAGER.lock();
     if let Some(seg) = mgr.segments.get_mut(&a.shmid) {
         if seg.nattch > 0 {
             seg.nattch -= 1;
         }
+        seg.dtime = now_secs();
+        seg.lpid = pid;
         if seg.marked_for_deletion && seg.nattch == 0 {
             mgr.remove_segment(a.shmid);
         }
@@ -261,16 +381,53 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
 }
 
 pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
-    if cmd != IPC_RMID {
-        return EINVAL;
-    }
+    let token = crate::trap::get_current_token();
+    let (uid, gid, _pid, groups) = current_ids();
     let mut mgr = SHM_MANAGER.lock();
     let Some(seg) = mgr.segments.get_mut(&shmid) else {
         return EINVAL;
     };
-    seg.marked_for_deletion = true;
-    if seg.nattch == 0 {
-        mgr.remove_segment(shmid);
+    match cmd {
+        IPC_RMID => {
+            if uid != 0 && uid != seg.uid && uid != seg.cuid {
+                return EPERM;
+            }
+            seg.marked_for_deletion = true;
+            if seg.nattch == 0 {
+                mgr.remove_segment(shmid);
+            }
+            0
+        }
+        IPC_STAT => {
+            if !check_perm(
+                seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, 0o400, uid, gid, &groups,
+            ) {
+                return EACCES;
+            }
+            let ds = ShmidDsUser {
+                shm_perm: IpcPermUser {
+                    __key: seg.key.unwrap_or(0) as u32,
+                    uid: seg.uid,
+                    gid: seg.gid,
+                    cuid: seg.cuid,
+                    cgid: seg.cgid,
+                    mode: seg.mode,
+                    ..IpcPermUser::default()
+                },
+                shm_segsz: seg.size as u64,
+                shm_atime: seg.atime,
+                shm_dtime: seg.dtime,
+                shm_ctime: seg.ctime,
+                shm_cpid: seg.cpid,
+                shm_lpid: seg.lpid,
+                shm_nattch: seg.nattch as u64,
+                ..ShmidDsUser::default()
+            };
+            if try_write_user_value(token, _buf as *mut ShmidDsUser, &ds).is_err() {
+                return EFAULT;
+            }
+            0
+        }
+        _ => EINVAL,
     }
-    0
 }

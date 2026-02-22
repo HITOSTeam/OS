@@ -1,8 +1,9 @@
 use crate::{
     config::{PAGE_SIZE, TRAP_CONTEXT},
-    fs::{File, OSInode, PseudoShmFile, ext4_lock},
-    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user_unchecked},
+    fs::{ext4_lock, File, OSInode, PseudoShmFile},
+    mm::{frame_alloc, try_copy_to_user, try_copy_to_user_unchecked, MapPermission, PTEFlags},
     task::processor::{current_files_process, current_process},
+    task::MmapRegion,
     trap::get_current_token,
 };
 use alloc::sync::Arc;
@@ -15,16 +16,26 @@ const PROT_EXEC: usize = 4;
 // Linux `mmap(2)` flags (subset).
 const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
+const MAP_SHARED_VALIDATE: usize = 0x03;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 const MAP_STACK: usize = 0x20000;
 const MAP_FIXED_NOREPLACE: usize = 0x100000;
+const MAP_TYPE_MASK: usize = 0x0f;
 
 const LARGE_ANON_MMAP: usize = 1 * 1024 * 1024;
 
+const EACCES: isize = -13;
+const EBADF: isize = -9;
+const EFAULT: isize = -14;
 const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
 const EEXIST: isize = -17;
+const EPERM: isize = -1;
+
+const MCL_CURRENT: usize = 0x01;
+const MCL_FUTURE: usize = 0x02;
+const MCL_ONFAULT: usize = 0x04;
 
 #[cfg(target_arch = "loongarch64")]
 const USER_VA_TOP: usize = TRAP_CONTEXT;
@@ -64,7 +75,162 @@ fn get_fd_inode(fd: usize) -> Option<Arc<ext4_fs::Inode>> {
     })
 }
 
+fn push_mmap_region_merged(regions: &mut alloc::vec::Vec<MmapRegion>, region: MmapRegion) {
+    if region.len == 0 {
+        return;
+    }
+    if let Some(last) = regions.last_mut() {
+        if last.end() == region.start
+            && last.prot == region.prot
+            && last.shared == region.shared
+            && last.may_write_upgrade == region.may_write_upgrade
+        {
+            last.len += region.len;
+            return;
+        }
+    }
+    regions.push(region);
+}
+
+fn trim_mmap_regions(regions: &mut alloc::vec::Vec<MmapRegion>, start: usize, end: usize) {
+    let mut next = alloc::vec::Vec::new();
+    for region in regions.drain(..) {
+        let r_end = region.end();
+        if end <= region.start || start >= r_end {
+            push_mmap_region_merged(&mut next, region);
+            continue;
+        }
+        if start > region.start {
+            push_mmap_region_merged(
+                &mut next,
+                MmapRegion {
+                    start: region.start,
+                    len: start - region.start,
+                    ..region
+                },
+            );
+        }
+        if end < r_end {
+            push_mmap_region_merged(
+                &mut next,
+                MmapRegion {
+                    start: end,
+                    len: r_end - end,
+                    ..region
+                },
+            );
+        }
+    }
+    *regions = next;
+}
+
+fn apply_mprotect_to_mmap_regions(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    start: usize,
+    end: usize,
+    new_prot: usize,
+) -> Result<(), ()> {
+    let mut next = alloc::vec::Vec::new();
+    for region in regions.iter().copied() {
+        let r_end = region.end();
+        if end <= region.start || start >= r_end {
+            push_mmap_region_merged(&mut next, region);
+            continue;
+        }
+        if start > region.start {
+            push_mmap_region_merged(
+                &mut next,
+                MmapRegion {
+                    start: region.start,
+                    len: start - region.start,
+                    ..region
+                },
+            );
+        }
+        let ov_start = core::cmp::max(start, region.start);
+        let ov_end = core::cmp::min(end, r_end);
+        let mut mid = MmapRegion {
+            start: ov_start,
+            len: ov_end - ov_start,
+            ..region
+        };
+        if (new_prot & PROT_WRITE) != 0 && (mid.prot & PROT_WRITE) == 0 && !mid.may_write_upgrade {
+            return Err(());
+        }
+        mid.prot = new_prot;
+        push_mmap_region_merged(&mut next, mid);
+        if end < r_end {
+            push_mmap_region_merged(
+                &mut next,
+                MmapRegion {
+                    start: end,
+                    len: r_end - end,
+                    ..region
+                },
+            );
+        }
+    }
+    *regions = next;
+    Ok(())
+}
+
+fn push_range_merged(ranges: &mut alloc::vec::Vec<(usize, usize)>, start: usize, end: usize) {
+    if end <= start {
+        return;
+    }
+    if let Some(last) = ranges.last_mut() {
+        if start <= last.1 {
+            last.1 = last.1.max(end);
+            return;
+        }
+    }
+    ranges.push((start, end));
+}
+
+fn normalize_ranges(ranges: &mut alloc::vec::Vec<(usize, usize)>) {
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut merged = alloc::vec::Vec::new();
+    for (start, end) in ranges.drain(..) {
+        push_range_merged(&mut merged, start, end);
+    }
+    *ranges = merged;
+}
+
+fn trim_ranges(ranges: &mut alloc::vec::Vec<(usize, usize)>, start: usize, end: usize) {
+    if end <= start {
+        return;
+    }
+    let mut next = alloc::vec::Vec::new();
+    for (r_start, r_end) in ranges.drain(..) {
+        if end <= r_start || start >= r_end {
+            push_range_merged(&mut next, r_start, r_end);
+            continue;
+        }
+        if start > r_start {
+            push_range_merged(&mut next, r_start, start);
+        }
+        if end < r_end {
+            push_range_merged(&mut next, end, r_end);
+        }
+    }
+    *ranges = next;
+}
+
+fn ranges_total_len(ranges: &[(usize, usize)]) -> usize {
+    ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .sum()
+}
+
+fn ranges_overlap(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    ranges
+        .iter()
+        .any(|(r_start, r_end)| end > *r_start && start < *r_end)
+}
+
 pub fn syscall_brk(addr: usize) -> isize {
+    const BRK_RELATIVE_COMPAT_MAX: usize = 64 * 1024;
     let process = current_process();
     let pid = process.getpid();
     let mut inner = process.borrow_mut();
@@ -79,24 +245,38 @@ pub fn syscall_brk(addr: usize) -> isize {
         }
         return inner.brk as isize;
     }
-    if addr < inner.heap_start {
+    let mut new_brk = addr;
+    if new_brk < inner.heap_start
+        && inner.brk == inner.heap_start
+        && new_brk <= BRK_RELATIVE_COMPAT_MAX
+    {
+        // Some musl environments may issue `brk()` with a small positive
+        // increment before their internal break base gets initialized.
+        // Treat this as a relative grow-from-base request.
+        if let Some(candidate) = inner.brk.checked_add(new_brk) {
+            if candidate > inner.brk {
+                new_brk = candidate;
+            }
+        }
+    }
+    if new_brk < inner.heap_start {
         if crate::debug_config::DEBUG_SYSCALL {
             crate::println!(
                 "[brk] pid={} reject addr={:#x} heap_start={:#x} brk={:#x}",
                 pid,
-                addr,
+                new_brk,
                 inner.heap_start,
                 inner.brk
             );
         }
         return inner.brk as isize;
     }
-    if addr > USER_VA_TOP || align_up(addr, PAGE_SIZE) > USER_VA_TOP {
+    if new_brk > USER_VA_TOP || align_up(new_brk, PAGE_SIZE) > USER_VA_TOP {
         if crate::debug_config::DEBUG_SYSCALL {
             crate::println!(
                 "[brk] pid={} reject addr={:#x} above user top={:#x}",
                 pid,
-                addr,
+                new_brk,
                 USER_VA_TOP
             );
         }
@@ -104,7 +284,6 @@ pub fn syscall_brk(addr: usize) -> isize {
     }
 
     let old_brk = inner.brk;
-    let new_brk = addr;
     let heap_start = inner.heap_start;
     let old_end = align_up(old_brk, PAGE_SIZE);
     let new_end = align_up(new_brk, PAGE_SIZE);
@@ -172,20 +351,30 @@ pub fn syscall_mmap(
     if len == 0 {
         return EINVAL;
     }
-    if (flags & MAP_SHARED) != 0 && (flags & MAP_PRIVATE) != 0 {
+    let map_type = flags & MAP_TYPE_MASK;
+    if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
         return EINVAL;
     }
-    if fd < 0 && (flags & MAP_ANONYMOUS) == 0 {
+    let is_shared = map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE;
+    let is_anon = fd < 0 || (flags & MAP_ANONYMOUS) != 0;
+    if !is_anon && fd < 0 {
         return EINVAL;
     }
     if fd >= 0 && (off % PAGE_SIZE) != 0 {
         return EINVAL;
     }
 
-    let is_shared = (flags & MAP_SHARED) != 0;
-    let is_anon = fd < 0 || (flags & MAP_ANONYMOUS) != 0;
-    let file = if !is_anon && fd >= 0 {
-        get_fd_file(fd as usize)
+    let file = if !is_anon {
+        let Some(file) = get_fd_file(fd as usize) else {
+            return EBADF;
+        };
+        if !file.readable() {
+            return EACCES;
+        }
+        if is_shared && (prot & PROT_WRITE) != 0 && !file.writable() {
+            return EACCES;
+        }
+        Some(file)
     } else {
         None
     };
@@ -269,21 +458,8 @@ pub fn syscall_mmap(
         inner.memory_set.unmap_user_range(start.into(), end.into());
 
         // Keep `mmap_areas` bookkeeping consistent (split/trim overlaps).
-        let mut new_areas = alloc::vec::Vec::new();
-        for (s, l) in inner.mmap_areas.drain(..) {
-            let e = s + l;
-            if end <= s || start >= e {
-                new_areas.push((s, l));
-                continue;
-            }
-            if start > s {
-                new_areas.push((s, start - s));
-            }
-            if end < e {
-                new_areas.push((end, e - end));
-            }
-        }
-        inner.mmap_areas = new_areas;
+        trim_mmap_regions(&mut inner.mmap_areas, start, end);
+        trim_ranges(&mut inner.mlocked_ranges, start, end);
     }
 
     if is_shared {
@@ -335,17 +511,26 @@ pub fn syscall_mmap(
     if !is_fixed && end > inner.mmap_next {
         inner.mmap_next = end;
     }
-    // Keep mmap bookkeeping compact: adjacent regions can be represented
-    // as one interval, which avoids O(n^2) growth in fork-heavy tests.
-    if let Some((last_start, last_len)) = inner.mmap_areas.last_mut() {
-        let last_end = *last_start + *last_len;
-        if last_end == start {
-            *last_len += map_len;
-        } else {
-            inner.mmap_areas.push((start, map_len));
-        }
+    let may_write_upgrade = if is_anon {
+        true
+    } else if is_shared {
+        file.as_ref().map(|f| f.writable()).unwrap_or(false)
     } else {
-        inner.mmap_areas.push((start, map_len));
+        true
+    };
+    push_mmap_region_merged(
+        &mut inner.mmap_areas,
+        MmapRegion {
+            start,
+            len: map_len,
+            prot: prot & (PROT_READ | PROT_WRITE | PROT_EXEC),
+            shared: is_shared,
+            may_write_upgrade,
+        },
+    );
+    if inner.mlockall_future {
+        inner.mlocked_ranges.push((start, end));
+        normalize_ranges(&mut inner.mlocked_ranges);
     }
     drop(inner);
 
@@ -396,21 +581,35 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
     inner.memory_set.unmap_user_range(start.into(), end.into());
 
     // Update `mmap_areas` bookkeeping: remove/split any overlapping entries.
-    let mut new_areas = alloc::vec::Vec::new();
-    for (s, l) in inner.mmap_areas.drain(..) {
-        let e = s + l;
-        if end <= s || start >= e {
-            new_areas.push((s, l));
-            continue;
-        }
-        if start > s {
-            new_areas.push((s, start - s));
-        }
-        if end < e {
-            new_areas.push((end, e - end));
-        }
+    trim_mmap_regions(&mut inner.mmap_areas, start, end);
+    trim_ranges(&mut inner.mlocked_ranges, start, end);
+    0
+}
+
+/// Linux `msync(2)` (syscall 227).
+pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
+    const MS_ASYNC: usize = 1;
+    const MS_INVALIDATE: usize = 2;
+    const MS_SYNC: usize = 4;
+
+    if (flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC)) != 0 {
+        return EINVAL;
     }
-    inner.mmap_areas = new_areas;
+    if (flags & MS_ASYNC) != 0 && (flags & MS_SYNC) != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if addr % PAGE_SIZE != 0 {
+        return EINVAL;
+    }
+    let Some(end) = addr.checked_add(len) else {
+        return EINVAL;
+    };
+    if !user_range_valid(addr, align_up(end, PAGE_SIZE)) {
+        return ENOMEM;
+    }
     0
 }
 
@@ -446,12 +645,17 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 
     let process = current_process();
     let mut inner = process.borrow_mut();
+    let mut next_regions = inner.mmap_areas.clone();
+    if apply_mprotect_to_mmap_regions(&mut next_regions, addr, end, prot).is_err() {
+        return EACCES;
+    }
     if !inner
         .memory_set
         .mprotect_user_range(addr.into(), end.into(), perm)
     {
         return ENOMEM;
     }
+    inner.mmap_areas = next_regions;
     // Ensure permission changes take effect immediately.
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -466,7 +670,7 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 
 /// Linux `madvise(2)` (syscall 233 on riscv64).
 ///
-/// We only implement MADV_DONTNEED/MADV_FREE for anonymous lazy mappings.
+/// This keeps a Linux-like errno matrix for LTP coverage.
 pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
     if addr % PAGE_SIZE != 0 {
         return EINVAL;
@@ -475,16 +679,50 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
         return 0;
     }
     let Some(end) = addr.checked_add(len) else {
-        return EINVAL;
+        return ENOMEM;
     };
     let end = align_up(end, PAGE_SIZE);
+    if !user_range_valid(addr, end) {
+        return ENOMEM;
+    }
 
+    const MADV_NORMAL: usize = 0;
+    const MADV_RANDOM: usize = 1;
+    const MADV_SEQUENTIAL: usize = 2;
+    const MADV_WILLNEED: usize = 3;
     const MADV_DONTNEED: usize = 4;
     const MADV_FREE: usize = 8;
     match advice {
-        MADV_DONTNEED | MADV_FREE => {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE => {
             let process = current_process();
             let mut inner = process.borrow_mut();
+            if !inner
+                .memory_set
+                .user_range_fully_mapped(addr.into(), end.into())
+            {
+                return ENOMEM;
+            }
+            if advice == MADV_WILLNEED || advice == MADV_NORMAL {
+                return 0;
+            }
+            if advice == MADV_DONTNEED {
+                let shared_overlap = inner
+                    .mmap_areas
+                    .iter()
+                    .any(|region| end > region.start && addr < region.end() && region.shared);
+                if shared_overlap || ranges_overlap(&inner.mlocked_ranges, addr, end) {
+                    return EINVAL;
+                }
+            }
+            if advice == MADV_FREE {
+                let shared_overlap = inner
+                    .mmap_areas
+                    .iter()
+                    .any(|region| end > region.start && addr < region.end() && region.shared);
+                if shared_overlap {
+                    return EINVAL;
+                }
+            }
             inner
                 .memory_set
                 .discard_lazy_user_range(addr.into(), end.into());
@@ -495,23 +733,143 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
 }
 
 /// Linux `mlock` (syscall 228).
-///
-/// We do not implement page pinning; accept the call so rt-tests can proceed.
-pub fn syscall_mlock(_addr: usize, _len: usize) -> isize {
+pub fn syscall_mlock(addr: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let start = align_down(addr, PAGE_SIZE);
+    let Some(end) = addr.checked_add(len) else {
+        return ENOMEM;
+    };
+    let end = align_up(end, PAGE_SIZE);
+    if !user_range_valid(start, end) {
+        return ENOMEM;
+    }
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if !inner
+        .memory_set
+        .user_range_fully_mapped(start.into(), end.into())
+    {
+        return ENOMEM;
+    }
+    let mut next = inner.mlocked_ranges.clone();
+    next.push((start, end));
+    normalize_ranges(&mut next);
+    if inner.euid != 0 {
+        let limit = inner.rlimit_memlock_cur as usize;
+        if limit == 0 {
+            return EPERM;
+        }
+        if ranges_total_len(&next) > limit {
+            return ENOMEM;
+        }
+    }
+    inner.mlocked_ranges = next;
     0
 }
 
 /// Linux `munlock` (syscall 229).
-pub fn syscall_munlock(_addr: usize, _len: usize) -> isize {
+pub fn syscall_munlock(addr: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let start = align_down(addr, PAGE_SIZE);
+    let Some(end) = addr.checked_add(len) else {
+        return ENOMEM;
+    };
+    let end = align_up(end, PAGE_SIZE);
+    if !user_range_valid(start, end) {
+        return ENOMEM;
+    }
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if !inner
+        .memory_set
+        .user_range_fully_mapped(start.into(), end.into())
+    {
+        return ENOMEM;
+    }
+    trim_ranges(&mut inner.mlocked_ranges, start, end);
     0
 }
 
 /// Linux `mlockall` (syscall 230).
-pub fn syscall_mlockall(_flags: usize) -> isize {
+pub fn syscall_mlockall(flags: usize) -> isize {
+    if (flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) != 0 {
+        return EINVAL;
+    }
+    if (flags & (MCL_CURRENT | MCL_FUTURE)) == 0 {
+        return EINVAL;
+    }
+    if (flags & MCL_ONFAULT) != 0 && (flags & (MCL_CURRENT | MCL_FUTURE)) == 0 {
+        return EINVAL;
+    }
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    let mut next = inner.mlocked_ranges.clone();
+    if (flags & MCL_CURRENT) != 0 {
+        for (start, end) in inner.memory_set.user_mapped_ranges() {
+            next.push((start, end));
+        }
+        if next.is_empty() {
+            next.push((inner.heap_start, inner.heap_start + PAGE_SIZE));
+        }
+    }
+    normalize_ranges(&mut next);
+    if inner.euid != 0 {
+        let limit = inner.rlimit_memlock_cur as usize;
+        if limit == 0 {
+            return EPERM;
+        }
+        if ranges_total_len(&next) > limit {
+            return ENOMEM;
+        }
+    }
+    inner.mlocked_ranges = next;
+    inner.mlockall_future = (flags & MCL_FUTURE) != 0;
     0
 }
 
 /// Linux `munlockall` (syscall 231).
 pub fn syscall_munlockall() -> isize {
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    inner.mlocked_ranges.clear();
+    inner.mlockall_future = false;
+    0
+}
+
+/// Linux `mincore(2)` (syscall 232).
+pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
+    if addr % PAGE_SIZE != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(end_raw) = addr.checked_add(len) else {
+        return ENOMEM;
+    };
+    let end = align_up(end_raw, PAGE_SIZE);
+    if !user_range_valid(addr, end) {
+        return ENOMEM;
+    }
+
+    let process = current_process();
+    let inner = process.borrow_mut();
+    if !inner
+        .memory_set
+        .user_range_fully_mapped(addr.into(), end.into())
+    {
+        return ENOMEM;
+    }
+    drop(inner);
+
+    let pages = (end - addr) / PAGE_SIZE;
+    let residency = alloc::vec![1u8; pages];
+    if try_copy_to_user(get_current_token(), vec as *mut u8, &residency).is_err() {
+        return EFAULT;
+    }
     0
 }

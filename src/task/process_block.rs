@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
-use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
+use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
@@ -31,6 +31,22 @@ use lazy_static::lazy_static;
 use spin::{Mutex as SpinMutex, MutexGuard};
 
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmapRegion {
+    pub start: usize,
+    pub len: usize,
+    pub prot: usize,
+    pub shared: bool,
+    /// False for shared file mappings on descriptors without write access.
+    pub may_write_upgrade: bool,
+}
+
+impl MmapRegion {
+    pub fn end(&self) -> usize {
+        self.start.saturating_add(self.len)
+    }
+}
 
 lazy_static! {
     /// owner_pid -> processes currently sharing that owner's file table.
@@ -711,7 +727,11 @@ pub struct ProcessControlBlockInner {
     pub heap_start: usize,
     pub brk: usize,
     pub mmap_next: usize,
-    pub mmap_areas: Vec<(usize, usize)>,
+    pub mmap_areas: Vec<MmapRegion>,
+    /// Virtual ranges currently locked by mlock/mlockall.
+    pub mlocked_ranges: Vec<(usize, usize)>,
+    /// Whether MCL_FUTURE is currently enabled.
+    pub mlockall_future: bool,
     /// System V shared memory attachments (shmat/shmdt).
     pub sysv_shm_attaches: Vec<crate::syscall::sysv_shm::ShmAttach>,
     pub signals: SignalFlags,
@@ -1017,7 +1037,7 @@ impl ProcessControlBlock {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE;
+        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         // allocate a pid
         let pid_handle = pid_alloc();
         let pid = pid_handle.0;
@@ -1113,6 +1133,8 @@ impl ProcessControlBlock {
                 // Keep anonymous/file mmaps high to avoid colliding with ELF segments.
                 mmap_next: DEFAULT_MMAP_BASE,
                 mmap_areas: Vec::new(),
+                mlocked_ranges: Vec::new(),
+                mlockall_future: false,
                 sysv_shm_attaches: Vec::new(),
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
@@ -1231,7 +1253,7 @@ impl ProcessControlBlock {
             self.terminate_other_threads();
         }
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE;
+        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         {
             let mut inner = self.borrow_mut();
             inner.close_cloexec_fds();
@@ -1243,6 +1265,8 @@ impl ProcessControlBlock {
             inner.brk = heap_start;
             inner.mmap_next = DEFAULT_MMAP_BASE;
             inner.mmap_areas.clear();
+            inner.mlocked_ranges.clear();
+            inner.mlockall_future = false;
             inner.argv = args.clone();
             inner.did_exec = true;
         }
@@ -1298,7 +1322,7 @@ impl ProcessControlBlock {
             self.terminate_other_threads();
         }
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE;
+        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         {
             let mut inner = self.borrow_mut();
             inner.close_cloexec_fds();
@@ -1310,6 +1334,8 @@ impl ProcessControlBlock {
             inner.brk = heap_start;
             inner.mmap_next = DEFAULT_MMAP_BASE;
             inner.mmap_areas.clear();
+            inner.mlocked_ranges.clear();
+            inner.mlockall_future = false;
             inner.argv = args.clone();
             inner.did_exec = true;
         }
@@ -1505,6 +1531,9 @@ impl ProcessControlBlock {
                 brk: parent.brk,
                 mmap_next: parent.mmap_next,
                 mmap_areas: parent.mmap_areas.clone(),
+                // Linux does not inherit mlock/mlockall locks across fork.
+                mlocked_ranges: Vec::new(),
+                mlockall_future: false,
                 sysv_shm_attaches: inherited_shm.clone(),
                 // is right here?
                 signals: SignalFlags::empty(),

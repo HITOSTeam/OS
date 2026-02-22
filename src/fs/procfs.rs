@@ -10,11 +10,11 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    File, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
-    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode,
+    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, OSInode,
+    PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
 };
 use crate::mm::UserBuffer;
-use crate::task::manager::{PID2PCB, pid2process};
+use crate::task::manager::{pid2process, PID2PCB};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
 
@@ -107,7 +107,11 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 { None } else { Some(ino) }
+    if ino == 0 {
+        None
+    } else {
+        Some(ino)
+    }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
@@ -582,7 +586,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::PidStat(pid) => proc_pid_stat(*pid),
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
         ProcFileKind::PidStatus(pid) => proc_pid_status(*pid),
-        ProcFileKind::PidMaps(_) => String::from("00000000-00000000 r--p 00000000 00:00 0 \n"),
+        ProcFileKind::PidMaps(pid) => proc_pid_maps(*pid),
     }
 }
 
@@ -752,12 +756,14 @@ fn proc_pid_status(pid: u32) -> String {
         .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
         .unwrap_or(TaskStatus::Ready);
     let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-    let mmap_bytes: usize = inner
-        .mmap_areas
+    let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
+    let vmlck_bytes: usize = inner
+        .mlocked_ranges
         .iter()
-        .map(|(s, e)| e.saturating_sub(*s))
+        .map(|(start, end)| end.saturating_sub(*start))
         .sum();
     let vsize_kb: usize = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
+    let vmlck_kb: usize = (vmlck_bytes + 1023) / 1024;
     let uid = inner.uid;
     let euid = inner.euid;
     let suid = inner.suid;
@@ -789,7 +795,7 @@ fn proc_pid_status(pid: u32) -> String {
         _ => "R (running)",
     };
     alloc::format!(
-        "Name:\t{comm}\nState:\t{state_desc}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{euid}\t{suid}\t{fsuid}\nGid:\t{gid}\t{egid}\t{sgid}\t{fsgid}\nThreads:\t{num_threads}\nVmSize:\t{vsize_kb} kB\n"
+        "Name:\t{comm}\nState:\t{state_desc}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{euid}\t{suid}\t{fsuid}\nGid:\t{gid}\t{egid}\t{sgid}\t{fsgid}\nThreads:\t{num_threads}\nVmLck:\t{vmlck_kb} kB\nVmSize:\t{vsize_kb} kB\n"
     )
 }
 
@@ -820,11 +826,7 @@ fn proc_pid_stat(pid: u32) -> String {
         .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
         .unwrap_or(TaskStatus::Ready);
     let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-    let mmap_bytes: usize = inner
-        .mmap_areas
-        .iter()
-        .map(|(s, e)| e.saturating_sub(*s))
-        .sum();
+    let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
     let vsize: u64 = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
 
     let comm = argv
@@ -912,4 +914,57 @@ fn proc_pid_stat(pid: u32) -> String {
     alloc::format!(
         "{pid} ({comm}) {state_char} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} {num_threads} {itrealvalue} {starttime} {vsize} {rss_pages} {rsslim} {startcode} {endcode} {startstack} {kstkesp} {kstkeip} {signal} {blocked} {sigignore} {sigcatch} {wchan} {nswap} {cnswap} {exit_signal} {processor} {rt_priority} {policy} {delayacct_blkio_ticks} {guest_time} {cguest_time} {start_data} {end_data} {start_brk} {arg_start} {arg_end} {env_start} {env_end} {exit_code}\n"
     )
+}
+
+fn proc_pid_maps(pid: u32) -> String {
+    const PROT_READ: usize = 1;
+    const PROT_WRITE: usize = 2;
+    const PROT_EXEC: usize = 4;
+
+    let Some(proc) = pid2process(pid as usize) else {
+        return String::new();
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        if crate::debug_config::DEBUG_PROCFS {
+            crate::println!("[procfs] maps pid={} lock busy", pid);
+        }
+        return String::new();
+    };
+    let mut regions = inner.mmap_areas.clone();
+    drop(inner);
+    regions.sort_by_key(|r| r.start);
+
+    let mut out = String::new();
+    for region in regions {
+        let end = region.end();
+        if end <= region.start {
+            continue;
+        }
+        let r = if (region.prot & PROT_READ) != 0 {
+            'r'
+        } else {
+            '-'
+        };
+        let w = if (region.prot & PROT_WRITE) != 0 {
+            'w'
+        } else {
+            '-'
+        };
+        let x = if (region.prot & PROT_EXEC) != 0 {
+            'x'
+        } else {
+            '-'
+        };
+        let p = if region.shared { 's' } else { 'p' };
+        out.push_str(&alloc::format!(
+            "{:x}-{:x} {}{}{}{} 00000000 00:00 0 \n",
+            region.start,
+            end,
+            r,
+            w,
+            x,
+            p
+        ));
+    }
+    out
 }

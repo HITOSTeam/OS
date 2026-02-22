@@ -16,6 +16,7 @@ mod semaphore;
 pub(crate) mod signal;
 mod smp;
 mod socket;
+mod sysv_ipc;
 pub(crate) mod sysv_shm;
 mod thread;
 mod time_sys;
@@ -104,6 +105,7 @@ const SYSCALL_STATX: usize = 291;
 // riscv64 Linux syscall numbers (match upstream): statfs=43, fstatfs=44.
 const SYSCALL_STATFS: usize = 43;
 const SYSCALL_FSTATFS: usize = 44;
+const SYSCALL_TRUNCATE: usize = 45;
 const SYSCALL_UTIMENSAT: usize = 88;
 const SYSCALL_ACCT: usize = 89;
 const SYSCALL_CAPGET: usize = 90;
@@ -175,6 +177,14 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_GETTID_LINUX: usize = 178;
+const SYSCALL_MSGGET: usize = 186;
+const SYSCALL_MSGCTL: usize = 187;
+const SYSCALL_MSGRCV: usize = 188;
+const SYSCALL_MSGSND: usize = 189;
+const SYSCALL_SEMGET: usize = 190;
+const SYSCALL_SEMCTL: usize = 191;
+const SYSCALL_SEMTIMEDOP: usize = 192;
+const SYSCALL_SEMOP: usize = 193;
 const SYSCALL_SHMGET: usize = 194;
 const SYSCALL_SHMCTL: usize = 195;
 const SYSCALL_SHMAT: usize = 196;
@@ -199,10 +209,12 @@ const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_EXECVEAT: usize = 281;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
+const SYSCALL_MSYNC: usize = 227;
 const SYSCALL_MLOCK: usize = 228;
 const SYSCALL_MUNLOCK: usize = 229;
 const SYSCALL_MLOCKALL: usize = 230;
 const SYSCALL_MUNLOCKALL: usize = 231;
+const SYSCALL_MINCORE: usize = 232;
 const SYSCALL_GETRLIMIT: usize = 163;
 const SYSCALL_SETRLIMIT: usize = 164;
 const SYSCALL_GETRUSAGE: usize = 165;
@@ -212,6 +224,7 @@ const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_MEMFD_CREATE: usize = 279;
 const SYSCALL_BPF: usize = 280;
+const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_USERFAULTFD: usize = 282;
 const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 const SYSCALL_FANOTIFY_INIT: usize = 262;
@@ -451,6 +464,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             filesystem::syscall_newfstatat(args[0] as isize, args[1], args[2], args[3])
         }
         SYSCALL_FSTAT => filesystem::syscall_fstat(args[0], args[1]),
+        SYSCALL_TRUNCATE => filesystem::syscall_truncate(args[0], args[1]),
         SYSCALL_STATX => {
             filesystem::syscall_statx(args[0] as isize, args[1], args[2], args[3], args[4])
         }
@@ -543,6 +557,16 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => misc::syscall_getgid(),
         SYSCALL_GETEGID => misc::syscall_getegid(),
         SYSCALL_GETTID_LINUX => misc::syscall_gettid_linux(),
+        SYSCALL_MSGGET => sysv_ipc::syscall_msgget(args[0], args[1]),
+        SYSCALL_MSGCTL => sysv_ipc::syscall_msgctl(args[0], args[1], args[2]),
+        SYSCALL_MSGRCV => {
+            sysv_ipc::syscall_msgrcv(args[0], args[1], args[2], args[3] as isize, args[4])
+        }
+        SYSCALL_MSGSND => sysv_ipc::syscall_msgsnd(args[0], args[1], args[2], args[3]),
+        SYSCALL_SEMGET => sysv_ipc::syscall_semget(args[0], args[1], args[2]),
+        SYSCALL_SEMCTL => sysv_ipc::syscall_semctl(args[0], args[1], args[2], args[3]),
+        SYSCALL_SEMTIMEDOP => sysv_ipc::syscall_semtimedop(args[0], args[1], args[2], args[3]),
+        SYSCALL_SEMOP => sysv_ipc::syscall_semop(args[0], args[1], args[2]),
         SYSCALL_SHMGET => sysv_shm::syscall_shmget(args[0], args[1], args[2]),
         SYSCALL_SHMCTL => sysv_shm::syscall_shmctl(args[0], args[1], args[2]),
         SYSCALL_SHMAT => sysv_shm::syscall_shmat(args[0], args[1], args[2]),
@@ -573,11 +597,13 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             args[5],
         ),
         SYSCALL_MPROTECT => memory::syscall_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MSYNC => memory::syscall_msync(args[0], args[1], args[2]),
         SYSCALL_MADVISE => memory::syscall_madvise(args[0], args[1], args[2]),
         SYSCALL_MLOCK => memory::syscall_mlock(args[0], args[1]),
         SYSCALL_MUNLOCK => memory::syscall_munlock(args[0], args[1]),
         SYSCALL_MLOCKALL => memory::syscall_mlockall(args[0]),
         SYSCALL_MUNLOCKALL => memory::syscall_munlockall(),
+        SYSCALL_MINCORE => memory::syscall_mincore(args[0], args[1], args[2]),
         SYSCALL_GETRLIMIT => misc::syscall_getrlimit(args[0], args[1]),
         SYSCALL_SETRLIMIT => misc::syscall_setrlimit(args[0], args[1]),
         SYSCALL_GETRUSAGE => misc::syscall_getrusage(args[0] as isize, args[1]),
@@ -592,6 +618,9 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRANDOM => misc::syscall_getrandom(args[0], args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => dummy::syscall_memfd_create(args[0], args[1]),
         SYSCALL_BPF => dummy::syscall_bpf(args[0], args[1], args[2]),
+        SYSCALL_COPY_FILE_RANGE => filesystem::syscall_copy_file_range(
+            args[0], args[1], args[2], args[3], args[4], args[5],
+        ),
         SYSCALL_USERFAULTFD => dummy::syscall_userfaultfd(args[0]),
         SYSCALL_PERF_EVENT_OPEN => dummy::syscall_perf_event_open(
             args[0],
