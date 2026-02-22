@@ -5,7 +5,7 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
-    mm::{MemorySet, kernel_token, translated_single_address, translated_str, write_user_value},
+    mm::{kernel_token, translated_single_address, translated_str, write_user_value, MemorySet},
     println,
     syscall::{
         filesystem::{normalize_path, resolve_exec_inode, resolve_read_inode},
@@ -13,11 +13,11 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        ProcessControlBlock,
         manager::{add_task, remove_inactive_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::{MAX_SIG, SIG_DFL, SIG_IGN, SignalFlags, pending_unmasked_bits},
+        signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
         task_block::TaskControlBlock,
+        ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
@@ -303,9 +303,29 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     #[cfg(target_arch = "loongarch64")]
     let (_tls, _ctid) = (_ctid, _tls);
 
-    // Thread-like clone: share address space (glibc pthreads).
-    let is_thread_like =
-        (flags & CLONE_VM) != 0 && ((flags & CLONE_THREAD) != 0 || (flags & CLONE_SIGHAND) != 0);
+    // Linux flag constraints:
+    // - CLONE_SIGHAND requires CLONE_VM.
+    // - CLONE_THREAD requires CLONE_SIGHAND (and therefore CLONE_VM).
+    if (flags & CLONE_SIGHAND) != 0 && (flags & CLONE_VM) == 0 {
+        return -22; // EINVAL
+    }
+    if (flags & CLONE_THREAD) != 0 && (flags & CLONE_SIGHAND) == 0 {
+        return -22; // EINVAL
+    }
+    if stack == 0 {
+        // Linux permits fork-like clone(SIGCHLD, NULL, ...) but rejects NULL
+        // stack for plain clone(0, ...) and thread-like clone variants.
+        let exit_signal = flags & 0xff;
+        let requires_child_stack =
+            (flags & (CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS)) != 0;
+        if exit_signal == 0 || requires_child_stack {
+            return -22; // EINVAL
+        }
+    }
+
+    // Thread-like clone is strictly CLONE_THREAD-based. CLONE_SIGHAND without
+    // CLONE_THREAD still creates a child process that wait()/getppid() must see.
+    let is_thread_like = (flags & CLONE_THREAD) != 0 && (flags & CLONE_VM) != 0;
     if is_thread_like {
         const ENOMEM: isize = -12;
         let task = current_task().unwrap();
