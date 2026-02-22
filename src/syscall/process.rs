@@ -5,15 +5,15 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
-    mm::{kernel_token, translated_single_address, translated_str, write_user_value, MemorySet},
+    mm::{kernel_token, try_read_user_value, write_user_value, MemorySet},
     println,
     syscall::{
-        filesystem::{normalize_path, resolve_exec_inode, resolve_read_inode},
+        filesystem::{normalize_path, resolve_exec_inode, resolve_exec_inode_at, resolve_read_inode},
         misc::encode_linux_tid,
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        manager::{add_task, remove_inactive_task, select_hart_for_new_task},
+        manager::{add_task, remove_inactive_task, select_hart_for_new_task, PID2PCB},
         processor::{block_current_and_run_next, current_process, current_task},
         signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
         task_block::TaskControlBlock,
@@ -24,13 +24,66 @@ use crate::{
 
 const ENOENT: isize = -2;
 const EACCES: isize = -13;
+const EFAULT: isize = -14;
+const ENAMETOOLONG: isize = -36;
+const E2BIG: isize = -7;
+const ETXTBSY: isize = -26;
 
-fn read_usize_user(token: usize, ptr: usize) -> usize {
-    let mut raw = [0u8; size_of::<usize>()];
-    for (i, byte) in raw.iter_mut().enumerate() {
-        *byte = *translated_single_address(token, (ptr + i) as *const u8);
+fn try_read_usize_user(token: usize, ptr: usize) -> Result<usize, isize> {
+    try_read_user_value(token, ptr as *const usize).ok_or(EFAULT)
+}
+
+fn try_read_user_cstr(token: usize, ptr: usize) -> Result<String, isize> {
+    const MAX_USER_CSTR: usize = 256 * 1024;
+    let mut s = String::new();
+    for i in 0..MAX_USER_CSTR {
+        let ch = try_read_user_value(token, (ptr + i) as *const u8).ok_or(EFAULT)?;
+        if ch == 0 {
+            return Ok(s);
+        }
+        s.push(ch as char);
     }
-    usize::from_ne_bytes(raw)
+    Err(ENAMETOOLONG)
+}
+
+fn read_user_str_array(token: usize, vec_ptr: usize) -> Result<Vec<String>, isize> {
+    let mut out = Vec::new();
+    if vec_ptr == 0 {
+        return Ok(out);
+    }
+    for i in 0..4096usize {
+        let p = try_read_usize_user(token, vec_ptr + i * size_of::<usize>())?;
+        if p == 0 {
+            return Ok(out);
+        }
+        out.push(try_read_user_cstr(token, p)?);
+    }
+    Err(E2BIG)
+}
+
+fn is_inode_open_for_write(inode_num: u32) -> bool {
+    let processes: Vec<_> = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+    for process in processes {
+        let inner = process.borrow_mut();
+        for file in inner.fd_table.iter() {
+            let Some(file) = file else {
+                continue;
+            };
+            if !file.writable() {
+                continue;
+            }
+            let Some(inode_file) = file.as_any().downcast_ref::<crate::fs::OSInode>() else {
+                continue;
+            };
+            if inode_file.ext4_inode().inode_num() == inode_num {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// This function tries to load a file from the given path.
@@ -1032,104 +1085,13 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     }
 }
 
-pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
+fn execve_with_inode(
+    path: String,
+    args_vec: Vec<String>,
+    envs_vec: Vec<String>,
+    inode: Arc<ext4_fs::Inode>,
+) -> isize {
     const ENOEXEC: isize = -8;
-    let token = get_current_token();
-    let path = translated_str(token, path_ptr as *const u8);
-
-    let mut args_vec: Vec<String> = Vec::new();
-    if argv_ptr != 0 {
-        let mut i = 0usize;
-        loop {
-            let arg_ptr = read_usize_user(token, argv_ptr + i * size_of::<usize>());
-            if arg_ptr == 0 {
-                break;
-            }
-            args_vec.push(translated_str(token, arg_ptr as *const u8));
-            i += 1;
-        }
-    }
-    if args_vec.is_empty() {
-        args_vec.push(path.clone());
-    }
-    crate::log_if!(
-        DEBUG_SIGNAL,
-        info,
-        "[execve] pid={} path='{}' argv0='{}' argv1='{}'",
-        current_process().getpid(),
-        path,
-        args_vec.get(0).map(|s| s.as_str()).unwrap_or(""),
-        args_vec.get(1).map(|s| s.as_str()).unwrap_or("")
-    );
-
-    let mut envs_vec: Vec<String> = Vec::new();
-    if envp_ptr != 0 {
-        let mut i = 0usize;
-        loop {
-            let env_ptr = read_usize_user(token, envp_ptr + i * size_of::<usize>());
-            if env_ptr == 0 {
-                break;
-            }
-            envs_vec.push(translated_str(token, env_ptr as *const u8));
-            i += 1;
-        }
-    }
-    if envs_vec.is_empty() {
-        // Include LTP testcases bin dirs so helper binaries (e.g. acct02_helper)
-        // can be resolved via tst_get_path() in LTP.
-        envs_vec.push(String::from(
-            "PATH=/user:/:/bin:/usr/bin:/musl:/glibc:/musl/ltp/testcases/bin:/glibc/ltp/testcases/bin",
-        ));
-    } else if !envs_vec.iter().any(|e| e.starts_with("PATH=")) {
-        // Ensure PATH contains LTP testcases bin dirs for helper lookups.
-        envs_vec.push(String::from(
-            "PATH=/user:/:/bin:/usr/bin:/musl:/glibc:/musl/ltp/testcases/bin:/glibc/ltp/testcases/bin",
-        ));
-    }
-    if is_system_shell_path(&path) {
-        if let Ok(Some((bb_path, bb_data))) = find_busybox_shell() {
-            let mut new_args: Vec<String> = Vec::new();
-            new_args.push(bb_path);
-            new_args.push(String::from("sh"));
-            for a in args_vec.iter().skip(1) {
-                new_args.push(a.clone());
-            }
-            return exec_interpreter(bb_data, new_args, envs_vec);
-        }
-    }
-
-    let inode = match resolve_exec_inode_with_fallback(&path) {
-        Ok(inode) => inode,
-        Err(e) => {
-            if e == ENOENT {
-                if let Some(ret) = try_exec_busybox_applet(&path, &args_vec, &envs_vec) {
-                    return ret;
-                }
-            }
-            if DEBUG_EXEC {
-                let cwd = { current_process().borrow_mut().cwd.clone() };
-                let abs = if path.starts_with('/') {
-                    normalize_path("/", &path)
-                } else {
-                    normalize_path(&cwd, &path)
-                };
-                let (primary_hit, secondary_hit) = {
-                    let _ext4_guard = ext4_lock();
-                    let primary_hit = root_inode_for_path(&abs).find_path(&abs).is_some();
-                    let secondary_hit = secondary_root_inode()
-                        .and_then(|root| root.find_path(&abs))
-                        .is_some();
-                    (primary_hit, secondary_hit)
-                };
-                println!(
-                    "[exec] path='{}' abs='{}' cwd='{}' err={} primary_hit={} secondary_hit={}",
-                    path, abs, cwd, e, primary_hit, secondary_hit
-                );
-            }
-            return e;
-        }
-    };
-
     // Try lazy ELF loading to avoid reading large binaries into kernel heap.
     let interp = {
         let inode = Arc::clone(&inode);
@@ -1350,9 +1312,159 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     }
 
     // Non-ELF without shebang: let shells interpret it.
-    return ENOEXEC;
+    ENOEXEC
+}
 
-    // unreachable
+pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
+    let token = get_current_token();
+    if path_ptr == 0 {
+        return EFAULT;
+    }
+    let path = match try_read_user_cstr(token, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let mut args_vec: Vec<String> = Vec::new();
+    if argv_ptr != 0 {
+        let mut i = 0usize;
+        loop {
+            if i >= 4096 {
+                return E2BIG;
+            }
+            let arg_ptr = match try_read_usize_user(token, argv_ptr + i * size_of::<usize>()) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if arg_ptr == 0 {
+                break;
+            }
+            match try_read_user_cstr(token, arg_ptr) {
+                Ok(s) => args_vec.push(s),
+                Err(e) => return e,
+            }
+            i += 1;
+        }
+    }
+    if args_vec.is_empty() {
+        args_vec.push(path.clone());
+    }
+    crate::log_if!(
+        DEBUG_SIGNAL,
+        info,
+        "[execve] pid={} path='{}' argv0='{}' argv1='{}'",
+        current_process().getpid(),
+        path,
+        args_vec.get(0).map(|s| s.as_str()).unwrap_or(""),
+        args_vec.get(1).map(|s| s.as_str()).unwrap_or("")
+    );
+
+    let mut envs_vec: Vec<String> = Vec::new();
+    if envp_ptr != 0 {
+        let mut i = 0usize;
+        loop {
+            if i >= 4096 {
+                return E2BIG;
+            }
+            let env_ptr = match try_read_usize_user(token, envp_ptr + i * size_of::<usize>()) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if env_ptr == 0 {
+                break;
+            }
+            match try_read_user_cstr(token, env_ptr) {
+                Ok(s) => envs_vec.push(s),
+                Err(e) => return e,
+            }
+            i += 1;
+        }
+    }
+    if is_system_shell_path(&path) {
+        if let Ok(Some((bb_path, bb_data))) = find_busybox_shell() {
+            let mut new_args: Vec<String> = Vec::new();
+            new_args.push(bb_path);
+            new_args.push(String::from("sh"));
+            for a in args_vec.iter().skip(1) {
+                new_args.push(a.clone());
+            }
+            return exec_interpreter(bb_data, new_args, envs_vec);
+        }
+    }
+
+    let inode = match resolve_exec_inode_with_fallback(&path) {
+        Ok(inode) => inode,
+        Err(e) => {
+            if e == ENOENT {
+                if let Some(ret) = try_exec_busybox_applet(&path, &args_vec, &envs_vec) {
+                    return ret;
+                }
+            }
+            if DEBUG_EXEC {
+                let cwd = { current_process().borrow_mut().cwd.clone() };
+                let abs = if path.starts_with('/') {
+                    normalize_path("/", &path)
+                } else {
+                    normalize_path(&cwd, &path)
+                };
+                let (primary_hit, secondary_hit) = {
+                    let _ext4_guard = ext4_lock();
+                    let primary_hit = root_inode_for_path(&abs).find_path(&abs).is_some();
+                    let secondary_hit = secondary_root_inode()
+                        .and_then(|root| root.find_path(&abs))
+                        .is_some();
+                    (primary_hit, secondary_hit)
+                };
+                println!(
+                    "[exec] path='{}' abs='{}' cwd='{}' err={} primary_hit={} secondary_hit={}",
+                    path, abs, cwd, e, primary_hit, secondary_hit
+                );
+            }
+            return e;
+        }
+    };
+    if is_inode_open_for_write(inode.inode_num()) {
+        return ETXTBSY;
+    }
+
+    execve_with_inode(path, args_vec, envs_vec, inode)
+}
+
+pub fn syscall_execveat(
+    dirfd: isize,
+    path_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
+    flags: usize,
+) -> isize {
+    let token = get_current_token();
+    if path_ptr == 0 {
+        return EFAULT;
+    }
+    let path = match try_read_user_cstr(token, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let mut args_vec = match read_user_str_array(token, argv_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if args_vec.is_empty() {
+        args_vec.push(path.clone());
+    }
+    let envs_vec = match read_user_str_array(token, envp_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let inode = match resolve_exec_inode_at(dirfd, &path, flags) {
+        Ok(inode) => inode,
+        Err(e) => return e,
+    };
+    if is_inode_open_for_write(inode.inode_num()) {
+        return ETXTBSY;
+    }
+    execve_with_inode(path, args_vec, envs_vec, inode)
 }
 
 pub fn syscall_getpid() -> isize {

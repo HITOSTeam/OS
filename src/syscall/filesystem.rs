@@ -826,6 +826,53 @@ pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
     Ok(inode)
 }
 
+pub(crate) fn resolve_exec_inode_at(
+    dirfd: isize,
+    path: &str,
+    flags: usize,
+) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    let valid_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+    if (flags & !valid_flags) != 0 {
+        return Err(EINVAL);
+    }
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let inode = if path.is_empty() {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return Err(ENOENT);
+        }
+        if dirfd < 0 {
+            return Err(EBADF);
+        }
+        let Some(file) = get_fd_file(dirfd as usize) else {
+            return Err(EBADF);
+        };
+        let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+            return Err(ENOTDIR);
+        };
+        os_inode.ext4_inode()
+    } else {
+        let at = resolve_at_path(dirfd, path)?;
+        if let AtPath::PseudoAbs(_) = &at {
+            return Err(ENOENT);
+        }
+        let inode = resolve_at_inode(&at, fsuid, fsgid, follow_final)?;
+        if !follow_final && inode.is_symlink() {
+            return Err(ELOOP);
+        }
+        inode
+    };
+    if !inode.is_file() {
+        return Err(EACCES);
+    }
+    let exec_mask = if path.ends_with(".sh") { 4 } else { 1 };
+    if !inode_mode_allows_uid_gid(&inode, exec_mask, fsuid, fsgid) {
+        return Err(EACCES);
+    }
+    Ok(inode)
+}
+
 pub(crate) fn resolve_read_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let at = resolve_at_path(AT_FDCWD, path)?;
     if let AtPath::PseudoAbs(_) = &at {

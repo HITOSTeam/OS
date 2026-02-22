@@ -195,6 +195,7 @@ const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_EXECVE: usize = 221;
+const SYSCALL_EXECVEAT: usize = 281;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_MLOCK: usize = 228;
@@ -221,6 +222,7 @@ const SYSCALL_PIDFD_OPEN: usize = 434;
 const SYSCALL_MEMFD_SECRET: usize = 447;
 const SYSCALL_SIGACTION: usize = 134; // rt_sigaction
 const SYSCALL_SIGPROCMASK: usize = 135; // rt_sigprocmask
+const SYSCALL_SIGPENDING: usize = 136; // rt_sigpending
 const SYSCALL_SIGSUSPEND: usize = 133; // rt_sigsuspend
 const SYSCALL_SIGTIMEDWAIT: usize = 137; // rt_sigtimedwait
 const SYSCALL_SIGRETURN: usize = 139; // rt_sigreturn
@@ -524,6 +526,9 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_WAIT4 => process::syscall_wait4(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_WAITID => process::syscall_waitid(args[0], args[1], args[2], args[3]),
         SYSCALL_EXECVE => process::syscall_execve(args[0], args[1], args[2]),
+        SYSCALL_EXECVEAT => {
+            process::syscall_execveat(args[0] as isize, args[1], args[2], args[3], args[4])
+        }
         SYSCALL_CLONE => process::syscall_clone(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETPID => process::syscall_getpid(),
         SYSCALL_GETPPID => misc::syscall_getppid(),
@@ -609,6 +614,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SIGSUSPEND => signal::syscall_rt_sigsuspend(args[0], args[1]),
         SYSCALL_SIGACTION => signal::syscall_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::syscall_rt_sigprocmask(args[0], args[1], args[2], args[3]),
+        SYSCALL_SIGPENDING => signal::syscall_rt_sigpending(args[0], args[1]),
         SYSCALL_SIGTIMEDWAIT => signal::syscall_rt_sigtimedwait(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGRETURN => signal::syscall_rt_sigreturn(),
         SYSCALL_THREAD_CREATE => thread::sys_thread_create(args[0], args[1]),

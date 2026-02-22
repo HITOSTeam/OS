@@ -41,6 +41,7 @@ fn sigreturn_trampoline_va() -> usize {
 const EINVAL: isize = -22;
 const EAGAIN: isize = -11;
 const ESRCH: isize = -3;
+const EFAULT: isize = -14;
 const SIGCHLD: usize = 17;
 const SA_SIGINFO: usize = 0x4;
 const SA_NODEFER: usize = 0x40000000;
@@ -333,6 +334,35 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
     }
     if oldset != 0 {
         write_user_value(token, oldset as *mut u64, &old_mask);
+    }
+    0
+}
+
+/// Linux `rt_sigpending` (syscall 136).
+pub fn syscall_rt_sigpending(set: usize, sigsetsize: usize) -> isize {
+    if set == 0 {
+        return EFAULT;
+    }
+    if sigsetsize < core::mem::size_of::<u64>() {
+        return EINVAL;
+    }
+    let pending = {
+        let task = current_task().unwrap();
+        let inner = task.borrow_mut();
+        inner.pending_signals
+    };
+    let token = get_current_token();
+    if try_write_user_value(token, set as *mut u64, &pending).is_err() {
+        return EFAULT;
+    }
+    // User sigset_t may be larger than 8 bytes; zero trailing bytes.
+    if sigsetsize > core::mem::size_of::<u64>() {
+        let zero: u8 = 0;
+        for off in core::mem::size_of::<u64>()..sigsetsize {
+            if try_write_user_value(token, (set + off) as *mut u8, &zero).is_err() {
+                return EFAULT;
+            }
+        }
     }
     0
 }
