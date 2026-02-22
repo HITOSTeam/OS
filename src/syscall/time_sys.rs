@@ -58,6 +58,10 @@ fn realtime_now_ns() -> u64 {
     }
 }
 
+pub fn realtime_now_seconds() -> u64 {
+    realtime_now_ns() / NSEC_PER_SEC
+}
+
 fn timespec_to_ns(ts: TimeSpec) -> Option<u64> {
     if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= NSEC_PER_SEC as i64 {
         return None;

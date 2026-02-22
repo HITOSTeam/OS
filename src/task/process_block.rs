@@ -10,18 +10,18 @@ use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
-    ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
+    read_user_value, translated_mutref, write_user_value, ElfAux, MemorySet, KERNEL_SPACE,
 };
 use crate::println;
 use crate::task::condvar::Condvar;
-use crate::task::id::{PidHandle, pid_alloc};
+use crate::task::id::{pid_alloc, PidHandle};
 use crate::task::manager::{
     add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
-    RT_SIG_MAX, RtSigAction, SIG_IGN, SignalAction, SignalActions, SignalFlags,
+    RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN,
 };
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
@@ -563,7 +563,7 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     // Walk argv/envp to find auxv.
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-    // Skip envp pointers (NULL terminated).
+                                                                        // Skip envp pointers (NULL terminated).
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();
@@ -642,6 +642,12 @@ pub struct ProcessControlBlockInner {
     pub fsgid: u32,
     /// Supplementary group IDs.
     pub supplementary_gids: Vec<u32>,
+    /// Linux capability sets (v2/v3 user API stores up to 64 bits).
+    pub cap_effective: u64,
+    pub cap_permitted: u64,
+    pub cap_inheritable: u64,
+    /// Capability bounding set used by PR_CAPBSET_DROP checks.
+    pub cap_bounding: u64,
     /// Per-process file mode creation mask (umask).
     pub umask: usize,
     //
@@ -1052,6 +1058,10 @@ impl ProcessControlBlock {
                 sgid: 0,
                 fsgid: 0,
                 supplementary_gids: vec![0],
+                cap_effective: u64::MAX,
+                cap_permitted: u64::MAX,
+                cap_inheritable: u64::MAX,
+                cap_bounding: u64::MAX,
                 umask: 0,
                 fd_table: vec![
                     // 0 -> stdin
@@ -1448,6 +1458,10 @@ impl ProcessControlBlock {
                 sgid: parent.sgid,
                 fsgid: parent.fsgid,
                 supplementary_gids: parent.supplementary_gids.clone(),
+                cap_effective: parent.cap_effective,
+                cap_permitted: parent.cap_permitted,
+                cap_inheritable: parent.cap_inheritable,
+                cap_bounding: parent.cap_bounding,
                 umask: parent.umask,
                 fd_table: new_fd_table,
                 fd_flags: new_fd_flags,

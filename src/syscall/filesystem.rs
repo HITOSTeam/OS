@@ -12,21 +12,21 @@ use crate::task::manager::PID2PCB;
 use crate::{
     config::clock_freq,
     fs::{
-        File, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
-        PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file,
-        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
+        ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode, shm_create,
+        shm_get, shm_list, shm_remove, File, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir,
+        PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
     },
     mm::{
-        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
-        translated_byte_buffer, translated_mutref, translated_str, try_copy_to_user,
-        try_read_user_value, try_write_user_value, write_user_value,
+        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
+        translated_str, try_copy_to_user, try_read_user_value, try_write_user_value,
+        write_user_value, MapPermission, UserBuffer,
     },
     task::processor::{current_files_process, current_process},
     task::{
+        signal::{queue_process_signal, SIGXFSZ_NUM},
         ProcessControlBlock,
-        signal::{SIGXFSZ_NUM, queue_process_signal},
     },
-    time::get_time,
+    time::{get_time, get_time_ms},
     trap::get_current_token,
 };
 use ext4_fs::sync_all;
@@ -982,12 +982,15 @@ pub fn acct_process_exit(process: &Arc<ProcessControlBlock>, exit_code: i32) {
         )
     };
 
+    let now_sec = crate::syscall::time_sys::realtime_now_seconds();
+    let elapsed_ms = get_time_ms().saturating_sub(start_time_ms);
+    let start_sec = now_sec.saturating_sub((elapsed_ms / 1000) as u64);
     let record = Acct {
         ac_flag: 0,
         ac_uid: uid as u16,
         ac_gid: gid as u16,
         ac_tty: 0,
-        ac_btime: (start_time_ms / 1000) as u32,
+        ac_btime: start_sec.min(u32::MAX as u64) as u32,
         ac_utime: 0,
         ac_stime: 0,
         ac_etime: 0,

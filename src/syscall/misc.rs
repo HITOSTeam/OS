@@ -3,19 +3,19 @@ use crate::{
     debug_config::DEBUG_PTHREAD,
     fs::ext4_lock,
     mm::{
-        MapPermission, read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
-        try_read_user_value, try_write_user_value, write_user_value,
+        read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
+        try_read_user_value, try_write_user_value, write_user_value, MapPermission,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
-        manager::{PID2PCB, pid2process},
+        manager::{pid2process, PID2PCB},
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
-        signal::{SIGKILL_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal},
+        signal::{has_unmasked_pending, queue_process_signal, SIGKILL_NUM, SIGXCPU_NUM},
     },
     time::{get_time, get_time_ms},
     trap::get_current_token,
@@ -317,6 +317,10 @@ struct CapUserData {
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const CAP_LAST_CAP: usize = 63;
+const CAP_SETPCAP: usize = 8;
+const PR_CAPBSET_READ: usize = 23;
+const PR_CAPBSET_DROP: usize = 24;
 
 fn cap_data_u32s(version: u32) -> Option<usize> {
     match version {
@@ -330,12 +334,13 @@ fn cap_pid_matches_current(pid: i32) -> bool {
     if pid == 0 {
         return true;
     }
-    if pid < 0 {
-        return false;
-    }
     let pid = pid as usize;
     // Linux capability operations are per-thread (TID-based pid field).
     pid == current_process().getpid() || pid == current_linux_tid()
+}
+
+fn cap_bit(cap: usize) -> u64 {
+    1u64 << cap
 }
 
 /// Linux `capget(2)` (syscall 90 on riscv64).
@@ -358,17 +363,29 @@ pub fn syscall_capget(hdrp: usize, datap: usize) -> isize {
         }
         return EINVAL;
     };
+    if hdr.pid < 0 {
+        return EINVAL;
+    }
 
     if !cap_pid_matches_current(hdr.pid) {
         return ESRCH;
     }
-
-    let data = CapUserData {
-        effective: 0,
-        permitted: 0,
-        inheritable: 0,
+    let (effective, permitted, inheritable) = {
+        let process = current_process();
+        let inner = process.borrow_mut();
+        (
+            inner.cap_effective,
+            inner.cap_permitted,
+            inner.cap_inheritable,
+        )
     };
     for i in 0..n_u32s {
+        let shift = i * 32;
+        let data = CapUserData {
+            effective: ((effective >> shift) & u32::MAX as u64) as u32,
+            permitted: ((permitted >> shift) & u32::MAX as u64) as u32,
+            inheritable: ((inheritable >> shift) & u32::MAX as u64) as u32,
+        };
         let ptr = (datap + i * size_of::<CapUserData>()) as *mut CapUserData;
         if try_write_user_value(token, ptr, &data).is_err() {
             return EFAULT;
@@ -397,20 +414,90 @@ pub fn syscall_capset(hdrp: usize, datap: usize) -> isize {
         }
         return EINVAL;
     };
+    if hdr.pid < 0 {
+        return EINVAL;
+    }
 
     if !cap_pid_matches_current(hdr.pid) {
         return EPERM;
     }
 
-    // Validate user pointers and payload readability; current kernel model does
-    // not enforce fine-grained capabilities yet.
+    let mut payload = [CapUserData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
     for i in 0..n_u32s {
         let ptr = (datap + i * size_of::<CapUserData>()) as *const CapUserData;
-        if try_read_user_value(token, ptr).is_none() {
+        let Some(data) = try_read_user_value(token, ptr) else {
             return EFAULT;
-        }
+        };
+        payload[i] = data;
     }
+    let mut new_effective = 0u64;
+    let mut new_permitted = 0u64;
+    let mut new_inheritable = 0u64;
+    for (i, entry) in payload.iter().take(n_u32s).enumerate() {
+        let shift = i * 32;
+        new_effective |= (entry.effective as u64) << shift;
+        new_permitted |= (entry.permitted as u64) << shift;
+        new_inheritable |= (entry.inheritable as u64) << shift;
+    }
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if (new_effective & !new_permitted) != 0 {
+        return EPERM;
+    }
+    if (new_permitted & !inner.cap_permitted) != 0 {
+        return EPERM;
+    }
+    if (new_inheritable & !inner.cap_inheritable) != 0 {
+        return EPERM;
+    }
+    if (new_inheritable & !inner.cap_bounding) != 0 {
+        return EPERM;
+    }
+    inner.cap_effective = new_effective;
+    inner.cap_permitted = new_permitted;
+    inner.cap_inheritable = new_inheritable;
     0
+}
+
+/// Linux `prctl(2)` subset needed by credential/capability tests.
+pub fn syscall_prctl(
+    option: usize,
+    arg2: usize,
+    _arg3: usize,
+    _arg4: usize,
+    _arg5: usize,
+) -> isize {
+    match option {
+        PR_CAPBSET_READ => {
+            if arg2 > CAP_LAST_CAP {
+                return EINVAL;
+            }
+            let process = current_process();
+            let inner = process.borrow_mut();
+            if (inner.cap_bounding & cap_bit(arg2)) != 0 {
+                1
+            } else {
+                0
+            }
+        }
+        PR_CAPBSET_DROP => {
+            if arg2 > CAP_LAST_CAP {
+                return EINVAL;
+            }
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            if inner.euid != 0 || (inner.cap_effective & cap_bit(CAP_SETPCAP)) == 0 {
+                return EPERM;
+            }
+            inner.cap_bounding &= !cap_bit(arg2);
+            0
+        }
+        _ => EINVAL,
+    }
 }
 
 /// Linux `unshare(2)` (syscall 97 on riscv64).
@@ -460,7 +547,11 @@ pub fn syscall_getppid() -> isize {
 }
 
 fn normalized_pgid(pid: usize, pgid: usize) -> usize {
-    if pgid == 0 && pid != 0 { pid } else { pgid }
+    if pgid == 0 && pid != 0 {
+        pid
+    } else {
+        pgid
+    }
 }
 
 fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {

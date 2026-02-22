@@ -154,6 +154,7 @@ const SYSCALL_SETDOMAINNAME: usize = 162;
 const SYSCALL_SETPRIORITY: usize = 140;
 const SYSCALL_GETPRIORITY: usize = 141;
 const SYSCALL_UMASK: usize = 166;
+const SYSCALL_PRCTL: usize = 167;
 const SYSCALL_SETREGID: usize = 143;
 const SYSCALL_SETGID: usize = 144;
 const SYSCALL_SETREUID: usize = 145;
@@ -265,7 +266,11 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         if is_cyclic {
             let left = CYCLIC_SYSCALL_LOGS
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    if val == 0 { None } else { Some(val - 1) }
+                    if val == 0 {
+                        None
+                    } else {
+                        Some(val - 1)
+                    }
                 })
                 .unwrap_or(0);
             if left > 0 {
@@ -461,6 +466,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_ACCT => filesystem::syscall_acct(args[0]),
         SYSCALL_CAPGET => misc::syscall_capget(args[0], args[1]),
         SYSCALL_CAPSET => misc::syscall_capset(args[0], args[1]),
+        SYSCALL_PRCTL => misc::syscall_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_EXIT => flow::syscall_exit(args[0]),
         SYSCALL_EXIT_GROUP => flow::syscall_exit_group(args[0]),
         SYSCALL_SET_TID_ADDRESS => misc::syscall_set_tid_address(args[0]),
