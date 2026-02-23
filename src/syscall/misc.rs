@@ -1823,12 +1823,21 @@ pub fn syscall_umask(mask: usize) -> isize {
 pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const EBADF: isize = -9;
     const ENOTTY: isize = -25;
+    const EFAULT: isize = -14;
     const BLKGETSIZE: usize = 0x1260;
     const BLKSSZGET: usize = 0x1268;
     const BLKGETSIZE64: usize = 0x8008_1272;
     // Some libc builds issue BLKGETSIZE64 with a 32-bit size encoding.
     const BLKGETSIZE64_COMPAT: usize = 0x8004_1272;
     const BLKPBSZGET: usize = 0x127b;
+    const SIOCATMARK: usize = 0x8905;
+    const SIOCGIFCONF: usize = 0x8912;
+    const SIOCGIFFLAGS: usize = 0x8913;
+    const SIOCSIFFLAGS: usize = 0x8914;
+    const IFF_UP: i16 = 0x1;
+    const IFF_LOOPBACK: i16 = 0x8;
+    const IFF_RUNNING: i16 = 0x40;
+    const AF_INET: u16 = 2;
     const PSEUDO_ROOT_DEV_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
     const PSEUDO_ROOT_DEV_SECTOR_SIZE: u32 = 512;
     const PSEUDO_ROOT_DEV_PHYS_BLOCK_SIZE: u32 = 4096;
@@ -1845,6 +1854,102 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     let Some(file) = file else {
         return EBADF;
     };
+    // Some libcs pass ioctl request as signed int (sign-extended on rv64).
+    // Compare on low 32 bits to accept both calling conventions.
+    let request = _request & 0xffff_ffffusize;
+    let token = get_current_token();
+
+    if let Some(sock) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Ifconf {
+            ifc_len: i32,
+            _pad: i32,
+            ifc_buf: usize,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SockAddr {
+            sa_family: u16,
+            sa_data: [u8; 14],
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct IfreqAddr {
+            ifr_name: [u8; 16],
+            ifr_addr: SockAddr,
+        }
+
+        return match request {
+            SIOCATMARK => {
+                if _argp == 0 {
+                    EFAULT
+                } else if sock.kind() == crate::fs::NetSocketKind::Udp {
+                    ENOTTY
+                } else if try_write_user_value(token, _argp as *mut i32, &0i32).is_err() {
+                    EFAULT
+                } else {
+                    0
+                }
+            }
+            SIOCGIFCONF => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(mut ifc) = try_read_user_value(token, _argp as *const Ifconf) else {
+                    return EFAULT;
+                };
+                if ifc.ifc_buf == 0 {
+                    return EFAULT;
+                }
+                let mut ifr_name = [0u8; 16];
+                ifr_name[0] = b'l';
+                ifr_name[1] = b'o';
+                let mut sa_data = [0u8; 14];
+                sa_data[2] = 127;
+                sa_data[5] = 1;
+                let ifr = IfreqAddr {
+                    ifr_name,
+                    ifr_addr: SockAddr {
+                        sa_family: AF_INET,
+                        sa_data,
+                    },
+                };
+                if (ifc.ifc_len as usize) >= size_of::<IfreqAddr>() {
+                    if try_write_user_value(token, ifc.ifc_buf as *mut IfreqAddr, &ifr).is_err() {
+                        return EFAULT;
+                    }
+                    ifc.ifc_len = size_of::<IfreqAddr>() as i32;
+                } else {
+                    ifc.ifc_len = 0;
+                }
+                if try_write_user_value(token, _argp as *mut Ifconf, &ifc).is_err() {
+                    return EFAULT;
+                }
+                0
+            }
+            SIOCGIFFLAGS => {
+                if _argp == 0 {
+                    EFAULT
+                } else {
+                    let flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+                    if try_write_user_value(token, (_argp + 16) as *mut i16, &flags).is_err() {
+                        EFAULT
+                    } else {
+                        0
+                    }
+                }
+            }
+            SIOCSIFFLAGS => {
+                if _argp == 0 {
+                    EFAULT
+                } else {
+                    0
+                }
+            }
+            _ => ENOTTY,
+        };
+    }
 
     // Minimal block-device ioctls so LTP can use /dev/root as LTP_DEV.
     if file
@@ -1855,10 +1960,6 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         if _argp == 0 {
             return EFAULT;
         }
-        let token = get_current_token();
-        // Some libcs pass ioctl request as signed int (sign-extended on rv64).
-        // Compare on low 32 bits to accept both calling conventions.
-        let request = _request & 0xffff_ffffusize;
         match request {
             BLKGETSIZE64 | BLKGETSIZE64_COMPAT => {
                 if try_write_user_value(token, _argp as *mut u64, &PSEUDO_ROOT_DEV_BYTES).is_err() {

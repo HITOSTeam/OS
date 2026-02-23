@@ -30,6 +30,19 @@ fn pending_unmasked_signal() -> bool {
     has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
 }
 
+fn tcp_accept_ready(state: tcp::State) -> bool {
+    matches!(
+        state,
+        tcp::State::Established
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+            | tcp::State::CloseWait
+            | tcp::State::Closing
+            | tcp::State::LastAck
+            | tcp::State::TimeWait
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetSocketKind {
     TcpStream,
@@ -148,7 +161,7 @@ impl NetSocketFile {
             }
             Snapshot::TcpListener(listen) => listen.iter().any(|h| {
                 let s = sockets.get::<tcp::Socket>(*h);
-                matches!(s.state(), tcp::State::Established)
+                tcp_accept_ready(s.state())
             }),
             Snapshot::Udp(handle) => sockets.get::<udp::Socket>(handle).can_recv(),
             Snapshot::ListenerOnly => false,
@@ -286,7 +299,7 @@ impl NetSocketFile {
             for (i, h) in listen.iter().enumerate() {
                 let established = crate::net::with_sockets_mut(|_iface, _dev, sockets| {
                     let s = sockets.get::<tcp::Socket>(*h);
-                    matches!(s.state(), tcp::State::Established)
+                    tcp_accept_ready(s.state())
                 });
                 if established {
                     idx = Some(i);
@@ -330,6 +343,8 @@ impl NetSocketFile {
     pub fn connect_v4(&self, ip: Ipv4Address, port: u16, local_port: Option<u16>) -> Result<(), isize> {
         const EINVAL: isize = -22;
         const EOPNOTSUPP: isize = -95;
+        const EISCONN: isize = -106;
+        const ECONNREFUSED: isize = -111;
         if port == 0 {
             return Err(EINVAL);
         }
@@ -358,7 +373,11 @@ impl NetSocketFile {
                     local_ep,
                 )
             });
-            r.map_err(|_| EINVAL)?;
+            match r {
+                Ok(()) => {}
+                Err(tcp::ConnectError::InvalidState) => return Err(EISCONN),
+                Err(tcp::ConnectError::Unaddressable) => return Err(EINVAL),
+            }
             // Our userspace (musl/glibc) often assumes a blocking connect unless O_NONBLOCK is set.
             // Since we do not model per-fd nonblocking flags yet, wait until the connection is established.
             const ETIMEDOUT: isize = -110;
@@ -371,6 +390,9 @@ impl NetSocketFile {
                 });
                 if matches!(st, tcp::State::Established) {
                     break;
+                }
+                if matches!(st, tcp::State::Closed) {
+                    return Err(ECONNREFUSED);
                 }
                 if crate::time::get_time_ms() >= deadline {
                     return Err(ETIMEDOUT);

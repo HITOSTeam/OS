@@ -195,6 +195,7 @@ const SYSCALL_SOCKETPAIR: usize = 199;
 const SYSCALL_BIND: usize = 200;
 const SYSCALL_LISTEN: usize = 201;
 const SYSCALL_ACCEPT: usize = 202;
+const SYSCALL_ACCEPT4: usize = 242;
 const SYSCALL_CONNECT: usize = 203;
 const SYSCALL_GETSOCKNAME: usize = 204;
 const SYSCALL_GETPEERNAME: usize = 205;
@@ -578,6 +579,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_BIND => net::syscall_bind(args[0], args[1], args[2]),
         SYSCALL_LISTEN => net::syscall_listen(args[0], args[1]),
         SYSCALL_ACCEPT => net::syscall_accept(args[0], args[1], args[2]),
+        SYSCALL_ACCEPT4 => net::syscall_accept4(args[0], args[1], args[2], args[3]),
         SYSCALL_CONNECT => net::syscall_connect(args[0], args[1], args[2]),
         SYSCALL_GETSOCKNAME => net::syscall_getsockname(args[0], args[1], args[2]),
         SYSCALL_GETPEERNAME => net::syscall_getpeername(args[0], args[1], args[2]),

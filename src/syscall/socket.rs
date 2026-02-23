@@ -1,7 +1,9 @@
 use core::mem::size_of;
 
 use crate::{
-    fs::make_socketpair, mm::write_user_value, task::processor::current_files_process,
+    fs::make_socketpair,
+    mm::{try_write_user_value, write_user_value},
+    task::processor::current_files_process,
     trap::get_current_token,
 };
 
@@ -10,10 +12,14 @@ const EINVAL: isize = -22;
 const EFAULT: isize = -14;
 const EAFNOSUPPORT: isize = -97;
 const EPROTONOSUPPORT: isize = -93;
+const EOPNOTSUPP: isize = -95;
 const EMFILE: isize = -24;
 
 const AF_UNIX: usize = 1;
+const AF_INET: usize = 2;
 const SOCK_STREAM: usize = 1;
+const SOCK_DGRAM: usize = 2;
+const SOCK_RAW: usize = 3;
 const SOCK_TYPE_MASK: usize = 0xf;
 const SOCK_NONBLOCK: usize = 0x800;
 const SOCK_CLOEXEC: usize = 0x80000;
@@ -27,15 +33,33 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
     if sv_ptr == 0 {
         return EFAULT;
     }
-    if domain != AF_UNIX {
-        return EAFNOSUPPORT;
-    }
-    if protocol != 0 {
-        return EPROTONOSUPPORT;
-    }
     let sock_type = type_ & SOCK_TYPE_MASK;
-    if sock_type != SOCK_STREAM {
+    if !matches!(sock_type, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) {
         return EINVAL;
+    }
+    let token = get_current_token();
+    if try_write_user_value(token, sv_ptr as *mut i32, &0i32).is_err()
+        || try_write_user_value(token, (sv_ptr + size_of::<i32>()) as *mut i32, &0i32).is_err()
+    {
+        return EFAULT;
+    }
+    match domain {
+        AF_UNIX => {
+            if protocol != 0 {
+                return EPROTONOSUPPORT;
+            }
+            if !matches!(sock_type, SOCK_STREAM | SOCK_DGRAM) {
+                return EPROTONOSUPPORT;
+            }
+        }
+        AF_INET => {
+            return match (sock_type, protocol) {
+                (SOCK_STREAM, 6) | (SOCK_DGRAM, 17) => EOPNOTSUPP,
+                (SOCK_DGRAM, 6) | (SOCK_STREAM, 1) | (SOCK_RAW, 0) => EPROTONOSUPPORT,
+                _ => EPROTONOSUPPORT,
+            };
+        }
+        _ => return EAFNOSUPPORT,
     }
     let cloexec = (type_ & SOCK_CLOEXEC) != 0;
     let nonblock = (type_ & SOCK_NONBLOCK) != 0;
@@ -43,7 +67,6 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
     let (end0, end1) = make_socketpair();
 
     let process = current_files_process();
-    let token = get_current_token();
     let mut inner = process.borrow_mut();
     let Some(fd0) = inner.alloc_fd() else {
         return EMFILE;
