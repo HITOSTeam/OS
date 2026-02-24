@@ -204,6 +204,11 @@ const SYSCALL_RECVFROM: usize = 207;
 const SYSCALL_SETSOCKOPT: usize = 208;
 const SYSCALL_GETSOCKOPT: usize = 209;
 const SYSCALL_SHUTDOWN: usize = 210;
+const SYSCALL_SENDMSG: usize = 211;
+const SYSCALL_RECVMSG: usize = 212;
+const SYSCALL_RECVMMSG: usize = 243;
+const SYSCALL_SENDMMSG: usize = 269;
+const SYSCALL_RECVMMSG_TIME64: usize = 417;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_CLONE: usize = 220;
@@ -281,11 +286,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         if is_cyclic {
             let left = CYCLIC_SYSCALL_LOGS
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    if val == 0 {
-                        None
-                    } else {
-                        Some(val - 1)
-                    }
+                    if val == 0 { None } else { Some(val - 1) }
                 })
                 .unwrap_or(0);
             if left > 0 {
@@ -584,8 +585,15 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETSOCKNAME => net::syscall_getsockname(args[0], args[1], args[2]),
         SYSCALL_GETPEERNAME => net::syscall_getpeername(args[0], args[1], args[2]),
         SYSCALL_SENDTO => net::syscall_sendto(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYSCALL_SENDMSG => net::syscall_sendmsg(args[0], args[1], args[2]),
         SYSCALL_RECVFROM => {
             net::syscall_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
+        SYSCALL_RECVMSG => net::syscall_recvmsg(args[0], args[1], args[2]),
+        SYSCALL_RECVMMSG => net::syscall_recvmmsg(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_SENDMMSG => net::syscall_sendmmsg(args[0], args[1], args[2], args[3]),
+        SYSCALL_RECVMMSG_TIME64 => {
+            net::syscall_recvmmsg(args[0], args[1], args[2], args[3], args[4])
         }
         SYSCALL_SETSOCKOPT => net::syscall_setsockopt(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_GETSOCKOPT => net::syscall_getsockopt(args[0], args[1], args[2], args[3], args[4]),

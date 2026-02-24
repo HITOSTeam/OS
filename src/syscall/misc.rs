@@ -1,5 +1,6 @@
 use crate::{
     arch,
+    config::clock_freq,
     debug_config::DEBUG_PTHREAD,
     fs::ext4_lock,
     mm::{
@@ -15,7 +16,10 @@ use crate::{
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
-        signal::{has_unmasked_pending, queue_process_signal, SIGKILL_NUM, SIGXCPU_NUM},
+        signal::{
+            has_unmasked_pending, queue_process_signal, signal_bit, SIGKILL_NUM, SIGSTOP_NUM,
+            SIGXCPU_NUM,
+        },
     },
     time::{get_time, get_time_ms},
     trap::get_current_token,
@@ -1679,6 +1683,42 @@ struct PollFd {
     revents: i16,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollTimeSpec {
+    sec: i64,
+    nsec: i64,
+}
+
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+
+fn ppoll_now_ns() -> u64 {
+    (get_time() as u64)
+        .saturating_mul(NSEC_PER_SEC)
+        .saturating_div(clock_freq() as u64)
+}
+
+fn ppoll_timespec_to_ns(ts: PollTimeSpec) -> Option<u64> {
+    if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= NSEC_PER_SEC as i64 {
+        return None;
+    }
+    Some(
+        (ts.sec as u64)
+            .saturating_mul(NSEC_PER_SEC)
+            .saturating_add(ts.nsec as u64),
+    )
+}
+
+fn ppoll_write_back(token: usize, fds_ptr: usize, pfds: &[PollFd]) -> Result<(), isize> {
+    for (i, pfd) in pfds.iter().enumerate() {
+        let pfd_ptr = (fds_ptr + i * size_of::<PollFd>()) as *mut PollFd;
+        if try_write_user_value(token, pfd_ptr, pfd).is_err() {
+            return Err(EFAULT);
+        }
+    }
+    Ok(())
+}
+
 /// Linux `ppoll(2)` (syscall 73 on riscv64).
 ///
 /// Minimal readiness reporting for shells (busybox/ash) and glibc helpers.
@@ -1692,47 +1732,81 @@ pub fn syscall_ppoll(
 ) -> isize {
     const POLLIN: i16 = 0x0001;
     const POLLOUT: i16 = 0x0004;
-    const EBADF: isize = -9;
+    const POLLNVAL: i16 = 0x0020;
     const EINTR: isize = -4;
-
-    if nfds == 0 {
-        if _tmo_p != 0 {
-            return crate::syscall::time_sys::syscall_nanosleep(_tmo_p, 0);
-        }
-        if _sigmask != 0 {
-            return crate::syscall::signal::syscall_rt_sigsuspend(_sigmask, _sigsetsize);
-        }
-        loop {
-            let task = current_task().unwrap();
-            let (pending, mask) = {
-                let inner = task.borrow_mut();
-                (inner.pending_signals, inner.signal_mask)
-            };
-            if has_unmasked_pending(pending, mask, false) {
-                return EINTR;
-            }
-            block_current_and_run_next();
-        }
+    if (nfds as isize) < 0 {
+        return EINVAL;
     }
-    if fds_ptr == 0 {
+    if nfds > i32::MAX as usize {
+        return EINVAL;
+    }
+    if nfds > 0 && fds_ptr == 0 {
         return EFAULT;
     }
 
     let token = get_current_token();
     let process = current_files_process();
+    let deadline_ns = if _tmo_p == 0 {
+        None
+    } else {
+        let Some(ts) = try_read_user_value::<PollTimeSpec>(token, _tmo_p as *const PollTimeSpec)
+        else {
+            return EFAULT;
+        };
+        let Some(delta_ns) = ppoll_timespec_to_ns(ts) else {
+            return EINVAL;
+        };
+        Some(ppoll_now_ns().saturating_add(delta_ns))
+    };
 
-    // `ppoll(NULL)` means "wait forever" (no timeout). Many libc `poll(-1)` wrappers
-    // map to `ppoll(..., NULL, ...)`.
-    let infinite = _tmo_p == 0;
+    let task = current_task().unwrap();
+    let mut restore_mask = None;
+    if _sigmask != 0 {
+        if _sigsetsize < size_of::<u64>() {
+            return EINVAL;
+        }
+        let Some(mut new_mask) = try_read_user_value::<u64>(token, _sigmask as *const u64) else {
+            return EFAULT;
+        };
+        let sigkill_bit = signal_bit(SIGKILL_NUM).unwrap_or(0);
+        let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
+        new_mask &= !(sigkill_bit | sigstop_bit);
+        let old_mask = {
+            let mut inner = task.borrow_mut();
+            let old = inner.signal_mask;
+            inner.signal_mask = new_mask;
+            old
+        };
+        restore_mask = Some(old_mask);
+    }
 
-    loop {
+    let mut pfds = Vec::with_capacity(nfds);
+    for i in 0..nfds {
+        let pfd_ptr = (fds_ptr + i * size_of::<PollFd>()) as *const PollFd;
+        let Some(mut pfd) = try_read_user_value::<PollFd>(token, pfd_ptr) else {
+            if let Some(old_mask) = restore_mask {
+                let mut inner = task.borrow_mut();
+                inner.signal_mask = old_mask;
+            }
+            return EFAULT;
+        };
+        pfd.revents = 0;
+        pfds.push(pfd);
+    }
+
+    let ret = loop {
+        let (pending, mask) = {
+            let inner = task.borrow_mut();
+            (inner.pending_signals, inner.signal_mask)
+        };
+        if has_unmasked_pending(pending, mask, false) {
+            break EINTR;
+        }
+
         let mut ready = 0isize;
-        for i in 0..nfds {
-            let pfd_ptr = (fds_ptr + i * size_of::<PollFd>()) as *mut PollFd;
-            let mut pfd = read_user_value(token, pfd_ptr as *const PollFd);
+        for pfd in pfds.iter_mut() {
+            pfd.revents = 0;
             if pfd.fd < 0 {
-                pfd.revents = 0;
-                write_user_value(token, pfd_ptr, &pfd);
                 continue;
             }
             let fd = pfd.fd as usize;
@@ -1745,58 +1819,69 @@ pub fn syscall_ppoll(
                 }
             };
             let Some(file) = file else {
-                pfd.revents = 0;
-                return EBADF;
+                pfd.revents = POLLNVAL;
+                ready += 1;
+                continue;
             };
 
             let mut revents: i16 = 0;
-
-            // Pipes and our socketpair endpoints need real readiness (buffer-based),
-            // not just "is readable/writable" capability.
-            if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
-                if (pfd.events & POLLIN) != 0 && pipe.poll_readable() {
-                    revents |= POLLIN;
-                }
-                if (pfd.events & POLLOUT) != 0 && pipe.poll_writable() {
-                    revents |= POLLOUT;
-                }
-            } else if let Some(sp) = file.as_any().downcast_ref::<crate::fs::SocketPairEnd>() {
-                if (pfd.events & POLLIN) != 0 && sp.poll_readable() {
-                    revents |= POLLIN;
-                }
-                if (pfd.events & POLLOUT) != 0 && sp.poll_writable() {
-                    revents |= POLLOUT;
-                }
-            } else if let Some(ns) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
-                if (pfd.events & POLLIN) != 0 && ns.poll_readable() {
-                    revents |= POLLIN;
-                }
-                if (pfd.events & POLLOUT) != 0 && ns.poll_writable() {
-                    revents |= POLLOUT;
-                }
-            } else {
-                if (pfd.events & POLLIN) != 0 && file.readable() {
-                    revents |= POLLIN;
-                }
-                if (pfd.events & POLLOUT) != 0 && file.writable() {
-                    revents |= POLLOUT;
-                }
+            let (readable, writable) = crate::syscall::net::poll_file_read_write(&file);
+            if (pfd.events & POLLIN) != 0 && readable {
+                revents |= POLLIN;
             }
-
+            if (pfd.events & POLLOUT) != 0 && writable {
+                revents |= POLLOUT;
+            }
             pfd.revents = revents;
-            write_user_value(token, pfd_ptr, &pfd);
             if revents != 0 {
                 ready += 1;
             }
         }
 
-        if ready != 0 || !infinite {
-            return ready;
+        if ready != 0 {
+            break ready;
         }
+        if let Some(deadline) = deadline_ns {
+            let now = ppoll_now_ns();
+            if now >= deadline {
+                break 0;
+            }
+            if nfds == 0 {
+                let remain_ns = deadline.saturating_sub(now);
+                let mut sleep_ms = ((remain_ns.saturating_add(999_999)) / 1_000_000) as usize;
+                if sleep_ms == 0 {
+                    sleep_ms = 1;
+                }
+                let r = crate::syscall::thread::sys_sleep(sleep_ms);
+                if r == EINTR {
+                    break EINTR;
+                }
+            } else {
+                crate::task::processor::suspend_current_and_run_next();
+            }
+        } else if nfds == 0 {
+            block_current_and_run_next();
+        } else {
+            crate::task::processor::suspend_current_and_run_next();
+        }
+    };
 
-        // Block (best-effort): yield and retry until something becomes ready.
-        crate::task::processor::suspend_current_and_run_next();
+    if ret >= 0 || ret == EINTR {
+        if ppoll_write_back(token, fds_ptr, &pfds).is_err() {
+            if let Some(old_mask) = restore_mask {
+                let mut inner = task.borrow_mut();
+                inner.signal_mask = old_mask;
+            }
+            return EFAULT;
+        }
     }
+
+    if let Some(old_mask) = restore_mask {
+        let mut inner = task.borrow_mut();
+        inner.signal_mask = old_mask;
+    }
+
+    ret
 }
 
 pub fn current_umask() -> usize {

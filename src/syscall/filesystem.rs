@@ -70,6 +70,7 @@ const S_IFIFO: u16 = 0o010000;
 const EBADF: isize = -9;
 const EFAULT: isize = -14;
 const EFBIG: isize = -27;
+const EAGAIN: isize = -11;
 const ELOOP: isize = -40;
 const EPERM: isize = -1;
 const ENOENT: isize = -2;
@@ -408,6 +409,44 @@ fn fd_has_o_path(fd: usize) -> bool {
         return false;
     }
     (inner.fd_flags[fd] & O_PATH as u32) != 0
+}
+
+fn fd_has_nonblock(fd: usize) -> bool {
+    let process = current_files_process();
+    let inner = process.borrow_mut();
+    if fd >= inner.fd_flags.len() {
+        return false;
+    }
+    (inner.fd_flags[fd] & O_NONBLOCK as u32) != 0
+}
+
+fn open_fd_flags(flags: usize, o_path: bool) -> u32 {
+    let mut fd_flags = 0u32;
+    if (flags & O_CLOEXEC) != 0 {
+        fd_flags |= FD_CLOEXEC;
+    }
+    if (flags & O_NONBLOCK) != 0 {
+        fd_flags |= O_NONBLOCK as u32;
+    }
+    if o_path {
+        fd_flags |= O_PATH as u32;
+    }
+    fd_flags
+}
+
+fn install_open_file_fd(
+    file: alloc::sync::Arc<dyn File + Send + Sync>,
+    flags: usize,
+    o_path: bool,
+) -> Result<usize, isize> {
+    let process = current_files_process();
+    let mut inner = process.borrow_mut();
+    let Some(fd) = inner.alloc_fd() else {
+        return Err(EMFILE);
+    };
+    inner.fd_table[fd] = Some(file);
+    inner.fd_flags[fd] = open_fd_flags(flags, o_path);
+    Ok(fd)
 }
 
 fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
@@ -1554,23 +1593,10 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             } else {
                 return ENOENT;
             };
-        let process = current_files_process();
-        let mut inner = process.borrow_mut();
-        let Some(fd) = inner.alloc_fd() else {
-            return EMFILE;
+        let fd = match install_open_file_fd(file, flags, o_path) {
+            Ok(fd) => fd,
+            Err(e) => return e,
         };
-        inner.fd_table[fd] = Some(file);
-        let mut fd_flags = 0u32;
-        if (flags & O_CLOEXEC) != 0 {
-            fd_flags |= FD_CLOEXEC;
-        }
-        if (flags & O_NONBLOCK) != 0 {
-            fd_flags |= O_NONBLOCK as u32;
-        }
-        if o_path {
-            fd_flags |= O_PATH as u32;
-        }
-        inner.fd_flags[fd] = fd_flags;
         if crate::debug_config::DEBUG_FS {
             let pid = current_process().getpid();
             if abs == "/proc" || abs == "/sys" || abs == "/dev" {
@@ -1591,23 +1617,10 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             drop(_ext4_guard);
             let file: alloc::sync::Arc<dyn File + Send + Sync> =
                 alloc::sync::Arc::new(PseudoDir::new("/", entries));
-            let process = current_files_process();
-            let mut inner = process.borrow_mut();
-            let Some(fd) = inner.alloc_fd() else {
-                return EMFILE;
+            let fd = match install_open_file_fd(file, flags, o_path) {
+                Ok(fd) => fd,
+                Err(e) => return e,
             };
-            inner.fd_table[fd] = Some(file);
-            let mut fd_flags = 0u32;
-            if (flags & O_CLOEXEC) != 0 {
-                fd_flags |= FD_CLOEXEC;
-            }
-            if (flags & O_NONBLOCK) != 0 {
-                fd_flags |= O_NONBLOCK as u32;
-            }
-            if o_path {
-                fd_flags |= O_PATH as u32;
-            }
-            inner.fd_flags[fd] = fd_flags;
             return fd as isize;
         }
     }
@@ -1858,23 +1871,10 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     ));
     crate::fs::debug_track_iozone_inode(&path, inode_num);
     drop(ext4_guard);
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd) = inner.alloc_fd() else {
-        return EMFILE;
+    let fd = match install_open_file_fd(os_inode, flags, o_path) {
+        Ok(fd) => fd,
+        Err(e) => return e,
     };
-    inner.fd_table[fd] = Some(os_inode);
-    let mut fd_flags = 0u32;
-    if (flags & O_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
-    }
-    if (flags & O_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK as u32;
-    }
-    if o_path {
-        fd_flags |= O_PATH as u32;
-    }
-    inner.fd_flags[fd] = fd_flags;
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
         if path == "." || path == "/proc" || path == "/proc/" {
@@ -2716,6 +2716,13 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     if !file.readable() {
         return EBADF;
     }
+    if fd_has_nonblock(fd) {
+        if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+            if !pipe.poll_readable() {
+                return EAGAIN;
+            }
+        }
+    }
     let buf = UserBuffer::new(translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
@@ -2734,6 +2741,13 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     };
     if !file.writable() {
         return EBADF;
+    }
+    if fd_has_nonblock(fd) {
+        if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+            if !pipe.poll_writable() {
+                return EAGAIN;
+            }
+        }
     }
     let mut write_len = len;
     let mut hit_fsize_limit = false;

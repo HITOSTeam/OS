@@ -1,14 +1,17 @@
 use crate::{
     config::clock_freq,
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    mm::{read_user_value, try_read_user_value, try_write_user_value, write_user_value},
+    mm::{
+        read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
+        try_write_user_value, write_user_value,
+    },
     syscall::thread,
     task::block_sleep::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
     },
     task::processor::{current_files_process, current_process, current_task},
-    task::signal::SIGALRM_NUM,
+    task::signal::{has_unmasked_pending, signal_bit, SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM},
     time::get_time,
     trap::get_current_token,
 };
@@ -108,6 +111,13 @@ struct TimeZone {
 struct TimeSpec {
     sec: i64,
     nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PSelectSigmaskArg {
+    sigmask_ptr: usize,
+    sigset_size: usize,
 }
 
 #[repr(C)]
@@ -745,67 +755,176 @@ pub fn syscall_pselect6(
 ) -> isize {
     const EBADF: isize = -9;
     const MAX_FDSET_BYTES: usize = 256 * 1024;
-
+    if (_nfds as isize) < 0 {
+        return EINVAL;
+    }
+    if _nfds > i32::MAX as usize {
+        return EINVAL;
+    }
     let nfds = _nfds;
     let readfds = _readfds;
     let writefds = _writefds;
     let exceptfds = _exceptfds;
 
-    // Sleep primitive: `pselect6(0, NULL, NULL, NULL, &ts, NULL)`.
-    if (nfds == 0 || (readfds == 0 && writefds == 0 && exceptfds == 0)) && timeout_ptr != 0 {
-        let _ = syscall_nanosleep(timeout_ptr, 0);
-        return 0;
-    }
-
-    if nfds == 0 {
-        crate::task::processor::suspend_current_and_run_next();
-        return 0;
-    }
-
-    let token = crate::trap::get_current_token();
+    let token = get_current_token();
     let process = current_files_process();
+    let task = current_task().unwrap();
 
-    // Use a byte-sized bitmap (nfds bits).
-    let bytes_len_full = (nfds + 7) / 8;
-    let bytes_len = bytes_len_full.min(MAX_FDSET_BYTES);
-    let max_fds = bytes_len * 8;
-    let mut in_r = alloc::vec![0u8; bytes_len];
-    let mut in_w = alloc::vec![0u8; bytes_len];
-    let mut out_r = alloc::vec![0u8; bytes_len];
-    let mut out_w = alloc::vec![0u8; bytes_len];
-
-    if readfds != 0 {
-        crate::mm::copy_from_user(token, readfds as *const u8, in_r.as_mut_slice());
+    let mut restore_mask = None;
+    if _sigmask != 0 {
+        let Some(arg) =
+            try_read_user_value::<PSelectSigmaskArg>(token, _sigmask as *const PSelectSigmaskArg)
+        else {
+            return EFAULT;
+        };
+        if arg.sigset_size < core::mem::size_of::<u64>() {
+            return EINVAL;
+        }
+        let mut new_mask = 0u64;
+        if arg.sigmask_ptr != 0 {
+            let Some(mask) = try_read_user_value::<u64>(token, arg.sigmask_ptr as *const u64)
+            else {
+                return EFAULT;
+            };
+            new_mask = mask;
+        }
+        let sigkill_bit = signal_bit(SIGKILL_NUM).unwrap_or(0);
+        let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
+        new_mask &= !(sigkill_bit | sigstop_bit);
+        let old_mask = {
+            let mut inner = task.borrow_mut();
+            let old = inner.signal_mask;
+            inner.signal_mask = new_mask;
+            old
+        };
+        restore_mask = Some(old_mask);
     }
-    if writefds != 0 {
-        crate::mm::copy_from_user(token, writefds as *const u8, in_w.as_mut_slice());
-    }
 
-    // If a timeout is provided, we must return early when fds become ready.
-    // Avoid relying on `nanosleep()` here (which can oversleep) and instead
-    // cooperatively yield until either an fd becomes ready or the deadline hits.
-    let deadline_ms = if timeout_ptr == 0 {
+    let deadline_ns = if timeout_ptr == 0 {
         None
     } else {
-        let ts = read_user_value(token, timeout_ptr as *const TimeSpec);
-        let ms = (ts.sec.max(0) as usize)
-            .saturating_mul(1000)
-            .saturating_add((ts.nsec.max(0) as usize) / 1_000_000);
-        Some(crate::time::get_time_ms().saturating_add(ms))
+        let Some(ts) = try_read_user_value::<TimeSpec>(token, timeout_ptr as *const TimeSpec)
+        else {
+            if let Some(old_mask) = restore_mask {
+                let mut inner = task.borrow_mut();
+                inner.signal_mask = old_mask;
+            }
+            return EFAULT;
+        };
+        let Some(delta_ns) = timespec_to_ns(ts) else {
+            if let Some(old_mask) = restore_mask {
+                let mut inner = task.borrow_mut();
+                inner.signal_mask = old_mask;
+            }
+            return EINVAL;
+        };
+        Some(now_ns().saturating_add(delta_ns))
     };
-    loop {
+
+    if nfds == 0 {
+        let ret = loop {
+            let (pending, mask) = {
+                let inner = task.borrow_mut();
+                (inner.pending_signals, inner.signal_mask)
+            };
+            if has_unmasked_pending(pending, mask, false) {
+                break EINTR;
+            }
+            if let Some(deadline) = deadline_ns {
+                if now_ns() >= deadline {
+                    break 0;
+                }
+                crate::task::processor::suspend_current_and_run_next();
+            } else {
+                crate::task::processor::block_current_and_run_next();
+            }
+        };
+        if let Some(old_mask) = restore_mask {
+            let mut inner = task.borrow_mut();
+            inner.signal_mask = old_mask;
+        }
+        return ret;
+    }
+
+    let bytes_len = (nfds + 7) / 8;
+    if bytes_len > MAX_FDSET_BYTES {
+        if let Some(old_mask) = restore_mask {
+            let mut inner = task.borrow_mut();
+            inner.signal_mask = old_mask;
+        }
+        return EINVAL;
+    }
+
+    let mut in_r = alloc::vec![0u8; bytes_len];
+    let mut in_w = alloc::vec![0u8; bytes_len];
+    let mut in_e = alloc::vec![0u8; bytes_len];
+    let mut out_r = alloc::vec![0u8; bytes_len];
+    let mut out_w = alloc::vec![0u8; bytes_len];
+    let mut out_e = alloc::vec![0u8; bytes_len];
+
+    if readfds != 0 && try_copy_from_user(token, readfds as *const u8, in_r.as_mut_slice()).is_err()
+    {
+        if let Some(old_mask) = restore_mask {
+            let mut inner = task.borrow_mut();
+            inner.signal_mask = old_mask;
+        }
+        return EFAULT;
+    }
+    if writefds != 0
+        && try_copy_from_user(token, writefds as *const u8, in_w.as_mut_slice()).is_err()
+    {
+        if let Some(old_mask) = restore_mask {
+            let mut inner = task.borrow_mut();
+            inner.signal_mask = old_mask;
+        }
+        return EFAULT;
+    }
+    if exceptfds != 0
+        && try_copy_from_user(token, exceptfds as *const u8, in_e.as_mut_slice()).is_err()
+    {
+        if let Some(old_mask) = restore_mask {
+            let mut inner = task.borrow_mut();
+            inner.signal_mask = old_mask;
+        }
+        return EFAULT;
+    }
+
+    let write_sets = |r: &[u8], w: &[u8], e: &[u8]| -> isize {
+        if readfds != 0 && try_copy_to_user(token, readfds as *mut u8, r).is_err() {
+            return EFAULT;
+        }
+        if writefds != 0 && try_copy_to_user(token, writefds as *mut u8, w).is_err() {
+            return EFAULT;
+        }
+        if exceptfds != 0 && try_copy_to_user(token, exceptfds as *mut u8, e).is_err() {
+            return EFAULT;
+        }
+        0
+    };
+
+    let ret = loop {
+        let (pending, mask) = {
+            let inner = task.borrow_mut();
+            (inner.pending_signals, inner.signal_mask)
+        };
+        if has_unmasked_pending(pending, mask, false) {
+            break EINTR;
+        }
+
         let mut ready = 0isize;
         out_r.fill(0);
         out_w.fill(0);
+        out_e.fill(0);
 
-        let limit = core::cmp::min(nfds, max_fds);
-        for fd in 0..limit {
+        let mut bad_fd = false;
+        for fd in 0..nfds {
             let byte = fd / 8;
             let bit = fd % 8;
             let mask = 1u8 << bit;
             let want_r = readfds != 0 && (in_r[byte] & mask) != 0;
             let want_w = writefds != 0 && (in_w[byte] & mask) != 0;
-            if !want_r && !want_w {
+            let want_e = exceptfds != 0 && (in_e[byte] & mask) != 0;
+            if !want_r && !want_w && !want_e {
                 continue;
             }
             let file = {
@@ -817,24 +936,11 @@ pub fn syscall_pselect6(
                 }
             };
             let Some(file) = file else {
-                return EBADF;
+                bad_fd = true;
+                break;
             };
 
-            let mut r_ok = false;
-            let mut w_ok = false;
-            if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
-                r_ok = pipe.poll_readable();
-                w_ok = pipe.poll_writable();
-            } else if let Some(sp) = file.as_any().downcast_ref::<crate::fs::SocketPairEnd>() {
-                r_ok = sp.poll_readable();
-                w_ok = sp.poll_writable();
-            } else if let Some(ns) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
-                r_ok = ns.poll_readable();
-                w_ok = ns.poll_writable();
-            } else {
-                r_ok = file.readable();
-                w_ok = file.writable();
-            }
+            let (r_ok, w_ok) = crate::syscall::net::poll_file_read_write(&file);
 
             if want_r && r_ok {
                 out_r[byte] |= mask;
@@ -846,34 +952,35 @@ pub fn syscall_pselect6(
             }
         }
 
-        // Always clear exceptfds (we don't model exceptions).
-        if exceptfds != 0 {
-            let zeros = alloc::vec![0u8; bytes_len];
-            crate::mm::copy_to_user(token, exceptfds as *mut u8, zeros.as_slice());
+        if bad_fd {
+            break EBADF;
         }
 
         if ready != 0 {
-            if readfds != 0 {
-                crate::mm::copy_to_user(token, readfds as *mut u8, out_r.as_slice());
+            let wr = write_sets(&out_r, &out_w, &out_e);
+            if wr != 0 {
+                break wr;
             }
-            if writefds != 0 {
-                crate::mm::copy_to_user(token, writefds as *mut u8, out_w.as_slice());
-            }
-            return ready;
+            break ready;
         }
 
-        if let Some(deadline) = deadline_ms {
-            if crate::time::get_time_ms() >= deadline {
-                if readfds != 0 {
-                    crate::mm::copy_to_user(token, readfds as *mut u8, out_r.as_slice());
+        if let Some(deadline) = deadline_ns {
+            if now_ns() >= deadline {
+                let wr = write_sets(&out_r, &out_w, &out_e);
+                if wr != 0 {
+                    break wr;
                 }
-                if writefds != 0 {
-                    crate::mm::copy_to_user(token, writefds as *mut u8, out_w.as_slice());
-                }
-                return 0;
+                break 0;
             }
         }
 
         crate::task::processor::suspend_current_and_run_next();
+    };
+
+    if let Some(old_mask) = restore_mask {
+        let mut inner = task.borrow_mut();
+        inner.signal_mask = old_mask;
     }
+
+    ret
 }
