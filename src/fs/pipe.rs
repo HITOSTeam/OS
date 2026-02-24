@@ -61,12 +61,42 @@ impl Pipe {
         ring.available_write() >= ring.poll_writable_threshold() || ring.all_read_ends_closed()
     }
 
+    pub fn available_read(&self) -> usize {
+        if !self.readable {
+            return 0;
+        }
+        self.buffer.lock().available_read()
+    }
+
+    pub fn available_write(&self) -> usize {
+        if !self.writable {
+            return 0;
+        }
+        self.buffer.lock().available_write()
+    }
+
     pub fn pipe_size(&self) -> usize {
         self.buffer.lock().pipe_size()
     }
 
     pub fn set_pipe_size(&self, size: usize) -> Result<usize, isize> {
         self.buffer.lock().set_pipe_size(size)
+    }
+
+    pub fn set_end_ref_bias(&self, read_bias: usize, write_bias: usize) {
+        self.buffer.lock().set_end_ref_bias(read_bias, write_bias);
+    }
+
+    pub fn open_read_end_count(&self) -> usize {
+        self.buffer.lock().read_end_count()
+    }
+
+    pub fn open_write_end_count(&self) -> usize {
+        self.buffer.lock().write_end_count()
+    }
+
+    pub fn all_read_ends_closed(&self) -> bool {
+        self.buffer.lock().all_read_ends_closed()
     }
 }
 #[derive(Copy, Clone, PartialEq)]
@@ -84,6 +114,8 @@ pub struct PipeRingBuffer {
     status: RingBufferStatus,
     read_end: Option<Weak<Pipe>>,
     write_end: Option<Weak<Pipe>>,
+    read_end_ref_bias: usize,
+    write_end_ref_bias: usize,
     read_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
     write_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
 }
@@ -98,6 +130,8 @@ impl PipeRingBuffer {
             status: RingBufferStatus::EMPTY,
             read_end: None,
             write_end: None,
+            read_end_ref_bias: 0,
+            write_end_ref_bias: 0,
             read_waiters: VecDeque::new(),
             write_waiters: VecDeque::new(),
         }
@@ -109,6 +143,11 @@ impl PipeRingBuffer {
     }
     pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
         self.write_end = Some(Arc::downgrade(write_end));
+    }
+
+    pub fn set_end_ref_bias(&mut self, read_bias: usize, write_bias: usize) {
+        self.read_end_ref_bias = read_bias;
+        self.write_end_ref_bias = write_bias;
     }
     /// 环状队列 读取字节
     pub fn read_byte(&mut self) -> u8 {
@@ -204,25 +243,31 @@ impl PipeRingBuffer {
     }
     /// 通过weak Ptr 判断是否所有写端都关闭
     pub fn all_write_ends_closed(&self) -> bool {
-        self.write_end.as_ref().unwrap().upgrade().is_none()
+        match self.write_end.as_ref() {
+            Some(end) => end.strong_count() <= self.write_end_ref_bias,
+            None => true,
+        }
     }
 
     /// 通过weak Ptr 判断是否所有读端都关闭
     pub fn all_read_ends_closed(&self) -> bool {
-        self.read_end.as_ref().unwrap().upgrade().is_none()
+        match self.read_end.as_ref() {
+            Some(end) => end.strong_count() <= self.read_end_ref_bias,
+            None => true,
+        }
     }
 
     fn read_end_count(&self) -> usize {
         self.read_end
             .as_ref()
-            .map(|w| w.strong_count())
+            .map(|w| w.strong_count().saturating_sub(self.read_end_ref_bias))
             .unwrap_or(0)
     }
 
     fn write_end_count(&self) -> usize {
         self.write_end
             .as_ref()
-            .map(|w| w.strong_count())
+            .map(|w| w.strong_count().saturating_sub(self.write_end_ref_bias))
             .unwrap_or(0)
     }
 

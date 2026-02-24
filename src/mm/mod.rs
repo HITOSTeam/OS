@@ -48,7 +48,8 @@ pub use memory_set::{ElfAux, KERNEL_SPACE, MapPermission, MemorySet};
 pub use page_table::{PTEFlags, PageTable};
 pub use page_table::{
     PageTableEntry, copy_from_user, copy_to_user, read_user_value, translated_byte_buffer,
-    translated_mutref, translated_single_address, translated_str, write_user_value,
+    translated_mutref, translated_single_address, translated_str, try_translated_byte_buffer,
+    write_user_value,
 };
 pub use page_table::{
     try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,

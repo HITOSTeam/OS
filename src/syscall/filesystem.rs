@@ -11,19 +11,20 @@ use spin::Mutex;
 use crate::task::manager::PID2PCB;
 use crate::{
     fs::{
-        ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode, shm_create,
-        shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock,
-        PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
+        File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent,
+        PseudoFile, PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file,
+        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
     },
     mm::{
-        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
-        translated_str, try_copy_from_user, try_copy_to_user, try_read_user_value,
-        try_write_user_value, write_user_value, MapPermission, UserBuffer,
+        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
+        translated_byte_buffer, translated_mutref, translated_str, try_copy_from_user,
+        try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_user_value,
+        write_user_value,
     },
     task::processor::{current_files_process, current_process},
     task::{
-        signal::{queue_process_signal, SIGXFSZ_NUM},
         ProcessControlBlock,
+        signal::{SIGXFSZ_NUM, queue_process_signal},
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -86,6 +87,7 @@ const EEXIST: isize = -17;
 const EXDEV: isize = -18;
 const EIO: isize = -5;
 const ESPIPE: isize = -29;
+const EPIPE: isize = -32;
 const EROFS: isize = -30;
 const ENOSPC: isize = -28;
 const ENOSYS: isize = -38;
@@ -99,6 +101,7 @@ const XATTR_CREATE: usize = 0x1;
 const XATTR_REPLACE: usize = 0x2;
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
+const PIPE_BUF: usize = 4096;
 
 // fs/ioctl.h flags consumed by setxattr03.
 const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
@@ -144,11 +147,103 @@ struct AcctState {
     inode: alloc::sync::Arc<ext4_fs::Inode>,
 }
 
+struct FifoDuplexFile {
+    read_end: Arc<Pipe>,
+    write_end: Arc<Pipe>,
+}
+
+impl FifoDuplexFile {
+    fn new(read_end: Arc<Pipe>, write_end: Arc<Pipe>) -> Self {
+        Self {
+            read_end,
+            write_end,
+        }
+    }
+
+    fn write_end_closed(&self) -> bool {
+        self.write_end.all_read_ends_closed()
+    }
+
+    fn poll_readable(&self) -> bool {
+        self.read_end.poll_readable()
+    }
+
+    fn poll_writable(&self) -> bool {
+        self.write_end.poll_writable()
+    }
+
+    fn available_write(&self) -> usize {
+        self.write_end.available_write()
+    }
+}
+
+impl File for FifoDuplexFile {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, buf: UserBuffer) -> usize {
+        self.read_end.read(buf)
+    }
+
+    fn write(&self, buf: UserBuffer) -> usize {
+        self.write_end.write(buf)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+struct FifoPipeState {
+    read_end: Arc<Pipe>,
+    write_end: Arc<Pipe>,
+}
+
+impl FifoPipeState {
+    fn new() -> Self {
+        let (read_end, write_end) = make_pipe();
+        // Keep one registry reference to each end, but exclude it from
+        // "open-end" accounting so EOF/EPIPE semantics still track real FDs.
+        read_end.set_end_ref_bias(1, 1);
+        Self {
+            read_end,
+            write_end,
+        }
+    }
+
+    fn has_open_readers(&self) -> bool {
+        self.read_end.open_read_end_count() > 0
+    }
+
+    fn has_open_writers(&self) -> bool {
+        self.write_end.open_write_end_count() > 0
+    }
+
+    fn open_file(&self, accmode: usize) -> Option<Arc<dyn File + Send + Sync>> {
+        match accmode {
+            O_RDONLY => Some(self.read_end.clone()),
+            O_WRONLY => Some(self.write_end.clone()),
+            O_RDWR => Some(Arc::new(FifoDuplexFile::new(
+                self.read_end.clone(),
+                self.write_end.clone(),
+            ))),
+            _ => None,
+        }
+    }
+}
+
 lazy_static! {
     static ref INODE_TIMES: Mutex<BTreeMap<u64, InodeTimes>> = Mutex::new(BTreeMap::new());
     static ref INODE_XATTRS: Mutex<BTreeMap<u64, BTreeMap<String, Vec<u8>>>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_FSFLAGS: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
+    static ref FIFO_PIPE_STATES: Mutex<BTreeMap<u64, Arc<FifoPipeState>>> =
+        Mutex::new(BTreeMap::new());
     static ref ROFS_MOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static ref ACCT_STATE: Mutex<Option<AcctState>> = Mutex::new(None);
 }
@@ -499,6 +594,21 @@ fn install_open_file_fd(
     inner.fd_table[fd] = Some(file);
     inner.fd_flags[fd] = open_fd_flags(flags, o_path);
     Ok(fd)
+}
+
+fn fifo_pipe_state_for_inode(inode_num: u64) -> Arc<FifoPipeState> {
+    let mut states = FIFO_PIPE_STATES.lock();
+    if let Some(state) = states.get(&inode_num) {
+        // Drop idle state so reopened FIFOs start with an empty buffer.
+        if !state.has_open_readers() && !state.has_open_writers() {
+            states.remove(&inode_num);
+        } else {
+            return state.clone();
+        }
+    }
+    let state = Arc::new(FifoPipeState::new());
+    states.insert(inode_num, state.clone());
+    state
 }
 
 fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
@@ -2076,12 +2186,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         }
     }
 
-    // FIFO write end with `O_NONBLOCK` and no reader should fail with ENXIO.
-    // We currently model this conservatively as always ENXIO for this flag combo.
-    if inode.is_fifo() && (flags & O_NONBLOCK) != 0 && (flags & O_ACCMODE) == O_WRONLY {
-        return ENXIO;
-    }
-
     // Basic permission check based on owner/group/other bits.
     let mut mask = 0usize;
     if readable {
@@ -2118,6 +2222,25 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             return ext4_err_to_errno(e);
         }
         touch_inode_mtime_ctime_now(&inode);
+    }
+
+    if !o_path && inode.is_fifo() {
+        let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
+        let accmode = flags & O_ACCMODE;
+        if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
+            drop(ext4_guard);
+            return ENXIO;
+        }
+        let Some(file) = state.open_file(accmode) else {
+            drop(ext4_guard);
+            return EINVAL;
+        };
+        drop(ext4_guard);
+        let fd = match install_open_file_fd(file, flags, o_path) {
+            Ok(fd) => fd,
+            Err(e) => return e,
+        };
+        return fd as isize;
     }
 
     let inode_num = inode.inode_num();
@@ -3153,19 +3276,39 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     if !file.readable() {
         return EBADF;
     }
+    if len == 0 {
+        return 0;
+    }
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = os_inode.ext4_inode();
+        let is_dir = {
+            let _ext4_guard = ext4_lock();
+            inode.is_dir()
+        };
+        if is_dir {
+            return EISDIR;
+        }
+    }
     if fd_has_nonblock(fd) {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
             if !pipe.poll_readable() {
                 return EAGAIN;
             }
+        } else if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
+            if !duplex.poll_readable() {
+                return EAGAIN;
+            }
         }
     }
-    let buf = UserBuffer::new(translated_byte_buffer(
+    let Ok(user_bufs) = try_translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
         len,
         MapPermission::W,
-    ));
+    ) else {
+        return EFAULT;
+    };
+    let buf = UserBuffer::new(user_bufs);
     file.read(buf) as isize
 }
 
@@ -3179,14 +3322,43 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if !file.writable() {
         return EBADF;
     }
+    if len == 0 {
+        return 0;
+    }
+    let mut write_len = len;
     if fd_has_nonblock(fd) {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
-            if !pipe.poll_writable() {
+            if pipe.all_read_ends_closed() {
+                return EPIPE;
+            }
+            let avail = pipe.available_write();
+            if avail == 0 {
                 return EAGAIN;
+            }
+            if write_len <= PIPE_BUF {
+                if avail < write_len {
+                    return EAGAIN;
+                }
+            } else {
+                write_len = write_len.min(avail);
+            }
+        } else if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
+            if duplex.write_end_closed() {
+                return EPIPE;
+            }
+            let avail = duplex.available_write();
+            if avail == 0 {
+                return EAGAIN;
+            }
+            if write_len <= PIPE_BUF {
+                if avail < write_len {
+                    return EAGAIN;
+                }
+            } else {
+                write_len = write_len.min(avail);
             }
         }
     }
-    let mut write_len = len;
     let mut hit_fsize_limit = false;
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let fsize_limit = {
@@ -3208,13 +3380,35 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             }
         }
     }
-    let buf = UserBuffer::new(translated_byte_buffer(
+    let Ok(user_bufs) = try_translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
         write_len,
         MapPermission::R,
-    ));
+    ) else {
+        return EFAULT;
+    };
+    let buf = UserBuffer::new(user_bufs);
     let written = file.write(buf) as isize;
+    if written == 0 && write_len > 0 {
+        if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+            if pipe.all_read_ends_closed() {
+                return EPIPE;
+            }
+        }
+        if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
+            if duplex.write_end_closed() {
+                return EPIPE;
+            }
+        }
+    }
+    if written > 0 {
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            if os_inode.flush().is_err() {
+                return EIO;
+            }
+        }
+    }
     if hit_fsize_limit {
         let pid = current_process().getpid();
         queue_process_signal(pid, SIGXFSZ_NUM);
@@ -5749,12 +5943,15 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
         let inode_num = inode.inode_num();
-        let (is_dir, mut end) = {
+        let (is_dir, is_fifo, mut end) = {
             let _ext4_guard = ext4_lock();
             let disk = inode.size() as usize;
             let end = core::cmp::max(disk, os_inode.pending_write_end()) as isize;
-            (inode.is_dir(), end)
+            (inode.is_dir(), inode.is_fifo(), end)
         };
+        if is_fifo {
+            return ESPIPE;
+        }
         if !is_dir {
             if let Some(kind) = crate::fs::proc_file_kind(inode_num) {
                 end = crate::fs::proc_file_len(&kind) as isize;

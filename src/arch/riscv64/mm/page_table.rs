@@ -510,3 +510,37 @@ pub fn translated_byte_buffer(
     }
     v
 }
+
+/// Fallible variant of `translated_byte_buffer`.
+///
+/// Returns `Err(())` when the range is invalid instead of terminating
+/// the current task.
+pub fn try_translated_byte_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: MapPermission,
+) -> Result<Vec<&'static mut [u8]>, ()> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut start = ptr as usize;
+    let end = start.checked_add(len).ok_or(())?;
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = resolve_user_pte(token, start, access)?;
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.into();
+    }
+    Ok(v)
+}
