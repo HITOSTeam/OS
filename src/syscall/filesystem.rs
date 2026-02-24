@@ -11,19 +11,20 @@ use spin::Mutex;
 use crate::task::manager::PID2PCB;
 use crate::{
     fs::{
-        ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode, shm_create,
-        shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock,
-        PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
+        File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent,
+        PseudoFile, PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file,
+        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
     },
     mm::{
-        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
-        translated_str, try_copy_to_user, try_read_user_value, try_write_user_value,
-        write_user_value, MapPermission, UserBuffer,
+        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
+        translated_byte_buffer, translated_mutref, translated_str, try_copy_from_user,
+        try_copy_to_user,
+        try_read_user_value, try_write_user_value, write_user_value,
     },
     task::processor::{current_files_process, current_process},
     task::{
-        signal::{queue_process_signal, SIGXFSZ_NUM},
         ProcessControlBlock,
+        signal::{SIGXFSZ_NUM, queue_process_signal},
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -71,9 +72,11 @@ const EBADF: isize = -9;
 const EFAULT: isize = -14;
 const EFBIG: isize = -27;
 const EAGAIN: isize = -11;
+const E2BIG: isize = -7;
 const ELOOP: isize = -40;
 const EPERM: isize = -1;
 const ENOENT: isize = -2;
+const ENODATA: isize = -61;
 const EINVAL: isize = -22;
 const ERANGE: isize = -34;
 const EMFILE: isize = -24;
@@ -92,6 +95,15 @@ const ENXIO: isize = -6;
 const EOPNOTSUPP: isize = -95;
 const ENOTEMPTY: isize = -39;
 const EOVERFLOW: isize = -75;
+
+const XATTR_CREATE: usize = 0x1;
+const XATTR_REPLACE: usize = 0x2;
+const XATTR_NAME_MAX: usize = 255;
+const XATTR_SIZE_MAX: usize = 65536;
+
+// fs/ioctl.h flags consumed by setxattr03.
+const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+const FS_APPEND_FL: u32 = 0x0000_0020;
 
 static TMPFILE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -135,6 +147,9 @@ struct AcctState {
 
 lazy_static! {
     static ref INODE_TIMES: Mutex<BTreeMap<u64, InodeTimes>> = Mutex::new(BTreeMap::new());
+    static ref INODE_XATTRS: Mutex<BTreeMap<u64, BTreeMap<String, Vec<u8>>>> =
+        Mutex::new(BTreeMap::new());
+    static ref INODE_FSFLAGS: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
     static ref ROFS_MOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static ref ACCT_STATE: Mutex<Option<AcctState>> = Mutex::new(None);
 }
@@ -171,6 +186,22 @@ fn touch_inode_mtime_ctime_now(inode: &Arc<ext4_fs::Inode>) {
     times.ctime_sec = sec;
     times.ctime_nsec = nsec;
     set_inode_times(ino, times);
+}
+
+pub(crate) fn inode_fs_flags(ino: u64) -> u32 {
+    INODE_FSFLAGS.lock().get(&ino).copied().unwrap_or(0)
+}
+
+pub(crate) fn set_inode_fs_flags(ino: u64, flags: u32) {
+    if flags == 0 {
+        INODE_FSFLAGS.lock().remove(&ino);
+    } else {
+        INODE_FSFLAGS.lock().insert(ino, flags);
+    }
+}
+
+fn inode_is_immutable_or_append(inode: &Arc<ext4_fs::Inode>) -> bool {
+    (inode_fs_flags(inode.inode_num() as u64) & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0
 }
 
 pub(crate) fn register_rofs_mount(abs: &str) {
@@ -744,6 +775,192 @@ fn read_user_cstring(token: usize, ptr: usize) -> Result<String, isize> {
         }
     }
     Err(ENAMETOOLONG)
+}
+
+fn validate_xattr_name(name: &str) -> Result<(), isize> {
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return Err(ERANGE);
+    }
+    let Some((ns, key)) = name.split_once('.') else {
+        return Err(EINVAL);
+    };
+    if ns.is_empty() || key.is_empty() {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+fn read_user_xattr_name(token: usize, ptr: usize) -> Result<String, isize> {
+    let name = read_user_cstring(token, ptr)?;
+    validate_xattr_name(&name)?;
+    Ok(name)
+}
+
+fn read_user_xattr_value(token: usize, value: usize, size: usize) -> Result<Vec<u8>, isize> {
+    if size > XATTR_SIZE_MAX {
+        return Err(E2BIG);
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    if value == 0 {
+        return Err(EFAULT);
+    }
+    let mut out = vec![0u8; size];
+    if try_copy_from_user(token, value as *const u8, out.as_mut_slice()).is_err() {
+        return Err(EFAULT);
+    }
+    Ok(out)
+}
+
+fn xattr_is_user_namespace(name: &str) -> bool {
+    name.starts_with("user.")
+}
+
+fn inode_supports_user_xattr(inode: &Arc<ext4_fs::Inode>) -> bool {
+    inode.is_file() || inode.is_dir()
+}
+
+fn resolve_xattr_path_inode(path_ptr: usize, follow_final: bool) -> Result<Arc<ext4_fs::Inode>, isize> {
+    let token = get_current_token();
+    let path = read_user_cstring(token, path_ptr)?;
+    let at = resolve_at_path(AT_FDCWD, &path)?;
+    if matches!(at, AtPath::PseudoAbs(_)) {
+        return Err(ENOENT);
+    }
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    resolve_at_inode(&at, fsuid, fsgid, follow_final)
+}
+
+fn resolve_xattr_fd_inode(fd: usize) -> Result<Arc<ext4_fs::Inode>, isize> {
+    if fd_has_o_path(fd) {
+        return Err(EBADF);
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return Err(EBADF);
+    };
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return Err(EBADF);
+    };
+    Ok(os_inode.ext4_inode())
+}
+
+fn do_setxattr(inode: &Arc<ext4_fs::Inode>, name: &str, value: &[u8], flags: usize) -> isize {
+    let valid_flags = XATTR_CREATE | XATTR_REPLACE;
+    if (flags & !valid_flags) != 0 || (flags & valid_flags) == valid_flags {
+        return EINVAL;
+    }
+    if xattr_is_user_namespace(name) && !inode_supports_user_xattr(inode) {
+        return EPERM;
+    }
+    if inode_is_immutable_or_append(inode) {
+        return EPERM;
+    }
+
+    let ino = inode.inode_num() as u64;
+    let mut all = INODE_XATTRS.lock();
+    let attrs = all.entry(ino).or_default();
+    let exists = attrs.contains_key(name);
+    if (flags & XATTR_CREATE) != 0 && exists {
+        return EEXIST;
+    }
+    if (flags & XATTR_REPLACE) != 0 && !exists {
+        return ENODATA;
+    }
+    attrs.insert(String::from(name), value.to_vec());
+    drop(all);
+    touch_inode_mtime_ctime_now(inode);
+    0
+}
+
+fn do_getxattr(
+    inode: &Arc<ext4_fs::Inode>,
+    name: &str,
+    value_ptr: usize,
+    size: usize,
+    token: usize,
+) -> isize {
+    if xattr_is_user_namespace(name) && !inode_supports_user_xattr(inode) {
+        return ENODATA;
+    }
+    let value = {
+        let all = INODE_XATTRS.lock();
+        let Some(attrs) = all.get(&(inode.inode_num() as u64)) else {
+            return ENODATA;
+        };
+        let Some(val) = attrs.get(name) else {
+            return ENODATA;
+        };
+        val.clone()
+    };
+
+    if size == 0 {
+        return value.len() as isize;
+    }
+    if size < value.len() {
+        return ERANGE;
+    }
+    if value_ptr == 0 {
+        return EFAULT;
+    }
+    if try_copy_to_user(token, value_ptr as *mut u8, value.as_slice()).is_err() {
+        return EFAULT;
+    }
+    value.len() as isize
+}
+
+fn do_listxattr(inode: &Arc<ext4_fs::Inode>, list_ptr: usize, size: usize, token: usize) -> isize {
+    let data = {
+        let mut out = Vec::new();
+        let all = INODE_XATTRS.lock();
+        if let Some(attrs) = all.get(&(inode.inode_num() as u64)) {
+            for name in attrs.keys() {
+                out.extend_from_slice(name.as_bytes());
+                out.push(0);
+            }
+        }
+        out
+    };
+
+    if size == 0 {
+        return data.len() as isize;
+    }
+    if size < data.len() {
+        return ERANGE;
+    }
+    if !data.is_empty() && list_ptr == 0 {
+        return EFAULT;
+    }
+    if !data.is_empty() && try_copy_to_user(token, list_ptr as *mut u8, data.as_slice()).is_err() {
+        return EFAULT;
+    }
+    data.len() as isize
+}
+
+fn do_removexattr(inode: &Arc<ext4_fs::Inode>, name: &str) -> isize {
+    if xattr_is_user_namespace(name) && !inode_supports_user_xattr(inode) {
+        return ENODATA;
+    }
+    if inode_is_immutable_or_append(inode) {
+        return EPERM;
+    }
+
+    let ino = inode.inode_num() as u64;
+    let mut all = INODE_XATTRS.lock();
+    let Some(attrs) = all.get_mut(&ino) else {
+        return ENODATA;
+    };
+    if attrs.remove(name).is_none() {
+        return ENODATA;
+    }
+    let became_empty = attrs.is_empty();
+    if became_empty {
+        all.remove(&ino);
+    }
+    drop(all);
+    touch_inode_mtime_ctime_now(inode);
+    0
 }
 
 fn resolve_ext4_path(
@@ -1370,6 +1587,8 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_GETFL: usize = 3;
     const F_SETFL: usize = 4;
     const F_DUPFD_CLOEXEC: usize = 1030;
+    const F_SETPIPE_SZ: usize = 1031;
+    const F_GETPIPE_SZ: usize = 1032;
 
     let ret = match cmd {
         F_GETFD => {
@@ -1444,6 +1663,33 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 }
             }
             flags as isize
+        }
+        F_SETPIPE_SZ => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                return EINVAL;
+            };
+            match pipe.set_pipe_size(arg) {
+                Ok(sz) => sz as isize,
+                Err(e) => e,
+            }
+        }
+        F_GETPIPE_SZ => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                return EINVAL;
+            };
+            pipe.pipe_size() as isize
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let process = current_files_process();
@@ -2315,18 +2561,172 @@ pub fn syscall_fchownat(
     0
 }
 
-/// Linux `fgetxattr(2)` (syscall 10 on riscv64).
-///
-/// For now we only need the fd-level semantics used by LTP `open13`:
-/// operations on `O_PATH` descriptors must fail with `EBADF`.
-pub fn syscall_fgetxattr(fd: usize, _name: usize, _value: usize, _size: usize) -> isize {
-    if fd_has_o_path(fd) {
-        return EBADF;
-    }
-    let Some(_file) = get_fd_file(fd) else {
-        return EBADF;
+/// Linux `setxattr(2)` (syscall 5 on riscv64).
+pub fn syscall_setxattr(path: usize, name: usize, value: usize, size: usize, flags: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    EOPNOTSUPP
+    let value = match read_user_xattr_value(token, value, size) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_path_inode(path, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_setxattr(&inode, &name, value.as_slice(), flags)
+}
+
+/// Linux `lsetxattr(2)` (syscall 6 on riscv64).
+pub fn syscall_lsetxattr(path: usize, name: usize, value: usize, size: usize, flags: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let value = match read_user_xattr_value(token, value, size) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_path_inode(path, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_setxattr(&inode, &name, value.as_slice(), flags)
+}
+
+/// Linux `fsetxattr(2)` (syscall 7 on riscv64).
+pub fn syscall_fsetxattr(fd: usize, name: usize, value: usize, size: usize, flags: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let value = match read_user_xattr_value(token, value, size) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_fd_inode(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_setxattr(&inode, &name, value.as_slice(), flags)
+}
+
+/// Linux `getxattr(2)` (syscall 8 on riscv64).
+pub fn syscall_getxattr(path: usize, name: usize, value: usize, size: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_path_inode(path, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_getxattr(&inode, &name, value, size, token)
+}
+
+/// Linux `lgetxattr(2)` (syscall 9 on riscv64).
+pub fn syscall_lgetxattr(path: usize, name: usize, value: usize, size: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_path_inode(path, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_getxattr(&inode, &name, value, size, token)
+}
+
+/// Linux `fgetxattr(2)` (syscall 10 on riscv64).
+pub fn syscall_fgetxattr(fd: usize, name: usize, value: usize, size: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_fd_inode(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_getxattr(&inode, &name, value, size, token)
+}
+
+/// Linux `listxattr(2)` (syscall 11 on riscv64).
+pub fn syscall_listxattr(path: usize, list: usize, size: usize) -> isize {
+    let token = get_current_token();
+    let inode = match resolve_xattr_path_inode(path, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_listxattr(&inode, list, size, token)
+}
+
+/// Linux `llistxattr(2)` (syscall 12 on riscv64).
+pub fn syscall_llistxattr(path: usize, list: usize, size: usize) -> isize {
+    let token = get_current_token();
+    let inode = match resolve_xattr_path_inode(path, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_listxattr(&inode, list, size, token)
+}
+
+/// Linux `flistxattr(2)` (syscall 13 on riscv64).
+pub fn syscall_flistxattr(fd: usize, list: usize, size: usize) -> isize {
+    let token = get_current_token();
+    let inode = match resolve_xattr_fd_inode(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_listxattr(&inode, list, size, token)
+}
+
+/// Linux `removexattr(2)` (syscall 14 on riscv64).
+pub fn syscall_removexattr(path: usize, name: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_path_inode(path, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_removexattr(&inode, &name)
+}
+
+/// Linux `lremovexattr(2)` (syscall 15 on riscv64).
+pub fn syscall_lremovexattr(path: usize, name: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_path_inode(path, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_removexattr(&inode, &name)
+}
+
+/// Linux `fremovexattr(2)` (syscall 16 on riscv64).
+pub fn syscall_fremovexattr(fd: usize, name: usize) -> isize {
+    let token = get_current_token();
+    let name = match read_user_xattr_name(token, name) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let inode = match resolve_xattr_fd_inode(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    do_removexattr(&inode, &name)
 }
 
 /// Linux `readlinkat(2)` (syscall 78 on riscv64).

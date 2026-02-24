@@ -3,6 +3,7 @@ pub(crate) mod filesystem;
 
 mod condvar;
 mod dummy;
+mod epoll;
 mod flow;
 pub(crate) mod futex;
 mod memory;
@@ -55,7 +56,18 @@ const SYSCALL_EPOLL_CREATE1: usize = 20;
 const SYSCALL_EPOLL_CTL: usize = 21;
 const SYSCALL_EPOLL_PWAIT: usize = 22;
 const SYSCALL_INOTIFY_INIT1: usize = 26;
+const SYSCALL_SETXATTR: usize = 5;
+const SYSCALL_LSETXATTR: usize = 6;
+const SYSCALL_FSETXATTR: usize = 7;
+const SYSCALL_GETXATTR: usize = 8;
+const SYSCALL_LGETXATTR: usize = 9;
 const SYSCALL_FGETXATTR: usize = 10;
+const SYSCALL_LISTXATTR: usize = 11;
+const SYSCALL_LLISTXATTR: usize = 12;
+const SYSCALL_FLISTXATTR: usize = 13;
+const SYSCALL_REMOVEXATTR: usize = 14;
+const SYSCALL_LREMOVEXATTR: usize = 15;
+const SYSCALL_FREMOVEXATTR: usize = 16;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_FCNTL: usize = 25;
 const SYSCALL_DUP: usize = 23;
@@ -406,11 +418,30 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP3 => filesystem::syscall_dup3(args[0], args[1], args[2]),
         SYSCALL_IOCTL => misc::syscall_ioctl(args[0], args[1], args[2]),
         SYSCALL_EVENTFD2 => dummy::syscall_eventfd2(args[0] as u64, args[1]),
-        SYSCALL_EPOLL_CREATE1 => dummy::syscall_epoll_create1(args[0]),
-        SYSCALL_EPOLL_CTL => -38,
-        SYSCALL_EPOLL_PWAIT => -38,
+        SYSCALL_EPOLL_CREATE1 => epoll::syscall_epoll_create1(args[0]),
+        SYSCALL_EPOLL_CTL => epoll::syscall_epoll_ctl(args[0], args[1], args[2], args[3]),
+        SYSCALL_EPOLL_PWAIT => {
+            epoll::syscall_epoll_pwait(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
         SYSCALL_INOTIFY_INIT1 => dummy::syscall_inotify_init1(args[0]),
+        SYSCALL_SETXATTR => {
+            filesystem::syscall_setxattr(args[0], args[1], args[2], args[3], args[4])
+        }
+        SYSCALL_LSETXATTR => {
+            filesystem::syscall_lsetxattr(args[0], args[1], args[2], args[3], args[4])
+        }
+        SYSCALL_FSETXATTR => {
+            filesystem::syscall_fsetxattr(args[0], args[1], args[2], args[3], args[4])
+        }
+        SYSCALL_GETXATTR => filesystem::syscall_getxattr(args[0], args[1], args[2], args[3]),
+        SYSCALL_LGETXATTR => filesystem::syscall_lgetxattr(args[0], args[1], args[2], args[3]),
         SYSCALL_FGETXATTR => filesystem::syscall_fgetxattr(args[0], args[1], args[2], args[3]),
+        SYSCALL_LISTXATTR => filesystem::syscall_listxattr(args[0], args[1], args[2]),
+        SYSCALL_LLISTXATTR => filesystem::syscall_llistxattr(args[0], args[1], args[2]),
+        SYSCALL_FLISTXATTR => filesystem::syscall_flistxattr(args[0], args[1], args[2]),
+        SYSCALL_REMOVEXATTR => filesystem::syscall_removexattr(args[0], args[1]),
+        SYSCALL_LREMOVEXATTR => filesystem::syscall_lremovexattr(args[0], args[1]),
+        SYSCALL_FREMOVEXATTR => filesystem::syscall_fremovexattr(args[0], args[1]),
         SYSCALL_MKNODAT => filesystem::syscall_mknodat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_MKDIRAT => filesystem::syscall_mkdirat(args[0] as isize, args[1], args[2]),
         SYSCALL_UNLINKAT => filesystem::syscall_unlinkat(args[0] as isize, args[1], args[2]),

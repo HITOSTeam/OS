@@ -180,11 +180,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
             let refcnt_entries = FRAME_REFCOUNTS.lock().len();
             println!(
                 "[mm-debug] frame_alloc failed count={} current={:#x} end={:#x} recycled={} refcnt_entries={}",
-                fails,
-                current,
-                end,
-                recycled,
-                refcnt_entries
+                fails, current, end, recycled, refcnt_entries
             );
         }
         return None;

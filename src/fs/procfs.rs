@@ -10,11 +10,11 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, OSInode,
-    PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
+    File, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
+    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode,
 };
 use crate::mm::UserBuffer;
-use crate::task::manager::{pid2process, PID2PCB};
+use crate::task::manager::{PID2PCB, pid2process};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
 
@@ -107,11 +107,7 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 {
-        None
-    } else {
-        Some(ino)
-    }
+    if ino == 0 { None } else { Some(ino) }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {

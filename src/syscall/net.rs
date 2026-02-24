@@ -9,11 +9,11 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::fs::{
-    ext4_lock, find_path_in_roots, make_socketpair, File, NetSocketFile, SocketPairEnd,
+    File, NetSocketFile, SocketPairEnd, ext4_lock, find_path_in_roots, make_socketpair,
 };
 use crate::mm::{
-    read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
-    try_write_user_value, UserBuffer,
+    UserBuffer, read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
+    try_write_user_value,
 };
 use crate::syscall::filesystem::normalize_path;
 use crate::task::processor::{
@@ -595,6 +595,22 @@ pub(crate) fn poll_file_read_write(file: &Arc<dyn File + Send + Sync>) -> (bool,
         return (us.poll_readable(), us.poll_writable());
     }
     (file.readable(), file.writable())
+}
+
+pub(crate) fn file_supports_poll(file: &Arc<dyn File + Send + Sync>) -> bool {
+    file.as_any().downcast_ref::<crate::fs::Pipe>().is_some()
+        || file.as_any().downcast_ref::<SocketPairEnd>().is_some()
+        || file.as_any().downcast_ref::<NetSocketFile>().is_some()
+        || file.as_any().downcast_ref::<UnixSocketFile>().is_some()
+}
+
+pub(crate) fn poll_file_epoll(file: &Arc<dyn File + Send + Sync>) -> (bool, bool, bool) {
+    let (readable, writable) = poll_file_read_write(file);
+    let mut rdhup = false;
+    if let Some(ns) = file.as_any().downcast_ref::<NetSocketFile>() {
+        rdhup = ns.poll_rdhup();
+    }
+    (readable, writable, rdhup)
 }
 
 fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {
@@ -2244,6 +2260,12 @@ pub fn syscall_getsockopt(
 }
 
 pub fn syscall_shutdown(_fd: usize, _how: usize) -> isize {
+    const SHUT_RD: usize = 0;
+    const SHUT_WR: usize = 1;
+    const SHUT_RDWR: usize = 2;
+    if _how > SHUT_RDWR {
+        return EINVAL;
+    }
     let file = match get_file(_fd) {
         Ok(f) => f,
         Err(e) => return e,
@@ -2256,7 +2278,12 @@ pub fn syscall_shutdown(_fd: usize, _how: usize) -> isize {
         None => return ENOTSOCK,
     };
     if sock.kind() == crate::fs::NetSocketKind::TcpStream {
-        let _ = sock.tcp_close();
+        if _how == SHUT_RD || _how == SHUT_RDWR {
+            sock.shutdown_read();
+        }
+        if _how == SHUT_WR || _how == SHUT_RDWR {
+            let _ = sock.tcp_close();
+        }
     }
     0
 }

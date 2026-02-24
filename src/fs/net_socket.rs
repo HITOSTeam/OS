@@ -1,5 +1,5 @@
-use alloc::vec;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cmp::min;
@@ -13,7 +13,6 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
-
 
 const TCP_RX_BUF_LEN_IPERF: usize = 128 * 1024;
 const TCP_TX_BUF_LEN_IPERF: usize = 128 * 1024;
@@ -51,7 +50,9 @@ pub enum NetSocketKind {
 }
 
 enum Inner {
-    TcpStream { handle: SocketHandle },
+    TcpStream {
+        handle: SocketHandle,
+    },
     TcpListener {
         port: u16,
         backlog: usize,
@@ -73,6 +74,7 @@ pub struct SocketOptions {
     sndbuf: u32,
     rcvbuf: u32,
     mcast_joined: bool,
+    rd_shutdown: bool,
 }
 
 impl NetSocketFile {
@@ -89,6 +91,7 @@ impl NetSocketFile {
                 sndbuf: TCP_TX_BUF_LEN_IPERF as u32,
                 rcvbuf: TCP_RX_BUF_LEN_IPERF as u32,
                 mcast_joined: false,
+                rd_shutdown: false,
             }),
         })
     }
@@ -96,8 +99,14 @@ impl NetSocketFile {
     pub fn new_udp() -> Arc<Self> {
         crate::net::init();
         let handle = crate::net::with_sockets_mut(|_iface, _dev, sockets| {
-            let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 256], vec![0u8; UDP_RX_BUF_LEN]);
-            let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 256], vec![0u8; UDP_TX_BUF_LEN]);
+            let rx = udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; 256],
+                vec![0u8; UDP_RX_BUF_LEN],
+            );
+            let tx = udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; 256],
+                vec![0u8; UDP_TX_BUF_LEN],
+            );
             sockets.add(udp::Socket::new(rx, tx))
         });
         Arc::new(Self {
@@ -109,6 +118,7 @@ impl NetSocketFile {
                 sndbuf: UDP_TX_BUF_LEN as u32,
                 rcvbuf: UDP_RX_BUF_LEN as u32,
                 mcast_joined: false,
+                rd_shutdown: false,
             }),
         })
     }
@@ -183,6 +193,25 @@ impl NetSocketFile {
             Snapshot::TcpListener(_) | Snapshot::ListenerOnly => true,
             Snapshot::Udp(handle) => sockets.get::<udp::Socket>(handle).can_send(),
         })
+    }
+
+    pub fn poll_rdhup(&self) -> bool {
+        if self.opts.lock().rd_shutdown {
+            return true;
+        }
+        crate::net::poll();
+        let handle = match &*self.inner.lock() {
+            Inner::TcpStream { handle } => *handle,
+            _ => return false,
+        };
+        crate::net::with_sockets_mut(|_iface, _dev, sockets| {
+            let s = sockets.get::<tcp::Socket>(handle);
+            !s.may_recv()
+        })
+    }
+
+    pub fn shutdown_read(&self) {
+        self.opts.lock().rd_shutdown = true;
     }
 
     pub fn bind_v4(&self, ip: Ipv4Address, port: u16) -> Result<(), isize> {
@@ -291,7 +320,12 @@ impl NetSocketFile {
         loop {
             crate::net::poll();
             let mut inner = self.inner.lock();
-            let Inner::TcpListener { port, backlog, listen } = &mut *inner else {
+            let Inner::TcpListener {
+                port,
+                backlog,
+                listen,
+            } = &mut *inner
+            else {
                 return Err(EOPNOTSUPP);
             };
             // Find an established connection.
@@ -326,6 +360,7 @@ impl NetSocketFile {
                         sndbuf: TCP_TX_BUF_LEN_IPERF as u32,
                         rcvbuf: TCP_RX_BUF_LEN_IPERF as u32,
                         mcast_joined: false,
+                        rd_shutdown: false,
                     }),
                 }));
             }
@@ -340,7 +375,12 @@ impl NetSocketFile {
         }
     }
 
-    pub fn connect_v4(&self, ip: Ipv4Address, port: u16, local_port: Option<u16>) -> Result<(), isize> {
+    pub fn connect_v4(
+        &self,
+        ip: Ipv4Address,
+        port: u16,
+        local_port: Option<u16>,
+    ) -> Result<(), isize> {
         const EINVAL: isize = -22;
         const EOPNOTSUPP: isize = -95;
         const EISCONN: isize = -106;
@@ -361,7 +401,13 @@ impl NetSocketFile {
                 let cx = iface.context();
                 let bound = sockets.get::<tcp::Socket>(handle).get_bound_endpoint();
                 let local = local_port
-                    .or_else(|| if bound.port != 0 { Some(bound.port) } else { None })
+                    .or_else(|| {
+                        if bound.port != 0 {
+                            Some(bound.port)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_else(crate::net::alloc_ephemeral_port);
                 let local_ep = IpListenEndpoint {
                     addr: bound.addr,
@@ -397,7 +443,7 @@ impl NetSocketFile {
                 if crate::time::get_time_ms() >= deadline {
                     return Err(ETIMEDOUT);
                 }
-                        crate::task::processor::suspend_current_and_run_next();
+                crate::task::processor::suspend_current_and_run_next();
             }
             return Ok(());
         }
@@ -467,16 +513,17 @@ impl NetSocketFile {
         };
         loop {
             crate::net::poll();
-            let res: Result<Option<usize>, isize> = crate::net::with_sockets_mut(|_iface, _dev, sockets| {
-                let s = sockets.get_mut::<tcp::Socket>(handle);
-                if s.can_recv() {
-                    return Ok(Some(s.recv_slice(buf).unwrap_or(0)));
-                }
-                if !s.may_recv() {
-                    return Ok(Some(0usize));
-                }
-                Ok(None)
-            });
+            let res: Result<Option<usize>, isize> =
+                crate::net::with_sockets_mut(|_iface, _dev, sockets| {
+                    let s = sockets.get_mut::<tcp::Socket>(handle);
+                    if s.can_recv() {
+                        return Ok(Some(s.recv_slice(buf).unwrap_or(0)));
+                    }
+                    if !s.may_recv() {
+                        return Ok(Some(0usize));
+                    }
+                    Ok(None)
+                });
             let res = res?;
             if let Some(n) = res {
                 return Ok(n);
@@ -607,7 +654,13 @@ impl NetSocketFile {
                 if let IpAddress::Ipv4(ip) = meta.endpoint.addr {
                     if crate::debug_config::DEBUG_NET && n == 4 {
                         let v = u32::from_ne_bytes(buf[..4].try_into().unwrap_or([0; 4]));
-                        crate::println!("[net] udp recv {} bytes from {}:{} val=0x{:08x}", n, ip, meta.endpoint.port, v);
+                        crate::println!(
+                            "[net] udp recv {} bytes from {}:{} val=0x{:08x}",
+                            n,
+                            ip,
+                            meta.endpoint.port,
+                            v
+                        );
                     }
                     return Ok((n, ip, meta.endpoint.port));
                 }
@@ -630,8 +683,12 @@ impl NetSocketFile {
             let s = sockets.get::<tcp::Socket>(handle);
             let local = s.local_endpoint()?;
             let remote = s.remote_endpoint()?;
-            let IpAddress::Ipv4(lip) = local.addr else { return None };
-            let IpAddress::Ipv4(rip) = remote.addr else { return None };
+            let IpAddress::Ipv4(lip) = local.addr else {
+                return None;
+            };
+            let IpAddress::Ipv4(rip) = remote.addr else {
+                return None;
+            };
             Some((lip, local.port, rip, remote.port))
         })
     }
@@ -653,9 +710,7 @@ impl NetSocketFile {
                 };
                 Some((ip, bound.port))
             }),
-            Inner::TcpListener { port, .. } => {
-                Some((Ipv4Address::new(127, 0, 0, 1), *port))
-            }
+            Inner::TcpListener { port, .. } => Some((Ipv4Address::new(127, 0, 0, 1), *port)),
             _ => None,
         }
     }
@@ -882,7 +937,12 @@ impl crate::fs::File for NetSocketFile {
                         }
                         let r = s.send_slice(&data, remote);
                         if crate::debug_config::DEBUG_NET && data.len() <= 8 {
-                            crate::println!("[net] udp send {} bytes to {} -> {:?}", data.len(), remote, r);
+                            crate::println!(
+                                "[net] udp send {} bytes to {} -> {:?}",
+                                data.len(),
+                                remote,
+                                r
+                            );
                         }
                         r.is_ok()
                     });

@@ -9,7 +9,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
-use crate::mm::{frame_alloc, FrameTracker, UserBuffer};
+use crate::mm::{FrameTracker, UserBuffer, frame_alloc};
 
 use super::File;
 
@@ -327,8 +327,7 @@ impl File for PseudoShmFile {
                 }
                 let frame = data.frames[page].ppn.get_bytes_array();
                 let chunk = core::cmp::min(remaining, PAGE_SIZE - in_page);
-                slice[dst_off..dst_off + chunk]
-                    .copy_from_slice(&frame[in_page..in_page + chunk]);
+                slice[dst_off..dst_off + chunk].copy_from_slice(&frame[in_page..in_page + chunk]);
                 cur_off += chunk;
                 dst_off += chunk;
                 remaining -= chunk;
@@ -367,8 +366,7 @@ impl File for PseudoShmFile {
                 }
                 let frame = data.frames[page].ppn.get_bytes_array();
                 let chunk = core::cmp::min(remaining, PAGE_SIZE - in_page);
-                frame[in_page..in_page + chunk]
-                    .copy_from_slice(&slice[src_off..src_off + chunk]);
+                frame[in_page..in_page + chunk].copy_from_slice(&slice[src_off..src_off + chunk]);
                 cur_off += chunk;
                 src_off += chunk;
                 remaining -= chunk;

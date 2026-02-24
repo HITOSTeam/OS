@@ -46,7 +46,11 @@ pub fn init() {
     });
     iface.set_any_ip(true);
     let sockets = SocketSet::new(vec![]);
-    *net = Some(NetStack { iface, dev, sockets });
+    *net = Some(NetStack {
+        iface,
+        dev,
+        sockets,
+    });
 }
 
 pub fn poll() {
@@ -68,7 +72,9 @@ pub fn alloc_ephemeral_port() -> u16 {
     }
 }
 
-pub fn with_sockets_mut<R>(f: impl FnOnce(&mut Interface, &mut Loopback, &mut SocketSet<'static>) -> R) -> R {
+pub fn with_sockets_mut<R>(
+    f: impl FnOnce(&mut Interface, &mut Loopback, &mut SocketSet<'static>) -> R,
+) -> R {
     init();
     let mut net = NET.lock();
     let stack = net.as_mut().unwrap();

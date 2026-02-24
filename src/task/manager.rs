@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch;
 use crate::config::MAX_HARTS;
 use crate::debug_config::DEBUG_SCHED;
-use crate::task::block_sleep::{TimeWrap, TIMERS};
+use crate::task::block_sleep::{TIMERS, TimeWrap};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use spin::Mutex;
@@ -25,11 +25,7 @@ pub fn mark_hart_online(hart_id: usize) {
 fn online_hart_mask() -> usize {
     let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
     // Fallback: at least hart0 exists.
-    if mask == 0 {
-        1
-    } else {
-        mask
-    }
+    if mask == 0 { 1 } else { mask }
 }
 
 fn pick_online_hart(start: usize) -> usize {

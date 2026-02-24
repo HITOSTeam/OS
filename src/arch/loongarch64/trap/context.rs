@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 
-use super::super::{hart_id, REG_SP};
+use super::super::{REG_SP, hart_id};
 
 #[derive(Clone, Copy)]
 #[repr(C)]

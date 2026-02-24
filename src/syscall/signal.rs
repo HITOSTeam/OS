@@ -14,15 +14,15 @@ use crate::{
     syscall::misc::decode_linux_tid,
     task::{
         block_sleep::add_timer,
-        manager::{pid2process, wakeup_task, PID2PCB},
+        manager::{PID2PCB, pid2process, wakeup_task},
         processor::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
         signal::{
-            has_unmasked_pending, kill, kill_current, pending_unmasked_bits, set_signal,
-            set_signal_mask, signal_bit, take_first_unmasked, RtSigAction, SignalAction,
-            SignalFlags, RT_SIG_MAX, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM, SIGTSTP_NUM,
-            SIGTTIN_NUM, SIGTTOU_NUM, SIG_DFL, SIG_IGN,
+            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM,
+            SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags, has_unmasked_pending,
+            kill, kill_current, pending_unmasked_bits, set_signal, set_signal_mask, signal_bit,
+            take_first_unmasked,
         },
         task_block::{SigSavedContext, TaskControlBlock, TaskStatus},
     },
@@ -138,11 +138,7 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
             delivered = true;
         }
     }
-    if delivered {
-        0
-    } else {
-        ESRCH
-    }
+    if delivered { 0 } else { ESRCH }
 }
 
 /// Linux `tgkill` (syscall 131).

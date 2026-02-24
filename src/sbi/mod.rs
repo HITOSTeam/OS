@@ -85,7 +85,13 @@ mod riscv {
     }
 
     pub fn hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> usize {
-        sbi_call_ext(SBI_EXT_HSM, SBI_EXT_HSM_HART_START, hart_id, start_addr, opaque)
+        sbi_call_ext(
+            SBI_EXT_HSM,
+            SBI_EXT_HSM_HART_START,
+            hart_id,
+            start_addr,
+            opaque,
+        )
     }
 }
 

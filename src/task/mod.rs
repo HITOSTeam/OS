@@ -4,10 +4,10 @@ use core::{arch::asm, cell::RefCell, fmt::Display, task};
 
 use crate::{
     console::print,
-    fs::{open_file, OpenFlags},
+    fs::{OpenFlags, open_file},
     println,
     task::{
-        manager::{add_task, TASK_MANAGER},
+        manager::{TASK_MANAGER, add_task},
         processor::{current_task, go_to_first_task},
         task_context::TaskContext,
     },

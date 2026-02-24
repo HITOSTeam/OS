@@ -10,18 +10,18 @@ use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE
 use crate::debug_config::{DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
-    read_user_value, translated_mutref, write_user_value, ElfAux, MemorySet, KERNEL_SPACE,
+    ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
 };
 use crate::println;
 use crate::task::condvar::Condvar;
-use crate::task::id::{pid_alloc, PidHandle};
+use crate::task::id::{PidHandle, pid_alloc};
 use crate::task::manager::{
     add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
-    RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN,
+    RT_SIG_MAX, RtSigAction, SIG_IGN, SignalAction, SignalActions, SignalFlags,
 };
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
@@ -579,7 +579,7 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     // Walk argv/envp to find auxv.
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-                                                                        // Skip envp pointers (NULL terminated).
+    // Skip envp pointers (NULL terminated).
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();

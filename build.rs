@@ -17,7 +17,10 @@ fn main() {
     let entries = match read_dir(user_app_dir) {
         Ok(entries) => Some(entries),
         Err(err) => {
-            println!("cargo:warning=missing results dir '{}': {}", user_app_dir, err);
+            println!(
+                "cargo:warning=missing results dir '{}': {}",
+                user_app_dir, err
+            );
             None
         }
     };

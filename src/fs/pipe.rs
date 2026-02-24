@@ -1,6 +1,7 @@
 use alloc::{
     collections::VecDeque,
     sync::{Arc, Weak},
+    vec,
     vec::Vec,
 };
 use spin::Mutex;
@@ -10,15 +11,17 @@ use crate::{
     fs::File,
     mm::UserBuffer,
     task::{
-        manager::{wakeup_task, PID2PCB},
+        manager::{PID2PCB, wakeup_task},
         processor::{block_current_and_run_next, current_task},
-        signal::{has_unmasked_pending, signal_bit, SIGPIPE_NUM},
+        signal::{SIGPIPE_NUM, has_unmasked_pending, signal_bit},
     },
 };
 
 // A small pipe buffer makes typical shell pipelines (busybox/ash, rt-tests) extremely
 // slow and can even deadlock if producers/consumers don't run concurrently.
-const RING_BUFFER_SIZE: usize = 4096;
+const PIPE_BUF: usize = 4096;
+const DEFAULT_PIPE_CAPACITY: usize = 16 * PIPE_BUF;
+const MAX_PIPE_CAPACITY: usize = DEFAULT_PIPE_CAPACITY;
 //  Pipe 是一个包装器,包装 具体的 队列
 pub struct Pipe {
     readable: bool,
@@ -55,7 +58,15 @@ impl Pipe {
             return false;
         }
         let ring = self.buffer.lock();
-        ring.available_write() > 0 || ring.all_read_ends_closed()
+        ring.available_write() >= ring.poll_writable_threshold() || ring.all_read_ends_closed()
+    }
+
+    pub fn pipe_size(&self) -> usize {
+        self.buffer.lock().pipe_size()
+    }
+
+    pub fn set_pipe_size(&self, size: usize) -> Result<usize, isize> {
+        self.buffer.lock().set_pipe_size(size)
     }
 }
 #[derive(Copy, Clone, PartialEq)]
@@ -66,7 +77,8 @@ enum RingBufferStatus {
 }
 
 pub struct PipeRingBuffer {
-    arr: [u8; RING_BUFFER_SIZE],
+    arr: Vec<u8>,
+    capacity: usize,
     head: usize,
     tail: usize,
     status: RingBufferStatus,
@@ -79,7 +91,8 @@ pub struct PipeRingBuffer {
 impl PipeRingBuffer {
     pub fn new() -> Self {
         Self {
-            arr: [0; RING_BUFFER_SIZE],
+            arr: vec![0; MAX_PIPE_CAPACITY],
+            capacity: DEFAULT_PIPE_CAPACITY,
             head: 0,
             tail: 0,
             status: RingBufferStatus::EMPTY,
@@ -101,7 +114,7 @@ impl PipeRingBuffer {
     pub fn read_byte(&mut self) -> u8 {
         self.status = RingBufferStatus::NORMAL;
         let c = self.arr[self.head];
-        self.head = (self.head + 1) % RING_BUFFER_SIZE;
+        self.head = (self.head + 1) % self.capacity;
         if self.head == self.tail {
             self.status = RingBufferStatus::EMPTY;
         }
@@ -110,7 +123,7 @@ impl PipeRingBuffer {
     pub fn write_byte(&mut self, byte: u8) {
         self.status = RingBufferStatus::NORMAL;
         self.arr[self.tail] = byte;
-        self.tail = (self.tail + 1) % RING_BUFFER_SIZE;
+        self.tail = (self.tail + 1) % self.capacity;
         if self.tail == self.head {
             self.status = RingBufferStatus::FULL;
         }
@@ -120,10 +133,12 @@ impl PipeRingBuffer {
         if self.status == RingBufferStatus::EMPTY {
             0
         } else {
-            if self.tail > self.head {
+            if self.status == RingBufferStatus::FULL {
+                self.capacity
+            } else if self.tail > self.head {
                 self.tail - self.head
             } else {
-                self.tail + RING_BUFFER_SIZE - self.head
+                self.tail + self.capacity - self.head
             }
         }
     }
@@ -131,8 +146,61 @@ impl PipeRingBuffer {
         if self.status == RingBufferStatus::FULL {
             0
         } else {
-            RING_BUFFER_SIZE - self.available_read()
+            self.capacity - self.available_read()
         }
+    }
+
+    fn pipe_size(&self) -> usize {
+        self.capacity
+    }
+
+    fn poll_writable_threshold(&self) -> usize {
+        self.capacity.min(PIPE_BUF)
+    }
+
+    fn set_pipe_size(&mut self, size: usize) -> Result<usize, isize> {
+        const EBUSY: isize = -16;
+        const EINVAL: isize = -22;
+        if size == 0 {
+            return Err(EINVAL);
+        }
+        let base = size.max(PIPE_BUF);
+        let Some(new_capacity) = base
+            .checked_add(PIPE_BUF - 1)
+            .map(|v| (v / PIPE_BUF) * PIPE_BUF)
+        else {
+            return Err(EINVAL);
+        };
+        if new_capacity > MAX_PIPE_CAPACITY {
+            return Err(EINVAL);
+        }
+        if new_capacity == self.capacity {
+            return Ok(self.capacity);
+        }
+
+        let used = self.available_read();
+        if used > new_capacity {
+            return Err(EBUSY);
+        }
+
+        let old_capacity = self.capacity;
+        let mut data = Vec::with_capacity(used);
+        for i in 0..used {
+            data.push(self.arr[(self.head + i) % old_capacity]);
+        }
+
+        self.capacity = new_capacity;
+        self.head = 0;
+        self.tail = if used == new_capacity { 0 } else { used };
+        if used == 0 {
+            self.status = RingBufferStatus::EMPTY;
+        } else if used == new_capacity {
+            self.status = RingBufferStatus::FULL;
+        } else {
+            self.status = RingBufferStatus::NORMAL;
+        }
+        self.arr[..used].copy_from_slice(data.as_slice());
+        Ok(self.capacity)
     }
     /// 通过weak Ptr 判断是否所有写端都关闭
     pub fn all_write_ends_closed(&self) -> bool {

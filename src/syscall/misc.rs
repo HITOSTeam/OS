@@ -4,21 +4,21 @@ use crate::{
     debug_config::DEBUG_PTHREAD,
     fs::ext4_lock,
     mm::{
-        read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
-        try_read_user_value, try_write_user_value, write_user_value, MapPermission,
+        MapPermission, read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
+        try_read_user_value, try_write_user_value, write_user_value,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
-        manager::{pid2process, PID2PCB},
+        manager::{PID2PCB, pid2process},
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
         signal::{
-            has_unmasked_pending, queue_process_signal, signal_bit, SIGKILL_NUM, SIGSTOP_NUM,
-            SIGXCPU_NUM,
+            SIGKILL_NUM, SIGSTOP_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal,
+            signal_bit,
         },
     },
     time::{get_time, get_time_ms},
@@ -565,11 +565,7 @@ pub fn syscall_getppid() -> isize {
 }
 
 fn normalized_pgid(pid: usize, pgid: usize) -> usize {
-    if pgid == 0 && pid != 0 {
-        pid
-    } else {
-        pgid
-    }
+    if pgid == 0 && pid != 0 { pid } else { pgid }
 }
 
 fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {
@@ -1915,6 +1911,10 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     // Some libc builds issue BLKGETSIZE64 with a 32-bit size encoding.
     const BLKGETSIZE64_COMPAT: usize = 0x8004_1272;
     const BLKPBSZGET: usize = 0x127b;
+    const FS_IOC_GETFLAGS: usize = 0x8008_6601;
+    const FS_IOC_SETFLAGS: usize = 0x4008_6602;
+    const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+    const FS_APPEND_FL: u32 = 0x0000_0020;
     const SIOCATMARK: usize = 0x8905;
     const SIOCGIFCONF: usize = 0x8912;
     const SIOCGIFFLAGS: usize = 0x8913;
@@ -1943,6 +1943,34 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     // Compare on low 32 bits to accept both calling conventions.
     let request = _request & 0xffff_ffffusize;
     let token = get_current_token();
+
+    if let Some(os_inode) = file.as_any().downcast_ref::<crate::fs::OSInode>() {
+        let ino = os_inode.ext4_inode().inode_num() as u64;
+        match request {
+            FS_IOC_GETFLAGS => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let flags = crate::syscall::filesystem::inode_fs_flags(ino) as i32;
+                if try_write_user_value(token, _argp as *mut i32, &flags).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            FS_IOC_SETFLAGS => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(raw_flags) = try_read_user_value(token, _argp as *const i32) else {
+                    return EFAULT;
+                };
+                let allowed = (raw_flags as u32) & (FS_IMMUTABLE_FL | FS_APPEND_FL);
+                crate::syscall::filesystem::set_inode_fs_flags(ino, allowed);
+                return 0;
+            }
+            _ => {}
+        }
+    }
 
     if let Some(sock) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
         #[repr(C)]

@@ -1,7 +1,7 @@
 //!Stdin & Stdout
 use super::File;
-use crate::mm::UserBuffer;
 use crate::arch::{console_flush, console_getchar, console_putchar};
+use crate::mm::UserBuffer;
 use crate::task::processor::suspend_current_and_run_next;
 ///Standard input
 pub struct Stdin;

@@ -3,8 +3,8 @@ use core::any::Any;
 
 use crate::mm::UserBuffer;
 
-use super::pipe::{make_pipe, Pipe};
 use super::File;
+use super::pipe::{Pipe, make_pipe};
 
 /// A minimal full-duplex endpoint used to implement `socketpair(AF_UNIX, SOCK_STREAM, ...)`.
 ///
@@ -16,7 +16,10 @@ pub struct SocketPairEnd {
 
 impl SocketPairEnd {
     fn new(read_end: Arc<Pipe>, write_end: Arc<Pipe>) -> Self {
-        Self { read_end, write_end }
+        Self {
+            read_end,
+            write_end,
+        }
     }
 
     pub fn poll_readable(&self) -> bool {

@@ -347,7 +347,7 @@ use spin::{Mutex, MutexGuard};
 use crate::{
     mm::PhysPageNum,
     task::{
-        id::{kstack_alloc, KernelStack, TaskUserRes},
+        id::{KernelStack, TaskUserRes, kstack_alloc},
         process_block::ProcessControlBlock,
         task_context::TaskContext,
     },

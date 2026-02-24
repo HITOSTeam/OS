@@ -7,7 +7,7 @@ pub const USER_STACK_SIZE: usize = 4096 * 256; // 1 MiB
 // Keep the initial program break away from the top of the first thread stack.
 // Some libc `sbrk()` paths reject growth when brk starts too close to stack.
 pub const USER_HEAP_GAP: usize = 64 * 1024; // 64 KiB
-pub const KERNEL_STACK_SIZE: usize = 4096 * 8;  // 32KB
+pub const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32KB
 // Kernel heap must be large enough for fork-heavy LTP runs on glibc.
 // 256 MiB reduces allocator OOMs in long `fork13` stress loops.
 pub const KERNEL_HEAP_SIZE: usize = 0x1000_0000; // 256 MiB
@@ -65,11 +65,7 @@ pub fn set_clock_freq(freq: usize) {
 #[cfg(target_arch = "loongarch64")]
 pub fn clock_freq() -> usize {
     let freq = CLOCK_FREQ.load(Ordering::Relaxed);
-    if freq == 0 {
-        DEFAULT_CLOCK_FREQ
-    } else {
-        freq
-    }
+    if freq == 0 { DEFAULT_CLOCK_FREQ } else { freq }
 }
 
 #[cfg(not(target_arch = "loongarch64"))]

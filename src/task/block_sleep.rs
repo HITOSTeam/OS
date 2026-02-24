@@ -2,7 +2,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use core::{cmp::Ordering, time};
 
-use crate::task::signal::{pick_task_for_signal, queue_process_signal, signal_bit, SIGALRM_NUM};
+use crate::task::signal::{SIGALRM_NUM, pick_task_for_signal, queue_process_signal, signal_bit};
 use crate::{
     task::{manager::wakeup_task, task_block::TaskControlBlock},
     time::get_time_ms,
@@ -16,9 +16,7 @@ use alloc::{collections::BinaryHeap, sync::Arc};
 use crate::debug_config::{DEBUG_TIMER, DEBUG_UNIXBENCH};
 use crate::task::process_block::ProcessControlBlock;
 use crate::{
-    arch,
-    mm::write_user_value,
-    syscall::futex::futex_wake_private_and_shared,
+    arch, mm::write_user_value, syscall::futex::futex_wake_private_and_shared,
     task::manager::pid2process,
 };
 pub struct TimeWrap {
@@ -139,7 +137,10 @@ pub fn set_posix_timer(
     else {
         return Err(EINVAL);
     };
-    let prev_remain = timer.deadline_ms.map(|d| d.saturating_sub(now)).unwrap_or(0);
+    let prev_remain = timer
+        .deadline_ms
+        .map(|d| d.saturating_sub(now))
+        .unwrap_or(0);
     let prev_interval = timer.interval_ms;
     timer.interval_ms = interval_ms;
     timer.deadline_ms = delay_ms.map(|d| now.saturating_add(d));
@@ -160,7 +161,10 @@ pub fn delete_posix_timer(pid: usize, timer_id: usize) -> isize {
     EINVAL
 }
 
-pub fn query_posix_timer(pid: usize, timer_id: usize) -> Result<(usize, Option<usize>, usize), isize> {
+pub fn query_posix_timer(
+    pid: usize,
+    timer_id: usize,
+) -> Result<(usize, Option<usize>, usize), isize> {
     const EINVAL: isize = -22;
     let timers = POSIX_TIMERS.lock();
     let Some(timer) = timers
@@ -279,10 +283,7 @@ pub fn itimer_remaining_and_interval_ms(pid: usize, which: usize) -> (usize, usi
     let now = get_time_ms();
     let timers = ALARM_TIMERS.lock();
     if let Some(entry) = timers.iter().find(|t| t.pid == pid && t.which == which) {
-        return (
-            entry.deadline_ms.saturating_sub(now),
-            entry.interval_ms,
-        );
+        return (entry.deadline_ms.saturating_sub(now), entry.interval_ms);
     }
     (0, 0)
 }
@@ -399,12 +400,10 @@ fn process_posix_timers(current_ms: usize) {
                     let expirations = elapsed / interval + 1;
                     let extra = expirations.saturating_sub(1);
                     if extra > 0 {
-                        timer.overrun = timer
-                            .overrun
-                            .saturating_add(extra)
-                            .min(i32::MAX as usize);
+                        timer.overrun = timer.overrun.saturating_add(extra).min(i32::MAX as usize);
                     }
-                    timer.deadline_ms = Some(base.saturating_add(expirations.saturating_mul(interval)));
+                    timer.deadline_ms =
+                        Some(base.saturating_add(expirations.saturating_mul(interval)));
                 }
                 Some((pid, signum))
             } else {
@@ -505,9 +504,6 @@ pub fn check_timer() {
 pub fn has_pending_timers() -> bool {
     !TIMERS.lock().is_empty()
         || !ALARM_TIMERS.lock().is_empty()
-        || POSIX_TIMERS
-            .lock()
-            .iter()
-            .any(|t| t.deadline_ms.is_some())
+        || POSIX_TIMERS.lock().iter().any(|t| t.deadline_ms.is_some())
         || !DELAYED_TID_CLEARS.lock().is_empty()
 }

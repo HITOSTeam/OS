@@ -3,8 +3,8 @@
 #![feature(str_from_raw_parts)]
 pub mod utils;
 extern crate alloc;
-mod config;
 mod arch;
+mod config;
 mod console;
 pub mod debug_config;
 mod drivers;

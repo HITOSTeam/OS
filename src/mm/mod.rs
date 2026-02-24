@@ -11,20 +11,20 @@ mod dtb;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
-#[cfg(target_arch = "riscv64")]
-pub use crate::arch::riscv64::mm::page_table;
 #[cfg(target_arch = "loongarch64")]
 pub use crate::arch::loongarch64::mm::page_table;
+#[cfg(target_arch = "riscv64")]
+pub use crate::arch::riscv64::mm::page_table;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::println;
-pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 pub use address::StepByOne;
 use address::VPNRange;
+pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
-pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_contiguous, frame_dealloc};
 pub use dtb::init_phys_mem_from_dtb;
+pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_contiguous, frame_dealloc};
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
@@ -42,9 +42,9 @@ pub fn activate_kernel_space() {
         memory_set::activate_token(token);
     }
 }
+pub(crate) use memory_set::elf_interp_path_from_reader;
 pub use memory_set::remap_test;
 pub use memory_set::{ElfAux, KERNEL_SPACE, MapPermission, MemorySet};
-pub(crate) use memory_set::elf_interp_path_from_reader;
 pub use page_table::{PTEFlags, PageTable};
 pub use page_table::{
     PageTableEntry, copy_from_user, copy_to_user, read_user_value, translated_byte_buffer,

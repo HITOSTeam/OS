@@ -35,11 +35,7 @@ pub fn record_uart_bytes(bytes: usize) {
 
 #[inline]
 pub fn uart_flush_begin() -> usize {
-    if DEBUG_PERF {
-        arch::read_time()
-    } else {
-        0
-    }
+    if DEBUG_PERF { arch::read_time() } else { 0 }
 }
 
 #[inline]
@@ -55,11 +51,7 @@ pub fn uart_flush_end(start: usize) {
 
 #[inline]
 pub fn block_read_begin() -> usize {
-    if DEBUG_PERF {
-        arch::read_time()
-    } else {
-        0
-    }
+    if DEBUG_PERF { arch::read_time() } else { 0 }
 }
 
 #[inline]
@@ -76,11 +68,7 @@ pub fn block_read_end(start: usize, bytes: usize) {
 
 #[inline]
 pub fn block_write_begin() -> usize {
-    if DEBUG_PERF {
-        arch::read_time()
-    } else {
-        0
-    }
+    if DEBUG_PERF { arch::read_time() } else { 0 }
 }
 
 #[inline]

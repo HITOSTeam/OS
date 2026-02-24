@@ -2,7 +2,7 @@ use alloc::{collections::BTreeSet, sync::Arc, sync::Weak};
 
 use crate::{
     config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
-    mm::{MapPermission, PhysPageNum, VirtAddr, KERNEL_SPACE},
+    mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr},
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
 };

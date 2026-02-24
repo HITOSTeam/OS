@@ -60,9 +60,7 @@ pub fn console_putchar(c: usize) {
 
 pub fn console_flush() {
     uart_init_once();
-    unsafe {
-        while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {}
-    }
+    unsafe { while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {} }
 }
 
 pub fn console_getchar() -> usize {

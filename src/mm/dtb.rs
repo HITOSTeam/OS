@@ -2,7 +2,7 @@ use core::cmp::{max, min};
 
 use fdt::Fdt;
 
-use crate::config::{set_phys_mem_range};
+use crate::config::set_phys_mem_range;
 
 pub fn init_phys_mem_from_dtb(dtb_pa: usize) {
     if dtb_pa == 0 {
@@ -29,10 +29,6 @@ pub fn init_phys_mem_from_dtb(dtb_pa: usize) {
 
     if start != usize::MAX && end > start {
         set_phys_mem_range(start, end);
-        crate::println!(
-            "[mm] dtb memory range: {:#x}-{:#x}",
-            start,
-            end
-        );
+        crate::println!("[mm] dtb memory range: {:#x}-{:#x}", start, end);
     }
 }

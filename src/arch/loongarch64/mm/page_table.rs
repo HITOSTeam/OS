@@ -471,11 +471,7 @@ pub fn try_copy_to_user(token: usize, dst: *mut u8, src: &[u8]) -> Result<(), ()
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr().add(read),
-                (pa.0 + page_off) as *mut u8,
-                n,
-            );
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(read), (pa.0 + page_off) as *mut u8, n);
         }
         start += n;
         read += n;
@@ -502,11 +498,7 @@ pub fn try_copy_to_user_unchecked(token: usize, dst: *mut u8, src: &[u8]) -> Res
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr().add(read),
-                (pa.0 + page_off) as *mut u8,
-                n,
-            );
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(read), (pa.0 + page_off) as *mut u8, n);
         }
         start += n;
         read += n;

@@ -5,7 +5,7 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
-    mm::{kernel_token, try_read_user_value, write_user_value, MemorySet},
+    mm::{MemorySet, kernel_token, try_read_user_value, write_user_value},
     println,
     syscall::{
         filesystem::{
@@ -15,11 +15,11 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        manager::{add_task, remove_inactive_task, select_hart_for_new_task, PID2PCB},
-        processor::{block_current_and_run_next, current_process, current_task},
-        signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
-        task_block::TaskControlBlock,
         ProcessControlBlock,
+        manager::{PID2PCB, add_task, remove_inactive_task, select_hart_for_new_task},
+        processor::{block_current_and_run_next, current_process, current_task},
+        signal::{MAX_SIG, SIG_DFL, SIG_IGN, SignalFlags, pending_unmasked_bits},
+        task_block::TaskControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };

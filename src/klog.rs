@@ -103,4 +103,3 @@ pub fn snapshot_and_clear(max_len: usize) -> Vec<u8> {
     inner.clear();
     out
 }
-
