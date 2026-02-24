@@ -70,6 +70,7 @@ const ENOENT: isize = -2;
 
 const MSG_OOB: usize = 0x1;
 const MSG_PEEK: usize = 0x2;
+const MSG_TRUNC: usize = 0x20;
 const MSG_DONTWAIT: usize = 0x40;
 const MSG_ERRQUEUE: usize = 0x2000;
 const MSG_NOSIGNAL: usize = 0x4000;
@@ -900,10 +901,7 @@ fn read_iovecs(iov_ptr: usize, iovcnt: usize) -> Result<Vec<IoVec>, isize> {
 }
 
 fn gather_iovecs_data(iovs: &[IoVec]) -> Result<Vec<u8>, isize> {
-    let total = iovs
-        .iter()
-        .try_fold(0usize, |acc, iv| acc.checked_add(iv.len))
-        .ok_or(EINVAL)?;
+    let total = iovecs_total_len(iovs)?;
     let token = get_current_token();
     let mut out = vec![0u8; total];
     let mut off = 0usize;
@@ -918,6 +916,98 @@ fn gather_iovecs_data(iovs: &[IoVec]) -> Result<Vec<u8>, isize> {
         off = end;
     }
     Ok(out)
+}
+
+fn iovecs_total_len(iovs: &[IoVec]) -> Result<usize, isize> {
+    iovs.iter()
+        .try_fold(0usize, |acc, iv| acc.checked_add(iv.len))
+        .ok_or(EINVAL)
+}
+
+fn scatter_iovecs_data(iovs: &[IoVec], data: &[u8]) -> Result<usize, isize> {
+    let token = get_current_token();
+    let mut off = 0usize;
+    for iv in iovs {
+        if off >= data.len() {
+            break;
+        }
+        if iv.len == 0 {
+            continue;
+        }
+        let n = core::cmp::min(iv.len, data.len() - off);
+        if try_copy_to_user(token, iv.base as *mut u8, &data[off..off + n]).is_err() {
+            return Err(EFAULT);
+        }
+        off += n;
+    }
+    Ok(off)
+}
+
+fn write_msg_name_bytes(msg: &mut MsgHdr, value: &[u8]) -> isize {
+    if msg.msg_name == 0 {
+        msg.msg_namelen = 0;
+        return 0;
+    }
+    let user_len = msg.msg_namelen as usize;
+    if user_len > i32::MAX as usize {
+        return EINVAL;
+    }
+    let copy_len = core::cmp::min(user_len, value.len());
+    if copy_len > 0 {
+        let token = get_current_token();
+        if try_copy_to_user(token, msg.msg_name as *mut u8, &value[..copy_len]).is_err() {
+            return EFAULT;
+        }
+    }
+    msg.msg_namelen = value.len() as u32;
+    0
+}
+
+fn write_msg_name_in(msg: &mut MsgHdr, ip: smoltcp::wire::Ipv4Address, port: u16) -> isize {
+    let sa = SockAddrIn {
+        sin_family: AF_INET,
+        sin_port: port.to_be(),
+        sin_addr: {
+            let b = ip.as_bytes();
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_be()
+        },
+        sin_zero: [0; 8],
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&sa as *const SockAddrIn) as *const u8,
+            size_of::<SockAddrIn>(),
+        )
+    };
+    write_msg_name_bytes(msg, bytes)
+}
+
+fn write_msg_name_un(msg: &mut MsgHdr, addr: Option<&UnixBoundAddr>) -> isize {
+    let mut sa = SockAddrUn {
+        sun_family: AF_UNIX,
+        sun_path: [0; 108],
+    };
+    if let Some(bound) = addr {
+        match bound {
+            UnixBoundAddr::Path(path) => {
+                let raw = path.as_bytes();
+                let copy = raw.len().min(sa.sun_path.len().saturating_sub(1));
+                sa.sun_path[..copy].copy_from_slice(&raw[..copy]);
+            }
+            UnixBoundAddr::Abstract(name) => {
+                sa.sun_path[0] = 0;
+                let copy = name.len().min(sa.sun_path.len().saturating_sub(1));
+                sa.sun_path[1..1 + copy].copy_from_slice(&name[..copy]);
+            }
+        }
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&sa as *const SockAddrUn) as *const u8,
+            size_of::<SockAddrUn>(),
+        )
+    };
+    write_msg_name_bytes(msg, bytes)
 }
 
 fn validate_send_flags(flags: usize) -> isize {
@@ -958,6 +1048,15 @@ fn write_mmsghdr_msg_len(user_ptr: usize, idx: usize, msg_len: u32) -> isize {
     let base = user_ptr + idx * size_of::<MMsgHdr>();
     let ptr = (base + size_of::<MsgHdr>()) as *mut u32;
     if try_write_user_value(token, ptr, &msg_len).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+fn write_mmsghdr(user_ptr: usize, idx: usize, mmsg: &MMsgHdr) -> isize {
+    let token = get_current_token();
+    let ptr = (user_ptr + idx * size_of::<MMsgHdr>()) as *mut MMsgHdr;
+    if try_write_user_value(token, ptr, mmsg).is_err() {
         return EFAULT;
     }
     0
@@ -1108,7 +1207,7 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
     }
 }
 
-fn recvmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
+fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
     let recv_flag_check = validate_recv_flags(flags);
     if recv_flag_check != 0 {
         return recv_flag_check;
@@ -1123,11 +1222,144 @@ fn recvmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
     if msg.msg_controllen > 0 && msg.msg_control == 0 {
         return EFAULT;
     }
-    if iovs.is_empty() {
+    let total_len = match iovecs_total_len(&iovs) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    msg.msg_flags = 0;
+    msg.msg_controllen = 0;
+    if total_len == 0 {
+        msg.msg_namelen = 0;
         return 0;
     }
-    let first = iovs[0];
-    syscall_recvfrom(fd, first.base, first.len, flags, 0, 0)
+    if iovs.is_empty() {
+        msg.msg_namelen = 0;
+        return 0;
+    }
+    let file = match get_file(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    if let Some(unix_sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
+        if unix_sock.is_stream_like() {
+            if (flags & MSG_DONTWAIT) != 0 && !unix_sock.poll_readable() {
+                return EAGAIN;
+            }
+            let mut total = 0usize;
+            for iv in iovs.iter() {
+                if iv.len == 0 {
+                    continue;
+                }
+                if total > 0 && !unix_sock.poll_readable() {
+                    break;
+                }
+                let n = crate::syscall::filesystem::syscall_read(fd, iv.base, iv.len);
+                if n < 0 {
+                    return if total > 0 { total as isize } else { n };
+                }
+                let n = n as usize;
+                total = match total.checked_add(n) {
+                    Some(v) => v,
+                    None => return EINVAL,
+                };
+                if n < iv.len {
+                    break;
+                }
+            }
+            let peer = unix_sock.peer_addr();
+            let r = write_msg_name_un(msg, peer.as_ref());
+            if r != 0 {
+                return r;
+            }
+            return total as isize;
+        }
+        if !unix_sock.is_dgram() {
+            return EOPNOTSUPP;
+        }
+        if (flags & MSG_DONTWAIT) != 0 && unix_sock.state.lock().dgram_queue.is_empty() {
+            return EAGAIN;
+        }
+        let dgram = unix_sock.recv_dgram();
+        let copied = match scatter_iovecs_data(&iovs, &dgram.payload) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if copied < dgram.payload.len() {
+            msg.msg_flags |= MSG_TRUNC as i32;
+        }
+        let r = write_msg_name_un(msg, dgram.from.as_ref());
+        if r != 0 {
+            return r;
+        }
+        return copied as isize;
+    }
+    let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
+        Some(s) => s,
+        None => return ENOTSOCK,
+    };
+    match sock.kind() {
+        crate::fs::NetSocketKind::TcpStream => {
+            if (flags & MSG_DONTWAIT) != 0 && !sock.poll_readable() {
+                return EAGAIN;
+            }
+            let mut total = 0usize;
+            for iv in iovs.iter() {
+                if iv.len == 0 {
+                    continue;
+                }
+                if total > 0 && !sock.poll_readable() {
+                    break;
+                }
+                let mut kbuf = vec![0u8; iv.len];
+                let n = match sock.tcp_recv(&mut kbuf) {
+                    Ok(v) => v,
+                    Err(e) => return if total > 0 { total as isize } else { e },
+                };
+                if n > 0 {
+                    let token = get_current_token();
+                    if try_copy_to_user(token, iv.base as *mut u8, &kbuf[..n]).is_err() {
+                        return EFAULT;
+                    }
+                }
+                total = match total.checked_add(n) {
+                    Some(v) => v,
+                    None => return EINVAL,
+                };
+                if n < iv.len {
+                    break;
+                }
+            }
+            if let Some((_lip, _lport, rip, rport)) = sock.tcp_endpoints_v4() {
+                let r = write_msg_name_in(msg, rip, rport);
+                if r != 0 {
+                    return r;
+                }
+            } else {
+                msg.msg_namelen = 0;
+            }
+            total as isize
+        }
+        crate::fs::NetSocketKind::Udp => {
+            if (flags & MSG_DONTWAIT) != 0 && !sock.poll_readable() {
+                return EAGAIN;
+            }
+            let mut kbuf = vec![0u8; total_len];
+            let (n, ip, port) = match sock.udp_recv_from(&mut kbuf) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let copied = match scatter_iovecs_data(&iovs, &kbuf[..n]) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let r = write_msg_name_in(msg, ip, port);
+            if r != 0 {
+                return r;
+            }
+            copied as isize
+        }
+        crate::fs::NetSocketKind::TcpListener => EOPNOTSUPP,
+    }
 }
 
 pub fn syscall_sendmsg(fd: usize, msg: usize, flags: usize) -> isize {
@@ -1143,11 +1375,10 @@ pub fn syscall_recvmsg(fd: usize, msg: usize, flags: usize) -> isize {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let ret = recvmsg_inner(fd, &msghdr, flags);
+    let ret = recvmsg_inner(fd, &mut msghdr, flags);
     if ret < 0 {
         return ret;
     }
-    msghdr.msg_flags = 0;
     let token = get_current_token();
     if try_write_user_value(token, msg as *mut MsgHdr, &msghdr).is_err() {
         return EFAULT;
@@ -1209,18 +1440,19 @@ pub fn syscall_recvmmsg(
     for i in 0..vlen {
         let token = get_current_token();
         let ptr = (msgvec + i * size_of::<MMsgHdr>()) as *const MMsgHdr;
-        let Some(mmsg) = try_read_user_value::<MMsgHdr>(token, ptr) else {
+        let Some(mut mmsg) = try_read_user_value::<MMsgHdr>(token, ptr) else {
             return if recvd > 0 { recvd as isize } else { EFAULT };
         };
         let mut recv_flags = flags;
         if recvd > 0 && (flags & MSG_WAITFORONE) != 0 {
             recv_flags |= MSG_DONTWAIT;
         }
-        let ret = recvmsg_inner(fd, &mmsg.msg_hdr, recv_flags);
+        let ret = recvmsg_inner(fd, &mut mmsg.msg_hdr, recv_flags);
         if ret < 0 {
             return if recvd > 0 { recvd as isize } else { ret };
         }
-        let wr = write_mmsghdr_msg_len(msgvec, i, ret as u32);
+        mmsg.msg_len = ret as u32;
+        let wr = write_mmsghdr(msgvec, i, &mmsg);
         if wr < 0 {
             return if recvd > 0 { recvd as isize } else { wr };
         }
