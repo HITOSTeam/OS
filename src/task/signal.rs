@@ -26,7 +26,7 @@ use crate::{
     task::{
         manager::{pid2process, wakeup_task},
         processor::{current_task, suspend_current_and_run_next},
-        task_block::TaskControlBlock,
+        task_block::{TaskControlBlock, TaskControlBlockInner},
     },
     time::get_time_ms,
     trap::{context::TrapContext, get_current_token},
@@ -37,6 +37,34 @@ pub fn signal_bit(signum: usize) -> Option<u64> {
         return None;
     }
     Some(1u64 << (signum - 1))
+}
+
+fn current_sender_ids() -> (i32, u32) {
+    let proc = current_process();
+    let pid = proc.getpid() as i32;
+    let uid = {
+        let inner = proc.borrow_mut();
+        inner.euid
+    };
+    (pid, uid)
+}
+
+fn mark_pending_signal(
+    inner: &mut TaskControlBlockInner,
+    signum: usize,
+    sender_pid: i32,
+    sender_uid: u32,
+    si_code: i32,
+) {
+    let Some(bit) = signal_bit(signum) else {
+        return;
+    };
+    inner.pending_signals |= bit;
+    if signum <= RT_SIG_MAX {
+        inner.pending_signal_pid[signum] = sender_pid;
+        inner.pending_signal_uid[signum] = sender_uid;
+        inner.pending_signal_code[signum] = si_code;
+    }
 }
 
 pub fn pending_unmasked_bits(pending: u64, mask: u64, ignore_sigchld: bool) -> u64 {
@@ -320,20 +348,40 @@ pub fn set_signal(
     let token = get_current_token();
     let process = current_process();
     let mut inner = process.borrow_mut();
-    if signum as usize > MAX_SIG {
+    if signum <= 0 || signum as usize > RT_SIG_MAX {
         return -1;
     }
-    if let Some(flag) = SignalFlags::from_bits(1 << signum) {
-        if check_sigaction_error(flag, action as usize, old_action as usize) {
-            return -1;
-        }
-        let prev_action = inner.signals_actions.table[signum as usize];
+    let signum = signum as usize;
+    if action.is_null() || old_action.is_null() || signum == SIGKILL_NUM || signum == SIGSTOP_NUM {
+        -1
+    } else {
+        let prev_rt = inner
+            .rt_sig_handlers
+            .get(signum)
+            .copied()
+            .unwrap_or_default();
+        let prev_action = if signum <= MAX_SIG {
+            inner.signals_actions.table[signum]
+        } else {
+            SignalAction {
+                handler: prev_rt.handler,
+                mask: SignalFlags::from_bits_truncate(prev_rt.mask as u32),
+            }
+        };
         write_user_value(token, old_action, &prev_action);
+
         let new_action = read_user_value(token, action as *const SignalAction);
-        inner.signals_actions.table[signum as usize] = new_action;
+        if signum <= MAX_SIG {
+            if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
+                if check_sigaction_error(flag, action as usize, old_action as usize) {
+                    return -1;
+                }
+            }
+            inner.signals_actions.table[signum] = new_action;
+        }
         // Keep rt_sigaction table in sync so delivery uses the latest handler.
-        if (signum as usize) <= RT_SIG_MAX && (signum as usize) < inner.rt_sig_handlers.len() {
-            inner.rt_sig_handlers[signum as usize] = RtSigAction {
+        if signum < inner.rt_sig_handlers.len() {
+            inner.rt_sig_handlers[signum] = RtSigAction {
                 handler: new_action.handler,
                 flags: 0,
                 restorer: 0,
@@ -341,8 +389,6 @@ pub fn set_signal(
             };
         }
         0
-    } else {
-        -1
     }
 }
 
@@ -354,16 +400,21 @@ pub fn kill(pid: usize, signum: i32) -> isize {
     if signum == 0 {
         return 0;
     }
-    if signum < 0 || signum as usize > MAX_SIG {
+    if signum < 0 || signum as usize > RT_SIG_MAX {
         return -22; // EINVAL
     }
-    let Some(flag) = SignalFlags::from_bits(1u32 << signum) else {
-        return -22; // EINVAL
-    };
     let sig_bit = signal_bit(signum as usize).unwrap_or(0);
+    let legacy_flag = if signum as usize <= MAX_SIG {
+        SignalFlags::from_bits(1u32 << signum)
+    } else {
+        None
+    };
+    let (sender_pid, sender_uid) = current_sender_ids();
     let (tasks, child_pids) = {
         let mut process_ref = process.borrow_mut();
-        process_ref.signals.insert(flag);
+        if let Some(flag) = legacy_flag {
+            process_ref.signals.insert(flag);
+        }
         let tasks = process_ref
             .tasks
             .iter()
@@ -393,7 +444,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
         for t in &tasks {
             let (tid, pending, mask) = {
                 let mut inner = t.borrow_mut();
-                inner.pending_signals |= sig_bit;
+                mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0);
                 let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 (tid, inner.pending_signals, inner.signal_mask)
             };
@@ -423,15 +474,20 @@ pub fn kill_current(signum: i32) -> isize {
     if signum == 0 {
         return 0;
     }
-    if signum < 0 || signum as usize > MAX_SIG {
+    if signum < 0 || signum as usize > RT_SIG_MAX {
         return -22; // EINVAL
     }
-    let Some(flag) = SignalFlags::from_bits(1u32 << signum) else {
-        return -22; // EINVAL
+    let legacy_flag = if signum as usize <= MAX_SIG {
+        SignalFlags::from_bits(1u32 << signum)
+    } else {
+        None
     };
+    let (sender_pid, sender_uid) = current_sender_ids();
     let tasks = {
         let mut process_ref = process.borrow_mut();
-        process_ref.signals.insert(flag);
+        if let Some(flag) = legacy_flag {
+            process_ref.signals.insert(flag);
+        }
         process_ref
             .tasks
             .iter()
@@ -439,6 +495,10 @@ pub fn kill_current(signum: i32) -> isize {
             .collect::<alloc::vec::Vec<_>>()
     };
     for t in tasks {
+        {
+            let mut inner = t.borrow_mut();
+            mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0);
+        }
         wakeup_task(t);
     }
     0
@@ -486,7 +546,7 @@ pub fn queue_process_signal(pid: usize, signum: usize) {
     let (tid, on_cpu, queued) = {
         let mut inner = task.borrow_mut();
         let already = (inner.pending_signals & bit) != 0;
-        inner.pending_signals |= bit;
+        mark_pending_signal(&mut inner, signum, 0, 0, 0);
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
         (
             tid,

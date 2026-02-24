@@ -4,21 +4,21 @@ use crate::{
     debug_config::DEBUG_PTHREAD,
     fs::ext4_lock,
     mm::{
-        MapPermission, read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
-        try_read_user_value, try_write_user_value, write_user_value,
+        read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
+        try_read_user_value, try_write_user_value, write_user_value, MapPermission,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
-        manager::{PID2PCB, pid2process},
+        manager::{pid2process, refresh_process_runqueues, PID2PCB},
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
         signal::{
-            SIGKILL_NUM, SIGSTOP_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal,
-            signal_bit,
+            has_unmasked_pending, queue_process_signal, signal_bit, SIGKILL_NUM, SIGSTOP_NUM,
+            SIGXCPU_NUM,
         },
     },
     time::{get_time, get_time_ms},
@@ -565,7 +565,11 @@ pub fn syscall_getppid() -> isize {
 }
 
 fn normalized_pgid(pid: usize, pgid: usize) -> usize {
-    if pgid == 0 && pid != 0 { pid } else { pgid }
+    if pgid == 0 && pid != 0 {
+        pid
+    } else {
+        pgid
+    }
 }
 
 fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {
@@ -775,6 +779,40 @@ fn collect_priority_targets(
 
 /// Linux `setpriority(2)` (syscall 140 on riscv64).
 pub fn syscall_setpriority(which: isize, who: isize, prio: isize) -> isize {
+    if which == PRIO_PROCESS && who == 0 {
+        let new_nice = clamp_nice(prio);
+        let caller = current_process();
+        let caller_euid = {
+            let inner = caller.borrow_mut();
+            inner.euid
+        };
+        let task = current_task().unwrap();
+        let (cur_nice, from_nice_wrapper) = {
+            let mut inner = task.borrow_mut();
+            let cur_nice = inner.nice;
+            let from_nice_wrapper = inner.nice_query_hint;
+            inner.nice_query_hint = false;
+            (cur_nice, from_nice_wrapper)
+        };
+        if caller_euid != 0 && new_nice < cur_nice {
+            // libc `nice()` is often emulated by getpriority()+setpriority().
+            // Linux reports EPERM for nice(-N), while plain setpriority() keeps EACCES.
+            return if from_nice_wrapper { EPERM } else { EACCES };
+        }
+        {
+            let mut inner = task.borrow_mut();
+            inner.nice = new_nice;
+        }
+        // Keep process-level default nice in sync for newly created threads.
+        caller.borrow_mut().nice = new_nice;
+        refresh_process_runqueues(&caller);
+        return 0;
+    }
+
+    if let Some(task) = current_task() {
+        task.borrow_mut().nice_query_hint = false;
+    }
+
     let targets = match collect_priority_targets(which, who) {
         Ok(v) => v,
         Err(e) => return e,
@@ -804,6 +842,8 @@ pub fn syscall_setpriority(which: isize, who: isize, prio: isize) -> isize {
     for proc in targets {
         let mut inner = proc.borrow_mut();
         inner.nice = new_nice;
+        drop(inner);
+        refresh_process_runqueues(&proc);
     }
     0
 }
@@ -813,6 +853,16 @@ pub fn syscall_setpriority(which: isize, who: isize, prio: isize) -> isize {
 /// Return kernel-internal encoded value (1..40); libc converts it back to
 /// user-visible nice range (-20..19).
 pub fn syscall_getpriority(which: isize, who: isize) -> isize {
+    if which == PRIO_PROCESS && who == 0 {
+        let task = current_task().unwrap();
+        let nice = {
+            let mut inner = task.borrow_mut();
+            inner.nice_query_hint = true;
+            inner.nice
+        };
+        return (20 - nice as isize) as isize;
+    }
+
     let targets = match collect_priority_targets(which, who) {
         Ok(v) => v,
         Err(e) => return e,
@@ -871,7 +921,11 @@ pub fn syscall_getegid() -> isize {
 }
 
 /// Linux `getgroups(2)` (syscall 158 on riscv64).
-pub fn syscall_getgroups(size: usize, list: usize) -> isize {
+pub fn syscall_getgroups(size: isize, list: usize) -> isize {
+    if size < 0 {
+        return EINVAL;
+    }
+    let size = size as usize;
     let groups = {
         let process = current_process();
         let inner = process.borrow_mut();

@@ -90,6 +90,7 @@ const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_FCHDIR: usize = 50;
+const SYSCALL_CHROOT: usize = 51;
 const SYSCALL_OPENAT: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_CLOSE_RANGE: usize = 436;
@@ -257,6 +258,7 @@ const SYSCALL_SIGACTION: usize = 134; // rt_sigaction
 const SYSCALL_SIGPROCMASK: usize = 135; // rt_sigprocmask
 const SYSCALL_SIGPENDING: usize = 136; // rt_sigpending
 const SYSCALL_SIGSUSPEND: usize = 133; // rt_sigsuspend
+const SYSCALL_SIGALTSTACK: usize = 132; // sigaltstack
 const SYSCALL_SIGTIMEDWAIT: usize = 137; // rt_sigtimedwait
 const SYSCALL_SIGRETURN: usize = 139; // rt_sigreturn
 const SYSCALL_KILL: usize = 129;
@@ -298,7 +300,11 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         if is_cyclic {
             let left = CYCLIC_SYSCALL_LOGS
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    if val == 0 { None } else { Some(val - 1) }
+                    if val == 0 {
+                        None
+                    } else {
+                        Some(val - 1)
+                    }
                 })
                 .unwrap_or(0);
             if left > 0 {
@@ -475,6 +481,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_CHDIR => filesystem::syscall_chdir(args[0]),
         SYSCALL_FCHDIR => filesystem::syscall_fchdir(args[0]),
+        SYSCALL_CHROOT => filesystem::syscall_chroot(args[0]),
         SYSCALL_OPENAT => filesystem::syscall_openat(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_READ => flow::syscall_read(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_WRITE => flow::syscall_write(args[0], args[1] as *const u8, args[2]),
@@ -557,7 +564,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETPGID => misc::syscall_getpgid(args[0]),
         SYSCALL_GETSID => misc::syscall_getsid(args[0]),
         SYSCALL_SETSID => misc::syscall_setsid(),
-        SYSCALL_GETGROUPS => misc::syscall_getgroups(args[0], args[1]),
+        SYSCALL_GETGROUPS => misc::syscall_getgroups(args[0] as isize, args[1]),
         SYSCALL_SETGROUPS => misc::syscall_setgroups(args[0], args[1]),
         SYSCALL_UNAME => misc::syscall_uname(args[0]),
         SYSCALL_SETHOSTNAME => misc::syscall_sethostname(args[0], args[1]),
@@ -690,6 +697,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TGKILL => signal::syscall_tgkill(args[0], args[1], args[2] as i32),
 
         SYSCALL_SIGSUSPEND => signal::syscall_rt_sigsuspend(args[0], args[1]),
+        SYSCALL_SIGALTSTACK => signal::syscall_sigaltstack(args[0], args[1]),
         SYSCALL_SIGACTION => signal::syscall_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::syscall_rt_sigprocmask(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGPENDING => signal::syscall_rt_sigpending(args[0], args[1]),

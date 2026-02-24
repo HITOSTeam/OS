@@ -179,6 +179,7 @@ pub fn trap_handler() {
             crate::time::loongarch_record_timer_tick();
             set_next_trigger();
             check_timer();
+            crate::task::processor::account_current_task_tick();
             crate::syscall::misc::check_current_rlimit_cpu();
             if crate::debug_config::DEBUG_SIGNAL {
                 static LAST_SLEEP_TIMER_LOG: AtomicUsize = AtomicUsize::new(0);
@@ -205,7 +206,9 @@ pub fn trap_handler() {
                 println!("[kernel] {}", msg);
                 exit_current_and_run_next(errno);
             }
-            suspend_current_and_run_next();
+            if crate::task::processor::should_preempt_current_on_tick() {
+                suspend_current_and_run_next();
+            }
         } else {
             panic!(
                 "Unhandled interrupt: estat={:#x} badv={:#x} badi={:#x}",

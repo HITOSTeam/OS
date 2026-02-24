@@ -725,6 +725,8 @@ pub struct ProcessControlBlockInner {
     /// Per-process RLIMIT_RTTIME (soft/hard).
     pub rlimit_rttime_cur: u64,
     pub rlimit_rttime_max: u64,
+    /// Process root directory (host-absolute path), used for `chroot`.
+    pub root: String,
     pub cwd: String,
     pub heap_start: usize,
     pub brk: usize,
@@ -745,6 +747,9 @@ pub struct ProcessControlBlockInner {
     /// Linux-like scheduler state used by rt-tests (cyclictest/hackbench).
     pub sched_policy: i32,
     pub sched_priority: i32,
+    pub sched_runtime: u64,
+    pub sched_deadline: u64,
+    pub sched_period: u64,
     /// POSIX nice value used by getpriority/setpriority.
     pub nice: i32,
     // TaskControlBlock实际上现在是线程
@@ -1130,6 +1135,7 @@ impl ProcessControlBlock {
                 rlimit_sigpending_max: u64::MAX,
                 rlimit_rttime_cur: u64::MAX,
                 rlimit_rttime_max: u64::MAX,
+                root: String::from("/"),
                 cwd: String::from("/user"),
                 heap_start,
                 brk: heap_start,
@@ -1146,6 +1152,9 @@ impl ProcessControlBlock {
                 rt_sig_handlers: vec![RtSigAction::default(); RT_SIG_MAX + 1],
                 sched_policy: 0,
                 sched_priority: 0,
+                sched_runtime: 0,
+                sched_deadline: 0,
+                sched_period: 0,
                 nice: 0,
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
@@ -1381,6 +1390,7 @@ impl ProcessControlBlock {
     fn fork_impl(
         self: &Arc<Self>,
         share_files: bool,
+        share_vm: bool,
     ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
         let mut parent = self.borrow_mut();
         let thread_count = parent.thread_count();
@@ -1393,6 +1403,9 @@ impl ProcessControlBlock {
         }
         let sched_policy = parent.sched_policy;
         let sched_priority = parent.sched_priority;
+        let sched_runtime = parent.sched_runtime;
+        let sched_deadline = parent.sched_deadline;
+        let sched_period = parent.sched_period;
         let nice = parent.nice;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
@@ -1404,11 +1417,17 @@ impl ProcessControlBlock {
         #[cfg(target_arch = "loongarch64")]
         let mut memory_set = if DEBUG_LOONGARCH_FULL_COPY_FORK {
             MemorySet::from_existed_user(&parent.memory_set)
+        } else if share_vm {
+            MemorySet::from_existed_user_shared(&parent.memory_set)
         } else {
             MemorySet::from_existed_user_cow(&mut parent.memory_set)
         };
         #[cfg(not(target_arch = "loongarch64"))]
-        let mut memory_set = MemorySet::from_existed_user_cow(&mut parent.memory_set);
+        let mut memory_set = if share_vm {
+            MemorySet::from_existed_user_shared(&parent.memory_set)
+        } else {
+            MemorySet::from_existed_user_cow(&mut parent.memory_set)
+        };
         if thread_count > 1 {
             for task in parent.tasks.iter().filter_map(|t| t.as_ref()) {
                 let mut task_inner = task.borrow_mut();
@@ -1530,6 +1549,7 @@ impl ProcessControlBlock {
                 rlimit_sigpending_max: parent.rlimit_sigpending_max,
                 rlimit_rttime_cur: parent.rlimit_rttime_cur,
                 rlimit_rttime_max: parent.rlimit_rttime_max,
+                root: parent.root.clone(),
                 cwd: parent.cwd.clone(),
                 heap_start: parent.heap_start,
                 brk: parent.brk,
@@ -1547,6 +1567,9 @@ impl ProcessControlBlock {
                 rt_sig_handlers,
                 sched_policy,
                 sched_priority,
+                sched_runtime,
+                sched_deadline,
+                sched_period,
                 nice,
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
@@ -1612,7 +1635,7 @@ impl ProcessControlBlock {
 
     /// Only support processes with a single thread.
     pub fn fork(self: &Arc<Self>) -> Option<Arc<Self>> {
-        let (child, task) = self.fork_impl(false)?;
+        let (child, task) = self.fork_impl(false, false)?;
         // add this thread to scheduler
         add_task(task);
         Some(child)
@@ -1622,8 +1645,9 @@ impl ProcessControlBlock {
     pub fn fork_with_task(
         self: &Arc<Self>,
         share_files: bool,
+        share_vm: bool,
     ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
-        self.fork_impl(share_files)
+        self.fork_impl(share_files, share_vm)
     }
 
     pub fn getpid(&self) -> usize {

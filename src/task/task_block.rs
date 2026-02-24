@@ -349,6 +349,7 @@ use crate::{
     task::{
         id::{KernelStack, TaskUserRes, kstack_alloc},
         process_block::ProcessControlBlock,
+        signal::RT_SIG_MAX,
         task_context::TaskContext,
     },
     trap::{context::TrapContext, trap_handler, trap_return},
@@ -440,18 +441,35 @@ pub struct TaskControlBlockInner {
     pub robust_list_len: usize,
     /// Pending POSIX signals for this thread (bitmask).
     pub pending_signals: u64,
+    /// Best-effort sender metadata for pending signals (indexed by signum).
+    pub pending_signal_pid: [i32; RT_SIG_MAX + 1],
+    pub pending_signal_uid: [u32; RT_SIG_MAX + 1],
+    pub pending_signal_code: [i32; RT_SIG_MAX + 1],
     /// Signal mask for this thread (bitmask of blocked signals).
     pub signal_mask: u64,
     /// Saved mask to restore after a `sigsuspend`-delivered signal.
     pub sigsuspend_old_mask: Option<u64>,
     /// Saved user contexts when running nested signal handlers (stack).
     pub sig_saved_ctx: alloc::vec::Vec<SigSavedContext>,
+    /// Alternate signal stack state (`sigaltstack`).
+    pub sigaltstack_sp: usize,
+    pub sigaltstack_size: usize,
+    pub sigaltstack_enabled: bool,
+    pub on_sigaltstack: bool,
     /// Last syscall info for restartable syscalls (SA_RESTART).
     pub last_syscall_id: usize,
     pub last_syscall_args: [usize; 6],
     pub last_syscall_valid: bool,
     /// Task was blocked due to a job-control stop signal.
     pub stopped_by_signal: bool,
+    /// Number of timer ticks consumed in current SCHED_RR round.
+    pub rr_ticks: usize,
+    /// Best-effort per-thread CPU runtime used for *_CPUTIME clocks.
+    pub cpu_time_ns: u64,
+    /// Per-thread nice value (Linux/NPTL semantics).
+    pub nice: i32,
+    /// Hint that libc just queried self priority and may issue `nice()`.
+    pub nice_query_hint: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -461,6 +479,7 @@ pub struct SigSavedContext {
     pub ucontext_ptr: usize,
     pub uses_ucontext: bool,
     pub signum: usize,
+    pub was_on_sigaltstack: bool,
 }
 
 impl TaskControlBlockInner {
@@ -484,6 +503,10 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc()?;
         let kstack_top = kstack.get_top();
+        let process_nice = {
+            let inner = process.borrow_mut();
+            inner.nice
+        };
         Some(Self {
             process: Arc::downgrade(&process),
             kstack: Mutex::new(Some(kstack)),
@@ -502,13 +525,24 @@ impl TaskControlBlock {
                 robust_list_head: 0,
                 robust_list_len: 0,
                 pending_signals: 0,
+                pending_signal_pid: [0; RT_SIG_MAX + 1],
+                pending_signal_uid: [0; RT_SIG_MAX + 1],
+                pending_signal_code: [0; RT_SIG_MAX + 1],
                 signal_mask: 0,
                 sigsuspend_old_mask: None,
                 sig_saved_ctx: alloc::vec::Vec::new(),
+                sigaltstack_sp: 0,
+                sigaltstack_size: 0,
+                sigaltstack_enabled: false,
+                on_sigaltstack: false,
                 last_syscall_id: 0,
                 last_syscall_args: [0; 6],
                 last_syscall_valid: false,
                 stopped_by_signal: false,
+                rr_ticks: 0,
+                cpu_time_ns: 0,
+                nice: process_nice,
+                nice_query_hint: false,
             }),
         })
     }
@@ -533,6 +567,10 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc()?;
         let kstack_top = kstack.get_top();
+        let process_nice = {
+            let inner = process.borrow_mut();
+            inner.nice
+        };
         Some(Self {
             process: Arc::downgrade(&process),
             kstack: Mutex::new(Some(kstack)),
@@ -551,13 +589,24 @@ impl TaskControlBlock {
                 robust_list_head: 0,
                 robust_list_len: 0,
                 pending_signals: 0,
+                pending_signal_pid: [0; RT_SIG_MAX + 1],
+                pending_signal_uid: [0; RT_SIG_MAX + 1],
+                pending_signal_code: [0; RT_SIG_MAX + 1],
                 signal_mask: 0,
                 sigsuspend_old_mask: None,
                 sig_saved_ctx: alloc::vec::Vec::new(),
+                sigaltstack_sp: 0,
+                sigaltstack_size: 0,
+                sigaltstack_enabled: false,
+                on_sigaltstack: false,
                 last_syscall_id: 0,
                 last_syscall_args: [0; 6],
                 last_syscall_valid: false,
                 stopped_by_signal: false,
+                rr_ticks: 0,
+                cpu_time_ns: 0,
+                nice: process_nice,
+                nice_query_hint: false,
             }),
         })
     }

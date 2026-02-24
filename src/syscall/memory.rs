@@ -1,9 +1,9 @@
 use crate::{
     config::{PAGE_SIZE, TRAP_CONTEXT},
-    fs::{File, OSInode, PseudoShmFile, ext4_lock},
-    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked},
-    task::MmapRegion,
+    fs::{ext4_lock, File, OSInode, PseudoShmFile},
+    mm::{frame_alloc, try_copy_to_user, try_copy_to_user_unchecked, MapPermission, PTEFlags},
     task::processor::{current_files_process, current_process},
+    task::MmapRegion,
     trap::get_current_token,
 };
 use alloc::sync::Arc;

@@ -10,6 +10,9 @@ use crate::config::MAX_HARTS;
 use crate::debug_config::DEBUG_SCHED;
 use crate::task::block_sleep::{TIMERS, TimeWrap};
 use crate::task::process_block::ProcessControlBlock;
+use crate::task::sched::{
+    RT_PRIO_LEVELS, RT_PRIO_MAX, RT_PRIO_MIN, SchedClass, rt_queue_index, sched_class,
+};
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use spin::Mutex;
 
@@ -47,13 +50,13 @@ pub fn select_hart_for_new_task() -> usize {
 pub fn dump_system_state() {
     log::warn!("==== [watchdog] system state dump ====");
     let mgr = TASK_MANAGER.lock();
-    let total_ready: usize = mgr.ready_queues.iter().map(|q| q.len()).sum();
+    let total_ready: usize = mgr.ready_queues.iter().map(HartRunQueue::len).sum();
     log::warn!(
         "[watchdog] ready_queues_total_len={} per_hart={:?}",
         total_ready,
         mgr.ready_queues
             .iter()
-            .map(|q| q.len())
+            .map(HartRunQueue::len)
             .collect::<alloc::vec::Vec<_>>()
     );
     drop(mgr);
@@ -122,15 +125,69 @@ pub fn dump_system_state() {
     log::warn!("==== [watchdog] end ====");
 }
 
-pub struct TaskManager {
-    ready_queues: alloc::vec::Vec<VecDeque<Arc<TaskControlBlock>>>,
+#[derive(Default)]
+struct HartRunQueue {
+    rt_queues: alloc::vec::Vec<VecDeque<Arc<TaskControlBlock>>>,
+    fair_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+impl HartRunQueue {
+    fn new() -> Self {
+        Self {
+            rt_queues: (0..RT_PRIO_LEVELS).map(|_| VecDeque::new()).collect(),
+            fair_queue: VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.fair_queue.len() + self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
+    }
+}
+
+enum ReadyQueueSlot {
+    Rt(usize),
+    Fair,
+}
+
+fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
+    let Some(process) = task.process.upgrade() else {
+        return ReadyQueueSlot::Fair;
+    };
+    let (policy, rt_priority) = {
+        let inner = process.borrow_mut();
+        (inner.sched_policy, inner.sched_priority)
+    };
+    match sched_class(policy) {
+        Some(SchedClass::Fifo) | Some(SchedClass::Rr) => {
+            ReadyQueueSlot::Rt(rt_queue_index(rt_priority))
+        }
+        Some(SchedClass::Fair) | None => ReadyQueueSlot::Fair,
+    }
+}
+
+pub struct TaskManager {
+    ready_queues: alloc::vec::Vec<HartRunQueue>,
+}
+
+fn resolve_enqueue_hart(task: &Arc<TaskControlBlock>, current_hart: usize, mask: usize) -> usize {
+    let desired = task.get_cpu_id() % MAX_HARTS;
+    if (mask & (1usize << desired)) != 0 {
+        desired
+    } else if (mask & (1usize << current_hart)) != 0 {
+        task.set_cpu_id(current_hart);
+        current_hart
+    } else {
+        let picked = pick_online_hart(0);
+        task.set_cpu_id(picked);
+        picked
+    }
+}
+
+/// A Linux-like split runqueue: RT queues + a fair queue.
 impl TaskManager {
     pub fn new() -> Self {
         Self {
-            ready_queues: (0..MAX_HARTS).map(|_| VecDeque::new()).collect(),
+            ready_queues: (0..MAX_HARTS).map(|_| HartRunQueue::new()).collect(),
         }
     }
     pub fn add(&mut self, task: Arc<TaskControlBlock>, hart_id: usize) {
@@ -155,7 +212,11 @@ impl TaskManager {
                 self.ready_queues[hart_id].len()
             );
         }
-        self.ready_queues[hart_id].push_back(task);
+        let hart_rq = &mut self.ready_queues[hart_id];
+        match task_queue_slot(&task) {
+            ReadyQueueSlot::Rt(idx) => hart_rq.rt_queues[idx].push_back(task),
+            ReadyQueueSlot::Fair => hart_rq.fair_queue.push_back(task),
+        }
         if DEBUG_SCHED {
             log::debug!(
                 "[sched] hart={} ready_queue_len_after={}",
@@ -164,19 +225,20 @@ impl TaskManager {
             );
         }
     }
-    pub fn fetch(&mut self, hart_id: usize) -> Option<Arc<TaskControlBlock>> {
-        // Skip stale entries: under SMP, bugs or races can temporarily leave
-        // non-ready tasks (Blocked/Running) in the ready queue. Never schedule them.
-        let mut t = None;
-        while let Some(candidate) = self.ready_queues[hart_id].pop_front() {
+
+    fn pop_ready_candidate(
+        queue: &mut VecDeque<Arc<TaskControlBlock>>,
+        hart_id: usize,
+    ) -> Option<Arc<TaskControlBlock>> {
+        while let Some(candidate) = queue.pop_front() {
             candidate
                 .in_ready_queue
                 .store(false, core::sync::atomic::Ordering::Release);
             let status = candidate.borrow_mut().task_status;
             if status == TaskStatus::Ready {
-                t = Some(candidate);
-                break;
-            } else if DEBUG_SCHED {
+                return Some(candidate);
+            }
+            if DEBUG_SCHED {
                 let tid = candidate
                     .borrow_mut()
                     .res
@@ -188,10 +250,30 @@ impl TaskManager {
                     tid,
                     hart_id,
                     status,
-                    self.ready_queues[hart_id].len()
+                    queue.len()
                 );
             }
         }
+        None
+    }
+
+    pub fn fetch(&mut self, hart_id: usize) -> Option<Arc<TaskControlBlock>> {
+        // Skip stale entries: under SMP, bugs or races can temporarily leave
+        // non-ready tasks (Blocked/Running) in the ready queue. Never schedule them.
+        let t = {
+            let rq = &mut self.ready_queues[hart_id];
+            let mut picked = None;
+            for rtq in rq.rt_queues.iter_mut() {
+                if let Some(task) = Self::pop_ready_candidate(rtq, hart_id) {
+                    picked = Some(task);
+                    break;
+                }
+            }
+            if picked.is_none() {
+                picked = Self::pop_ready_candidate(&mut rq.fair_queue, hart_id);
+            }
+            picked
+        };
         if DEBUG_SCHED {
             if let Some(ref task) = t {
                 let tid = task
@@ -211,14 +293,20 @@ impl TaskManager {
         t
     }
     pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
-        for q in self.ready_queues.iter_mut() {
-            if let Some((id, _)) = q
-                .iter()
-                .enumerate()
-                .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(&task))
+        for rq in self.ready_queues.iter_mut() {
+            for q in rq
+                .rt_queues
+                .iter_mut()
+                .chain(core::iter::once(&mut rq.fair_queue))
             {
-                q.remove(id);
-                break;
+                if let Some((id, _)) = q
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(&task))
+                {
+                    q.remove(id);
+                    break;
+                }
             }
         }
         task.in_ready_queue
@@ -226,7 +314,21 @@ impl TaskManager {
     }
 
     pub fn ready_queue_lengths(&self) -> alloc::vec::Vec<usize> {
-        self.ready_queues.iter().map(|q| q.len()).collect()
+        self.ready_queues.iter().map(HartRunQueue::len).collect()
+    }
+
+    fn has_ready_rt_higher_than(&self, hart_id: usize, priority: i32) -> bool {
+        let rq = &self.ready_queues[hart_id];
+        let prio = priority.clamp(RT_PRIO_MIN, RT_PRIO_MAX);
+        let idx = rt_queue_index(prio);
+        rq.rt_queues[..idx].iter().any(|q| !q.is_empty())
+    }
+
+    fn has_ready_rt_at_or_above(&self, hart_id: usize, priority: i32) -> bool {
+        let rq = &self.ready_queues[hart_id];
+        let prio = priority.clamp(RT_PRIO_MIN, RT_PRIO_MAX);
+        let idx = rt_queue_index(prio);
+        rq.rt_queues[..=idx].iter().any(|q| !q.is_empty())
     }
 }
 
@@ -239,25 +341,44 @@ lazy_static! {
 pub fn add_task(task: Arc<TaskControlBlock>) {
     // Protect the ready queue from timer interrupt re-entrancy, but restore the previous SIE state.
     let prev_sie = arch::disable_interrupts();
-    let desired = task.get_cpu_id() % MAX_HARTS;
     let mask = online_hart_mask();
     let cur = crate::task::processor::hart_id() % MAX_HARTS;
-    let hart_id = if (mask & (1usize << desired)) != 0 {
-        desired
-    } else if (mask & (1usize << cur)) != 0 {
-        // If the preferred hart is offline, run it where we are.
-        task.set_cpu_id(cur);
-        cur
-    } else {
-        // Last resort: pick any online hart.
-        let picked = pick_online_hart(0);
-        task.set_cpu_id(picked);
-        picked
-    };
+    let hart_id = resolve_enqueue_hart(&task, cur, mask);
     TASK_MANAGER.lock().add(task, hart_id);
     // Linux-style: if we queued to a remote hart, kick it out of `wfi` via IPI.
     if cur < MAX_HARTS && cur != hart_id {
         arch::send_ipi(hart_id);
+    }
+    arch::restore_interrupts(prev_sie);
+}
+
+/// Requeue runnable threads after policy/priority/nice changes.
+pub fn refresh_process_runqueues(process: &Arc<ProcessControlBlock>) {
+    let tasks = {
+        let inner = process.borrow_mut();
+        inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    if tasks.is_empty() {
+        return;
+    }
+    let prev_sie = arch::disable_interrupts();
+    let cur = crate::task::processor::hart_id() % MAX_HARTS;
+    let mask = online_hart_mask();
+    let mut mgr = TASK_MANAGER.lock();
+    for task in tasks {
+        if !task
+            .in_ready_queue
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            continue;
+        }
+        mgr.remove(Arc::clone(&task));
+        let hart_id = resolve_enqueue_hart(&task, cur, mask);
+        mgr.add(task, hart_id);
     }
     arch::restore_interrupts(prev_sie);
 }
@@ -309,6 +430,26 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     let t = TASK_MANAGER.lock().fetch(hart_id);
     arch::restore_interrupts(prev_sie);
     t
+}
+
+pub fn has_ready_rt_higher_than(priority: i32) -> bool {
+    let prev_sie = arch::disable_interrupts();
+    let hart_id = crate::task::processor::hart_id();
+    let ready = TASK_MANAGER
+        .lock()
+        .has_ready_rt_higher_than(hart_id, priority);
+    arch::restore_interrupts(prev_sie);
+    ready
+}
+
+pub fn has_ready_rt_at_or_above(priority: i32) -> bool {
+    let prev_sie = arch::disable_interrupts();
+    let hart_id = crate::task::processor::hart_id();
+    let ready = TASK_MANAGER
+        .lock()
+        .has_ready_rt_at_or_above(hart_id, priority);
+    arch::restore_interrupts(prev_sie);
+    ready
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {

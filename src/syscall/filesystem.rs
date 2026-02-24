@@ -11,20 +11,19 @@ use spin::Mutex;
 use crate::task::manager::PID2PCB;
 use crate::{
     fs::{
-        File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent,
-        PseudoFile, PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file,
-        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
+        ext4_lock, find_path_in_roots, make_pipe, open_file, secondary_root_inode, shm_create,
+        shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock,
+        PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
     },
     mm::{
-        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
-        translated_byte_buffer, translated_mutref, translated_str, try_copy_from_user,
-        try_copy_to_user,
-        try_read_user_value, try_write_user_value, write_user_value,
+        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
+        translated_str, try_copy_from_user, try_copy_to_user, try_read_user_value,
+        try_write_user_value, write_user_value, MapPermission, UserBuffer,
     },
     task::processor::{current_files_process, current_process},
     task::{
+        signal::{queue_process_signal, SIGXFSZ_NUM},
         ProcessControlBlock,
-        signal::{SIGXFSZ_NUM, queue_process_signal},
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -301,6 +300,28 @@ pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
     out
 }
 
+fn current_process_root() -> String {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    inner.root.clone()
+}
+
+fn apply_process_root(abs: &str) -> String {
+    let root = current_process_root();
+    if root == "/" {
+        return String::from(abs);
+    }
+    if abs == "/" {
+        return root;
+    }
+    let mut out = root;
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    out.push_str(abs.trim_start_matches('/'));
+    normalize_path("/", &out)
+}
+
 fn normalize_relative_path(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for seg in path.split('/') {
@@ -530,7 +551,8 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
 
     // Absolute path: ignore dirfd.
     if path.starts_with('/') {
-        let abs = rewrite_proc_self(&normalize_path("/", path));
+        let jail_abs = normalize_path("/", path);
+        let abs = rewrite_proc_self(&apply_process_root(&jail_abs));
         if crate::fs::is_proc_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
         }
@@ -821,7 +843,10 @@ fn inode_supports_user_xattr(inode: &Arc<ext4_fs::Inode>) -> bool {
     inode.is_file() || inode.is_dir()
 }
 
-fn resolve_xattr_path_inode(path_ptr: usize, follow_final: bool) -> Result<Arc<ext4_fs::Inode>, isize> {
+fn resolve_xattr_path_inode(
+    path_ptr: usize,
+    follow_final: bool,
+) -> Result<Arc<ext4_fs::Inode>, isize> {
     let token = get_current_token();
     let path = read_user_cstring(token, path_ptr)?;
     let at = resolve_at_path(AT_FDCWD, &path)?;
@@ -2562,7 +2587,13 @@ pub fn syscall_fchownat(
 }
 
 /// Linux `setxattr(2)` (syscall 5 on riscv64).
-pub fn syscall_setxattr(path: usize, name: usize, value: usize, size: usize, flags: usize) -> isize {
+pub fn syscall_setxattr(
+    path: usize,
+    name: usize,
+    value: usize,
+    size: usize,
+    flags: usize,
+) -> isize {
     let token = get_current_token();
     let name = match read_user_xattr_name(token, name) {
         Ok(v) => v,
@@ -2580,7 +2611,13 @@ pub fn syscall_setxattr(path: usize, name: usize, value: usize, size: usize, fla
 }
 
 /// Linux `lsetxattr(2)` (syscall 6 on riscv64).
-pub fn syscall_lsetxattr(path: usize, name: usize, value: usize, size: usize, flags: usize) -> isize {
+pub fn syscall_lsetxattr(
+    path: usize,
+    name: usize,
+    value: usize,
+    size: usize,
+    flags: usize,
+) -> isize {
     let token = get_current_token();
     let name = match read_user_xattr_name(token, name) {
         Ok(v) => v,
@@ -3453,6 +3490,65 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     }
     inner.fd_flags[newfd] = new_flags;
     newfd as isize
+}
+
+/// Linux `chroot(2)` (syscall 51 on riscv64/loongarch64).
+pub fn syscall_chroot(pathname: usize) -> isize {
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+
+    let at = match resolve_at_path(AT_FDCWD, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if matches!(at, AtPath::PseudoAbs(_)) {
+        return ENOTDIR;
+    }
+
+    let process = current_process();
+    let cwd = { process.borrow_mut().cwd.clone() };
+    let candidate_abs = match &at {
+        AtPath::Ext4Abs(abs) => abs.clone(),
+        AtPath::Ext4Rel { .. } => normalize_path(&cwd, &path),
+        AtPath::PseudoAbs(abs) => abs.clone(),
+    };
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let final_root = {
+        let _ext4_guard = ext4_lock();
+        let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if !inode.is_dir() {
+            return ENOTDIR;
+        }
+        if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
+            return EACCES;
+        }
+        resolve_final_symlink_abs_path(&candidate_abs)
+    };
+
+    // Capability check after pathname validation so permission errors surface
+    // first, matching Linux/LTP expectations.
+    let has_priv = {
+        let inner = process.borrow_mut();
+        inner.euid == 0
+    };
+    if !has_priv {
+        return EPERM;
+    }
+
+    let mut inner = process.borrow_mut();
+    inner.root = final_root.clone();
+    inner.cwd = final_root;
+    0
 }
 
 pub fn syscall_chdir(pathname: usize) -> isize {

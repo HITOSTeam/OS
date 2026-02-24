@@ -5,7 +5,7 @@ use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
 use crate::mm::{
-    FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc, try_write_user_value,
+    frame_alloc, try_write_user_value, FrameTracker, MapPermission, PTEFlags, VirtAddr,
 };
 use crate::task::processor::current_process;
 

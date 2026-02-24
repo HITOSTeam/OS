@@ -24,6 +24,7 @@ pub mod mutex;
 mod process_block;
 pub(crate) use process_block::{MmapRegion, ProcessControlBlock};
 pub mod processor;
+pub mod sched;
 pub mod semaphore;
 pub mod signal;
 mod switch;

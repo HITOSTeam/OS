@@ -283,6 +283,7 @@ pub fn trap_handler() {
         Trap::Interrupt(TIME_INTERVAL) => {
             set_next_trigger();
             check_timer();
+            crate::task::processor::account_current_task_tick();
             crate::syscall::misc::check_current_rlimit_cpu();
             // Also handle pending fatal signals on timer ticks.
             // Without this, CPU-bound tasks that never enter syscalls would never observe
@@ -291,7 +292,9 @@ pub fn trap_handler() {
                 println!("[kernel] {}", msg);
                 exit_current_and_run_next(errno);
             }
-            suspend_current_and_run_next();
+            if crate::task::processor::should_preempt_current_on_tick() {
+                suspend_current_and_run_next();
+            }
         }
         Trap::Interrupt(SOFTWARE_INTERRUPT) => {
             // Used as an IPI to wake up harts from `wfi` (e.g., when a remote hart enqueues a task).

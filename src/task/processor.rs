@@ -7,8 +7,12 @@ use crate::{
     task::{
         INITPROC,
         id::{KernelStack, TaskUserRes},
-        manager::{TASK_MANAGER, add_task, fetch_task, remove_inactive_task, wakeup_task},
+        manager::{
+            TASK_MANAGER, add_task, fetch_task, has_ready_rt_at_or_above, has_ready_rt_higher_than,
+            remove_inactive_task, wakeup_task,
+        },
         process_block::ProcessControlBlock,
+        sched::{RR_TIMESLICE_TICKS, RT_PRIO_MIN, SchedClass, sched_class},
         switch,
         task_block::{TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
@@ -68,6 +72,25 @@ fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
     }
     let _ = try_write_user_value(token, ctid as *mut i32, &0);
     let _ = futex_wake_private_and_shared(pid, token, ctid, 1);
+}
+
+fn fair_timeslice_ticks(nice: i32) -> usize {
+    if nice < 0 {
+        // Negative nice values (higher priority) get a longer timeslice.
+        (1 + (-nice as usize)).min(20)
+    } else {
+        1
+    }
+}
+
+/// Best-effort per-thread CPU accounting used by *_CPUTIME clocks.
+pub fn account_current_task_tick() {
+    const TICK_NS: u64 = 10_000_000; // 100Hz
+    let Some(task) = current_task() else {
+        return;
+    };
+    let mut inner = task.borrow_mut();
+    inner.cpu_time_ns = inner.cpu_time_ns.saturating_add(TICK_NS);
 }
 pub struct Processor {
     now_task_block: Option<Arc<TaskControlBlock>>,
@@ -222,6 +245,51 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
             switched_task_cx_ptr as *const usize,
             idle_task_cx_ptr as *const usize,
         );
+    }
+}
+
+/// Linux-like tick preemption policy:
+/// - FAIR class: preempt on every tick.
+/// - FIFO class: only preempt when a higher-priority RT task is waiting.
+/// - RR class: round-robin at fixed quantum, but still preempt immediately for higher RT prio.
+pub fn should_preempt_current_on_tick() -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let Some(process) = task.process.upgrade() else {
+        return true;
+    };
+    let (policy, rt_prio) = {
+        let inner = process.borrow_mut();
+        (inner.sched_policy, inner.sched_priority)
+    };
+    match sched_class(policy) {
+        Some(SchedClass::Fair) | None => {
+            if has_ready_rt_at_or_above(RT_PRIO_MIN) {
+                return true;
+            }
+            let mut task_inner = task.borrow_mut();
+            task_inner.rr_ticks = task_inner.rr_ticks.saturating_add(1);
+            let slice = fair_timeslice_ticks(task_inner.nice);
+            if task_inner.rr_ticks < slice {
+                return false;
+            }
+            task_inner.rr_ticks = 0;
+            true
+        }
+        Some(SchedClass::Fifo) => has_ready_rt_higher_than(rt_prio),
+        Some(SchedClass::Rr) => {
+            if has_ready_rt_higher_than(rt_prio) {
+                return true;
+            }
+            let mut task_inner = task.borrow_mut();
+            task_inner.rr_ticks = task_inner.rr_ticks.saturating_add(1);
+            if task_inner.rr_ticks < RR_TIMESLICE_TICKS.max(1) {
+                return false;
+            }
+            task_inner.rr_ticks = 0;
+            has_ready_rt_at_or_above(rt_prio)
+        }
     }
 }
 pub fn idle_task() {
@@ -432,6 +500,7 @@ pub fn suspend_current_and_run_next() {
     let mut task_inner = task.borrow_mut();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     task_inner.task_status = TaskStatus::Ready;
+    task_inner.rr_ticks = 0;
     drop(task_inner);
     // ---- release current PCB
 
@@ -473,6 +542,7 @@ pub fn block_current_and_run_next() {
     if should_block {
         task_inner.task_status = TaskStatus::Blocked;
     }
+    task_inner.rr_ticks = 0;
     drop(task_inner);
     // ---- release current PCB
 

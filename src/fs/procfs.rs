@@ -171,6 +171,29 @@ pub fn init_procfs() {
                 let _ = pipe_max.write_at(0, b"4096");
             }
         }
+        let net_dir = ensure_dir(&sys_dir, "net", 0o555);
+        if let Some(net_dir) = net_dir {
+            let ipv4_dir = ensure_dir(&net_dir, "ipv4", 0o555);
+            if let Some(ipv4_dir) = ipv4_dir {
+                let conf_dir = ensure_dir(&ipv4_dir, "conf", 0o555);
+                if let Some(conf_dir) = conf_dir {
+                    let lo_dir = ensure_dir(&conf_dir, "lo", 0o555);
+                    if let Some(lo_dir) = lo_dir {
+                        let tag = ensure_file(&lo_dir, "tag", 0o644);
+                        if let Some(tag) = tag {
+                            let _ = tag.write_at(0, b"0\n");
+                        }
+                    }
+                    let default_dir = ensure_dir(&conf_dir, "default", 0o555);
+                    if let Some(default_dir) = default_dir {
+                        let tag = ensure_file(&default_dir, "tag", 0o644);
+                        if let Some(tag) = tag {
+                            let _ = tag.write_at(0, b"0\n");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if proc_inode.find("config.gz").is_none() {

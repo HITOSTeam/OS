@@ -1007,6 +1007,69 @@ impl MemorySet {
         memory_set
     }
 
+    /// Fork a user address space by sharing mapped user frames.
+    ///
+    /// This is used for Linux `clone(..., CLONE_VM, ...)`-style semantics:
+    /// parent and child keep separate page tables but map the same user
+    /// physical frames with the same permissions.
+    pub fn from_existed_user_shared(user_space: &MemorySet) -> MemorySet {
+        let mut memory_set = Self::new_bare();
+        memory_set.map_trampoline();
+        memory_set.map_sigreturn_trampoline_user();
+
+        for area in user_space.areas.iter() {
+            let mut new_area = MapArea::from_another(area);
+
+            match area.map_type {
+                MapType::Identical => {
+                    for vpn in area.vpn_range {
+                        let Some(src_pte) = user_space.translate(vpn) else {
+                            continue;
+                        };
+                        if !src_pte.is_valid() {
+                            continue;
+                        }
+                        memory_set.page_table.map(vpn, src_pte.ppn(), src_pte.flags());
+                    }
+                }
+                // Share only materialized pages for Framed/Lazy areas.
+                MapType::Framed | MapType::Lazy => {
+                    for (&vpn, frame_tracker) in area.data_frames.iter() {
+                        let Some(src_pte) = user_space.translate(vpn) else {
+                            continue;
+                        };
+                        if !src_pte.is_valid() {
+                            continue;
+                        }
+                        let src_ppn = src_pte.ppn();
+                        let src_flags = src_pte.flags();
+
+                        // Keep kernel-only mappings private.
+                        if !src_flags.contains(PTEFlags::U) {
+                            let Some(frame) = frame_alloc() else {
+                                continue;
+                            };
+                            frame
+                                .ppn
+                                .get_bytes_array()
+                                .copy_from_slice(src_ppn.get_bytes_array());
+                            memory_set.page_table.map(vpn, frame.ppn, src_flags);
+                            new_area.data_frames.insert(vpn, frame);
+                            continue;
+                        }
+
+                        memory_set.page_table.map(vpn, src_ppn, src_flags);
+                        new_area.data_frames.insert(vpn, frame_tracker.clone());
+                    }
+                }
+            }
+
+            memory_set.push_mapped(new_area);
+        }
+
+        memory_set
+    }
+
     /// Fork a user address space by copying all mapped pages (no COW).
     ///
     /// This is slower than COW but avoids COW corner cases on some platforms.

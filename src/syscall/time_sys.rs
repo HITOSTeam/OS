@@ -5,16 +5,22 @@ use crate::{
         read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
         try_write_user_value, write_user_value,
     },
+    syscall::misc::decode_linux_tid,
     syscall::thread,
     task::block_sleep::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
     },
-    task::processor::{current_files_process, current_process, current_task},
-    task::signal::{SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
+    task::signal::{has_unmasked_pending, signal_bit, SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM},
+    task::{
+        manager::pid2process,
+        processor::{current_files_process, current_process, current_task},
+        ProcessControlBlock,
+    },
     time::get_time,
     trap::get_current_token,
 };
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 const CYCLICTEST_LOG_LIMIT: usize = 32;
@@ -31,6 +37,10 @@ const CLOCK_MONOTONIC_RAW: usize = 4;
 const CLOCK_REALTIME_COARSE: usize = 5;
 const CLOCK_MONOTONIC_COARSE: usize = 6;
 const CLOCK_BOOTTIME: usize = 7;
+
+const CLOCKFD: i32 = 3;
+const CPUCLOCK_CLOCK_MASK: i32 = 0x3;
+const CPUCLOCK_PERTHREAD_MASK: i32 = 0x4;
 
 const EINVAL: isize = -22;
 const EFAULT: isize = -14;
@@ -90,6 +100,89 @@ fn ns_to_timespec(ns: u64) -> TimeSpec {
 
 fn ns_to_ms_ceil(ns: u64) -> usize {
     ((ns.saturating_add(999_999)) / 1_000_000) as usize
+}
+
+#[derive(Clone, Copy)]
+struct DynamicCpuClock {
+    target_id: usize,
+    per_thread: bool,
+}
+
+fn decode_dynamic_cpu_clock(clk_id: i32) -> Option<DynamicCpuClock> {
+    if clk_id >= 0 {
+        return None;
+    }
+    // fd-based clocks use low bits `11` and are handled differently.
+    if (clk_id & CPUCLOCK_CLOCK_MASK) == CLOCKFD {
+        return None;
+    }
+    Some(DynamicCpuClock {
+        target_id: ((!clk_id) >> 3) as usize,
+        per_thread: (clk_id & CPUCLOCK_PERTHREAD_MASK) != 0,
+    })
+}
+
+fn task_cpu_time_ns(task: &Arc<crate::task::task_block::TaskControlBlock>) -> u64 {
+    let inner = task.borrow_mut();
+    inner.cpu_time_ns
+}
+
+fn process_cpu_time_ns(process: &Arc<ProcessControlBlock>) -> u64 {
+    let tasks = {
+        let inner = process.borrow_mut();
+        inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    tasks
+        .into_iter()
+        .map(|task| task_cpu_time_ns(&task))
+        .fold(0u64, |acc, ns| acc.saturating_add(ns))
+}
+
+fn current_thread_cpu_time_ns() -> u64 {
+    current_task()
+        .map(|task| task_cpu_time_ns(&task))
+        .unwrap_or(0)
+}
+
+fn resolve_thread_cpu_time_ns(target_tid_like: usize) -> Option<u64> {
+    let process = current_process();
+    let cur_pid = process.getpid();
+    let tid = if target_tid_like == 0 || target_tid_like == cur_pid {
+        Some(0usize)
+    } else if let Some(t) = decode_linux_tid(cur_pid, target_tid_like) {
+        Some(t)
+    } else {
+        // Accept raw per-process thread indices as a compatibility fallback.
+        Some(target_tid_like)
+    }?;
+    let task = {
+        let inner = process.borrow_mut();
+        if tid >= inner.tasks.len() {
+            return None;
+        }
+        inner.tasks[tid].as_ref().cloned()
+    }?;
+    Some(task_cpu_time_ns(&task))
+}
+
+fn resolve_process_cpu_time_ns(target_pid: usize) -> Option<u64> {
+    if target_pid == 0 {
+        return Some(process_cpu_time_ns(&current_process()));
+    }
+    let process = pid2process(target_pid)?;
+    Some(process_cpu_time_ns(&process))
+}
+
+fn dynamic_cpu_clock_time_ns(clk: DynamicCpuClock) -> Option<u64> {
+    if clk.per_thread {
+        resolve_thread_cpu_time_ns(clk.target_id)
+    } else {
+        resolve_process_cpu_time_ns(clk.target_id)
+    }
 }
 
 #[repr(C)]
@@ -259,26 +352,35 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
     if tp_ptr == 0 {
         return EFAULT;
     }
-    match clk_id {
-        CLOCK_REALTIME
-        | CLOCK_MONOTONIC
-        | CLOCK_PROCESS_CPUTIME_ID
-        | CLOCK_THREAD_CPUTIME_ID
-        | CLOCK_MONOTONIC_RAW
-        | CLOCK_REALTIME_COARSE
-        | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME => {}
-        _ => return EINVAL,
+    let dynamic_clk = decode_dynamic_cpu_clock(clk_id as i32);
+    if dynamic_clk.is_none() {
+        match clk_id {
+            CLOCK_REALTIME
+            | CLOCK_MONOTONIC
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_REALTIME_COARSE
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME => {}
+            _ => return EINVAL,
+        }
     }
-    let ns = match clk_id {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => realtime_now_ns(),
-        CLOCK_MONOTONIC
-        | CLOCK_PROCESS_CPUTIME_ID
-        | CLOCK_THREAD_CPUTIME_ID
-        | CLOCK_MONOTONIC_RAW
-        | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME => now_ns(),
-        _ => return EINVAL,
+    let ns = if let Some(clk) = dynamic_clk {
+        let Some(ns) = dynamic_cpu_clock_time_ns(clk) else {
+            return EINVAL;
+        };
+        ns
+    } else {
+        match clk_id {
+            CLOCK_REALTIME | CLOCK_REALTIME_COARSE => realtime_now_ns(),
+            CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
+                now_ns()
+            }
+            CLOCK_PROCESS_CPUTIME_ID => process_cpu_time_ns(&current_process()),
+            CLOCK_THREAD_CPUTIME_ID => current_thread_cpu_time_ns(),
+            _ => return EINVAL,
+        }
     };
     let ts = TimeSpec {
         sec: (ns / NSEC_PER_SEC) as i64,
@@ -292,6 +394,9 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
 }
 
 pub fn syscall_clock_settime(clk_id: usize, tp_ptr: usize) -> isize {
+    if decode_dynamic_cpu_clock(clk_id as i32).is_some() {
+        return EINVAL;
+    }
     if clk_id != CLOCK_REALTIME {
         return EINVAL;
     }
@@ -314,16 +419,18 @@ pub fn syscall_clock_settime(clk_id: usize, tp_ptr: usize) -> isize {
 }
 
 pub fn syscall_clock_getres(clk_id: usize, tp_ptr: usize) -> isize {
-    match clk_id {
-        CLOCK_REALTIME
-        | CLOCK_MONOTONIC
-        | CLOCK_PROCESS_CPUTIME_ID
-        | CLOCK_THREAD_CPUTIME_ID
-        | CLOCK_MONOTONIC_RAW
-        | CLOCK_REALTIME_COARSE
-        | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME => {}
-        _ => return EINVAL,
+    if decode_dynamic_cpu_clock(clk_id as i32).is_none() {
+        match clk_id {
+            CLOCK_REALTIME
+            | CLOCK_MONOTONIC
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_REALTIME_COARSE
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME => {}
+            _ => return EINVAL,
+        }
     }
     if tp_ptr == 0 {
         return 0;

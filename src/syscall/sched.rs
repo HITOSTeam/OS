@@ -3,22 +3,25 @@ use alloc::sync::Arc;
 use crate::{
     config::MAX_HARTS,
     debug_config::DEBUG_CYCLICTEST,
-    mm::{
-        MapPermission, read_user_value, translated_byte_buffer, try_copy_from_user,
-        try_copy_to_user, write_user_value,
-    },
+    mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value},
     syscall::misc::decode_linux_tid,
-    task::{ProcessControlBlock, manager::pid2process, processor::current_process},
+    task::{
+        manager::{pid2process, refresh_process_runqueues},
+        processor::current_process,
+        sched::{
+            check_policy, clamp_nice, policy_priority_max, policy_priority_min, sched_class,
+            valid_priority_for_policy, SchedClass, RR_TIMESLICE_MS, SCHED_BATCH, SCHED_DEADLINE,
+            SCHED_IDLE, SCHED_OTHER,
+        },
+        ProcessControlBlock,
+    },
     trap::get_current_token,
 };
 
+const EPERM: isize = -1;
 const ESRCH: isize = -3;
 const EINVAL: isize = -22;
 const EFAULT: isize = -14;
-
-const SCHED_OTHER: i32 = 0;
-const SCHED_FIFO: i32 = 1;
-const SCHED_RR: i32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -49,17 +52,32 @@ struct SchedAttr {
 }
 
 const SCHED_ATTR_SIZE_V0: usize = 48;
-// Keep in sync with misc.rs Linux-like TID encoding (tgid << 15 | tid).
-const LINUX_TID_PID_SHIFT: usize = 15;
 
-fn decode_any_linux_tid(pid: usize) -> Option<(usize, usize)> {
-    // Strip futex owner/waiter bits that user space may OR into the TID word.
-    let tid = pid & 0x3fff_ffff;
-    let tgid = tid >> LINUX_TID_PID_SHIFT;
-    if tgid == 0 {
-        return None;
+fn invalid_pid(pid: usize) -> bool {
+    (pid as isize) < 0
+}
+
+fn allowed_unpriv_policy(policy: i32) -> bool {
+    matches!(policy, SCHED_OTHER | SCHED_BATCH | SCHED_IDLE)
+}
+
+fn can_control_target(target: &Arc<ProcessControlBlock>) -> bool {
+    let caller = current_process();
+    let caller_euid = {
+        let inner = caller.borrow_mut();
+        inner.euid
+    };
+    if caller_euid == 0 {
+        return true;
     }
-    Some((tgid, tid & 0x7fff))
+    if Arc::ptr_eq(target, &caller) {
+        return true;
+    }
+    let (target_uid, target_euid) = {
+        let inner = target.borrow_mut();
+        (inner.uid, inner.euid)
+    };
+    caller_euid == target_uid || caller_euid == target_euid
 }
 
 fn resolve_process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
@@ -89,28 +107,27 @@ fn resolve_process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
             if let Some(proc) = pid2process(pid) {
                 return Some(proc);
             }
-            // Accept encoded TIDs from other processes: decode and use tgid.
-            if let Some((tgid, _)) = decode_any_linux_tid(pid) {
-                return pid2process(tgid);
-            }
             None
         }
     }
-}
-
-fn check_policy(policy: i32) -> bool {
-    matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR)
 }
 
 pub fn syscall_sched_getscheduler(pid: usize) -> isize {
     if DEBUG_CYCLICTEST {
         log::warn!("[sched_getscheduler] pid={}", pid);
     }
+    if invalid_pid(pid) {
+        return EINVAL;
+    }
     let Some(process) = resolve_process(pid) else {
         return ESRCH;
     };
-    let inner = process.borrow_mut();
-    inner.sched_policy as isize
+    let policy = process.borrow_mut().sched_policy;
+    if check_policy(policy) {
+        policy as isize
+    } else {
+        0
+    }
 }
 
 pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
@@ -121,6 +138,9 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
         if DEBUG_CYCLICTEST {
             log::warn!("[sched_getparam] EINVAL pid={} param_ptr=0", pid);
         }
+        return EINVAL;
+    }
+    if invalid_pid(pid) {
         return EINVAL;
     }
     let Some(process) = resolve_process(pid) else {
@@ -168,18 +188,34 @@ pub fn syscall_sched_setparam(pid: usize, param_ptr: usize) -> isize {
     if param_ptr == 0 {
         return EINVAL;
     }
+    if invalid_pid(pid) {
+        return EINVAL;
+    }
     let Some(process) = resolve_process(pid) else {
         return ESRCH;
     };
     let token = get_current_token();
-    let prio = read_user_value(token, param_ptr as *const SchedParam).sched_priority;
-    let mut inner = process.borrow_mut();
-    inner.sched_priority = prio;
+    let Some(param) = try_read_user_value(token, param_ptr as *const SchedParam) else {
+        return EFAULT;
+    };
+    if !can_control_target(&process) {
+        return EPERM;
+    }
+    let prio = param.sched_priority;
+    let policy = process.borrow_mut().sched_policy;
+    if !check_policy(policy) || !valid_priority_for_policy(policy, prio) {
+        return EINVAL;
+    }
+    process.borrow_mut().sched_priority = prio;
+    refresh_process_runqueues(&process);
     0
 }
 
 pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -> isize {
     if param_ptr == 0 {
+        return EINVAL;
+    }
+    if invalid_pid(pid) {
         return EINVAL;
     }
     let Some(process) = resolve_process(pid) else {
@@ -190,15 +226,37 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
         return EINVAL;
     }
     let token = get_current_token();
-    let prio = read_user_value(token, param_ptr as *const SchedParam).sched_priority;
+    let Some(param) = try_read_user_value(token, param_ptr as *const SchedParam) else {
+        return EFAULT;
+    };
+    if !can_control_target(&process) {
+        return EPERM;
+    }
+    if !allowed_unpriv_policy(policy) && current_process().borrow_mut().euid != 0 {
+        return EPERM;
+    }
+    let prio = param.sched_priority;
+    if !valid_priority_for_policy(policy, prio) {
+        return EINVAL;
+    }
     let mut inner = process.borrow_mut();
     inner.sched_policy = policy;
     inner.sched_priority = prio;
+    if policy != SCHED_DEADLINE {
+        inner.sched_runtime = 0;
+        inner.sched_deadline = 0;
+        inner.sched_period = 0;
+    }
+    drop(inner);
+    refresh_process_runqueues(&process);
     0
 }
 
 pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
     if mask_ptr == 0 || cpusetsize == 0 {
+        return EINVAL;
+    }
+    if invalid_pid(pid) {
         return EINVAL;
     }
     // Avoid large kernel allocations from bogus cpusetsize values.
@@ -216,15 +274,8 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
         tmp[cpu / 8] |= 1u8 << (cpu % 8);
     }
     let token = get_current_token();
-    let bufs = translated_byte_buffer(token, mask_ptr as *mut u8, cpusetsize, MapPermission::W);
-    let mut off = 0usize;
-    for b in bufs {
-        let n = core::cmp::min(b.len(), cpusetsize - off);
-        b[..n].copy_from_slice(&tmp[off..off + n]);
-        off += n;
-        if off == cpusetsize {
-            break;
-        }
+    if try_copy_to_user(token, mask_ptr as *mut u8, tmp.as_slice()).is_err() {
+        return EFAULT;
     }
     // Linux `sched_getaffinity` syscall returns the number of bytes written.
     // musl uses this return value (not the wrapper) when implementing `sysconf(_SC_NPROCESSORS_*)`.
@@ -235,7 +286,13 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     if mask_ptr == 0 || cpusetsize == 0 {
         return EINVAL;
     }
-    let Some(_process) = resolve_process(pid) else {
+    if invalid_pid(pid) {
+        return EINVAL;
+    }
+    // Avoid large allocations from bogus cpusetsize values.
+    const MAX_CPUSET_BYTES: usize = 128;
+    let cpusetsize = core::cmp::min(cpusetsize, MAX_CPUSET_BYTES);
+    let Some(process) = resolve_process(pid) else {
         if DEBUG_CYCLICTEST {
             log::warn!(
                 "[sched_setaffinity] ESRCH pid={} cpusetsize={} mask_ptr={:#x}",
@@ -246,39 +303,59 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
         }
         return ESRCH;
     };
-    // Best-effort: accept and ignore. The scheduler is FIFO and does not yet enforce affinity.
+    if !can_control_target(&process) {
+        return EPERM;
+    }
+    let token = get_current_token();
+    let mut mask = alloc::vec![0u8; cpusetsize];
+    if try_copy_from_user(token, mask_ptr as *const u8, mask.as_mut_slice()).is_err() {
+        return EFAULT;
+    }
+    let mut has_valid_cpu = false;
+    for cpu in 0..MAX_HARTS {
+        if (mask[cpu / 8] & (1u8 << (cpu % 8))) != 0 {
+            has_valid_cpu = true;
+            break;
+        }
+    }
+    if !has_valid_cpu {
+        return EINVAL;
+    }
+    // Best-effort: affinity mask is validated but not enforced yet.
     0
 }
 
 pub fn syscall_sched_get_priority_max(policy: usize) -> isize {
-    match policy as i32 {
-        SCHED_FIFO | SCHED_RR => 99,
-        SCHED_OTHER => 0,
-        _ => EINVAL,
-    }
+    policy_priority_max(policy as i32).map_or(EINVAL, |v| v as isize)
 }
 
 pub fn syscall_sched_get_priority_min(policy: usize) -> isize {
-    match policy as i32 {
-        SCHED_FIFO | SCHED_RR => 1,
-        SCHED_OTHER => 0,
-        _ => EINVAL,
-    }
+    policy_priority_min(policy as i32).map_or(EINVAL, |v| v as isize)
 }
 
 pub fn syscall_sched_rr_get_interval(pid: usize, interval_ptr: usize) -> isize {
     if interval_ptr == 0 {
         return EINVAL;
     }
-    let Some(_process) = resolve_process(pid) else {
+    if invalid_pid(pid) {
+        return EINVAL;
+    }
+    let Some(process) = resolve_process(pid) else {
         return ESRCH;
+    };
+    let policy = process.borrow_mut().sched_policy;
+    let interval_ms = match sched_class(policy) {
+        Some(SchedClass::Rr) => RR_TIMESLICE_MS,
+        _ => 0,
     };
     let token = get_current_token();
     let ts = TimeSpec {
-        tv_sec: 0,
-        tv_nsec: 0,
+        tv_sec: interval_ms / 1000,
+        tv_nsec: (interval_ms % 1000) * 1_000_000,
     };
-    write_user_value(token, interval_ptr as *mut TimeSpec, &ts);
+    if try_write_user_value(token, interval_ptr as *mut TimeSpec, &ts).is_err() {
+        return EFAULT;
+    }
     0
 }
 
@@ -286,12 +363,22 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     if attr_ptr == 0 || size < SCHED_ATTR_SIZE_V0 || flags != 0 {
         return EINVAL;
     }
+    if invalid_pid(pid) {
+        return EINVAL;
+    }
     let Some(process) = resolve_process(pid) else {
         return ESRCH;
     };
-    let (policy, prio) = {
+    let (policy, prio, nice, runtime, deadline, period) = {
         let inner = process.borrow_mut();
-        (inner.sched_policy as u32, inner.sched_priority as u32)
+        (
+            inner.sched_policy as u32,
+            inner.sched_priority as u32,
+            inner.nice,
+            inner.sched_runtime,
+            inner.sched_deadline,
+            inner.sched_period,
+        )
     };
     let mut attr = SchedAttr::default();
     let struct_size = core::mem::size_of::<SchedAttr>();
@@ -299,6 +386,10 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     attr.size = copy_len as u32;
     attr.sched_policy = policy;
     attr.sched_priority = prio;
+    attr.sched_nice = nice;
+    attr.sched_runtime = runtime;
+    attr.sched_deadline = deadline;
+    attr.sched_period = period;
     let bytes =
         unsafe { core::slice::from_raw_parts(&attr as *const SchedAttr as *const u8, copy_len) };
     let token = get_current_token();
@@ -308,17 +399,12 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     0
 }
 
-pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, size: usize, flags: usize) -> isize {
+pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused: usize) -> isize {
     if attr_ptr == 0 {
         return EINVAL;
     }
-    let mut size = size;
-    let mut flags = flags;
-    // Linux sched_setattr has 3 arguments (pid, attr, flags). Accept both 3-arg and 4-arg variants.
-    if flags == 0 && size < SCHED_ATTR_SIZE_V0 {
-        // Treat "size" as flags for the 3-arg call.
-        flags = size;
-        size = 0;
+    if invalid_pid(pid) {
+        return EINVAL;
     }
     if flags != 0 {
         return EINVAL;
@@ -326,29 +412,58 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     let Some(process) = resolve_process(pid) else {
         return ESRCH;
     };
-    let struct_size = core::mem::size_of::<SchedAttr>();
-    let copy_len = if size == 0 {
-        struct_size
-    } else {
-        core::cmp::min(size, struct_size)
-    };
-    if copy_len < SCHED_ATTR_SIZE_V0 {
-        return EINVAL;
+    if !can_control_target(&process) {
+        return EPERM;
     }
     let token = get_current_token();
     let mut attr = SchedAttr::default();
     let dst_bytes = unsafe {
-        core::slice::from_raw_parts_mut(&mut attr as *mut SchedAttr as *mut u8, copy_len)
+        core::slice::from_raw_parts_mut(
+            &mut attr as *mut SchedAttr as *mut u8,
+            core::mem::size_of::<SchedAttr>(),
+        )
     };
     if try_copy_from_user(token, attr_ptr as *const u8, dst_bytes).is_err() {
         return EFAULT;
+    }
+    if attr.size < SCHED_ATTR_SIZE_V0 as u32 {
+        return EINVAL;
     }
     let policy = attr.sched_policy as i32;
     if !check_policy(policy) {
         return EINVAL;
     }
+    if !allowed_unpriv_policy(policy) && current_process().borrow_mut().euid != 0 {
+        return EPERM;
+    }
+    let prio = attr.sched_priority as i32;
+    if !valid_priority_for_policy(policy, prio) {
+        return EINVAL;
+    }
+    let nice = clamp_nice(attr.sched_nice);
+    if policy == SCHED_DEADLINE
+        && (attr.sched_runtime == 0
+            || attr.sched_deadline == 0
+            || attr.sched_period == 0
+            || attr.sched_runtime > attr.sched_deadline
+            || attr.sched_deadline > attr.sched_period)
+    {
+        return EINVAL;
+    }
     let mut inner = process.borrow_mut();
     inner.sched_policy = policy;
-    inner.sched_priority = attr.sched_priority as i32;
+    inner.sched_priority = prio;
+    inner.nice = nice;
+    if policy == SCHED_DEADLINE {
+        inner.sched_runtime = attr.sched_runtime;
+        inner.sched_deadline = attr.sched_deadline;
+        inner.sched_period = attr.sched_period;
+    } else {
+        inner.sched_runtime = 0;
+        inner.sched_deadline = 0;
+        inner.sched_period = 0;
+    }
+    drop(inner);
+    refresh_process_runqueues(&process);
     0
 }

@@ -14,15 +14,15 @@ use crate::{
     syscall::misc::decode_linux_tid,
     task::{
         block_sleep::add_timer,
-        manager::{PID2PCB, pid2process, wakeup_task},
+        manager::{pid2process, wakeup_task, PID2PCB},
         processor::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
         signal::{
-            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM,
-            SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags, has_unmasked_pending,
-            kill, kill_current, pending_unmasked_bits, set_signal, set_signal_mask, signal_bit,
-            take_first_unmasked,
+            has_unmasked_pending, kill, kill_current, pending_unmasked_bits, set_signal,
+            set_signal_mask, signal_bit, take_first_unmasked, RtSigAction, SignalAction,
+            SignalFlags, RT_SIG_MAX, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM, SIGTSTP_NUM,
+            SIGTTIN_NUM, SIGTTOU_NUM, SIG_DFL, SIG_IGN,
         },
         task_block::{SigSavedContext, TaskControlBlock, TaskStatus},
     },
@@ -40,13 +40,25 @@ fn sigreturn_trampoline_va() -> usize {
 
 const EINVAL: isize = -22;
 const EAGAIN: isize = -11;
+const ENOMEM: isize = -12;
 const ESRCH: isize = -3;
 const EFAULT: isize = -14;
+const EINTR: isize = -4;
+const EPERM: isize = -1;
 const SIGCHLD: usize = 17;
 const SA_SIGINFO: usize = 0x4;
+const SA_ONSTACK: usize = 0x08000000;
 const SA_NODEFER: usize = 0x40000000;
 pub const SA_RESTART: usize = 0x10000000;
 pub const ERESTARTSYS: isize = -512;
+const SS_ONSTACK: i32 = 1;
+const SS_DISABLE: i32 = 2;
+const MINSIGSTKSZ: usize = 2048;
+const COMPAT_SIGSET_SIZE: usize = 128;
+
+fn valid_sigset_size(sigsetsize: usize) -> bool {
+    sigsetsize == core::mem::size_of::<u64>() || sigsetsize == COMPAT_SIGSET_SIZE
+}
 
 fn is_stop_signal(signum: usize) -> bool {
     matches!(
@@ -138,7 +150,11 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
             delivered = true;
         }
     }
-    if delivered { 0 } else { ESRCH }
+    if delivered {
+        0
+    } else {
+        ESRCH
+    }
 }
 
 /// Linux `tgkill` (syscall 131).
@@ -171,10 +187,22 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
     let Some(task) = task else {
         return ESRCH;
     };
+    let sender = current_process();
+    let sender_pid = sender.getpid() as i32;
+    let sender_uid = {
+        let inner = sender.borrow_mut();
+        inner.euid
+    };
     {
         let mut inner = task.borrow_mut();
         if let Some(bit) = signal_bit(sig as usize) {
             inner.pending_signals |= bit;
+            let signum = sig as usize;
+            if signum <= RT_SIG_MAX {
+                inner.pending_signal_pid[signum] = sender_pid;
+                inner.pending_signal_uid[signum] = sender_uid;
+                inner.pending_signal_code[signum] = -6; // SI_TKILL
+            }
         }
     }
     if DEBUG_PTHREAD && sig == 33 {
@@ -237,8 +265,13 @@ pub fn syscall_sigprocmask(how: u32) -> isize {
 
 /// Linux `rt_sigaction` (syscall 134).
 pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize: usize) -> isize {
-    let _ = sigsetsize;
     if signum == 0 || signum > RT_SIG_MAX {
+        return EINVAL;
+    }
+    if signum == crate::task::signal::SIGKILL_NUM || signum == crate::task::signal::SIGSTOP_NUM {
+        return EINVAL;
+    }
+    if !valid_sigset_size(sigsetsize) {
         return EINVAL;
     }
     let token = get_current_token();
@@ -250,10 +283,14 @@ pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize
             .get(signum)
             .copied()
             .unwrap_or_default();
-        write_user_value(token, oldact as *mut RtSigAction, &cur);
+        if try_write_user_value(token, oldact as *mut RtSigAction, &cur).is_err() {
+            return EFAULT;
+        }
     }
     if act != 0 {
-        let new = read_user_value(token, act as *const RtSigAction);
+        let Some(new) = try_read_user_value(token, act as *const RtSigAction) else {
+            return EFAULT;
+        };
         if DEBUG_UNIXBENCH && signum == 14 {
             crate::log_if!(
                 DEBUG_UNIXBENCH,
@@ -285,14 +322,19 @@ pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize
 
 /// Linux `rt_sigprocmask` (syscall 135).
 pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize: usize) -> isize {
+    if !valid_sigset_size(sigsetsize) {
+        return EINVAL;
+    }
     let token = get_current_token();
     let task = current_task().unwrap();
     let mut inner = task.borrow_mut();
-    let _ = sigsetsize;
     let old_mask = inner.signal_mask;
     let new_mask = if set != 0 {
         // Read new mask before writing oldset to support aliasing set/oldset.
-        read_user_value(token, set as *const u64)
+        let Some(v) = try_read_user_value(token, set as *const u64) else {
+            return EFAULT;
+        };
+        v
     } else {
         old_mask
     };
@@ -333,8 +375,65 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
         }
     }
     if oldset != 0 {
-        write_user_value(token, oldset as *mut u64, &old_mask);
+        if try_write_user_value(token, oldset as *mut u64, &old_mask).is_err() {
+            return EFAULT;
+        }
     }
+    0
+}
+
+/// Linux `sigaltstack` (syscall 132).
+pub fn syscall_sigaltstack(ss: usize, old_ss: usize) -> isize {
+    let token = get_current_token();
+    let task = current_task().unwrap();
+    let mut inner = task.borrow_mut();
+
+    if old_ss != 0 {
+        let flags = if !inner.sigaltstack_enabled {
+            SS_DISABLE
+        } else if inner.on_sigaltstack {
+            SS_ONSTACK
+        } else {
+            0
+        };
+        let old = SigStack {
+            ss_sp: inner.sigaltstack_sp,
+            ss_flags: flags,
+            _pad: 0,
+            ss_size: inner.sigaltstack_size,
+        };
+        if try_write_user_value(token, old_ss as *mut SigStack, &old).is_err() {
+            return EFAULT;
+        }
+    }
+
+    if ss == 0 {
+        return 0;
+    }
+    if inner.on_sigaltstack {
+        return EPERM;
+    }
+    let Some(new_ss) = try_read_user_value(token, ss as *const SigStack) else {
+        return EFAULT;
+    };
+    if (new_ss.ss_flags & !(SS_DISABLE)) != 0 {
+        return EINVAL;
+    }
+    if (new_ss.ss_flags & SS_DISABLE) != 0 {
+        inner.sigaltstack_enabled = false;
+        inner.sigaltstack_sp = 0;
+        inner.sigaltstack_size = 0;
+        return 0;
+    }
+    if new_ss.ss_sp == 0 {
+        return EINVAL;
+    }
+    if new_ss.ss_size < MINSIGSTKSZ {
+        return ENOMEM;
+    }
+    inner.sigaltstack_enabled = true;
+    inner.sigaltstack_sp = new_ss.ss_sp;
+    inner.sigaltstack_size = new_ss.ss_size;
     0
 }
 
@@ -343,7 +442,7 @@ pub fn syscall_rt_sigpending(set: usize, sigsetsize: usize) -> isize {
     if set == 0 {
         return EFAULT;
     }
-    if sigsetsize < core::mem::size_of::<u64>() {
+    if !valid_sigset_size(sigsetsize) {
         return EINVAL;
     }
     let pending = {
@@ -404,14 +503,15 @@ fn has_deliverable_pending(pending: u64, mask: u64) -> bool {
 
 /// Linux `rt_sigsuspend` (syscall 133).
 pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
-    const EINVAL: isize = -22;
-    const EINTR: isize = -4;
-    if sigsetsize < core::mem::size_of::<u64>() {
+    if !valid_sigset_size(sigsetsize) {
         return EINVAL;
     }
     let token = get_current_token();
     let new_mask = if mask_ptr != 0 {
-        read_user_value(token, mask_ptr as *const u64)
+        let Some(v) = try_read_user_value(token, mask_ptr as *const u64) else {
+            return EFAULT;
+        };
+        v
     } else {
         0
     };
@@ -488,11 +588,13 @@ pub fn syscall_rt_sigreturn() -> isize {
             sig_ctx.regs.write_to_trap(&mut restored);
             *inner.get_trap_cx() = restored;
             inner.signal_mask = uc.uc_sigmask;
+            inner.on_sigaltstack = saved.was_on_sigaltstack;
             return restored.x[REG_A0] as isize;
         }
     }
     *inner.get_trap_cx() = saved.trap_cx;
     inner.signal_mask = saved.mask;
+    inner.on_sigaltstack = saved.was_on_sigaltstack;
     saved.trap_cx.x[REG_A0] as isize
 }
 
@@ -678,25 +780,25 @@ struct TimeSpec {
     nsec: i64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SigInfoHead {
-    si_signo: i32,
-    si_errno: i32,
+fn write_siginfo(
+    info_ptr: usize,
+    signum: usize,
+    sender_pid: i32,
+    sender_uid: u32,
     si_code: i32,
-}
-
-fn write_siginfo(info_ptr: usize, signum: usize) {
+) -> Result<(), ()> {
     if info_ptr == 0 {
-        return;
+        return Ok(());
     }
     let token = get_current_token();
-    let si = SigInfoHead {
-        si_signo: signum as i32,
-        si_errno: 0,
-        si_code: 0,
-    };
-    let _ = try_write_user_value(token, info_ptr as *mut SigInfoHead, &si);
+    let mut si = LinuxSigInfo::default();
+    si.si_signo = signum as i32;
+    si.si_errno = 0;
+    si.si_code = si_code;
+    // siginfo_t kill/pid payload.
+    si.field[0] = sender_pid;
+    si.field[1] = sender_uid as i32;
+    try_write_user_value(token, info_ptr as *mut LinuxSigInfo, &si)
 }
 
 fn timespec_to_ms(ts: TimeSpec) -> Option<usize> {
@@ -731,6 +833,39 @@ fn remove_waiter(task: &Arc<TaskControlBlock>) {
     inner.wait_queue.retain(|t| !Arc::ptr_eq(t, task));
 }
 
+fn take_pending_in_set(
+    task: &Arc<TaskControlBlock>,
+    wait_mask: u64,
+) -> Option<(usize, i32, u32, i32)> {
+    let mut inner = task.borrow_mut();
+    let pending = inner.pending_signals & wait_mask;
+    if pending == 0 {
+        return None;
+    }
+    let sig = pending.trailing_zeros() as usize + 1;
+    if let Some(bit) = sig_bit(sig) {
+        inner.pending_signals &= !bit;
+    }
+    let mut sender_pid = 0;
+    let mut sender_uid = 0;
+    let mut si_code = 0;
+    if sig <= RT_SIG_MAX {
+        sender_pid = inner.pending_signal_pid[sig];
+        sender_uid = inner.pending_signal_uid[sig];
+        si_code = inner.pending_signal_code[sig];
+        inner.pending_signal_pid[sig] = 0;
+        inner.pending_signal_uid[sig] = 0;
+        inner.pending_signal_code[sig] = 0;
+    }
+    Some((sig, sender_pid, sender_uid, si_code))
+}
+
+fn has_nonwait_interrupt(task: &Arc<TaskControlBlock>, wait_mask: u64) -> bool {
+    let inner = task.borrow_mut();
+    let ready = pending_unmasked_bits(inner.pending_signals, inner.signal_mask, false);
+    (ready & !wait_mask) != 0
+}
+
 /// Linux `rt_sigtimedwait` (syscall 137).
 pub fn syscall_rt_sigtimedwait(
     set: usize,
@@ -738,60 +873,61 @@ pub fn syscall_rt_sigtimedwait(
     timeout: usize,
     sigsetsize: usize,
 ) -> isize {
-    let _ = sigsetsize;
     if set == 0 {
+        return EFAULT;
+    }
+    if !valid_sigset_size(sigsetsize) {
         return EINVAL;
     }
     let token = get_current_token();
-    let mask = read_user_value(token, set as *const u64);
-    if mask == 0 {
-        return EINVAL;
-    }
+    let Some(mask) = try_read_user_value(token, set as *const u64) else {
+        return EFAULT;
+    };
 
     let sigchld_bit = sig_bit(SIGCHLD).unwrap();
     let task = current_task().unwrap();
 
-    // Immediate pending signal.
-    let pending_sig = {
-        let mut inner = task.borrow_mut();
-        let pending = inner.pending_signals & mask;
-        if pending != 0 {
-            let sig = pending.trailing_zeros() as usize + 1;
-            if let Some(bit) = sig_bit(sig) {
-                inner.pending_signals &= !bit;
-            }
-            Some(sig)
-        } else {
-            None
-        }
-    };
-    if let Some(sig) = pending_sig {
-        write_siginfo(info, sig);
-        return sig as isize;
-    }
-
-    // SIGCHLD via zombie child detection.
-    if (mask & sigchld_bit) != 0 && has_zombie_child() {
-        write_siginfo(info, SIGCHLD);
-        return SIGCHLD as isize;
-    }
-
-    let deadline_ms = if timeout == 0 {
-        None
-    } else {
-        let ts = read_user_value(token, timeout as *const TimeSpec);
+    let deadline_ms = if timeout != 0 {
+        let Some(ts) = try_read_user_value(token, timeout as *const TimeSpec) else {
+            return EFAULT;
+        };
         let timeout_ms = match timespec_to_ms(ts) {
             Some(ms) => ms,
             None => return EINVAL,
         };
-        if timeout_ms == 0 {
-            return EAGAIN;
-        }
         Some(get_time_ms().saturating_add(timeout_ms))
+    } else {
+        None
     };
 
     let mut timer_set = false;
     loop {
+        if let Some((sig, sender_pid, sender_uid, si_code)) = take_pending_in_set(&task, mask) {
+            if write_siginfo(info, sig, sender_pid, sender_uid, si_code).is_err() {
+                return EFAULT;
+            }
+            return sig as isize;
+        }
+
+        // SIGCHLD may be observed via waitable zombie state even before queueing.
+        if (mask & sigchld_bit) != 0 && has_zombie_child() {
+            if write_siginfo(info, SIGCHLD, 0, 0, 0).is_err() {
+                return EFAULT;
+            }
+            return SIGCHLD as isize;
+        }
+
+        // Non-target signals interrupt the wait.
+        if has_nonwait_interrupt(&task, mask) {
+            return EINTR;
+        }
+
+        if let Some(deadline_ms) = deadline_ms {
+            if get_time_ms() >= deadline_ms {
+                return EAGAIN;
+            }
+        }
+
         {
             let process = current_process();
             let mut inner = process.borrow_mut();
@@ -812,35 +948,6 @@ pub fn syscall_rt_sigtimedwait(
 
         block_current_and_run_next();
         remove_waiter(&task);
-
-        // Re-check pending signal.
-        let pending_sig = {
-            let mut inner = task.borrow_mut();
-            let pending = inner.pending_signals & mask;
-            if pending != 0 {
-                let sig = pending.trailing_zeros() as usize + 1;
-                if let Some(bit) = sig_bit(sig) {
-                    inner.pending_signals &= !bit;
-                }
-                Some(sig)
-            } else {
-                None
-            }
-        };
-        if let Some(sig) = pending_sig {
-            write_siginfo(info, sig);
-            return sig as isize;
-        }
-
-        if (mask & sigchld_bit) != 0 && has_zombie_child() {
-            write_siginfo(info, SIGCHLD);
-            return SIGCHLD as isize;
-        }
-        if let Some(deadline_ms) = deadline_ms {
-            if get_time_ms() >= deadline_ms {
-                return EAGAIN;
-            }
-        }
     }
 }
 
@@ -894,6 +1001,11 @@ pub fn maybe_deliver_signal() {
             }
             return;
         };
+        if sig <= RT_SIG_MAX {
+            inner.pending_signal_pid[sig] = 0;
+            inner.pending_signal_uid[sig] = 0;
+            inner.pending_signal_code[sig] = 0;
+        }
         sig
     };
     if DEBUG_UNIXBENCH && signum == 14 {
@@ -1070,6 +1182,7 @@ pub fn maybe_deliver_signal() {
     let cx = inner.get_trap_cx();
     let cur_mask = inner.signal_mask;
     let saved_mask = inner.sigsuspend_old_mask.take().unwrap_or(cur_mask);
+    let was_on_sigaltstack = inner.on_sigaltstack;
     let mut saved_trap = *cx;
     let restart_syscall = saved_trap.x[REG_A0] == ERESTARTSYS as usize;
     if restart_syscall && inner.last_syscall_valid {
@@ -1088,6 +1201,7 @@ pub fn maybe_deliver_signal() {
         ucontext_ptr: 0,
         uses_ucontext: false,
         signum,
+        was_on_sigaltstack,
     });
 
     let mut new_mask = cur_mask | action.mask;
@@ -1099,6 +1213,14 @@ pub fn maybe_deliver_signal() {
     inner.signal_mask = new_mask;
 
     let mut user_sp = cx.x[REG_SP];
+    if (action.flags & SA_ONSTACK) != 0
+        && inner.sigaltstack_enabled
+        && !inner.on_sigaltstack
+        && inner.sigaltstack_size > 0
+    {
+        user_sp = inner.sigaltstack_sp.saturating_add(inner.sigaltstack_size);
+        inner.on_sigaltstack = true;
+    }
     let mut siginfo_ptr = 0usize;
     let mut ucontext_ptr = 0usize;
     if (action.flags & SA_SIGINFO) != 0 {
@@ -1120,10 +1242,22 @@ pub fn maybe_deliver_signal() {
             regs: UserRegsStruct::from_trap(&saved_trap),
             ..Default::default()
         };
+        let uc_stack = SigStack {
+            ss_sp: inner.sigaltstack_sp,
+            ss_flags: if !inner.sigaltstack_enabled {
+                SS_DISABLE
+            } else if was_on_sigaltstack {
+                SS_ONSTACK
+            } else {
+                0
+            },
+            _pad: 0,
+            ss_size: inner.sigaltstack_size,
+        };
         let ucontext = UContext {
             uc_flags: 0,
             uc_link: 0,
-            uc_stack: SigStack::default(),
+            uc_stack,
             uc_sigmask: saved_mask,
             uc_mcontext: sig_context,
             ..Default::default()
@@ -1139,7 +1273,6 @@ pub fn maybe_deliver_signal() {
 
         cx.x[REG_A1] = siginfo_ptr;
         cx.x[REG_A2] = ucontext_ptr;
-        cx.x[REG_SP] = user_sp;
         if DEBUG_PTHREAD && signum == 33 {
             log::debug!(
                 "[sigcancel] frame sp={:#x} siginfo={:#x} ucontext={:#x}",
@@ -1153,6 +1286,7 @@ pub fn maybe_deliver_signal() {
         cx.x[REG_A2] = 0;
     }
 
+    cx.x[REG_SP] = user_sp;
     cx.sepc = action.handler;
     cx.x[REG_A0] = signum;
     // Always use the kernel-provided rt_sigreturn trampoline to avoid invalid
@@ -1168,5 +1302,6 @@ pub fn try_sigreturn_from_fault() -> bool {
     };
     *inner.get_trap_cx() = saved.trap_cx;
     inner.signal_mask = saved.mask;
+    inner.on_sigaltstack = saved.was_on_sigaltstack;
     true
 }

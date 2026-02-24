@@ -5,7 +5,10 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
-    mm::{MemorySet, kernel_token, try_read_user_value, write_user_value},
+    mm::{
+        kernel_token, try_read_user_value, try_write_user_value, write_user_value, MapPermission,
+        MemorySet,
+    },
     println,
     syscall::{
         filesystem::{
@@ -15,11 +18,11 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        ProcessControlBlock,
-        manager::{PID2PCB, add_task, remove_inactive_task, select_hart_for_new_task},
+        manager::{add_task, remove_inactive_task, select_hart_for_new_task, PID2PCB},
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::{MAX_SIG, SIG_DFL, SIG_IGN, SignalFlags, pending_unmasked_bits},
+        signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
         task_block::TaskControlBlock,
+        ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
@@ -346,26 +349,36 @@ fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
 pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
     const CLONE_FILES: usize = 0x0000_0400;
+    const CLONE_VFORK: usize = 0x0000_4000;
+    const CLONE_PARENT: usize = 0x0000_8000;
     const CLONE_SIGHAND: usize = 0x0000_0800;
     const CLONE_THREAD: usize = 0x0001_0000;
     const CLONE_SETTLS: usize = 0x0008_0000;
     const CLONE_PARENT_SETTID: usize = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+    const CLONE_NEWNET: usize = 0x4000_0000;
+    const EINVAL: isize = -22;
+    const EFAULT: isize = -14;
 
     // LoongArch syscall ABI uses a different argument order:
     // clone(flags, stack, ptid, ctid, tls). Swap tls/ctid here.
     #[cfg(target_arch = "loongarch64")]
     let (_tls, _ctid) = (_ctid, _tls);
 
+    // Network namespace is not implemented yet.
+    if (flags & CLONE_NEWNET) != 0 {
+        return EINVAL;
+    }
+
     // Linux flag constraints:
     // - CLONE_SIGHAND requires CLONE_VM.
     // - CLONE_THREAD requires CLONE_SIGHAND (and therefore CLONE_VM).
     if (flags & CLONE_SIGHAND) != 0 && (flags & CLONE_VM) == 0 {
-        return -22; // EINVAL
+        return EINVAL;
     }
     if (flags & CLONE_THREAD) != 0 && (flags & CLONE_SIGHAND) == 0 {
-        return -22; // EINVAL
+        return EINVAL;
     }
     if stack == 0 {
         // Linux permits fork-like clone(SIGCHLD, NULL, ...) but rejects NULL
@@ -374,7 +387,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let requires_child_stack =
             (flags & (CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS)) != 0;
         if exit_signal == 0 || requires_child_stack {
-            return -22; // EINVAL
+            return EINVAL;
         }
     }
 
@@ -451,10 +464,14 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         // Parent/child tid pointers live in the shared address space.
         let token = get_current_token();
         if (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
-            write_user_value(token, _ptid as *mut i32, &(linux_tid as i32));
+            if try_write_user_value(token, _ptid as *mut i32, &(linux_tid as i32)).is_err() {
+                return EFAULT;
+            }
         }
         if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
-            write_user_value(token, _ctid as *mut i32, &(linux_tid as i32));
+            if try_write_user_value(token, _ctid as *mut i32, &(linux_tid as i32)).is_err() {
+                return EFAULT;
+            }
         }
 
         add_task(new_task);
@@ -469,9 +486,19 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     };
     let process = current_process();
     let share_files = (flags & CLONE_FILES) != 0;
-    let Some((child, task)) = process.fork_with_task(share_files) else {
+    let share_vm = (flags & CLONE_VM) != 0;
+
+    // For CLONE_VM + CLONE_PARENT_SETTID, ensure the parent-tid page is
+    // materialized before cloning so the child shares the same backing frame.
+    if share_vm && (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
+        let token = get_current_token();
+        let _ = try_write_user_value(token, _ptid as *mut i32, &0);
+    }
+
+    let Some((child, task)) = process.fork_with_task(share_files, share_vm) else {
         return -12;
     };
+    let child_pid = child.getpid();
 
     {
         let mut task_inner = task.borrow_mut();
@@ -484,18 +511,82 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         trap_cx.kernel_satp = kernel_token();
         trap_cx.kernel_sp = task.kstack_top();
         trap_cx.trap_handler = trap_handler as usize;
+        if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
+            task_inner.clear_child_tid = Some(_ctid);
+        }
+    }
+
+    if (flags & CLONE_PARENT) != 0 {
+        let real_parent = {
+            let inner = process.borrow_mut();
+            inner.parent.as_ref().and_then(|p| p.upgrade())
+        };
+        if let Some(real_parent) = real_parent {
+            {
+                let mut caller_inner = process.borrow_mut();
+                caller_inner.children.retain(|c| !Arc::ptr_eq(c, &child));
+            }
+            {
+                let mut child_inner = child.borrow_mut();
+                child_inner.parent = Some(Arc::downgrade(&real_parent));
+            }
+            {
+                let mut real_parent_inner = real_parent.borrow_mut();
+                real_parent_inner.children.push(Arc::clone(&child));
+            }
+        }
+    }
+
+    if (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
+        let token = get_current_token();
+        let _ = try_write_user_value(token, _ptid as *mut i32, &(child_pid as i32));
+    }
+
+    if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
+        let child_token = {
+            let mut inner = child.borrow_mut();
+            let _ = inner.memory_set.resolve_cow_fault(_ctid);
+            let _ = inner.memory_set.resolve_lazy_fault(_ctid, MapPermission::W);
+            inner.memory_set.token()
+        };
+        if try_write_user_value(child_token, _ctid as *mut i32, &(child_pid as i32)).is_err() {
+            return EFAULT;
+        }
     }
     add_task(task);
+
+    if (flags & CLONE_VFORK) != 0 {
+        let parent_task = current_task().unwrap();
+        loop {
+            let done = {
+                let inner = child.borrow_mut();
+                inner.is_zombie || inner.did_exec
+            };
+            if done {
+                break;
+            }
+            {
+                let mut inner = process.borrow_mut();
+                enqueue_waiter_once(&mut inner.wait_queue, &parent_task);
+            }
+            block_current_and_run_next();
+        }
+        {
+            let mut inner = process.borrow_mut();
+            remove_wait_queue_entry(&mut inner.wait_queue, &parent_task);
+        }
+    }
+
     crate::log_if!(
         DEBUG_SIGNAL,
         info,
         "[fork] parent_pid={} child_pid={} flags={:#x} stack={:#x}",
         process.getpid(),
-        child.getpid(),
+        child_pid,
         flags,
         stack
     );
-    child.getpid() as isize
+    child_pid as isize
 }
 
 /// Linux `vfork(2)` compatibility.
