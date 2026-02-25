@@ -190,14 +190,16 @@ impl TaskManager {
             ready_queues: (0..MAX_HARTS).map(|_| HartRunQueue::new()).collect(),
         }
     }
-    pub fn add(&mut self, task: Arc<TaskControlBlock>, hart_id: usize) {
+    pub fn add(&mut self, task: Arc<TaskControlBlock>, hart_id: usize) -> bool {
         // Avoid enqueueing the same task multiple times under SMP.
         if task
             .in_ready_queue
             .swap(true, core::sync::atomic::Ordering::AcqRel)
         {
-            return;
+            return false;
         }
+        let hart_rq = &mut self.ready_queues[hart_id];
+        let was_empty = hart_rq.len() == 0;
         if DEBUG_SCHED {
             let tid = task
                 .borrow_mut()
@@ -209,10 +211,9 @@ impl TaskManager {
                 "[sched] add_task tid={} hart={} ready_queue_len_before={}",
                 tid,
                 hart_id,
-                self.ready_queues[hart_id].len()
+                hart_rq.len()
             );
         }
-        let hart_rq = &mut self.ready_queues[hart_id];
         match task_queue_slot(&task) {
             ReadyQueueSlot::Rt(idx) => hart_rq.rt_queues[idx].push_back(task),
             ReadyQueueSlot::Fair => hart_rq.fair_queue.push_back(task),
@@ -221,9 +222,10 @@ impl TaskManager {
             log::debug!(
                 "[sched] hart={} ready_queue_len_after={}",
                 hart_id,
-                self.ready_queues[hart_id].len()
+                hart_rq.len()
             );
         }
+        was_empty
     }
 
     fn pop_ready_candidate(
@@ -344,9 +346,11 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     let mask = online_hart_mask();
     let cur = crate::task::processor::hart_id() % MAX_HARTS;
     let hart_id = resolve_enqueue_hart(&task, cur, mask);
-    TASK_MANAGER.lock().add(task, hart_id);
+    let was_empty = TASK_MANAGER.lock().add(task, hart_id);
     // Linux-style: if we queued to a remote hart, kick it out of `wfi` via IPI.
-    if cur < MAX_HARTS && cur != hart_id {
+    // For fork storms this avoids flooding remote harts with redundant IPIs when
+    // their runqueue is already non-empty.
+    if cur < MAX_HARTS && cur != hart_id && was_empty {
         arch::send_ipi(hart_id);
     }
     arch::restore_interrupts(prev_sie);
@@ -378,7 +382,7 @@ pub fn refresh_process_runqueues(process: &Arc<ProcessControlBlock>) {
         }
         mgr.remove(Arc::clone(&task));
         let hart_id = resolve_enqueue_hart(&task, cur, mask);
-        mgr.add(task, hart_id);
+        let _ = mgr.add(task, hart_id);
     }
     arch::restore_interrupts(prev_sie);
 }

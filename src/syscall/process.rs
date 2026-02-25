@@ -1,9 +1,12 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{mem::size_of, sync::atomic::Ordering};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
-    debug_config::{DEBUG_EXEC, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
+    debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
     mm::{
         kernel_token, try_read_user_value, try_write_user_value, write_user_value, MapPermission,
@@ -33,6 +36,41 @@ const EFAULT: isize = -14;
 const ENAMETOOLONG: isize = -36;
 const E2BIG: isize = -7;
 const ETXTBSY: isize = -26;
+
+static FORK_DIAG_PARENT_PID: AtomicUsize = AtomicUsize::new(usize::MAX);
+static FORK_DIAG_START_MS: AtomicUsize = AtomicUsize::new(0);
+static FORK_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn should_report_fork_diag(count: usize) -> bool {
+    count <= 16 || count % 128 == 0
+}
+
+fn record_fork_diag(parent_pid: usize, child_pid: usize, flags: usize, fork_elapsed_us: usize) {
+    if !DEBUG_FUTEX {
+        return;
+    }
+    let now_ms = crate::time::get_time_ms();
+    let prev_parent = FORK_DIAG_PARENT_PID.load(Ordering::Relaxed);
+    if prev_parent != parent_pid {
+        FORK_DIAG_PARENT_PID.store(parent_pid, Ordering::Relaxed);
+        FORK_DIAG_START_MS.store(now_ms, Ordering::Relaxed);
+        FORK_DIAG_COUNT.store(0, Ordering::Relaxed);
+    }
+    let count = FORK_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let start_ms = FORK_DIAG_START_MS.load(Ordering::Relaxed);
+    let elapsed_ms = now_ms.saturating_sub(start_ms);
+    if should_report_fork_diag(count) {
+        log::warn!(
+            "[fork_diag] parent_pid={} child_pid={} count={} elapsed_ms={} fork_elapsed_us={} flags={:#x}",
+            parent_pid,
+            child_pid,
+            count,
+            elapsed_ms,
+            fork_elapsed_us,
+            flags
+        );
+    }
+}
 
 fn try_read_usize_user(token: usize, ptr: usize) -> Result<usize, isize> {
     try_read_user_value(token, ptr as *const usize).ok_or(EFAULT)
@@ -495,8 +533,20 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let _ = try_write_user_value(token, _ptid as *mut i32, &0);
     }
 
+    let fork_start_cycles = if DEBUG_FUTEX { crate::arch::read_time() } else { 0 };
     let Some((child, task)) = process.fork_with_task(share_files, share_vm) else {
         return -12;
+    };
+    let fork_elapsed_us = if DEBUG_FUTEX {
+        let delta = crate::arch::read_time().wrapping_sub(fork_start_cycles) as u128;
+        let freq = crate::config::clock_freq() as u128;
+        if freq == 0 {
+            0
+        } else {
+            (delta.saturating_mul(1_000_000) / freq) as usize
+        }
+    } else {
+        0
     };
     let child_pid = child.getpid();
 
@@ -554,6 +604,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         }
     }
     add_task(task);
+    record_fork_diag(process.getpid(), child_pid, flags, fork_elapsed_us);
 
     if (flags & CLONE_VFORK) != 0 {
         let parent_task = current_task().unwrap();

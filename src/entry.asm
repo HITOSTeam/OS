@@ -2,10 +2,10 @@
 .globl _start
 _start:
     # a0: hart id, a1: dtb / opaque
-    li t0, 4096 * 16          # per-hart stack size (64KiB)
     # Stack grows downward; start from the end of the reserved stack region.
     la sp, boot_stack_bottom
-    mul t0, t0, a0
+    # 64KiB per hart => hart_id * 2^16, avoids requiring MUL in early boot.
+    slli t0, a0, 16
     sub sp, sp, t0            # pick stack slice for this hart
     mv tp, a0                 # stash hart id in tp for S-mode use
     call rust_main

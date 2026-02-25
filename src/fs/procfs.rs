@@ -39,6 +39,58 @@ static PROC_ROOT_INO: AtomicU32 = AtomicU32::new(0);
 static PROC_ROOT_DEV: AtomicUsize = AtomicUsize::new(0);
 static PROC_FILES: Mutex<BTreeMap<u32, ProcFileKind>> = Mutex::new(BTreeMap::new());
 const PROC_LINUX_TID_PID_SHIFT: usize = 15;
+static PROC_PID_STAT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PROC_PID_STAT_STATE_S: AtomicUsize = AtomicUsize::new(0);
+static PROC_PID_STAT_STATE_R: AtomicUsize = AtomicUsize::new(0);
+static PROC_PID_STAT_STATE_Z: AtomicUsize = AtomicUsize::new(0);
+static PROC_PID_STAT_LOCK_BUSY: AtomicUsize = AtomicUsize::new(0);
+static PROC_PID_STAT_TOTAL_CYCLES: AtomicUsize = AtomicUsize::new(0);
+
+fn should_report_proc_pid_stat_diag(calls: usize) -> bool {
+    calls <= 16 || calls % 2048 == 0
+}
+
+fn record_proc_pid_stat_diag(pid: u32, state_char: char, elapsed_cycles: usize, lock_busy: bool) {
+    if !crate::debug_config::DEBUG_FUTEX {
+        return;
+    }
+    let calls = PROC_PID_STAT_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    PROC_PID_STAT_TOTAL_CYCLES.fetch_add(elapsed_cycles, Ordering::Relaxed);
+    if lock_busy {
+        PROC_PID_STAT_LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
+    }
+    match state_char {
+        'S' => {
+            PROC_PID_STAT_STATE_S.fetch_add(1, Ordering::Relaxed);
+        }
+        'R' => {
+            PROC_PID_STAT_STATE_R.fetch_add(1, Ordering::Relaxed);
+        }
+        'Z' => {
+            PROC_PID_STAT_STATE_Z.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    if should_report_proc_pid_stat_diag(calls) {
+        let s = PROC_PID_STAT_STATE_S.load(Ordering::Relaxed);
+        let r = PROC_PID_STAT_STATE_R.load(Ordering::Relaxed);
+        let z = PROC_PID_STAT_STATE_Z.load(Ordering::Relaxed);
+        let busy = PROC_PID_STAT_LOCK_BUSY.load(Ordering::Relaxed);
+        let total_cycles = PROC_PID_STAT_TOTAL_CYCLES.load(Ordering::Relaxed);
+        let avg_cycles = if calls == 0 { 0 } else { total_cycles / calls };
+        log::warn!(
+            "[proc_stat_diag] calls={} pid={} state={} s={} r={} z={} lock_busy={} avg_cycles={}",
+            calls,
+            pid,
+            state_char,
+            s,
+            r,
+            z,
+            busy,
+            avg_cycles
+        );
+    }
+}
 
 // gzip-compressed minimal config for LTP kconfig checks.
 const PROC_CONFIG_GZ: &[u8] = &[
@@ -957,10 +1009,21 @@ fn proc_pid_status(pid: u32) -> String {
 }
 
 fn proc_pid_stat(pid: u32) -> String {
+    let start_cycles = if crate::debug_config::DEBUG_FUTEX {
+        crate::arch::read_time()
+    } else {
+        0
+    };
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
     let Some(inner) = proc.try_borrow_mut() else {
+        let elapsed = if crate::debug_config::DEBUG_FUTEX {
+            crate::arch::read_time().wrapping_sub(start_cycles)
+        } else {
+            0
+        };
+        record_proc_pid_stat_diag(pid, 'B', elapsed, true);
         if crate::debug_config::DEBUG_PROCFS {
             crate::println!("[procfs] stat pid={} lock busy", pid);
         }
@@ -1071,9 +1134,16 @@ fn proc_pid_stat(pid: u32) -> String {
     let env_end = 0;
     let exit_code = 0;
 
-    alloc::format!(
+    let out = alloc::format!(
         "{pid} ({comm}) {state_char} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} {num_threads} {itrealvalue} {starttime} {vsize} {rss_pages} {rsslim} {startcode} {endcode} {startstack} {kstkesp} {kstkeip} {signal} {blocked} {sigignore} {sigcatch} {wchan} {nswap} {cnswap} {exit_signal} {processor} {rt_priority} {policy} {delayacct_blkio_ticks} {guest_time} {cguest_time} {start_data} {end_data} {start_brk} {arg_start} {arg_end} {env_start} {env_end} {exit_code}\n"
-    )
+    );
+    let elapsed = if crate::debug_config::DEBUG_FUTEX {
+        crate::arch::read_time().wrapping_sub(start_cycles)
+    } else {
+        0
+    };
+    record_proc_pid_stat_diag(pid, state_char, elapsed, false);
+    out
 }
 
 fn proc_pid_task_stat(pid: u32, tid: u32) -> String {

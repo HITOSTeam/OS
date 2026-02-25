@@ -148,6 +148,35 @@ pub struct PageTable {
     frames: Vec<FrameTracker>,
 }
 
+/// Cached upper-level walk state for repeated nearby VPN lookups/maps.
+#[derive(Clone, Copy)]
+pub struct PageWalkCache {
+    l0_idx: usize,
+    l0_ppn: PhysPageNum,
+    l1_idx: usize,
+    l1_ppn: PhysPageNum,
+    l0_valid: bool,
+    l1_valid: bool,
+}
+
+impl PageWalkCache {
+    pub const fn new() -> Self {
+        Self {
+            l0_idx: 0,
+            l0_ppn: PhysPageNum(0),
+            l1_idx: 0,
+            l1_ppn: PhysPageNum(0),
+            l0_valid: false,
+            l1_valid: false,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.l0_valid = false;
+        self.l1_valid = false;
+    }
+}
+
 /// Assume that it won't oom when creating/mapping.
 impl PageTable {
     pub fn new() -> Self {
@@ -208,6 +237,48 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         flush_tlb_vaddr(vpn.0 << 12);
     }
+
+    /// Fast-path map for sorted/nearby VPN streams.
+    pub fn map_cached(
+        &mut self,
+        vpn: VirtPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+        cache: &mut PageWalkCache,
+    ) {
+        let idxs = vpn.indexes();
+        if !cache.l0_valid || cache.l0_idx != idxs[0] {
+            let pte_l0 = &mut self.root_ppn.get_pte_array()[idxs[0]];
+            if !pte_l0.is_valid() {
+                let frame = frame_alloc().unwrap();
+                *pte_l0 = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                self.frames.push(frame);
+            }
+            cache.l0_idx = idxs[0];
+            cache.l0_ppn = pte_l0.ppn();
+            cache.l0_valid = true;
+            cache.l1_valid = false;
+        }
+        if !cache.l1_valid || cache.l1_idx != idxs[1] {
+            let pte_l1 = &mut cache.l0_ppn.get_pte_array()[idxs[1]];
+            if !pte_l1.is_valid() {
+                let frame = frame_alloc().unwrap();
+                *pte_l1 = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                self.frames.push(frame);
+            }
+            cache.l1_idx = idxs[1];
+            cache.l1_ppn = pte_l1.ppn();
+            cache.l1_valid = true;
+        }
+        let pte_leaf = &mut cache.l1_ppn.get_pte_array()[idxs[2]];
+        debug_assert!(
+            !pte_leaf.is_valid(),
+            "vpn {:?} is mapped before mapping",
+            vpn
+        );
+        *pte_leaf = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        flush_tlb_vaddr(vpn.0 << 12);
+    }
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
@@ -232,6 +303,41 @@ impl PageTable {
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
+    }
+
+    /// Fast-path translate for sorted/nearby VPN streams.
+    pub fn translate_cached(
+        &self,
+        vpn: VirtPageNum,
+        cache: &mut PageWalkCache,
+    ) -> Option<PageTableEntry> {
+        let idxs = vpn.indexes();
+        if !cache.l0_valid || cache.l0_idx != idxs[0] {
+            let pte_l0 = &mut self.root_ppn.get_pte_array()[idxs[0]];
+            if !pte_l0.is_valid() {
+                cache.reset();
+                return None;
+            }
+            cache.l0_idx = idxs[0];
+            cache.l0_ppn = pte_l0.ppn();
+            cache.l0_valid = true;
+            cache.l1_valid = false;
+        }
+        if !cache.l1_valid || cache.l1_idx != idxs[1] {
+            let pte_l1 = &mut cache.l0_ppn.get_pte_array()[idxs[1]];
+            if !pte_l1.is_valid() {
+                cache.l1_valid = false;
+                return None;
+            }
+            cache.l1_idx = idxs[1];
+            cache.l1_ppn = pte_l1.ppn();
+            cache.l1_valid = true;
+        }
+        let pte_leaf = &mut cache.l1_ppn.get_pte_array()[idxs[2]];
+        if !pte_leaf.is_valid() {
+            return None;
+        }
+        Some(*pte_leaf)
     }
 
     /// Update an existing leaf PTE's flags, preserving its mapped PPN.

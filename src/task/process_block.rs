@@ -3,11 +3,12 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
-use crate::debug_config::{DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
+use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
     ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
@@ -31,6 +32,20 @@ use lazy_static::lazy_static;
 use spin::{Mutex as SpinMutex, MutexGuard};
 
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
+static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn fork_diag_cycles_to_us(delta_cycles: usize) -> usize {
+    let freq = crate::config::clock_freq() as u128;
+    if freq == 0 {
+        0
+    } else {
+        ((delta_cycles as u128).saturating_mul(1_000_000) / freq) as usize
+    }
+}
+
+fn should_report_fork_impl_diag(seq: usize, total_us: usize) -> bool {
+    seq <= 16 || seq % 128 == 0 || total_us >= 50_000
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MmapRegion {
@@ -766,13 +781,35 @@ pub struct ProcessControlBlockInner {
 }
 
 impl ProcessControlBlockInner {
+    fn effective_fd_state_len(&self) -> usize {
+        let mut len = self.fd_table.len();
+        while len > 0 {
+            let idx = len - 1;
+            let has_file = self.fd_table[idx].is_some();
+            let has_flag = self.fd_flags.get(idx).copied().unwrap_or(0) != 0;
+            if has_file || has_flag {
+                break;
+            }
+            len -= 1;
+        }
+        len
+    }
+
+    fn trim_fd_state(&mut self) {
+        let len = self.effective_fd_state_len();
+        self.fd_table.truncate(len);
+        self.fd_flags.truncate(len);
+    }
+
     pub fn snapshot_fd_state(&self) -> (Vec<Option<Arc<dyn File + Send + Sync>>>, Vec<u32>) {
+        let len = self.effective_fd_state_len();
         let fd_table = self
             .fd_table
             .iter()
+            .take(len)
             .map(|fd| fd.as_ref().map(Arc::clone))
             .collect::<Vec<_>>();
-        let mut fd_flags = self.fd_flags.clone();
+        let mut fd_flags = self.fd_flags.iter().take(len).copied().collect::<Vec<_>>();
         if fd_flags.len() < fd_table.len() {
             fd_flags.resize(fd_table.len(), 0);
         }
@@ -788,6 +825,7 @@ impl ProcessControlBlockInner {
                 *flags = 0;
             }
         }
+        self.trim_fd_state();
     }
 
     /// Keep `fd_flags` aligned with `fd_table` length.
@@ -812,6 +850,7 @@ impl ProcessControlBlockInner {
         self.fd_table[fd] = None;
         self.ensure_fd_flags_len();
         self.fd_flags[fd] = 0;
+        self.trim_fd_state();
         true
     }
 
@@ -1395,6 +1434,16 @@ impl ProcessControlBlock {
         share_files: bool,
         share_vm: bool,
     ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
+        let diag_enabled = DEBUG_FUTEX;
+        let fork_start_cycles = if diag_enabled {
+            crate::arch::read_time()
+        } else {
+            0
+        };
+        let mut after_mem_cycles = fork_start_cycles;
+        let mut after_pcb_cycles = fork_start_cycles;
+        let mut after_task_cycles = fork_start_cycles;
+
         let mut parent = self.borrow_mut();
         let thread_count = parent.thread_count();
         if thread_count != 1 {
@@ -1443,6 +1492,9 @@ impl ProcessControlBlock {
                 let trap_cx_bottom = TRAP_CONTEXT_BASE - res.tid * PAGE_SIZE;
                 memory_set.remove_area_with_start_vpn(trap_cx_bottom.into());
             }
+        }
+        if diag_enabled {
+            after_mem_cycles = crate::arch::read_time();
         }
         // alloc a pid
         let pid = pid_alloc();
@@ -1587,18 +1639,24 @@ impl ProcessControlBlock {
             Self::register_files_sharer(&root_files_owner, &child);
         }
         crate::syscall::sysv_shm::fork_inherit(&inherited_shm);
+        if diag_enabled {
+            after_pcb_cycles = crate::arch::read_time();
+        }
 
         // Drop parent lock before allocating child task resources.
         drop(parent);
 
         // create main thread of child process (allocates a fresh kernel stack)
-        let task = Arc::new(TaskControlBlock::try_new(
+        let task = match TaskControlBlock::try_new(
             Arc::clone(&child),
             parent_ustack_base,
             // here we do not allocate trap_cx or ustack again
             // but mention that we allocate a new kstack here
             false,
-        )?);
+        ) {
+            Some(task) => Arc::new(task),
+            None => return None,
+        };
         // Distribute child processes across harts.
         task.set_cpu_id(select_hart_for_new_task());
         // attach task to child process
@@ -1631,9 +1689,36 @@ impl ProcessControlBlock {
         // );
 
         drop(task_inner);
+        if diag_enabled {
+            after_task_cycles = crate::arch::read_time();
+        }
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add child to parent's children list (after success)
         self.borrow_mut().children.push(Arc::clone(&child));
+        if diag_enabled {
+            let end_cycles = crate::arch::read_time();
+            let seq = FORK_IMPL_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let total_us = fork_diag_cycles_to_us(end_cycles.wrapping_sub(fork_start_cycles));
+            if should_report_fork_impl_diag(seq, total_us) {
+                let mem_us = fork_diag_cycles_to_us(after_mem_cycles.wrapping_sub(fork_start_cycles));
+                let pcb_us = fork_diag_cycles_to_us(after_pcb_cycles.wrapping_sub(after_mem_cycles));
+                let task_us = fork_diag_cycles_to_us(after_task_cycles.wrapping_sub(after_pcb_cycles));
+                let final_us = fork_diag_cycles_to_us(end_cycles.wrapping_sub(after_task_cycles));
+                log::warn!(
+                    "[fork_impl_diag] seq={} parent_pid={} child_pid={} share_vm={} share_files={} total_us={} mem_clone_us={} child_pcb_us={} child_task_us={} publish_us={}",
+                    seq,
+                    self.getpid(),
+                    child.getpid(),
+                    share_vm,
+                    share_files,
+                    total_us,
+                    mem_us,
+                    pcb_us,
+                    task_us,
+                    final_us
+                );
+            }
+        }
         Some((child, task))
     }
 

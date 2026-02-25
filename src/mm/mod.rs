@@ -54,7 +54,7 @@ pub use page_table::{
     try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
     try_write_user_value,
 };
-pub use page_table::{PTEFlags, PageTable};
+pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub struct UserBuffer {
     pub buffers: Vec<&'static mut [u8]>,
 }

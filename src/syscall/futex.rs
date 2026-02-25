@@ -3,7 +3,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -11,7 +11,7 @@ use spin::Mutex;
 use crate::{
     config::clock_freq,
     debug_config::DEBUG_FUTEX,
-    mm::{PageTable, VirtAddr, read_user_value},
+    mm::{read_user_value, PageTable, VirtAddr},
     syscall::time_sys::realtime_now_timespec,
     task::block_sleep::add_timer,
     task::{
@@ -56,6 +56,9 @@ lazy_static! {
     static ref FUTEX_QUEUES: Mutex<BTreeMap<FutexKey, VecDeque<FutexWaiter>>> =
         Mutex::new(BTreeMap::new());
 }
+
+static FUTEX_TIMEOUT_SEQ: AtomicUsize = AtomicUsize::new(0);
+static FUTEX_WAIT_DIAG_BASE_NS: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -111,6 +114,13 @@ fn pending_unmasked_signal() -> bool {
 
 pub(crate) fn shared_futex_addr_key(token: usize, uaddr: usize) -> usize {
     let page_table = PageTable::from_token(token);
+    if DEBUG_FUTEX && page_table.translate_va(VirtAddr::from(uaddr)).is_none() {
+        log::debug!(
+            "[futex_key] shared translation miss token={:#x} uaddr={:#x}, fallback to va key",
+            token,
+            uaddr
+        );
+    }
     page_table
         .translate_va(VirtAddr::from(uaddr))
         .map(|pa| {
@@ -130,10 +140,11 @@ fn futex_key(pid: usize, token: usize, uaddr: usize, private: bool) -> FutexKey 
     }
 }
 
-fn remove_waiter(in_queue: &Arc<AtomicBool>) -> bool {
+fn remove_waiter(in_queue: &Arc<AtomicBool>) -> Option<FutexKey> {
     let mut map = FUTEX_QUEUES.lock();
     let mut removed = false;
-    map.retain(|_, queue| {
+    let mut removed_key = None;
+    map.retain(|key, queue| {
         queue.retain(|w| {
             let keep = !Arc::ptr_eq(&w.in_queue, in_queue);
             if !keep {
@@ -141,12 +152,17 @@ fn remove_waiter(in_queue: &Arc<AtomicBool>) -> bool {
             }
             keep
         });
+        if removed && removed_key.is_none() {
+            removed_key = Some(*key);
+        }
         !queue.is_empty()
     });
     if removed {
         in_queue.store(false, Ordering::Release);
+        removed_key
+    } else {
+        None
     }
-    removed
 }
 
 pub fn remove_futex_waiters(task: &Arc<TaskControlBlock>) {
@@ -254,6 +270,12 @@ pub fn syscall_futex(
             }
             let task = current_task().unwrap();
             let pid = current_process().getpid();
+            let tid = task
+                .borrow_mut()
+                .res
+                .as_ref()
+                .map(|r| r.tid)
+                .unwrap_or(usize::MAX);
             let token = get_current_token();
             let bitset = if cmd == FUTEX_WAIT_BITSET {
                 let bitset = _val3 as u32;
@@ -267,12 +289,6 @@ pub fn syscall_futex(
             let cur = read_user_value(token, uaddr as *const i32);
             if cur != val as i32 {
                 if DEBUG_FUTEX {
-                    let tid = task
-                        .borrow_mut()
-                        .res
-                        .as_ref()
-                        .map(|r| r.tid)
-                        .unwrap_or(usize::MAX);
                     log::debug!(
                         "[futex_wait] mismatch pid={} tid={} uaddr={:#x} cur={} expected={}",
                         pid,
@@ -293,6 +309,7 @@ pub fn syscall_futex(
             let key = futex_key(pid, token, uaddr, _private);
             let in_queue = Arc::new(AtomicBool::new(true));
             let mut map = FUTEX_QUEUES.lock();
+            let queue_len_before = map.get(&key).map(VecDeque::len).unwrap_or(0);
             if crate::debug_config::DEBUG_PTHREAD {
                 let (tid, pending_sig, mask) = {
                     let inner = task.borrow_mut();
@@ -316,12 +333,6 @@ pub fn syscall_futex(
                 return EINTR;
             }
             if DEBUG_FUTEX {
-                let tid = task
-                    .borrow_mut()
-                    .res
-                    .as_ref()
-                    .map(|r| r.tid)
-                    .unwrap_or(usize::MAX);
                 log::debug!(
                     "[futex_wait] pid={} tid={} uaddr={:#x} val={}",
                     pid,
@@ -330,6 +341,7 @@ pub fn syscall_futex(
                     val
                 );
             }
+            let wait_start_ns = futex_wait_now_ns(cmd, clock_realtime);
             let deadline_ns = if _timeout == 0 {
                 None
             } else {
@@ -356,6 +368,46 @@ pub fn syscall_futex(
                     bitset,
                     in_queue: Arc::clone(&in_queue),
                 });
+            if DEBUG_FUTEX && queue_len_before == 0 {
+                FUTEX_WAIT_DIAG_BASE_NS.store(monotonic_now_ns() as usize, Ordering::Relaxed);
+            }
+            if DEBUG_FUTEX {
+                let queue_len_after = map.get(&key).map(VecDeque::len).unwrap_or(0);
+                log::debug!(
+                    "[futex_wait_enqueue] pid={} tid={} private={} uaddr={:#x} key=({:#x},{:#x}) val={} bitset={:#x} qlen={}=>{}",
+                    pid,
+                    tid,
+                    _private,
+                    uaddr,
+                    key.0,
+                    key.1,
+                    val,
+                    bitset,
+                    queue_len_before,
+                    queue_len_after
+                );
+                if queue_len_after >= 100 && queue_len_after % 100 == 0 {
+                    let base_ns = FUTEX_WAIT_DIAG_BASE_NS.load(Ordering::Relaxed) as u64;
+                    let now_ns = monotonic_now_ns();
+                    let elapsed_ms = if base_ns == 0 {
+                        0
+                    } else {
+                        now_ns
+                            .saturating_sub(base_ns)
+                            .saturating_div(NSEC_PER_MSEC)
+                    };
+                    log::warn!(
+                        "[futex_wait_depth] pid={} tid={} key=({:#x},{:#x}) qlen={} val={} elapsed_ms={}",
+                        pid,
+                        tid,
+                        key.0,
+                        key.1,
+                        queue_len_after,
+                        val,
+                        elapsed_ms
+                    );
+                }
+            }
             drop(map);
             if let Some(deadline_ns) = deadline_ns {
                 let now_ns = futex_wait_now_ns(cmd, clock_realtime);
@@ -390,7 +442,20 @@ pub fn syscall_futex(
                     return 0;
                 }
                 if pending_unmasked_signal() {
-                    if remove_waiter(&in_queue) {
+                    if let Some(removed_key) = remove_waiter(&in_queue) {
+                        if DEBUG_FUTEX {
+                            let seq = FUTEX_TIMEOUT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                            if seq <= 8 || seq % 64 == 0 {
+                                log::warn!(
+                                    "[futex_wait_detach] seq={} reason=signal pid={} tid={} key=({:#x},{:#x})",
+                                    seq,
+                                    pid,
+                                    tid,
+                                    removed_key.0,
+                                    removed_key.1
+                                );
+                            }
+                        }
                         return EINTR;
                     }
                     if !in_queue.load(Ordering::Acquire) {
@@ -401,9 +466,25 @@ pub fn syscall_futex(
                 if let Some(deadline_ns) = deadline_ns {
                     let now_ns = futex_wait_now_ns(cmd, clock_realtime);
                     if now_ns >= deadline_ns {
-                        if remove_waiter(&in_queue) {
-                            return ETIMEDOUT;
+                    if let Some(removed_key) = remove_waiter(&in_queue) {
+                        if DEBUG_FUTEX {
+                            let seq = FUTEX_TIMEOUT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                            let waited_ms =
+                                now_ns.saturating_sub(wait_start_ns).saturating_div(NSEC_PER_MSEC);
+                            if seq <= 16 || seq % 32 == 0 {
+                                log::warn!(
+                                    "[futex_wait_detach] seq={} reason=timeout pid={} tid={} key=({:#x},{:#x}) waited_ms={}",
+                                    seq,
+                                    pid,
+                                    tid,
+                                    removed_key.0,
+                                    removed_key.1,
+                                    waited_ms
+                                );
+                            }
                         }
+                        return ETIMEDOUT;
+                    }
                         if !in_queue.load(Ordering::Acquire) {
                             return 0;
                         }
@@ -452,9 +533,44 @@ pub fn syscall_futex(
             let token = get_current_token();
             let key1 = futex_key(pid, token, uaddr, _private);
             let key2 = futex_key(pid, token, _uaddr2, _private);
+            if DEBUG_FUTEX {
+                log::warn!(
+                    "[futex_requeue_enter] pid={} private={} cmd={} uaddr={:#x} uaddr2={:#x} key1=({:#x},{:#x}) key2=({:#x},{:#x}) nr_wake={} nr_requeue={} cmp_expected={}",
+                    pid,
+                    _private,
+                    cmd,
+                    uaddr,
+                    _uaddr2,
+                    key1.0,
+                    key1.1,
+                    key2.0,
+                    key2.1,
+                    nr_wake,
+                    nr_requeue,
+                    _val3
+                );
+            }
             if cmd == FUTEX_CMP_REQUEUE {
                 let cur = read_user_value(token, uaddr as *const i32);
+                if DEBUG_FUTEX {
+                    log::warn!(
+                        "[futex_cmp_requeue_cmp] pid={} uaddr={:#x} key1=({:#x},{:#x}) cur={} expected={}",
+                        pid,
+                        uaddr,
+                        key1.0,
+                        key1.1,
+                        cur,
+                        _val3
+                    );
+                }
                 if cur != _val3 as i32 {
+                    if DEBUG_FUTEX {
+                        log::warn!(
+                            "[futex_cmp_requeue_cmp] cmp mismatch -> EAGAIN pid={} uaddr={:#x}",
+                            pid,
+                            uaddr
+                        );
+                    }
                     return EAGAIN;
                 }
             }
@@ -462,7 +578,19 @@ pub fn syscall_futex(
             let mut wake_list = Vec::new();
             let (woke, moved) = {
                 let mut map = FUTEX_QUEUES.lock();
+                let key1_len_before = map.get(&key1).map(VecDeque::len).unwrap_or(0);
+                let key2_len_before = map.get(&key2).map(VecDeque::len).unwrap_or(0);
                 let Some(mut queue1) = map.remove(&key1) else {
+                    if DEBUG_FUTEX {
+                        log::warn!(
+                            "[futex_requeue_state] pid={} key1=({:#x},{:#x}) missing source queue key1_len_before={} key2_len_before={}",
+                            pid,
+                            key1.0,
+                            key1.1,
+                            key1_len_before,
+                            key2_len_before
+                        );
+                    }
                     return 0;
                 };
                 let mut woke = 0usize;
@@ -475,6 +603,7 @@ pub fn syscall_futex(
                     wake_list.push(waiter.task);
                     woke += 1;
                 }
+                let skipped_same_key = val2 > 0 && !queue1.is_empty() && key2 == key1;
                 if val2 > 0 && !queue1.is_empty() && key2 != key1 {
                     let target = map.entry(key2).or_insert_with(VecDeque::new);
                     while moved < val2 {
@@ -487,6 +616,25 @@ pub fn syscall_futex(
                 }
                 if !queue1.is_empty() {
                     map.insert(key1, queue1);
+                }
+                if DEBUG_FUTEX {
+                    let key1_len_after = map.get(&key1).map(VecDeque::len).unwrap_or(0);
+                    let key2_len_after = map.get(&key2).map(VecDeque::len).unwrap_or(0);
+                    log::warn!(
+                        "[futex_requeue_state] pid={} key1=({:#x},{:#x}) key2=({:#x},{:#x}) qlen1={}=>{} qlen2={}=>{} woke={} moved={} skipped_same_key={}",
+                        pid,
+                        key1.0,
+                        key1.1,
+                        key2.0,
+                        key2.1,
+                        key1_len_before,
+                        key1_len_after,
+                        key2_len_before,
+                        key2_len_after,
+                        woke,
+                        moved,
+                        skipped_same_key
+                    );
                 }
                 (woke, moved)
             };

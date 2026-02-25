@@ -51,7 +51,7 @@ pub const DEBUG_IOZONE_FS: bool = false;
 pub const DEBUG_NET: bool = false;
 
 /// Targeted logs for UnixBench hangs (alarm/pipe/signal).
-pub const DEBUG_UNIXBENCH: bool = true;
+pub const DEBUG_UNIXBENCH: bool = false;
 
 /// Targeted logs for cyclictest hangs (clock_nanosleep/affinity/sleep).
 pub const DEBUG_CYCLICTEST: bool = false;
@@ -69,7 +69,7 @@ pub const DEBUG_WATCHDOG: bool = false;
 pub const DEBUG_LOG_TEST: bool = false;
 
 /// Lightweight performance counters for diagnosing bottlenecks.
-pub const DEBUG_PERF: bool = true;
+pub const DEBUG_PERF: bool = false;
 
 /// Use full-copy fork on LoongArch instead of COW (slower but safer).
 pub const DEBUG_LOONGARCH_FULL_COPY_FORK: bool = false;

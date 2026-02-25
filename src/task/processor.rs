@@ -75,11 +75,14 @@ fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
 }
 
 fn fair_timeslice_ticks(nice: i32) -> usize {
+    // A 1-tick fair slice causes excessive context-switch churn under heavy
+    // fork/futex workloads. Use a slightly larger base slice while preserving
+    // longer quanta for higher-priority (negative nice) threads.
+    const FAIR_BASE_SLICE_TICKS: usize = 4;
     if nice < 0 {
-        // Negative nice values (higher priority) get a longer timeslice.
-        (1 + (-nice as usize)).min(20)
+        (FAIR_BASE_SLICE_TICKS + (-nice as usize)).min(20)
     } else {
-        1
+        FAIR_BASE_SLICE_TICKS
     }
 }
 

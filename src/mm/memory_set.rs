@@ -1,7 +1,7 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
 use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
-use super::{PTEFlags, PageTable, PageTableEntry};
+use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
@@ -15,6 +15,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
 #[cfg(target_arch = "riscv64")]
 use riscv::register::satp::{self, Satp};
@@ -34,6 +35,7 @@ unsafe extern "C" {
 
 const ENOEXEC: isize = -8;
 const ENOMEM: isize = -12;
+static COW_CLONE_DIAG_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
@@ -931,34 +933,59 @@ impl MemorySet {
     ///   in both parent and child.
     /// - Kernel-only pages (e.g., TrapContext, no PTE.U) are copied eagerly.
     pub fn from_existed_user_cow(user_space: &mut MemorySet) -> MemorySet {
+        let diag_enabled = crate::debug_config::DEBUG_FUTEX;
+        let start_cycles = if diag_enabled {
+            crate::arch::read_time()
+        } else {
+            0
+        };
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
 
         let mut parent_updates: Vec<(VirtPageNum, PTEFlags)> = Vec::new();
+        let mut src_walk_cache = PageWalkCache::new();
+        let mut dst_walk_cache = PageWalkCache::new();
+        let mut area_count = 0usize;
+        let mut identical_pages = 0usize;
+        let mut shared_pages = 0usize;
+        let mut kernel_private_pages = 0usize;
+        let mut cow_marked_pages = 0usize;
 
         for area in user_space.areas.iter() {
+            area_count = area_count.saturating_add(1);
+            src_walk_cache.reset();
+            dst_walk_cache.reset();
             let mut new_area = MapArea::from_another(area);
 
             match area.map_type {
                 MapType::Identical => {
                     for vpn in area.vpn_range {
-                        let Some(src_pte) = user_space.translate(vpn) else {
+                        let Some(src_pte) = user_space
+                            .page_table
+                            .translate_cached(vpn, &mut src_walk_cache)
+                        else {
                             continue;
                         };
                         if !src_pte.is_valid() {
                             continue;
                         }
+                        identical_pages = identical_pages.saturating_add(1);
                         let src_ppn = src_pte.ppn();
                         let src_flags = src_pte.flags();
-                        memory_set.page_table.map(vpn, src_ppn, src_flags);
+                        memory_set
+                            .page_table
+                            .map_cached(vpn, src_ppn, src_flags, &mut dst_walk_cache);
                     }
                 }
                 // For Framed/Lazy areas we only walk materialized pages.
                 // This avoids O(vma_len) scans for huge untouched lazy mappings.
                 MapType::Framed | MapType::Lazy => {
                     for (&vpn, frame_tracker) in area.data_frames.iter() {
-                        let Some(src_pte) = user_space.translate(vpn) else {
+                        let Some(src_pte) = user_space
+                            .page_table
+                            .translate_cached(vpn, &mut src_walk_cache)
+                        else {
                             continue;
                         };
                         if !src_pte.is_valid() {
@@ -976,12 +1003,19 @@ impl MemorySet {
                                 .ppn
                                 .get_bytes_array()
                                 .copy_from_slice(src_ppn.get_bytes_array());
-                            memory_set.page_table.map(vpn, frame.ppn, src_flags);
+                            memory_set.page_table.map_cached(
+                                vpn,
+                                frame.ppn,
+                                src_flags,
+                                &mut dst_walk_cache,
+                            );
                             new_area.data_frames.insert(vpn, frame);
+                            kernel_private_pages = kernel_private_pages.saturating_add(1);
                             continue;
                         }
 
                         // Share the physical page.
+                        shared_pages = shared_pages.saturating_add(1);
                         let writable =
                             src_flags.contains(PTEFlags::W) || src_flags.contains(PTEFlags::D);
                         if writable && !src_flags.contains(PTEFlags::SHARED) {
@@ -989,8 +1023,11 @@ impl MemorySet {
                             src_flags.remove(PTEFlags::D);
                             src_flags.insert(PTEFlags::COW);
                             parent_updates.push((vpn, src_flags));
+                            cow_marked_pages = cow_marked_pages.saturating_add(1);
                         }
-                        memory_set.page_table.map(vpn, src_ppn, src_flags);
+                        memory_set
+                            .page_table
+                            .map_cached(vpn, src_ppn, src_flags, &mut dst_walk_cache);
                         new_area.data_frames.insert(vpn, frame_tracker.clone());
                     }
                 }
@@ -999,9 +1036,45 @@ impl MemorySet {
             memory_set.push_mapped(new_area);
         }
 
+        let before_parent_update_cycles = if diag_enabled {
+            crate::arch::read_time()
+        } else {
+            0
+        };
+        let parent_update_count = parent_updates.len();
         // Apply parent COW flag updates after we finish iterating its areas.
         for (vpn, flags) in parent_updates {
             user_space.set_pte_flags(vpn, flags);
+        }
+        if diag_enabled {
+            let end_cycles = crate::arch::read_time();
+            let to_us = |delta_cycles: usize| -> usize {
+                let freq = crate::config::clock_freq() as u128;
+                if freq == 0 {
+                    0
+                } else {
+                    ((delta_cycles as u128).saturating_mul(1_000_000) / freq) as usize
+                }
+            };
+            let total_us = to_us(end_cycles.wrapping_sub(start_cycles));
+            let seq = COW_CLONE_DIAG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            if seq <= 16 || seq % 128 == 0 || total_us >= 30_000 {
+                let walk_us = to_us(before_parent_update_cycles.wrapping_sub(start_cycles));
+                let update_us = to_us(end_cycles.wrapping_sub(before_parent_update_cycles));
+                log::warn!(
+                    "[cow_clone_diag] seq={} total_us={} walk_us={} parent_update_us={} areas={} ident_pages={} shared_pages={} kernel_copy_pages={} cow_marked={} parent_updates={}",
+                    seq,
+                    total_us,
+                    walk_us,
+                    update_us,
+                    area_count,
+                    identical_pages,
+                    shared_pages,
+                    kernel_private_pages,
+                    cow_marked_pages,
+                    parent_update_count
+                );
+            }
         }
 
         memory_set
@@ -1016,26 +1089,41 @@ impl MemorySet {
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
+        let mut src_walk_cache = PageWalkCache::new();
+        let mut dst_walk_cache = PageWalkCache::new();
 
         for area in user_space.areas.iter() {
+            src_walk_cache.reset();
+            dst_walk_cache.reset();
             let mut new_area = MapArea::from_another(area);
 
             match area.map_type {
                 MapType::Identical => {
                     for vpn in area.vpn_range {
-                        let Some(src_pte) = user_space.translate(vpn) else {
+                        let Some(src_pte) = user_space
+                            .page_table
+                            .translate_cached(vpn, &mut src_walk_cache)
+                        else {
                             continue;
                         };
                         if !src_pte.is_valid() {
                             continue;
                         }
-                        memory_set.page_table.map(vpn, src_pte.ppn(), src_pte.flags());
+                        memory_set.page_table.map_cached(
+                            vpn,
+                            src_pte.ppn(),
+                            src_pte.flags(),
+                            &mut dst_walk_cache,
+                        );
                     }
                 }
                 // Share only materialized pages for Framed/Lazy areas.
                 MapType::Framed | MapType::Lazy => {
                     for (&vpn, frame_tracker) in area.data_frames.iter() {
-                        let Some(src_pte) = user_space.translate(vpn) else {
+                        let Some(src_pte) = user_space
+                            .page_table
+                            .translate_cached(vpn, &mut src_walk_cache)
+                        else {
                             continue;
                         };
                         if !src_pte.is_valid() {
@@ -1053,12 +1141,19 @@ impl MemorySet {
                                 .ppn
                                 .get_bytes_array()
                                 .copy_from_slice(src_ppn.get_bytes_array());
-                            memory_set.page_table.map(vpn, frame.ppn, src_flags);
+                            memory_set.page_table.map_cached(
+                                vpn,
+                                frame.ppn,
+                                src_flags,
+                                &mut dst_walk_cache,
+                            );
                             new_area.data_frames.insert(vpn, frame);
                             continue;
                         }
 
-                        memory_set.page_table.map(vpn, src_ppn, src_flags);
+                        memory_set
+                            .page_table
+                            .map_cached(vpn, src_ppn, src_flags, &mut dst_walk_cache);
                         new_area.data_frames.insert(vpn, frame_tracker.clone());
                     }
                 }
@@ -1077,14 +1172,21 @@ impl MemorySet {
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
+        let mut src_walk_cache = PageWalkCache::new();
+        let mut dst_walk_cache = PageWalkCache::new();
 
         for area in user_space.areas.iter() {
+            src_walk_cache.reset();
+            dst_walk_cache.reset();
             let mut new_area = MapArea::from_another(area);
 
             match area.map_type {
                 MapType::Identical => {
                     for vpn in area.vpn_range {
-                        let Some(src_pte) = user_space.translate(vpn) else {
+                        let Some(src_pte) = user_space
+                            .page_table
+                            .translate_cached(vpn, &mut src_walk_cache)
+                        else {
                             continue;
                         };
                         if !src_pte.is_valid() {
@@ -1092,14 +1194,19 @@ impl MemorySet {
                         }
                         let src_ppn = src_pte.ppn();
                         let src_flags = src_pte.flags();
-                        memory_set.page_table.map(vpn, src_ppn, src_flags);
+                        memory_set
+                            .page_table
+                            .map_cached(vpn, src_ppn, src_flags, &mut dst_walk_cache);
                     }
                 }
                 // Lazy areas can span terabytes with no materialized pages.
                 // Copy only present pages tracked in data_frames.
                 MapType::Framed | MapType::Lazy => {
                     for (&vpn, _) in area.data_frames.iter() {
-                        let Some(src_pte) = user_space.translate(vpn) else {
+                        let Some(src_pte) = user_space
+                            .page_table
+                            .translate_cached(vpn, &mut src_walk_cache)
+                        else {
                             continue;
                         };
                         if !src_pte.is_valid() {
@@ -1114,7 +1221,12 @@ impl MemorySet {
                             .get_bytes_array()
                             .copy_from_slice(src_ppn.get_bytes_array());
                         let pte_flags = PTEFlags::from(area.map_perm);
-                        memory_set.page_table.map(vpn, frame.ppn, pte_flags);
+                        memory_set.page_table.map_cached(
+                            vpn,
+                            frame.ppn,
+                            pte_flags,
+                            &mut dst_walk_cache,
+                        );
                         new_area.data_frames.insert(vpn, frame);
                     }
                 }
