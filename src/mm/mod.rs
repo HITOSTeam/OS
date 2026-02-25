@@ -24,37 +24,37 @@ use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
 pub use dtb::init_phys_mem_from_dtb;
-pub use frame_allocator::{FrameTracker, frame_alloc, frame_alloc_contiguous, frame_dealloc};
+pub use frame_allocator::{frame_alloc, frame_alloc_contiguous, frame_dealloc, FrameTracker};
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn cached_kernel_token() -> usize {
-    KERNEL_SATP.load(Ordering::SeqCst)
+    KERNEL_SATP.load(Ordering::Acquire)
 }
 pub fn activate_kernel_space() {
-    let cached = KERNEL_SATP.load(Ordering::SeqCst);
+    let cached = KERNEL_SATP.load(Ordering::Acquire);
     if cached != 0 {
         memory_set::activate_token(cached);
     } else {
         let token = memory_set::kernel_token();
-        KERNEL_SATP.store(token, Ordering::SeqCst);
+        KERNEL_SATP.store(token, Ordering::Release);
         memory_set::activate_token(token);
     }
 }
 pub(crate) use memory_set::elf_interp_path_from_reader;
 pub use memory_set::remap_test;
-pub use memory_set::{ElfAux, KERNEL_SPACE, MapPermission, MemorySet};
-pub use page_table::{PTEFlags, PageTable};
+pub use memory_set::{ElfAux, MapPermission, MemorySet, KERNEL_SPACE};
 pub use page_table::{
-    PageTableEntry, copy_from_user, copy_to_user, read_user_value, translated_byte_buffer,
-    translated_mutref, translated_single_address, translated_str, try_translated_byte_buffer,
-    write_user_value,
+    copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
+    translated_single_address, translated_str, try_translated_byte_buffer, write_user_value,
+    PageTableEntry,
 };
 pub use page_table::{
     try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
     try_write_user_value,
 };
+pub use page_table::{PTEFlags, PageTable};
 pub struct UserBuffer {
     pub buffers: Vec<&'static mut [u8]>,
 }
@@ -115,6 +115,6 @@ pub fn init() {
     frame_allocator::init_frame_allocator();
     println!("[kernel] frame allocator initialized.");
     KERNEL_SPACE.lock().activate();
-    KERNEL_SATP.store(kernel_token(), Ordering::SeqCst);
+    KERNEL_SATP.store(kernel_token(), Ordering::Release);
     println!("[kernel] kernel space activated.");
 }

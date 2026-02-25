@@ -32,11 +32,13 @@ pub enum ProcFileKind {
     PidStatus(u32),
     PidMaps(u32),
     PidMounts(u32),
+    PidTaskStat(u32, u32),
 }
 
 static PROC_ROOT_INO: AtomicU32 = AtomicU32::new(0);
 static PROC_ROOT_DEV: AtomicUsize = AtomicUsize::new(0);
 static PROC_FILES: Mutex<BTreeMap<u32, ProcFileKind>> = Mutex::new(BTreeMap::new());
+const PROC_LINUX_TID_PID_SHIFT: usize = 15;
 
 // gzip-compressed minimal config for LTP kconfig checks.
 const PROC_CONFIG_GZ: &[u8] = &[
@@ -298,6 +300,11 @@ fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
         ino: pid as u64,
         dtype: 4,
     });
+    entries.push(PseudoDirent {
+        name: String::from("task"),
+        ino: pid as u64,
+        dtype: 4,
+    });
     entries
 }
 
@@ -329,6 +336,105 @@ fn proc_pid_fd_entries(pid: u32) -> Vec<PseudoDirent> {
             });
         }
     }
+    entries
+}
+
+fn encode_proc_linux_tid(tgid: u32, tid_index: usize) -> u32 {
+    if tid_index == 0 {
+        tgid
+    } else {
+        (((tgid as usize) << PROC_LINUX_TID_PID_SHIFT) | (tid_index & 0x7fff)) as u32
+    }
+}
+
+fn decode_proc_linux_tid(tgid: u32, tid: u32) -> Option<usize> {
+    if tid == tgid {
+        return Some(0);
+    }
+    let pid_part = (tid as usize) >> PROC_LINUX_TID_PID_SHIFT;
+    if pid_part != tgid as usize {
+        return None;
+    }
+    Some((tid as usize) & 0x7fff)
+}
+
+fn proc_pid_task_entries(pid: u32) -> Vec<PseudoDirent> {
+    let mut entries = Vec::new();
+    entries.push(PseudoDirent {
+        name: String::from("."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from(".."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    let Some(proc) = pid2process(pid as usize) else {
+        return entries;
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        return entries;
+    };
+    for (tid_index, task) in inner.tasks.iter().enumerate() {
+        let Some(task) = task.as_ref() else {
+            continue;
+        };
+        let alive = task
+            .try_borrow_mut()
+            .map(|ti| ti.res.is_some() && ti.exit_code.is_none())
+            .unwrap_or(false);
+        if !alive {
+            continue;
+        }
+        let tid = encode_proc_linux_tid(pid, tid_index);
+        entries.push(PseudoDirent {
+            name: alloc::format!("{tid}"),
+            ino: tid as u64,
+            dtype: 4,
+        });
+    }
+    entries
+}
+
+fn proc_pid_task_alive(pid: u32, tid: u32) -> bool {
+    let Some(tid_index) = decode_proc_linux_tid(pid, tid) else {
+        return false;
+    };
+    let Some(proc) = pid2process(pid as usize) else {
+        return false;
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        return false;
+    };
+    inner
+        .tasks
+        .get(tid_index)
+        .and_then(|t| t.as_ref())
+        .and_then(|t| t.try_borrow_mut().map(|ti| ti.res.is_some() && ti.exit_code.is_none()))
+        .unwrap_or(false)
+}
+
+fn proc_pid_task_tid_entries(pid: u32, tid: u32) -> Vec<PseudoDirent> {
+    let mut entries = Vec::new();
+    entries.push(PseudoDirent {
+        name: String::from("."),
+        ino: tid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from(".."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    if !proc_pid_task_alive(pid, tid) {
+        return entries;
+    }
+    entries.push(PseudoDirent {
+        name: String::from("stat"),
+        ino: tid as u64,
+        dtype: 8,
+    });
     entries
 }
 
@@ -531,6 +637,34 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             proc_pid_fd_entries(pid),
         )));
     }
+    if rest == "task" {
+        return Some(Arc::new(PseudoDir::new(
+            &alloc::format!("/proc/{pid}/task"),
+            proc_pid_task_entries(pid),
+        )));
+    }
+    if let Some(task_rest) = rest.strip_prefix("task/") {
+        let mut parts = task_rest.splitn(2, '/');
+        let tid_name = parts.next().unwrap_or("");
+        if tid_name.is_empty() || !tid_name.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let tid = tid_name.parse::<u32>().ok()?;
+        if !proc_pid_task_alive(pid, tid) {
+            return None;
+        }
+        let tail = parts.next().unwrap_or("");
+        if tail.is_empty() {
+            return Some(Arc::new(PseudoDir::new(
+                &alloc::format!("/proc/{pid}/task/{tid}"),
+                proc_pid_task_tid_entries(pid, tid),
+            )));
+        }
+        if tail == "stat" {
+            return Some(ProcPseudoFile::new(ProcFileKind::PidTaskStat(pid, tid)));
+        }
+        return None;
+    }
     match rest {
         "stat" => Some(ProcPseudoFile::new(ProcFileKind::PidStat(pid))),
         "cmdline" => Some(ProcPseudoFile::new(ProcFileKind::PidCmdline(pid))),
@@ -606,6 +740,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
         ProcFileKind::PidStatus(pid) => proc_pid_status(*pid),
         ProcFileKind::PidMaps(pid) => proc_pid_maps(*pid),
+        ProcFileKind::PidTaskStat(pid, tid) => proc_pid_task_stat(*pid, *tid),
     }
 }
 
@@ -887,6 +1022,7 @@ fn proc_pid_stat(pid: u32) -> String {
     } else {
         inner.sid as u32
     };
+
     let tty_nr = 0;
     let tpgid = 0;
     let flags = 0;
@@ -938,6 +1074,62 @@ fn proc_pid_stat(pid: u32) -> String {
     alloc::format!(
         "{pid} ({comm}) {state_char} {ppid} {pgrp} {session} {tty_nr} {tpgid} {flags} {minflt} {cminflt} {majflt} {cmajflt} {utime} {stime} {cutime} {cstime} {priority} {nice} {num_threads} {itrealvalue} {starttime} {vsize} {rss_pages} {rsslim} {startcode} {endcode} {startstack} {kstkesp} {kstkeip} {signal} {blocked} {sigignore} {sigcatch} {wchan} {nswap} {cnswap} {exit_signal} {processor} {rt_priority} {policy} {delayacct_blkio_ticks} {guest_time} {cguest_time} {start_data} {end_data} {start_brk} {arg_start} {arg_end} {env_start} {env_end} {exit_code}\n"
     )
+}
+
+fn proc_pid_task_stat(pid: u32, tid: u32) -> String {
+    let Some(proc) = pid2process(pid as usize) else {
+        return String::new();
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        if crate::debug_config::DEBUG_PROCFS {
+            crate::println!("[procfs] task stat pid={} tid={} lock busy", pid, tid);
+        }
+        return String::new();
+    };
+    let Some(tid_index) = decode_proc_linux_tid(pid, tid) else {
+        return String::new();
+    };
+    let Some(task_state) = inner
+        .tasks
+        .get(tid_index)
+        .and_then(|t| t.as_ref())
+        .and_then(|t| {
+            t.try_borrow_mut().and_then(|ti| {
+                if ti.res.is_none() || ti.exit_code.is_some() {
+                    None
+                } else {
+                    Some(ti.task_status)
+                }
+            })
+        })
+    else {
+        return String::new();
+    };
+
+    let ppid = inner
+        .parent
+        .as_ref()
+        .and_then(|w| w.upgrade())
+        .map(|p| p.getpid())
+        .unwrap_or(0);
+    let comm = inner
+        .argv
+        .first()
+        .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
+        .unwrap_or("CongCore")
+        .replace(')', "_");
+    let state_char = if inner.is_zombie {
+        'Z'
+    } else if inner.stopped {
+        'T'
+    } else {
+        match task_state {
+            TaskStatus::Running => 'R',
+            TaskStatus::Ready => 'R',
+            TaskStatus::Blocked => 'S',
+        }
+    };
+    alloc::format!("{tid} ({comm}) {state_char} {ppid}\n")
 }
 
 fn proc_pid_maps(pid: u32) -> String {

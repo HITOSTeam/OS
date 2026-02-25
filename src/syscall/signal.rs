@@ -11,7 +11,7 @@ use crate::{
     arch,
     debug_config::{DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     mm::{read_user_value, try_read_user_value, try_write_user_value, write_user_value},
-    syscall::misc::decode_linux_tid,
+    syscall::misc::{decode_linux_tid, encode_linux_tid},
     task::{
         block_sleep::add_timer,
         manager::{pid2process, wakeup_task, PID2PCB},
@@ -19,12 +19,13 @@ use crate::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
         signal::{
-            has_unmasked_pending, kill, kill_current, pending_unmasked_bits, set_signal,
-            set_signal_mask, signal_bit, take_first_unmasked, RtSigAction, SignalAction,
-            SignalFlags, RT_SIG_MAX, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM, SIGTSTP_NUM,
-            SIGTTIN_NUM, SIGTTOU_NUM, SIG_DFL, SIG_IGN,
+            can_signal_process, has_unmasked_pending, kill, kill_current, pending_unmasked_bits,
+            set_signal, set_signal_mask, signal_bit, take_first_unmasked, RtSigAction,
+            SignalAction, SignalFlags, RT_SIG_MAX, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM,
+            SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SIG_DFL, SIG_IGN,
         },
         task_block::{SigSavedContext, TaskControlBlock, TaskStatus},
+        ProcessControlBlock,
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -86,6 +87,69 @@ fn wake_parent_waiters() {
     }
 }
 
+fn find_task_by_linux_tid(tid: usize) -> Option<(Arc<ProcessControlBlock>, Arc<TaskControlBlock>)> {
+    let tid = tid & 0x3fff_ffff;
+
+    if let Some(proc) = pid2process(tid) {
+        let main_task = {
+            let inner = proc.borrow_mut();
+            inner.tasks.first().and_then(|t| t.as_ref()).cloned()
+        };
+        if let Some(task) = main_task {
+            return Some((proc, task));
+        }
+    }
+
+    let procs: Vec<_> = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+    for proc in procs {
+        let pid = proc.getpid();
+        let tasks = {
+            let inner = proc.borrow_mut();
+            inner
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, t)| t.as_ref().cloned().map(|task| (idx, task)))
+                .collect::<Vec<_>>()
+        };
+        for (idx, task) in tasks {
+            if encode_linux_tid(pid, idx) == tid {
+                return Some((proc.clone(), task));
+            }
+        }
+    }
+    None
+}
+
+fn rt_sigpending_limit_reached(proc: &Arc<ProcessControlBlock>, signum: usize) -> bool {
+    if signum <= crate::task::signal::MAX_SIG {
+        return false;
+    }
+    let (limit, tasks) = {
+        let inner = proc.borrow_mut();
+        let tasks = inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<Vec<_>>();
+        (inner.rlimit_sigpending_cur, tasks)
+    };
+    if limit == u64::MAX {
+        return false;
+    }
+    let pending = tasks
+        .iter()
+        .map(|task| {
+            let inner = task.borrow_mut();
+            (inner.pending_signals >> crate::task::signal::MAX_SIG).count_ones() as u64
+        })
+        .sum::<u64>();
+    pending >= limit
+}
+
 // pub fn syscall_sigreturn() -> isize {
 //     sigreturn()
 // }
@@ -145,13 +209,18 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
     };
 
     let mut delivered = false;
+    let mut denied = false;
     for target in targets {
-        if kill(target, signum) == 0 {
-            delivered = true;
+        match kill(target, signum) {
+            0 => delivered = true,
+            EPERM => denied = true,
+            _ => {}
         }
     }
     if delivered {
         0
+    } else if denied {
+        EPERM
     } else {
         ESRCH
     }
@@ -161,25 +230,25 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
 ///
 /// Delivers a signal to a specific thread (Linux-style tid encoding).
 pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
-    if sig == 0 {
-        return if pid2process(tgid).is_some() {
-            0
-        } else {
-            ESRCH
-        };
-    }
     if sig < 0 || sig as usize > RT_SIG_MAX {
+        return EINVAL;
+    }
+    if (tgid as isize) <= 0 || (tid as isize) <= 0 {
         return EINVAL;
     }
     if DEBUG_PTHREAD {
         crate::println!("[tgkill] tgid={} tid={} sig={}", tgid, tid, sig);
     }
-    let Some(tid_index) = decode_linux_tid(tgid, tid) else {
-        return EINVAL;
-    };
+    let norm_tid = tid & 0x3fff_ffff;
     let Some(proc) = pid2process(tgid) else {
         return ESRCH;
     };
+    let Some(tid_index) = decode_linux_tid(tgid, norm_tid) else {
+        return ESRCH;
+    };
+    if !can_signal_process(&proc, sig) {
+        return EPERM;
+    }
     let task = {
         let inner = proc.borrow_mut();
         inner.tasks.get(tid_index).and_then(|t| t.as_ref()).cloned()
@@ -187,11 +256,17 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
     let Some(task) = task else {
         return ESRCH;
     };
+    if sig == 0 {
+        return 0;
+    }
+    if rt_sigpending_limit_reached(&proc, sig as usize) {
+        return EAGAIN;
+    }
     let sender = current_process();
     let sender_pid = sender.getpid() as i32;
     let sender_uid = {
         let inner = sender.borrow_mut();
-        inner.euid
+        inner.uid
     };
     {
         let mut inner = task.borrow_mut();
@@ -234,8 +309,48 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
 ///
 /// Delivers a signal to a specific thread in the current process.
 pub fn syscall_tkill(tid: usize, sig: i32) -> isize {
-    let tgid = current_process().getpid();
-    syscall_tgkill(tgid, tid, sig)
+    if sig < 0 || sig as usize > RT_SIG_MAX {
+        return EINVAL;
+    }
+    if (tid as isize) <= 0 {
+        return EINVAL;
+    }
+    let Some((proc, task)) = find_task_by_linux_tid(tid) else {
+        return ESRCH;
+    };
+    if !can_signal_process(&proc, sig) {
+        return EPERM;
+    }
+    if sig == 0 {
+        return 0;
+    }
+    if rt_sigpending_limit_reached(&proc, sig as usize) {
+        return EAGAIN;
+    }
+    let sender = current_process();
+    let sender_pid = sender.getpid() as i32;
+    let sender_uid = {
+        let inner = sender.borrow_mut();
+        inner.uid
+    };
+    {
+        let mut inner = task.borrow_mut();
+        if let Some(bit) = signal_bit(sig as usize) {
+            inner.pending_signals |= bit;
+            let signum = sig as usize;
+            if signum <= RT_SIG_MAX {
+                inner.pending_signal_pid[signum] = sender_pid;
+                inner.pending_signal_uid[signum] = sender_uid;
+                inner.pending_signal_code[signum] = -6; // SI_TKILL
+            }
+        }
+    }
+    let on_cpu = task.on_cpu.load(Ordering::Acquire);
+    wakeup_task(task);
+    if on_cpu != TaskControlBlock::OFF_CPU {
+        arch::send_ipi(on_cpu);
+    }
+    0
 }
 pub fn syscall_sigaction(
     signum: i32,
@@ -958,7 +1073,7 @@ pub fn maybe_deliver_signal() {
     const MAX_SIGNAL_DEPTH: usize = 8;
     static SIGALRM_LOG_LEFT: AtomicUsize = AtomicUsize::new(16);
     let sigalrm_bit = signal_bit(SIGALRM_NUM).unwrap_or(0);
-    let signum = {
+    let (signum, sender_pid, sender_uid, si_code) = {
         let mut inner = task.borrow_mut();
         if inner.sig_saved_ctx.len() >= MAX_SIGNAL_DEPTH {
             if DEBUG_UNIXBENCH
@@ -1001,12 +1116,18 @@ pub fn maybe_deliver_signal() {
             }
             return;
         };
+        let mut sender_pid = 0;
+        let mut sender_uid = 0;
+        let mut si_code = 0;
         if sig <= RT_SIG_MAX {
+            sender_pid = inner.pending_signal_pid[sig];
+            sender_uid = inner.pending_signal_uid[sig];
+            si_code = inner.pending_signal_code[sig];
             inner.pending_signal_pid[sig] = 0;
             inner.pending_signal_uid[sig] = 0;
             inner.pending_signal_code[sig] = 0;
         }
-        sig
+        (sig, sender_pid, sender_uid, si_code)
     };
     if DEBUG_UNIXBENCH && signum == 14 {
         let pid = current_process().getpid();
@@ -1234,9 +1355,9 @@ pub fn maybe_deliver_signal() {
 
         let mut siginfo = LinuxSigInfo::default();
         siginfo.si_signo = signum as i32;
-        siginfo.si_code = -6; // SI_TKILL
-        siginfo.field[0] = current_process().getpid() as i32;
-        siginfo.field[1] = 0; // uid
+        siginfo.si_code = si_code;
+        siginfo.field[0] = sender_pid;
+        siginfo.field[1] = sender_uid as i32;
 
         let sig_context = SigContext {
             regs: UserRegsStruct::from_trap(&saved_trap),

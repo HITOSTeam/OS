@@ -667,17 +667,24 @@ fn enqueue_waiter_once(
     true
 }
 
-fn reap_zombie_child(child: &Arc<ProcessControlBlock>) {
+fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     // Main-thread resources are already detached in exit path; this aggressively
     // drops lingering task Arcs so kernel stacks are reclaimed on reap.
-    let tasks = {
+    let (tasks, cpu_ns) = {
         let mut inner = child.borrow_mut();
-        core::mem::take(&mut inner.tasks)
+        let cpu_ns = inner
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref())
+            .map(|task| task.borrow_mut().cpu_time_ns)
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+        (core::mem::take(&mut inner.tasks), cpu_ns)
     };
     for task in tasks.into_iter().flatten() {
         remove_inactive_task(task.clone());
         drop(task);
     }
+    cpu_ns
 }
 
 fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
@@ -922,7 +929,13 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             // Keep exited processes visible (e.g., for `kill $!`) until they are reaped.
             // Reaping happens here (wait4), so remove it from the global PID table now.
             crate::task::manager::remove_from_pid2process(pid);
-            reap_zombie_child(&child);
+            let child_cpu_ns = reap_zombie_child(&child);
+            {
+                let mut parent_inner = cur_process.borrow_mut();
+                parent_inner.child_cpu_time_ns = parent_inner
+                    .child_cpu_time_ns
+                    .saturating_add(child_cpu_ns);
+            }
             drop(child);
             if wstatus_ptr != 0 {
                 // Linux wait status encoding:
@@ -1092,7 +1105,11 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             if (options & WNOWAIT) == 0 {
                 crate::task::manager::remove_from_pid2process(child_pid);
                 if let Some(child) = child.as_ref() {
-                    reap_zombie_child(child);
+                    let child_cpu_ns = reap_zombie_child(child);
+                    let mut parent_inner = cur_process.borrow_mut();
+                    parent_inner.child_cpu_time_ns = parent_inner
+                        .child_cpu_time_ns
+                        .saturating_add(child_cpu_ns);
                 }
             }
             let (si_status, si_code) = if let Some(sig) = signal {

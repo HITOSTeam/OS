@@ -1,4 +1,4 @@
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::task::manager::PID2PCB;
+use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
         File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent,
@@ -21,10 +21,13 @@ use crate::{
         try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_user_value,
         write_user_value,
     },
-    task::processor::{current_files_process, current_process},
+    task::processor::{
+        current_files_process, current_process, current_task, suspend_current_and_run_next,
+    },
     task::{
         ProcessControlBlock,
-        signal::{SIGXFSZ_NUM, queue_process_signal},
+        signal::{SIGXFSZ_NUM, has_unmasked_pending, queue_process_signal},
+        task_block::TaskControlBlock,
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -72,6 +75,7 @@ const EBADF: isize = -9;
 const EFAULT: isize = -14;
 const EFBIG: isize = -27;
 const EAGAIN: isize = -11;
+const EINTR: isize = -4;
 const E2BIG: isize = -7;
 const ELOOP: isize = -40;
 const EPERM: isize = -1;
@@ -145,6 +149,30 @@ struct Acct {
 
 struct AcctState {
     inode: alloc::sync::Arc<ext4_fs::Inode>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FcntlFlock {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FileLockKey {
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RecordLock {
+    owner_pid: usize,
+    lock_type: i16,
+    start: i64,
+    end: Option<i64>,
 }
 
 struct FifoDuplexFile {
@@ -246,6 +274,10 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref ROFS_MOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static ref ACCT_STATE: Mutex<Option<AcctState>> = Mutex::new(None);
+    static ref RECORD_LOCKS: Mutex<BTreeMap<FileLockKey, Vec<RecordLock>>> =
+        Mutex::new(BTreeMap::new());
+    static ref RECORD_LOCK_WAITERS: Mutex<BTreeMap<FileLockKey, VecDeque<Arc<TaskControlBlock>>>> =
+        Mutex::new(BTreeMap::new());
 }
 
 fn get_inode_times(ino: u64) -> InodeTimes {
@@ -1714,6 +1746,137 @@ fn inode_visible_size(inode: &ext4_fs::Inode) -> usize {
     size
 }
 
+fn file_lock_key(file: &Arc<dyn File + Send + Sync>) -> Option<FileLockKey> {
+    let os_inode = file.as_any().downcast_ref::<OSInode>()?;
+    let inode = os_inode.ext4_inode();
+    Some(FileLockKey {
+        dev: inode.device_id() as u64,
+        ino: inode.inode_num() as u64,
+    })
+}
+
+fn range_end_i128(end: Option<i64>) -> i128 {
+    end.map(|v| v as i128).unwrap_or(i128::MAX)
+}
+
+fn ranges_overlap(a_start: i64, a_end: Option<i64>, b_start: i64, b_end: Option<i64>) -> bool {
+    let a0 = a_start as i128;
+    let b0 = b_start as i128;
+    let a1 = range_end_i128(a_end);
+    let b1 = range_end_i128(b_end);
+    a0 <= b1 && b0 <= a1
+}
+
+fn lock_conflicts(
+    req_type: i16,
+    req_start: i64,
+    req_end: Option<i64>,
+    owner_pid: usize,
+    existing: &RecordLock,
+) -> bool {
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+
+    if existing.owner_pid == owner_pid || existing.lock_type == F_UNLCK {
+        return false;
+    }
+    if !ranges_overlap(req_start, req_end, existing.start, existing.end) {
+        return false;
+    }
+    match req_type {
+        F_RDLCK => existing.lock_type == F_WRLCK,
+        F_WRLCK => existing.lock_type == F_RDLCK || existing.lock_type == F_WRLCK,
+        _ => false,
+    }
+}
+
+fn lock_range_from_flock(
+    file: &Arc<dyn File + Send + Sync>,
+    flock: &FcntlFlock,
+) -> Result<(i64, Option<i64>), isize> {
+    const SEEK_SET: i16 = 0;
+    const SEEK_CUR: i16 = 1;
+    const SEEK_END: i16 = 2;
+
+    let base = match flock.l_whence {
+        SEEK_SET => 0i64,
+        SEEK_CUR => {
+            let os_inode = file.as_any().downcast_ref::<OSInode>().ok_or(EINVAL)?;
+            i64::try_from(os_inode.offset()).map_err(|_| EOVERFLOW)?
+        }
+        SEEK_END => {
+            let os_inode = file.as_any().downcast_ref::<OSInode>().ok_or(EINVAL)?;
+            let inode = os_inode.ext4_inode();
+            i64::try_from(inode_visible_size(&inode)).map_err(|_| EOVERFLOW)?
+        }
+        _ => return Err(EINVAL),
+    };
+
+    let mut start = base.checked_add(flock.l_start).ok_or(EOVERFLOW)?;
+    if start < 0 {
+        return Err(EINVAL);
+    }
+
+    if flock.l_len > 0 {
+        let end = start.checked_add(flock.l_len - 1).ok_or(EOVERFLOW)?;
+        return Ok((start, Some(end)));
+    }
+    if flock.l_len == 0 {
+        return Ok((start, None));
+    }
+
+    let neg_start = start.checked_add(flock.l_len).ok_or(EOVERFLOW)?;
+    let end = start.checked_sub(1).ok_or(EOVERFLOW)?;
+    if neg_start < 0 {
+        return Err(EINVAL);
+    }
+    start = neg_start;
+    Ok((start, Some(end)))
+}
+
+fn enqueue_record_lock_waiter(key: FileLockKey, task: &Arc<TaskControlBlock>) {
+    let mut waiters = RECORD_LOCK_WAITERS.lock();
+    let queue = waiters.entry(key).or_insert_with(VecDeque::new);
+    if queue.iter().any(|waiter| Arc::ptr_eq(waiter, task)) {
+        return;
+    }
+    queue.push_back(Arc::clone(task));
+}
+
+fn remove_record_lock_waiter(key: FileLockKey, task: &Arc<TaskControlBlock>) {
+    let mut waiters = RECORD_LOCK_WAITERS.lock();
+    let Some(queue) = waiters.get_mut(&key) else {
+        return;
+    };
+    queue.retain(|waiter| !Arc::ptr_eq(waiter, task));
+    if queue.is_empty() {
+        waiters.remove(&key);
+    }
+}
+
+fn take_record_lock_waiters(key: FileLockKey) -> Vec<Arc<TaskControlBlock>> {
+    RECORD_LOCK_WAITERS
+        .lock()
+        .remove(&key)
+        .map(|queue| queue.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn wake_record_lock_waiters(key: FileLockKey) {
+    for waiter in take_record_lock_waiters(key) {
+        wakeup_task(waiter);
+    }
+}
+
+fn has_pending_unmasked_signal() -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let inner = task.borrow_mut();
+    has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
+}
+
 pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     // Minimal `fcntl(2)` support for busybox/ash/glibc startup.
     const F_DUPFD: usize = 0;
@@ -1721,9 +1884,15 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_SETFD: usize = 2;
     const F_GETFL: usize = 3;
     const F_SETFL: usize = 4;
+    const F_GETLK: usize = 5;
+    const F_SETLK: usize = 6;
+    const F_SETLKW: usize = 7;
     const F_DUPFD_CLOEXEC: usize = 1030;
     const F_SETPIPE_SZ: usize = 1031;
     const F_GETPIPE_SZ: usize = 1032;
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
 
     let ret = match cmd {
         F_GETFD => {
@@ -1798,6 +1967,163 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 }
             }
             flags as isize
+        }
+        F_GETLK | F_SETLK | F_SETLKW => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+
+            let Some(key) = file_lock_key(&file) else {
+                return EINVAL;
+            };
+            let token = get_current_token();
+            let flock = match try_read_user_value::<FcntlFlock>(token, arg as *const FcntlFlock) {
+                Some(v) => v,
+                None => return EFAULT,
+            };
+
+            let (start, end) = match lock_range_from_flock(&file, &flock) {
+                Ok(range) => range,
+                Err(e) => return e,
+            };
+
+            match flock.l_type {
+                F_RDLCK => {
+                    if !file.readable() {
+                        return EBADF;
+                    }
+                }
+                F_WRLCK => {
+                    if !file.writable() {
+                        return EBADF;
+                    }
+                }
+                F_UNLCK => {}
+                _ => return EINVAL,
+            }
+
+            if cmd == F_GETLK {
+                let owner_pid = current_process().getpid();
+                let mut out = flock;
+                let conflict = {
+                    let table = RECORD_LOCKS.lock();
+                    table.get(&key).and_then(|locks| {
+                        locks
+                            .iter()
+                            .find(|lock| lock_conflicts(flock.l_type, start, end, owner_pid, lock))
+                            .copied()
+                    })
+                };
+                if let Some(lock) = conflict {
+                    out.l_type = lock.lock_type;
+                    out.l_whence = 0;
+                    out.l_start = lock.start;
+                    out.l_len = match lock.end {
+                        Some(lock_end) => lock_end.saturating_sub(lock.start).saturating_add(1),
+                        None => 0,
+                    };
+                    out.l_pid = lock.owner_pid as i32;
+                } else {
+                    out.l_type = F_UNLCK;
+                    out.l_pid = 0;
+                }
+                if try_write_user_value(token, arg as *mut FcntlFlock, &out).is_err() {
+                    return EFAULT;
+                }
+                0
+            } else {
+                let blocking = cmd == F_SETLKW;
+                let owner_pid = current_process().getpid();
+                let waiter_task = if blocking { current_task() } else { None };
+                let ret = loop {
+                    let mut remove_key = false;
+                    let mut conflict_exists = false;
+                    let mut should_wake_waiters = false;
+                    {
+                        let mut table = RECORD_LOCKS.lock();
+                        let locks = table.entry(key).or_insert_with(Vec::new);
+                        if flock.l_type == F_UNLCK {
+                            let before = locks.len();
+                            locks.retain(|lock| {
+                                !(lock.owner_pid == owner_pid
+                                    && ranges_overlap(start, end, lock.start, lock.end))
+                            });
+                            should_wake_waiters = locks.len() != before;
+                            remove_key = locks.is_empty();
+                        } else {
+                            conflict_exists = locks.iter().any(|lock| {
+                                lock_conflicts(flock.l_type, start, end, owner_pid, lock)
+                            });
+                            if !conflict_exists {
+                                let before = locks.len();
+                                locks.retain(|lock| {
+                                    !(lock.owner_pid == owner_pid
+                                        && ranges_overlap(start, end, lock.start, lock.end))
+                                });
+                                should_wake_waiters = locks.len() != before;
+                                locks.push(RecordLock {
+                                    owner_pid,
+                                    lock_type: flock.l_type,
+                                    start,
+                                    end,
+                                });
+                            }
+                        }
+                        if remove_key {
+                            table.remove(&key);
+                        }
+                    }
+                    if should_wake_waiters {
+                        wake_record_lock_waiters(key);
+                    }
+
+                    if flock.l_type == F_UNLCK {
+                        break 0;
+                    }
+                    if !conflict_exists {
+                        break 0;
+                    }
+                    if !blocking {
+                        break EACCES;
+                    }
+                    let Some(task) = waiter_task.as_ref() else {
+                        break EACCES;
+                    };
+                    enqueue_record_lock_waiter(key, task);
+                    let still_conflict = {
+                        let table = RECORD_LOCKS.lock();
+                        table
+                            .get(&key)
+                            .map(|locks| {
+                                locks.iter().any(|lock| {
+                                    lock_conflicts(flock.l_type, start, end, owner_pid, lock)
+                                })
+                            })
+                            .unwrap_or(false)
+                    };
+                    if !still_conflict {
+                        remove_record_lock_waiter(key, task);
+                        continue;
+                    }
+                    if has_pending_unmasked_signal() {
+                        remove_record_lock_waiter(key, task);
+                        break EINTR;
+                    }
+                    suspend_current_and_run_next();
+                    if has_pending_unmasked_signal() {
+                        remove_record_lock_waiter(key, task);
+                        break EINTR;
+                    }
+                };
+                if let Some(task) = waiter_task.as_ref() {
+                    remove_record_lock_waiter(key, task);
+                }
+                ret
+            }
         }
         F_SETPIPE_SZ => {
             let process = current_files_process();
@@ -4583,6 +4909,9 @@ fn resolve_utime(ts: TimeSpec, now: (i64, i64)) -> Result<Option<(i64, i64)>, is
 pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: usize) -> isize {
     // `futimens` passes a null pathname and uses dirfd as the target fd.
     if pathname == 0 {
+        if dirfd == AT_FDCWD {
+            return EFAULT;
+        }
         if dirfd < 0 {
             return EBADF;
         }
@@ -4666,25 +4995,23 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         return ENOENT;
     }
 
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let (euid, _egid) = current_effective_uid_gid();
     let _ext4_guard = ext4_lock();
-    let inode = match at {
-        AtPath::Ext4Abs(abs) => find_path_in_roots(&abs),
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                Some(base)
-            } else {
-                base.find_path(&rel)
-            }
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
-    if inode.is_none() {
-        return ENOENT;
-    }
     if rofs_for_path(dirfd, &path) {
         return EROFS;
     }
-    let inode = inode.unwrap();
+    if _times == 0 {
+        if euid != 0 && euid != inode.uid() && !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+            return EACCES;
+        }
+    } else if euid != 0 && euid != inode.uid() {
+        return EPERM;
+    }
     let ino = inode.inode_num() as u64;
     let now = current_timespec();
     let (atime, mtime) = if _times == 0 {

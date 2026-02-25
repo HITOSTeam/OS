@@ -25,6 +25,7 @@ use crate::{
     task::processor::current_process,
     task::{
         manager::{pid2process, wakeup_task},
+        process_block::ProcessControlBlock,
         processor::{current_task, suspend_current_and_run_next},
         task_block::{TaskControlBlock, TaskControlBlockInner},
     },
@@ -39,14 +40,57 @@ pub fn signal_bit(signum: usize) -> Option<u64> {
     Some(1u64 << (signum - 1))
 }
 
-fn current_sender_ids() -> (i32, u32) {
+fn current_sender_ids() -> (i32, u32, u32, usize) {
     let proc = current_process();
     let pid = proc.getpid() as i32;
-    let uid = {
+    let (uid, euid, sid) = {
         let inner = proc.borrow_mut();
-        inner.euid
+        (inner.uid, inner.euid, inner.sid)
     };
-    (pid, uid)
+    (pid, uid, euid, sid)
+}
+
+fn can_send_signal(
+    sender_uid: u32,
+    sender_euid: u32,
+    sender_sid: usize,
+    target_uid: u32,
+    target_euid: u32,
+    target_suid: u32,
+    target_sid: usize,
+    signum: i32,
+) -> bool {
+    if sender_euid == 0 {
+        return true;
+    }
+    if sender_uid == target_uid
+        || sender_uid == target_euid
+        || sender_uid == target_suid
+        || sender_euid == target_uid
+        || sender_euid == target_euid
+        || sender_euid == target_suid
+    {
+        return true;
+    }
+    signum as usize == SIGCONT_NUM && sender_sid != 0 && sender_sid == target_sid
+}
+
+pub fn can_signal_process(process: &Arc<ProcessControlBlock>, signum: i32) -> bool {
+    let (_, sender_uid, sender_euid, sender_sid) = current_sender_ids();
+    let (target_uid, target_euid, target_suid, target_sid) = {
+        let inner = process.borrow_mut();
+        (inner.uid, inner.euid, inner.suid, inner.sid)
+    };
+    can_send_signal(
+        sender_uid,
+        sender_euid,
+        sender_sid,
+        target_uid,
+        target_euid,
+        target_suid,
+        target_sid,
+        signum,
+    )
 }
 
 fn mark_pending_signal(
@@ -196,6 +240,8 @@ impl SignalFlags {
             Some((-14, "Alarm clock, SIGALRM=14"))
         } else if self.contains(Self::SIGTERM) {
             Some((-15, "Terminated, SIGTERM=15"))
+        } else if self.contains(Self::SIGSTKFLT) {
+            Some((-16, "Stack fault, SIGSTKFLT=16"))
         } else if self.contains(Self::SIGXCPU) {
             Some((-24, "CPU time limit exceeded, SIGXCPU=24"))
         } else if self.contains(Self::SIGXFSZ) {
@@ -206,6 +252,8 @@ impl SignalFlags {
             Some((-27, "Profiling timer expired, SIGPROF=27"))
         } else if self.contains(Self::SIGIO) {
             Some((-29, "I/O possible, SIGIO/SIGPOLL=29"))
+        } else if self.contains(Self::SIGPWR) {
+            Some((-30, "Power failure, SIGPWR=30"))
         } else if self.contains(Self::SIGSYS) {
             Some((-31, "Bad system call, SIGSYS=31"))
         } else {
@@ -397,11 +445,14 @@ pub fn kill(pid: usize, signum: i32) -> isize {
     let Some(process) = pid2process(pid) else {
         return -3; // ESRCH
     };
-    if signum == 0 {
-        return 0;
-    }
     if signum < 0 || signum as usize > RT_SIG_MAX {
         return -22; // EINVAL
+    }
+    if !can_signal_process(&process, signum) {
+        return -1; // EPERM
+    }
+    if signum == 0 {
+        return 0;
     }
     let sig_bit = signal_bit(signum as usize).unwrap_or(0);
     let legacy_flag = if signum as usize <= MAX_SIG {
@@ -409,8 +460,8 @@ pub fn kill(pid: usize, signum: i32) -> isize {
     } else {
         None
     };
-    let (sender_pid, sender_uid) = current_sender_ids();
-    let (tasks, child_pids) = {
+    let (sender_pid, sender_uid, _, _) = current_sender_ids();
+    let tasks = {
         let mut process_ref = process.borrow_mut();
         if let Some(flag) = legacy_flag {
             process_ref.signals.insert(flag);
@@ -420,16 +471,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             .iter()
             .filter_map(|t| t.as_ref().cloned())
             .collect::<alloc::vec::Vec<_>>();
-        let child_pids = if signum == 2 || signum == 9 {
-            process_ref
-                .children
-                .iter()
-                .map(|c| c.getpid())
-                .collect::<alloc::vec::Vec<_>>()
-        } else {
-            alloc::vec::Vec::new()
-        };
-        (tasks, child_pids)
+        tasks
     };
     crate::log_if!(
         DEBUG_SIGNAL,
@@ -463,9 +505,6 @@ pub fn kill(pid: usize, signum: i32) -> isize {
     for t in tasks {
         wakeup_task(t);
     }
-    for child_pid in child_pids {
-        let _ = kill(child_pid, signum);
-    }
     0
 }
 
@@ -482,7 +521,7 @@ pub fn kill_current(signum: i32) -> isize {
     } else {
         None
     };
-    let (sender_pid, sender_uid) = current_sender_ids();
+    let (sender_pid, sender_uid, _, _) = current_sender_ids();
     let tasks = {
         let mut process_ref = process.borrow_mut();
         if let Some(flag) = legacy_flag {

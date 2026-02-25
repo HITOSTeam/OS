@@ -1,14 +1,18 @@
 use alloc::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
+    vec::Vec,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::{
+    config::clock_freq,
     debug_config::DEBUG_FUTEX,
-    mm::{read_user_value, PageTable, VirtAddr},
+    mm::{PageTable, VirtAddr, read_user_value},
+    syscall::time_sys::realtime_now_timespec,
     task::block_sleep::add_timer,
     task::{
         manager::wakeup_task,
@@ -16,7 +20,7 @@ use crate::{
         signal::has_unmasked_pending,
         task_block::TaskControlBlock,
     },
-    time::get_time_ms,
+    time::get_time,
     trap::get_current_token,
 };
 
@@ -35,11 +39,21 @@ const FUTEX_WAKE_BITSET: usize = 10;
 const FUTEX_PRIVATE_FLAG: usize = 128;
 const FUTEX_CLOCK_REALTIME: usize = 256;
 const FUTEX_CMD_MASK: usize = 0x7f;
+const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+const NSEC_PER_MSEC: u64 = 1_000_000;
 
 type FutexKey = (usize, usize); // (key_pid, uaddr)
 
+#[derive(Clone)]
+struct FutexWaiter {
+    task: Arc<TaskControlBlock>,
+    bitset: u32,
+    in_queue: Arc<AtomicBool>,
+}
+
 lazy_static! {
-    static ref FUTEX_QUEUES: Mutex<BTreeMap<FutexKey, VecDeque<Arc<TaskControlBlock>>>> =
+    static ref FUTEX_QUEUES: Mutex<BTreeMap<FutexKey, VecDeque<FutexWaiter>>> =
         Mutex::new(BTreeMap::new());
 }
 
@@ -50,14 +64,43 @@ struct TimeSpec {
     nsec: i64,
 }
 
-fn timespec_to_ms(ts: TimeSpec) -> Option<usize> {
-    if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1_000_000_000 {
+fn timespec_to_ns(ts: TimeSpec) -> Option<u64> {
+    if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= NSEC_PER_SEC as i64 {
         return None;
     }
-    let ms = (ts.sec as u64)
-        .saturating_mul(1_000)
-        .saturating_add((ts.nsec as u64) / 1_000_000);
-    Some(ms.min(usize::MAX as u64) as usize)
+    Some(
+        (ts.sec as u64)
+            .saturating_mul(NSEC_PER_SEC)
+            .saturating_add(ts.nsec as u64),
+    )
+}
+
+fn monotonic_now_ns() -> u64 {
+    let ticks = get_time() as u64;
+    let freq = clock_freq() as u128;
+    ((ticks as u128).saturating_mul(NSEC_PER_SEC as u128) / freq) as u64
+}
+
+fn realtime_now_ns() -> u64 {
+    let (sec, nsec) = realtime_now_timespec();
+    if sec < 0 || nsec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(NSEC_PER_SEC)
+        .saturating_add(nsec as u64)
+}
+
+fn ns_to_ms_ceil(ns: u64) -> usize {
+    ((ns.saturating_add(NSEC_PER_MSEC - 1)) / NSEC_PER_MSEC) as usize
+}
+
+fn futex_wait_now_ns(cmd: usize, clock_realtime: bool) -> u64 {
+    if cmd == FUTEX_WAIT_BITSET && clock_realtime {
+        realtime_now_ns()
+    } else {
+        monotonic_now_ns()
+    }
 }
 
 fn pending_unmasked_signal() -> bool {
@@ -87,53 +130,86 @@ fn futex_key(pid: usize, token: usize, uaddr: usize, private: bool) -> FutexKey 
     }
 }
 
-fn remove_waiter(key: FutexKey, task: &Arc<TaskControlBlock>) {
+fn remove_waiter(in_queue: &Arc<AtomicBool>) -> bool {
     let mut map = FUTEX_QUEUES.lock();
-    let Some(queue) = map.get_mut(&key) else {
-        return;
-    };
-    queue.retain(|t| !Arc::ptr_eq(t, task));
-    if queue.is_empty() {
-        map.remove(&key);
+    let mut removed = false;
+    map.retain(|_, queue| {
+        queue.retain(|w| {
+            let keep = !Arc::ptr_eq(&w.in_queue, in_queue);
+            if !keep {
+                removed = true;
+            }
+            keep
+        });
+        !queue.is_empty()
+    });
+    if removed {
+        in_queue.store(false, Ordering::Release);
     }
+    removed
 }
 
 pub fn remove_futex_waiters(task: &Arc<TaskControlBlock>) {
     let mut map = FUTEX_QUEUES.lock();
     map.retain(|_, queue| {
-        queue.retain(|t| !Arc::ptr_eq(t, task));
+        queue.retain(|w| {
+            let keep = !Arc::ptr_eq(&w.task, task);
+            if !keep {
+                w.in_queue.store(false, Ordering::Release);
+            }
+            keep
+        });
         !queue.is_empty()
     });
 }
 
-pub(crate) fn futex_wake(key: FutexKey, uaddr: usize, nr_wake: usize) -> isize {
+fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask: u32) -> isize {
     if uaddr == 0 {
+        return EINVAL;
+    }
+    if bitset_mask == 0 {
         return EINVAL;
     }
     if DEBUG_FUTEX {
         log::debug!(
-            "[futex_wake] key_pid={} uaddr={:#x} nr={}",
+            "[futex_wake] key_pid={} uaddr={:#x} nr={} bitset={:#x}",
             key.0,
             uaddr,
-            nr_wake
+            nr_wake,
+            bitset_mask
         );
     }
-    let mut map = FUTEX_QUEUES.lock();
-    let Some(queue) = map.get_mut(&key) else {
-        return 0;
-    };
-    let mut woke = 0usize;
-    while woke < nr_wake {
-        let Some(task) = queue.pop_front() else {
-            break;
+    let mut wake_list = Vec::new();
+    let woke = {
+        let mut map = FUTEX_QUEUES.lock();
+        let Some(queue) = map.get_mut(&key) else {
+            return 0;
         };
+        let mut woke = 0usize;
+        let mut remain = VecDeque::new();
+        while let Some(waiter) = queue.pop_front() {
+            if woke < nr_wake && (waiter.bitset & bitset_mask) != 0 {
+                waiter.in_queue.store(false, Ordering::Release);
+                wake_list.push(waiter.task);
+                woke += 1;
+            } else {
+                remain.push_back(waiter);
+            }
+        }
+        *queue = remain;
+        if queue.is_empty() {
+            map.remove(&key);
+        }
+        woke
+    };
+    for task in wake_list {
         wakeup_task(task);
-        woke += 1;
-    }
-    if queue.is_empty() {
-        map.remove(&key);
     }
     woke as isize
+}
+
+pub(crate) fn futex_wake(key: FutexKey, uaddr: usize, nr_wake: usize) -> isize {
+    futex_wake_with_mask(key, uaddr, nr_wake, FUTEX_BITSET_MATCH_ANY)
 }
 
 /// Wake futex waiters when caller doesn't know whether the waiter used
@@ -179,8 +255,15 @@ pub fn syscall_futex(
             let task = current_task().unwrap();
             let pid = current_process().getpid();
             let token = get_current_token();
-            let key = futex_key(pid, token, uaddr, _private);
-            let mut map = FUTEX_QUEUES.lock();
+            let bitset = if cmd == FUTEX_WAIT_BITSET {
+                let bitset = _val3 as u32;
+                if bitset == 0 {
+                    return EINVAL;
+                }
+                bitset
+            } else {
+                FUTEX_BITSET_MATCH_ANY
+            };
             let cur = read_user_value(token, uaddr as *const i32);
             if cur != val as i32 {
                 if DEBUG_FUTEX {
@@ -205,6 +288,11 @@ pub fn syscall_futex(
                     EAGAIN
                 };
             }
+            // Read first, then derive key. This forces lazy mappings to be
+            // instantiated before shared-key PA translation.
+            let key = futex_key(pid, token, uaddr, _private);
+            let in_queue = Arc::new(AtomicBool::new(true));
+            let mut map = FUTEX_QUEUES.lock();
             if crate::debug_config::DEBUG_PTHREAD {
                 let (tid, pending_sig, mask) = {
                     let inner = task.borrow_mut();
@@ -242,80 +330,122 @@ pub fn syscall_futex(
                     val
                 );
             }
-            let deadline_ms = if _timeout == 0 {
+            let deadline_ns = if _timeout == 0 {
                 None
             } else {
                 let ts = read_user_value(token, _timeout as *const TimeSpec);
-                let timeout_ms = match timespec_to_ms(ts) {
-                    Some(ms) => ms,
+                let timeout_ns = match timespec_to_ns(ts) {
+                    Some(ns) => ns,
                     None => return EINVAL,
                 };
-                let now_ms = get_time_ms();
-                if clock_realtime {
-                    if timeout_ms <= now_ms {
-                        return ETIMEDOUT;
-                    }
-                    Some(timeout_ms)
+                let now_ns = futex_wait_now_ns(cmd, clock_realtime);
+                let deadline_ns = if cmd == FUTEX_WAIT_BITSET {
+                    timeout_ns
                 } else {
-                    if timeout_ms == 0 {
-                        return ETIMEDOUT;
-                    }
-                    Some(now_ms.saturating_add(timeout_ms))
+                    now_ns.saturating_add(timeout_ns)
+                };
+                if deadline_ns <= now_ns {
+                    return ETIMEDOUT;
                 }
+                Some(deadline_ns)
             };
             map.entry(key)
                 .or_insert_with(VecDeque::new)
-                .push_back(Arc::clone(&task));
+                .push_back(FutexWaiter {
+                    task: Arc::clone(&task),
+                    bitset,
+                    in_queue: Arc::clone(&in_queue),
+                });
             drop(map);
-            if let Some(deadline_ms) = deadline_ms {
-                let now_ms = get_time_ms();
-                let wait_ms = deadline_ms.saturating_sub(now_ms);
-                if wait_ms == 0 {
-                    remove_waiter(key, &task);
+            if let Some(deadline_ns) = deadline_ns {
+                let now_ns = futex_wait_now_ns(cmd, clock_realtime);
+                if now_ns >= deadline_ns {
+                    let _ = remove_waiter(&in_queue);
                     return ETIMEDOUT;
                 }
+                let wait_ms = ns_to_ms_ceil(deadline_ns.saturating_sub(now_ns)).max(1);
                 add_timer(Arc::clone(&task), wait_ms);
             }
-            block_current_and_run_next();
-            if crate::debug_config::DEBUG_PTHREAD {
-                let (tid, pending_sig, mask) = {
-                    let inner = task.borrow_mut();
-                    (
-                        inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
-                        inner.pending_signals,
-                        inner.signal_mask,
-                    )
-                };
-                log::debug!(
-                    "[futex_wait] pid={} tid={} woke pending_sig={:#x} mask={:#x}",
-                    pid,
-                    tid,
-                    pending_sig,
-                    mask
-                );
-            }
-            if pending_unmasked_signal() {
-                remove_waiter(key, &task);
-                return EINTR;
-            }
-            if let Some(deadline_ms) = deadline_ms {
-                let now_ms = get_time_ms();
-                if now_ms >= deadline_ms {
-                    let task = current_task().unwrap();
-                    remove_waiter(key, &task);
-                    return ETIMEDOUT;
+            loop {
+                block_current_and_run_next();
+                if crate::debug_config::DEBUG_PTHREAD {
+                    let (tid, pending_sig, mask) = {
+                        let inner = task.borrow_mut();
+                        (
+                            inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
+                            inner.pending_signals,
+                            inner.signal_mask,
+                        )
+                    };
+                    log::debug!(
+                        "[futex_wait] pid={} tid={} woke pending_sig={:#x} mask={:#x}",
+                        pid,
+                        tid,
+                        pending_sig,
+                        mask
+                    );
                 }
+                // Fast waiter-local check: dequeue side clears this bit before waking us.
+                if !in_queue.load(Ordering::Acquire) {
+                    return 0;
+                }
+                if pending_unmasked_signal() {
+                    if remove_waiter(&in_queue) {
+                        return EINTR;
+                    }
+                    if !in_queue.load(Ordering::Acquire) {
+                        return 0;
+                    }
+                    return EINTR;
+                }
+                if let Some(deadline_ns) = deadline_ns {
+                    let now_ns = futex_wait_now_ns(cmd, clock_realtime);
+                    if now_ns >= deadline_ns {
+                        if remove_waiter(&in_queue) {
+                            return ETIMEDOUT;
+                        }
+                        if !in_queue.load(Ordering::Acquire) {
+                            return 0;
+                        }
+                        return ETIMEDOUT;
+                    }
+                    // Our timer wheel is millisecond-granularity and may wake
+                    // slightly early; re-arm until the absolute deadline.
+                    let wait_ms = ns_to_ms_ceil(deadline_ns.saturating_sub(now_ns)).max(1);
+                    add_timer(Arc::clone(&task), wait_ms);
+                }
+                // Blocked signals can still wake tasks in our scheduler, so if
+                // the waiter remains queued we continue sleeping.
             }
-            0
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let nr_wake = val as isize;
+            if nr_wake < 0 {
+                return EINVAL;
+            }
+            let bitset_mask = if cmd == FUTEX_WAKE_BITSET {
+                let bitset = _val3 as u32;
+                if bitset == 0 {
+                    return EINVAL;
+                }
+                bitset
+            } else {
+                FUTEX_BITSET_MATCH_ANY
+            };
             let pid = current_process().getpid();
             let token = get_current_token();
+            // Validate/fault-in mapping before PA-based shared-key lookup.
+            let _ = read_user_value(token, uaddr as *const i32);
             let key = futex_key(pid, token, uaddr, _private);
-            futex_wake(key, uaddr, val)
+            futex_wake_with_mask(key, uaddr, nr_wake as usize, bitset_mask)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if uaddr == 0 || _uaddr2 == 0 {
+                return EINVAL;
+            }
+            let nr_wake = val as isize;
+            let nr_requeue = _timeout as isize;
+            if nr_wake < 0 || nr_requeue < 0 {
                 return EINVAL;
             }
             let pid = current_process().getpid();
@@ -324,38 +454,46 @@ pub fn syscall_futex(
             let key2 = futex_key(pid, token, _uaddr2, _private);
             if cmd == FUTEX_CMP_REQUEUE {
                 let cur = read_user_value(token, uaddr as *const i32);
-                if cur != val as i32 {
+                if cur != _val3 as i32 {
                     return EAGAIN;
                 }
             }
-            let val2 = _timeout;
-            let mut map = FUTEX_QUEUES.lock();
-            let Some(mut queue1) = map.remove(&key1) else {
-                return 0;
-            };
-            let mut woke = 0usize;
-            while woke < val {
-                let Some(task) = queue1.pop_front() else {
-                    break;
+            let val2 = nr_requeue as usize;
+            let mut wake_list = Vec::new();
+            let (woke, moved) = {
+                let mut map = FUTEX_QUEUES.lock();
+                let Some(mut queue1) = map.remove(&key1) else {
+                    return 0;
                 };
-                wakeup_task(task);
-                woke += 1;
-            }
-            if val2 > 0 && !queue1.is_empty() && key2 != key1 {
-                let target = map.entry(key2).or_insert_with(VecDeque::new);
+                let mut woke = 0usize;
                 let mut moved = 0usize;
-                while moved < val2 {
-                    let Some(task) = queue1.pop_front() else {
+                while woke < nr_wake as usize {
+                    let Some(waiter) = queue1.pop_front() else {
                         break;
                     };
-                    target.push_back(task);
-                    moved += 1;
+                    waiter.in_queue.store(false, Ordering::Release);
+                    wake_list.push(waiter.task);
+                    woke += 1;
                 }
+                if val2 > 0 && !queue1.is_empty() && key2 != key1 {
+                    let target = map.entry(key2).or_insert_with(VecDeque::new);
+                    while moved < val2 {
+                        let Some(waiter) = queue1.pop_front() else {
+                            break;
+                        };
+                        target.push_back(waiter);
+                        moved += 1;
+                    }
+                }
+                if !queue1.is_empty() {
+                    map.insert(key1, queue1);
+                }
+                (woke, moved)
+            };
+            for task in wake_list {
+                wakeup_task(task);
             }
-            if !queue1.is_empty() {
-                map.insert(key1, queue1);
-            }
-            woke as isize
+            woke.saturating_add(moved) as isize
         }
         _ => ENOSYS,
     }

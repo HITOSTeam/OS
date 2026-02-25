@@ -646,6 +646,8 @@ pub struct ProcessControlBlockInner {
     pub argv: Vec<String>,
     /// Process creation time since boot (ms).
     pub start_time_ms: usize,
+    /// Accumulated CPU time of reaped children (ns), used by `times(2)`.
+    pub child_cpu_time_ns: u64,
     /// Real/effective/saved user IDs and filesystem UID.
     pub uid: u32,
     pub euid: u32,
@@ -1076,6 +1078,7 @@ impl ProcessControlBlock {
                 exit_code: 0,
                 argv: args.clone(),
                 start_time_ms: crate::time::get_time_ms(),
+                child_cpu_time_ns: 0,
                 uid: 0,
                 euid: 0,
                 suid: 0,
@@ -1497,6 +1500,7 @@ impl ProcessControlBlock {
                 exit_code: 0,
                 argv,
                 start_time_ms: crate::time::get_time_ms(),
+                child_cpu_time_ns: 0,
                 uid: parent.uid,
                 euid: parent.euid,
                 suid: parent.suid,

@@ -155,6 +155,8 @@ const SYSCALL_YIELD: usize = 124;
 const SYSCALL_SCHED_GET_PRIORITY_MAX: usize = 125;
 const SYSCALL_SCHED_GET_PRIORITY_MIN: usize = 126;
 const SYSCALL_SCHED_RR_GET_INTERVAL: usize = 127;
+const SYSCALL_CLOCK_ADJTIME: usize = 266;
+const SYSCALL_CLOCK_ADJTIME64: usize = 405;
 const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
 const SYSCALL_TIMES: usize = 153;
@@ -183,6 +185,8 @@ const SYSCALL_SETFSUID: usize = 151;
 const SYSCALL_SETFSGID: usize = 152;
 const SYSCALL_REBOOT: usize = 142;
 const SYSCALL_GETTIMEOFDAY: usize = 169;
+const SYSCALL_SETTIMEOFDAY: usize = 170;
+const SYSCALL_ADJTIMEX: usize = 171;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_GETPPID: usize = 173;
@@ -540,9 +544,13 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             time_sys::syscall_timer_settime(args[0] as isize, args[1], args[2], args[3])
         }
         SYSCALL_TIMER_DELETE => time_sys::syscall_timer_delete(args[0] as isize),
+        SYSCALL_ADJTIMEX => time_sys::syscall_adjtimex(args[0]),
         SYSCALL_CLOCK_SETTIME => time_sys::syscall_clock_settime(args[0], args[1]),
         SYSCALL_CLOCK_GETTIME => time_sys::syscall_clock_gettime(args[0], args[1]),
         SYSCALL_CLOCK_GETRES => time_sys::syscall_clock_getres(args[0], args[1]),
+        SYSCALL_CLOCK_ADJTIME | SYSCALL_CLOCK_ADJTIME64 => {
+            time_sys::syscall_clock_adjtime(args[0], args[1])
+        }
         SYSCALL_CLOCK_NANOSLEEP => {
             time_sys::syscall_clock_nanosleep(args[0], args[1], args[2], args[3])
         }
@@ -585,6 +593,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETFSUID => misc::syscall_setfsuid(args[0]),
         SYSCALL_SETFSGID => misc::syscall_setfsgid(args[0]),
         SYSCALL_GETTIMEOFDAY => time_sys::syscall_gettimeofday(args[0], args[1]),
+        SYSCALL_SETTIMEOFDAY => time_sys::syscall_settimeofday(args[0], args[1]),
         SYSCALL_WAIT4 => process::syscall_wait4(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_WAITID => process::syscall_waitid(args[0], args[1], args[2], args[3]),
         SYSCALL_EXECVE => process::syscall_execve(args[0], args[1], args[2]),

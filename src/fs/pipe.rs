@@ -11,9 +11,9 @@ use crate::{
     fs::File,
     mm::UserBuffer,
     task::{
-        manager::{PID2PCB, wakeup_task},
+        manager::{wakeup_task, PID2PCB},
         processor::{block_current_and_run_next, current_task},
-        signal::{SIGPIPE_NUM, has_unmasked_pending, signal_bit},
+        signal::{has_unmasked_pending, signal_bit, SIGPIPE_NUM},
     },
 };
 
@@ -223,9 +223,13 @@ impl PipeRingBuffer {
         }
 
         let old_capacity = self.capacity;
-        let mut data = Vec::with_capacity(used);
-        for i in 0..used {
-            data.push(self.arr[(self.head + i) % old_capacity]);
+        let mut data = vec![0u8; used];
+        if used > 0 {
+            let first = core::cmp::min(used, old_capacity - self.head);
+            data[..first].copy_from_slice(&self.arr[self.head..self.head + first]);
+            if used > first {
+                data[first..].copy_from_slice(&self.arr[..used - first]);
+            }
         }
 
         self.capacity = new_capacity;

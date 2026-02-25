@@ -22,6 +22,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use spin::Mutex;
 
 const CYCLICTEST_LOG_LIMIT: usize = 32;
 static CLOCK_NS_LOGS: AtomicUsize = AtomicUsize::new(0);
@@ -44,10 +45,66 @@ const CPUCLOCK_PERTHREAD_MASK: i32 = 0x4;
 
 const EINVAL: isize = -22;
 const EFAULT: isize = -14;
+const EPERM: isize = -1;
 const EOPNOTSUPP: isize = -95;
 const EINTR: isize = -4;
 const TIMER_ABSTIME: usize = 1;
 const SIGEV_SIGNAL: i32 = 0;
+const ADJ_OFFSET: u32 = 0x0001;
+const ADJ_FREQUENCY: u32 = 0x0002;
+const ADJ_MAXERROR: u32 = 0x0004;
+const ADJ_ESTERROR: u32 = 0x0008;
+const ADJ_STATUS: u32 = 0x0010;
+const ADJ_TIMECONST: u32 = 0x0020;
+const ADJ_TAI: u32 = 0x0080;
+const ADJ_MICRO: u32 = 0x1000;
+const ADJ_NANO: u32 = 0x2000;
+const ADJ_TICK: u32 = 0x4000;
+const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
+const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+const STA_NANO: i32 = 0x2000;
+const CAP_SYS_TIME: usize = 25;
+const TIMEX_WRITE_MODES: u32 = ADJ_OFFSET
+    | ADJ_FREQUENCY
+    | ADJ_MAXERROR
+    | ADJ_ESTERROR
+    | ADJ_STATUS
+    | ADJ_TIMECONST
+    | ADJ_TAI
+    | ADJ_MICRO
+    | ADJ_NANO
+    | ADJ_TICK
+    | ADJ_OFFSET_SINGLESHOT;
+const TIMEX_ALLOWED_MODES: u32 = TIMEX_WRITE_MODES | ADJ_OFFSET_SS_READ;
+
+#[derive(Clone, Copy)]
+struct AdjtimexState {
+    offset: i64,
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    status: i32,
+    constant: i64,
+    tick: i64,
+    tai: i32,
+}
+
+impl AdjtimexState {
+    const fn new() -> Self {
+        Self {
+            offset: 0,
+            freq: 0,
+            maxerror: 0,
+            esterror: 0,
+            status: 0,
+            constant: 0,
+            tick: 10_000,
+            tai: 0,
+        }
+    }
+}
+
+static ADJTIMEX_STATE: Mutex<AdjtimexState> = Mutex::new(AdjtimexState::new());
 
 fn ticks_to_ns(ticks: u64) -> u64 {
     let freq = clock_freq() as u128;
@@ -231,6 +288,35 @@ struct TimeVal64 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct Timex {
+    modes: u32,
+    _pad0: u32,
+    offset: i64,
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    status: i32,
+    _pad1: i32,
+    constant: i64,
+    precision: i64,
+    tolerance: i64,
+    time: TimeVal64,
+    tick: i64,
+    ppsfreq: i64,
+    jitter: i64,
+    shift: i32,
+    _pad2: i32,
+    stabil: i64,
+    jitcnt: i64,
+    calcnt: i64,
+    errcnt: i64,
+    stbcnt: i64,
+    tai: i32,
+    _pad3: [i32; 11],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct ITimerVal {
     it_interval: TimeVal64,
     it_value: TimeVal64,
@@ -249,6 +335,152 @@ struct SigEvent {
 struct ITimerSpec {
     it_interval: TimeSpec,
     it_value: TimeSpec,
+}
+
+fn current_euid() -> u32 {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    inner.euid
+}
+
+fn can_adjust_wallclock() -> bool {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    inner.euid == 0 && (inner.cap_effective & (1u64 << CAP_SYS_TIME)) != 0
+}
+
+fn timex_tick_limits() -> (i64, i64) {
+    // Linux uses USER_HZ here; LTP reads _SC_CLK_TCK (typically 100).
+    let hz = 100i64;
+    (900_000 / hz, 1_100_000 / hz)
+}
+
+fn apply_adjtimex(ptr: usize) -> isize {
+    if ptr == 0 {
+        return EFAULT;
+    }
+    let token = get_current_token();
+    let Some(mut tx) = try_read_user_value::<Timex>(token, ptr as *const Timex) else {
+        return EFAULT;
+    };
+    let modes = tx.modes;
+    if modes != ADJ_OFFSET_SINGLESHOT && modes != ADJ_OFFSET_SS_READ && (modes & 0x8000) != 0 {
+        return EINVAL;
+    }
+    if (modes & !TIMEX_ALLOWED_MODES) != 0 {
+        return EINVAL;
+    }
+
+    let mut state = ADJTIMEX_STATE.lock();
+    if modes != 0 && modes != ADJ_OFFSET_SS_READ {
+        if !can_adjust_wallclock() {
+            return EPERM;
+        }
+        if (modes & ADJ_TICK) != 0 {
+            let (min_tick, max_tick) = timex_tick_limits();
+            if tx.tick < min_tick || tx.tick > max_tick {
+                return EINVAL;
+            }
+            state.tick = tx.tick;
+        }
+        if (modes & ADJ_OFFSET) != 0 {
+            state.offset = tx.offset;
+        }
+        if (modes & ADJ_FREQUENCY) != 0 {
+            state.freq = tx.freq;
+        }
+        if (modes & ADJ_MAXERROR) != 0 {
+            state.maxerror = tx.maxerror;
+        }
+        if (modes & ADJ_ESTERROR) != 0 {
+            state.esterror = tx.esterror;
+        }
+        if (modes & ADJ_TIMECONST) != 0 {
+            state.constant = tx.constant;
+        }
+        if (modes & ADJ_STATUS) != 0 {
+            state.status = tx.status;
+        }
+        if (modes & ADJ_TAI) != 0 {
+            state.tai = tx.tai;
+        }
+        if (modes & ADJ_NANO) != 0 {
+            state.status |= STA_NANO;
+        }
+        if (modes & ADJ_MICRO) != 0 {
+            state.status &= !STA_NANO;
+        }
+    }
+
+    tx.offset = state.offset;
+    tx.freq = state.freq;
+    tx.maxerror = state.maxerror;
+    tx.esterror = state.esterror;
+    tx.status = state.status;
+    tx.constant = state.constant;
+    tx.tick = state.tick;
+    tx.tai = state.tai;
+    let now = realtime_now_ns();
+    tx.time.sec = (now / NSEC_PER_SEC) as i64;
+    tx.time.usec = if (state.status & STA_NANO) != 0 {
+        (now % NSEC_PER_SEC) as i64
+    } else {
+        ((now % NSEC_PER_SEC) / 1_000) as i64
+    };
+
+    if try_write_user_value(token, ptr as *mut Timex, &tx).is_err() {
+        return EFAULT;
+    }
+    // TIME_OK
+    0
+}
+
+pub fn syscall_settimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
+    if tv_ptr == 0 {
+        if tz_ptr != 0 {
+            let token = get_current_token();
+            if try_read_user_value::<TimeZone>(token, tz_ptr as *const TimeZone).is_none() {
+                return EFAULT;
+            }
+        }
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let Some(tv) = try_read_user_value::<TimeVal64>(token, tv_ptr as *const TimeVal64) else {
+        return EFAULT;
+    };
+    if tv.sec < 0 || tv.usec < 0 || tv.usec >= 1_000_000 {
+        return EINVAL;
+    }
+    if !can_adjust_wallclock() {
+        return EPERM;
+    }
+    if tz_ptr != 0 && try_read_user_value::<TimeZone>(token, tz_ptr as *const TimeZone).is_none() {
+        return EFAULT;
+    }
+    let target_ns = (tv.sec as u64)
+        .saturating_mul(NSEC_PER_SEC)
+        .saturating_add((tv.usec as u64).saturating_mul(1_000));
+    let current_mono_ns = now_ns();
+    let offset = (target_ns as i128)
+        .saturating_sub(current_mono_ns as i128)
+        .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
+    0
+}
+
+pub fn syscall_adjtimex(ptr: usize) -> isize {
+    apply_adjtimex(ptr)
+}
+
+pub fn syscall_clock_adjtime(clk_id: usize, ptr: usize) -> isize {
+    if decode_dynamic_cpu_clock(clk_id as i32).is_some() {
+        return EINVAL;
+    }
+    if clk_id != CLOCK_REALTIME {
+        return EINVAL;
+    }
+    apply_adjtimex(ptr)
 }
 
 pub fn syscall_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
@@ -410,6 +642,9 @@ pub fn syscall_clock_settime(clk_id: usize, tp_ptr: usize) -> isize {
     let Some(target_ns) = timespec_to_ns(ts) else {
         return EINVAL;
     };
+    if !can_adjust_wallclock() {
+        return EPERM;
+    }
     let current_mono_ns = now_ns();
     let offset = (target_ns as i128)
         .saturating_sub(current_mono_ns as i128)
@@ -722,14 +957,25 @@ pub fn syscall_clock_nanosleep(
     }
 }
 
+fn ns_to_user_hz_ticks(ns: u64) -> i64 {
+    const USER_HZ: u64 = 100;
+    (ns.saturating_mul(USER_HZ) / NSEC_PER_SEC) as i64
+}
+
 pub fn syscall_times(tms_ptr: usize) -> isize {
+    let process = current_process();
+    let self_cpu_ns = process_cpu_time_ns(&process);
+    let child_cpu_ns = {
+        let inner = process.borrow_mut();
+        inner.child_cpu_time_ns
+    };
     if tms_ptr != 0 {
         let token = get_current_token();
         let tms = Tms {
-            tms_utime: 0,
-            tms_stime: 0,
-            tms_cutime: 0,
-            tms_cstime: 0,
+            tms_utime: ns_to_user_hz_ticks(self_cpu_ns),
+            tms_stime: ns_to_user_hz_ticks(self_cpu_ns),
+            tms_cutime: ns_to_user_hz_ticks(child_cpu_ns),
+            tms_cstime: ns_to_user_hz_ticks(child_cpu_ns),
         };
         write_user_value(token, tms_ptr as *mut Tms, &tms);
     }
