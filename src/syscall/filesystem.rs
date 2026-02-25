@@ -581,6 +581,16 @@ fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     inner.fd_table[fd].clone()
 }
 
+fn file_is_seekable_for_preadwrite(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> bool {
+    if file.as_any().downcast_ref::<OSInode>().is_some() {
+        return true;
+    }
+    if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+        return pf.len().is_some();
+    }
+    false
+}
+
 fn fd_has_o_path(fd: usize) -> bool {
     let process = current_files_process();
     let inner = process.borrow_mut();
@@ -3758,6 +3768,9 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
+    if !file_is_seekable_for_preadwrite(&file) {
+        return ESPIPE;
+    }
     if !file.readable() {
         return EBADF;
     }
@@ -3770,7 +3783,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
             inode.is_dir()
         };
         if is_dir {
-            return ESPIPE;
+            return EISDIR;
         }
 
         let mut total = 0usize;
@@ -3786,7 +3799,9 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
             if n == 0 {
                 break;
             }
-            copy_to_user(token, user_ptr as *mut u8, &kbuf[..n]);
+            if try_copy_to_user(token, user_ptr as *mut u8, &kbuf[..n]).is_err() {
+                return if total > 0 { total as isize } else { EFAULT };
+            }
             total += n;
             off += n;
             user_ptr += n;
@@ -3804,12 +3819,16 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
         }
         let old = pf.offset();
         pf.set_offset(pos as usize);
-        let buf = UserBuffer::new(translated_byte_buffer(
+        let Ok(user_bufs) = try_translated_byte_buffer(
             get_current_token(),
             buffer as *mut u8,
             len,
             MapPermission::W,
-        ));
+        ) else {
+            pf.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
         let n = file.read(buf) as isize;
         pf.set_offset(old);
         return n;
@@ -3834,6 +3853,9 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
+    if !file_is_seekable_for_preadwrite(&file) {
+        return ESPIPE;
+    }
     if !file.writable() {
         return EBADF;
     }
@@ -3846,8 +3868,18 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             inode.is_dir()
         };
         if is_dir {
-            return ESPIPE;
+            return EISDIR;
         }
+
+        let effective_pos = if os_inode.append() {
+            let disk_end = {
+                let _ext4_guard = ext4_lock();
+                inode.size() as usize
+            };
+            core::cmp::max(disk_end, os_inode.pending_write_end())
+        } else {
+            pos as usize
+        };
 
         let mut write_len = len;
         let mut hit_fsize_limit = false;
@@ -3857,7 +3889,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             inner.rlimit_fsize_cur
         };
         if fsize_limit != u64::MAX {
-            let start = pos as u64;
+            let start = effective_pos as u64;
             if start >= fsize_limit && len > 0 {
                 let pid = current_process().getpid();
                 queue_process_signal(pid, SIGXFSZ_NUM);
@@ -3872,14 +3904,16 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
 
         let mut total = 0usize;
         let token = get_current_token();
-        let mut off = pos as usize;
+        let mut off = effective_pos;
         let mut user_ptr = buffer;
         const CHUNK_MAX: usize = 16 * 1024;
         let buf_cap = core::cmp::min(write_len, CHUNK_MAX);
         let mut kbuf = vec![0u8; buf_cap];
         while total < write_len {
             let want = core::cmp::min(write_len - total, buf_cap);
-            copy_from_user(token, user_ptr as *const u8, &mut kbuf[..want]);
+            if try_copy_from_user(token, user_ptr as *const u8, &mut kbuf[..want]).is_err() {
+                return if total > 0 { total as isize } else { EFAULT };
+            }
             match os_inode.pwrite_at(off, &kbuf[..want]) {
                 Ok(n) => {
                     total += n;
@@ -3891,7 +3925,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
                 }
                 Err(_) => {
                     crate::println!("[ext4] Warning: pwrite failed");
-                    break;
+                    return if total > 0 { total as isize } else { EIO };
                 }
             }
         }
@@ -3909,12 +3943,16 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         }
         let old = pf.offset();
         pf.set_offset(pos as usize);
-        let buf = UserBuffer::new(translated_byte_buffer(
+        let Ok(user_bufs) = try_translated_byte_buffer(
             get_current_token(),
             buffer as *mut u8,
             len,
             MapPermission::R,
-        ));
+        ) else {
+            pf.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
         let n = file.write(buf) as isize;
         pf.set_offset(old);
         return n;

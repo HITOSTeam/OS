@@ -16,6 +16,7 @@ struct IoVec {
 
 const EFAULT: isize = -14;
 const EINVAL: isize = -22;
+const EOPNOTSUPP: isize = -95;
 const IOV_MAX: usize = 1024;
 
 fn validate_iovcnt(iovcnt_raw: usize) -> Result<usize, isize> {
@@ -83,6 +84,60 @@ where
     total
 }
 
+fn do_iov_with_offset<F>(
+    iov_ptr: usize,
+    iovcnt_raw: usize,
+    mut offset: isize,
+    mut io_once: F,
+) -> isize
+where
+    F: FnMut(usize, usize, isize) -> isize,
+{
+    if offset < 0 {
+        return EINVAL;
+    }
+    let Ok(iovcnt) = validate_iovcnt(iovcnt_raw) else {
+        return EINVAL;
+    };
+    if iovcnt == 0 {
+        return 0;
+    }
+
+    let token = get_current_token();
+    let mut total_len = 0usize;
+    let mut total: isize = 0;
+    for i in 0..iovcnt {
+        let iv = match read_iovec(token, iov_ptr, i) {
+            Ok(iv) => iv,
+            Err(err) => return if total > 0 { total } else { err },
+        };
+        if iv.len > isize::MAX as usize {
+            return EINVAL;
+        }
+        total_len = match total_len.checked_add(iv.len) {
+            Some(v) if v <= isize::MAX as usize => v,
+            _ => return EINVAL,
+        };
+        if iv.len == 0 {
+            continue;
+        }
+
+        let n = io_once(iv.base, iv.len, offset);
+        if n < 0 {
+            return if total > 0 { total } else { n };
+        }
+        total += n;
+        if n as usize != iv.len {
+            break;
+        }
+        offset = match offset.checked_add(n) {
+            Some(v) => v,
+            None => return if total > 0 { total } else { EINVAL },
+        };
+    }
+    total
+}
+
 pub fn syscall_read(_fd: usize, buf: *mut u8, len: usize) -> isize {
     super::filesystem::syscall_read(_fd, buf as usize, len)
 }
@@ -100,6 +155,61 @@ pub fn syscall_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
     do_iov(iov_ptr, iovcnt, |base, len| {
         syscall_read(fd, base as *mut u8, len)
     })
+}
+
+pub fn syscall_preadv(fd: usize, iov_ptr: usize, iovcnt: usize, offset: isize) -> isize {
+    do_iov_with_offset(iov_ptr, iovcnt, offset, |base, len, off| {
+        super::filesystem::syscall_pread64(fd, base, len, off)
+    })
+}
+
+pub fn syscall_pwritev(fd: usize, iov_ptr: usize, iovcnt: usize, offset: isize) -> isize {
+    do_iov_with_offset(iov_ptr, iovcnt, offset, |base, len, off| {
+        super::filesystem::syscall_pwrite64(fd, base, len, off)
+    })
+}
+
+fn split_offset_to_isize(offset_lo: usize, offset_hi: usize) -> isize {
+    let off = ((offset_hi as u64) << 32) | (offset_lo as u64 & 0xffff_ffff);
+    off as i64 as isize
+}
+
+pub fn syscall_preadv2(
+    fd: usize,
+    iov_ptr: usize,
+    iovcnt: usize,
+    offset_lo: usize,
+    offset_hi: usize,
+    flags: usize,
+) -> isize {
+    if flags != 0 {
+        return EOPNOTSUPP;
+    }
+    let offset = split_offset_to_isize(offset_lo, offset_hi);
+    if offset == -1 {
+        syscall_readv(fd, iov_ptr, iovcnt)
+    } else {
+        syscall_preadv(fd, iov_ptr, iovcnt, offset)
+    }
+}
+
+pub fn syscall_pwritev2(
+    fd: usize,
+    iov_ptr: usize,
+    iovcnt: usize,
+    offset_lo: usize,
+    offset_hi: usize,
+    flags: usize,
+) -> isize {
+    if flags != 0 {
+        return EOPNOTSUPP;
+    }
+    let offset = split_offset_to_isize(offset_lo, offset_hi);
+    if offset == -1 {
+        syscall_writev(fd, iov_ptr, iovcnt)
+    } else {
+        syscall_pwritev(fd, iov_ptr, iovcnt, offset)
+    }
 }
 
 pub fn syscall_exit(_code: usize) -> isize {

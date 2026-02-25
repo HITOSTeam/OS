@@ -104,6 +104,8 @@ const SYSCALL_READV: usize = 65;
 const SYSCALL_WRITEV: usize = 66;
 const SYSCALL_PREAD64: usize = 67;
 const SYSCALL_PWRITE64: usize = 68;
+const SYSCALL_PREADV: usize = 69;
+const SYSCALL_PWRITEV: usize = 70;
 const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_SIGNALFD4: usize = 74;
@@ -159,6 +161,8 @@ const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_CLOCK_ADJTIME64: usize = 405;
 const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
+const SYSCALL_PREADV2: usize = 286;
+const SYSCALL_PWRITEV2: usize = 287;
 const SYSCALL_TIMES: usize = 153;
 const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETPGID: usize = 155;
@@ -494,6 +498,14 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PREAD64 => filesystem::syscall_pread64(args[0], args[1], args[2], args[3] as isize),
         SYSCALL_PWRITE64 => {
             filesystem::syscall_pwrite64(args[0], args[1], args[2], args[3] as isize)
+        }
+        SYSCALL_PREADV => flow::syscall_preadv(args[0], args[1], args[2], args[3] as isize),
+        SYSCALL_PWRITEV => flow::syscall_pwritev(args[0], args[1], args[2], args[3] as isize),
+        SYSCALL_PREADV2 => {
+            flow::syscall_preadv2(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
+        SYSCALL_PWRITEV2 => {
+            flow::syscall_pwritev2(args[0], args[1], args[2], args[3], args[4], args[5])
         }
         SYSCALL_PSELECT6 => {
             time_sys::syscall_pselect6(args[0], args[1], args[2], args[3], args[4], args[5])
