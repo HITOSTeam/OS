@@ -5149,15 +5149,24 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
     }
     inner.fd_flags[read_fd] = fd_flags;
     inner.fd_flags[write_fd] = fd_flags;
+    // Drop PCB borrow before user-memory writes: uaccess may need to resolve
+    // lazy/COW pages via `process.try_borrow_mut()`.
     drop(inner);
 
     // Linux ABI: pipefd points to `int pipefd[2]` (i32).
-    write_user_value(token, pipefd as *mut i32, &(read_fd as i32));
-    write_user_value(
-        token,
-        (pipefd + core::mem::size_of::<i32>()) as *mut i32,
-        &(write_fd as i32),
-    );
+    if try_write_user_value(token, pipefd as *mut i32, &(read_fd as i32)).is_err()
+        || try_write_user_value(
+            token,
+            (pipefd + core::mem::size_of::<i32>()) as *mut i32,
+            &(write_fd as i32),
+        )
+        .is_err()
+    {
+        let mut inner = process.borrow_mut();
+        let _ = inner.clear_fd(read_fd);
+        let _ = inner.clear_fd(write_fd);
+        return EFAULT;
+    }
     0
 }
 
@@ -7142,6 +7151,55 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
     }
     let _ = os_inode.flush();
     pseudo_block_note_sync();
+    0
+}
+
+/// Linux `fadvise64(2)` / userspace `posix_fadvise(3)` backend.
+pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) -> isize {
+    const POSIX_FADV_NORMAL: usize = 0;
+    const POSIX_FADV_RANDOM: usize = 1;
+    const POSIX_FADV_SEQUENTIAL: usize = 2;
+    const POSIX_FADV_WILLNEED: usize = 3;
+    const POSIX_FADV_DONTNEED: usize = 4;
+    const POSIX_FADV_NOREUSE: usize = 5;
+
+    if (offset as i64) < 0 || (len as i64) < 0 {
+        return EINVAL;
+    }
+    if !matches!(
+        advice,
+        POSIX_FADV_NORMAL
+            | POSIX_FADV_RANDOM
+            | POSIX_FADV_SEQUENTIAL
+            | POSIX_FADV_WILLNEED
+            | POSIX_FADV_DONTNEED
+            | POSIX_FADV_NOREUSE
+    ) {
+        return EINVAL;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+
+    if file.as_any().downcast_ref::<Pipe>().is_some()
+        || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
+    {
+        return ESPIPE;
+    }
+
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let inode = os_inode.ext4_inode();
+    {
+        let _ext4_guard = ext4_lock();
+        if !inode.is_file() {
+            return ESPIPE;
+        }
+    }
     0
 }
 

@@ -1955,6 +1955,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const EBADF: isize = -9;
     const ENOTTY: isize = -25;
     const EFAULT: isize = -14;
+    const FIONREAD: usize = 0x541B;
     const BLKGETSIZE: usize = 0x1260;
     const BLKSSZGET: usize = 0x1268;
     const BLKGETSIZE64: usize = 0x8008_1272;
@@ -1994,6 +1995,20 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     // Compare on low 32 bits to accept both calling conventions.
     let request = _request & 0xffff_ffffusize;
     let token = get_current_token();
+
+    if request == FIONREAD {
+        if _argp == 0 {
+            return EFAULT;
+        }
+        if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
+            // Linux reports unread bytes for both read and write pipe fds.
+            let readable = pipe.queued_bytes() as i32;
+            if try_write_user_value(token, _argp as *mut i32, &readable).is_err() {
+                return EFAULT;
+            }
+            return 0;
+        }
+    }
 
     if let Some(os_inode) = file.as_any().downcast_ref::<crate::fs::OSInode>() {
         let ino = os_inode.ext4_inode().inode_num() as u64;

@@ -224,6 +224,16 @@ pub fn init_procfs() {
             if let Some(pipe_max) = pipe_max {
                 let _ = pipe_max.write_at(0, b"65536\n");
             }
+            let pipe_user_pages_soft = ensure_file(&fs_dir, "pipe-user-pages-soft", 0o644);
+            if let Some(pipe_user_pages_soft) = pipe_user_pages_soft {
+                // Keep this low enough to avoid huge per-test setup while still
+                // exercising soft-limit behavior.
+                let _ = pipe_user_pages_soft.write_at(0, b"128\n");
+            }
+            let pipe_user_pages_hard = ensure_file(&fs_dir, "pipe-user-pages-hard", 0o644);
+            if let Some(pipe_user_pages_hard) = pipe_user_pages_hard {
+                let _ = pipe_user_pages_hard.write_at(0, b"0\n");
+            }
             let lease_break_time = ensure_file(&fs_dir, "lease-break-time", 0o644);
             if let Some(lease_break_time) = lease_break_time {
                 let _ = lease_break_time.write_at(0, b"45\n");
@@ -383,11 +393,40 @@ fn proc_pid_fd_entries(pid: u32) -> Vec<PseudoDirent> {
     let Some(inner) = files_proc.try_borrow_mut() else {
         return entries;
     };
+    let mut has_predicted = false;
+    let predicted_fd = if pid as usize == current_process().getpid() {
+        let limit = inner.rlimit_nofile_cur as usize;
+        let fd =
+            if let Some(fd) = (0..inner.fd_table.len()).find(|fd| inner.fd_table[*fd].is_none()) {
+                (fd < limit).then_some(fd)
+            } else if inner.fd_table.len() < limit {
+                Some(inner.fd_table.len())
+            } else {
+                None
+            };
+        fd
+    } else {
+        None
+    };
+
     for (fd, file) in inner.fd_table.iter().enumerate() {
         if file.is_some() {
+            if predicted_fd == Some(fd) {
+                has_predicted = true;
+            }
             entries.push(PseudoDirent {
                 name: alloc::format!("{fd}"),
-                ino: fd as u64,
+                // glibc may skip dirents whose inode is 0; keep procfd inodes non-zero.
+                ino: (fd + 1) as u64,
+                dtype: 10,
+            });
+        }
+    }
+    if let Some(fd) = predicted_fd {
+        if !has_predicted {
+            entries.push(PseudoDirent {
+                name: alloc::format!("{fd}"),
+                ino: (fd + 1) as u64,
                 dtype: 10,
             });
         }

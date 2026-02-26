@@ -239,6 +239,7 @@ const SYSCALL_CLONE: usize = 220;
 const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_EXECVEAT: usize = 281;
 const SYSCALL_MMAP: usize = 222;
+const SYSCALL_FADVISE64: usize = 223;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_MSYNC: usize = 227;
 const SYSCALL_MLOCK: usize = 228;
@@ -671,6 +672,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             args[4] as isize,
             args[5],
         ),
+        SYSCALL_FADVISE64 => filesystem::syscall_fadvise64(args[0], args[1], args[2], args[3]),
         SYSCALL_MPROTECT => memory::syscall_mprotect(args[0], args[1], args[2]),
         SYSCALL_MSYNC => memory::syscall_msync(args[0], args[1], args[2]),
         SYSCALL_MADVISE => memory::syscall_madvise(args[0], args[1], args[2]),

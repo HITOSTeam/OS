@@ -105,6 +105,12 @@ impl Pipe {
         self.buffer.lock().available_read()
     }
 
+    /// Number of unread bytes currently buffered in the pipe, regardless of
+    /// whether this handle is a read end or a write end.
+    pub fn queued_bytes(&self) -> usize {
+        self.buffer.lock().available_read()
+    }
+
     pub fn available_write(&self) -> usize {
         if !self.writable {
             return 0;
@@ -292,13 +298,14 @@ impl PipeRingBuffer {
         const EBUSY: isize = -16;
         const EPERM: isize = -1;
         const EINVAL: isize = -22;
-        if size == 0 {
-            return Err(EINVAL);
-        }
         if size > (1usize << 31) {
             return Err(EINVAL);
         }
-        let base = size.max(PIPE_BUF);
+        let base = if size == 0 {
+            PIPE_BUF
+        } else {
+            size.max(PIPE_BUF)
+        };
         let Some(new_capacity) = base
             .checked_add(PIPE_BUF - 1)
             .map(|v| (v / PIPE_BUF) * PIPE_BUF)
@@ -550,9 +557,16 @@ impl File for Pipe {
                 }
                 let task_for_log = task.clone();
                 let inserted = ring_buffer.push_reader(task.clone());
-                let waiters = ring_buffer.read_waiters.len();
-                let writers = ring_buffer.write_end_count();
-                let write_end = ring_buffer.write_end.as_ref().and_then(|w| w.upgrade());
+                let mut waiters = 0usize;
+                let mut writers = 0usize;
+                let mut write_end: Option<Arc<Pipe>> = None;
+                if DEBUG_UNIXBENCH && inserted {
+                    waiters = ring_buffer.read_waiters.len();
+                    writers = ring_buffer.write_end_count();
+                    if writers > 0 {
+                        write_end = ring_buffer.write_end.as_ref().and_then(|w| w.upgrade());
+                    }
+                }
                 drop(ring_buffer);
                 if DEBUG_UNIXBENCH && inserted {
                     let pid = task_for_log
@@ -649,9 +663,16 @@ impl File for Pipe {
                 }
                 let task_for_log = task.clone();
                 let inserted = ring_buffer.push_writer(task.clone());
-                let waiters = ring_buffer.write_waiters.len();
-                let readers = ring_buffer.read_end_count();
-                let read_end = ring_buffer.read_end.as_ref().and_then(|w| w.upgrade());
+                let mut waiters = 0usize;
+                let mut readers = 0usize;
+                let mut read_end: Option<Arc<Pipe>> = None;
+                if DEBUG_UNIXBENCH && inserted {
+                    waiters = ring_buffer.write_waiters.len();
+                    readers = ring_buffer.read_end_count();
+                    if readers > 0 {
+                        read_end = ring_buffer.read_end.as_ref().and_then(|w| w.upgrade());
+                    }
+                }
                 drop(ring_buffer);
                 if DEBUG_UNIXBENCH && inserted {
                     let pid = task_for_log
