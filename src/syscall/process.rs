@@ -9,8 +9,8 @@ use crate::{
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
     mm::{
-        kernel_token, try_read_user_value, try_write_user_value, write_user_value, MapPermission,
-        MemorySet,
+        MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
+        write_user_value,
     },
     println,
     syscall::{
@@ -21,11 +21,11 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        manager::{add_task, remove_inactive_task, select_hart_for_new_task, PID2PCB},
-        processor::{block_current_and_run_next, current_process, current_task},
-        signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
-        task_block::TaskControlBlock,
         ProcessControlBlock,
+        manager::{PID2PCB, add_task, remove_inactive_task, select_hart_for_new_task},
+        processor::{block_current_and_run_next, current_process, current_task},
+        signal::{MAX_SIG, SIG_DFL, SIG_IGN, SignalFlags, pending_unmasked_bits},
+        task_block::TaskControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
@@ -533,7 +533,11 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let _ = try_write_user_value(token, _ptid as *mut i32, &0);
     }
 
-    let fork_start_cycles = if DEBUG_FUTEX { crate::arch::read_time() } else { 0 };
+    let fork_start_cycles = if DEBUG_FUTEX {
+        crate::arch::read_time()
+    } else {
+        0
+    };
     let Some((child, task)) = process.fork_with_task(share_files, share_vm) else {
         return -12;
     };
@@ -983,9 +987,8 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             let child_cpu_ns = reap_zombie_child(&child);
             {
                 let mut parent_inner = cur_process.borrow_mut();
-                parent_inner.child_cpu_time_ns = parent_inner
-                    .child_cpu_time_ns
-                    .saturating_add(child_cpu_ns);
+                parent_inner.child_cpu_time_ns =
+                    parent_inner.child_cpu_time_ns.saturating_add(child_cpu_ns);
             }
             drop(child);
             if wstatus_ptr != 0 {
@@ -1158,9 +1161,8 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
                 if let Some(child) = child.as_ref() {
                     let child_cpu_ns = reap_zombie_child(child);
                     let mut parent_inner = cur_process.borrow_mut();
-                    parent_inner.child_cpu_time_ns = parent_inner
-                        .child_cpu_time_ns
-                        .saturating_add(child_cpu_ns);
+                    parent_inner.child_cpu_time_ns =
+                        parent_inner.child_cpu_time_ns.saturating_add(child_cpu_ns);
                 }
             }
             let (si_status, si_code) = if let Some(sig) = signal {

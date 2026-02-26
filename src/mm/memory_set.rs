@@ -973,9 +973,12 @@ impl MemorySet {
                         identical_pages = identical_pages.saturating_add(1);
                         let src_ppn = src_pte.ppn();
                         let src_flags = src_pte.flags();
-                        memory_set
-                            .page_table
-                            .map_cached(vpn, src_ppn, src_flags, &mut dst_walk_cache);
+                        memory_set.page_table.map_cached(
+                            vpn,
+                            src_ppn,
+                            src_flags,
+                            &mut dst_walk_cache,
+                        );
                     }
                 }
                 // For Framed/Lazy areas we only walk materialized pages.
@@ -1025,9 +1028,12 @@ impl MemorySet {
                             parent_updates.push((vpn, src_flags));
                             cow_marked_pages = cow_marked_pages.saturating_add(1);
                         }
-                        memory_set
-                            .page_table
-                            .map_cached(vpn, src_ppn, src_flags, &mut dst_walk_cache);
+                        memory_set.page_table.map_cached(
+                            vpn,
+                            src_ppn,
+                            src_flags,
+                            &mut dst_walk_cache,
+                        );
                         new_area.data_frames.insert(vpn, frame_tracker.clone());
                     }
                 }
@@ -1151,9 +1157,12 @@ impl MemorySet {
                             continue;
                         }
 
-                        memory_set
-                            .page_table
-                            .map_cached(vpn, src_ppn, src_flags, &mut dst_walk_cache);
+                        memory_set.page_table.map_cached(
+                            vpn,
+                            src_ppn,
+                            src_flags,
+                            &mut dst_walk_cache,
+                        );
                         new_area.data_frames.insert(vpn, frame_tracker.clone());
                     }
                 }
@@ -1194,9 +1203,12 @@ impl MemorySet {
                         }
                         let src_ppn = src_pte.ppn();
                         let src_flags = src_pte.flags();
-                        memory_set
-                            .page_table
-                            .map_cached(vpn, src_ppn, src_flags, &mut dst_walk_cache);
+                        memory_set.page_table.map_cached(
+                            vpn,
+                            src_ppn,
+                            src_flags,
+                            &mut dst_walk_cache,
+                        );
                     }
                 }
                 // Lazy areas can span terabytes with no materialized pages.

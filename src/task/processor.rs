@@ -761,6 +761,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         // Drop the full user address space here so unreaped zombies do not pin
         // page-table pages (and COW refs) during fork-heavy workloads.
         process_inner.memory_set = MemorySet::new_bare();
+        crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
+        crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
         // drop file descriptors
         process_inner.fd_table.clear();
         process_inner.fd_flags.clear();
@@ -916,6 +918,8 @@ pub fn exit_group_and_run_next(exit_code: i32) {
     // Same as exit_current_and_run_next(): release the whole user address
     // space eagerly and keep only zombie bookkeeping in the PCB.
     process_inner.memory_set = MemorySet::new_bare();
+    crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
+    crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
     process_inner.fd_table.clear();
     process_inner.fd_flags.clear();
 

@@ -220,9 +220,13 @@ pub fn init_procfs() {
         }
         let fs_dir = ensure_dir(&sys_dir, "fs", 0o555);
         if let Some(fs_dir) = fs_dir {
-            let pipe_max = ensure_file(&fs_dir, "pipe-max-size", 0o444);
+            let pipe_max = ensure_file(&fs_dir, "pipe-max-size", 0o644);
             if let Some(pipe_max) = pipe_max {
-                let _ = pipe_max.write_at(0, b"4096");
+                let _ = pipe_max.write_at(0, b"65536\n");
+            }
+            let lease_break_time = ensure_file(&fs_dir, "lease-break-time", 0o644);
+            if let Some(lease_break_time) = lease_break_time {
+                let _ = lease_break_time.write_at(0, b"45\n");
             }
         }
         let net_dir = ensure_dir(&sys_dir, "net", 0o555);
@@ -463,7 +467,10 @@ fn proc_pid_task_alive(pid: u32, tid: u32) -> bool {
         .tasks
         .get(tid_index)
         .and_then(|t| t.as_ref())
-        .and_then(|t| t.try_borrow_mut().map(|ti| ti.res.is_some() && ti.exit_code.is_none()))
+        .and_then(|t| {
+            t.try_borrow_mut()
+                .map(|ti| ti.res.is_some() && ti.exit_code.is_none())
+        })
         .unwrap_or(false)
 }
 

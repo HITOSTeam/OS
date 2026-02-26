@@ -11,7 +11,7 @@ use spin::Mutex;
 use crate::{
     config::clock_freq,
     debug_config::DEBUG_FUTEX,
-    mm::{read_user_value, PageTable, VirtAddr},
+    mm::{PageTable, VirtAddr, read_user_value},
     syscall::time_sys::realtime_now_timespec,
     task::block_sleep::add_timer,
     task::{
@@ -392,9 +392,7 @@ pub fn syscall_futex(
                     let elapsed_ms = if base_ns == 0 {
                         0
                     } else {
-                        now_ns
-                            .saturating_sub(base_ns)
-                            .saturating_div(NSEC_PER_MSEC)
+                        now_ns.saturating_sub(base_ns).saturating_div(NSEC_PER_MSEC)
                     };
                     log::warn!(
                         "[futex_wait_depth] pid={} tid={} key=({:#x},{:#x}) qlen={} val={} elapsed_ms={}",
@@ -466,25 +464,26 @@ pub fn syscall_futex(
                 if let Some(deadline_ns) = deadline_ns {
                     let now_ns = futex_wait_now_ns(cmd, clock_realtime);
                     if now_ns >= deadline_ns {
-                    if let Some(removed_key) = remove_waiter(&in_queue) {
-                        if DEBUG_FUTEX {
-                            let seq = FUTEX_TIMEOUT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-                            let waited_ms =
-                                now_ns.saturating_sub(wait_start_ns).saturating_div(NSEC_PER_MSEC);
-                            if seq <= 16 || seq % 32 == 0 {
-                                log::warn!(
-                                    "[futex_wait_detach] seq={} reason=timeout pid={} tid={} key=({:#x},{:#x}) waited_ms={}",
-                                    seq,
-                                    pid,
-                                    tid,
-                                    removed_key.0,
-                                    removed_key.1,
-                                    waited_ms
-                                );
+                        if let Some(removed_key) = remove_waiter(&in_queue) {
+                            if DEBUG_FUTEX {
+                                let seq = FUTEX_TIMEOUT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                                let waited_ms = now_ns
+                                    .saturating_sub(wait_start_ns)
+                                    .saturating_div(NSEC_PER_MSEC);
+                                if seq <= 16 || seq % 32 == 0 {
+                                    log::warn!(
+                                        "[futex_wait_detach] seq={} reason=timeout pid={} tid={} key=({:#x},{:#x}) waited_ms={}",
+                                        seq,
+                                        pid,
+                                        tid,
+                                        removed_key.0,
+                                        removed_key.1,
+                                        waited_ms
+                                    );
+                                }
                             }
+                            return ETIMEDOUT;
                         }
-                        return ETIMEDOUT;
-                    }
                         if !in_queue.load(Ordering::Acquire) {
                             return 0;
                         }

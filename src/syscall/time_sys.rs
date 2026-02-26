@@ -11,11 +11,11 @@ use crate::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
     },
-    task::signal::{has_unmasked_pending, signal_bit, SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM},
+    task::signal::{SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
     task::{
+        ProcessControlBlock,
         manager::pid2process,
         processor::{current_files_process, current_process, current_task},
-        ProcessControlBlock,
     },
     time::get_time,
     trap::get_current_token,

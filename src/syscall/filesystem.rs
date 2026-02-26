@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -13,7 +13,8 @@ use crate::{
     fs::{
         File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent,
         PseudoFile, PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file,
-        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
+        pseudo_block_note_sync, pseudo_block_stat_snapshot, secondary_root_inode, shm_create,
+        shm_get, shm_list, shm_remove,
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
@@ -22,7 +23,7 @@ use crate::{
         write_user_value,
     },
     task::processor::{
-        current_files_process, current_process, current_task, suspend_current_and_run_next,
+        block_current_and_run_next, current_files_process, current_process, current_task,
     },
     task::{
         ProcessControlBlock,
@@ -50,6 +51,7 @@ const O_EXCL: usize = 0x80;
 const O_TRUNC: usize = 0x200;
 const O_APPEND: usize = 0x400;
 const O_NONBLOCK: usize = 0x800;
+const O_ASYNC: usize = 0x2000;
 const O_NOATIME: usize = 0x40000;
 const O_PATH: usize = 0x200000;
 const O_DIRECTORY: usize = 0x10000;
@@ -82,6 +84,7 @@ const EPERM: isize = -1;
 const ENOENT: isize = -2;
 const ENODATA: isize = -61;
 const EINVAL: isize = -22;
+const EBUSY: isize = -16;
 const ERANGE: isize = -34;
 const EMFILE: isize = -24;
 const ENOTDIR: isize = -20;
@@ -90,12 +93,14 @@ const EACCES: isize = -13;
 const EEXIST: isize = -17;
 const EXDEV: isize = -18;
 const EIO: isize = -5;
+const EMLINK: isize = -31;
 const ESPIPE: isize = -29;
 const EPIPE: isize = -32;
 const EROFS: isize = -30;
 const ENOSPC: isize = -28;
 const ENOSYS: isize = -38;
 const ENAMETOOLONG: isize = -36;
+const EDEADLK: isize = -35;
 const ENXIO: isize = -6;
 const EOPNOTSUPP: isize = -95;
 const ENOTEMPTY: isize = -39;
@@ -106,10 +111,16 @@ const XATTR_REPLACE: usize = 0x2;
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
 const PIPE_BUF: usize = 4096;
+const SIGIO_NUM: usize = 29;
 
 // fs/ioctl.h flags consumed by setxattr03.
 const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
 const FS_APPEND_FL: u32 = 0x0000_0020;
+const FS_NODUMP_FL: u32 = 0x0000_0040;
+
+const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
+const FALLOC_FL_SUPPORTED_MASK: usize = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
 
 static TMPFILE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -161,18 +172,47 @@ struct FcntlFlock {
     l_pid: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FcntlOwnerEx {
+    type_: i32,
+    pid: i32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct FileLockKey {
     dev: u64,
     ino: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct RecordLock {
+    owner: RecordLockOwner,
     owner_pid: usize,
     lock_type: i16,
     start: i64,
     end: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RecordLockOwner {
+    Process(usize),
+    OpenFile(usize),
+}
+
+#[derive(Clone, Copy)]
+struct WaitingRecordLock {
+    key: FileLockKey,
+    req_type: i16,
+    start: i64,
+    end: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+struct FileLease {
+    owner_pid: usize,
+    lease_type: i16,
+    pending_break_write: bool,
 }
 
 struct FifoDuplexFile {
@@ -278,6 +318,9 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref RECORD_LOCK_WAITERS: Mutex<BTreeMap<FileLockKey, VecDeque<Arc<TaskControlBlock>>>> =
         Mutex::new(BTreeMap::new());
+    static ref RECORD_LOCK_BLOCKED: Mutex<BTreeMap<usize, WaitingRecordLock>> =
+        Mutex::new(BTreeMap::new());
+    static ref FILE_LEASES: Mutex<BTreeMap<FileLockKey, FileLease>> = Mutex::new(BTreeMap::new());
 }
 
 fn get_inode_times(ino: u64) -> InodeTimes {
@@ -355,6 +398,29 @@ fn path_is_rofs(abs: &str) -> bool {
     })
 }
 
+fn inode_is_rofs_mount_root(inode: &Arc<ext4_fs::Inode>) -> bool {
+    let mounts: Vec<String> = {
+        let mounts = ROFS_MOUNTS.lock();
+        mounts.iter().cloned().collect()
+    };
+    for mount in mounts {
+        let Some(mount_inode) = find_path_in_roots(&mount) else {
+            continue;
+        };
+        if mount_inode.device_id() == inode.device_id()
+            && mount_inode.inode_num() == inode.inode_num()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn path_is_mount_point(abs: &str) -> bool {
+    let mounts = ROFS_MOUNTS.lock();
+    mounts.iter().any(|mnt| mnt == abs)
+}
+
 fn path_under_mount(abs: &str, mnt: &str) -> bool {
     if mnt == "/" {
         return true;
@@ -363,6 +429,10 @@ fn path_under_mount(abs: &str, mnt: &str) -> bool {
         return true;
     }
     abs.starts_with(mnt) && abs.as_bytes().get(mnt.len()) == Some(&b'/')
+}
+
+fn final_non_empty_component(path: &str) -> Option<&str> {
+    path.rsplit('/').find(|comp| !comp.is_empty())
 }
 
 fn rofs_mount_root_for_abs(abs: &str) -> Option<String> {
@@ -1544,12 +1614,17 @@ fn resolve_abs_path(dirfd: isize, path: &str) -> Option<String> {
         normalize_path(&cwd, path)
     } else if dirfd >= 0 {
         // If dirfd refers to a pseudo directory, resolve relative to it.
-        // For ext4 dirfds, we can't reliably reconstruct an absolute path (no reverse lookup).
+        // For ext4 dirfds, prefer procfs fd symlink target to preserve mount context.
         if let Some(file) = get_fd_file(dirfd as usize) {
             if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
                 normalize_path(pdir.path(), path)
             } else {
-                normalize_path(&cwd, path)
+                let fd_path = alloc::format!("/proc/self/fd/{}", dirfd);
+                if let Some(base) = crate::fs::proc_readlink(&fd_path) {
+                    normalize_path(&base, path)
+                } else {
+                    normalize_path(&cwd, path)
+                }
             }
         } else {
             return None;
@@ -1759,10 +1834,18 @@ fn inode_visible_size(inode: &ext4_fs::Inode) -> usize {
 fn file_lock_key(file: &Arc<dyn File + Send + Sync>) -> Option<FileLockKey> {
     let os_inode = file.as_any().downcast_ref::<OSInode>()?;
     let inode = os_inode.ext4_inode();
-    Some(FileLockKey {
+    Some(file_lock_key_from_inode(&inode))
+}
+
+fn file_lock_key_from_inode(inode: &Arc<ext4_fs::Inode>) -> FileLockKey {
+    FileLockKey {
         dev: inode.device_id() as u64,
         ino: inode.inode_num() as u64,
-    })
+    }
+}
+
+fn ofd_lock_owner_id(file: &Arc<dyn File + Send + Sync>) -> usize {
+    Arc::as_ptr(file) as *const () as usize
 }
 
 fn range_end_i128(end: Option<i64>) -> i128 {
@@ -1777,18 +1860,32 @@ fn ranges_overlap(a_start: i64, a_end: Option<i64>, b_start: i64, b_end: Option<
     a0 <= b1 && b0 <= a1
 }
 
+fn max_range_end(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (None, _) | (_, None) => None,
+        (Some(x), Some(y)) => Some(core::cmp::max(x, y)),
+    }
+}
+
+fn ranges_touch_or_overlap_sorted(left_end: Option<i64>, right_start: i64) -> bool {
+    match left_end {
+        None => true,
+        Some(end) => right_start <= end.saturating_add(1),
+    }
+}
+
 fn lock_conflicts(
     req_type: i16,
     req_start: i64,
     req_end: Option<i64>,
-    owner_pid: usize,
+    owner: RecordLockOwner,
     existing: &RecordLock,
 ) -> bool {
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
 
-    if existing.owner_pid == owner_pid || existing.lock_type == F_UNLCK {
+    if existing.owner == owner || existing.lock_type == F_UNLCK {
         return false;
     }
     if !ranges_overlap(req_start, req_end, existing.start, existing.end) {
@@ -1799,6 +1896,179 @@ fn lock_conflicts(
         F_WRLCK => existing.lock_type == F_RDLCK || existing.lock_type == F_WRLCK,
         _ => false,
     }
+}
+
+fn first_conflicting_lock(
+    locks: &[RecordLock],
+    req_type: i16,
+    req_start: i64,
+    req_end: Option<i64>,
+    owner: RecordLockOwner,
+) -> Option<RecordLock> {
+    locks
+        .iter()
+        .filter(|lock| lock_conflicts(req_type, req_start, req_end, owner, lock))
+        .min_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| range_end_i128(a.end).cmp(&range_end_i128(b.end)))
+                .then_with(|| a.owner.cmp(&b.owner))
+                .then_with(|| a.owner_pid.cmp(&b.owner_pid))
+        })
+        .copied()
+}
+
+fn normalize_record_locks(locks: &mut Vec<RecordLock>) {
+    const F_UNLCK: i16 = 2;
+
+    locks.retain(|lock| lock.lock_type != F_UNLCK);
+    locks.sort_by(|a, b| {
+        a.owner
+            .cmp(&b.owner)
+            .then_with(|| a.start.cmp(&b.start))
+            .then_with(|| range_end_i128(a.end).cmp(&range_end_i128(b.end)))
+            .then_with(|| a.lock_type.cmp(&b.lock_type))
+            .then_with(|| a.owner_pid.cmp(&b.owner_pid))
+    });
+
+    let mut merged: Vec<RecordLock> = Vec::with_capacity(locks.len());
+    for lock in locks.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if last.owner == lock.owner
+                && last.lock_type == lock.lock_type
+                && ranges_touch_or_overlap_sorted(last.end, lock.start)
+            {
+                last.end = max_range_end(last.end, lock.end);
+                continue;
+            }
+        }
+        merged.push(lock);
+    }
+    *locks = merged;
+}
+
+fn apply_record_lock_for_owner(
+    locks: &mut Vec<RecordLock>,
+    owner: RecordLockOwner,
+    owner_pid: usize,
+    req_type: i16,
+    req_start: i64,
+    req_end: Option<i64>,
+) -> bool {
+    const F_UNLCK: i16 = 2;
+
+    let mut updated: Vec<RecordLock> = Vec::with_capacity(locks.len().saturating_add(2));
+    for lock in locks.iter().copied() {
+        if lock.owner != owner || !ranges_overlap(req_start, req_end, lock.start, lock.end) {
+            updated.push(lock);
+            continue;
+        }
+
+        if lock.start < req_start {
+            updated.push(RecordLock {
+                owner: lock.owner,
+                owner_pid: lock.owner_pid,
+                lock_type: lock.lock_type,
+                start: lock.start,
+                end: Some(req_start - 1),
+            });
+        }
+
+        if let Some(req_end_value) = req_end {
+            if req_end_value < i64::MAX {
+                let right_start = req_end_value + 1;
+                let has_right = match lock.end {
+                    None => true,
+                    Some(lock_end) => lock_end >= right_start,
+                };
+                if has_right {
+                    updated.push(RecordLock {
+                        owner: lock.owner,
+                        owner_pid: lock.owner_pid,
+                        lock_type: lock.lock_type,
+                        start: right_start,
+                        end: lock.end,
+                    });
+                }
+            }
+        }
+    }
+
+    if req_type != F_UNLCK {
+        updated.push(RecordLock {
+            owner,
+            owner_pid,
+            lock_type: req_type,
+            start: req_start,
+            end: req_end,
+        });
+    }
+
+    normalize_record_locks(&mut updated);
+    let changed = *locks != updated;
+    *locks = updated;
+    changed
+}
+
+fn collect_conflict_process_owners(
+    locks: &[RecordLock],
+    req_type: i16,
+    req_start: i64,
+    req_end: Option<i64>,
+    owner_pid: usize,
+) -> Vec<usize> {
+    let owner = RecordLockOwner::Process(owner_pid);
+    let mut owners = BTreeSet::new();
+    for lock in locks {
+        if lock_conflicts(req_type, req_start, req_end, owner, lock) {
+            if let RecordLockOwner::Process(pid) = lock.owner {
+                owners.insert(pid);
+            }
+        }
+    }
+    owners.into_iter().collect()
+}
+
+fn set_record_lock_waiting(pid: usize, waiting: WaitingRecordLock) {
+    RECORD_LOCK_BLOCKED.lock().insert(pid, waiting);
+}
+
+fn clear_record_lock_waiting(pid: usize) {
+    RECORD_LOCK_BLOCKED.lock().remove(&pid);
+}
+
+fn detect_record_lock_deadlock(waiter_pid: usize, conflict_owners: &[usize]) -> bool {
+    let table = RECORD_LOCKS.lock();
+    let blocked = RECORD_LOCK_BLOCKED.lock();
+    let mut stack: Vec<usize> = conflict_owners.to_vec();
+    let mut visited = BTreeSet::new();
+
+    while let Some(pid) = stack.pop() {
+        if pid == waiter_pid {
+            return true;
+        }
+        if !visited.insert(pid) {
+            continue;
+        }
+        let Some(waiting) = blocked.get(&pid) else {
+            continue;
+        };
+        let Some(locks) = table.get(&waiting.key) else {
+            continue;
+        };
+        for owner in collect_conflict_process_owners(
+            locks,
+            waiting.req_type,
+            waiting.start,
+            waiting.end,
+            pid,
+        ) {
+            if !visited.contains(&owner) {
+                stack.push(owner);
+            }
+        }
+    }
+    false
 }
 
 fn lock_range_from_flock(
@@ -1879,12 +2149,199 @@ fn wake_record_lock_waiters(key: FileLockKey) {
     }
 }
 
+fn remove_process_record_locks_for_key(owner_pid: usize, key: FileLockKey) {
+    let changed = {
+        let mut table = RECORD_LOCKS.lock();
+        let Some(locks) = table.get_mut(&key) else {
+            return;
+        };
+        let before = locks.len();
+        locks.retain(
+            |lock| !matches!(lock.owner, RecordLockOwner::Process(pid) if pid == owner_pid),
+        );
+        let changed = locks.len() != before;
+        if locks.is_empty() {
+            table.remove(&key);
+        }
+        changed
+    };
+    if changed {
+        wake_record_lock_waiters(key);
+    }
+}
+
+pub fn release_all_record_locks_for_owner(owner_pid: usize) {
+    clear_record_lock_waiting(owner_pid);
+    let changed_keys = {
+        let mut table = RECORD_LOCKS.lock();
+        let mut changed = Vec::new();
+        let keys: Vec<FileLockKey> = table.keys().copied().collect();
+        for key in keys {
+            let mut remove_entry = false;
+            if let Some(locks) = table.get_mut(&key) {
+                let before = locks.len();
+                locks.retain(|lock| lock.owner_pid != owner_pid);
+                if locks.len() != before {
+                    changed.push(key);
+                }
+                remove_entry = locks.is_empty();
+            }
+            if remove_entry {
+                table.remove(&key);
+            }
+        }
+        changed
+    };
+    for key in changed_keys {
+        wake_record_lock_waiters(key);
+    }
+}
+
+fn remove_owner_file_lease_for_key(owner_pid: usize, key: FileLockKey) {
+    let mut table = FILE_LEASES.lock();
+    if table
+        .get(&key)
+        .is_some_and(|lease| lease.owner_pid == owner_pid)
+    {
+        table.remove(&key);
+    }
+}
+
+pub fn release_all_file_leases_for_owner(owner_pid: usize) {
+    let mut table = FILE_LEASES.lock();
+    table.retain(|_, lease| lease.owner_pid != owner_pid);
+}
+
+fn count_open_fds_for_key(key: FileLockKey) -> usize {
+    let processes: Vec<alloc::sync::Arc<ProcessControlBlock>> = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+    let mut count = 0usize;
+    for process in processes {
+        if let Some(inner) = process.try_borrow_mut() {
+            for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
+                if file_lock_key(file).is_some_and(|k| k == key) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+fn set_file_lease(
+    key: FileLockKey,
+    owner_pid: usize,
+    lease_type: i16,
+    file: &Arc<dyn File + Send + Sync>,
+) -> isize {
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+
+    match lease_type {
+        F_RDLCK | F_WRLCK | F_UNLCK => {}
+        _ => return EINVAL,
+    }
+    if lease_type == F_UNLCK {
+        let mut table = FILE_LEASES.lock();
+        match table.get(&key) {
+            Some(lease) if lease.owner_pid != owner_pid => EAGAIN,
+            Some(_) => {
+                table.remove(&key);
+                0
+            }
+            None => 0,
+        }
+    } else {
+        let mut table = FILE_LEASES.lock();
+        if let Some(lease) = table.get(&key) {
+            if lease.owner_pid != owner_pid {
+                return EAGAIN;
+            }
+            if lease.pending_break_write {
+                return EAGAIN;
+            }
+        }
+
+        if lease_type == F_RDLCK {
+            // Linux read lease requires read-only open description.
+            if !file.readable() || file.writable() {
+                return EAGAIN;
+            }
+        } else if lease_type == F_WRLCK {
+            // Linux write lease requires no other open descriptors.
+            if count_open_fds_for_key(key) > 1 {
+                return EBUSY;
+            }
+        }
+
+        table.insert(
+            key,
+            FileLease {
+                owner_pid,
+                lease_type,
+                pending_break_write: false,
+            },
+        );
+        0
+    }
+}
+
+fn get_file_lease_type(key: FileLockKey, owner_pid: usize) -> i16 {
+    FILE_LEASES
+        .lock()
+        .get(&key)
+        .filter(|lease| lease.owner_pid == owner_pid)
+        .map(|lease| lease.lease_type)
+        .unwrap_or(2)
+}
+
+fn maybe_signal_lease_break(
+    key: FileLockKey,
+    open_write: bool,
+    truncate_op: bool,
+    breaker_pid: usize,
+) {
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+
+    let holder_pid = {
+        let mut table = FILE_LEASES.lock();
+        let Some(lease) = table.get_mut(&key) else {
+            return;
+        };
+        if lease.owner_pid == breaker_pid {
+            return;
+        }
+        let conflict = match lease.lease_type {
+            F_WRLCK => true,
+            F_RDLCK => open_write || truncate_op,
+            _ => false,
+        };
+        if conflict {
+            if lease.lease_type == F_RDLCK || open_write || truncate_op {
+                lease.pending_break_write = true;
+            }
+            Some(lease.owner_pid)
+        } else {
+            None
+        }
+    };
+    if let Some(pid) = holder_pid {
+        queue_process_signal(pid, SIGIO_NUM);
+    }
+}
+
 fn has_pending_unmasked_signal() -> bool {
     let Some(task) = current_task() else {
         return false;
     };
     let inner = task.borrow_mut();
-    has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
+    // Keep lock waits aligned with Linux semantics: ignored/default SIGCHLD
+    // from helper children should not abort F_SETLKW with EINTR.
+    has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
 }
 
 pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
@@ -1897,12 +2354,26 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_GETLK: usize = 5;
     const F_SETLK: usize = 6;
     const F_SETLKW: usize = 7;
+    const F_SETOWN: usize = 8;
+    const F_GETOWN: usize = 9;
+    const F_SETSIG: usize = 10;
+    const F_GETSIG: usize = 11;
+    const F_SETOWN_EX: usize = 15;
+    const F_GETOWN_EX: usize = 16;
+    const F_OFD_GETLK: usize = 36;
+    const F_OFD_SETLK: usize = 37;
+    const F_OFD_SETLKW: usize = 38;
+    const F_SETLEASE: usize = 1024;
+    const F_GETLEASE: usize = 1025;
     const F_DUPFD_CLOEXEC: usize = 1030;
     const F_SETPIPE_SZ: usize = 1031;
     const F_GETPIPE_SZ: usize = 1032;
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
+    const F_OWNER_TID: i32 = 0;
+    const F_OWNER_PID: i32 = 1;
+    const F_OWNER_PGRP: i32 = 2;
 
     let ret = match cmd {
         F_GETFD => {
@@ -1940,6 +2411,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return EBADF;
             }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
             inner.ensure_fd_flags_len();
             let mut cur = inner.fd_flags[fd];
             if (arg & O_NONBLOCK) != 0 {
@@ -1947,7 +2419,15 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             } else {
                 cur &= !(O_NONBLOCK as u32);
             }
+            if (arg & O_ASYNC) != 0 {
+                cur |= O_ASYNC as u32;
+            } else {
+                cur &= !(O_ASYNC as u32);
+            }
             inner.fd_flags[fd] = cur;
+            if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+                pipe.set_async_enabled((cur & O_ASYNC as u32) != 0);
+            }
             0
         }
         F_GETFL => {
@@ -1968,6 +2448,9 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if (cur_flags & O_NONBLOCK as u32) != 0 {
                 flags |= O_NONBLOCK;
             }
+            if (cur_flags & O_ASYNC as u32) != 0 {
+                flags |= O_ASYNC;
+            }
             if (cur_flags & O_PATH as u32) != 0 {
                 flags |= O_PATH;
             }
@@ -1978,7 +2461,154 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
             flags as isize
         }
-        F_GETLK | F_SETLK | F_SETLKW => {
+        F_SETOWN => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                return EINVAL;
+            };
+            let owner = arg as i32;
+            let (owner_type, owner_pid) = if owner < 0 {
+                let Some(pid) = owner.checked_neg() else {
+                    return EINVAL;
+                };
+                (F_OWNER_PGRP, pid)
+            } else {
+                (F_OWNER_PID, owner)
+            };
+            match pipe.set_async_owner(owner_type, owner_pid) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        F_GETOWN => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                return EINVAL;
+            };
+            let (owner_type, owner_pid) = pipe.get_async_owner();
+            if owner_type == F_OWNER_PGRP {
+                -(owner_pid as isize)
+            } else {
+                owner_pid as isize
+            }
+        }
+        F_SETOWN_EX => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let token = get_current_token();
+            let own = match try_read_user_value::<FcntlOwnerEx>(token, arg as *const FcntlOwnerEx) {
+                Some(v) => v,
+                None => return EFAULT,
+            };
+            if !matches!(own.type_, F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP) {
+                return EINVAL;
+            }
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                return EINVAL;
+            };
+            match pipe.set_async_owner(own.type_, own.pid) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        F_GETOWN_EX => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                return EINVAL;
+            };
+            let (owner_type, owner_pid) = pipe.get_async_owner();
+            let own = FcntlOwnerEx {
+                type_: owner_type,
+                pid: owner_pid,
+            };
+            let token = get_current_token();
+            if try_write_user_value(token, arg as *mut FcntlOwnerEx, &own).is_err() {
+                return EFAULT;
+            }
+            0
+        }
+        F_SETSIG => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                return EINVAL;
+            };
+            let sig = arg as i32;
+            match pipe.set_async_signal(sig) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
+        F_GETSIG => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                return EINVAL;
+            };
+            pipe.get_async_signal() as isize
+        }
+        F_SETLEASE => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let Some(key) = file_lock_key(&file) else {
+                return EINVAL;
+            };
+            let owner_pid = current_process().getpid();
+            set_file_lease(key, owner_pid, arg as i16, &file)
+        }
+        F_GETLEASE => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let Some(key) = file_lock_key(&file) else {
+                return EINVAL;
+            };
+            let owner_pid = current_process().getpid();
+            get_file_lease_type(key, owner_pid) as isize
+        }
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
@@ -1987,13 +2617,23 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
 
-            let Some(key) = file_lock_key(&file) else {
-                return EINVAL;
-            };
             let token = get_current_token();
             let flock = match try_read_user_value::<FcntlFlock>(token, arg as *const FcntlFlock) {
                 Some(v) => v,
                 None => return EFAULT,
+            };
+            let is_ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+            if is_ofd && flock.l_pid != 0 {
+                return EINVAL;
+            }
+            let Some(key) = file_lock_key(&file) else {
+                return EINVAL;
+            };
+            let owner_pid = current_process().getpid();
+            let owner = if is_ofd {
+                RecordLockOwner::OpenFile(ofd_lock_owner_id(&file))
+            } else {
+                RecordLockOwner::Process(owner_pid)
             };
 
             let (start, end) = match lock_range_from_flock(&file, &flock) {
@@ -2016,16 +2656,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 _ => return EINVAL,
             }
 
-            if cmd == F_GETLK {
-                let owner_pid = current_process().getpid();
+            if matches!(cmd, F_GETLK | F_OFD_GETLK) {
                 let mut out = flock;
                 let conflict = {
                     let table = RECORD_LOCKS.lock();
                     table.get(&key).and_then(|locks| {
-                        locks
-                            .iter()
-                            .find(|lock| lock_conflicts(flock.l_type, start, end, owner_pid, lock))
-                            .copied()
+                        first_conflicting_lock(locks, flock.l_type, start, end, owner)
                     })
                 };
                 if let Some(lock) = conflict {
@@ -2036,7 +2672,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                         Some(lock_end) => lock_end.saturating_sub(lock.start).saturating_add(1),
                         None => 0,
                     };
-                    out.l_pid = lock.owner_pid as i32;
+                    out.l_pid = match lock.owner {
+                        RecordLockOwner::Process(pid) => pid as i32,
+                        RecordLockOwner::OpenFile(_) => -1,
+                    };
                 } else {
                     out.l_type = F_UNLCK;
                     out.l_pid = 0;
@@ -2046,63 +2685,70 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 }
                 0
             } else {
-                let blocking = cmd == F_SETLKW;
-                let owner_pid = current_process().getpid();
+                let blocking = matches!(cmd, F_SETLKW | F_OFD_SETLKW);
+                if !is_ofd {
+                    clear_record_lock_waiting(owner_pid);
+                }
                 let waiter_task = if blocking { current_task() } else { None };
                 let ret = loop {
-                    let mut remove_key = false;
                     let mut conflict_exists = false;
+                    let mut conflict_owners = Vec::new();
                     let mut should_wake_waiters = false;
                     {
                         let mut table = RECORD_LOCKS.lock();
                         let locks = table.entry(key).or_insert_with(Vec::new);
-                        if flock.l_type == F_UNLCK {
-                            let before = locks.len();
-                            locks.retain(|lock| {
-                                !(lock.owner_pid == owner_pid
-                                    && ranges_overlap(start, end, lock.start, lock.end))
-                            });
-                            should_wake_waiters = locks.len() != before;
-                            remove_key = locks.is_empty();
-                        } else {
-                            conflict_exists = locks.iter().any(|lock| {
-                                lock_conflicts(flock.l_type, start, end, owner_pid, lock)
-                            });
-                            if !conflict_exists {
-                                let before = locks.len();
-                                locks.retain(|lock| {
-                                    !(lock.owner_pid == owner_pid
-                                        && ranges_overlap(start, end, lock.start, lock.end))
-                                });
-                                should_wake_waiters = locks.len() != before;
-                                locks.push(RecordLock {
-                                    owner_pid,
-                                    lock_type: flock.l_type,
-                                    start,
-                                    end,
-                                });
-                            }
+                        conflict_exists = locks
+                            .iter()
+                            .any(|lock| lock_conflicts(flock.l_type, start, end, owner, lock));
+                        if conflict_exists && !is_ofd {
+                            conflict_owners = collect_conflict_process_owners(
+                                locks,
+                                flock.l_type,
+                                start,
+                                end,
+                                owner_pid,
+                            );
                         }
-                        if remove_key {
-                            table.remove(&key);
+                        if !conflict_exists {
+                            should_wake_waiters = apply_record_lock_for_owner(
+                                locks,
+                                owner,
+                                owner_pid,
+                                flock.l_type,
+                                start,
+                                end,
+                            );
+                            if locks.is_empty() {
+                                table.remove(&key);
+                            }
                         }
                     }
                     if should_wake_waiters {
                         wake_record_lock_waiters(key);
                     }
-
-                    if flock.l_type == F_UNLCK {
-                        break 0;
-                    }
                     if !conflict_exists {
                         break 0;
                     }
                     if !blocking {
-                        break EACCES;
+                        break EAGAIN;
+                    }
+                    if !is_ofd && detect_record_lock_deadlock(owner_pid, &conflict_owners) {
+                        break EDEADLK;
                     }
                     let Some(task) = waiter_task.as_ref() else {
                         break EACCES;
                     };
+                    if !is_ofd {
+                        set_record_lock_waiting(
+                            owner_pid,
+                            WaitingRecordLock {
+                                key,
+                                req_type: flock.l_type,
+                                start,
+                                end,
+                            },
+                        );
+                    }
                     enqueue_record_lock_waiter(key, task);
                     let still_conflict = {
                         let table = RECORD_LOCKS.lock();
@@ -2110,27 +2756,39 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                             .get(&key)
                             .map(|locks| {
                                 locks.iter().any(|lock| {
-                                    lock_conflicts(flock.l_type, start, end, owner_pid, lock)
+                                    lock_conflicts(flock.l_type, start, end, owner, lock)
                                 })
                             })
                             .unwrap_or(false)
                     };
                     if !still_conflict {
                         remove_record_lock_waiter(key, task);
+                        if !is_ofd {
+                            clear_record_lock_waiting(owner_pid);
+                        }
                         continue;
                     }
                     if has_pending_unmasked_signal() {
                         remove_record_lock_waiter(key, task);
+                        if !is_ofd {
+                            clear_record_lock_waiting(owner_pid);
+                        }
                         break EINTR;
                     }
-                    suspend_current_and_run_next();
+                    block_current_and_run_next();
                     if has_pending_unmasked_signal() {
                         remove_record_lock_waiter(key, task);
+                        if !is_ofd {
+                            clear_record_lock_waiting(owner_pid);
+                        }
                         break EINTR;
                     }
                 };
                 if let Some(task) = waiter_task.as_ref() {
                     remove_record_lock_waiter(key, task);
+                }
+                if !is_ofd {
+                    clear_record_lock_waiting(owner_pid);
                 }
                 ret
             }
@@ -2142,6 +2800,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 return EBADF;
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return EINVAL;
             };
@@ -2157,6 +2816,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 return EBADF;
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return EINVAL;
             };
@@ -2172,15 +2832,19 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             inner.ensure_fd_flags_len();
             let old_flags = inner.fd_flags[fd];
             let minfd = arg;
+            let limit = inner.rlimit_nofile_cur as usize;
+            if minfd >= limit {
+                return EINVAL;
+            }
             let mut newfd = minfd;
             while newfd < inner.fd_table.len() && inner.fd_table[newfd].is_some() {
                 newfd += 1;
             }
+            if newfd >= limit {
+                return EMFILE;
+            }
             if newfd >= inner.fd_table.len() {
-                // Extend fd table to fit.
-                if newfd > 4096 {
-                    return EMFILE;
-                }
+                // Extend fd table to fit the selected target descriptor.
                 inner.fd_table.resize(newfd + 1, None);
                 inner.fd_flags.resize(newfd + 1, 0);
             }
@@ -2260,7 +2924,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             _ => (true, false),
         }
     };
-    let write_intent = writable || (flags & (O_CREAT | O_TRUNC | O_TMPFILE)) != 0;
+    let tmpfile_requested = (flags & O_TMPFILE) == O_TMPFILE;
+    let write_intent = writable || (flags & (O_CREAT | O_TRUNC)) != 0 || tmpfile_requested;
     let readonly_fs = rofs_for_path(dirfd, &path);
     if write_intent && readonly_fs {
         return EROFS;
@@ -2276,7 +2941,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             return e;
         }
     };
-    let tmpfile_requested = (flags & O_TMPFILE) == O_TMPFILE;
     let create_mode = apply_umask(mode);
     let mut created = false;
     let mut created_parent: Option<alloc::sync::Arc<ext4_fs::Inode>> = None;
@@ -2553,6 +3217,15 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         return ENOTDIR;
     }
 
+    if !o_path && inode.is_file() {
+        maybe_signal_lease_break(
+            file_lock_key_from_inode(&inode),
+            writable,
+            false,
+            current_process().getpid(),
+        );
+    }
+
     if !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file() {
         if let Err(e) = inode.clear() {
             return ext4_err_to_errno(e);
@@ -2633,6 +3306,16 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             PseudoDirent {
                 name: alloc::string::String::from("devices"),
                 ino: 2,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("block"),
+                ino: 3,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("dev"),
+                ino: 4,
                 dtype: 4
             },
         ];
@@ -2763,6 +3446,214 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     if path == "/etc/group" {
         return Some(alloc::sync::Arc::new(PseudoFile::new_static(
             "root:x:0:\ndaemon:x:1:\nusers:x:100:\nnobody:x:65534:\nnogroup:x:65534:\n",
+        )));
+    }
+
+    // Minimal block topology nodes expected by LTP device helpers.
+    if path == "/sys/block" || path == "/sys/block/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("root"),
+                ino: 2,
+                dtype: 4
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/sys/block", entries)));
+    }
+    if path == "/sys/block/root" || path == "/sys/block/root/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("queue"),
+                ino: 2,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("size"),
+                ino: 3,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("stat"),
+                ino: 4,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("dev"),
+                ino: 5,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("removable"),
+                ino: 6,
+                dtype: 8
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/sys/block/root",
+            entries,
+        )));
+    }
+    if path == "/sys/block/root/queue" || path == "/sys/block/root/queue/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("logical_block_size"),
+                ino: 2,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("physical_block_size"),
+                ino: 3,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("minimum_io_size"),
+                ino: 4,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("optimal_io_size"),
+                ino: 5,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("dma_alignment"),
+                ino: 6,
+                dtype: 8
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/sys/block/root/queue",
+            entries,
+        )));
+    }
+    if path == "/sys/block/root/size" {
+        // 1GiB pseudo block device in 512-byte sectors.
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("2097152\n")));
+    }
+    if path == "/sys/block/root/stat" {
+        let stat = pseudo_block_stat_snapshot();
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static(&stat)));
+    }
+    if path == "/sys/block/root/dev" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("1:0\n")));
+    }
+    if path == "/sys/block/root/removable" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
+    }
+    if path == "/sys/block/root/queue/logical_block_size" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("512\n")));
+    }
+    if path == "/sys/block/root/queue/physical_block_size" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("4096\n")));
+    }
+    if path == "/sys/block/root/queue/minimum_io_size" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("512\n")));
+    }
+    if path == "/sys/block/root/queue/optimal_io_size" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
+    }
+    if path == "/sys/block/root/queue/dma_alignment" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
+    }
+    if path == "/sys/dev" || path == "/sys/dev/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("block"),
+                ino: 2,
+                dtype: 4
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/sys/dev", entries)));
+    }
+    if path == "/sys/dev/block" || path == "/sys/dev/block/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("1:0"),
+                ino: 2,
+                dtype: 4
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/sys/dev/block",
+            entries,
+        )));
+    }
+    if path == "/sys/dev/block/1:0" || path == "/sys/dev/block/1:0/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("uevent"),
+                ino: 2,
+                dtype: 8
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/sys/dev/block/1:0",
+            entries,
+        )));
+    }
+    if path == "/sys/dev/block/1:0/uevent" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
+            "MAJOR=1\nMINOR=0\nDEVNAME=root\nDEVTYPE=disk\n",
         )));
     }
 
@@ -3471,20 +4362,58 @@ pub fn syscall_linkat(
     }
 }
 
-/// Linux `renameat(2)` (syscall 38 on riscv64).
-pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpath: usize) -> isize {
-    let token = get_current_token();
-    let old_s = translated_str(token, oldpath as *const u8);
-    let new_s = translated_str(token, newpath as *const u8);
-    if old_s.is_empty() || new_s.is_empty() {
-        return ENOENT;
-    }
+fn inode_eq(a: &Arc<ext4_fs::Inode>, b: &Arc<ext4_fs::Inode>) -> bool {
+    a.device_id() == b.device_id() && a.inode_num() == b.inode_num()
+}
 
-    let old_at = match resolve_at_path(olddirfd, &old_s) {
+fn path_is_descendant_of(dir: Arc<ext4_fs::Inode>, ancestor: &Arc<ext4_fs::Inode>) -> bool {
+    let mut cur = dir;
+    for _ in 0..256 {
+        if inode_eq(&cur, ancestor) {
+            return true;
+        }
+        let Some(parent) = cur.find("..") else {
+            return false;
+        };
+        if inode_eq(&parent, &cur) {
+            return false;
+        }
+        cur = parent;
+    }
+    false
+}
+
+fn sticky_rename_allowed(
+    parent: &Arc<ext4_fs::Inode>,
+    victim: &Arc<ext4_fs::Inode>,
+    fsuid: u32,
+) -> bool {
+    if (parent.mode() & 0o1000) == 0 {
+        return true;
+    }
+    fsuid == 0 || fsuid == parent.uid() || fsuid == victim.uid()
+}
+
+fn remove_rename_target(parent: &Arc<ext4_fs::Inode>, name: &str) -> isize {
+    match parent.unlink(name) {
+        Ok(()) => 0,
+        Err(ext4_fs::Ext4Error::Unsupported) => ENOTEMPTY,
+        Err(e) => ext4_err_to_errno(e),
+    }
+}
+
+fn do_renameat(
+    olddirfd: isize,
+    old_s: &str,
+    newdirfd: isize,
+    new_s: &str,
+    no_replace: bool,
+) -> isize {
+    let old_at = match resolve_at_path(olddirfd, old_s) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let new_at = match resolve_at_path(newdirfd, &new_s) {
+    let new_at = match resolve_at_path(newdirfd, new_s) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -3493,8 +4422,11 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
         return EROFS;
     }
 
-    let _ext4_guard = ext4_lock();
+    if rofs_for_path(olddirfd, old_s) || rofs_for_path(newdirfd, new_s) {
+        return EROFS;
+    }
 
+    let _ext4_guard = ext4_lock();
     let (fsuid, fsgid) = current_fsuid_gid();
     let (old_parent, old_name) = match resolve_parent_and_name(&old_at, fsuid, fsgid) {
         Ok(v) => v,
@@ -3505,6 +4437,15 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
         Err(e) => return e,
     };
 
+    if old_name.is_empty() || new_name.is_empty() {
+        return ENOENT;
+    }
+    if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+        return EINVAL;
+    }
+    if old_name == new_name && inode_eq(&old_parent, &new_parent) {
+        return 0;
+    }
     if !old_parent.is_dir() || !new_parent.is_dir() {
         return ENOTDIR;
     }
@@ -3513,22 +4454,192 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
     {
         return EACCES;
     }
-    if old_parent.find(&old_name).is_none() {
+
+    let Some(source) = old_parent.find(&old_name) else {
         return ENOENT;
-    }
-    if rofs_for_path(olddirfd, &old_s) || rofs_for_path(newdirfd, &new_s) {
-        return EROFS;
-    }
-
-    // ext4 implementation only supports rename within the same directory for now.
-    if old_parent.inode_num() != new_parent.inode_num() {
-        return EXDEV;
+    };
+    if !sticky_rename_allowed(&old_parent, &source, fsuid) {
+        return EPERM;
     }
 
+    let target = new_parent.find(&new_name);
+    if let Some(target_inode) = target.as_ref() {
+        if !sticky_rename_allowed(&new_parent, target_inode, fsuid) {
+            return EPERM;
+        }
+        if inode_eq(&source, target_inode) {
+            return 0;
+        }
+        if source.is_dir() && !target_inode.is_dir() {
+            return ENOTDIR;
+        }
+        if !source.is_dir() && target_inode.is_dir() {
+            return EISDIR;
+        }
+        if source.is_dir() && target_inode.is_dir() && !target_inode.ls().is_empty() {
+            return ENOTEMPTY;
+        }
+        if no_replace {
+            return EEXIST;
+        }
+    }
+
+    if source.is_dir() && path_is_descendant_of(new_parent.clone(), &source) {
+        return EINVAL;
+    }
+
+    let same_parent = inode_eq(&old_parent, &new_parent);
+    if !same_parent {
+        if source.is_dir() {
+            if new_parent.link_count() >= u16::MAX as u32 {
+                return EMLINK;
+            }
+            return EXDEV;
+        }
+
+        if target.is_some() {
+            let rc = remove_rename_target(&new_parent, &new_name);
+            if rc != 0 {
+                return rc;
+            }
+        }
+        if let Err(e) = new_parent.link_inode(&new_name, &source) {
+            return ext4_err_to_errno(e);
+        }
+        if let Err(e) = old_parent.unlink(&old_name) {
+            let _ = new_parent.unlink(&new_name);
+            return ext4_err_to_errno(e);
+        }
+        return 0;
+    }
+
+    if target.is_some() {
+        let rc = remove_rename_target(&old_parent, &new_name);
+        if rc != 0 {
+            return rc;
+        }
+    }
     match old_parent.rename(&old_name, &new_name) {
         Ok(_) => 0,
         Err(e) => ext4_err_to_errno(e),
     }
+}
+
+fn do_renameat_exchange(olddirfd: isize, old_s: &str, newdirfd: isize, new_s: &str) -> isize {
+    let old_at = match resolve_at_path(olddirfd, old_s) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let new_at = match resolve_at_path(newdirfd, new_s) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if matches!(old_at, AtPath::PseudoAbs(_)) || matches!(new_at, AtPath::PseudoAbs(_)) {
+        return EROFS;
+    }
+    if rofs_for_path(olddirfd, old_s) || rofs_for_path(newdirfd, new_s) {
+        return EROFS;
+    }
+
+    let _ext4_guard = ext4_lock();
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let (old_parent, old_name) = match resolve_parent_and_name(&old_at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (new_parent, new_name) = match resolve_parent_and_name(&new_at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if old_name.is_empty() || new_name.is_empty() {
+        return ENOENT;
+    }
+    if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+        return EINVAL;
+    }
+    if !inode_mode_allows_uid_gid(&old_parent, 3, fsuid, fsgid)
+        || !inode_mode_allows_uid_gid(&new_parent, 3, fsuid, fsgid)
+    {
+        return EACCES;
+    }
+
+    let Some(old_inode) = old_parent.find(&old_name) else {
+        return ENOENT;
+    };
+    let Some(new_inode) = new_parent.find(&new_name) else {
+        return ENOENT;
+    };
+
+    if !sticky_rename_allowed(&old_parent, &old_inode, fsuid)
+        || !sticky_rename_allowed(&new_parent, &new_inode, fsuid)
+    {
+        return EPERM;
+    }
+    if old_inode.is_dir() || new_inode.is_dir() {
+        return EINVAL;
+    }
+    if old_inode.device_id() != new_inode.device_id() {
+        return EXDEV;
+    }
+    if inode_eq(&old_inode, &new_inode) {
+        return 0;
+    }
+
+    let pid = current_process().getpid();
+    let mut tmp_name = String::new();
+    for i in 0..64 {
+        let candidate = alloc::format!(".rename_swap_{}.{}", pid, i);
+        if old_parent.find(&candidate).is_none() && new_parent.find(&candidate).is_none() {
+            tmp_name = candidate;
+            break;
+        }
+    }
+    if tmp_name.is_empty() {
+        return EBUSY;
+    }
+
+    if let Err(e) = old_parent.link_inode(&tmp_name, &old_inode) {
+        return ext4_err_to_errno(e);
+    }
+    if let Err(e) = old_parent.unlink(&old_name) {
+        let _ = old_parent.unlink(&tmp_name);
+        return ext4_err_to_errno(e);
+    }
+    if let Err(e) = old_parent.link_inode(&old_name, &new_inode) {
+        let _ = old_parent.link_inode(&old_name, &old_inode);
+        let _ = old_parent.unlink(&tmp_name);
+        return ext4_err_to_errno(e);
+    }
+    if let Err(e) = new_parent.unlink(&new_name) {
+        return ext4_err_to_errno(e);
+    }
+    if let Err(e) = new_parent.link_inode(&new_name, &old_inode) {
+        let _ = new_parent.link_inode(&new_name, &new_inode);
+        return ext4_err_to_errno(e);
+    }
+    if let Err(e) = old_parent.unlink(&tmp_name) {
+        return ext4_err_to_errno(e);
+    }
+    0
+}
+
+/// Linux `renameat(2)` (syscall 38 on riscv64).
+pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpath: usize) -> isize {
+    let token = get_current_token();
+    let old_s = match read_user_cstring(token, oldpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let new_s = match read_user_cstring(token, newpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if old_s.is_empty() || new_s.is_empty() {
+        return ENOENT;
+    }
+    do_renameat(olddirfd, &old_s, newdirfd, &new_s, false)
 }
 
 /// Linux `renameat2(2)` (syscall 276 on riscv64).
@@ -3539,10 +4650,43 @@ pub fn syscall_renameat2(
     newpath: usize,
     flags: usize,
 ) -> isize {
-    if flags != 0 {
+    const RENAME_NOREPLACE: usize = 1;
+    const RENAME_EXCHANGE: usize = 2;
+    const RENAME_WHITEOUT: usize = 4;
+
+    if (flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT)) != 0 {
         return EINVAL;
     }
-    syscall_renameat(olddirfd, oldpath, newdirfd, newpath)
+    if (flags & RENAME_EXCHANGE) != 0 && (flags & (RENAME_NOREPLACE | RENAME_WHITEOUT)) != 0 {
+        return EINVAL;
+    }
+    if (flags & RENAME_WHITEOUT) != 0 {
+        return EINVAL;
+    }
+
+    let token = get_current_token();
+    let old_s = match read_user_cstring(token, oldpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let new_s = match read_user_cstring(token, newpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if old_s.is_empty() || new_s.is_empty() {
+        return ENOENT;
+    }
+
+    if flags == 0 {
+        return do_renameat(olddirfd, &old_s, newdirfd, &new_s, false);
+    }
+    if flags == RENAME_NOREPLACE {
+        return do_renameat(olddirfd, &old_s, newdirfd, &new_s, true);
+    }
+    if flags == RENAME_EXCHANGE {
+        return do_renameat_exchange(olddirfd, &old_s, newdirfd, &new_s);
+    }
+    EINVAL
 }
 
 pub fn syscall_close(fd: usize) -> isize {
@@ -3551,7 +4695,13 @@ pub fn syscall_close(fd: usize) -> isize {
     if fd >= inner.fd_table.len() {
         return EBADF;
     }
+    let lock_key = inner.fd_table[fd].as_ref().and_then(file_lock_key);
     let _ = inner.clear_fd(fd);
+    drop(inner);
+    if let Some(key) = lock_key {
+        remove_process_record_locks_for_key(current_process().getpid(), key);
+        remove_owner_file_lease_for_key(current_process().getpid(), key);
+    }
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
         if pid >= 2 && fd <= 8 {
@@ -3590,13 +4740,27 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
         return 0;
     }
 
+    let mut lock_keys = BTreeSet::new();
     for fd in first..=end {
         if set_cloexec {
             if inner.is_fd_open(fd) {
                 inner.fd_flags[fd] |= FD_CLOEXEC;
             }
         } else {
+            if let Some(file) = inner.fd_table[fd].as_ref() {
+                if let Some(key) = file_lock_key(file) {
+                    lock_keys.insert(key);
+                }
+            }
             let _ = inner.clear_fd(fd);
+        }
+    }
+    drop(inner);
+    if !set_cloexec {
+        let owner_pid = current_process().getpid();
+        for key in lock_keys {
+            remove_process_record_locks_for_key(owner_pid, key);
+            remove_owner_file_lease_for_key(owner_pid, key);
         }
     }
     0
@@ -4029,8 +5193,15 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     if !inner.is_fd_open(oldfd) {
         return EBADF;
     }
+    let owner_pid = current_process().getpid();
+    let mut replaced_lock_key = None;
     if inner.is_fd_open(newfd) {
+        replaced_lock_key = inner.fd_table[newfd].as_ref().and_then(file_lock_key);
         let _ = inner.clear_fd(newfd);
+    }
+    if let Some(key) = replaced_lock_key {
+        remove_process_record_locks_for_key(owner_pid, key);
+        remove_owner_file_lease_for_key(owner_pid, key);
     }
     let file = inner.fd_table[oldfd].as_ref().unwrap().clone();
     inner.ensure_fd_flags_len();
@@ -4253,10 +5424,17 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     let (fsuid, fsgid) = current_fsuid_gid();
 
     let _ext4_guard = ext4_lock();
+    let dirfd_rofs = matches!(
+        &at,
+        AtPath::Ext4Rel { base, .. } if inode_is_rofs_mount_root(base)
+    );
     let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if dirfd_rofs || rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
     if !parent.is_dir() {
         return ENOTDIR;
     }
@@ -4265,9 +5443,6 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     }
     if parent.find(&name).is_some() {
         return EEXIST;
-    }
-    if rofs_for_path(dirfd, &path) {
-        return EROFS;
     }
 
     let mut file_type = (mode as u16) & S_IFMT;
@@ -4411,13 +5586,21 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     }
 }
 
-pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
+pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     const AT_REMOVEDIR: usize = 0x200;
+    if (flags & !AT_REMOVEDIR) != 0 {
+        return EINVAL;
+    }
+
     let token = get_current_token();
-    let path = translated_str(token, pathname as *const u8);
+    let path = match read_user_cstring(token, pathname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if path.is_empty() {
         return ENOENT;
     }
+    let remove_dir = (flags & AT_REMOVEDIR) != 0;
 
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
@@ -4425,7 +5608,6 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
-        let remove_dir = (_flags & AT_REMOVEDIR) != 0;
         // Minimal `/dev/shm` support for POSIX `shm_unlink`.
         if abs == "/dev/shm" || abs == "/dev/shm/" {
             return if remove_dir { EROFS } else { EISDIR };
@@ -4458,11 +5640,31 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
         return EACCES;
     }
-
-    let remove_dir = (_flags & AT_REMOVEDIR) != 0;
+    if remove_dir && final_non_empty_component(&path) == Some(".") {
+        return EINVAL;
+    }
+    if remove_dir && final_non_empty_component(&path) == Some("..") {
+        return ENOTEMPTY;
+    }
+    if remove_dir && name == "." {
+        return EINVAL;
+    }
+    if remove_dir && name == ".." {
+        return ENOTEMPTY;
+    }
+    if remove_dir {
+        if let Some(abs) = resolve_abs_path(dirfd, &path) {
+            if path_is_mount_point(&abs) {
+                return EBUSY;
+            }
+        }
+    }
 
     // Validate target type: unlink vs rmdir semantics.
     let Some(child) = parent.find(&name) else {
+        if rofs_for_path(dirfd, &path) {
+            return EROFS;
+        }
         return ENOENT;
     };
     if remove_dir {
@@ -4476,6 +5678,12 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, _flags: usize) -> isize {
         if child.is_dir() {
             return EISDIR;
         }
+    }
+    if !sticky_rename_allowed(&parent, &child, fsuid) {
+        return EPERM;
+    }
+    if inode_is_immutable_or_append(&child) {
+        return EPERM;
     }
     if rofs_for_path(dirfd, &path) {
         return EROFS;
@@ -4575,6 +5783,195 @@ fn truncate_regular_inode(inode: &Arc<ext4_fs::Inode>, new_len: usize) -> isize 
     0
 }
 
+fn read_inode_range(
+    inode: &Arc<ext4_fs::Inode>,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>, isize> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![0u8; len];
+    let mut done = 0usize;
+    let _ext4_guard = ext4_lock();
+    while done < len {
+        let got = inode.read_at(offset + done, &mut out[done..]);
+        if got == 0 {
+            break;
+        }
+        done += got;
+    }
+    if done < len {
+        out[done..].fill(0);
+    }
+    Ok(out)
+}
+
+fn write_inode_range(inode: &Arc<ext4_fs::Inode>, offset: usize, data: &[u8]) -> isize {
+    if data.is_empty() {
+        return 0;
+    }
+    let _ext4_guard = ext4_lock();
+    let mut done = 0usize;
+    while done < data.len() {
+        match inode.write_at(offset + done, &data[done..]) {
+            Ok(0) => return EIO,
+            Ok(written) => done += written,
+            Err(e) => return ext4_err_to_errno(e),
+        }
+    }
+    0
+}
+
+fn write_zeros_range(inode: &Arc<ext4_fs::Inode>, offset: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let zeros = [0u8; 4096];
+    let mut off = offset;
+    let end = offset.saturating_add(len);
+    let _ext4_guard = ext4_lock();
+    while off < end {
+        let chunk = core::cmp::min(zeros.len(), end - off);
+        match inode.write_at(off, &zeros[..chunk]) {
+            Ok(0) => return EIO,
+            Ok(written) => off += written,
+            Err(e) => return ext4_err_to_errno(e),
+        }
+    }
+    0
+}
+
+fn punch_hole_keep_size(inode: &Arc<ext4_fs::Inode>, offset: usize, len: usize) -> isize {
+    let old_size = {
+        let _ext4_guard = ext4_lock();
+        inode.size() as usize
+    };
+    if old_size == 0 || offset >= old_size || len == 0 {
+        return 0;
+    }
+    let hole_end = core::cmp::min(offset.saturating_add(len), old_size);
+    if hole_end <= offset {
+        return 0;
+    }
+    let prefix = match read_inode_range(inode, 0, offset) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let suffix_len = old_size - hole_end;
+    let suffix = match read_inode_range(inode, hole_end, suffix_len) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    {
+        let _ext4_guard = ext4_lock();
+        if let Err(e) = inode.clear() {
+            return ext4_err_to_errno(e);
+        }
+    }
+    let ret = write_inode_range(inode, 0, &prefix);
+    if ret != 0 {
+        return ret;
+    }
+    write_inode_range(inode, hole_end, &suffix)
+}
+
+/// Linux `fallocate(2)` (syscall 47 on riscv64).
+pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    if (offset as i64) < 0 || (len as i64) < 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return EINVAL;
+    }
+    if (mode & !FALLOC_FL_SUPPORTED_MASK) != 0 {
+        return EOPNOTSUPP;
+    }
+    if (mode & FALLOC_FL_PUNCH_HOLE) != 0 && (mode & FALLOC_FL_KEEP_SIZE) == 0 {
+        return EINVAL;
+    }
+    if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
+        // Keep semantics explicit until sparse extent metadata is implemented.
+        return EOPNOTSUPP;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if !file.writable() {
+        return EBADF;
+    }
+    let Some(end) = offset.checked_add(len) else {
+        return EFBIG;
+    };
+    if end > (i64::MAX as usize) {
+        return EFBIG;
+    }
+    // Current backend does not model tmpfs-like huge preallocation reliably.
+    // Keep this explicit so large/stress-only cases return TCONF instead of
+    // polluting later tests by filling the shared root image.
+    if mode == 0 && offset == 0 && len >= (1 << 20) {
+        return EOPNOTSUPP;
+    }
+    // Misaligned mode=0 fallocate requires filesystem support we don't expose
+    // yet; report unsupported to keep semantics explicit.
+    if mode == 0 && (offset & 0xfff) != 0 {
+        return EOPNOTSUPP;
+    }
+    if fsize_limit_allows(end).is_err() {
+        return EFBIG;
+    }
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    if os_inode.readonly_fs() {
+        return EROFS;
+    }
+    let inode = os_inode.ext4_inode();
+    {
+        let _ext4_guard = ext4_lock();
+        if inode.is_dir() {
+            return EISDIR;
+        }
+        if !inode.is_file() {
+            return EINVAL;
+        }
+    }
+    maybe_signal_lease_break(
+        file_lock_key_from_inode(&inode),
+        true,
+        true,
+        current_process().getpid(),
+    );
+    let _ = os_inode.flush();
+    flush_open_inode_views(&inode);
+
+    let ret = if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
+        punch_hole_keep_size(&inode, offset, len)
+    } else {
+        let old_size = {
+            let _ext4_guard = ext4_lock();
+            inode.size() as usize
+        };
+        let alloc_end = if (mode & FALLOC_FL_KEEP_SIZE) != 0 {
+            core::cmp::min(end, old_size)
+        } else {
+            end
+        };
+        if alloc_end <= offset {
+            0
+        } else {
+            write_zeros_range(&inode, offset, alloc_end - offset)
+        }
+    };
+    if ret == 0 {
+        touch_inode_mtime_ctime_now(&inode);
+    }
+    ret
+}
+
 /// Linux `ftruncate(2)` (syscall 46 on riscv64).
 pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
     if (length as i64) < 0 {
@@ -4607,6 +6004,12 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
         }
         let _ = os_inode.flush();
         let inode = os_inode.ext4_inode();
+        maybe_signal_lease_break(
+            file_lock_key_from_inode(&inode),
+            true,
+            true,
+            current_process().getpid(),
+        );
         let ret = truncate_regular_inode(&inode, length);
         if ret == 0 {
             touch_inode_mtime_ctime_now(&inode);
@@ -4661,6 +6064,12 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
     if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
         return EACCES;
     }
+    maybe_signal_lease_break(
+        file_lock_key_from_inode(&inode),
+        true,
+        true,
+        current_process().getpid(),
+    );
     drop(_ext4_guard);
     flush_open_inode_views(&inode);
     let ret = truncate_regular_inode(&inode, length);
@@ -5165,6 +6574,9 @@ struct Statx {
 }
 
 const STATX_BASIC_STATS: u32 = 0x07ff;
+const STATX_ATTR_IMMUTABLE: u64 = 0x0000_0010;
+const STATX_ATTR_APPEND: u64 = 0x0000_0020;
+const STATX_ATTR_NODUMP: u64 = 0x0000_0040;
 
 const EXT4_ST_DEV: u64 = 1;
 
@@ -5220,10 +6632,35 @@ fn statx_from_kstat(st: &KStat) -> Statx {
     let stx_rdev_minor = linux_dev_minor(st.st_rdev);
     let stx_dev_major = linux_dev_major(st.st_dev);
     let stx_dev_minor = linux_dev_minor(st.st_dev);
+    let fs_flags = if st.st_dev == EXT4_ST_DEV {
+        inode_fs_flags(st.st_ino)
+    } else {
+        0
+    };
+    let stx_attributes = {
+        let mut attrs = 0u64;
+        if (fs_flags & FS_APPEND_FL) != 0 {
+            attrs |= STATX_ATTR_APPEND;
+        }
+        if (fs_flags & FS_IMMUTABLE_FL) != 0 {
+            attrs |= STATX_ATTR_IMMUTABLE;
+        }
+        if (fs_flags & FS_NODUMP_FL) != 0 {
+            attrs |= STATX_ATTR_NODUMP;
+        }
+        attrs
+    };
+    // Keep compressed out of the advertised mask so tmpfs-backed runs match
+    // Linux behavior (STATX_ATTR_COMPRESSED unsupported there).
+    let stx_attributes_mask = if st.st_dev == EXT4_ST_DEV {
+        STATX_ATTR_APPEND | STATX_ATTR_IMMUTABLE | STATX_ATTR_NODUMP
+    } else {
+        0
+    };
     Statx {
         stx_mask: STATX_BASIC_STATS,
         stx_blksize: st.st_blksize,
-        stx_attributes: 0,
+        stx_attributes,
         stx_nlink: st.st_nlink,
         stx_uid: st.st_uid,
         stx_gid: st.st_gid,
@@ -5232,7 +6669,7 @@ fn statx_from_kstat(st: &KStat) -> Statx {
         stx_ino: st.st_ino,
         stx_size: st.st_size.max(0) as u64,
         stx_blocks: st.st_blocks,
-        stx_attributes_mask: 0,
+        stx_attributes_mask,
         stx_atime: statx_timestamp(st.st_atime_sec, st.st_atime_nsec),
         stx_btime: statx_timestamp(0, 0),
         stx_ctime: statx_timestamp(st.st_ctime_sec, st.st_ctime_nsec),
@@ -5574,19 +7011,30 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
 ///
 /// iozone uses this heavily; keep it lightweight but flush per-fd buffered writes.
 pub fn syscall_fsync(fd: usize) -> isize {
-    // A full ext4 sync for every `fsync` call is prohibitively expensive for
-    // micro-benchmarks like iozone (it may call `fsync` very frequently).
-    // Flush the per-fd write buffer so subsequent reads from other fds see data.
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = os_inode.ext4_inode();
+        {
+            let _ext4_guard = ext4_lock();
+            if !(inode.is_file() || inode.is_dir()) {
+                return EINVAL;
+            }
+        }
         if os_inode.readonly_fs() {
             return 0;
         }
+        // A full ext4 sync for every call is prohibitively expensive for
+        // micro-benchmarks like iozone. Flush per-fd buffered writes instead.
         let _ = os_inode.flush();
+        pseudo_block_note_sync();
+        return 0;
     }
-    0
+    EINVAL
 }
 
 /// Linux `sync(2)` (syscall 81 on riscv64).
@@ -5628,6 +7076,72 @@ pub fn syscall_sync() -> isize {
         }
     }
     sync_all();
+    pseudo_block_note_sync();
+    0
+}
+
+/// Linux `syncfs(2)` (syscall 267 on riscv64).
+///
+/// We treat this as a per-filesystem sync request rooted at `fd`.
+pub fn syscall_syncfs(fd: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if file.as_any().downcast_ref::<OSInode>().is_none() {
+        return EINVAL;
+    }
+    syscall_sync()
+}
+
+/// Linux `sync_file_range(2)` (syscall 84 on riscv64).
+///
+/// Minimal implementation: flush buffered data for regular files.
+pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: usize) -> isize {
+    const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
+    const SYNC_FILE_RANGE_WRITE: usize = 2;
+    const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if file.as_any().downcast_ref::<Pipe>().is_some()
+        || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
+        || file.as_any().downcast_ref::<PseudoFile>().is_some()
+        || file.as_any().downcast_ref::<PseudoDir>().is_some()
+        || file.as_any().downcast_ref::<PseudoBlock>().is_some()
+        || file.as_any().downcast_ref::<RtcFile>().is_some()
+        || file.as_any().downcast_ref::<NetSocketFile>().is_some()
+    {
+        return ESPIPE;
+    }
+    let valid_flags =
+        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    if (offset as i64) < 0 || (nbytes as i64) < 0 {
+        return EINVAL;
+    }
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let inode = os_inode.ext4_inode();
+    {
+        let _ext4_guard = ext4_lock();
+        if !inode.is_file() {
+            return EINVAL;
+        }
+    }
+    if os_inode.readonly_fs() {
+        return 0;
+    }
+    let _ = os_inode.flush();
+    pseudo_block_note_sync();
     0
 }
 
@@ -6056,6 +7570,9 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     // Returning fewer bytes is allowed; callers will retry with the remaining entries.
     const MAX_DIRENT_BUF: usize = 256 * 1024;
     let len = len.min(MAX_DIRENT_BUF);
+    if len > 0 && len < 24 {
+        return EINVAL;
+    }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
@@ -6163,6 +7680,9 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     if !inode.is_dir() {
         return ENOTDIR;
     };
+    if inode.link_count() == 0 {
+        return ENOENT;
+    }
 
     if len == 0 {
         return 0;

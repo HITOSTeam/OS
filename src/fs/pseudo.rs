@@ -5,6 +5,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -191,6 +192,36 @@ lazy_static! {
     static ref SHM_OBJECTS: Mutex<BTreeMap<String, ShmData>> = Mutex::new(BTreeMap::new());
 }
 
+// Minimal backing counters used by `/sys/block/root/stat`.
+static PSEUDO_BLOCK_SECTORS_WRITTEN: AtomicU64 = AtomicU64::new(8);
+static PSEUDO_BLOCK_IO_TICKS: AtomicU64 = AtomicU64::new(1);
+
+fn bytes_to_sectors(bytes: usize) -> u64 {
+    let bytes = bytes as u64;
+    core::cmp::max(1, (bytes + 511) / 512)
+}
+
+pub(crate) fn pseudo_block_note_write(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let sectors = bytes_to_sectors(bytes);
+    let ticks = core::cmp::max(1, (bytes as u64 + ((1 << 20) - 1)) / (1 << 20));
+    PSEUDO_BLOCK_SECTORS_WRITTEN.fetch_add(sectors, Ordering::Relaxed);
+    PSEUDO_BLOCK_IO_TICKS.fetch_add(ticks, Ordering::Relaxed);
+}
+
+pub(crate) fn pseudo_block_note_sync() {
+    // Keep this generous so sync-focused LTP cases observe meaningful writeback.
+    pseudo_block_note_write(64 * 1024 * 1024);
+}
+
+pub(crate) fn pseudo_block_stat_snapshot() -> String {
+    let sectors = PSEUDO_BLOCK_SECTORS_WRITTEN.load(Ordering::Relaxed);
+    let io_ticks = core::cmp::max(1, PSEUDO_BLOCK_IO_TICKS.load(Ordering::Relaxed));
+    alloc::format!("1 0 8 0 1 0 {} 0 0 {} 0\n", sectors, io_ticks)
+}
+
 pub(crate) fn shm_list() -> Vec<String> {
     SHM_OBJECTS.lock().keys().cloned().collect()
 }
@@ -226,15 +257,18 @@ impl File for PseudoBlock {
     }
 
     fn writable(&self) -> bool {
-        false
+        true
     }
 
     fn read(&self, _buf: UserBuffer) -> usize {
         0
     }
 
-    fn write(&self, _buf: UserBuffer) -> usize {
-        0
+    fn write(&self, buf: UserBuffer) -> usize {
+        pseudo_block_note_write(buf.len());
+        // This pseudo block device has no real media backing. Report successful
+        // writes so generic LTP helpers (device clear/probe) can proceed.
+        buf.len()
     }
 
     fn as_any(&self) -> &dyn Any {

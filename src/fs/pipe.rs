@@ -8,12 +8,12 @@ use spin::Mutex;
 
 use crate::{
     debug_config::DEBUG_UNIXBENCH,
-    fs::File,
+    fs::{File, find_path_in_roots},
     mm::UserBuffer,
     task::{
-        manager::{wakeup_task, PID2PCB},
-        processor::{block_current_and_run_next, current_task},
-        signal::{has_unmasked_pending, signal_bit, SIGPIPE_NUM},
+        manager::{PID2PCB, wakeup_task},
+        processor::{block_current_and_run_next, current_process, current_task},
+        signal::{SIGPIPE_NUM, has_unmasked_pending, queue_process_signal, signal_bit},
     },
 };
 
@@ -22,6 +22,43 @@ use crate::{
 const PIPE_BUF: usize = 4096;
 const DEFAULT_PIPE_CAPACITY: usize = 16 * PIPE_BUF;
 const MAX_PIPE_CAPACITY: usize = DEFAULT_PIPE_CAPACITY;
+const SIGIO_NUM: i32 = 29;
+const CAP_SYS_RESOURCE: usize = 24;
+const F_OWNER_TID: i32 = 0;
+const F_OWNER_PID: i32 = 1;
+const F_OWNER_PGRP: i32 = 2;
+
+fn has_cap_sys_resource() -> bool {
+    let proc = current_process();
+    let inner = proc.borrow_mut();
+    inner.euid == 0 && (inner.cap_effective & (1u64 << CAP_SYS_RESOURCE)) != 0
+}
+
+fn pipe_max_size_limit() -> usize {
+    let Some(inode) = find_path_in_roots("/proc/sys/fs/pipe-max-size") else {
+        return DEFAULT_PIPE_CAPACITY;
+    };
+    let mut buf = [0u8; 32];
+    let len = inode.read_at(0, &mut buf);
+    if len == 0 {
+        return DEFAULT_PIPE_CAPACITY;
+    }
+    let Ok(raw) = core::str::from_utf8(&buf[..len]) else {
+        return DEFAULT_PIPE_CAPACITY;
+    };
+    let Ok(value) = raw.trim().parse::<usize>() else {
+        return DEFAULT_PIPE_CAPACITY;
+    };
+    value.clamp(PIPE_BUF, MAX_PIPE_CAPACITY)
+}
+
+fn default_pipe_capacity_for_current() -> usize {
+    if has_cap_sys_resource() {
+        DEFAULT_PIPE_CAPACITY
+    } else {
+        DEFAULT_PIPE_CAPACITY.min(pipe_max_size_limit())
+    }
+}
 //  Pipe 是一个包装器,包装 具体的 队列
 pub struct Pipe {
     readable: bool,
@@ -87,6 +124,51 @@ impl Pipe {
         self.buffer.lock().set_end_ref_bias(read_bias, write_bias);
     }
 
+    pub fn set_async_enabled(&self, enabled: bool) {
+        if !self.readable {
+            return;
+        }
+        self.buffer.lock().async_enabled = enabled;
+    }
+
+    pub fn get_async_owner(&self) -> (i32, i32) {
+        let ring = self.buffer.lock();
+        (ring.async_owner_type, ring.async_owner_pid)
+    }
+
+    pub fn set_async_owner(&self, owner_type: i32, owner_pid: i32) -> Result<(), isize> {
+        const EINVAL: isize = -22;
+        if !self.readable {
+            return Err(EINVAL);
+        }
+        if !matches!(owner_type, F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP) {
+            return Err(EINVAL);
+        }
+        if owner_pid < 0 {
+            return Err(EINVAL);
+        }
+        let mut ring = self.buffer.lock();
+        ring.async_owner_type = owner_type;
+        ring.async_owner_pid = owner_pid;
+        Ok(())
+    }
+
+    pub fn get_async_signal(&self) -> i32 {
+        self.buffer.lock().async_signal
+    }
+
+    pub fn set_async_signal(&self, sig: i32) -> Result<(), isize> {
+        const EINVAL: isize = -22;
+        if sig < 0 || sig > 64 {
+            return Err(EINVAL);
+        }
+        if !self.readable {
+            return Err(EINVAL);
+        }
+        self.buffer.lock().async_signal = sig;
+        Ok(())
+    }
+
     pub fn open_read_end_count(&self) -> usize {
         self.buffer.lock().read_end_count()
     }
@@ -118,13 +200,18 @@ pub struct PipeRingBuffer {
     write_end_ref_bias: usize,
     read_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
     write_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
+    async_enabled: bool,
+    async_owner_type: i32,
+    async_owner_pid: i32,
+    async_signal: i32,
 }
 
 impl PipeRingBuffer {
     pub fn new() -> Self {
+        let capacity = default_pipe_capacity_for_current();
         Self {
             arr: vec![0; MAX_PIPE_CAPACITY],
-            capacity: DEFAULT_PIPE_CAPACITY,
+            capacity,
             head: 0,
             tail: 0,
             status: RingBufferStatus::EMPTY,
@@ -134,6 +221,10 @@ impl PipeRingBuffer {
             write_end_ref_bias: 0,
             read_waiters: VecDeque::new(),
             write_waiters: VecDeque::new(),
+            async_enabled: false,
+            async_owner_type: F_OWNER_PID,
+            async_owner_pid: 0,
+            async_signal: 0,
         }
     }
 
@@ -199,8 +290,12 @@ impl PipeRingBuffer {
 
     fn set_pipe_size(&mut self, size: usize) -> Result<usize, isize> {
         const EBUSY: isize = -16;
+        const EPERM: isize = -1;
         const EINVAL: isize = -22;
         if size == 0 {
+            return Err(EINVAL);
+        }
+        if size > (1usize << 31) {
             return Err(EINVAL);
         }
         let base = size.max(PIPE_BUF);
@@ -210,6 +305,11 @@ impl PipeRingBuffer {
         else {
             return Err(EINVAL);
         };
+        let cap_sys_resource = has_cap_sys_resource();
+        let unpriv_limit = pipe_max_size_limit();
+        if !cap_sys_resource && new_capacity > unpriv_limit {
+            return Err(EPERM);
+        }
         if new_capacity > MAX_PIPE_CAPACITY {
             return Err(EINVAL);
         }
@@ -317,6 +417,49 @@ impl PipeRingBuffer {
 
     fn drain_writers(&mut self) -> Vec<Arc<crate::task::task_block::TaskControlBlock>> {
         self.write_waiters.drain(..).collect()
+    }
+
+    fn async_target(&self) -> Option<(i32, i32, i32)> {
+        if !self.async_enabled || self.async_owner_pid <= 0 {
+            return None;
+        }
+        Some((
+            self.async_owner_type,
+            self.async_owner_pid,
+            self.async_signal,
+        ))
+    }
+}
+
+fn notify_async_io(owner_type: i32, owner_pid: i32, sig: i32) {
+    let signum = if sig == 0 { SIGIO_NUM } else { sig };
+    if signum <= 0 || signum > 64 {
+        return;
+    }
+    match owner_type {
+        // For now map TID to process leader PID in this single-thread use case.
+        F_OWNER_TID | F_OWNER_PID => {
+            queue_process_signal(owner_pid as usize, signum as usize);
+        }
+        F_OWNER_PGRP => {
+            let targets = {
+                let map = PID2PCB.lock();
+                map.values()
+                    .filter_map(|pcb| {
+                        let inner = pcb.try_borrow_mut()?;
+                        if inner.pgid == owner_pid as usize {
+                            Some(pcb.getpid())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for pid in targets {
+                queue_process_signal(pid, signum as usize);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -542,6 +685,7 @@ impl File for Pipe {
             }
             // write at most loop_write bytes
             let mut reader_to_wake: Option<Arc<crate::task::task_block::TaskControlBlock>> = None;
+            let mut async_notify: Option<(i32, i32, i32)> = None;
             for _ in 0..loop_write {
                 if let Some(byte) = buf_iter.next() {
                     ring_buffer.write_byte(byte);
@@ -549,8 +693,14 @@ impl File for Pipe {
                     if reader_to_wake.is_none() {
                         reader_to_wake = ring_buffer.pop_reader();
                     }
+                    if async_notify.is_none() {
+                        async_notify = ring_buffer.async_target();
+                    }
                     if already_write == want_to_write {
                         drop(ring_buffer);
+                        if let Some((owner_type, owner_pid, sig)) = async_notify {
+                            notify_async_io(owner_type, owner_pid, sig);
+                        }
                         if let Some(reader) = reader_to_wake {
                             wakeup_task(reader);
                         }
@@ -558,6 +708,9 @@ impl File for Pipe {
                     }
                 } else {
                     drop(ring_buffer);
+                    if let Some((owner_type, owner_pid, sig)) = async_notify {
+                        notify_async_io(owner_type, owner_pid, sig);
+                    }
                     if let Some(reader) = reader_to_wake {
                         wakeup_task(reader);
                     }
@@ -565,6 +718,9 @@ impl File for Pipe {
                 }
             }
             drop(ring_buffer);
+            if let Some((owner_type, owner_pid, sig)) = async_notify {
+                notify_async_io(owner_type, owner_pid, sig);
+            }
             if let Some(reader) = reader_to_wake {
                 wakeup_task(reader);
             }

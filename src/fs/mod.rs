@@ -38,6 +38,8 @@ pub use procfs::{
 };
 pub use pseudo::PseudoBlock;
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
-pub(crate) use pseudo::{shm_create, shm_get, shm_list, shm_remove};
+pub(crate) use pseudo::{
+    pseudo_block_note_sync, pseudo_block_stat_snapshot, shm_create, shm_get, shm_list, shm_remove,
+};
 pub use socketpair::{SocketPairEnd, make_socketpair};
 pub use stdio::{Stdin, Stdout};

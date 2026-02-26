@@ -85,6 +85,7 @@ const SYSCALL_FCHMODAT2: usize = 452;
 const SYSCALL_FCHOWNAT: usize = 54;
 const SYSCALL_FCHOWN: usize = 55;
 const SYSCALL_FTRUNCATE: usize = 46;
+const SYSCALL_FALLOCATE: usize = 47;
 const SYSCALL_FACCESSAT: usize = 48;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
@@ -115,6 +116,7 @@ const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_SYNC: usize = 81;
 const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_FDATASYNC: usize = 83;
+const SYSCALL_SYNC_FILE_RANGE: usize = 84;
 const SYSCALL_TIMERFD_CREATE: usize = 85;
 const SYSCALL_STATX: usize = 291;
 // riscv64 Linux syscall numbers (match upstream): statfs=43, fstatfs=44.
@@ -158,6 +160,7 @@ const SYSCALL_SCHED_GET_PRIORITY_MAX: usize = 125;
 const SYSCALL_SCHED_GET_PRIORITY_MIN: usize = 126;
 const SYSCALL_SCHED_RR_GET_INTERVAL: usize = 127;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
+const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_CLOCK_ADJTIME64: usize = 405;
 const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
@@ -308,11 +311,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         if is_cyclic {
             let left = CYCLIC_SYSCALL_LOGS
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    if val == 0 {
-                        None
-                    } else {
-                        Some(val - 1)
-                    }
+                    if val == 0 { None } else { Some(val - 1) }
                 })
                 .unwrap_or(0);
             if left > 0 {
@@ -478,6 +477,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_FCHOWN => filesystem::syscall_fchown(args[0], args[1], args[2]),
         SYSCALL_FTRUNCATE => filesystem::syscall_ftruncate(args[0], args[1]),
+        SYSCALL_FALLOCATE => filesystem::syscall_fallocate(args[0], args[1], args[2], args[3]),
         SYSCALL_RENAMEAT => {
             filesystem::syscall_renameat(args[0] as isize, args[1], args[2] as isize, args[3])
         }
@@ -528,6 +528,9 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYNC => filesystem::syscall_sync(),
         SYSCALL_FSYNC => filesystem::syscall_fsync(args[0]),
         SYSCALL_FDATASYNC => filesystem::syscall_fsync(args[0]),
+        SYSCALL_SYNC_FILE_RANGE => {
+            filesystem::syscall_sync_file_range(args[0], args[1], args[2], args[3])
+        }
         SYSCALL_FSTATFS => filesystem::syscall_fstatfs(args[0], args[1]),
         SYSCALL_STATFS => filesystem::syscall_statfs(args[0], args[1]),
         SYSCALL_TIMERFD_CREATE => dummy::syscall_timerfd_create(args[0], args[1]),
@@ -563,6 +566,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_CLOCK_ADJTIME | SYSCALL_CLOCK_ADJTIME64 => {
             time_sys::syscall_clock_adjtime(args[0], args[1])
         }
+        SYSCALL_SYNCFS => filesystem::syscall_syncfs(args[0]),
         SYSCALL_CLOCK_NANOSLEEP => {
             time_sys::syscall_clock_nanosleep(args[0], args[1], args[2], args[3])
         }

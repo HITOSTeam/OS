@@ -1700,9 +1700,12 @@ impl ProcessControlBlock {
             let seq = FORK_IMPL_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             let total_us = fork_diag_cycles_to_us(end_cycles.wrapping_sub(fork_start_cycles));
             if should_report_fork_impl_diag(seq, total_us) {
-                let mem_us = fork_diag_cycles_to_us(after_mem_cycles.wrapping_sub(fork_start_cycles));
-                let pcb_us = fork_diag_cycles_to_us(after_pcb_cycles.wrapping_sub(after_mem_cycles));
-                let task_us = fork_diag_cycles_to_us(after_task_cycles.wrapping_sub(after_pcb_cycles));
+                let mem_us =
+                    fork_diag_cycles_to_us(after_mem_cycles.wrapping_sub(fork_start_cycles));
+                let pcb_us =
+                    fork_diag_cycles_to_us(after_pcb_cycles.wrapping_sub(after_mem_cycles));
+                let task_us =
+                    fork_diag_cycles_to_us(after_task_cycles.wrapping_sub(after_pcb_cycles));
                 let final_us = fork_diag_cycles_to_us(end_cycles.wrapping_sub(after_task_cycles));
                 log::warn!(
                     "[fork_impl_diag] seq={} parent_pid={} child_pid={} share_vm={} share_files={} total_us={} mem_clone_us={} child_pcb_us={} child_task_us={} publish_us={}",
