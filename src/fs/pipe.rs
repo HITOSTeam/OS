@@ -186,6 +186,160 @@ impl Pipe {
     pub fn all_read_ends_closed(&self) -> bool {
         self.buffer.lock().all_read_ends_closed()
     }
+
+    pub fn same_buffer(&self, other: &Pipe) -> bool {
+        Arc::ptr_eq(&self.buffer, &other.buffer)
+    }
+
+    pub fn read_to_slice(&self, out: &mut [u8], nonblock: bool) -> Result<usize, isize> {
+        const EAGAIN: isize = -11;
+        assert!(self.readable());
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let task = current_task().unwrap();
+        let has_pending_signal = || {
+            let inner = task.borrow_mut();
+            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+        };
+        loop {
+            let mut ring_buffer = self.buffer.lock();
+            let avail = ring_buffer.available_read();
+            if avail == 0 {
+                if ring_buffer.all_write_ends_closed() {
+                    ring_buffer.remove_reader(&task);
+                    return Ok(0);
+                }
+                if nonblock {
+                    ring_buffer.remove_reader(&task);
+                    return Err(EAGAIN);
+                }
+                if has_pending_signal() {
+                    ring_buffer.remove_reader(&task);
+                    return Ok(0);
+                }
+                ring_buffer.push_reader(task.clone());
+                drop(ring_buffer);
+                block_current_and_run_next();
+                continue;
+            }
+            let to_read = core::cmp::min(avail, out.len());
+            for byte in out.iter_mut().take(to_read) {
+                *byte = ring_buffer.read_byte();
+            }
+            let writer = ring_buffer.pop_writer();
+            drop(ring_buffer);
+            if let Some(writer) = writer {
+                wakeup_task(writer);
+            }
+            return Ok(to_read);
+        }
+    }
+
+    pub fn write_from_slice(&self, data: &[u8], nonblock: bool) -> Result<usize, isize> {
+        const EAGAIN: isize = -11;
+        assert!(self.writable());
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let task = current_task().unwrap();
+        let has_pending_signal = || {
+            let inner = task.borrow_mut();
+            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+        };
+        let mut written = 0usize;
+        loop {
+            let mut ring_buffer = self.buffer.lock();
+            if ring_buffer.all_read_ends_closed() {
+                ring_buffer.remove_writer(&task);
+                return Ok(written);
+            }
+            let avail = ring_buffer.available_write();
+            let remaining = data.len() - written;
+            if avail == 0
+                || (nonblock && remaining <= PIPE_BUF && avail < remaining && written == 0)
+            {
+                if nonblock {
+                    ring_buffer.remove_writer(&task);
+                    return if written > 0 {
+                        Ok(written)
+                    } else {
+                        Err(EAGAIN)
+                    };
+                }
+                if has_pending_signal() {
+                    ring_buffer.remove_writer(&task);
+                    return Ok(written);
+                }
+                ring_buffer.push_writer(task.clone());
+                drop(ring_buffer);
+                block_current_and_run_next();
+                continue;
+            }
+            let mut to_write = remaining;
+            if nonblock && to_write > PIPE_BUF {
+                to_write = to_write.min(avail);
+            }
+            let mut reader_to_wake: Option<Arc<crate::task::task_block::TaskControlBlock>> = None;
+            let mut async_notify: Option<(i32, i32, i32)> = None;
+            for byte in data[written..written + to_write].iter().copied() {
+                ring_buffer.write_byte(byte);
+                if reader_to_wake.is_none() {
+                    reader_to_wake = ring_buffer.pop_reader();
+                }
+                if async_notify.is_none() {
+                    async_notify = ring_buffer.async_target();
+                }
+            }
+            written += to_write;
+            drop(ring_buffer);
+            if let Some((owner_type, owner_pid, sig)) = async_notify {
+                notify_async_io(owner_type, owner_pid, sig);
+            }
+            if let Some(reader) = reader_to_wake {
+                wakeup_task(reader);
+            }
+            if written == data.len() || nonblock {
+                return Ok(written);
+            }
+        }
+    }
+
+    pub fn peek_to_slice(&self, out: &mut [u8], nonblock: bool) -> Result<usize, isize> {
+        const EAGAIN: isize = -11;
+        assert!(self.readable());
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let task = current_task().unwrap();
+        let has_pending_signal = || {
+            let inner = task.borrow_mut();
+            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+        };
+        loop {
+            let mut ring_buffer = self.buffer.lock();
+            let avail = ring_buffer.available_read();
+            if avail == 0 {
+                if ring_buffer.all_write_ends_closed() {
+                    ring_buffer.remove_reader(&task);
+                    return Ok(0);
+                }
+                if nonblock {
+                    ring_buffer.remove_reader(&task);
+                    return Err(EAGAIN);
+                }
+                if has_pending_signal() {
+                    ring_buffer.remove_reader(&task);
+                    return Ok(0);
+                }
+                ring_buffer.push_reader(task.clone());
+                drop(ring_buffer);
+                block_current_and_run_next();
+                continue;
+            }
+            return Ok(ring_buffer.peek_into(out));
+        }
+    }
 }
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -351,6 +505,19 @@ impl PipeRingBuffer {
         }
         self.arr[..used].copy_from_slice(data.as_slice());
         Ok(self.capacity)
+    }
+
+    fn peek_into(&self, dst: &mut [u8]) -> usize {
+        let n = core::cmp::min(dst.len(), self.available_read());
+        if n == 0 {
+            return 0;
+        }
+        let first = core::cmp::min(n, self.capacity - self.head);
+        dst[..first].copy_from_slice(&self.arr[self.head..self.head + first]);
+        if n > first {
+            dst[first..n].copy_from_slice(&self.arr[..n - first]);
+        }
+        n
     }
     /// 通过weak Ptr 判断是否所有写端都关闭
     pub fn all_write_ends_closed(&self) -> bool {

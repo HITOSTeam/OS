@@ -107,9 +107,13 @@ const SYSCALL_PREAD64: usize = 67;
 const SYSCALL_PWRITE64: usize = 68;
 const SYSCALL_PREADV: usize = 69;
 const SYSCALL_PWRITEV: usize = 70;
+const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
 const SYSCALL_SIGNALFD4: usize = 74;
+const SYSCALL_VMSPLICE: usize = 75;
+const SYSCALL_SPLICE: usize = 76;
+const SYSCALL_TEE: usize = 77;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSTAT: usize = 80;
@@ -502,6 +506,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_PREADV => flow::syscall_preadv(args[0], args[1], args[2], args[3] as isize),
         SYSCALL_PWRITEV => flow::syscall_pwritev(args[0], args[1], args[2], args[3] as isize),
+        SYSCALL_SENDFILE => filesystem::syscall_sendfile(args[0], args[1], args[2], args[3]),
         SYSCALL_PREADV2 => {
             flow::syscall_preadv2(args[0], args[1], args[2], args[3], args[4], args[5])
         }
@@ -513,6 +518,11 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         }
         SYSCALL_PPOLL => misc::syscall_ppoll(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_SIGNALFD4 => dummy::syscall_signalfd4(args[0] as isize, args[1], args[2], args[3]),
+        SYSCALL_VMSPLICE => filesystem::syscall_vmsplice(args[0], args[1], args[2], args[3]),
+        SYSCALL_SPLICE => {
+            filesystem::syscall_splice(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
+        SYSCALL_TEE => filesystem::syscall_tee(args[0], args[1], args[2], args[3]),
         SYSCALL_GETDENTS64 => filesystem::syscall_getdents64(args[0], args[1], args[2]),
         SYSCALL_LSEEK => filesystem::syscall_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_READLINKAT => {

@@ -12,9 +12,9 @@ use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
         File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent,
-        PseudoFile, PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, make_pipe, open_file,
-        pseudo_block_note_sync, pseudo_block_stat_snapshot, secondary_root_inode, shm_create,
-        shm_get, shm_list, shm_remove,
+        PseudoFile, PseudoShmFile, RtcFile, SocketPairEnd, ext4_lock, find_path_in_roots,
+        make_pipe, open_file, pseudo_block_note_sync, pseudo_block_stat_snapshot,
+        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
@@ -112,6 +112,12 @@ const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
 const PIPE_BUF: usize = 4096;
 const SIGIO_NUM: usize = 29;
+const IOV_MAX: usize = 1024;
+
+const SPLICE_F_MOVE: usize = 0x01;
+const SPLICE_F_NONBLOCK: usize = 0x02;
+const SPLICE_F_MORE: usize = 0x04;
+const SPLICE_F_GIFT: usize = 0x08;
 
 // fs/ioctl.h flags consumed by setxattr03.
 const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
@@ -677,6 +683,76 @@ fn fd_has_nonblock(fd: usize) -> bool {
         return false;
     }
     (inner.fd_flags[fd] & O_NONBLOCK as u32) != 0
+}
+
+fn fd_has_append(fd: usize) -> bool {
+    let process = current_files_process();
+    let inner = process.borrow_mut();
+    if fd >= inner.fd_flags.len() {
+        return false;
+    }
+    (inner.fd_flags[fd] & O_APPEND as u32) != 0
+}
+
+fn read_optional_offset(ptr: usize) -> Result<Option<usize>, isize> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let Some(raw) = try_read_user_value(get_current_token(), ptr as *const i64) else {
+        return Err(EFAULT);
+    };
+    if raw < 0 {
+        return Err(EINVAL);
+    }
+    Ok(Some(raw as usize))
+}
+
+fn write_optional_offset(ptr: usize, value: usize) -> Result<(), isize> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    let next = value as i64;
+    if try_write_user_value(get_current_token(), ptr as *mut i64, &next).is_err() {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+fn file_is_pipe(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> bool {
+    file.as_any().downcast_ref::<Pipe>().is_some()
+}
+
+fn pipe_read_to_kernel(
+    file: &alloc::sync::Arc<dyn File + Send + Sync>,
+    out: &mut [u8],
+    nonblock: bool,
+) -> Result<usize, isize> {
+    if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+        return pipe.read_to_slice(out, nonblock);
+    }
+    Err(EINVAL)
+}
+
+fn pipe_write_from_kernel(
+    file: &alloc::sync::Arc<dyn File + Send + Sync>,
+    data: &[u8],
+    nonblock: bool,
+) -> Result<usize, isize> {
+    if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+        return pipe.write_from_slice(data, nonblock);
+    }
+    Err(EINVAL)
+}
+
+fn socketpair_write_from_kernel(
+    file: &alloc::sync::Arc<dyn File + Send + Sync>,
+    data: &[u8],
+    nonblock: bool,
+) -> Result<usize, isize> {
+    if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
+        return sock.write_from_slice(data, nonblock);
+    }
+    Err(EINVAL)
 }
 
 fn open_fd_flags(flags: usize, o_path: bool) -> u32 {
@@ -4794,6 +4870,10 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             if !pipe.poll_readable() {
                 return EAGAIN;
             }
+        } else if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
+            if !sock.poll_readable() {
+                return EAGAIN;
+            }
         } else if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
             if !duplex.poll_readable() {
                 return EAGAIN;
@@ -4841,6 +4921,10 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
                 }
             } else {
                 write_len = write_len.min(avail);
+            }
+        } else if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
+            if !sock.poll_writable() {
+                return EAGAIN;
             }
         } else if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
             if duplex.write_end_closed() {
@@ -6086,6 +6170,471 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
         touch_inode_mtime_ctime_now(&inode);
     }
     ret
+}
+
+/// Linux `sendfile(2)` (syscall 71 on riscv64).
+pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if fd_has_o_path(in_fd) || fd_has_o_path(out_fd) {
+        return EBADF;
+    }
+    let Some(in_file) = get_fd_file(in_fd) else {
+        return EBADF;
+    };
+    let Some(out_file) = get_fd_file(out_fd) else {
+        return EBADF;
+    };
+    if !in_file.readable() || !out_file.writable() {
+        return EBADF;
+    }
+
+    let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let raw_in_pos = match read_optional_offset(offset) {
+        Ok(Some(v)) => v,
+        Ok(None) => in_inode.offset(),
+        Err(e) => return e,
+    };
+
+    let out_is_socketpair = out_file.as_any().downcast_ref::<SocketPairEnd>().is_some();
+    let nonblock = fd_has_nonblock(out_fd);
+    if nonblock && out_is_socketpair {
+        let Some(sock) = out_file.as_any().downcast_ref::<SocketPairEnd>() else {
+            return EINVAL;
+        };
+        if !sock.poll_writable() {
+            return EAGAIN;
+        }
+    }
+
+    let mut in_pos = raw_in_pos;
+    let mut total = 0usize;
+    let mut remaining = count;
+    let mut out_pos = 0usize;
+    let mut out_inode_opt = out_file.as_any().downcast_ref::<OSInode>();
+    if let Some(out_inode) = out_inode_opt {
+        if out_inode.readonly_fs() {
+            return EROFS;
+        }
+        out_pos = out_inode.offset();
+    }
+    let mut buf = vec![0u8; core::cmp::min(remaining, 16 * 1024)];
+    while remaining > 0 {
+        let want = core::cmp::min(remaining, buf.len());
+        let read = in_inode.pread_at(in_pos, &mut buf[..want]);
+        if read == 0 {
+            break;
+        }
+        let wrote = if let Some(out_inode) = out_inode_opt {
+            match out_inode.pwrite_at(out_pos, &buf[..read]) {
+                Ok(n) => n,
+                Err(_) => return if total > 0 { total as isize } else { EIO },
+            }
+        } else if out_is_socketpair {
+            match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if total > 0 { total as isize } else { e },
+            }
+        } else {
+            return if total > 0 { total as isize } else { EINVAL };
+        };
+        if wrote == 0 {
+            break;
+        }
+        total += wrote;
+        remaining -= wrote;
+        in_pos += wrote;
+        if out_inode_opt.is_some() {
+            out_pos += wrote;
+        }
+        if wrote < read {
+            break;
+        }
+    }
+
+    if let Some(out_inode) = out_inode_opt {
+        if total > 0 && out_inode.flush().is_err() {
+            return EIO;
+        }
+        out_inode.set_offset(out_pos);
+    }
+
+    if offset == 0 {
+        in_inode.set_offset(in_pos);
+    } else if let Err(e) = write_optional_offset(offset, in_pos) {
+        return e;
+    }
+    total as isize
+}
+
+/// Linux `splice(2)` (syscall 76 on riscv64).
+pub fn syscall_splice(
+    fd_in: usize,
+    off_in: usize,
+    fd_out: usize,
+    off_out: usize,
+    len: usize,
+    flags: usize,
+) -> isize {
+    let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
+        return EBADF;
+    }
+    let Some(in_file) = get_fd_file(fd_in) else {
+        return EBADF;
+    };
+    let Some(out_file) = get_fd_file(fd_out) else {
+        return EBADF;
+    };
+    if !in_file.readable() || !out_file.writable() {
+        return EBADF;
+    }
+    let in_is_pipe = file_is_pipe(&in_file);
+    let out_is_pipe = file_is_pipe(&out_file);
+    if !in_is_pipe && !out_is_pipe {
+        return EINVAL;
+    }
+    if in_is_pipe && off_in != 0 {
+        return ESPIPE;
+    }
+    if out_is_pipe && off_out != 0 {
+        return ESPIPE;
+    }
+    if !out_is_pipe
+        && (fd_has_append(fd_out)
+            || out_file
+                .as_any()
+                .downcast_ref::<OSInode>()
+                .map(|f| f.append())
+                .unwrap_or(false))
+    {
+        return EINVAL;
+    }
+    let out_is_inode = out_file.as_any().downcast_ref::<OSInode>().is_some();
+    let out_is_socketpair = out_file.as_any().downcast_ref::<SocketPairEnd>().is_some();
+    if !out_is_pipe && !out_is_inode && !out_is_socketpair {
+        return EINVAL;
+    }
+    let in_is_inode = in_file.as_any().downcast_ref::<OSInode>().is_some();
+    if !in_is_pipe && !in_is_inode {
+        return EINVAL;
+    }
+
+    let nonblock =
+        (flags & SPLICE_F_NONBLOCK) != 0 || fd_has_nonblock(fd_in) || fd_has_nonblock(fd_out);
+    let mut in_pos = if in_is_pipe {
+        0usize
+    } else {
+        match read_optional_offset(off_in) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
+                    return EINVAL;
+                };
+                in_inode.offset()
+            }
+            Err(e) => return e,
+        }
+    };
+    let mut out_pos = if out_is_pipe {
+        0usize
+    } else {
+        match read_optional_offset(off_out) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                if let Some(out_inode) = out_file.as_any().downcast_ref::<OSInode>() {
+                    out_inode.offset()
+                } else {
+                    0
+                }
+            }
+            Err(e) => return e,
+        }
+    };
+
+    let mut moved = 0usize;
+    let mut buf = vec![0u8; core::cmp::min(len, PIPE_BUF)];
+    while moved < len {
+        let want = core::cmp::min(buf.len(), len - moved);
+        let read = if in_is_pipe {
+            if nonblock {
+                if let Some(pipe) = out_file.as_any().downcast_ref::<Pipe>() {
+                    if !pipe.poll_writable() {
+                        return if moved > 0 { moved as isize } else { EAGAIN };
+                    }
+                } else if let Some(sock) = out_file.as_any().downcast_ref::<SocketPairEnd>() {
+                    if !sock.poll_writable() {
+                        return if moved > 0 { moved as isize } else { EAGAIN };
+                    }
+                }
+            }
+            match pipe_read_to_kernel(&in_file, &mut buf[..want], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if moved > 0 { moved as isize } else { e },
+            }
+        } else {
+            let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
+                return if moved > 0 { moved as isize } else { EINVAL };
+            };
+            let is_file = {
+                let inode = in_inode.ext4_inode();
+                let _ext4_guard = ext4_lock();
+                inode.is_file()
+            };
+            if !is_file {
+                return if moved > 0 { moved as isize } else { EINVAL };
+            }
+            let n = in_inode.pread_at(in_pos, &mut buf[..want]);
+            if n == 0 {
+                break;
+            }
+            n
+        };
+        if read == 0 {
+            break;
+        }
+
+        let wrote = if out_is_pipe {
+            match pipe_write_from_kernel(&out_file, &buf[..read], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if moved > 0 { moved as isize } else { e },
+            }
+        } else if let Some(out_inode) = out_file.as_any().downcast_ref::<OSInode>() {
+            let is_file = {
+                let inode = out_inode.ext4_inode();
+                let _ext4_guard = ext4_lock();
+                inode.is_file()
+            };
+            if !is_file {
+                return if moved > 0 { moved as isize } else { EINVAL };
+            }
+            if out_inode.readonly_fs() {
+                return if moved > 0 { moved as isize } else { EROFS };
+            }
+            match out_inode.pwrite_at(out_pos, &buf[..read]) {
+                Ok(n) => n,
+                Err(_) => return if moved > 0 { moved as isize } else { EIO },
+            }
+        } else if out_file.as_any().downcast_ref::<SocketPairEnd>().is_some() {
+            match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if moved > 0 { moved as isize } else { e },
+            }
+        } else {
+            return if moved > 0 { moved as isize } else { EINVAL };
+        };
+        if wrote == 0 {
+            break;
+        }
+        moved += wrote;
+        if !in_is_pipe {
+            in_pos += wrote;
+        }
+        if !out_is_pipe && out_file.as_any().downcast_ref::<OSInode>().is_some() {
+            out_pos += wrote;
+        }
+        if wrote < read {
+            break;
+        }
+    }
+
+    if !in_is_pipe {
+        if off_in == 0 {
+            if let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() {
+                in_inode.set_offset(in_pos);
+            }
+        } else if let Err(e) = write_optional_offset(off_in, in_pos) {
+            return e;
+        }
+    }
+    if !out_is_pipe {
+        if let Some(out_inode) = out_file.as_any().downcast_ref::<OSInode>() {
+            if moved > 0 && out_inode.flush().is_err() {
+                return EIO;
+            }
+            if off_out == 0 {
+                out_inode.set_offset(out_pos);
+            } else if let Err(e) = write_optional_offset(off_out, out_pos) {
+                return e;
+            }
+        }
+    }
+    moved as isize
+}
+
+/// Linux `tee(2)` (syscall 77 on riscv64).
+pub fn syscall_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isize {
+    let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
+        return EBADF;
+    }
+    let Some(in_file) = get_fd_file(fd_in) else {
+        return EBADF;
+    };
+    let Some(out_file) = get_fd_file(fd_out) else {
+        return EBADF;
+    };
+    let Some(in_pipe) = in_file.as_any().downcast_ref::<Pipe>() else {
+        return EINVAL;
+    };
+    let Some(out_pipe) = out_file.as_any().downcast_ref::<Pipe>() else {
+        return EINVAL;
+    };
+    if in_pipe.same_buffer(out_pipe) {
+        return EINVAL;
+    }
+    let nonblock =
+        (flags & SPLICE_F_NONBLOCK) != 0 || fd_has_nonblock(fd_in) || fd_has_nonblock(fd_out);
+    let mut copied = 0usize;
+    let mut buf = vec![0u8; core::cmp::min(len, PIPE_BUF)];
+    let mut consume_buf = vec![0u8; core::cmp::min(len, PIPE_BUF)];
+    while copied < len {
+        let want = core::cmp::min(len - copied, buf.len());
+        let peeked = match in_pipe.peek_to_slice(&mut buf[..want], nonblock) {
+            Ok(n) => n,
+            Err(e) => return if copied > 0 { copied as isize } else { e },
+        };
+        if peeked == 0 {
+            break;
+        }
+        let wrote = match out_pipe.write_from_slice(&buf[..peeked], nonblock) {
+            Ok(n) => n,
+            Err(e) => return if copied > 0 { copied as isize } else { e },
+        };
+        if wrote == 0 {
+            break;
+        }
+        let consumed = match in_pipe.read_to_slice(&mut consume_buf[..wrote], true) {
+            Ok(n) => n,
+            Err(e) => return if copied > 0 { copied as isize } else { e },
+        };
+        if consumed == 0 {
+            break;
+        }
+        copied += consumed;
+        if consumed < peeked {
+            break;
+        }
+    }
+    copied as isize
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VmIoVec {
+    iov_base: usize,
+    iov_len: usize,
+}
+
+fn read_vm_iovec(token: usize, iov_ptr: usize, index: usize) -> Result<VmIoVec, isize> {
+    let iov_size = core::mem::size_of::<VmIoVec>();
+    let Some(off) = index
+        .checked_mul(iov_size)
+        .and_then(|v| iov_ptr.checked_add(v))
+    else {
+        return Err(EFAULT);
+    };
+    try_read_user_value(token, off as *const VmIoVec).ok_or(EFAULT)
+}
+
+/// Linux `vmsplice(2)` (syscall 75 on riscv64).
+pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize) -> isize {
+    let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+        return EBADF;
+    };
+    if nr_segs > IOV_MAX {
+        return EINVAL;
+    }
+    if nr_segs == 0 {
+        return 0;
+    }
+    let nonblock = (flags & SPLICE_F_NONBLOCK) != 0 || fd_has_nonblock(fd);
+    let token = get_current_token();
+    let mut total = 0usize;
+    let mut scratch = vec![0u8; PIPE_BUF];
+    for i in 0..nr_segs {
+        let iv = match read_vm_iovec(token, iov_ptr, i) {
+            Ok(v) => v,
+            Err(e) => return if total > 0 { total as isize } else { e },
+        };
+        if iv.iov_len == 0 {
+            continue;
+        }
+        if file.writable() {
+            let mut seg_off = 0usize;
+            while seg_off < iv.iov_len {
+                let want = core::cmp::min(iv.iov_len - seg_off, scratch.len());
+                let src_ptr = (iv.iov_base + seg_off) as *const u8;
+                if try_copy_from_user(token, src_ptr, &mut scratch[..want]).is_err() {
+                    return if total > 0 { total as isize } else { EFAULT };
+                }
+                // Linux may return a short vmsplice() once some bytes are moved.
+                // Avoid blocking indefinitely trying to drain very large iovecs.
+                let write_nonblock = nonblock || total > 0 || seg_off > 0;
+                let wrote = match pipe.write_from_slice(&scratch[..want], write_nonblock) {
+                    Ok(n) => n,
+                    Err(e) => return if total > 0 { total as isize } else { e },
+                };
+                if wrote == 0 {
+                    return if total > 0 { total as isize } else { EPIPE };
+                }
+                total += wrote;
+                seg_off += wrote;
+                if wrote < want {
+                    break;
+                }
+            }
+        } else if file.readable() {
+            let mut seg_off = 0usize;
+            while seg_off < iv.iov_len {
+                let want = core::cmp::min(iv.iov_len - seg_off, scratch.len());
+                let read = match pipe.read_to_slice(&mut scratch[..want], nonblock) {
+                    Ok(n) => n,
+                    Err(e) => return if total > 0 { total as isize } else { e },
+                };
+                if read == 0 {
+                    return total as isize;
+                }
+                let dst_ptr = (iv.iov_base + seg_off) as *mut u8;
+                if try_copy_to_user(token, dst_ptr, &scratch[..read]).is_err() {
+                    return if total > 0 { total as isize } else { EFAULT };
+                }
+                total += read;
+                seg_off += read;
+                if read < want {
+                    break;
+                }
+            }
+        } else {
+            return if total > 0 { total as isize } else { EBADF };
+        }
+    }
+    total as isize
 }
 
 /// Linux `copy_file_range(2)` (syscall 285 on riscv64).

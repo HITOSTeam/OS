@@ -29,6 +29,14 @@ impl SocketPairEnd {
     pub fn poll_writable(&self) -> bool {
         self.write_end.poll_writable()
     }
+
+    pub fn read_to_slice(&self, out: &mut [u8], nonblock: bool) -> Result<usize, isize> {
+        self.read_end.read_to_slice(out, nonblock)
+    }
+
+    pub fn write_from_slice(&self, data: &[u8], nonblock: bool) -> Result<usize, isize> {
+        self.write_end.write_from_slice(data, nonblock)
+    }
 }
 
 /// Create a bidirectional pair of endpoints.
