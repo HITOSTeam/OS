@@ -8,6 +8,7 @@ use spin::Mutex;
 use crate::mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value};
 use crate::task::manager::wakeup_task;
 use crate::task::processor::{block_current_and_run_next, current_process, current_task};
+use crate::task::signal::has_unmasked_pending;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::trap::get_current_token;
 
@@ -20,10 +21,15 @@ const IPC_RMID: usize = 0;
 const IPC_SET: usize = 1;
 const IPC_STAT: usize = 2;
 const IPC_INFO: usize = 3;
+const MSG_STAT: usize = 11;
+const MSG_INFO: usize = 12;
+const MSG_STAT_ANY: usize = 13;
 const SEM_STAT: usize = 18;
 const SEM_INFO: usize = 19;
 
 const MSG_NOERROR: usize = 0x1000;
+const MSG_EXCEPT: usize = 0x2000;
+const MSG_COPY: usize = 0x4000;
 
 const GETPID: usize = 11;
 const GETVAL: usize = 12;
@@ -39,19 +45,25 @@ const SEM_R: u16 = 0o400;
 const SEM_A: u16 = 0o200;
 
 const SEMVMX: i32 = 32767;
+const SEMMSL: usize = 32000;
 const MSGMNB: usize = 16384;
+const MSGMNI: usize = 4096;
+const MSGMAX: usize = 8192;
 
 const EPERM: isize = -1;
 const ENOENT: isize = -2;
+const EINTR: isize = -4;
 const EACCES: isize = -13;
 const EFAULT: isize = -14;
 const EEXIST: isize = -17;
 const EINVAL: isize = -22;
 const E2BIG: isize = -7;
 const ENOMSG: isize = -42;
+const EIDRM: isize = -43;
 const ERANGE: isize = -34;
 const EFBIG: isize = -27;
 const EAGAIN: isize = -11;
+const ENOSPC: isize = -28;
 const ENOSYS: isize = -38;
 
 #[repr(C)]
@@ -84,6 +96,19 @@ struct MsqidDsUser {
     msg_lrpid: u32,
     __unused4: u64,
     __unused5: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MsgInfoUser {
+    msgpool: i32,
+    msgmap: i32,
+    msgmax: i32,
+    msgmnb: i32,
+    msgmni: i32,
+    msgssz: i32,
+    msgtql: i32,
+    msgseg: i32,
 }
 
 #[repr(C)]
@@ -155,6 +180,8 @@ struct MsgQueue {
     key: Option<u32>,
     perm: IpcPermKernel,
     msgs: VecDeque<Msg>,
+    recv_waiters: VecDeque<Weak<TaskControlBlock>>,
+    send_waiters: VecDeque<Weak<TaskControlBlock>>,
     cbytes: usize,
     qbytes: usize,
     lspid: u32,
@@ -184,14 +211,28 @@ impl MsgManager {
         id
     }
 
-    fn remove_queue(&mut self, id: usize) {
-        if let Some(queue) = self.queues.remove(&id) {
+    fn remove_queue(&mut self, id: usize) -> Vec<Arc<TaskControlBlock>> {
+        let mut wake = Vec::new();
+        if let Some(mut queue) = self.queues.remove(&id) {
+            retain_blocked_waiters(&mut queue.recv_waiters);
+            retain_blocked_waiters(&mut queue.send_waiters);
+            for waiter in queue.recv_waiters.drain(..) {
+                if let Some(task) = waiter.upgrade() {
+                    wake.push(task);
+                }
+            }
+            for waiter in queue.send_waiters.drain(..) {
+                if let Some(task) = waiter.upgrade() {
+                    wake.push(task);
+                }
+            }
             if let Some(key) = queue.key {
                 if self.key2id.get(&key).copied() == Some(id) {
                     self.key2id.remove(&key);
                 }
             }
         }
+        wake
     }
 }
 
@@ -363,6 +404,27 @@ fn add_waiter_once(queue: &mut VecDeque<Weak<TaskControlBlock>>, task: &Arc<Task
     queue.push_back(Arc::downgrade(task));
 }
 
+fn wake_msg_waiters(queue: &mut VecDeque<Weak<TaskControlBlock>>) {
+    retain_blocked_waiters(queue);
+    let mut wake = Vec::new();
+    for waiter in queue.drain(..) {
+        if let Some(task) = waiter.upgrade() {
+            wake.push(task);
+        }
+    }
+    for task in wake {
+        wakeup_task(task);
+    }
+}
+
+fn has_pending_unmasked_signal() -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    let inner = task.borrow_mut();
+    has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+}
+
 fn msq_to_user(queue: &MsgQueue) -> MsqidDsUser {
     MsqidDsUser {
         msg_perm: queue.perm.to_user(),
@@ -411,6 +473,9 @@ pub fn syscall_msgget(key: usize, msgflg: usize) -> isize {
             return ENOENT;
         }
     }
+    if mgr.queues.len() >= MSGMNI {
+        return ENOSPC;
+    }
 
     let id = mgr.alloc_id();
     let mode = (msgflg & 0o777) as u16;
@@ -431,6 +496,8 @@ pub fn syscall_msgget(key: usize, msgflg: usize) -> isize {
         },
         perm,
         msgs: VecDeque::new(),
+        recv_waiters: VecDeque::new(),
+        send_waiters: VecDeque::new(),
         cbytes: 0,
         qbytes: MSGMNB,
         lspid: 0,
@@ -450,6 +517,42 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
     let cred = current_cred();
     let token = get_current_token();
     let mut mgr = MSG_MANAGER.lock();
+
+    if cmd == IPC_INFO || cmd == MSG_INFO {
+        let highest_index = if mgr.queues.is_empty() {
+            0
+        } else {
+            mgr.queues.len() - 1
+        };
+        let info = MsgInfoUser {
+            msgmax: MSGMAX as i32,
+            msgmnb: MSGMNB as i32,
+            msgmni: MSGMNI as i32,
+            msgssz: 16,
+            msgseg: 1024,
+            msgtql: mgr.queues.len() as i32,
+            ..MsgInfoUser::default()
+        };
+        if try_write_user_value(token, buf as *mut MsgInfoUser, &info).is_err() {
+            return EFAULT;
+        }
+        return highest_index as isize;
+    }
+
+    if cmd == MSG_STAT || cmd == MSG_STAT_ANY {
+        let Some((&queue_id, queue)) = mgr.queues.iter().nth(msqid) else {
+            return EINVAL;
+        };
+        if cmd == MSG_STAT_ANY || check_ipc_access(&queue.perm, MSG_R, &cred) {
+            let ds = msq_to_user(queue);
+            if try_write_user_value(token, buf as *mut MsqidDsUser, &ds).is_err() {
+                return EFAULT;
+            }
+            return queue_id as isize;
+        }
+        return EACCES;
+    }
+
     let Some(queue) = mgr.queues.get_mut(&msqid) else {
         return EINVAL;
     };
@@ -458,7 +561,11 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
             if !is_owner_or_root(&queue.perm, &cred) {
                 return EPERM;
             }
-            mgr.remove_queue(msqid);
+            let wake = mgr.remove_queue(msqid);
+            drop(mgr);
+            for task in wake {
+                wakeup_task(task);
+            }
             0
         }
         IPC_STAT => {
@@ -483,6 +590,7 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
             queue.perm.mode = ds.msg_perm.mode & 0o777;
             queue.qbytes = ds.msg_qbytes as usize;
             queue.ctime = now_secs();
+            wake_msg_waiters(&mut queue.send_waiters);
             0
         }
         _ => EINVAL,
@@ -509,25 +617,43 @@ pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) ->
         return EFAULT;
     }
 
-    let mut mgr = MSG_MANAGER.lock();
-    let Some(queue) = mgr.queues.get_mut(&msqid) else {
-        return EINVAL;
-    };
-    if !check_ipc_access(&queue.perm, MSG_W, &cred) {
-        return EACCES;
-    }
-    if queue.cbytes.saturating_add(msgsz) > queue.qbytes {
+    let mut waited = false;
+    loop {
+        let mut mgr = MSG_MANAGER.lock();
+        let Some(queue) = mgr.queues.get_mut(&msqid) else {
+            return if waited { EIDRM } else { EINVAL };
+        };
+        if !check_ipc_access(&queue.perm, MSG_W, &cred) {
+            return EACCES;
+        }
+        if queue.cbytes.saturating_add(msgsz) <= queue.qbytes {
+            queue.msgs.push_back(Msg {
+                mtype,
+                mtext: mtext.clone(),
+            });
+            queue.cbytes += msgsz;
+            queue.lspid = cred.pid;
+            queue.stime = now_secs();
+            wake_msg_waiters(&mut queue.recv_waiters);
+            return 0;
+        }
         if (msgflg & IPC_NOWAIT) != 0 {
             return EAGAIN;
         }
-        return EAGAIN;
+        if has_pending_unmasked_signal() {
+            return EINTR;
+        }
+        let Some(task) = current_task() else {
+            return EINVAL;
+        };
+        add_waiter_once(&mut queue.send_waiters, &task);
+        drop(mgr);
+        block_current_and_run_next();
+        waited = true;
+        if has_pending_unmasked_signal() {
+            return EINTR;
+        }
     }
-
-    queue.msgs.push_back(Msg { mtype, mtext });
-    queue.cbytes += msgsz;
-    queue.lspid = cred.pid;
-    queue.stime = now_secs();
-    0
 }
 
 pub fn syscall_msgrcv(
@@ -539,64 +665,104 @@ pub fn syscall_msgrcv(
 ) -> isize {
     let cred = current_cred();
     let token = get_current_token();
-
-    let mut mgr = MSG_MANAGER.lock();
-    let Some(queue) = mgr.queues.get_mut(&msqid) else {
+    let msg_copy = (msgflg & MSG_COPY) != 0;
+    let msg_except = (msgflg & MSG_EXCEPT) != 0;
+    if msg_copy {
+        if (msgflg & IPC_NOWAIT) == 0 || msg_except || msgtyp < 0 {
+            return EINVAL;
+        }
+    } else if msg_except && msgtyp <= 0 {
         return EINVAL;
-    };
-    if !check_ipc_access(&queue.perm, MSG_R, &cred) {
-        return EACCES;
     }
 
-    let pick_idx = if queue.msgs.is_empty() {
-        None
-    } else if msgtyp == 0 {
-        Some(0)
-    } else if msgtyp > 0 {
-        queue.msgs.iter().position(|m| m.mtype == msgtyp as i64)
-    } else {
-        let limit = (-msgtyp) as i64;
-        queue
-            .msgs
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.mtype <= limit)
-            .min_by_key(|(_, m)| m.mtype)
-            .map(|(idx, _)| idx)
-    };
-    let Some(idx) = pick_idx else {
+    let mut waited = false;
+    loop {
+        let mut mgr = MSG_MANAGER.lock();
+        let Some(queue) = mgr.queues.get_mut(&msqid) else {
+            return if waited { EIDRM } else { EINVAL };
+        };
+        if !check_ipc_access(&queue.perm, MSG_R, &cred) {
+            return EACCES;
+        }
+
+        let pick_idx = if queue.msgs.is_empty() {
+            None
+        } else if msg_copy {
+            let idx = msgtyp as usize;
+            if idx < queue.msgs.len() {
+                Some(idx)
+            } else {
+                None
+            }
+        } else if msgtyp == 0 {
+            Some(0)
+        } else if msgtyp > 0 {
+            if msg_except {
+                queue.msgs.iter().position(|m| m.mtype != msgtyp as i64)
+            } else {
+                queue.msgs.iter().position(|m| m.mtype == msgtyp as i64)
+            }
+        } else {
+            let limit = (-msgtyp) as i64;
+            queue
+                .msgs
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.mtype <= limit)
+                .min_by_key(|(_, m)| m.mtype)
+                .map(|(idx, _)| idx)
+        };
+
+        if let Some(idx) = pick_idx {
+            let src = queue.msgs.get(idx).unwrap();
+            if src.mtext.len() > msgsz && (msgflg & MSG_NOERROR) == 0 {
+                return E2BIG;
+            }
+            let copy_len = src.mtext.len().min(msgsz);
+            let msg_type = src.mtype;
+            let mut payload = vec![0u8; copy_len];
+            payload.copy_from_slice(&src.mtext[..copy_len]);
+            if !msg_copy {
+                let removed = queue.msgs.remove(idx).unwrap();
+                queue.cbytes = queue.cbytes.saturating_sub(removed.mtext.len());
+                queue.lrpid = cred.pid;
+                queue.rtime = now_secs();
+                wake_msg_waiters(&mut queue.send_waiters);
+            }
+            drop(mgr);
+
+            if try_write_user_value(token, msgp as *mut i64, &msg_type).is_err() {
+                return EFAULT;
+            }
+            if try_copy_to_user(
+                token,
+                (msgp + core::mem::size_of::<i64>()) as *mut u8,
+                &payload,
+            )
+            .is_err()
+            {
+                return EFAULT;
+            }
+            return copy_len as isize;
+        }
+
         if (msgflg & IPC_NOWAIT) != 0 {
             return ENOMSG;
         }
-        return ENOMSG;
-    };
-    let msg = queue.msgs.remove(idx).unwrap();
-    let mut copy_len = msg.mtext.len();
-    if copy_len > msgsz {
-        if (msgflg & MSG_NOERROR) == 0 {
-            queue.msgs.push_front(msg);
-            return E2BIG;
+        if has_pending_unmasked_signal() {
+            return EINTR;
         }
-        copy_len = msgsz;
+        let Some(task) = current_task() else {
+            return EINVAL;
+        };
+        add_waiter_once(&mut queue.recv_waiters, &task);
+        drop(mgr);
+        block_current_and_run_next();
+        waited = true;
+        if has_pending_unmasked_signal() {
+            return EINTR;
+        }
     }
-    queue.cbytes = queue.cbytes.saturating_sub(msg.mtext.len());
-    queue.lrpid = cred.pid;
-    queue.rtime = now_secs();
-    drop(mgr);
-
-    if try_write_user_value(token, msgp as *mut i64, &msg.mtype).is_err() {
-        return EFAULT;
-    }
-    if try_copy_to_user(
-        token,
-        (msgp + core::mem::size_of::<i64>()) as *mut u8,
-        &msg.mtext[..copy_len],
-    )
-    .is_err()
-    {
-        return EFAULT;
-    }
-    copy_len as isize
 }
 
 pub fn syscall_semget(key: usize, nsems: usize, semflg: usize) -> isize {
@@ -626,7 +792,7 @@ pub fn syscall_semget(key: usize, nsems: usize, semflg: usize) -> isize {
         }
     }
 
-    if nsems == 0 {
+    if nsems == 0 || nsems > SEMMSL {
         return EINVAL;
     }
     let id = mgr.alloc_id();
@@ -676,7 +842,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             let info = SemInfoUser {
                 semmni: 128,
                 semmns: 32000,
-                semmsl: 32000,
+                semmsl: SEMMSL as i32,
                 semopm: 500,
                 semusz: mgr.sets.len() as i32,
                 semvmx: SEMVMX,

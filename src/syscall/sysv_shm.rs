@@ -1,26 +1,44 @@
 use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
 use crate::mm::{
-    FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc, try_write_user_value,
+    frame_alloc, try_read_user_value, try_write_user_value, FrameTracker, MapPermission, PTEFlags,
+    VirtAddr,
 };
 use crate::task::processor::current_process;
 
 const IPC_PRIVATE: usize = 0;
 const IPC_CREAT: usize = 0x200;
 const IPC_EXCL: usize = 0x400;
+const IPC_SET: usize = 1;
+const IPC_INFO: usize = 3;
 
 // `shmat(2)` flags (subset).
 const SHM_RDONLY: usize = 0x1000;
 const SHM_RND: usize = 0x2000;
 const SHM_REMAP: usize = 0x4000;
+const SHM_HUGETLB: usize = 0x0800;
 
 // `shmctl(2)` operations (subset).
 const IPC_RMID: usize = 0;
 const IPC_STAT: usize = 2;
+const SHM_LOCK: usize = 11;
+const SHM_UNLOCK: usize = 12;
+const SHM_STAT: usize = 13;
+const SHM_INFO: usize = 14;
+const SHM_STAT_ANY: usize = 15;
+
+const SHM_LOCKED: u16 = 0o2000;
+const SHMMIN: usize = 1;
+const SHMMNI: usize = 4096;
+const SHMMAX: usize = usize::MAX - (1usize << 24);
+const SHMALL: usize = usize::MAX / PAGE_SIZE;
+const SHM_MMAP_MIN_ADDR: usize = 0x10000;
 
 const EACCES: isize = -13;
 const EFAULT: isize = -14;
@@ -29,6 +47,48 @@ const ENOMEM: isize = -12;
 const ENOENT: isize = -2;
 const EEXIST: isize = -17;
 const EPERM: isize = -1;
+const ENOSPC: isize = -28;
+
+pub fn shmmax_limit() -> usize {
+    SHMMAX
+}
+
+pub fn shmmni_limit() -> usize {
+    SHMMNI
+}
+
+pub fn shmall_limit() -> usize {
+    SHMALL
+}
+
+pub fn proc_sysvipc_shm() -> String {
+    let mgr = SHM_MANAGER.lock();
+    let mut out = String::from("       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime rss swap\n");
+    for seg in mgr.segments.values() {
+        let key = seg.key.unwrap_or(0);
+        let line = format!(
+            "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:3} {:4}\n",
+            key,
+            seg.id,
+            seg.mode & 0o777,
+            seg.size,
+            seg.cpid,
+            seg.lpid,
+            seg.nattch,
+            seg.uid,
+            seg.gid,
+            seg.cuid,
+            seg.cgid,
+            seg.atime,
+            seg.dtime,
+            seg.ctime,
+            align_up(seg.size, PAGE_SIZE) / PAGE_SIZE,
+            0
+        );
+        out.push_str(&line);
+    }
+    out
+}
 
 fn align_down(x: usize, align: usize) -> usize {
     x & !(align - 1)
@@ -131,6 +191,32 @@ struct ShmidDsUser {
     __unused5: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ShmInfoUser {
+    used_ids: i32,
+    __pad: i32,
+    shm_tot: u64,
+    shm_rss: u64,
+    shm_swp: u64,
+    swap_attempts: u64,
+    swap_successes: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ShminfoUser {
+    shmmax: u64,
+    shmmin: u64,
+    shmmni: u64,
+    shmseg: u64,
+    shmall: u64,
+    __unused1: u64,
+    __unused2: u64,
+    __unused3: u64,
+    __unused4: u64,
+}
+
 fn now_secs() -> i64 {
     crate::syscall::time_sys::realtime_now_seconds() as i64
 }
@@ -210,7 +296,11 @@ pub fn exit_cleanup(attaches: &[ShmAttach]) {
 }
 
 pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
-    if size == 0 {
+    if (shmflg & SHM_HUGETLB) != 0 {
+        // HugeTLB shared memory is not supported yet.
+        return EINVAL;
+    }
+    if size < SHMMIN || size > SHMMAX {
         return EINVAL;
     }
     let size_aligned = align_up(size, PAGE_SIZE);
@@ -221,11 +311,27 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
             if (shmflg & IPC_CREAT) != 0 && (shmflg & IPC_EXCL) != 0 {
                 return EEXIST;
             }
+            let Some(seg) = mgr.segments.get(&id) else {
+                return EINVAL;
+            };
+            if size > seg.size {
+                return EINVAL;
+            }
+            let (uid, gid, _, groups) = current_ids();
+            let req = (shmflg & 0o600) as u16;
+            if !check_perm(
+                seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, req, uid, gid, &groups,
+            ) {
+                return EACCES;
+            }
             return id as isize;
         }
         if (shmflg & IPC_CREAT) == 0 {
             return ENOENT;
         }
+    }
+    if mgr.segments.len() >= SHMMNI {
+        return ENOSPC;
     }
 
     let id = mgr.alloc_id();
@@ -295,6 +401,10 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     } else {
         align_down(shmaddr, PAGE_SIZE)
     };
+    if (shmflg & SHM_REMAP) != 0 && start < SHM_MMAP_MIN_ADDR {
+        // Keep low-page protection when SHM_RND rounds down close-to-null hints.
+        return EINVAL;
+    }
     let Some(end) = start.checked_add(map_len) else {
         return ENOMEM;
     };
@@ -380,10 +490,94 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
     0
 }
 
+fn shm_to_user(seg: &ShmSegment) -> ShmidDsUser {
+    ShmidDsUser {
+        shm_perm: IpcPermUser {
+            __key: seg.key.unwrap_or(0) as u32,
+            uid: seg.uid,
+            gid: seg.gid,
+            cuid: seg.cuid,
+            cgid: seg.cgid,
+            mode: seg.mode,
+            ..IpcPermUser::default()
+        },
+        shm_segsz: seg.size as u64,
+        shm_atime: seg.atime,
+        shm_dtime: seg.dtime,
+        shm_ctime: seg.ctime,
+        shm_cpid: seg.cpid,
+        shm_lpid: seg.lpid,
+        shm_nattch: seg.nattch as u64,
+        ..ShmidDsUser::default()
+    }
+}
+
 pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
     let token = crate::trap::get_current_token();
     let (uid, gid, _pid, groups) = current_ids();
     let mut mgr = SHM_MANAGER.lock();
+
+    if cmd == IPC_INFO {
+        let highest_index = if mgr.segments.is_empty() {
+            0
+        } else {
+            mgr.segments.len() - 1
+        };
+        let info = ShminfoUser {
+            shmmax: SHMMAX as u64,
+            shmmin: SHMMIN as u64,
+            shmmni: SHMMNI as u64,
+            shmseg: SHMMNI as u64,
+            shmall: SHMALL as u64,
+            ..ShminfoUser::default()
+        };
+        if try_write_user_value(token, _buf as *mut ShminfoUser, &info).is_err() {
+            return EFAULT;
+        }
+        return highest_index as isize;
+    }
+
+    if cmd == SHM_INFO {
+        let highest_index = if mgr.segments.is_empty() {
+            0
+        } else {
+            mgr.segments.len() - 1
+        };
+        let total_pages = mgr
+            .segments
+            .values()
+            .map(|s| align_up(s.size, PAGE_SIZE) / PAGE_SIZE)
+            .sum::<usize>();
+        let info = ShmInfoUser {
+            used_ids: mgr.segments.len() as i32,
+            shm_tot: total_pages as u64,
+            shm_rss: total_pages as u64,
+            ..ShmInfoUser::default()
+        };
+        if try_write_user_value(token, _buf as *mut ShmInfoUser, &info).is_err() {
+            return EFAULT;
+        }
+        return highest_index as isize;
+    }
+
+    if cmd == SHM_STAT || cmd == SHM_STAT_ANY {
+        let Some((&seg_id, seg)) = mgr.segments.iter().nth(shmid) else {
+            return EINVAL;
+        };
+        if cmd == SHM_STAT
+            && !check_perm(
+                seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, 0o400, uid, gid, &groups,
+            )
+        {
+            return EACCES;
+        }
+        let ds = shm_to_user(seg);
+        if try_write_user_value(token, _buf as *mut ShmidDsUser, &ds).is_err() {
+            return EFAULT;
+        }
+        return seg_id as isize;
+    }
+
     let Some(seg) = mgr.segments.get_mut(&shmid) else {
         return EINVAL;
     };
@@ -404,28 +598,37 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
             ) {
                 return EACCES;
             }
-            let ds = ShmidDsUser {
-                shm_perm: IpcPermUser {
-                    __key: seg.key.unwrap_or(0) as u32,
-                    uid: seg.uid,
-                    gid: seg.gid,
-                    cuid: seg.cuid,
-                    cgid: seg.cgid,
-                    mode: seg.mode,
-                    ..IpcPermUser::default()
-                },
-                shm_segsz: seg.size as u64,
-                shm_atime: seg.atime,
-                shm_dtime: seg.dtime,
-                shm_ctime: seg.ctime,
-                shm_cpid: seg.cpid,
-                shm_lpid: seg.lpid,
-                shm_nattch: seg.nattch as u64,
-                ..ShmidDsUser::default()
-            };
+            let ds = shm_to_user(seg);
             if try_write_user_value(token, _buf as *mut ShmidDsUser, &ds).is_err() {
                 return EFAULT;
             }
+            0
+        }
+        IPC_SET => {
+            if uid != 0 && uid != seg.uid && uid != seg.cuid {
+                return EPERM;
+            }
+            let Some(ds) = try_read_user_value(token, _buf as *const ShmidDsUser) else {
+                return EFAULT;
+            };
+            seg.uid = ds.shm_perm.uid;
+            seg.gid = ds.shm_perm.gid;
+            seg.mode = (seg.mode & SHM_LOCKED) | (ds.shm_perm.mode & 0o777);
+            seg.ctime = now_secs();
+            0
+        }
+        SHM_LOCK => {
+            if uid != 0 && uid != seg.uid && uid != seg.cuid {
+                return EPERM;
+            }
+            seg.mode |= SHM_LOCKED;
+            0
+        }
+        SHM_UNLOCK => {
+            if uid != 0 && uid != seg.uid && uid != seg.cuid {
+                return EPERM;
+            }
+            seg.mode &= !SHM_LOCKED;
             0
         }
         _ => EINVAL,

@@ -10,11 +10,11 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    File, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
-    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode,
+    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, OSInode,
+    PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
 };
 use crate::mm::UserBuffer;
-use crate::task::manager::{PID2PCB, pid2process};
+use crate::task::manager::{pid2process, PID2PCB};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
 
@@ -27,6 +27,7 @@ pub enum ProcFileKind {
     Uptime,
     Stat,
     Perf,
+    SysvipcShm,
     PidStat(u32),
     PidCmdline(u32),
     PidStatus(u32),
@@ -161,7 +162,11 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 { None } else { Some(ino) }
+    if ino == 0 {
+        None
+    } else {
+        Some(ino)
+    }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
@@ -216,6 +221,21 @@ pub fn init_procfs() {
             let tainted_file = ensure_file(&kernel_dir, "tainted", 0o444);
             if let Some(tainted_file) = tainted_file {
                 let _ = tainted_file.write_at(0, b"0\n");
+            }
+            let shmmax_file = ensure_file(&kernel_dir, "shmmax", 0o644);
+            if let Some(shmmax_file) = shmmax_file {
+                let value = alloc::format!("{}\n", crate::syscall::sysv_shm::shmmax_limit());
+                let _ = shmmax_file.write_at(0, value.as_bytes());
+            }
+            let shmmni_file = ensure_file(&kernel_dir, "shmmni", 0o644);
+            if let Some(shmmni_file) = shmmni_file {
+                let value = alloc::format!("{}\n", crate::syscall::sysv_shm::shmmni_limit());
+                let _ = shmmni_file.write_at(0, value.as_bytes());
+            }
+            let shmall_file = ensure_file(&kernel_dir, "shmall", 0o644);
+            if let Some(shmall_file) = shmall_file {
+                let value = alloc::format!("{}\n", crate::syscall::sysv_shm::shmall_limit());
+                let _ = shmall_file.write_at(0, value.as_bytes());
             }
         }
         let fs_dir = ensure_dir(&sys_dir, "fs", 0o555);
@@ -308,6 +328,11 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
     });
     entries.push(PseudoDirent {
         name: String::from("sys"),
+        ino: 1,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("sysvipc"),
         ino: 1,
         dtype: 4,
     });
@@ -709,6 +734,26 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         let mapped = alloc::format!("/proc/{pid}{suffix}");
         return open_proc_pseudo(&mapped);
     }
+    if trimmed == "/proc/sysvipc" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: String::from("."),
+                ino: 1,
+                dtype: 4,
+            },
+            PseudoDirent {
+                name: String::from(".."),
+                ino: 1,
+                dtype: 4,
+            },
+            PseudoDirent {
+                name: String::from("shm"),
+                ino: 1,
+                dtype: 8,
+            },
+        ];
+        return Some(Arc::new(PseudoDir::new("/proc/sysvipc", entries)));
+    }
 
     match trimmed {
         "/proc/mounts" => return Some(ProcPseudoFile::new(ProcFileKind::Mounts)),
@@ -718,6 +763,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
         "/proc/perf" => return Some(ProcPseudoFile::new(ProcFileKind::Perf)),
+        "/proc/sysvipc/shm" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcShm)),
         "/proc/config.gz" => return Some(Arc::new(PseudoFile::new_static_bytes(PROC_CONFIG_GZ))),
         _ => {}
     }
@@ -834,6 +880,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
         ProcFileKind::Perf => proc_perf(),
+        ProcFileKind::SysvipcShm => crate::syscall::sysv_shm::proc_sysvipc_shm(),
         ProcFileKind::PidStat(pid) => proc_pid_stat(*pid),
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
         ProcFileKind::PidStatus(pid) => proc_pid_status(*pid),
