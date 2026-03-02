@@ -445,6 +445,7 @@ pub struct TaskControlBlockInner {
     pub pending_signal_pid: [i32; RT_SIG_MAX + 1],
     pub pending_signal_uid: [u32; RT_SIG_MAX + 1],
     pub pending_signal_code: [i32; RT_SIG_MAX + 1],
+    pub pending_signal_value: [usize; RT_SIG_MAX + 1],
     /// Signal mask for this thread (bitmask of blocked signals).
     pub signal_mask: u64,
     /// Saved mask to restore after a `sigsuspend`-delivered signal.
@@ -528,6 +529,7 @@ impl TaskControlBlock {
                 pending_signal_pid: [0; RT_SIG_MAX + 1],
                 pending_signal_uid: [0; RT_SIG_MAX + 1],
                 pending_signal_code: [0; RT_SIG_MAX + 1],
+                pending_signal_value: [0; RT_SIG_MAX + 1],
                 signal_mask: 0,
                 sigsuspend_old_mask: None,
                 sig_saved_ctx: alloc::vec::Vec::new(),
@@ -592,6 +594,7 @@ impl TaskControlBlock {
                 pending_signal_pid: [0; RT_SIG_MAX + 1],
                 pending_signal_uid: [0; RT_SIG_MAX + 1],
                 pending_signal_code: [0; RT_SIG_MAX + 1],
+                pending_signal_value: [0; RT_SIG_MAX + 1],
                 signal_mask: 0,
                 sigsuspend_old_mask: None,
                 sig_saved_ctx: alloc::vec::Vec::new(),

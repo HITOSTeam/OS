@@ -16,13 +16,17 @@ use crate::mm::{
     try_write_user_value,
 };
 use crate::syscall::filesystem::normalize_path;
+use crate::task::manager::{pid2process, wakeup_task};
 use crate::task::processor::{
-    current_files_process, current_process, suspend_current_and_run_next,
+    block_current_and_run_next, current_files_process, current_process, current_task,
+    suspend_current_and_run_next,
 };
+use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::trap::get_current_token;
 
 const AF_UNIX: u16 = 1;
 const AF_INET: u16 = 2;
+const AF_NETLINK: u16 = 16;
 const SOL_IP: usize = 0;
 
 const SOCK_STREAM: usize = 1;
@@ -70,6 +74,7 @@ const ENOENT: isize = -2;
 
 const MSG_OOB: usize = 0x1;
 const MSG_PEEK: usize = 0x2;
+const MSG_WAITALL: usize = 0x100;
 const MSG_TRUNC: usize = 0x20;
 const MSG_DONTWAIT: usize = 0x40;
 const MSG_ERRQUEUE: usize = 0x2000;
@@ -78,6 +83,7 @@ const MSG_MORE: usize = 0x8000;
 const MSG_WAITFORONE: usize = 0x10000;
 
 const UIO_MAXIOV: usize = 1024;
+const MQ_THREAD_NOTIFY_COOKIE_LEN: usize = 32;
 
 type FileArc = Arc<dyn File + Send + Sync>;
 type FileWeak = Weak<dyn File + Send + Sync>;
@@ -481,6 +487,178 @@ impl File for UnixSocketFile {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SockAddrNl {
+    nl_family: u16,
+    nl_pad: u16,
+    nl_pid: u32,
+    nl_groups: u32,
+}
+
+struct NetlinkSocketState {
+    bound: Option<SockAddrNl>,
+    messages: VecDeque<[u8; MQ_THREAD_NOTIFY_COOKIE_LEN]>,
+    recv_waiters: VecDeque<Weak<TaskControlBlock>>,
+}
+
+pub(crate) struct NetlinkSocketFile {
+    state: Mutex<NetlinkSocketState>,
+}
+
+impl NetlinkSocketFile {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(NetlinkSocketState {
+                bound: None,
+                messages: VecDeque::new(),
+                recv_waiters: VecDeque::new(),
+            }),
+        }
+    }
+
+    fn retain_blocked_waiters(waiters: &mut VecDeque<Weak<TaskControlBlock>>) {
+        waiters.retain(|w| {
+            let Some(task) = w.upgrade() else {
+                return false;
+            };
+            task.borrow_mut().task_status == TaskStatus::Blocked
+        });
+    }
+
+    fn add_waiter_once(
+        waiters: &mut VecDeque<Weak<TaskControlBlock>>,
+        task: &Arc<TaskControlBlock>,
+    ) {
+        if waiters
+            .iter()
+            .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, task)))
+        {
+            return;
+        }
+        waiters.push_back(Arc::downgrade(task));
+    }
+
+    fn bind_local(&self, addr: SockAddrNl) -> isize {
+        if addr.nl_family != AF_NETLINK {
+            return EAFNOSUPPORT;
+        }
+        let mut st = self.state.lock();
+        if st.bound.is_some() {
+            return EINVAL;
+        }
+        st.bound = Some(SockAddrNl {
+            nl_family: AF_NETLINK,
+            nl_pad: 0,
+            nl_pid: if addr.nl_pid == 0 {
+                current_process().pid.0 as u32
+            } else {
+                addr.nl_pid
+            },
+            nl_groups: addr.nl_groups,
+        });
+        0
+    }
+
+    fn local_addr(&self) -> SockAddrNl {
+        self.state.lock().bound.unwrap_or(SockAddrNl {
+            nl_family: AF_NETLINK,
+            nl_pad: 0,
+            nl_pid: 0,
+            nl_groups: 0,
+        })
+    }
+
+    pub(crate) fn enqueue_mq_notify(
+        &self,
+        mut cookie: [u8; MQ_THREAD_NOTIFY_COOKIE_LEN],
+        notify_kind: u8,
+    ) {
+        cookie[MQ_THREAD_NOTIFY_COOKIE_LEN - 1] = notify_kind;
+        let mut wake = Vec::new();
+        {
+            let mut st = self.state.lock();
+            st.messages.push_back(cookie);
+            Self::retain_blocked_waiters(&mut st.recv_waiters);
+            for waiter in st.recv_waiters.drain(..) {
+                if let Some(task) = waiter.upgrade() {
+                    wake.push(task);
+                }
+            }
+        }
+        for task in wake {
+            wakeup_task(task);
+        }
+    }
+
+    fn recv_packet(
+        &self,
+        len: usize,
+        flags: usize,
+    ) -> Result<[u8; MQ_THREAD_NOTIFY_COOKIE_LEN], isize> {
+        let peek = (flags & MSG_PEEK) != 0;
+        let nonblock = (flags & MSG_DONTWAIT) != 0;
+        loop {
+            let mut st = self.state.lock();
+            let msg = if peek {
+                st.messages.front().copied()
+            } else {
+                st.messages.pop_front()
+            };
+            if let Some(msg) = msg {
+                drop(st);
+                return Ok(msg);
+            }
+            if nonblock {
+                return Err(EAGAIN);
+            }
+            let Some(task) = current_task() else {
+                return Err(EAGAIN);
+            };
+            Self::add_waiter_once(&mut st.recv_waiters, &task);
+            drop(st);
+            block_current_and_run_next();
+        }
+    }
+
+    pub(crate) fn poll_readable(&self) -> bool {
+        !self.state.lock().messages.is_empty()
+    }
+
+    pub(crate) fn poll_writable(&self) -> bool {
+        true
+    }
+}
+
+impl File for NetlinkSocketFile {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, buf: UserBuffer) -> usize {
+        let len = buf.len();
+        if len == 0 {
+            return 0;
+        }
+        match self.recv_packet(len, 0) {
+            Ok(msg) => copy_slice_to_user_buffer(buf, &msg[..len.min(msg.len())]),
+            Err(_) => 0,
+        }
+    }
+
+    fn write(&self, buf: UserBuffer) -> usize {
+        copy_user_buffer_to_vec(buf).len()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct SockAddrIn {
     sin_family: u16,
@@ -519,6 +697,45 @@ fn get_file(fd: usize) -> Result<FileArc, isize> {
         return Err(EBADF);
     }
     inner.fd_table[fd].clone().ok_or(EBADF)
+}
+
+fn get_file_from_process(pid: usize, fd: usize) -> Result<FileArc, isize> {
+    let Some(process) = pid2process(pid) else {
+        return Err(EBADF);
+    };
+    let inner = process.borrow_mut();
+    if fd >= inner.fd_table.len() {
+        return Err(EBADF);
+    }
+    inner.fd_table[fd].clone().ok_or(EBADF)
+}
+
+pub(crate) fn mq_notify_validate_thread_sockfd(pid: usize, sockfd: usize) -> isize {
+    let file = match get_file_from_process(pid, sockfd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_none() {
+        return EBADF;
+    }
+    0
+}
+
+pub(crate) fn mq_notify_send_thread_event(
+    pid: usize,
+    sockfd: usize,
+    cookie: [u8; MQ_THREAD_NOTIFY_COOKIE_LEN],
+    notify_kind: u8,
+) -> isize {
+    let file = match get_file_from_process(pid, sockfd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let Some(sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() else {
+        return EBADF;
+    };
+    sock.enqueue_mq_notify(cookie, notify_kind);
+    0
 }
 
 fn current_unix_ucred() -> UCred {
@@ -594,6 +811,9 @@ pub(crate) fn poll_file_read_write(file: &Arc<dyn File + Send + Sync>) -> (bool,
     if let Some(us) = file.as_any().downcast_ref::<UnixSocketFile>() {
         return (us.poll_readable(), us.poll_writable());
     }
+    if let Some(nl) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
+        return (nl.poll_readable(), nl.poll_writable());
+    }
     (file.readable(), file.writable())
 }
 
@@ -602,6 +822,7 @@ pub(crate) fn file_supports_poll(file: &Arc<dyn File + Send + Sync>) -> bool {
         || file.as_any().downcast_ref::<SocketPairEnd>().is_some()
         || file.as_any().downcast_ref::<NetSocketFile>().is_some()
         || file.as_any().downcast_ref::<UnixSocketFile>().is_some()
+        || file.as_any().downcast_ref::<NetlinkSocketFile>().is_some()
 }
 
 pub(crate) fn poll_file_epoll(file: &Arc<dyn File + Send + Sync>) -> (bool, bool, bool) {
@@ -657,6 +878,25 @@ fn parse_sockaddr_in(
     let ip_raw = u32::from_be(sa.sin_addr);
     let ip = smoltcp::wire::Ipv4Address::from_bytes(&ip_raw.to_be_bytes());
     Ok((ip, port))
+}
+
+fn parse_sockaddr_nl(user_ptr: usize, len: usize) -> Result<SockAddrNl, isize> {
+    if user_ptr == 0 || len < size_of::<SockAddrNl>() {
+        return Err(EINVAL);
+    }
+    if len > i32::MAX as usize {
+        return Err(EINVAL);
+    }
+    let token = get_current_token();
+    let Some(sa) = try_read_user_value(token, user_ptr as *const SockAddrNl) else {
+        return Err(EFAULT);
+    };
+    if sa.nl_family != AF_NETLINK {
+        if sa.nl_family != 0 {
+            return Err(EAFNOSUPPORT);
+        }
+    }
+    Ok(sa)
 }
 
 fn parse_sockaddr_un(user_ptr: usize, len: usize) -> Result<(bool, Vec<u8>), isize> {
@@ -837,6 +1077,34 @@ fn write_sockaddr_in(
     if copy_len > 0 {
         let bytes = unsafe {
             core::slice::from_raw_parts((&sa as *const SockAddrIn) as *const u8, copy_len)
+        };
+        if try_copy_to_user(token, user_ptr as *mut u8, bytes).is_err() {
+            return EFAULT;
+        }
+    }
+    if try_write_user_value(token, user_len_ptr as *mut u32, &(required as u32)).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+fn write_sockaddr_nl(user_ptr: usize, user_len_ptr: usize, sa: &SockAddrNl) -> isize {
+    if user_ptr == 0 || user_len_ptr == 0 {
+        return EFAULT;
+    }
+    let token = get_current_token();
+    let Some(len_u32) = try_read_user_value::<u32>(token, user_len_ptr as *const u32) else {
+        return EFAULT;
+    };
+    let len = len_u32 as usize;
+    if len > i32::MAX as usize {
+        return EINVAL;
+    }
+    let required = size_of::<SockAddrNl>();
+    let copy_len = core::cmp::min(len, required);
+    if copy_len > 0 {
+        let bytes = unsafe {
+            core::slice::from_raw_parts((&*sa as *const SockAddrNl) as *const u8, copy_len)
         };
         if try_copy_to_user(token, user_ptr as *mut u8, bytes).is_err() {
             return EFAULT;
@@ -1044,7 +1312,8 @@ fn validate_recv_flags(flags: usize) -> isize {
     if (flags & MSG_ERRQUEUE) != 0 {
         return EAGAIN;
     }
-    let known = MSG_DONTWAIT | MSG_PEEK | MSG_ERRQUEUE | MSG_OOB | MSG_WAITFORONE;
+    let known =
+        MSG_DONTWAIT | MSG_PEEK | MSG_ERRQUEUE | MSG_OOB | MSG_WAITFORONE | MSG_WAITALL | MSG_NOSIGNAL;
     if (flags & !known) != 0 {
         return EOPNOTSUPP;
     }
@@ -1159,6 +1428,27 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
         }
         let (kbuf, had_pending, _) = consume_pending_more(key, kbuf);
         return visible_send_result(unix_sock.send_dgram(kbuf, target), user_len, had_pending);
+    }
+    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
+        let send_flag_check = validate_send_flags(flags);
+        if send_flag_check != 0 {
+            return send_flag_check;
+        }
+        let kbuf = match gather_iovecs_data(&iovs) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if kbuf.is_empty() {
+            return 0;
+        }
+        if msg.msg_name != 0 && msg.msg_namelen != 0 {
+            let _ = match parse_sockaddr_nl(msg.msg_name, msg.msg_namelen as usize) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+        }
+        // Outbound netlink is ignored in current kernel model.
+        return kbuf.len() as isize;
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
@@ -1306,6 +1596,34 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
         let r = write_msg_name_un(msg, dgram.from.as_ref());
         if r != 0 {
             return r;
+        }
+        return copied as isize;
+    }
+    if let Some(netlink_sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
+        let packet = match netlink_sock.recv_packet(total_len, flags) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let copied = match scatter_iovecs_data(&iovs, &packet[..total_len.min(packet.len())]) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if msg.msg_name != 0 && msg.msg_namelen != 0 {
+            let sa = netlink_sock.local_addr();
+            let r = write_msg_name_bytes(
+                msg,
+                unsafe {
+                    core::slice::from_raw_parts(
+                        (&sa as *const SockAddrNl) as *const u8,
+                        size_of::<SockAddrNl>(),
+                    )
+                },
+            );
+            if r != 0 {
+                return r;
+            }
+        } else {
+            msg.msg_namelen = 0;
         }
         return copied as isize;
     }
@@ -1513,7 +1831,18 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
             }
             Arc::new(UnixSocketFile::new(st))
         }
-        _ => return EAFNOSUPPORT,
+        AF_NETLINK => {
+            if !matches!(st, SOCK_RAW | SOCK_DGRAM) {
+                return EPROTONOSUPPORT;
+            }
+            if protocol != 0 {
+                return EPROTONOSUPPORT;
+            }
+            Arc::new(NetlinkSocketFile::new())
+        }
+        _ => {
+            return EAFNOSUPPORT;
+        }
     };
     let process = current_files_process();
     let mut inner = process.borrow_mut();
@@ -1547,6 +1876,13 @@ pub fn syscall_bind(fd: usize, addr: usize, addrlen: usize) -> isize {
     };
     if let Some(unix_sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
         return bind_unix_socket(&file, unix_sock, addr, addrlen);
+    }
+    if let Some(netlink_sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
+        let sa = match parse_sockaddr_nl(addr, addrlen) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        return netlink_sock.bind_local(sa);
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
@@ -1783,6 +2119,13 @@ pub fn syscall_connect(fd: usize, addr: usize, addrlen: usize) -> isize {
         };
         return unix_sock.connect_unix(bound);
     }
+    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
+        let _ = match parse_sockaddr_nl(addr, addrlen) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        return 0;
+    }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
         None => return ENOTSOCK,
@@ -1859,6 +2202,28 @@ pub fn syscall_sendto(
         }
         let (kbuf, had_pending, _) = consume_pending_more(key, kbuf);
         return visible_send_result(unix_sock.send_dgram(kbuf, target), user_len, had_pending);
+    }
+    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
+        if len == 0 {
+            return 0;
+        }
+        let send_flag_check = validate_send_flags(flags);
+        if send_flag_check != 0 {
+            return send_flag_check;
+        }
+        // Minimal support for mq_notify helper sockets: outbound netlink is ignored.
+        let token = get_current_token();
+        let mut probe = [0u8; 1];
+        if try_copy_from_user(token, buf_ptr as *const u8, &mut probe).is_err() {
+            return EFAULT;
+        }
+        if addr != 0 && addrlen != 0 {
+            let _ = match parse_sockaddr_nl(addr, addrlen) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+        }
+        return len as isize;
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
@@ -1977,6 +2342,28 @@ pub fn syscall_recvfrom(
         }
         return n as isize;
     }
+    if let Some(netlink_sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
+        if len == 0 {
+            return 0;
+        }
+        let packet = match netlink_sock.recv_packet(len, flags) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let copied = core::cmp::min(len, packet.len());
+        let token = get_current_token();
+        if try_copy_to_user(token, buf_ptr as *mut u8, &packet[..copied]).is_err() {
+            return EFAULT;
+        }
+        if addr != 0 && addrlen != 0 {
+            let sa = netlink_sock.local_addr();
+            let r = write_sockaddr_nl(addr, addrlen, &sa);
+            if r != 0 {
+                return r;
+            }
+        }
+        return copied as isize;
+    }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
         None => return ENOTSOCK,
@@ -2053,6 +2440,10 @@ pub fn syscall_getsockname(fd: usize, addr: usize, addrlen: usize) -> isize {
     if file.as_any().downcast_ref::<SocketPairEnd>().is_some() {
         return write_sockaddr_un(addr, addrlen, None);
     }
+    if let Some(netlink_sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
+        let sa = netlink_sock.local_addr();
+        return write_sockaddr_nl(addr, addrlen, &sa);
+    }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
         None => return ENOTSOCK,
@@ -2087,6 +2478,9 @@ pub fn syscall_getpeername(fd: usize, addr: usize, addrlen: usize) -> isize {
     if file.as_any().downcast_ref::<SocketPairEnd>().is_some() {
         return write_sockaddr_un(addr, addrlen, None);
     }
+    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
+        return ENOTCONN;
+    }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
         None => return ENOTSOCK,
@@ -2111,6 +2505,9 @@ pub fn syscall_setsockopt(
         Ok(f) => f,
         Err(e) => return e,
     };
+    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
+        return 0;
+    }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
         None => return ENOTSOCK,
@@ -2204,6 +2601,10 @@ pub fn syscall_getsockopt(
         Ok(f) => f,
         Err(e) => return e,
     };
+    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
+        let val: u32 = 0;
+        return write_sockopt_bytes(optval, optlen, user_len, &val.to_ne_bytes());
+    }
     if let Some(unix_sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
         if level == SOL_SOCKET && optname == SO_PEERCRED {
             let Some(cred) = unix_sock.peer_cred() else {
@@ -2271,6 +2672,9 @@ pub fn syscall_shutdown(_fd: usize, _how: usize) -> isize {
         Err(e) => return e,
     };
     if file.as_any().downcast_ref::<UnixSocketFile>().is_some() {
+        return 0;
+    }
+    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
         return 0;
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {

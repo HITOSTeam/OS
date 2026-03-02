@@ -99,6 +99,7 @@ fn mark_pending_signal(
     sender_pid: i32,
     sender_uid: u32,
     si_code: i32,
+    sig_value: usize,
 ) {
     let Some(bit) = signal_bit(signum) else {
         return;
@@ -108,6 +109,7 @@ fn mark_pending_signal(
         inner.pending_signal_pid[signum] = sender_pid;
         inner.pending_signal_uid[signum] = sender_uid;
         inner.pending_signal_code[signum] = si_code;
+        inner.pending_signal_value[signum] = sig_value;
     }
 }
 
@@ -486,7 +488,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
         for t in &tasks {
             let (tid, pending, mask) = {
                 let mut inner = t.borrow_mut();
-                mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0);
+                mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0, 0);
                 let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 (tid, inner.pending_signals, inner.signal_mask)
             };
@@ -536,7 +538,7 @@ pub fn kill_current(signum: i32) -> isize {
     for t in tasks {
         {
             let mut inner = t.borrow_mut();
-            mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0);
+            mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0, 0);
         }
         wakeup_task(t);
     }
@@ -585,7 +587,7 @@ pub fn queue_process_signal(pid: usize, signum: usize) {
     let (tid, on_cpu, queued) = {
         let mut inner = task.borrow_mut();
         let already = (inner.pending_signals & bit) != 0;
-        mark_pending_signal(&mut inner, signum, 0, 0, 0);
+        mark_pending_signal(&mut inner, signum, 0, 0, 0, 0);
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
         (
             tid,

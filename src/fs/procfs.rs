@@ -258,6 +258,13 @@ pub fn init_procfs() {
             if let Some(lease_break_time) = lease_break_time {
                 let _ = lease_break_time.write_at(0, b"45\n");
             }
+            let mqueue_dir = ensure_dir(&fs_dir, "mqueue", 0o555);
+            if let Some(mqueue_dir) = mqueue_dir {
+                let queues_max = ensure_file(&mqueue_dir, "queues_max", 0o644);
+                if let Some(queues_max) = queues_max {
+                    let _ = queues_max.write_at(0, b"256\n");
+                }
+            }
         }
         let net_dir = ensure_dir(&sys_dir, "net", 0o555);
         if let Some(net_dir) = net_dir {

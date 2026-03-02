@@ -10,6 +10,7 @@ mod memory;
 pub(crate) mod misc;
 mod mutex;
 mod net;
+mod posix_mq;
 mod process;
 pub(crate) mod robust_list;
 mod sched;
@@ -206,6 +207,12 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_GETTID_LINUX: usize = 178;
+const SYSCALL_MQ_OPEN: usize = 180;
+const SYSCALL_MQ_UNLINK: usize = 181;
+const SYSCALL_MQ_TIMEDSEND: usize = 182;
+const SYSCALL_MQ_TIMEDRECEIVE: usize = 183;
+const SYSCALL_MQ_NOTIFY: usize = 184;
+const SYSCALL_MQ_GETSETATTR: usize = 185;
 const SYSCALL_MSGGET: usize = 186;
 const SYSCALL_MSGCTL: usize = 187;
 const SYSCALL_MSGRCV: usize = 188;
@@ -237,6 +244,8 @@ const SYSCALL_RECVMSG: usize = 212;
 const SYSCALL_RECVMMSG: usize = 243;
 const SYSCALL_SENDMMSG: usize = 269;
 const SYSCALL_RECVMMSG_TIME64: usize = 417;
+const SYSCALL_MQ_TIMEDSEND_TIME64: usize = 418;
+const SYSCALL_MQ_TIMEDRECEIVE_TIME64: usize = 419;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_CLONE: usize = 220;
@@ -635,6 +644,16 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETGID => misc::syscall_getgid(),
         SYSCALL_GETEGID => misc::syscall_getegid(),
         SYSCALL_GETTID_LINUX => misc::syscall_gettid_linux(),
+        SYSCALL_MQ_OPEN => posix_mq::syscall_mq_open(args[0], args[1], args[2], args[3]),
+        SYSCALL_MQ_UNLINK => posix_mq::syscall_mq_unlink(args[0]),
+        SYSCALL_MQ_TIMEDSEND | SYSCALL_MQ_TIMEDSEND_TIME64 => {
+            posix_mq::syscall_mq_timedsend(args[0], args[1], args[2], args[3], args[4])
+        }
+        SYSCALL_MQ_TIMEDRECEIVE | SYSCALL_MQ_TIMEDRECEIVE_TIME64 => {
+            posix_mq::syscall_mq_timedreceive(args[0], args[1], args[2], args[3], args[4])
+        }
+        SYSCALL_MQ_NOTIFY => posix_mq::syscall_mq_notify(args[0], args[1]),
+        SYSCALL_MQ_GETSETATTR => posix_mq::syscall_mq_getsetattr(args[0], args[1], args[2]),
         SYSCALL_MSGGET => sysv_ipc::syscall_msgget(args[0], args[1]),
         SYSCALL_MSGCTL => sysv_ipc::syscall_msgctl(args[0], args[1], args[2]),
         SYSCALL_MSGRCV => {
