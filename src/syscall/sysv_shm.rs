@@ -6,6 +6,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
+use crate::fs::find_path_in_roots;
 use crate::mm::{
     frame_alloc, try_read_user_value, try_write_user_value, FrameTracker, MapPermission, PTEFlags,
     VirtAddr,
@@ -39,6 +40,9 @@ const SHMMNI: usize = 4096;
 const SHMMAX: usize = usize::MAX - (1usize << 24);
 const SHMALL: usize = usize::MAX / PAGE_SIZE;
 const SHM_MMAP_MIN_ADDR: usize = 0x10000;
+const PROCFS_SHMMAX: &str = "/proc/sys/kernel/shmmax";
+const PROCFS_SHMMNI: &str = "/proc/sys/kernel/shmmni";
+const PROCFS_SHMALL: &str = "/proc/sys/kernel/shmall";
 
 const EACCES: isize = -13;
 const EFAULT: isize = -14;
@@ -59,6 +63,36 @@ pub fn shmmni_limit() -> usize {
 
 pub fn shmall_limit() -> usize {
     SHMALL
+}
+
+fn read_proc_sys_limit(path: &str, default: usize, min: usize, max: usize) -> usize {
+    let Some(inode) = find_path_in_roots(path) else {
+        return default;
+    };
+    let mut buf = [0u8; 64];
+    let len = inode.read_at(0, &mut buf);
+    if len == 0 {
+        return default;
+    }
+    let Ok(raw) = core::str::from_utf8(&buf[..len]) else {
+        return default;
+    };
+    let Ok(value) = raw.trim().parse::<usize>() else {
+        return default;
+    };
+    value.clamp(min, max)
+}
+
+fn runtime_shmmax_limit() -> usize {
+    read_proc_sys_limit(PROCFS_SHMMAX, SHMMAX, SHMMIN, SHMMAX)
+}
+
+fn runtime_shmmni_limit() -> usize {
+    read_proc_sys_limit(PROCFS_SHMMNI, SHMMNI, 1, SHMMNI)
+}
+
+fn runtime_shmall_limit() -> usize {
+    read_proc_sys_limit(PROCFS_SHMALL, SHMALL, 1, SHMALL)
 }
 
 pub fn proc_sysvipc_shm() -> String {
@@ -300,10 +334,9 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
         // HugeTLB shared memory is not supported yet.
         return EINVAL;
     }
-    if size < SHMMIN || size > SHMMAX {
-        return EINVAL;
-    }
-    let size_aligned = align_up(size, PAGE_SIZE);
+    let shmmax_limit = runtime_shmmax_limit();
+    let shmmni_limit = runtime_shmmni_limit();
+    let shmall_limit = runtime_shmall_limit();
 
     let mut mgr = SHM_MANAGER.lock();
     if key != IPC_PRIVATE {
@@ -330,13 +363,23 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
             return ENOENT;
         }
     }
-    if mgr.segments.len() >= SHMMNI {
+    if size < SHMMIN || size > shmmax_limit {
+        return EINVAL;
+    }
+    let size_aligned = align_up(size, PAGE_SIZE);
+    let pages = size_aligned / PAGE_SIZE;
+    if mgr.segments.len() >= shmmni_limit {
+        return ENOSPC;
+    }
+    let used_pages = mgr.segments.values().fold(0usize, |acc, seg| {
+        acc.saturating_add(align_up(seg.size, PAGE_SIZE) / PAGE_SIZE)
+    });
+    if pages > shmall_limit.saturating_sub(used_pages) {
         return ENOSPC;
     }
 
     let id = mgr.alloc_id();
     let (uid, gid, pid, _) = current_ids();
-    let pages = size_aligned / PAGE_SIZE;
     let mut frames = Vec::with_capacity(pages);
     for _ in 0..pages {
         let Some(frame) = frame_alloc() else {
@@ -524,11 +567,11 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
             mgr.segments.len() - 1
         };
         let info = ShminfoUser {
-            shmmax: SHMMAX as u64,
+            shmmax: runtime_shmmax_limit() as u64,
             shmmin: SHMMIN as u64,
-            shmmni: SHMMNI as u64,
-            shmseg: SHMMNI as u64,
-            shmall: SHMALL as u64,
+            shmmni: runtime_shmmni_limit() as u64,
+            shmseg: runtime_shmmni_limit() as u64,
+            shmall: runtime_shmall_limit() as u64,
             ..ShminfoUser::default()
         };
         if try_write_user_value(token, _buf as *mut ShminfoUser, &info).is_err() {

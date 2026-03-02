@@ -299,6 +299,17 @@ pub fn syscall_brk(addr: usize) -> isize {
         );
     }
     let ok = if new_end > old_end {
+        if inner.memory_set.range_overlaps(old_end.into(), new_end.into()) {
+            if crate::debug_config::DEBUG_SYSCALL {
+                crate::println!(
+                    "[brk] pid={} grow range [{:#x}, {:#x}) overlaps existing mapping",
+                    pid,
+                    old_end,
+                    new_end
+                );
+            }
+            return old_brk as isize;
+        }
         let mut ok = inner
             .memory_set
             .append_to(heap_start.into(), new_end.into());
