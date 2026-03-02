@@ -24,22 +24,23 @@ pub trait File: Send + Sync {
 }
 
 pub use dummy::DummyFile;
-pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub(crate) use inode::{
-    debug_track_iozone_inode, ext4_lock, find_path_in_roots, root_inode_for_path,
-    secondary_root_inode,
+    debug_track_iozone_inode, ext4_lock, find_path_in_roots, register_deferred_unlink_cleanup,
+    root_inode_for_path, secondary_root_inode,
 };
+pub use inode::{list_apps, open_file, OSInode, OpenFlags, EXT4_FS, ROOT_INODE, USER_INODE};
 pub use net_socket::{NetSocketFile, NetSocketKind};
-pub use pipe::{Pipe, make_pipe};
+pub use pipe::{make_pipe, Pipe};
 pub use procfs::{
     build_proc_root_entries, collect_pids, init_procfs, is_proc_pseudo_path, is_proc_root,
     open_proc_pseudo, proc_file_content, proc_file_kind, proc_file_len, proc_readlink,
     sync_proc_path,
 };
 pub use pseudo::PseudoBlock;
-pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub(crate) use pseudo::{
-    pseudo_block_note_sync, pseudo_block_stat_snapshot, shm_create, shm_get, shm_list, shm_remove,
+    pseudo_block_note_sync, pseudo_block_stat_snapshot, shm_create, shm_create_anonymous, shm_get,
+    shm_list, shm_remove,
 };
-pub use socketpair::{SocketPairEnd, make_socketpair};
+pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
+pub use socketpair::{make_socketpair, SocketPairEnd};
 pub use stdio::{Stdin, Stdout};

@@ -4,6 +4,7 @@ use super::File;
 use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
 use crate::mm::UserBuffer;
 use crate::println;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -57,6 +58,8 @@ impl Drop for Ext4Guard {
 lazy_static! {
     static ref EXT4_LOCK: Arc<Ext4Lock> = Arc::new(Ext4Lock::new());
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    static ref DEFERRED_UNLINK_CLEANUP: Mutex<BTreeMap<(usize, u32), TmpfileCleanup>> =
+        Mutex::new(BTreeMap::new());
 }
 
 pub(crate) fn ext4_lock() -> Ext4Guard {
@@ -401,6 +404,17 @@ impl OSInode {
     pub fn set_dir_offset(&self, offset: usize) {
         self.inner.lock().dir_offset = offset;
     }
+}
+
+pub(crate) fn register_deferred_unlink_cleanup(
+    inode: &Arc<Inode>,
+    parent: Arc<Inode>,
+    name: String,
+) {
+    let key = (inode.device_id(), inode.inode_num());
+    DEFERRED_UNLINK_CLEANUP
+        .lock()
+        .insert(key, TmpfileCleanup { parent, name });
 }
 
 lazy_static! {
@@ -836,6 +850,7 @@ impl File for OSInode {
 impl Drop for OSInode {
     fn drop(&mut self) {
         let mut inner = self.inner.lock();
+        let inode_key = (inner.inode.device_id(), inner.inode.inode_num());
         if !inner.write_buf.is_empty() {
             let off = inner.write_buf_off;
             let data = core::mem::take(&mut inner.write_buf);
@@ -846,6 +861,12 @@ impl Drop for OSInode {
         }
         drop(inner);
         if let Some(cleanup) = self.tmpfile_cleanup.take() {
+            let _ = {
+                let _fs_guard = ext4_lock();
+                cleanup.parent.unlink(&cleanup.name)
+            };
+        }
+        if let Some(cleanup) = DEFERRED_UNLINK_CLEANUP.lock().remove(&inode_key) {
             let _ = {
                 let _fs_guard = ext4_lock();
                 cleanup.parent.unlink(&cleanup.name)

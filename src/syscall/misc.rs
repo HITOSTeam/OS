@@ -4,21 +4,21 @@ use crate::{
     debug_config::DEBUG_PTHREAD,
     fs::ext4_lock,
     mm::{
-        MapPermission, read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
-        try_read_user_value, try_write_user_value, write_user_value,
+        read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
+        try_read_user_value, try_write_user_value, write_user_value, MapPermission,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
-        manager::{PID2PCB, pid2process, refresh_process_runqueues},
+        manager::{pid2process, refresh_process_runqueues, PID2PCB},
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
         signal::{
-            SIGKILL_NUM, SIGSTOP_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal,
-            signal_bit,
+            has_unmasked_pending, queue_process_signal, signal_bit, SIGKILL_NUM, SIGSTOP_NUM,
+            SIGXCPU_NUM,
         },
     },
     time::{get_time, get_time_ms},
@@ -337,6 +337,8 @@ const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const CAP_LAST_CAP: usize = 63;
 const CAP_SETPCAP: usize = 8;
+const PR_GET_DUMPABLE: usize = 3;
+const PR_SET_DUMPABLE: usize = 4;
 const PR_CAPBSET_READ: usize = 23;
 const PR_CAPBSET_DROP: usize = 24;
 
@@ -490,6 +492,14 @@ pub fn syscall_prctl(
     _arg5: usize,
 ) -> isize {
     match option {
+        PR_GET_DUMPABLE => 1,
+        PR_SET_DUMPABLE => {
+            if arg2 > 1 {
+                EINVAL
+            } else {
+                0
+            }
+        }
         PR_CAPBSET_READ => {
             if arg2 > CAP_LAST_CAP {
                 return EINVAL;
@@ -565,7 +575,11 @@ pub fn syscall_getppid() -> isize {
 }
 
 fn normalized_pgid(pid: usize, pgid: usize) -> usize {
-    if pgid == 0 && pid != 0 { pid } else { pgid }
+    if pgid == 0 && pid != 0 {
+        pid
+    } else {
+        pgid
+    }
 }
 
 fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {

@@ -8,27 +8,27 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::task::manager::{PID2PCB, wakeup_task};
+use crate::task::manager::{wakeup_task, PID2PCB};
 use crate::{
     fs::{
-        File, NetSocketFile, OSInode, OpenFlags, Pipe, PseudoBlock, PseudoDir, PseudoDirent,
-        PseudoFile, PseudoShmFile, RtcFile, SocketPairEnd, ext4_lock, find_path_in_roots,
-        make_pipe, open_file, pseudo_block_note_sync, pseudo_block_stat_snapshot,
-        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
+        ext4_lock, find_path_in_roots, make_pipe, open_file, pseudo_block_note_sync,
+        pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
+        shm_create, shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe,
+        PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile, SocketPairEnd,
     },
     mm::{
-        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
-        translated_byte_buffer, translated_mutref, translated_str, try_copy_from_user,
-        try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_user_value,
-        write_user_value,
+        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
+        translated_str, try_copy_from_user, try_copy_to_user, try_read_user_value,
+        try_translated_byte_buffer, try_write_user_value, write_user_value, MapPermission,
+        UserBuffer,
     },
     task::processor::{
         block_current_and_run_next, current_files_process, current_process, current_task,
     },
     task::{
-        ProcessControlBlock,
-        signal::{SIGXFSZ_NUM, has_unmasked_pending, queue_process_signal},
+        signal::{has_unmasked_pending, queue_process_signal, SIGXFSZ_NUM},
         task_block::TaskControlBlock,
+        ProcessControlBlock,
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -5782,6 +5782,14 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         return EROFS;
     }
 
+    if !remove_dir {
+        match defer_unlink_open_file(&parent, &name, &child) {
+            Ok(true) => return 0,
+            Ok(false) => {}
+            Err(e) => return e,
+        }
+    }
+
     match parent.unlink(&name) {
         Ok(_) => 0,
         Err(ext4_fs::Ext4Error::Unsupported) => ENOTEMPTY,
@@ -5824,6 +5832,52 @@ fn flush_open_inode_views(target: &Arc<ext4_fs::Inode>) {
             let _ = os_inode.flush();
         }
     }
+}
+
+fn has_open_inode_view(target: &Arc<ext4_fs::Inode>) -> bool {
+    let target_ino = target.inode_num();
+    let target_dev = target.device_id();
+    let process = current_files_process();
+    let inner = process.borrow_mut();
+    inner
+        .fd_table
+        .iter()
+        .filter_map(|f| f.as_ref())
+        .any(|file| {
+            file.as_any()
+                .downcast_ref::<OSInode>()
+                .map(|o| {
+                    let inode = o.ext4_inode();
+                    inode.inode_num() == target_ino && inode.device_id() == target_dev
+                })
+                .unwrap_or(false)
+        })
+}
+
+fn defer_unlink_open_file(
+    parent: &Arc<ext4_fs::Inode>,
+    name: &str,
+    child: &Arc<ext4_fs::Inode>,
+) -> Result<bool, isize> {
+    if !child.is_file() || !has_open_inode_view(child) {
+        return Ok(false);
+    }
+    let pid = current_process().getpid();
+    for _ in 0..64 {
+        let seq = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let hidden = alloc::format!(".ltp_orphan.{}.{}", pid, seq);
+        if parent.find(&hidden).is_some() {
+            continue;
+        }
+        match parent.rename(name, &hidden) {
+            Ok(_) => {
+                register_deferred_unlink_cleanup(child, Arc::clone(parent), hidden);
+                return Ok(true);
+            }
+            Err(e) => return Err(ext4_err_to_errno(e)),
+        }
+    }
+    Err(ENOSPC)
 }
 
 fn truncate_regular_inode(inode: &Arc<ext4_fs::Inode>, new_len: usize) -> isize {

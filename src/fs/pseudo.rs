@@ -10,7 +10,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
-use crate::mm::{FrameTracker, UserBuffer, frame_alloc};
+use crate::mm::{frame_alloc, FrameTracker, UserBuffer};
 
 use super::File;
 
@@ -235,6 +235,10 @@ pub(crate) fn shm_create(name: &str) -> ShmData {
     map.entry(String::from(name))
         .or_insert_with(|| Arc::new(Mutex::new(ShmDataInner::new())))
         .clone()
+}
+
+pub(crate) fn shm_create_anonymous() -> ShmData {
+    Arc::new(Mutex::new(ShmDataInner::new()))
 }
 
 pub(crate) fn shm_remove(name: &str) -> bool {

@@ -1,9 +1,9 @@
 use crate::{
     config::{PAGE_SIZE, TRAP_CONTEXT},
-    fs::{File, OSInode, PseudoShmFile, ext4_lock},
-    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked},
-    task::MmapRegion,
+    fs::{ext4_lock, File, OSInode, PseudoShmFile},
+    mm::{frame_alloc, try_copy_to_user, try_copy_to_user_unchecked, MapPermission, PTEFlags},
     task::processor::{current_files_process, current_process},
+    task::MmapRegion,
     trap::get_current_token,
 };
 use alloc::sync::Arc;
@@ -19,6 +19,7 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_SHARED_VALIDATE: usize = 0x03;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
+const MAP_LOCKED: usize = 0x2000;
 const MAP_STACK: usize = 0x20000;
 const MAP_FIXED_NOREPLACE: usize = 0x100000;
 const MAP_TYPE_MASK: usize = 0x0f;
@@ -299,7 +300,10 @@ pub fn syscall_brk(addr: usize) -> isize {
         );
     }
     let ok = if new_end > old_end {
-        if inner.memory_set.range_overlaps(old_end.into(), new_end.into()) {
+        if inner
+            .memory_set
+            .range_overlaps(old_end.into(), new_end.into())
+        {
             if crate::debug_config::DEBUG_SYSCALL {
                 crate::println!(
                     "[brk] pid={} grow range [{:#x}, {:#x}) overlaps existing mapping",
@@ -359,16 +363,16 @@ pub fn syscall_mmap(
     fd: isize,
     off: usize,
 ) -> isize {
-    if len == 0 {
-        return EINVAL;
-    }
     let map_type = flags & MAP_TYPE_MASK;
     if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
         return EINVAL;
     }
     let is_shared = map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE;
-    let is_anon = fd < 0 || (flags & MAP_ANONYMOUS) != 0;
+    let is_anon = (flags & MAP_ANONYMOUS) != 0;
     if !is_anon && fd < 0 {
+        return EBADF;
+    }
+    if len == 0 {
         return EINVAL;
     }
     if fd >= 0 && (off % PAGE_SIZE) != 0 {
@@ -539,7 +543,7 @@ pub fn syscall_mmap(
             may_write_upgrade,
         },
     );
-    if inner.mlockall_future {
+    if inner.mlockall_future || (flags & MAP_LOCKED) != 0 {
         inner.mlocked_ranges.push((start, end));
         normalize_ranges(&mut inner.mlocked_ranges);
     }
@@ -703,8 +707,11 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
     const MADV_WILLNEED: usize = 3;
     const MADV_DONTNEED: usize = 4;
     const MADV_FREE: usize = 8;
+    const MADV_DONTDUMP: usize = 16;
+    const MADV_DODUMP: usize = 17;
     match advice {
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE => {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
+        | MADV_DONTDUMP | MADV_DODUMP => {
             let process = current_process();
             let mut inner = process.borrow_mut();
             if !inner
@@ -714,6 +721,11 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                 return ENOMEM;
             }
             if advice == MADV_WILLNEED || advice == MADV_NORMAL {
+                return 0;
+            }
+            if advice == MADV_DONTDUMP || advice == MADV_DODUMP {
+                // Core-dump filtering is currently coarse-grained. Accept these
+                // hints as no-ops so Linux userspace can proceed.
                 return 0;
             }
             if advice == MADV_DONTNEED {

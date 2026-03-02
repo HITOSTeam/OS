@@ -10,14 +10,16 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::clock_freq;
-use crate::fs::{File, find_path_in_roots};
-use crate::mm::{UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value};
+use crate::fs::{find_path_in_roots, File};
+use crate::mm::{
+    try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value, UserBuffer,
+};
+use crate::task::block_sleep::add_timer;
 use crate::task::manager::wakeup_task;
 use crate::task::processor::{
     block_current_and_run_next, current_files_process, current_process, current_task,
 };
-use crate::task::block_sleep::add_timer;
-use crate::task::signal::{RT_SIG_MAX, has_unmasked_pending, signal_bit};
+use crate::task::signal::{has_unmasked_pending, signal_bit, RT_SIG_MAX};
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::time::get_time;
 use crate::trap::get_current_token;
@@ -188,6 +190,7 @@ struct MqQueueState {
 
 struct MqQueue {
     id: usize,
+    ipc_ns_id: usize,
     name: Mutex<Option<String>>,
     state: Mutex<MqQueueState>,
 }
@@ -214,7 +217,8 @@ impl MqManager {
 }
 
 lazy_static! {
-    static ref MQ_MANAGER: Mutex<MqManager> = Mutex::new(MqManager::default());
+    // POSIX MQ objects are isolated per IPC namespace.
+    static ref MQ_MANAGERS: Mutex<BTreeMap<usize, MqManager>> = Mutex::new(BTreeMap::new());
 }
 
 pub struct MqDescriptor {
@@ -254,7 +258,8 @@ impl MqDescriptor {
         if enabled {
             self.flags.fetch_or(O_NONBLOCK as u32, Ordering::Relaxed);
         } else {
-            self.flags.fetch_and(!(O_NONBLOCK as u32), Ordering::Relaxed);
+            self.flags
+                .fetch_and(!(O_NONBLOCK as u32), Ordering::Relaxed);
         }
     }
 }
@@ -262,7 +267,7 @@ impl MqDescriptor {
 impl Drop for MqDescriptor {
     fn drop(&mut self) {
         maybe_clear_notify_for_owner(&self.queue, self.owner_pid);
-        gc_unlinked_queue(self.queue.id);
+        gc_unlinked_queue(&self.queue);
     }
 }
 
@@ -312,8 +317,12 @@ fn maybe_clear_notify_for_owner(queue: &Arc<MqQueue>, owner_pid: usize) {
     }
 }
 
-fn gc_unlinked_queue(queue_id: usize) {
-    let mut mgr = MQ_MANAGER.lock();
+fn gc_unlinked_queue(queue: &Arc<MqQueue>) {
+    let mut managers = MQ_MANAGERS.lock();
+    let Some(mgr) = managers.get_mut(&queue.ipc_ns_id) else {
+        return;
+    };
+    let queue_id = queue.id;
     let should_remove = {
         let Some(queue) = mgr.by_id.get(&queue_id) else {
             return;
@@ -405,9 +414,7 @@ fn parse_abs_timeout(timeout_ptr: usize) -> Result<Option<u64>, isize> {
     }
     let sec = ts.tv_sec as u64;
     let nsec = ts.tv_nsec as u64;
-    Ok(Some(
-        sec.saturating_mul(NSEC_PER_SEC).saturating_add(nsec),
-    ))
+    Ok(Some(sec.saturating_mul(NSEC_PER_SEC).saturating_add(nsec)))
 }
 
 fn timed_out(deadline_ns: Option<u64>) -> bool {
@@ -431,6 +438,11 @@ fn has_pending_unmasked_signal() -> bool {
     };
     let inner = task.borrow_mut();
     has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+}
+
+fn current_ipc_namespace_id() -> usize {
+    let process = current_process();
+    process.borrow_mut().ipc_ns_id
 }
 
 fn read_queue_name(ptr: usize) -> Result<String, isize> {
@@ -545,10 +557,12 @@ pub fn syscall_mq_open(name: usize, oflag: usize, mode: usize, attr: usize) -> i
         _ => return EINVAL,
     };
     let cred = current_cred();
+    let ipc_ns_id = current_ipc_namespace_id();
     let mut created_new_queue = false;
 
     let queue = {
-        let mut mgr = MQ_MANAGER.lock();
+        let mut managers = MQ_MANAGERS.lock();
+        let mgr = managers.entry(ipc_ns_id).or_default();
         if let Some(id) = mgr.by_name.get(&qname).copied() {
             if (oflag & O_CREAT) != 0 && (oflag & O_EXCL) != 0 {
                 return EEXIST;
@@ -585,6 +599,7 @@ pub fn syscall_mq_open(name: usize, oflag: usize, mode: usize, attr: usize) -> i
             let id = mgr.alloc_id();
             let queue = Arc::new(MqQueue {
                 id,
+                ipc_ns_id,
                 name: Mutex::new(Some(qname.clone())),
                 state: Mutex::new(MqQueueState {
                     perm: MqPerm {
@@ -621,7 +636,10 @@ pub fn syscall_mq_open(name: usize, oflag: usize, mode: usize, attr: usize) -> i
             // Keep mq_open atomic: if queue creation succeeded but fd install failed
             // (e.g. EMFILE), drop the freshly created queue from the global namespace.
             if created_new_queue {
-                let mut mgr = MQ_MANAGER.lock();
+                let mut managers = MQ_MANAGERS.lock();
+                let Some(mgr) = managers.get_mut(&ipc_ns_id) else {
+                    return e;
+                };
                 if mgr.by_name.get(&qname).is_some_and(|id| *id == queue_id) {
                     mgr.by_name.remove(&qname);
                 }
@@ -638,15 +656,19 @@ pub fn syscall_mq_unlink(name: usize) -> isize {
         Err(e) => return e,
     };
     let cred = current_cred();
-    let (queue_id, queue) = {
-        let mgr = MQ_MANAGER.lock();
+    let ipc_ns_id = current_ipc_namespace_id();
+    let queue = {
+        let managers = MQ_MANAGERS.lock();
+        let Some(mgr) = managers.get(&ipc_ns_id) else {
+            return ENOENT;
+        };
         let Some(id) = mgr.by_name.get(&qname).copied() else {
             return ENOENT;
         };
         let Some(queue) = mgr.by_id.get(&id).cloned() else {
             return ENOENT;
         };
-        (id, queue)
+        queue
     };
 
     {
@@ -657,11 +679,14 @@ pub fn syscall_mq_unlink(name: usize) -> isize {
     }
 
     {
-        let mut mgr = MQ_MANAGER.lock();
+        let mut managers = MQ_MANAGERS.lock();
+        let Some(mgr) = managers.get_mut(&ipc_ns_id) else {
+            return ENOENT;
+        };
         mgr.by_name.remove(&qname);
     }
     *queue.name.lock() = None;
-    gc_unlinked_queue(queue_id);
+    gc_unlinked_queue(&queue);
     0
 }
 
@@ -675,7 +700,11 @@ pub fn syscall_mq_getsetattr(mqdes: usize, newattr: usize, oldattr: usize) -> is
     };
     let state = desc.queue.state.lock();
     let old = MqAttrUser {
-        mq_flags: if desc.nonblock() { O_NONBLOCK as i64 } else { 0 },
+        mq_flags: if desc.nonblock() {
+            O_NONBLOCK as i64
+        } else {
+            0
+        },
         mq_maxmsg: state.maxmsg as i64,
         mq_msgsize: state.msgsize as i64,
         mq_curmsgs: state.messages.len() as i64,
@@ -733,7 +762,8 @@ pub fn syscall_mq_notify(mqdes: usize, notification: usize) -> isize {
                     return EBADF;
                 }
                 let sockfd = ev.sigev_signo as usize;
-                let sock_ok = crate::syscall::net::mq_notify_validate_thread_sockfd(cred.pid, sockfd);
+                let sock_ok =
+                    crate::syscall::net::mq_notify_validate_thread_sockfd(cred.pid, sockfd);
                 if sock_ok != 0 {
                     return sock_ok;
                 }

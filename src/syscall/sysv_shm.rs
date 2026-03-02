@@ -96,8 +96,12 @@ fn runtime_shmall_limit() -> usize {
 }
 
 pub fn proc_sysvipc_shm() -> String {
-    let mgr = SHM_MANAGER.lock();
     let mut out = String::from("       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime rss swap\n");
+    let ipc_ns_id = current_ipc_namespace_id();
+    let managers = SHM_MANAGERS.lock();
+    let Some(mgr) = managers.get(&ipc_ns_id) else {
+        return out;
+    };
     for seg in mgr.segments.values() {
         let key = seg.key.unwrap_or(0);
         let line = format!(
@@ -191,7 +195,8 @@ impl ShmManager {
 }
 
 lazy_static! {
-    static ref SHM_MANAGER: Mutex<ShmManager> = Mutex::new(ShmManager::default());
+    // SysV SHM objects are scoped per IPC namespace.
+    static ref SHM_MANAGERS: Mutex<BTreeMap<usize, ShmManager>> = Mutex::new(BTreeMap::new());
 }
 
 #[repr(C)]
@@ -255,6 +260,11 @@ fn now_secs() -> i64 {
     crate::syscall::time_sys::realtime_now_seconds() as i64
 }
 
+fn current_ipc_namespace_id() -> usize {
+    let process = current_process();
+    process.borrow_mut().ipc_ns_id
+}
+
 fn current_ids() -> (u32, u32, u32, Vec<u32>) {
     let process = current_process();
     let inner = process.borrow_mut();
@@ -295,8 +305,9 @@ fn check_perm(
     (allow & need) == need
 }
 
-pub fn fork_inherit(attaches: &[ShmAttach]) {
-    let mut mgr = SHM_MANAGER.lock();
+pub fn fork_inherit(ipc_ns_id: usize, attaches: &[ShmAttach]) {
+    let mut managers = SHM_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
     for a in attaches {
         if let Some(seg) = mgr.segments.get_mut(&a.shmid) {
             seg.nattch += 1;
@@ -304,8 +315,11 @@ pub fn fork_inherit(attaches: &[ShmAttach]) {
     }
 }
 
-pub fn exit_cleanup(attaches: &[ShmAttach]) {
-    let mut mgr = SHM_MANAGER.lock();
+pub fn rollback_fork_inherit(ipc_ns_id: usize, attaches: &[ShmAttach]) {
+    let mut managers = SHM_MANAGERS.lock();
+    let Some(mgr) = managers.get_mut(&ipc_ns_id) else {
+        return;
+    };
     for a in attaches {
         if let Some(seg) = mgr.segments.get_mut(&a.shmid) {
             if seg.nattch > 0 {
@@ -329,6 +343,10 @@ pub fn exit_cleanup(attaches: &[ShmAttach]) {
     }
 }
 
+pub fn exit_cleanup(ipc_ns_id: usize, attaches: &[ShmAttach]) {
+    rollback_fork_inherit(ipc_ns_id, attaches);
+}
+
 pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
     if (shmflg & SHM_HUGETLB) != 0 {
         // HugeTLB shared memory is not supported yet.
@@ -338,7 +356,9 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
     let shmmni_limit = runtime_shmmni_limit();
     let shmall_limit = runtime_shmall_limit();
 
-    let mut mgr = SHM_MANAGER.lock();
+    let ipc_ns_id = current_ipc_namespace_id();
+    let mut managers = SHM_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
     if key != IPC_PRIVATE {
         if let Some(id) = mgr.key2id.get(&key).copied() {
             if (shmflg & IPC_CREAT) != 0 && (shmflg & IPC_EXCL) != 0 {
@@ -417,7 +437,9 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     if shmaddr % PAGE_SIZE != 0 && (shmflg & SHM_RND) == 0 {
         return EINVAL;
     }
-    let mut mgr = SHM_MANAGER.lock();
+    let ipc_ns_id = current_ipc_namespace_id();
+    let mut managers = SHM_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
     let Some(seg) = mgr.segments.get_mut(&shmid) else {
         return EINVAL;
     };
@@ -519,7 +541,9 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
     drop(inner);
 
     let (_, _, pid, _) = current_ids();
-    let mut mgr = SHM_MANAGER.lock();
+    let ipc_ns_id = current_ipc_namespace_id();
+    let mut managers = SHM_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
     if let Some(seg) = mgr.segments.get_mut(&a.shmid) {
         if seg.nattch > 0 {
             seg.nattch -= 1;
@@ -558,7 +582,9 @@ fn shm_to_user(seg: &ShmSegment) -> ShmidDsUser {
 pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
     let token = crate::trap::get_current_token();
     let (uid, gid, _pid, groups) = current_ids();
-    let mut mgr = SHM_MANAGER.lock();
+    let ipc_ns_id = current_ipc_namespace_id();
+    let mut managers = SHM_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
 
     if cmd == IPC_INFO {
         let highest_index = if mgr.segments.is_empty() {

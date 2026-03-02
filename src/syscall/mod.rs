@@ -18,7 +18,7 @@ mod semaphore;
 pub(crate) mod signal;
 mod smp;
 mod socket;
-mod sysv_ipc;
+pub(crate) mod sysv_ipc;
 pub(crate) mod sysv_shm;
 mod thread;
 mod time_sys;

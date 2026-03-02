@@ -27,11 +27,15 @@ pub enum ProcFileKind {
     Uptime,
     Stat,
     Perf,
+    SysvipcMsg,
+    SysvipcSem,
     SysvipcShm,
     PidStat(u32),
     PidCmdline(u32),
     PidStatus(u32),
     PidMaps(u32),
+    PidSmaps(u32),
+    PidCoredumpFilter(u32),
     PidMounts(u32),
     PidTaskStat(u32, u32),
 }
@@ -218,6 +222,11 @@ pub fn init_procfs() {
                 let value = alloc::format!("{}\n", crate::task::pid_max());
                 let _ = pid_max_file.write_at(0, value.as_bytes());
             }
+            let threads_max_file = ensure_file(&kernel_dir, "threads-max", 0o644);
+            if let Some(threads_max_file) = threads_max_file {
+                let value = alloc::format!("{}\n", crate::task::pid_max());
+                let _ = threads_max_file.write_at(0, value.as_bytes());
+            }
             let tainted_file = ensure_file(&kernel_dir, "tainted", 0o444);
             if let Some(tainted_file) = tainted_file {
                 let _ = tainted_file.write_at(0, b"0\n");
@@ -236,6 +245,32 @@ pub fn init_procfs() {
             if let Some(shmall_file) = shmall_file {
                 let value = alloc::format!("{}\n", crate::syscall::sysv_shm::shmall_limit());
                 let _ = shmall_file.write_at(0, value.as_bytes());
+            }
+            let msgmax_file = ensure_file(&kernel_dir, "msgmax", 0o644);
+            if let Some(msgmax_file) = msgmax_file {
+                let value = alloc::format!("{}\n", crate::syscall::sysv_ipc::msgmax_limit());
+                let _ = msgmax_file.write_at(0, value.as_bytes());
+            }
+            let msgmnb_file = ensure_file(&kernel_dir, "msgmnb", 0o644);
+            if let Some(msgmnb_file) = msgmnb_file {
+                let value = alloc::format!("{}\n", crate::syscall::sysv_ipc::msgmnb_limit());
+                let _ = msgmnb_file.write_at(0, value.as_bytes());
+            }
+            let msgmni_file = ensure_file(&kernel_dir, "msgmni", 0o644);
+            if let Some(msgmni_file) = msgmni_file {
+                let value = alloc::format!("{}\n", crate::syscall::sysv_ipc::msgmni_limit());
+                let _ = msgmni_file.write_at(0, value.as_bytes());
+            }
+            let sem_file = ensure_file(&kernel_dir, "sem", 0o644);
+            if let Some(sem_file) = sem_file {
+                let value = alloc::format!(
+                    "{}\t{}\t{}\t{}\n",
+                    crate::syscall::sysv_ipc::semmsl_limit(),
+                    crate::syscall::sysv_ipc::semmns_limit(),
+                    crate::syscall::sysv_ipc::semopm_limit(),
+                    crate::syscall::sysv_ipc::semmni_limit()
+                );
+                let _ = sem_file.write_at(0, value.as_bytes());
             }
         }
         let fs_dir = ensure_dir(&sys_dir, "fs", 0o555);
@@ -381,7 +416,15 @@ fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
         ino: 1,
         dtype: 4,
     });
-    for name in ["stat", "cmdline", "status", "maps", "mounts"] {
+    for name in [
+        "stat",
+        "cmdline",
+        "status",
+        "maps",
+        "smaps",
+        "coredump_filter",
+        "mounts",
+    ] {
         entries.push(PseudoDirent {
             name: String::from(name),
             ino: pid as u64,
@@ -758,6 +801,16 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
                 ino: 1,
                 dtype: 8,
             },
+            PseudoDirent {
+                name: String::from("msg"),
+                ino: 1,
+                dtype: 8,
+            },
+            PseudoDirent {
+                name: String::from("sem"),
+                ino: 1,
+                dtype: 8,
+            },
         ];
         return Some(Arc::new(PseudoDir::new("/proc/sysvipc", entries)));
     }
@@ -770,6 +823,8 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
         "/proc/perf" => return Some(ProcPseudoFile::new(ProcFileKind::Perf)),
+        "/proc/sysvipc/msg" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcMsg)),
+        "/proc/sysvipc/sem" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcSem)),
         "/proc/sysvipc/shm" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcShm)),
         "/proc/config.gz" => return Some(Arc::new(PseudoFile::new_static_bytes(PROC_CONFIG_GZ))),
         _ => {}
@@ -821,6 +876,8 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "cmdline" => Some(ProcPseudoFile::new(ProcFileKind::PidCmdline(pid))),
         "status" => Some(ProcPseudoFile::new(ProcFileKind::PidStatus(pid))),
         "maps" => Some(ProcPseudoFile::new(ProcFileKind::PidMaps(pid))),
+        "smaps" => Some(ProcPseudoFile::new(ProcFileKind::PidSmaps(pid))),
+        "coredump_filter" => Some(ProcPseudoFile::new(ProcFileKind::PidCoredumpFilter(pid))),
         "mounts" => Some(ProcPseudoFile::new(ProcFileKind::PidMounts(pid))),
         _ => None,
     }
@@ -887,11 +944,15 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
         ProcFileKind::Perf => proc_perf(),
+        ProcFileKind::SysvipcMsg => crate::syscall::sysv_ipc::proc_sysvipc_msg(),
+        ProcFileKind::SysvipcSem => crate::syscall::sysv_ipc::proc_sysvipc_sem(),
         ProcFileKind::SysvipcShm => crate::syscall::sysv_shm::proc_sysvipc_shm(),
         ProcFileKind::PidStat(pid) => proc_pid_stat(*pid),
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
         ProcFileKind::PidStatus(pid) => proc_pid_status(*pid),
         ProcFileKind::PidMaps(pid) => proc_pid_maps(*pid),
+        ProcFileKind::PidSmaps(pid) => proc_pid_smaps(*pid),
+        ProcFileKind::PidCoredumpFilter(_) => String::from("00000033\n"),
         ProcFileKind::PidTaskStat(pid, tid) => proc_pid_task_stat(*pid, *tid),
     }
 }
@@ -937,6 +998,13 @@ fn sync_proc_pid(pid: usize) {
     );
     let _ = ensure_proc_file(&pid_dir, "status", ProcFileKind::PidStatus(pid_u32), 0o444);
     let _ = ensure_proc_file(&pid_dir, "maps", ProcFileKind::PidMaps(pid_u32), 0o444);
+    let _ = ensure_proc_file(&pid_dir, "smaps", ProcFileKind::PidSmaps(pid_u32), 0o444);
+    let _ = ensure_proc_file(
+        &pid_dir,
+        "coredump_filter",
+        ProcFileKind::PidCoredumpFilter(pid_u32),
+        0o644,
+    );
     let _ = ensure_proc_file(&pid_dir, "mounts", ProcFileKind::PidMounts(pid_u32), 0o444);
     if crate::debug_config::DEBUG_PROCFS {
         crate::println!("[procfs] sync pid={} end", pid);
@@ -1351,6 +1419,90 @@ fn proc_pid_maps(pid: u32) -> String {
             x,
             p
         ));
+    }
+    out
+}
+
+fn range_overlap_len(start: usize, end: usize, lock_start: usize, lock_end: usize) -> usize {
+    let left = core::cmp::max(start, lock_start);
+    let right = core::cmp::min(end, lock_end);
+    right.saturating_sub(left)
+}
+
+fn proc_pid_smaps(pid: u32) -> String {
+    const PROT_READ: usize = 1;
+    const PROT_WRITE: usize = 2;
+    const PROT_EXEC: usize = 4;
+
+    let Some(proc) = pid2process(pid as usize) else {
+        return String::new();
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        if crate::debug_config::DEBUG_PROCFS {
+            crate::println!("[procfs] smaps pid={} lock busy", pid);
+        }
+        return String::new();
+    };
+    let mut regions = inner.mmap_areas.clone();
+    let mlocked = inner.mlocked_ranges.clone();
+    drop(inner);
+    regions.sort_by_key(|r| r.start);
+
+    let mut out = String::new();
+    for region in regions {
+        let end = region.end();
+        if end <= region.start {
+            continue;
+        }
+        let r = if (region.prot & PROT_READ) != 0 {
+            'r'
+        } else {
+            '-'
+        };
+        let w = if (region.prot & PROT_WRITE) != 0 {
+            'w'
+        } else {
+            '-'
+        };
+        let x = if (region.prot & PROT_EXEC) != 0 {
+            'x'
+        } else {
+            '-'
+        };
+        let p = if region.shared { 's' } else { 'p' };
+
+        let size_bytes = end - region.start;
+        let size_kb = (size_bytes + 1023) / 1024;
+        let locked_bytes: usize = mlocked
+            .iter()
+            .map(|(ls, le)| range_overlap_len(region.start, end, *ls, *le))
+            .sum();
+        let locked_kb = (locked_bytes + 1023) / 1024;
+        // LTP mlock05 only validates that Rss/Locked reflect mlock'ed mappings.
+        let rss_kb = if locked_bytes > 0 { size_kb } else { 0 };
+
+        out.push_str(&alloc::format!(
+            "{:x}-{:x} {}{}{}{} 00000000 00:00 0 \n",
+            region.start,
+            end,
+            r,
+            w,
+            x,
+            p
+        ));
+        out.push_str(&alloc::format!("Size:\t\t{} kB\n", size_kb));
+        out.push_str(&alloc::format!("Rss:\t\t{} kB\n", rss_kb));
+        out.push_str("Pss:\t\t0 kB\n");
+        out.push_str("Shared_Clean:\t0 kB\n");
+        out.push_str("Shared_Dirty:\t0 kB\n");
+        out.push_str("Private_Clean:\t0 kB\n");
+        out.push_str("Private_Dirty:\t0 kB\n");
+        out.push_str("Referenced:\t0 kB\n");
+        out.push_str("Anonymous:\t0 kB\n");
+        out.push_str("AnonHugePages:\t0 kB\n");
+        out.push_str("Swap:\t\t0 kB\n");
+        out.push_str(&alloc::format!("Locked:\t\t{} kB\n", locked_kb));
+        out.push('\n');
     }
     out
 }

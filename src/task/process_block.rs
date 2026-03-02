@@ -33,6 +33,11 @@ use spin::{Mutex as SpinMutex, MutexGuard};
 
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static NEXT_IPC_NS_ID: AtomicUsize = AtomicUsize::new(1);
+
+pub fn alloc_ipc_namespace_id() -> usize {
+    NEXT_IPC_NS_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 fn fork_diag_cycles_to_us(delta_cycles: usize) -> usize {
     let freq = crate::config::clock_freq() as u128;
@@ -753,6 +758,8 @@ pub struct ProcessControlBlockInner {
     pub mlocked_ranges: Vec<(usize, usize)>,
     /// Whether MCL_FUTURE is currently enabled.
     pub mlockall_future: bool,
+    /// IPC namespace id used by SysV IPC / POSIX MQ isolation.
+    pub ipc_ns_id: usize,
     /// System V shared memory attachments (shmat/shmdt).
     pub sysv_shm_attaches: Vec<crate::syscall::sysv_shm::ShmAttach>,
     pub signals: SignalFlags,
@@ -1186,6 +1193,7 @@ impl ProcessControlBlock {
                 mmap_areas: Vec::new(),
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
+                ipc_ns_id: 0,
                 sysv_shm_attaches: Vec::new(),
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
@@ -1312,7 +1320,7 @@ impl ProcessControlBlock {
             let mut inner = self.borrow_mut();
             inner.close_cloexec_fds();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
-            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+            crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
             reset_signal_handlers_on_exec(&mut inner);
             inner.memory_set = memory_set;
             inner.heap_start = heap_start;
@@ -1381,7 +1389,7 @@ impl ProcessControlBlock {
             let mut inner = self.borrow_mut();
             inner.close_cloexec_fds();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
-            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+            crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
             reset_signal_handlers_on_exec(&mut inner);
             inner.memory_set = memory_set;
             inner.heap_start = heap_start;
@@ -1614,6 +1622,7 @@ impl ProcessControlBlock {
                 // Linux does not inherit mlock/mlockall locks across fork.
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
+                ipc_ns_id: parent.ipc_ns_id,
                 sysv_shm_attaches: inherited_shm.clone(),
                 // is right here?
                 signals: SignalFlags::empty(),
@@ -1638,7 +1647,7 @@ impl ProcessControlBlock {
         if share_files {
             Self::register_files_sharer(&root_files_owner, &child);
         }
-        crate::syscall::sysv_shm::fork_inherit(&inherited_shm);
+        crate::syscall::sysv_shm::fork_inherit(parent.ipc_ns_id, &inherited_shm);
         if diag_enabled {
             after_pcb_cycles = crate::arch::read_time();
         }

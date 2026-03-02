@@ -9,8 +9,8 @@ use crate::{
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
     mm::{
-        MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
-        write_user_value,
+        kernel_token, try_read_user_value, try_write_user_value, write_user_value, MapPermission,
+        MemorySet,
     },
     println,
     syscall::{
@@ -21,11 +21,11 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        ProcessControlBlock,
-        manager::{PID2PCB, add_task, remove_inactive_task, select_hart_for_new_task},
+        manager::{add_task, remove_inactive_task, select_hart_for_new_task, PID2PCB},
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::{MAX_SIG, SIG_DFL, SIG_IGN, SignalFlags, pending_unmasked_bits},
+        signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
         task_block::TaskControlBlock,
+        ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
@@ -394,6 +394,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     const CLONE_SETTLS: usize = 0x0008_0000;
     const CLONE_PARENT_SETTID: usize = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+    const CLONE_NEWIPC: usize = 0x0800_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
     const EINVAL: isize = -22;
@@ -416,6 +417,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         return EINVAL;
     }
     if (flags & CLONE_THREAD) != 0 && (flags & CLONE_SIGHAND) == 0 {
+        return EINVAL;
+    }
+    if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
         return EINVAL;
     }
     if stack == 0 {
@@ -541,6 +545,18 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     let Some((child, task)) = process.fork_with_task(share_files, share_vm) else {
         return -12;
     };
+    if (flags & CLONE_NEWIPC) != 0 {
+        let (parent_ipc_ns_id, inherited_attaches) = {
+            let child_inner = child.borrow_mut();
+            (child_inner.ipc_ns_id, child_inner.sysv_shm_attaches.clone())
+        };
+        if !inherited_attaches.is_empty() {
+            crate::syscall::sysv_shm::rollback_fork_inherit(parent_ipc_ns_id, &inherited_attaches);
+        }
+        let mut child_inner = child.borrow_mut();
+        child_inner.sysv_shm_attaches.clear();
+        child_inner.ipc_ns_id = crate::task::alloc_ipc_namespace_id();
+    }
     let fork_elapsed_us = if DEBUG_FUTEX {
         let delta = crate::arch::read_time().wrapping_sub(fork_start_cycles) as u128;
         let freq = crate::config::clock_freq() as u128;
@@ -664,10 +680,6 @@ pub fn syscall_vfork() -> isize {
         }
         None => -12,
     }
-}
-
-fn is_core_dump_signal(sig: i32) -> bool {
-    matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31)
 }
 
 #[repr(C)]
@@ -910,9 +922,9 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                     } else {
                         None
                     };
-                    temp_coredump = temp_signal
-                        .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
-                        .unwrap_or(false);
+                    // Only report WCOREDUMP when a core file is actually emitted.
+                    // Current kernel path does not materialize core files yet.
+                    temp_coredump = false;
                     found = Some(index);
                     break;
                 }
@@ -1127,9 +1139,9 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
                 } else {
                     None
                 };
-                let coredump = signal
-                    .map(|sig| is_core_dump_signal(sig) && child_inner.rlimit_core_cur > 0)
-                    .unwrap_or(false);
+                // Keep waitid() consistent with wait4(): no synthetic CLD_DUMPED
+                // without real core-file generation support.
+                let coredump = false;
                 found_zombie = Some((index, exit_code, signal, coredump, child_inner.uid));
                 break;
             }

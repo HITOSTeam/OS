@@ -756,7 +756,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         let mut process_inner = process.borrow_mut();
         process_inner.children.clear();
         let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
-        crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+        crate::syscall::sysv_shm::exit_cleanup(process_inner.ipc_ns_id, &old_shm);
         // Linux releases `mm_struct` at exit and keeps only zombie metadata.
         // Drop the full user address space here so unreaped zombies do not pin
         // page-table pages (and COW refs) during fork-heavy workloads.
@@ -914,7 +914,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
     let mut process_inner = process.borrow_mut();
     process_inner.children.clear();
     let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
-    crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+    crate::syscall::sysv_shm::exit_cleanup(process_inner.ipc_ns_id, &old_shm);
     // Same as exit_current_and_run_next(): release the whole user address
     // space eagerly and keep only zombie bookkeeping in the PCB.
     process_inner.memory_set = MemorySet::new_bare();

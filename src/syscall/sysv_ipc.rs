@@ -1,4 +1,5 @@
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -46,6 +47,9 @@ const SEM_A: u16 = 0o200;
 
 const SEMVMX: i32 = 32767;
 const SEMMSL: usize = 32000;
+const SEMMNS: usize = 1_024_000_000;
+const SEMMNI: usize = 32000;
+const SEMOPM: usize = 500;
 const MSGMNB: usize = 16384;
 const MSGMNI: usize = 4096;
 const MSGMAX: usize = 8192;
@@ -65,6 +69,97 @@ const EFBIG: isize = -27;
 const EAGAIN: isize = -11;
 const ENOSPC: isize = -28;
 const ENOSYS: isize = -38;
+
+pub fn msgmax_limit() -> usize {
+    MSGMAX
+}
+
+pub fn msgmnb_limit() -> usize {
+    MSGMNB
+}
+
+pub fn msgmni_limit() -> usize {
+    MSGMNI
+}
+
+pub fn semmsl_limit() -> usize {
+    SEMMSL
+}
+
+pub fn semmns_limit() -> usize {
+    SEMMNS
+}
+
+pub fn semopm_limit() -> usize {
+    SEMOPM
+}
+
+pub fn semmni_limit() -> usize {
+    SEMMNI
+}
+
+pub fn proc_sysvipc_msg() -> String {
+    let mut out = String::from(
+        "       key      msqid perms      cbytes       qnum       qbytes lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
+    );
+    let ipc_ns_id = current_ipc_namespace_id();
+    let managers = MSG_MANAGERS.lock();
+    let Some(mgr) = managers.get(&ipc_ns_id) else {
+        return out;
+    };
+    for queue in mgr.queues.values() {
+        let key = queue.key.unwrap_or(0);
+        let line = alloc::format!(
+            "{:10} {:10} {:5o} {:11} {:10} {:12} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}\n",
+            key,
+            queue.id,
+            queue.perm.mode & 0o777,
+            queue.cbytes,
+            queue.msgs.len(),
+            queue.qbytes,
+            queue.lspid,
+            queue.lrpid,
+            queue.perm.uid,
+            queue.perm.gid,
+            queue.perm.cuid,
+            queue.perm.cgid,
+            queue.stime,
+            queue.rtime,
+            queue.ctime
+        );
+        out.push_str(&line);
+    }
+    out
+}
+
+pub fn proc_sysvipc_sem() -> String {
+    let mut out = String::from(
+        "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+    );
+    let ipc_ns_id = current_ipc_namespace_id();
+    let managers = SEM_MANAGERS.lock();
+    let Some(mgr) = managers.get(&ipc_ns_id) else {
+        return out;
+    };
+    for set in mgr.sets.values() {
+        let key = set.key.unwrap_or(0);
+        let line = alloc::format!(
+            "{:10} {:10} {:5o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",
+            key,
+            set.id,
+            set.perm.mode & 0o777,
+            set.sems.len(),
+            set.perm.uid,
+            set.perm.gid,
+            set.perm.cuid,
+            set.perm.cgid,
+            set.otime,
+            set.ctime
+        );
+        out.push_str(&line);
+    }
+    out
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -309,8 +404,9 @@ impl SemManager {
 }
 
 lazy_static! {
-    static ref MSG_MANAGER: Mutex<MsgManager> = Mutex::new(MsgManager::default());
-    static ref SEM_MANAGER: Mutex<SemManager> = Mutex::new(SemManager::default());
+    // SysV IPC objects are scoped per IPC namespace.
+    static ref MSG_MANAGERS: Mutex<BTreeMap<usize, MsgManager>> = Mutex::new(BTreeMap::new());
+    static ref SEM_MANAGERS: Mutex<BTreeMap<usize, SemManager>> = Mutex::new(BTreeMap::new());
 }
 
 struct Cred {
@@ -322,6 +418,11 @@ struct Cred {
 
 fn now_secs() -> i64 {
     crate::syscall::time_sys::realtime_now_seconds() as i64
+}
+
+fn current_ipc_namespace_id() -> usize {
+    let process = current_process();
+    process.borrow_mut().ipc_ns_id
 }
 
 fn current_cred() -> Cred {
@@ -453,7 +554,9 @@ fn sem_to_user(set: &SemSet) -> SemidDsUser {
 pub fn syscall_msgget(key: usize, msgflg: usize) -> isize {
     let cred = current_cred();
     let key_u32 = key as u32;
-    let mut mgr = MSG_MANAGER.lock();
+    let ipc_ns_id = current_ipc_namespace_id();
+    let mut managers = MSG_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
 
     if key != IPC_PRIVATE {
         if let Some(id) = mgr.key2id.get(&key_u32).copied() {
@@ -516,7 +619,9 @@ pub fn syscall_msgget(key: usize, msgflg: usize) -> isize {
 pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
     let cred = current_cred();
     let token = get_current_token();
-    let mut mgr = MSG_MANAGER.lock();
+    let ipc_ns_id = current_ipc_namespace_id();
+    let mut managers = MSG_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
 
     if cmd == IPC_INFO || cmd == MSG_INFO {
         let highest_index = if mgr.queues.is_empty() {
@@ -563,6 +668,7 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
             }
             let wake = mgr.remove_queue(msqid);
             drop(mgr);
+            drop(managers);
             for task in wake {
                 wakeup_task(task);
             }
@@ -618,8 +724,10 @@ pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) ->
     }
 
     let mut waited = false;
+    let ipc_ns_id = current_ipc_namespace_id();
     loop {
-        let mut mgr = MSG_MANAGER.lock();
+        let mut managers = MSG_MANAGERS.lock();
+        let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(queue) = mgr.queues.get_mut(&msqid) else {
             return if waited { EIDRM } else { EINVAL };
         };
@@ -647,7 +755,7 @@ pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) ->
             return EINVAL;
         };
         add_waiter_once(&mut queue.send_waiters, &task);
-        drop(mgr);
+        drop(managers);
         block_current_and_run_next();
         waited = true;
         if has_pending_unmasked_signal() {
@@ -676,8 +784,10 @@ pub fn syscall_msgrcv(
     }
 
     let mut waited = false;
+    let ipc_ns_id = current_ipc_namespace_id();
     loop {
-        let mut mgr = MSG_MANAGER.lock();
+        let mut managers = MSG_MANAGERS.lock();
+        let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(queue) = mgr.queues.get_mut(&msqid) else {
             return if waited { EIDRM } else { EINVAL };
         };
@@ -729,7 +839,7 @@ pub fn syscall_msgrcv(
                 queue.rtime = now_secs();
                 wake_msg_waiters(&mut queue.send_waiters);
             }
-            drop(mgr);
+            drop(managers);
 
             if try_write_user_value(token, msgp as *mut i64, &msg_type).is_err() {
                 return EFAULT;
@@ -756,7 +866,7 @@ pub fn syscall_msgrcv(
             return EINVAL;
         };
         add_waiter_once(&mut queue.recv_waiters, &task);
-        drop(mgr);
+        drop(managers);
         block_current_and_run_next();
         waited = true;
         if has_pending_unmasked_signal() {
@@ -768,7 +878,9 @@ pub fn syscall_msgrcv(
 pub fn syscall_semget(key: usize, nsems: usize, semflg: usize) -> isize {
     let cred = current_cred();
     let key_u32 = key as u32;
-    let mut mgr = SEM_MANAGER.lock();
+    let ipc_ns_id = current_ipc_namespace_id();
+    let mut managers = SEM_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
 
     if key != IPC_PRIVATE {
         if let Some(id) = mgr.key2id.get(&key_u32).copied() {
@@ -830,20 +942,22 @@ pub fn syscall_semget(key: usize, nsems: usize, semflg: usize) -> isize {
 pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> isize {
     let cred = current_cred();
     let token = get_current_token();
+    let ipc_ns_id = current_ipc_namespace_id();
 
     match cmd {
         IPC_INFO | SEM_INFO => {
-            let mgr = SEM_MANAGER.lock();
+            let mut managers = SEM_MANAGERS.lock();
+            let mgr = managers.entry(ipc_ns_id).or_default();
             let highest_index = if mgr.sets.is_empty() {
                 0
             } else {
                 mgr.sets.len() - 1
             };
             let info = SemInfoUser {
-                semmni: 128,
-                semmns: 32000,
+                semmni: SEMMNI as i32,
+                semmns: SEMMNS as i32,
                 semmsl: SEMMSL as i32,
-                semopm: 500,
+                semopm: SEMOPM as i32,
                 semusz: mgr.sets.len() as i32,
                 semvmx: SEMVMX,
                 ..SemInfoUser::default()
@@ -856,7 +970,8 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
         _ => {}
     }
 
-    let mut mgr = SEM_MANAGER.lock();
+    let mut managers = SEM_MANAGERS.lock();
+    let mgr = managers.entry(ipc_ns_id).or_default();
     if cmd == SEM_STAT {
         let Some((&set_id, _)) = mgr.sets.iter().nth(semid) else {
             return EINVAL;
@@ -885,6 +1000,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             }
             let wake = mgr.remove_set(semid);
             drop(mgr);
+            drop(managers);
             for task in wake {
                 wakeup_task(task);
             }
@@ -1016,9 +1132,11 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
         return EFAULT;
     };
     let cred = current_cred();
+    let ipc_ns_id = current_ipc_namespace_id();
 
     loop {
-        let mut mgr = SEM_MANAGER.lock();
+        let mut managers = SEM_MANAGERS.lock();
+        let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(set) = mgr.sets.get_mut(&semid) else {
             return EINVAL;
         };
@@ -1051,7 +1169,7 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
                 return EINVAL;
             };
             add_waiter_once(&mut sem.zcnt_waiters, &task);
-            drop(mgr);
+            drop(managers);
             block_current_and_run_next();
             continue;
         }
@@ -1070,7 +1188,7 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
             return EINVAL;
         };
         add_waiter_once(&mut sem.ncnt_waiters, &task);
-        drop(mgr);
+        drop(managers);
         block_current_and_run_next();
     }
 }
