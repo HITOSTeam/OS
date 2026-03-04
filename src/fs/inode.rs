@@ -231,7 +231,7 @@ impl OSInode {
         if self.writable {
             let _ = self.flush();
         }
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let inode_num = inner.inode.inode_num();
         if let Some(kind) = crate::fs::proc_file_kind(inode_num) {
             let data = crate::fs::proc_file_content(&kind);
@@ -243,18 +243,53 @@ impl OSInode {
             buf[..n].copy_from_slice(&bytes[offset..offset + n]);
             return n;
         }
-        let n = {
-            let _fs_guard = ext4_lock();
-            inner.inode.read_at(offset, buf)
-        };
-        if debug_iozone_tracked(inode_num) {
-            let size = inner.inode.size() as usize;
-            println!(
-                "[iozone-debug] pread inode={} off={} len={} size={}",
-                inode_num, offset, n, size
-            );
+
+        if inner.read_buf.len() < READBUF_MAX {
+            inner.read_buf.resize(READBUF_MAX, 0);
+            inner.read_buf_off = 0;
+            inner.read_buf_valid = 0;
         }
-        n
+
+        let mut pos = offset;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let need_refill = inner.read_buf_valid == 0
+                || pos < inner.read_buf_off
+                || pos >= inner.read_buf_off + inner.read_buf_valid;
+            if need_refill {
+                let refill_len =
+                    core::cmp::max(READBUF_MIN, core::cmp::min(READBUF_MAX, buf.len() - done));
+                inner.read_buf_off = pos;
+                let inode = inner.inode.clone();
+                let off = pos;
+                let n = {
+                    let _fs_guard = ext4_lock();
+                    inode.read_at(off, &mut inner.read_buf[..refill_len])
+                };
+                inner.read_buf_valid = n;
+                if debug_iozone_tracked(inode_num) {
+                    let size = inode.size() as usize;
+                    println!(
+                        "[iozone-debug] pread inode={} off={} len={} size={}",
+                        inode_num, off, n, size
+                    );
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+
+            let cache_off = pos - inner.read_buf_off;
+            let avail = inner.read_buf_valid.saturating_sub(cache_off);
+            if avail == 0 {
+                break;
+            }
+            let n = core::cmp::min(avail, buf.len() - done);
+            buf[done..done + n].copy_from_slice(&inner.read_buf[cache_off..cache_off + n]);
+            done += n;
+            pos += n;
+        }
+        done
     }
 
     /// Write to this inode at the given offset without updating the file offset.

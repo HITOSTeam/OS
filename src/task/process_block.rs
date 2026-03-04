@@ -108,6 +108,8 @@ pub struct MmapRegion {
     pub file_dev: usize,
     pub file_ino: u32,
     pub file_offset: usize,
+    /// Non-zero for `PseudoShmFile`/memfd-backed mappings.
+    pub memfd_id: u64,
     /// Whether this region should expand downward on guard-page faults.
     pub growsdown: bool,
     /// Start address (inclusive) of the SIGBUS tail for file mappings.

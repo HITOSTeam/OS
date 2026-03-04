@@ -68,16 +68,6 @@ fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
     inner.fd_table[fd].clone()
 }
 
-fn get_fd_inode(fd: usize) -> Option<Arc<ext4_fs::Inode>> {
-    let file = get_fd_file(fd)?;
-    file.as_any().downcast_ref::<OSInode>().map(|o| {
-        // Ensure data written via buffered `write(2)` is visible to file-backed `mmap(2)`.
-        // This keeps simple tests (write -> fstat -> mmap -> read) working.
-        let _ = o.flush();
-        o.ext4_inode()
-    })
-}
-
 fn push_mmap_region_merged(regions: &mut alloc::vec::Vec<MmapRegion>, region: MmapRegion) {
     if region.len == 0 {
         return;
@@ -250,13 +240,6 @@ pub fn syscall_brk(addr: usize) -> isize {
     let process = current_process();
     let pid = process.getpid();
     let mut inner = process.borrow_mut();
-    crate::println!(
-        "[brk-trace] pid={} req={:#x} cur={:#x} heap_start={:#x}",
-        pid,
-        addr,
-        inner.brk,
-        inner.heap_start
-    );
     if addr == 0 {
         if crate::debug_config::DEBUG_SYSCALL {
             crate::println!(
@@ -371,23 +354,12 @@ pub fn syscall_brk(addr: usize) -> isize {
         true
     };
     if !ok {
-        crate::println!(
-            "[brk-trace] pid={} reject req={:#x} keep={:#x}",
-            pid,
-            new_brk,
-            old_brk
-        );
         if crate::debug_config::DEBUG_SYSCALL {
             crate::println!("[brk] pid={} failed, brk stays {:#x}", pid, old_brk);
         }
         return old_brk as isize;
     }
     inner.brk = new_brk;
-    crate::println!(
-        "[brk-trace] pid={} ok new={:#x}",
-        pid,
-        inner.brk
-    );
     if crate::debug_config::DEBUG_SYSCALL {
         crate::println!("[brk] pid={} updated brk={:#x}", pid, inner.brk);
     }
@@ -436,8 +408,15 @@ pub fn syscall_mmap(
         if !file.readable() {
             return EACCES;
         }
-        if is_shared && (prot & PROT_WRITE) != 0 && !file.writable() {
-            return EACCES;
+        if is_shared && (prot & PROT_WRITE) != 0 {
+            if !file.writable() {
+                return EACCES;
+            }
+            if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+                if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+                    return EPERM;
+                }
+            }
         }
         Some(file)
     } else {
@@ -472,6 +451,22 @@ pub fn syscall_mmap(
             return EINVAL;
         }
         align_down(addr, PAGE_SIZE)
+    } else if addr != 0 {
+        let hinted = align_down(addr, PAGE_SIZE);
+        let hinted_end = hinted.checked_add(map_len);
+        if let Some(hinted_end) = hinted_end {
+            if user_range_valid(hinted, hinted_end)
+                && !inner
+                    .memory_set
+                    .range_overlaps(hinted.into(), hinted_end.into())
+            {
+                hinted
+            } else {
+                align_up(inner.mmap_next, PAGE_SIZE)
+            }
+        } else {
+            align_up(inner.mmap_next, PAGE_SIZE)
+        }
     } else {
         align_up(inner.mmap_next, PAGE_SIZE)
     };
@@ -526,12 +521,13 @@ pub fn syscall_mmap(
     let sigbus_start = if sigbus_enabled {
         if let Some(file) = &file {
             if let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() {
-                let _ = inode_file.flush();
+                let pending_end = inode_file.pending_write_end();
                 let inode = inode_file.ext4_inode();
                 let file_size = {
                     let _ext4_guard = ext4_lock();
                     inode.size() as usize
-                };
+                }
+                .max(pending_end);
                 let file_bytes = file_size.saturating_sub(off).min(map_len);
                 map_start + align_up(file_bytes, PAGE_SIZE).min(map_len)
             } else {
@@ -648,10 +644,24 @@ pub fn syscall_mmap(
     if !is_fixed && end > inner.mmap_next {
         inner.mmap_next = end;
     }
+    let (memfd_id, sealed_write) = if let Some(file) = &file {
+        if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+            (
+                shm.memfd_id(),
+                shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE),
+            )
+        } else {
+            (0, false)
+        }
+    } else {
+        (0, false)
+    };
     let may_write_upgrade = if is_anon {
         true
     } else if is_shared {
-        file.as_ref().map(|f| f.writable()).unwrap_or(false)
+        file.as_ref()
+            .map(|f| f.writable() && !sealed_write)
+            .unwrap_or(false)
     } else {
         true
     };
@@ -667,6 +677,7 @@ pub fn syscall_mmap(
             file_dev,
             file_ino,
             file_offset,
+            memfd_id,
             growsdown: (flags & MAP_GROWSDOWN) != 0,
             sigbus_start,
         },
@@ -679,23 +690,26 @@ pub fn syscall_mmap(
 
     // Best-effort: file-backed initial population.
     if !is_anon && fd >= 0 {
-        if let Some(inode) = get_fd_inode(fd as usize) {
-            let _ext4_guard = ext4_lock();
-            let token = get_current_token();
-            let mut pos = 0usize;
-            let mut tmp = [0u8; 512];
-            while pos < len {
-                let to_read = min(tmp.len(), len - pos);
-                let read = inode.read_at(off + pos, &mut tmp[..to_read]);
-                if read == 0 {
-                    break;
+        if let Some(file) = &file {
+            if let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() {
+                // Ensure buffered writes are reflected in file-backed mappings.
+                let _ = inode_file.flush();
+                let token = get_current_token();
+                let mut pos = 0usize;
+                let mut tmp = [0u8; 512];
+                while pos < len {
+                    let to_read = min(tmp.len(), len - pos);
+                    let read = inode_file.pread_at(off + pos, &mut tmp[..to_read]);
+                    if read == 0 {
+                        break;
+                    }
+                    if try_copy_to_user_unchecked(token, (start + pos) as *mut u8, &tmp[..read])
+                        .is_err()
+                    {
+                        return ENOMEM;
+                    }
+                    pos += read;
                 }
-                if try_copy_to_user_unchecked(token, (start + pos) as *mut u8, &tmp[..read])
-                    .is_err()
-                {
-                    return ENOMEM;
-                }
-                pos += read;
             }
         }
     }

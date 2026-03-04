@@ -152,13 +152,33 @@ impl File for RtcFile {
 }
 
 pub(crate) struct ShmDataInner {
+    id: u64,
+    is_memfd: bool,
+    seals: u32,
     len: usize,
     frames: Vec<FrameTracker>,
 }
 
 impl ShmDataInner {
-    fn new() -> Self {
+    fn new_posix_shm() -> Self {
         Self {
+            id: SHM_NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            is_memfd: false,
+            seals: 0,
+            len: 0,
+            frames: Vec::new(),
+        }
+    }
+
+    fn new_memfd(allow_sealing: bool) -> Self {
+        let mut seals = 0;
+        if !allow_sealing {
+            seals |= PseudoShmFile::F_SEAL_SEAL;
+        }
+        Self {
+            id: SHM_NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            is_memfd: true,
+            seals,
             len: 0,
             frames: Vec::new(),
         }
@@ -195,6 +215,7 @@ lazy_static! {
 // Minimal backing counters used by `/sys/block/root/stat`.
 static PSEUDO_BLOCK_SECTORS_WRITTEN: AtomicU64 = AtomicU64::new(8);
 static PSEUDO_BLOCK_IO_TICKS: AtomicU64 = AtomicU64::new(1);
+static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn bytes_to_sectors(bytes: usize) -> u64 {
     let bytes = bytes as u64;
@@ -233,12 +254,12 @@ pub(crate) fn shm_get(name: &str) -> Option<ShmData> {
 pub(crate) fn shm_create(name: &str) -> ShmData {
     let mut map = SHM_OBJECTS.lock();
     map.entry(String::from(name))
-        .or_insert_with(|| Arc::new(Mutex::new(ShmDataInner::new())))
+        .or_insert_with(|| Arc::new(Mutex::new(ShmDataInner::new_posix_shm())))
         .clone()
 }
 
-pub(crate) fn shm_create_anonymous() -> ShmData {
-    Arc::new(Mutex::new(ShmDataInner::new()))
+pub(crate) fn shm_create_anonymous(allow_sealing: bool) -> ShmData {
+    Arc::new(Mutex::new(ShmDataInner::new_memfd(allow_sealing)))
 }
 
 pub(crate) fn shm_remove(name: &str) -> bool {
@@ -287,13 +308,42 @@ impl File for PseudoBlock {
 pub struct PseudoShmFile {
     data: ShmData,
     offset: Mutex<usize>,
+    readable: bool,
+    writable: bool,
 }
 
 impl PseudoShmFile {
+    pub const F_SEAL_SEAL: u32 = 0x0001;
+    pub const F_SEAL_SHRINK: u32 = 0x0002;
+    pub const F_SEAL_GROW: u32 = 0x0004;
+    pub const F_SEAL_WRITE: u32 = 0x0008;
+    pub const F_SEAL_ALL: u32 =
+        Self::F_SEAL_SEAL | Self::F_SEAL_SHRINK | Self::F_SEAL_GROW | Self::F_SEAL_WRITE;
+
     pub fn new(data: ShmData) -> Self {
         Self {
             data,
             offset: Mutex::new(0),
+            readable: true,
+            writable: true,
+        }
+    }
+
+    pub fn new_with_mode(data: ShmData, readable: bool, writable: bool) -> Self {
+        Self {
+            data,
+            offset: Mutex::new(0),
+            readable,
+            writable,
+        }
+    }
+
+    pub fn reopen_with_mode(&self, readable: bool, writable: bool) -> Self {
+        Self {
+            data: self.data.clone(),
+            offset: Mutex::new(0),
+            readable,
+            writable,
         }
     }
 
@@ -318,6 +368,64 @@ impl PseudoShmFile {
         }
     }
 
+    pub fn punch_hole_keep_size(&self, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut data = self.data.lock();
+        if offset >= data.len() {
+            return;
+        }
+        let hole_end = core::cmp::min(offset.saturating_add(len), data.len());
+        let mut cur = offset;
+        while cur < hole_end {
+            let page = cur / PAGE_SIZE;
+            let in_page = cur % PAGE_SIZE;
+            let chunk = core::cmp::min(hole_end - cur, PAGE_SIZE - in_page);
+            if page >= data.frames.len() {
+                break;
+            }
+            let frame = data.frames[page].ppn.get_bytes_array();
+            frame[in_page..in_page + chunk].fill(0);
+            cur += chunk;
+        }
+    }
+
+    pub fn is_memfd(&self) -> bool {
+        self.data.lock().is_memfd
+    }
+
+    pub fn memfd_id(&self) -> u64 {
+        self.data.lock().id
+    }
+
+    pub fn memfd_seals(&self) -> Option<u32> {
+        let data = self.data.lock();
+        data.is_memfd.then_some(data.seals)
+    }
+
+    pub fn has_memfd_seal(&self, seal: u32) -> bool {
+        let data = self.data.lock();
+        data.is_memfd && (data.seals & seal) != 0
+    }
+
+    pub fn add_memfd_seals(&self, add: u32) -> Result<u32, isize> {
+        const EINVAL: isize = -22;
+        const EPERM: isize = -1;
+        if (add & !Self::F_SEAL_ALL) != 0 {
+            return Err(EINVAL);
+        }
+        let mut data = self.data.lock();
+        if !data.is_memfd {
+            return Err(EINVAL);
+        }
+        if (data.seals & Self::F_SEAL_SEAL) != 0 {
+            return Err(EPERM);
+        }
+        data.seals |= add;
+        Ok(data.seals)
+    }
+
     pub fn shared_frames(&self, offset: usize, len: usize) -> Option<Vec<FrameTracker>> {
         let end = offset.checked_add(len)?;
         let mut data = self.data.lock();
@@ -335,11 +443,11 @@ impl PseudoShmFile {
 
 impl File for PseudoShmFile {
     fn readable(&self) -> bool {
-        true
+        self.readable
     }
 
     fn writable(&self) -> bool {
-        true
+        self.writable
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {

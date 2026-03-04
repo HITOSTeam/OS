@@ -1123,23 +1123,12 @@ pub fn maybe_deliver_signal() {
     let (signum, sender_pid, sender_uid, si_code, sig_value) = {
         let mut inner = task.borrow_mut();
         if inner.sig_saved_ctx.len() >= MAX_SIGNAL_DEPTH {
-            if DEBUG_UNIXBENCH
-                && sigalrm_bit != 0
-                && (inner.pending_signals & sigalrm_bit) != 0
-                && SIGALRM_LOG_LEFT.fetch_sub(1, Ordering::Relaxed) > 0
-            {
-                let pid = current_process().getpid();
-                let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-                crate::log_if!(
-                    DEBUG_UNIXBENCH,
-                    debug,
-                    "[signal] drop sig=14 (nesting) pid={} tid={} depth={}",
-                    pid,
-                    tid,
-                    inner.sig_saved_ctx.len()
-                );
-            }
-            return;
+            // User handlers may escape via longjmp() instead of rt_sigreturn().
+            // In that case kernel-saved signal frames become stale and can
+            // accumulate until delivery is permanently blocked. Recover by
+            // dropping stale frames and continuing normal delivery.
+            inner.sig_saved_ctx.clear();
+            inner.sigsuspend_old_mask = None;
         }
         let mask = inner.signal_mask;
         let pending = inner.pending_signals;
@@ -1365,6 +1354,12 @@ pub fn maybe_deliver_signal() {
         saved_trap.x[REG_A4] = inner.last_syscall_args[4];
         saved_trap.x[REG_A5] = inner.last_syscall_args[5];
         saved_trap.x[REG_A7] = inner.last_syscall_id;
+    }
+    // Fault signals are often handled with non-local control flow (e.g. longjmp),
+    // which bypasses rt_sigreturn(). Keep only one saved context slot here to
+    // avoid unbounded stale-frame accumulation.
+    if signum == 11 || signum == 7 {
+        inner.sig_saved_ctx.clear();
     }
     inner.sig_saved_ctx.push(SigSavedContext {
         trap_cx: saved_trap,

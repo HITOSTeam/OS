@@ -1456,6 +1456,18 @@ impl MemorySet {
             return;
         }
 
+        // Fast path: exact-area munmap (common in tight mmap/munmap loops).
+        // Avoid rebuilding the whole area list when we can remove one area directly.
+        if let Some(idx) = self.areas.iter().position(|area| {
+            area.map_perm.contains(MapPermission::U)
+                && area.vpn_range.get_start() == start_vpn
+                && area.vpn_range.get_end() == end_vpn
+        }) {
+            let mut area = self.areas.remove(idx);
+            area.unmap(&mut self.page_table);
+            return;
+        }
+
         let mut new_areas: Vec<MapArea> = Vec::new();
         let mut areas = core::mem::take(&mut self.areas);
         for mut area in areas.drain(..) {

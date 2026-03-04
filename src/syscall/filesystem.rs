@@ -663,6 +663,9 @@ fn file_is_seekable_for_preadwrite(file: &alloc::sync::Arc<dyn File + Send + Syn
     if file.as_any().downcast_ref::<OSInode>().is_some() {
         return true;
     }
+    if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
+        return true;
+    }
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         return pf.len().is_some();
     }
@@ -2454,6 +2457,9 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD_CLOEXEC: usize = 1030;
     const F_SETPIPE_SZ: usize = 1031;
     const F_GETPIPE_SZ: usize = 1032;
+    const F_ADD_SEALS: usize = 1033;
+    const F_GET_SEALS: usize = 1034;
+    const PROT_WRITE: usize = 0x2;
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
@@ -2908,6 +2914,62 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             };
             pipe.pipe_size() as isize
         }
+        F_GET_SEALS => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            drop(inner);
+            let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
+                return EINVAL;
+            };
+            let Some(seals) = shm.memfd_seals() else {
+                return EINVAL;
+            };
+            seals as isize
+        }
+        F_ADD_SEALS => {
+            let process = current_files_process();
+            let inner = process.borrow_mut();
+            if !inner.is_fd_open(fd) {
+                return EBADF;
+            }
+            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let has_writable_shared_map =
+                if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+                    let id = shm.memfd_id();
+                    inner.mmap_areas.iter().any(|region| {
+                        region.memfd_id == id
+                            && region.shared
+                            && (region.prot & PROT_WRITE) != 0
+                    })
+                } else {
+                    false
+                };
+            drop(inner);
+            if !file.writable() {
+                return EPERM;
+            }
+            let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
+                return EINVAL;
+            };
+            let add = arg as u32;
+            if (add & !PseudoShmFile::F_SEAL_ALL) != 0 {
+                return EINVAL;
+            }
+            if (add & PseudoShmFile::F_SEAL_WRITE) != 0
+                && !shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE)
+                && has_writable_shared_map
+            {
+                return EBUSY;
+            }
+            match shm.add_memfd_seals(add) {
+                Ok(_) => 0,
+                Err(e) => e,
+            }
+        }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let process = current_files_process();
             let mut inner = process.borrow_mut();
@@ -3016,6 +3078,34 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     if write_intent && readonly_fs {
         return EROFS;
     }
+    // `/proc/self/fd/<n>` reopen path: used by memfd and shell helpers.
+    if let Some(abs) = resolve_abs_path(dirfd, &path) {
+        if let Some(src_fd) = parse_proc_fd_for_current_process(&abs) {
+            let Some(src_file) = get_fd_file(src_fd) else {
+                return ENOENT;
+            };
+            let file: alloc::sync::Arc<dyn File + Send + Sync> =
+                if let Some(shm) = src_file.as_any().downcast_ref::<PseudoShmFile>() {
+                    alloc::sync::Arc::new(shm.reopen_with_mode(readable, writable))
+                } else {
+                    src_file
+                };
+            let fd = match install_open_file_fd(file, flags, o_path) {
+                Ok(fd) => fd,
+                Err(e) => return e,
+            };
+            if !o_path && (flags & O_TRUNC) != 0 {
+                let tr = syscall_ftruncate(fd, 0);
+                if tr != 0 {
+                    let process = current_files_process();
+                    let mut inner = process.borrow_mut();
+                    let _ = inner.clear_fd(fd);
+                    return tr;
+                }
+            }
+            return fd as isize;
+        }
+    }
     let append = !o_path && (flags & O_APPEND) != 0;
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -3048,12 +3138,12 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                         return EEXIST;
                     }
                     let data = shm_create(name);
-                    alloc::sync::Arc::new(PseudoShmFile::new(data))
+                    alloc::sync::Arc::new(PseudoShmFile::new_with_mode(data, readable, writable))
                 } else {
                     let Some(data) = shm_get(name) else {
                         return ENOENT;
                     };
-                    alloc::sync::Arc::new(PseudoShmFile::new(data))
+                    alloc::sync::Arc::new(PseudoShmFile::new_with_mode(data, readable, writable))
                 }
             } else if let Some(f) = open_pseudo(abs) {
                 f
@@ -4978,6 +5068,16 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             }
         }
     }
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+            return EPERM;
+        }
+        let start = shm.offset();
+        let end = start.saturating_add(write_len);
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && end > shm.len() {
+            return EPERM;
+        }
+    }
     let Ok(user_bufs) = try_translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
@@ -5150,6 +5250,24 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
         return total as isize;
     }
 
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        let old = shm.offset();
+        shm.set_offset(pos as usize);
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            shm.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
+        let n = file.read(buf) as isize;
+        shm.set_offset(old);
+        return n;
+    }
+
     // Seekable pseudo files: emulate by temporarily adjusting the per-fd offset.
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         if pf.len().is_none() {
@@ -5272,6 +5390,32 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             queue_process_signal(pid, SIGXFSZ_NUM);
         }
         return total as isize;
+    }
+
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+            return EPERM;
+        }
+        let start = pos as usize;
+        let end = start.saturating_add(len);
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && end > shm.len() {
+            return EPERM;
+        }
+        let old = shm.offset();
+        shm.set_offset(start);
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            shm.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
+        let n = file.write(buf) as isize;
+        shm.set_offset(old);
+        return n;
     }
 
     // Seekable pseudo files: emulate by temporarily adjusting the per-fd offset.
@@ -6130,10 +6274,6 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
     if (mode & FALLOC_FL_PUNCH_HOLE) != 0 && (mode & FALLOC_FL_KEEP_SIZE) == 0 {
         return EINVAL;
     }
-    if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
-        // Keep semantics explicit until sparse extent metadata is implemented.
-        return EOPNOTSUPP;
-    }
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
@@ -6159,6 +6299,32 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
     }
     if fsize_limit_allows(end).is_err() {
         return EFBIG;
+    }
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
+            if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+                return EPERM;
+            }
+            shm.punch_hole_keep_size(offset, len);
+            return 0;
+        }
+        let old_size = shm.len();
+        let alloc_end = if (mode & FALLOC_FL_KEEP_SIZE) != 0 {
+            core::cmp::min(end, old_size)
+        } else {
+            end
+        };
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && alloc_end > old_size {
+            return EPERM;
+        }
+        if alloc_end > old_size {
+            shm.truncate(alloc_end);
+        }
+        return 0;
+    }
+    if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
+        // Keep semantics explicit until sparse extent metadata is implemented.
+        return EOPNOTSUPP;
     }
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
         return EINVAL;
@@ -6229,6 +6395,13 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
     }
 
     if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        let old_size = shm.len();
+        if length < old_size && shm.has_memfd_seal(PseudoShmFile::F_SEAL_SHRINK) {
+            return EPERM;
+        }
+        if length > old_size && shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) {
+            return EPERM;
+        }
         shm.truncate(length);
         return 0;
     }

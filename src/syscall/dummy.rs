@@ -221,7 +221,9 @@ pub fn syscall_memfd_create(name: usize, flags: usize) -> isize {
     if (flags & MFD_CLOEXEC) != 0 {
         fd_flags |= FD_CLOEXEC;
     }
-    let file: Arc<dyn File + Send + Sync> = Arc::new(PseudoShmFile::new(shm_create_anonymous()));
+    let allow_sealing = (flags & MFD_ALLOW_SEALING) != 0;
+    let file: Arc<dyn File + Send + Sync> =
+        Arc::new(PseudoShmFile::new(shm_create_anonymous(allow_sealing)));
     alloc_fd(file, fd_flags)
 }
 
