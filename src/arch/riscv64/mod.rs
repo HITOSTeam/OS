@@ -1,9 +1,13 @@
 pub mod mm;
 pub mod trap;
 
+use alloc::sync::Arc;
 use core::arch::asm;
 
 use riscv::register::sstatus;
+use spin::MutexGuard;
+
+use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
 
 pub const REG_SP: usize = 2;
 pub const REG_RA: usize = 1;
@@ -85,4 +89,124 @@ pub fn hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> usize {
 
 pub fn read_time() -> usize {
     riscv::register::time::read()
+}
+
+#[inline]
+fn ensure_fs_enabled() {
+    // sstatus.FS = Dirty, so S-mode can execute floating-point save/restore ops.
+    const SSTATUS_FS_DIRTY: usize = 0x6000;
+    unsafe {
+        let mut sstatus_bits: usize;
+        asm!("csrr {}, sstatus", out(reg) sstatus_bits, options(nostack));
+        if (sstatus_bits & SSTATUS_FS_DIRTY) != SSTATUS_FS_DIRTY {
+            sstatus_bits |= SSTATUS_FS_DIRTY;
+            asm!("csrw sstatus, {}", in(reg) sstatus_bits, options(nostack));
+        }
+    }
+}
+
+#[inline]
+fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
+    ensure_fs_enabled();
+    let ptr = inner.fp_regs.as_mut_ptr();
+    unsafe {
+        asm!(
+            "fsd f0, 0({base})",
+            "fsd f1, 8({base})",
+            "fsd f2, 16({base})",
+            "fsd f3, 24({base})",
+            "fsd f4, 32({base})",
+            "fsd f5, 40({base})",
+            "fsd f6, 48({base})",
+            "fsd f7, 56({base})",
+            "fsd f8, 64({base})",
+            "fsd f9, 72({base})",
+            "fsd f10, 80({base})",
+            "fsd f11, 88({base})",
+            "fsd f12, 96({base})",
+            "fsd f13, 104({base})",
+            "fsd f14, 112({base})",
+            "fsd f15, 120({base})",
+            "fsd f16, 128({base})",
+            "fsd f17, 136({base})",
+            "fsd f18, 144({base})",
+            "fsd f19, 152({base})",
+            "fsd f20, 160({base})",
+            "fsd f21, 168({base})",
+            "fsd f22, 176({base})",
+            "fsd f23, 184({base})",
+            "fsd f24, 192({base})",
+            "fsd f25, 200({base})",
+            "fsd f26, 208({base})",
+            "fsd f27, 216({base})",
+            "fsd f28, 224({base})",
+            "fsd f29, 232({base})",
+            "fsd f30, 240({base})",
+            "fsd f31, 248({base})",
+            base = in(reg) ptr,
+            options(nostack)
+        );
+        let fcsr: u32;
+        asm!("frcsr {}", out(reg) fcsr, options(nostack));
+        inner.fp_fcsr = fcsr;
+        inner.fp_valid = true;
+    }
+}
+
+#[inline]
+fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
+    if !inner.fp_valid {
+        return;
+    }
+    ensure_fs_enabled();
+    let ptr = inner.fp_regs.as_ptr();
+    unsafe {
+        asm!(
+            "fld f0, 0({base})",
+            "fld f1, 8({base})",
+            "fld f2, 16({base})",
+            "fld f3, 24({base})",
+            "fld f4, 32({base})",
+            "fld f5, 40({base})",
+            "fld f6, 48({base})",
+            "fld f7, 56({base})",
+            "fld f8, 64({base})",
+            "fld f9, 72({base})",
+            "fld f10, 80({base})",
+            "fld f11, 88({base})",
+            "fld f12, 96({base})",
+            "fld f13, 104({base})",
+            "fld f14, 112({base})",
+            "fld f15, 120({base})",
+            "fld f16, 128({base})",
+            "fld f17, 136({base})",
+            "fld f18, 144({base})",
+            "fld f19, 152({base})",
+            "fld f20, 160({base})",
+            "fld f21, 168({base})",
+            "fld f22, 176({base})",
+            "fld f23, 184({base})",
+            "fld f24, 192({base})",
+            "fld f25, 200({base})",
+            "fld f26, 208({base})",
+            "fld f27, 216({base})",
+            "fld f28, 224({base})",
+            "fld f29, 232({base})",
+            "fld f30, 240({base})",
+            "fld f31, 248({base})",
+            base = in(reg) ptr,
+            options(nostack)
+        );
+        asm!("fscsr {}", in(reg) inner.fp_fcsr, options(nostack));
+    }
+}
+
+pub fn save_user_fp_state(task: &Arc<TaskControlBlock>) {
+    let mut inner = task.borrow_mut();
+    save_fp_registers(&mut inner);
+}
+
+pub fn restore_user_fp_state(task: &Arc<TaskControlBlock>) {
+    let inner = task.borrow_mut();
+    restore_fp_registers(&inner);
 }

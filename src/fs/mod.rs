@@ -30,10 +30,12 @@ pub(crate) use inode::{
 };
 pub use inode::{list_apps, open_file, OSInode, OpenFlags, EXT4_FS, ROOT_INODE, USER_INODE};
 pub use net_socket::{NetSocketFile, NetSocketKind};
-pub use pipe::{make_pipe, Pipe};
+pub use pipe::{debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe, Pipe};
+pub(crate) use pipe::remove_task_waiters as remove_pipe_waiters_for_task;
 pub use procfs::{
     build_proc_root_entries, collect_pids, init_procfs, is_proc_pseudo_path, is_proc_root,
     open_proc_pseudo, proc_file_content, proc_file_kind, proc_file_len, proc_readlink,
+    ProcPseudoFile,
     sync_proc_path,
 };
 pub use pseudo::PseudoBlock;

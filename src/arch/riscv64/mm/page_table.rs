@@ -39,7 +39,9 @@ impl From<MapPermission> for PTEFlags {
             flags |= PTEFlags::R;
         }
         if perm.contains(MapPermission::W) {
-            flags |= PTEFlags::W;
+            // RISC-V leaf PTEs with W=1 and R=0 are reserved.
+            // Keep PROT_WRITE mappings hardware-valid by forcing R when W is set.
+            flags |= PTEFlags::R | PTEFlags::W;
         }
         if perm.contains(MapPermission::X) {
             flags |= PTEFlags::X;

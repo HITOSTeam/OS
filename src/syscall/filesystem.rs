@@ -14,12 +14,14 @@ use crate::{
         ext4_lock, find_path_in_roots, make_pipe, open_file, pseudo_block_note_sync,
         pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
         shm_create, shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe,
-        PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile, SocketPairEnd,
+        ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
+        SocketPairEnd,
     },
     mm::{
         copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
         translated_str, try_copy_from_user, try_copy_to_user, try_read_user_value,
-        try_translated_byte_buffer, try_write_user_value, write_user_value, MapPermission,
+        try_copy_to_user_unchecked, try_translated_byte_buffer, try_write_user_value,
+        write_user_value, MapPermission,
         UserBuffer,
     },
     task::processor::{
@@ -2209,6 +2211,14 @@ fn remove_record_lock_waiter(key: FileLockKey, task: &Arc<TaskControlBlock>) {
     if queue.is_empty() {
         waiters.remove(&key);
     }
+}
+
+pub fn debug_count_record_lock_waiters_for_task(task: &Arc<TaskControlBlock>) -> usize {
+    RECORD_LOCK_WAITERS
+        .lock()
+        .values()
+        .map(|queue| queue.iter().filter(|waiter| Arc::ptr_eq(waiter, task)).count())
+        .sum()
 }
 
 fn take_record_lock_waiters(key: FileLockKey) -> Vec<Arc<TaskControlBlock>> {
@@ -4905,6 +4915,10 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if len == 0 {
         return 0;
     }
+    let write_start_off = file
+        .as_any()
+        .downcast_ref::<OSInode>()
+        .map(|inode| inode.offset());
     let mut write_len = len;
     if fd_has_nonblock(fd) {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
@@ -4988,6 +5002,12 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if written > 0 {
         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            mirror_inode_write_to_current_mmaps(
+                os_inode,
+                write_start_off.unwrap_or(0),
+                buffer,
+                written as usize,
+            );
             if os_inode.flush().is_err() {
                 return EIO;
             }
@@ -4998,6 +5018,76 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         queue_process_signal(pid, SIGXFSZ_NUM);
     }
     written
+}
+
+fn mirror_inode_write_to_current_mmaps(
+    os_inode: &OSInode,
+    write_off: usize,
+    user_src: usize,
+    len: usize,
+) {
+    if len == 0 {
+        return;
+    }
+
+    let inode = os_inode.ext4_inode();
+    let (dev, ino) = {
+        let _ext4_guard = ext4_lock();
+        (inode.device_id(), inode.inode_num())
+    };
+    let write_end = write_off.saturating_add(len);
+    let copies: Vec<(usize, usize, usize)> = {
+        let process = current_process();
+        let inner = process.borrow_mut();
+        let mut pending = Vec::new();
+        for region in inner.mmap_areas.iter() {
+            if !region.file_backed || region.file_dev != dev || region.file_ino != ino {
+                continue;
+            }
+            let Some(region_file_end) = region.file_offset.checked_add(region.len) else {
+                continue;
+            };
+            let overlap_start = core::cmp::max(write_off, region.file_offset);
+            let mut overlap_end = core::cmp::min(write_end, region_file_end);
+            let region_valid_len = region.sigbus_start.saturating_sub(region.start).min(region.len);
+            let region_valid_end = region.file_offset.saturating_add(region_valid_len);
+            overlap_end = core::cmp::min(overlap_end, region_valid_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            pending.push((
+                region.start + (overlap_start - region.file_offset),
+                overlap_start - write_off,
+                overlap_end - overlap_start,
+            ));
+        }
+        pending
+    };
+    if copies.is_empty() {
+        return;
+    }
+
+    let token = get_current_token();
+    let mut tmp = [0u8; 1024];
+    for (dst, src_off, total) in copies {
+        let mut done = 0usize;
+        while done < total {
+            let chunk = core::cmp::min(tmp.len(), total - done);
+            if try_copy_from_user(
+                token,
+                (user_src + src_off + done) as *const u8,
+                &mut tmp[..chunk],
+            )
+            .is_err()
+            {
+                return;
+            }
+            if try_copy_to_user_unchecked(token, (dst + done) as *mut u8, &tmp[..chunk]).is_err() {
+                return;
+            }
+            done += chunk;
+        }
+    }
 }
 
 /// Linux `pread64(2)` (syscall 67 on riscv64).
@@ -6309,10 +6399,9 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
         }
     }
 
+    let mut flush_failed = false;
     if let Some(out_inode) = out_inode_opt {
-        if total > 0 && out_inode.flush().is_err() {
-            return EIO;
-        }
+        flush_failed = total > 0 && out_inode.flush().is_err();
         out_inode.set_offset(out_pos);
     }
 
@@ -6320,6 +6409,9 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
         in_inode.set_offset(in_pos);
     } else if let Err(e) = write_optional_offset(offset, in_pos) {
         return e;
+    }
+    if flush_failed {
+        return EIO;
     }
     total as isize
 }
@@ -6543,6 +6635,9 @@ pub fn syscall_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isi
     let Some(out_file) = get_fd_file(fd_out) else {
         return EBADF;
     };
+    if !in_file.readable() || !out_file.writable() {
+        return EBADF;
+    }
     let Some(in_pipe) = in_file.as_any().downcast_ref::<Pipe>() else {
         return EINVAL;
     };
@@ -8567,6 +8662,21 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             return EINVAL;
         }
         shm.set_offset(new as usize);
+        return new;
+    }
+
+    if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
+        let cur = proc_file.offset() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => proc_file.seek_end().saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        proc_file.set_offset(new as usize);
         return new;
     }
 

@@ -189,6 +189,36 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
+
+    /// Lightweight summary used to diagnose fork/COW memory pressure.
+    pub fn cow_diag_stats(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let mut total_data_frames = 0usize;
+        let mut identical_vpns = 0usize;
+        let mut lazy_areas = 0usize;
+        let mut framed_areas = 0usize;
+        let mut identical_areas = 0usize;
+        for area in self.areas.iter() {
+            total_data_frames = total_data_frames.saturating_add(area.data_frames.len());
+            match area.map_type {
+                MapType::Lazy => lazy_areas = lazy_areas.saturating_add(1),
+                MapType::Framed => framed_areas = framed_areas.saturating_add(1),
+                MapType::Identical => {
+                    identical_areas = identical_areas.saturating_add(1);
+                    let start = area.vpn_range.get_start().0;
+                    let end = area.vpn_range.get_end().0;
+                    identical_vpns = identical_vpns.saturating_add(end.saturating_sub(start));
+                }
+            }
+        }
+        (
+            self.areas.len(),
+            total_data_frames,
+            identical_vpns,
+            lazy_areas,
+            framed_areas,
+            identical_areas,
+        )
+    }
     /// Assume that no conflicts.
     pub fn insert_framed_area(
         &mut self,

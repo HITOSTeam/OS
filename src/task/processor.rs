@@ -9,7 +9,7 @@ use crate::{
         id::{KernelStack, TaskUserRes},
         manager::{
             TASK_MANAGER, add_task, fetch_task, has_ready_rt_at_or_above, has_ready_rt_higher_than,
-            remove_inactive_task, wakeup_task,
+            remove_inactive_task, wakeup_task, PID2PCB,
         },
         process_block::ProcessControlBlock,
         sched::{RR_TIMESLICE_TICKS, RT_PRIO_MIN, SchedClass, sched_class},
@@ -29,6 +29,10 @@ use crate::debug_config::{DEBUG_PTHREAD, DEBUG_SCHED};
 
 static TASK_DROP_QUEUED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static TASK_DROP_DONE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TASK_DROP_REF_DIAG_SEQ: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static TASK_FETCH_REF_DIAG_SEQ: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 fn should_log_pow2(v: usize) -> bool {
     v >= 64 && (v & (v - 1)) == 0
@@ -53,6 +57,122 @@ fn maybe_log_task_drop(event: &str) {
 }
 
 fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
+    if crate::debug_config::DEBUG_TASK_LIFECYCLE {
+        let seq = TASK_DROP_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if seq <= 16 || (seq & (seq - 1)) == 0 {
+            let strong = Arc::strong_count(&task);
+            let processes = {
+                let map = PID2PCB.lock();
+                map.values().cloned().collect::<Vec<_>>()
+            };
+            let runqueue_refs = crate::task::manager::debug_count_task_refs_in_runqueues(&task);
+            let processor_refs = debug_count_task_refs_in_processors(&task);
+            let timer_refs = crate::task::block_sleep::debug_count_task_refs_in_timers(&task);
+            let futex_refs = crate::syscall::futex::debug_count_task_waiters(&task);
+            let record_lock_refs =
+                crate::syscall::filesystem::debug_count_record_lock_waiters_for_task(&task);
+            let (self_join_len, self_join_self_refs, tid) = {
+                let inner = task.borrow_mut();
+                (
+                    inner.join_waiters.len(),
+                    inner
+                        .join_waiters
+                        .iter()
+                        .filter(|w| Arc::ptr_eq(w, &task))
+                        .count(),
+                    inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
+                )
+            };
+            let mut task_slots = 0usize;
+            let mut wait_queues = 0usize;
+            let mut join_waiters = 0usize;
+            let mut sem_waiters = 0usize;
+            let mut condvar_waiters = 0usize;
+            let mut mutex_waiters = 0usize;
+            for process in processes {
+                if let Some(inner) = process.try_borrow_mut() {
+                    task_slots = task_slots.saturating_add(
+                        inner
+                            .tasks
+                            .iter()
+                            .filter(|slot| {
+                                slot.as_ref()
+                                    .map(|holder| Arc::ptr_eq(holder, &task))
+                                    .unwrap_or(false)
+                            })
+                            .count(),
+                    );
+                    wait_queues = wait_queues.saturating_add(
+                        inner
+                            .wait_queue
+                            .iter()
+                            .filter(|holder| Arc::ptr_eq(holder, &task))
+                            .count(),
+                    );
+                    for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
+                        if Arc::ptr_eq(holder, &task) {
+                            continue;
+                        }
+                        if let Some(holder_inner) = holder.try_borrow_mut() {
+                            join_waiters = join_waiters.saturating_add(
+                                holder_inner
+                                    .join_waiters
+                                    .iter()
+                                    .filter(|w| Arc::ptr_eq(w, &task))
+                                    .count(),
+                            );
+                        }
+                    }
+                    for sem in inner.semaphore_list.iter().filter_map(|s| s.as_ref()) {
+                        sem_waiters = sem_waiters.saturating_add(
+                            sem.inner
+                                .lock()
+                                .wait_queue
+                                .iter()
+                                .filter(|w| Arc::ptr_eq(w, &task))
+                                .count(),
+                        );
+                    }
+                    for condvar in inner.condvar_list.iter().filter_map(|c| c.as_ref()) {
+                        condvar_waiters = condvar_waiters.saturating_add(
+                            condvar
+                                .inner
+                                .lock()
+                                .wait_queue
+                                .iter()
+                                .filter(|w| Arc::ptr_eq(w, &task))
+                                .count(),
+                        );
+                    }
+                    for mutex in inner.mutex_list.iter().filter_map(|m| m.as_ref()) {
+                        mutex_waiters =
+                            mutex_waiters.saturating_add(mutex.debug_count_waiters_for_task(&task));
+                    }
+                }
+            }
+            let pipe_waiters = crate::fs::debug_count_pipe_waiters_for_task(&task);
+            crate::println!(
+                "[task-drop-ref] phase=queue seq={} tid={} strong={} rq={} proc={} timer={} futex={} rec_lock={} task_slots={} waitq={} join={} sem={} cond={} mutex={} pipe={} self_join_len={} self_join_self={}",
+                seq,
+                tid,
+                strong,
+                runqueue_refs,
+                processor_refs,
+                timer_refs,
+                futex_refs,
+                record_lock_refs,
+                task_slots,
+                wait_queues,
+                join_waiters,
+                sem_waiters,
+                condvar_waiters,
+                mutex_waiters,
+                pipe_waiters,
+                self_join_len,
+                self_join_self_refs
+            );
+        }
+    }
     // Detach the kernel stack now, but free it only after switching to idle.
     // This keeps stack reclamation independent from lingering task Arc refs.
     let kstack = task.take_kstack();
@@ -229,6 +349,44 @@ pub fn current_process_has_child(pid_or_negative: isize, exit_code: &mut i32) ->
     None
 }
 
+pub fn debug_count_task_refs_in_processors(task: &Arc<TaskControlBlock>) -> usize {
+    PROCESSORS
+        .iter()
+        .map(|p| {
+            let p = p.lock();
+            let mut count = 0usize;
+            if p.now_task_block
+                .as_ref()
+                .map(|t| Arc::ptr_eq(t, task))
+                .unwrap_or(false)
+            {
+                count = count.saturating_add(1);
+            }
+            if p.pending_ready
+                .as_ref()
+                .map(|t| Arc::ptr_eq(t, task))
+                .unwrap_or(false)
+            {
+                count = count.saturating_add(1);
+            }
+            if p.pending_blocked
+                .as_ref()
+                .map(|t| Arc::ptr_eq(t, task))
+                .unwrap_or(false)
+            {
+                count = count.saturating_add(1);
+            }
+            count = count.saturating_add(
+                p.pending_drop
+                    .iter()
+                    .filter(|t| Arc::ptr_eq(t, task))
+                    .count(),
+            );
+            count
+        })
+        .sum()
+}
+
 pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
     let mut processor = local_processor().lock();
     let task = processor.take_current_task();
@@ -341,6 +499,17 @@ pub fn idle_task() {
         }
 
         while let Some(task) = local_processor().lock().take_pending_drop() {
+            if crate::debug_config::DEBUG_TASK_LIFECYCLE {
+                let seq = TASK_DROP_DONE.load(core::sync::atomic::Ordering::Relaxed) + 1;
+                if seq <= 16 || (seq & (seq - 1)) == 0 {
+                    let strong = Arc::strong_count(&task);
+                    crate::println!(
+                        "[task-drop-ref] phase=idle seq={} strong_refs={}",
+                        seq,
+                        strong
+                    );
+                }
+            }
             task.clear_on_cpu();
             // Best-effort cleanup in process task tables.
             //
@@ -374,6 +543,33 @@ pub fn idle_task() {
         }
 
         if let Some(task) = fetch_task() {
+            arch::restore_user_fp_state(&task);
+            if crate::debug_config::DEBUG_TASK_LIFECYCLE {
+                let seq =
+                    TASK_FETCH_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                if seq <= 32 || (seq & (seq - 1)) == 0 {
+                    let strong = Arc::strong_count(&task);
+                    let pid = task
+                        .process
+                        .upgrade()
+                        .map(|p| p.getpid())
+                        .unwrap_or(usize::MAX);
+                    let tid = task
+                        .borrow_mut()
+                        .res
+                        .as_ref()
+                        .map(|r| r.tid)
+                        .unwrap_or(usize::MAX);
+                    crate::println!(
+                        "[task-fetch-ref] seq={} pid={} tid={} strong_refs={}",
+                        seq,
+                        pid,
+                        tid,
+                        strong
+                    );
+                }
+            }
             if crate::debug_config::DEBUG_WATCHDOG {
                 EMPTY_SPINS.store(0, core::sync::atomic::Ordering::Relaxed);
             }
@@ -513,6 +709,7 @@ pub fn suspend_current_and_run_next() {
     //
     // Instead, stash it on this hart and let `idle_task()` enqueue it after the
     // context switch completes.
+    arch::save_user_fp_state(&task);
     local_processor().lock().set_pending_ready(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
@@ -550,10 +747,12 @@ pub fn block_current_and_run_next() {
     // ---- release current PCB
 
     if should_block {
+        arch::save_user_fp_state(&task);
         local_processor().lock().set_pending_blocked(task);
     } else {
         // Behave like a yield: enqueue after we have switched back to idle
         // to avoid "run on two harts".
+        arch::save_user_fp_state(&task);
         local_processor().lock().set_pending_ready(task);
     }
     // jump to scheduling cycle

@@ -377,6 +377,27 @@ pub struct TaskControlBlock {
     inner: Mutex<TaskControlBlockInner>,
 }
 
+static TASK_TCB_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TASK_TCB_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn maybe_log_tcb_inflight(event: &str) {
+    if !crate::debug_config::DEBUG_TASK_LIFECYCLE {
+        return;
+    }
+    let allocs = TASK_TCB_ALLOC_COUNT.load(Ordering::Relaxed);
+    let drops = TASK_TCB_DROP_COUNT.load(Ordering::Relaxed);
+    let inflight = allocs.saturating_sub(drops);
+    if inflight >= 64 && (inflight & (inflight - 1)) == 0 {
+        crate::println!(
+            "[tcb-debug] event={} inflight={} allocs={} drops={}",
+            event,
+            inflight,
+            allocs,
+            drops
+        );
+    }
+}
+
 impl TaskControlBlock {
     pub const OFF_CPU: usize = usize::MAX;
 
@@ -471,6 +492,12 @@ pub struct TaskControlBlockInner {
     pub nice: i32,
     /// Hint that libc just queried self priority and may issue `nice()`.
     pub nice_query_hint: bool,
+    /// Saved user floating-point registers (`f0..f31`) for context switches.
+    pub fp_regs: [u64; 32],
+    /// Saved floating-point control/status register.
+    pub fp_fcsr: u32,
+    /// Whether `fp_regs/fp_fcsr` contain a valid snapshot.
+    pub fp_valid: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -545,7 +572,15 @@ impl TaskControlBlock {
                 cpu_time_ns: 0,
                 nice: process_nice,
                 nice_query_hint: false,
+                fp_regs: [0; 32],
+                fp_fcsr: 0,
+                fp_valid: false,
             }),
+        })
+        .map(|tcb| {
+            TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            maybe_log_tcb_inflight("alloc");
+            tcb
         })
     }
 
@@ -610,12 +645,27 @@ impl TaskControlBlock {
                 cpu_time_ns: 0,
                 nice: process_nice,
                 nice_query_hint: false,
+                fp_regs: [0; 32],
+                fp_fcsr: 0,
+                fp_valid: false,
             }),
+        })
+        .map(|tcb| {
+            TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            maybe_log_tcb_inflight("alloc");
+            tcb
         })
     }
 
     pub fn new_linux_thread(process: Arc<ProcessControlBlock>) -> Self {
         Self::try_new_linux_thread(process).expect("OOM: TaskControlBlock::new_linux_thread")
+    }
+}
+
+impl Drop for TaskControlBlock {
+    fn drop(&mut self) {
+        TASK_TCB_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        maybe_log_tcb_inflight("drop");
     }
 }
 

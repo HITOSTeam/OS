@@ -658,8 +658,8 @@ pub fn syscall_mq_unlink(name: usize) -> isize {
     let cred = current_cred();
     let ipc_ns_id = current_ipc_namespace_id();
     let queue = {
-        let managers = MQ_MANAGERS.lock();
-        let Some(mgr) = managers.get(&ipc_ns_id) else {
+        let mut managers = MQ_MANAGERS.lock();
+        let Some(mgr) = managers.get_mut(&ipc_ns_id) else {
             return ENOENT;
         };
         let Some(id) = mgr.by_name.get(&qname).copied() else {
@@ -668,23 +668,16 @@ pub fn syscall_mq_unlink(name: usize) -> isize {
         let Some(queue) = mgr.by_id.get(&id).cloned() else {
             return ENOENT;
         };
-        queue
-    };
-
-    {
-        let state = queue.state.lock();
-        if !is_owner_or_root(&state.perm, &cred) {
+        let allowed = {
+            let state = queue.state.lock();
+            is_owner_or_root(&state.perm, &cred)
+        };
+        if !allowed {
             return EACCES;
         }
-    }
-
-    {
-        let mut managers = MQ_MANAGERS.lock();
-        let Some(mgr) = managers.get_mut(&ipc_ns_id) else {
-            return ENOENT;
-        };
         mgr.by_name.remove(&qname);
-    }
+        queue
+    };
     *queue.name.lock() = None;
     gc_unlinked_queue(&queue);
     0

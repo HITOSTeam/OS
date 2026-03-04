@@ -1,7 +1,7 @@
 //! Implementation of [`TrapContext`]
 
 use core::arch::asm;
-use riscv::register::sstatus::{self, SPP, Sstatus};
+use riscv::register::sstatus::{self, FS, SPP, Sstatus};
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -38,6 +38,7 @@ impl TrapContext {
     ) -> Self {
         let mut sstatus = sstatus::read(); // CSR sstatus
         sstatus.set_spp(SPP::User); //previous privilege mode: user mode
+        sstatus.set_fs(FS::Dirty);
         // Enable interrupts when we enter user mode for the first time.
         // Without setting SPIE, S-mode interrupts (timer) stay disabled in U-mode,
         // so sleeping tasks would never be woken if another runnable task spins.

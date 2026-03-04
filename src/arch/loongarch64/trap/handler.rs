@@ -260,25 +260,28 @@ pub fn trap_return() -> ! {
         let cx = get_trap_context();
         cx.sstatus = (cx.sstatus & !0x7) | 0x7;
     }
-    let task = crate::task::processor::current_task().unwrap();
-    let trap_cx_ptr = {
-        let task_inner = task.borrow_mut();
-        if let Some(res) = task_inner.res.as_ref() {
-            res.trap_cx_user_va()
-        } else {
-            drop(task_inner);
-            exit_current_and_run_next(-1);
-            unreachable!("exit_current_and_run_next should not return");
-        }
+    // IMPORTANT: `trap_return()` diverges, so keep Arc owners in a short scope.
+    let (trap_cx_ptr, user_token) = {
+        let task = crate::task::processor::current_task().unwrap();
+        let trap_cx_ptr = {
+            let task_inner = task.borrow_mut();
+            if let Some(res) = task_inner.res.as_ref() {
+                res.trap_cx_user_va()
+            } else {
+                drop(task_inner);
+                exit_current_and_run_next(-1);
+                unreachable!("exit_current_and_run_next should not return");
+            }
+        };
+        let user_token = task
+            .process
+            .upgrade()
+            .unwrap()
+            .borrow_mut()
+            .memory_set
+            .token();
+        (trap_cx_ptr, user_token)
     };
-
-    let user_token = task
-        .process
-        .upgrade()
-        .unwrap()
-        .borrow_mut()
-        .memory_set
-        .token();
 
     let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
     if DEBUG_TRAP && cnt < 4 {

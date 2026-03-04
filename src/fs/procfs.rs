@@ -13,7 +13,7 @@ use crate::fs::{
     ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, OSInode,
     PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
 };
-use crate::mm::UserBuffer;
+use crate::mm::{UserBuffer, VirtAddr};
 use crate::task::manager::{pid2process, PID2PCB};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
@@ -34,6 +34,7 @@ pub enum ProcFileKind {
     PidCmdline(u32),
     PidStatus(u32),
     PidMaps(u32),
+    PidPagemap(u32),
     PidSmaps(u32),
     PidCoredumpFilter(u32),
     PidMounts(u32),
@@ -121,6 +122,21 @@ impl ProcPseudoFile {
             inner: Mutex::new(ProcPseudoInner { offset: 0 }),
         })
     }
+
+    pub fn offset(&self) -> usize {
+        self.inner.lock().offset
+    }
+
+    pub fn set_offset(&self, offset: usize) {
+        self.inner.lock().offset = offset;
+    }
+
+    pub fn seek_end(&self) -> isize {
+        match self.kind {
+            ProcFileKind::PidPagemap(_) => isize::MAX,
+            _ => proc_file_len(&self.kind) as isize,
+        }
+    }
 }
 
 impl File for ProcPseudoFile {
@@ -134,6 +150,9 @@ impl File for ProcPseudoFile {
 
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut inner = self.inner.lock();
+        if let ProcFileKind::PidPagemap(pid) = self.kind {
+            return proc_pid_pagemap_read(pid, &mut inner.offset, &mut buf);
+        }
         let data = proc_file_content(&self.kind);
         let bytes = data.as_bytes();
         if inner.offset >= bytes.len() {
@@ -421,6 +440,7 @@ fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
         "cmdline",
         "status",
         "maps",
+        "pagemap",
         "smaps",
         "coredump_filter",
         "mounts",
@@ -876,6 +896,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "cmdline" => Some(ProcPseudoFile::new(ProcFileKind::PidCmdline(pid))),
         "status" => Some(ProcPseudoFile::new(ProcFileKind::PidStatus(pid))),
         "maps" => Some(ProcPseudoFile::new(ProcFileKind::PidMaps(pid))),
+        "pagemap" => Some(ProcPseudoFile::new(ProcFileKind::PidPagemap(pid))),
         "smaps" => Some(ProcPseudoFile::new(ProcFileKind::PidSmaps(pid))),
         "coredump_filter" => Some(ProcPseudoFile::new(ProcFileKind::PidCoredumpFilter(pid))),
         "mounts" => Some(ProcPseudoFile::new(ProcFileKind::PidMounts(pid))),
@@ -951,6 +972,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
         ProcFileKind::PidStatus(pid) => proc_pid_status(*pid),
         ProcFileKind::PidMaps(pid) => proc_pid_maps(*pid),
+        ProcFileKind::PidPagemap(_) => String::new(),
         ProcFileKind::PidSmaps(pid) => proc_pid_smaps(*pid),
         ProcFileKind::PidCoredumpFilter(_) => String::from("00000033\n"),
         ProcFileKind::PidTaskStat(pid, tid) => proc_pid_task_stat(*pid, *tid),
@@ -998,6 +1020,12 @@ fn sync_proc_pid(pid: usize) {
     );
     let _ = ensure_proc_file(&pid_dir, "status", ProcFileKind::PidStatus(pid_u32), 0o444);
     let _ = ensure_proc_file(&pid_dir, "maps", ProcFileKind::PidMaps(pid_u32), 0o444);
+    let _ = ensure_proc_file(
+        &pid_dir,
+        "pagemap",
+        ProcFileKind::PidPagemap(pid_u32),
+        0o444,
+    );
     let _ = ensure_proc_file(&pid_dir, "smaps", ProcFileKind::PidSmaps(pid_u32), 0o444);
     let _ = ensure_proc_file(
         &pid_dir,
@@ -1421,6 +1449,43 @@ fn proc_pid_maps(pid: u32) -> String {
         ));
     }
     out
+}
+
+fn proc_pid_pagemap_entry(pid: u32, entry: usize) -> u64 {
+    let Some(proc) = pid2process(pid as usize) else {
+        return 0;
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        return 0;
+    };
+    let Some(vaddr) = entry.checked_mul(config::PAGE_SIZE) else {
+        return 0;
+    };
+    let vpn = VirtAddr::from(vaddr).floor();
+    if let Some(pte) = inner.memory_set.translate(vpn) {
+        if pte.is_valid() {
+            // Linux pagemap bit 63 indicates page present.
+            return 1u64 << 63;
+        }
+    }
+    0
+}
+
+fn proc_pid_pagemap_read(pid: u32, offset: &mut usize, buf: &mut UserBuffer) -> usize {
+    let mut total = 0usize;
+    for slice in buf.buffers.iter_mut() {
+        let mut i = 0usize;
+        while i < slice.len() {
+            let entry = (*offset) / 8;
+            let byte_in_entry = (*offset) % 8;
+            let val = proc_pid_pagemap_entry(pid, entry);
+            slice[i] = ((val >> (byte_in_entry * 8)) & 0xff) as u8;
+            *offset += 1;
+            i += 1;
+            total += 1;
+        }
+    }
+    total
 }
 
 fn range_overlap_len(start: usize, end: usize, lock_start: usize, lock_end: usize) -> usize {

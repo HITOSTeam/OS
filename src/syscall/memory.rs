@@ -19,6 +19,7 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_SHARED_VALIDATE: usize = 0x03;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
+const MAP_GROWSDOWN: usize = 0x0100;
 const MAP_LOCKED: usize = 0x2000;
 const MAP_STACK: usize = 0x20000;
 const MAP_FIXED_NOREPLACE: usize = 0x100000;
@@ -32,6 +33,7 @@ const EFAULT: isize = -14;
 const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
 const EEXIST: isize = -17;
+const EOPNOTSUPP: isize = -95;
 const EPERM: isize = -1;
 
 const MCL_CURRENT: usize = 0x01;
@@ -85,6 +87,12 @@ fn push_mmap_region_merged(regions: &mut alloc::vec::Vec<MmapRegion>, region: Mm
             && last.prot == region.prot
             && last.shared == region.shared
             && last.may_write_upgrade == region.may_write_upgrade
+            && last.file_backed == region.file_backed
+            && last.file_dev == region.file_dev
+            && last.file_ino == region.file_ino
+            && last.file_offset + last.len == region.file_offset
+            && last.growsdown == region.growsdown
+            && last.sigbus_start == region.sigbus_start
         {
             last.len += region.len;
             return;
@@ -230,11 +238,25 @@ fn ranges_overlap(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
         .any(|(r_start, r_end)| end > *r_start && start < *r_end)
 }
 
+fn page_overlaps_mmap_regions(page_start: usize, regions: &[MmapRegion]) -> bool {
+    let page_end = page_start.saturating_add(PAGE_SIZE);
+    regions
+        .iter()
+        .any(|region| page_end > region.start && page_start < region.end())
+}
+
 pub fn syscall_brk(addr: usize) -> isize {
     const BRK_RELATIVE_COMPAT_MAX: usize = 64 * 1024;
     let process = current_process();
     let pid = process.getpid();
     let mut inner = process.borrow_mut();
+    crate::println!(
+        "[brk-trace] pid={} req={:#x} cur={:#x} heap_start={:#x}",
+        pid,
+        addr,
+        inner.brk,
+        inner.heap_start
+    );
     if addr == 0 {
         if crate::debug_config::DEBUG_SYSCALL {
             crate::println!(
@@ -247,13 +269,10 @@ pub fn syscall_brk(addr: usize) -> isize {
         return inner.brk as isize;
     }
     let mut new_brk = addr;
-    if new_brk < inner.heap_start
-        && inner.brk == inner.heap_start
-        && new_brk <= BRK_RELATIVE_COMPAT_MAX
-    {
-        // Some musl environments may issue `brk()` with a small positive
-        // increment before their internal break base gets initialized.
-        // Treat this as a relative grow-from-base request.
+    if new_brk < inner.heap_start && new_brk <= BRK_RELATIVE_COMPAT_MAX {
+        // Some libc builds issue `brk()` with a small positive increment
+        // (relative form) instead of an absolute break address.
+        // Treat such low values as relative grows from current break.
         if let Some(candidate) = inner.brk.checked_add(new_brk) {
             if candidate > inner.brk {
                 new_brk = candidate;
@@ -300,55 +319,75 @@ pub fn syscall_brk(addr: usize) -> isize {
         );
     }
     let ok = if new_end > old_end {
-        if inner
-            .memory_set
-            .range_overlaps(old_end.into(), new_end.into())
-        {
-            if crate::debug_config::DEBUG_SYSCALL {
-                crate::println!(
-                    "[brk] pid={} grow range [{:#x}, {:#x}) overlaps existing mapping",
-                    pid,
-                    old_end,
-                    new_end
-                );
+        let perm = MapPermission::R | MapPermission::W | MapPermission::U;
+        let mut cur = old_end;
+        let mut ok = true;
+        while cur < new_end {
+            if page_overlaps_mmap_regions(cur, &inner.mmap_areas)
+                || inner
+                    .memory_set
+                    .user_range_fully_mapped(cur.into(), (cur + PAGE_SIZE).into())
+            {
+                cur += PAGE_SIZE;
+                continue;
             }
-            return old_brk as isize;
-        }
-        let mut ok = inner
-            .memory_set
-            .append_to(heap_start.into(), new_end.into());
-        if crate::debug_config::DEBUG_SYSCALL {
-            crate::println!("[brk] pid={} append_to ok={}", pid, ok);
-        }
-        if !ok {
-            // fix posssible error that happends in the cloud env
-            let perm = MapPermission::R | MapPermission::W | MapPermission::U;
-            ok = inner
+            let run_start = cur;
+            cur += PAGE_SIZE;
+            while cur < new_end
+                && !page_overlaps_mmap_regions(cur, &inner.mmap_areas)
+                && !inner
+                    .memory_set
+                    .user_range_fully_mapped(cur.into(), (cur + PAGE_SIZE).into())
+            {
+                cur += PAGE_SIZE;
+            }
+            if !inner
                 .memory_set
-                .try_insert_lazy_area(heap_start.into(), new_end.into(), perm);
-            if crate::debug_config::DEBUG_SYSCALL {
-                crate::println!("[brk] pid={} insert_lazy ok={}", pid, ok);
+                .try_insert_lazy_area(run_start.into(), cur.into(), perm)
+            {
+                ok = false;
+                break;
             }
+        }
+        if crate::debug_config::DEBUG_SYSCALL {
+            crate::println!("[brk] pid={} grow_with_holes ok={}", pid, ok);
         }
         ok
     } else if new_end < old_end {
-        let ok = inner
-            .memory_set
-            .shrink_to(heap_start.into(), new_end.into());
-        if crate::debug_config::DEBUG_SYSCALL {
-            crate::println!("[brk] pid={} shrink_to ok={}", pid, ok);
+        let mut cur = new_end;
+        while cur < old_end {
+            if !page_overlaps_mmap_regions(cur, &inner.mmap_areas) {
+                inner
+                    .memory_set
+                    .unmap_user_range(cur.into(), (cur + PAGE_SIZE).into());
+            }
+            cur += PAGE_SIZE;
         }
-        ok
+        if crate::debug_config::DEBUG_SYSCALL {
+            crate::println!("[brk] pid={} shrink_with_holes done", pid);
+        }
+        true
     } else {
         true
     };
     if !ok {
+        crate::println!(
+            "[brk-trace] pid={} reject req={:#x} keep={:#x}",
+            pid,
+            new_brk,
+            old_brk
+        );
         if crate::debug_config::DEBUG_SYSCALL {
             crate::println!("[brk] pid={} failed, brk stays {:#x}", pid, old_brk);
         }
         return old_brk as isize;
     }
     inner.brk = new_brk;
+    crate::println!(
+        "[brk-trace] pid={} ok new={:#x}",
+        pid,
+        inner.brk
+    );
     if crate::debug_config::DEBUG_SYSCALL {
         crate::println!("[brk] pid={} updated brk={:#x}", pid, inner.brk);
     }
@@ -363,9 +402,20 @@ pub fn syscall_mmap(
     fd: isize,
     off: usize,
 ) -> isize {
+    const MAP_KNOWN_MASK: usize =
+        MAP_TYPE_MASK
+            | MAP_FIXED
+            | MAP_ANONYMOUS
+            | MAP_GROWSDOWN
+            | MAP_LOCKED
+            | MAP_STACK
+            | MAP_FIXED_NOREPLACE;
     let map_type = flags & MAP_TYPE_MASK;
     if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
         return EINVAL;
+    }
+    if map_type == MAP_SHARED_VALIDATE && (flags & !MAP_KNOWN_MASK) != 0 {
+        return EOPNOTSUPP;
     }
     let is_shared = map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE;
     let is_anon = (flags & MAP_ANONYMOUS) != 0;
@@ -392,6 +442,20 @@ pub fn syscall_mmap(
         Some(file)
     } else {
         None
+    };
+    let (file_backed, file_dev, file_ino, file_offset) = if let Some(file) = &file {
+        if let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() {
+            let inode = inode_file.ext4_inode();
+            let (dev, ino) = {
+                let _ext4_guard = ext4_lock();
+                (inode.device_id(), inode.inode_num())
+            };
+            (true, dev, ino, off)
+        } else {
+            (false, 0, 0, 0)
+        }
+    } else {
+        (false, 0, 0, 0)
     };
     let map_len = align_up(len, PAGE_SIZE);
 
@@ -456,6 +520,30 @@ pub fn syscall_mmap(
         }
     }
 
+    // Linux delivers SIGBUS for file-backed accesses that go beyond EOF,
+    // starting from the first full page after the file-backed byte range.
+    let sigbus_enabled = !is_anon && is_shared;
+    let sigbus_start = if sigbus_enabled {
+        if let Some(file) = &file {
+            if let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() {
+                let _ = inode_file.flush();
+                let inode = inode_file.ext4_inode();
+                let file_size = {
+                    let _ext4_guard = ext4_lock();
+                    inode.size() as usize
+                };
+                let file_bytes = file_size.saturating_sub(off).min(map_len);
+                map_start + align_up(file_bytes, PAGE_SIZE).min(map_len)
+            } else {
+                map_end
+            }
+        } else {
+            map_end
+        }
+    } else {
+        map_end
+    };
+
     if (flags & MAP_FIXED) != 0 {
         // Refuse to map over kernel-only pages (e.g. TrapContext/trampoline).
         let mut cur = start;
@@ -485,7 +573,8 @@ pub fn syscall_mmap(
                 };
                 frames
             } else {
-                let pages = map_len / PAGE_SIZE;
+                let file_mapped_len = sigbus_start.saturating_sub(map_start);
+                let pages = file_mapped_len / PAGE_SIZE;
                 let mut frames = alloc::vec::Vec::with_capacity(pages);
                 for _ in 0..pages {
                     let Some(frame) = frame_alloc() else {
@@ -506,20 +595,53 @@ pub fn syscall_mmap(
             }
             frames
         };
-        inner
-            .memory_set
-            .insert_shared_frames_area(map_start.into(), map_end.into(), perm, frames);
+        if map_start < sigbus_start {
+            inner.memory_set.insert_shared_frames_area(
+                map_start.into(),
+                sigbus_start.into(),
+                perm,
+                frames,
+            );
+        }
+        if sigbus_start < map_end
+            && !inner.memory_set.try_insert_lazy_area(
+                sigbus_start.into(),
+                map_end.into(),
+                MapPermission::U,
+            )
+        {
+            inner
+                .memory_set
+                .unmap_user_range(map_start.into(), map_end.into());
+            return ENOMEM;
+        }
     } else {
         let map_ok = if is_anon {
             inner
                 .memory_set
                 .try_insert_lazy_area(map_start.into(), map_end.into(), perm)
         } else {
-            inner
-                .memory_set
-                .try_insert_framed_area(map_start.into(), map_end.into(), perm)
+            let mut ok = true;
+            if map_start < sigbus_start {
+                ok &= inner.memory_set.try_insert_framed_area(
+                    map_start.into(),
+                    sigbus_start.into(),
+                    perm,
+                );
+            }
+            if ok && sigbus_start < map_end {
+                ok &= inner.memory_set.try_insert_lazy_area(
+                    sigbus_start.into(),
+                    map_end.into(),
+                    MapPermission::U,
+                );
+            }
+            ok
         };
         if !map_ok {
+            inner
+                .memory_set
+                .unmap_user_range(map_start.into(), map_end.into());
             return ENOMEM;
         }
     }
@@ -541,6 +663,12 @@ pub fn syscall_mmap(
             prot: prot & (PROT_READ | PROT_WRITE | PROT_EXEC),
             shared: is_shared,
             may_write_upgrade,
+            file_backed,
+            file_dev,
+            file_ino,
+            file_offset,
+            growsdown: (flags & MAP_GROWSDOWN) != 0,
+            sigbus_start,
         },
     );
     if inner.mlockall_future || (flags & MAP_LOCKED) != 0 {

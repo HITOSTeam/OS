@@ -214,11 +214,6 @@ pub fn syscall_memfd_create(name: usize, flags: usize) -> isize {
     if (flags & !KNOWN_FLAGS) != 0 {
         return EINVAL;
     }
-    // Report MFD_ALLOW_SEALING as unsupported for now so LTP can TCONF skip
-    // sealing-specific cases instead of breaking on partial behavior.
-    if (flags & MFD_ALLOW_SEALING) != 0 {
-        return EINVAL;
-    }
     if let Err(e) = validate_user_cstr(name, MEMFD_NAME_MAX) {
         return e;
     }

@@ -40,6 +40,114 @@ const ETXTBSY: isize = -26;
 static FORK_DIAG_PARENT_PID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static FORK_DIAG_START_MS: AtomicUsize = AtomicUsize::new(0);
 static FORK_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static REAP_LINGER_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static REAP_CHILD_ARC_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[allow(clippy::type_complexity)]
+fn debug_task_ref_breakdown(
+    task: &Arc<TaskControlBlock>,
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
+    let runqueue_refs = crate::task::manager::debug_count_task_refs_in_runqueues(task);
+    let processor_refs = crate::task::processor::debug_count_task_refs_in_processors(task);
+    let timer_refs = crate::task::block_sleep::debug_count_task_refs_in_timers(task);
+    let futex_refs = crate::syscall::futex::debug_count_task_waiters(task);
+    let record_lock_refs = crate::syscall::filesystem::debug_count_record_lock_waiters_for_task(task);
+
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    let mut task_slot_refs = 0usize;
+    let mut wait_queue_refs = 0usize;
+    let mut join_waiter_refs = 0usize;
+    let mut sem_waiter_refs = 0usize;
+    let mut condvar_waiter_refs = 0usize;
+    let mut mutex_waiter_refs = 0usize;
+    for process in processes {
+        let inner = process.borrow_mut();
+        task_slot_refs = task_slot_refs.saturating_add(
+            inner
+                .tasks
+                .iter()
+                .filter(|slot| {
+                    slot.as_ref()
+                        .map(|holder| Arc::ptr_eq(holder, task))
+                        .unwrap_or(false)
+                })
+                .count(),
+        );
+        wait_queue_refs = wait_queue_refs.saturating_add(
+            inner
+                .wait_queue
+                .iter()
+                .filter(|holder| Arc::ptr_eq(holder, task))
+                .count(),
+        );
+        for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
+            if let Some(holder_inner) = holder.try_borrow_mut() {
+                join_waiter_refs = join_waiter_refs.saturating_add(
+                    holder_inner
+                        .join_waiters
+                        .iter()
+                        .filter(|w| Arc::ptr_eq(w, task))
+                        .count(),
+                );
+            }
+        }
+        for sem in inner.semaphore_list.iter().filter_map(|s| s.as_ref()) {
+            sem_waiter_refs = sem_waiter_refs.saturating_add(
+                sem.inner
+                    .lock()
+                    .wait_queue
+                    .iter()
+                    .filter(|w| Arc::ptr_eq(w, task))
+                    .count(),
+            );
+        }
+        for condvar in inner.condvar_list.iter().filter_map(|c| c.as_ref()) {
+            condvar_waiter_refs = condvar_waiter_refs.saturating_add(
+                condvar
+                    .inner
+                    .lock()
+                    .wait_queue
+                    .iter()
+                    .filter(|w| Arc::ptr_eq(w, task))
+                    .count(),
+            );
+        }
+        for mutex in inner.mutex_list.iter().filter_map(|m| m.as_ref()) {
+            mutex_waiter_refs =
+                mutex_waiter_refs.saturating_add(mutex.debug_count_waiters_for_task(task));
+        }
+    }
+    let pipe_waiter_refs = crate::fs::debug_count_pipe_waiters_for_task(task);
+
+    (
+        runqueue_refs,
+        processor_refs,
+        timer_refs,
+        futex_refs,
+        record_lock_refs,
+        task_slot_refs,
+        wait_queue_refs,
+        join_waiter_refs,
+        sem_waiter_refs
+            .saturating_add(condvar_waiter_refs)
+            .saturating_add(mutex_waiter_refs),
+        pipe_waiter_refs,
+    )
+}
 
 fn should_report_fork_diag(count: usize) -> bool {
     count <= 16 || count % 128 == 0
@@ -623,6 +731,15 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             return EFAULT;
         }
     }
+    if crate::debug_config::DEBUG_TASK_LIFECYCLE
+        && (child_pid <= 16 || (child_pid & (child_pid - 1)) == 0)
+    {
+        crate::println!(
+            "[fork-task-ref] phase=pre_add child_pid={} strong_refs={}",
+            child_pid,
+            Arc::strong_count(&task)
+        );
+    }
     add_task(task);
     record_fork_diag(process.getpid(), child_pid, flags, fork_elapsed_us);
 
@@ -747,8 +864,64 @@ fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
             .fold(0u64, |acc, v| acc.saturating_add(v));
         (core::mem::take(&mut inner.tasks), cpu_ns)
     };
+    let child_pid = child.getpid();
     for task in tasks.into_iter().flatten() {
         remove_inactive_task(task.clone());
+        let strong = Arc::strong_count(&task);
+        if strong > 1 {
+            // Retry once so duplicate stale queue entries are aggressively dropped.
+            remove_inactive_task(task.clone());
+            let count = REAP_LINGER_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 16 || (count & (count - 1)) == 0 {
+                let tid = task
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX);
+                let (
+                    runqueue_refs,
+                    processor_refs,
+                    timer_refs,
+                    futex_refs,
+                    record_lock_refs,
+                    task_slot_refs,
+                    wait_queue_refs,
+                    join_waiter_refs,
+                    sync_waiter_refs,
+                    pipe_waiter_refs,
+                ) = debug_task_ref_breakdown(&task);
+                let known_refs = runqueue_refs
+                    .saturating_add(processor_refs)
+                    .saturating_add(timer_refs)
+                    .saturating_add(futex_refs)
+                    .saturating_add(record_lock_refs)
+                    .saturating_add(task_slot_refs)
+                    .saturating_add(wait_queue_refs)
+                    .saturating_add(join_waiter_refs)
+                    .saturating_add(sync_waiter_refs)
+                    .saturating_add(pipe_waiter_refs);
+                let unknown_refs = strong.saturating_sub(1 + known_refs);
+                crate::println!(
+                    "[reap-debug] child_pid={} tid={} lingering_refs={} seq={} rq={} proc={} timer={} futex={} rec_lock={} task_slot={} waitq={} join={} sync={} pipe={} unknown={}",
+                    child_pid,
+                    tid,
+                    strong,
+                    count,
+                    runqueue_refs,
+                    processor_refs,
+                    timer_refs,
+                    futex_refs,
+                    record_lock_refs,
+                    task_slot_refs,
+                    wait_queue_refs,
+                    join_waiter_refs,
+                    sync_waiter_refs,
+                    pipe_waiter_refs,
+                    unknown_refs
+                );
+            }
+        }
         drop(task);
     }
     cpu_ns
@@ -994,9 +1167,21 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             let pid = child.getpid();
             drop(process_inner);
             // Keep exited processes visible (e.g., for `kill $!`) until they are reaped.
-            // Reaping happens here (wait4), so remove it from the global PID table now.
-            crate::task::manager::remove_from_pid2process(pid);
             let child_cpu_ns = reap_zombie_child(&child);
+            // Reaping is complete now; remove it from the global PID table.
+            crate::task::manager::remove_from_pid2process(pid);
+            let child_refs = Arc::strong_count(&child);
+            if child_refs > 1 {
+                let seq = REAP_CHILD_ARC_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if seq <= 16 || (seq & (seq - 1)) == 0 {
+                    crate::println!(
+                        "[reap-child-debug] child_pid={} refs_after_reap={} seq={}",
+                        pid,
+                        child_refs,
+                        seq
+                    );
+                }
+            }
             {
                 let mut parent_inner = cur_process.borrow_mut();
                 parent_inner.child_cpu_time_ns =
@@ -1169,9 +1354,9 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             };
             drop(process_inner);
             if (options & WNOWAIT) == 0 {
-                crate::task::manager::remove_from_pid2process(child_pid);
                 if let Some(child) = child.as_ref() {
                     let child_cpu_ns = reap_zombie_child(child);
+                    crate::task::manager::remove_from_pid2process(child_pid);
                     let mut parent_inner = cur_process.borrow_mut();
                     parent_inner.child_cpu_time_ns =
                         parent_inner.child_cpu_time_ns.saturating_add(child_cpu_ns);

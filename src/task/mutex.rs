@@ -12,6 +12,12 @@ use spin::Mutex as SpinLock;
 pub trait Mutex: Sync + Send {
     fn lock(&self);
     fn unlock(&self);
+    fn remove_waiter(&self, _task: &Arc<TaskControlBlock>) -> usize {
+        0
+    }
+    fn debug_count_waiters_for_task(&self, _task: &Arc<TaskControlBlock>) -> usize {
+        0
+    }
 }
 // todo :busy-wait mutex and block mutex
 // because things in arc cant be changed we need inner part here.
@@ -58,6 +64,20 @@ impl Mutex for BlockMutex {
         } else {
             inner.is_blocked = false;
         }
+    }
+    fn remove_waiter(&self, task: &Arc<TaskControlBlock>) -> usize {
+        let mut inner = self.inner.lock();
+        let before = inner.wait_queue.len();
+        inner.wait_queue.retain(|t| !Arc::ptr_eq(t, task));
+        before.saturating_sub(inner.wait_queue.len())
+    }
+    fn debug_count_waiters_for_task(&self, task: &Arc<TaskControlBlock>) -> usize {
+        self.inner
+            .lock()
+            .wait_queue
+            .iter()
+            .filter(|t| Arc::ptr_eq(t, task))
+            .count()
     }
 }
 

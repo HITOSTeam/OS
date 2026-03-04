@@ -18,6 +18,7 @@ use crate::task::condvar::Condvar;
 use crate::task::id::{PidHandle, pid_alloc};
 use crate::task::manager::{
     add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
+    PID2PCB,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
@@ -33,10 +34,52 @@ use spin::{Mutex as SpinMutex, MutexGuard};
 
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FORK_PRE_COW_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPC_NS_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub fn alloc_ipc_namespace_id() -> usize {
     NEXT_IPC_NS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) fn remove_task_from_wait_queues(task: &Arc<TaskControlBlock>) {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+
+    for process in processes {
+        let Some(mut inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        inner.wait_queue.retain(|t| !Arc::ptr_eq(t, task));
+
+        for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
+            if Arc::ptr_eq(holder, task) {
+                continue;
+            }
+            if let Some(mut holder_inner) = holder.try_borrow_mut() {
+                holder_inner.join_waiters.retain(|w| !Arc::ptr_eq(w, task));
+            }
+        }
+
+        for mutex in inner.mutex_list.iter().filter_map(|m| m.as_ref()) {
+            let _ = mutex.remove_waiter(task);
+        }
+
+        for sem in inner.semaphore_list.iter().filter_map(|s| s.as_ref()) {
+            sem.inner.lock().wait_queue.retain(|w| !Arc::ptr_eq(w, task));
+        }
+
+        for condvar in inner.condvar_list.iter().filter_map(|c| c.as_ref()) {
+            condvar
+                .inner
+                .lock()
+                .wait_queue
+                .retain(|w| !Arc::ptr_eq(w, task));
+        }
+    }
+
+    let _ = crate::fs::remove_pipe_waiters_for_task(task);
 }
 
 fn fork_diag_cycles_to_us(delta_cycles: usize) -> usize {
@@ -60,6 +103,16 @@ pub struct MmapRegion {
     pub shared: bool,
     /// False for shared file mappings on descriptors without write access.
     pub may_write_upgrade: bool,
+    /// File-backed mapping identity for write/mmap coherence.
+    pub file_backed: bool,
+    pub file_dev: usize,
+    pub file_ino: u32,
+    pub file_offset: usize,
+    /// Whether this region should expand downward on guard-page faults.
+    pub growsdown: bool,
+    /// Start address (inclusive) of the SIGBUS tail for file mappings.
+    /// `>= end()` means no SIGBUS tail.
+    pub sigbus_start: usize,
 }
 
 impl MmapRegion {
@@ -1470,6 +1523,24 @@ impl ProcessControlBlock {
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.sysv_shm_attaches.clone();
+        if crate::debug_config::DEBUG_PID_MAP {
+            let seq = FORK_PRE_COW_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if seq <= 8 || (seq & (seq - 1)) == 0 {
+                let (areas, data_frames, ident_vpns, lazy_areas, framed_areas, ident_areas) =
+                    parent.memory_set.cow_diag_stats();
+                crate::println!(
+                    "[fork-cow-pre] seq={} pid={} areas={} data_frames={} ident_vpns={} lazy={} framed={} ident={}",
+                    seq,
+                    self.getpid(),
+                    areas,
+                    data_frames,
+                    ident_vpns,
+                    lazy_areas,
+                    framed_areas,
+                    ident_areas
+                );
+            }
+        }
         // Fork address space (COW by default, full copy on LoongArch).
         let caller_tid = crate::task::processor::current_task()
             .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.tid))

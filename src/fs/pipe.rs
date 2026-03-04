@@ -1,5 +1,5 @@
 use alloc::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     sync::{Arc, Weak},
     vec,
     vec::Vec,
@@ -14,6 +14,7 @@ use crate::{
         manager::{wakeup_task, PID2PCB},
         processor::{block_current_and_run_next, current_process, current_task},
         signal::{has_unmasked_pending, queue_process_signal, signal_bit, SIGPIPE_NUM},
+        task_block::TaskControlBlock,
     },
 };
 
@@ -635,6 +636,88 @@ fn notify_async_io(owner_type: i32, owner_pid: i32, sig: i32) {
         }
         _ => {}
     }
+}
+
+pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    let mut seen = BTreeSet::new();
+    let mut refs = 0usize;
+    for process in processes {
+        let files = {
+            let Some(inner) = process.try_borrow_mut() else {
+                continue;
+            };
+            inner
+                .fd_table
+                .iter()
+                .filter_map(|f| f.as_ref().cloned())
+                .collect::<Vec<_>>()
+        };
+        for file in files {
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                continue;
+            };
+            let ring_ptr = Arc::as_ptr(&pipe.buffer) as usize;
+            if !seen.insert(ring_ptr) {
+                continue;
+            }
+            let ring = pipe.buffer.lock();
+            refs = refs.saturating_add(
+                ring.read_waiters
+                    .iter()
+                    .filter(|w| Arc::ptr_eq(w, task))
+                    .count(),
+            );
+            refs = refs.saturating_add(
+                ring.write_waiters
+                    .iter()
+                    .filter(|w| Arc::ptr_eq(w, task))
+                    .count(),
+            );
+        }
+    }
+    refs
+}
+
+pub fn remove_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    let mut seen = BTreeSet::new();
+    let mut removed = 0usize;
+    for process in processes {
+        let files = {
+            let Some(inner) = process.try_borrow_mut() else {
+                continue;
+            };
+            inner
+                .fd_table
+                .iter()
+                .filter_map(|f| f.as_ref().cloned())
+                .collect::<Vec<_>>()
+        };
+        for file in files {
+            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+                continue;
+            };
+            let ring_ptr = Arc::as_ptr(&pipe.buffer) as usize;
+            if !seen.insert(ring_ptr) {
+                continue;
+            }
+            let mut ring = pipe.buffer.lock();
+            if ring.remove_reader(task) {
+                removed = removed.saturating_add(1);
+            }
+            if ring.remove_writer(task) {
+                removed = removed.saturating_add(1);
+            }
+        }
+    }
+    removed
 }
 
 fn log_pipe_end_owners(end: &Arc<Pipe>, label: &str) {

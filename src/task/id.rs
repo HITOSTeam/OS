@@ -38,6 +38,15 @@ fn clamp_pid_max(pid_max: usize) -> usize {
     pid_max.clamp(2, PID_MAX_HARD_LIMIT)
 }
 
+fn maybe_log_pid_active(event: &str, len: usize) {
+    if !crate::debug_config::DEBUG_PID_MAP {
+        return;
+    }
+    if len >= 64 && (len & (len - 1)) == 0 {
+        crate::println!("[pid-active] event={} active={}", event, len);
+    }
+}
+
 struct PidAllocator {
     next: usize,
     active: BTreeSet<usize>,
@@ -62,6 +71,7 @@ impl PidAllocator {
             let pid = self.next;
             self.next = if pid + 1 >= pid_max { 1 } else { pid + 1 };
             if self.active.insert(pid) {
+                maybe_log_pid_active("alloc", self.active.len());
                 return pid;
             }
         }
@@ -71,6 +81,7 @@ impl PidAllocator {
 
     fn dealloc(&mut self, pid: usize) {
         assert!(self.active.remove(&pid), "pid {pid} has been deallocated!");
+        maybe_log_pid_active("dealloc", self.active.len());
     }
 }
 

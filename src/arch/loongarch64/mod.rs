@@ -1,9 +1,11 @@
 pub mod mm;
 pub mod trap;
 
+use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
+use crate::task::task_block::TaskControlBlock;
 
 global_asm!(include_str!("tlb_refill.S"));
 
@@ -163,6 +165,10 @@ pub fn read_time() -> usize {
     }
     counter
 }
+
+pub fn save_user_fp_state(_task: &Arc<TaskControlBlock>) {}
+
+pub fn restore_user_fp_state(_task: &Arc<TaskControlBlock>) {}
 
 fn read_cpucfg(index: u32) -> u32 {
     let mut value = index;

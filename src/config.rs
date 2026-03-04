@@ -10,7 +10,7 @@ pub const USER_HEAP_GAP: usize = 64 * 1024; // 64 KiB
 pub const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32KB
 // Kernel heap must be large enough for fork-heavy LTP runs on glibc.
 // 256 MiB reduces allocator OOMs in long `fork13` stress loops.
-pub const KERNEL_HEAP_SIZE: usize = 0x1000_0000; // 256 MiB
+pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 

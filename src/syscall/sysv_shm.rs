@@ -587,11 +587,7 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
     let mgr = managers.entry(ipc_ns_id).or_default();
 
     if cmd == IPC_INFO {
-        let highest_index = if mgr.segments.is_empty() {
-            0
-        } else {
-            mgr.segments.len() - 1
-        };
+        let highest_index = mgr.segments.keys().next_back().copied().unwrap_or(0);
         let info = ShminfoUser {
             shmmax: runtime_shmmax_limit() as u64,
             shmmin: SHMMIN as u64,
@@ -607,11 +603,7 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
     }
 
     if cmd == SHM_INFO {
-        let highest_index = if mgr.segments.is_empty() {
-            0
-        } else {
-            mgr.segments.len() - 1
-        };
+        let highest_index = mgr.segments.keys().next_back().copied().unwrap_or(0);
         let total_pages = mgr
             .segments
             .values()

@@ -12,9 +12,22 @@ static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
 /// panic when heap allocation error occurs
 pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     let (id, args) = crate::syscall::last_syscall_snapshot();
+    let (alloc_user, alloc_actual, total_bytes) = {
+        let heap = HEAP_ALLOCATOR.lock();
+        (
+            heap.stats_alloc_user(),
+            heap.stats_alloc_actual(),
+            heap.stats_total_bytes(),
+        )
+    };
+    let frame_refs = crate::mm::frame_refcount_entries();
     crate::println!(
-        "[oom] heap alloc failed: layout={:?} last_syscall={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        "[oom] heap alloc failed: layout={:?} user={} actual={} total={} frame_refs={} last_syscall={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
         layout,
+        alloc_user,
+        alloc_actual,
+        total_bytes,
+        frame_refs,
         id,
         args[0],
         args[1],

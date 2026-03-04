@@ -4,14 +4,16 @@ use core::{
 };
 
 use super::context::TrapContext;
-use crate::config::TRAMPOLINE;
+use crate::config::{PAGE_SIZE, TRAMPOLINE};
 use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{MapPermission, PageTable, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
 use crate::task::block_sleep::check_timer;
-use crate::task::processor::{exit_current_and_run_next, suspend_current_and_run_next};
-use crate::task::signal::{check_if_current_signals_error, signal_bit};
+use crate::task::processor::{
+    exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
+};
+use crate::task::signal::{check_if_current_signals_error, signal_bit, MAX_SIG, SIG_DFL, SIG_IGN};
 use crate::time::set_next_trigger;
 use riscv::{
     interrupt::Trap,
@@ -340,6 +342,102 @@ fn exception_name(code: usize) -> &'static str {
     }
 }
 
+fn try_expand_mmap_growsdown(fault_va: usize, access: MapPermission) -> bool {
+    const PROT_READ: usize = 1;
+    const PROT_WRITE: usize = 2;
+    const PROT_EXEC: usize = 4;
+
+    let fault_page = fault_va & !(PAGE_SIZE - 1);
+    let process = crate::task::processor::current_process();
+    let mut inner = process.borrow_mut();
+
+    for idx in 0..inner.mmap_areas.len() {
+        let region = inner.mmap_areas[idx];
+        if !region.growsdown {
+            continue;
+        }
+        let Some(expected) = region.start.checked_sub(PAGE_SIZE) else {
+            continue;
+        };
+        if fault_page != expected {
+            continue;
+        }
+
+        let mut perm = MapPermission::U;
+        if (region.prot & PROT_READ) != 0 {
+            perm |= MapPermission::R;
+        }
+        if (region.prot & PROT_WRITE) != 0 {
+            perm |= MapPermission::W;
+        }
+        if (region.prot & PROT_EXEC) != 0 {
+            perm |= MapPermission::X;
+        }
+        if !perm.contains(access) {
+            return false;
+        }
+        if inner
+            .memory_set
+            .range_overlaps(fault_page.into(), region.start.into())
+        {
+            return false;
+        }
+        // Keep one-page guard below the expanded stack segment.
+        let Some(next_guard_start) = fault_page.checked_sub(PAGE_SIZE) else {
+            return false;
+        };
+        if inner
+            .memory_set
+            .range_overlaps(next_guard_start.into(), fault_page.into())
+        {
+            return false;
+        }
+        if !inner
+            .memory_set
+            .try_insert_lazy_area(fault_page.into(), region.start.into(), perm)
+        {
+            return false;
+        }
+
+        let grown = region.start - fault_page;
+        inner.mmap_areas[idx].start = fault_page;
+        inner.mmap_areas[idx].len += grown;
+        return inner.memory_set.resolve_lazy_fault(fault_va, access);
+    }
+    false
+}
+
+fn fault_hits_mmap_sigbus_tail(addr: usize) -> bool {
+    let process = crate::task::processor::current_process();
+    let inner = process.borrow_mut();
+    inner.mmap_areas.iter().any(|region| {
+        addr >= region.start && addr < region.end() && addr >= region.sigbus_start
+    })
+}
+
+fn current_signal_handler(signum: usize) -> usize {
+    let process = crate::task::processor::current_process();
+    let inner = process.borrow_mut();
+    if signum <= MAX_SIG {
+        let legacy = inner.signals_actions.table[signum].handler;
+        if legacy != 0 {
+            legacy
+        } else {
+            inner
+                .rt_sig_handlers
+                .get(signum)
+                .map(|a| a.handler)
+                .unwrap_or(SIG_DFL)
+        }
+    } else {
+        inner
+            .rt_sig_handlers
+            .get(signum)
+            .map(|a| a.handler)
+            .unwrap_or(SIG_DFL)
+    }
+}
+
 fn handle_user_exception(code: usize, stval: usize) {
     fn try_read_user_u64(token: usize, addr: usize) -> Option<u64> {
         let page_table = PageTable::from_token(token);
@@ -377,6 +475,17 @@ fn handle_user_exception(code: usize, stval: usize) {
             _ => MapPermission::R,
         };
         if inner.memory_set.resolve_lazy_fault(stval, access) {
+            return;
+        }
+    }
+    if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {
+        let access = match code {
+            LOAD_PAGE_FAULT => MapPermission::R,
+            STORE_PAGE_FAULT => MapPermission::W,
+            INSTRUCTION_PAGE_FAULT => MapPermission::X,
+            _ => MapPermission::R,
+        };
+        if try_expand_mmap_growsdown(stval, access) {
             return;
         }
     }
@@ -460,9 +569,23 @@ fn handle_user_exception(code: usize, stval: usize) {
     }
     if let Some(sig) = match code {
         ILLEGAL_INSTRUCTION => Some(4), // SIGILL
-        INSTRUCTION_PAGE_FAULT | LOAD_PAGE_FAULT | STORE_PAGE_FAULT => Some(11), // SIGSEGV
+        INSTRUCTION_PAGE_FAULT | LOAD_PAGE_FAULT | STORE_PAGE_FAULT => {
+            if fault_hits_mmap_sigbus_tail(stval) {
+                Some(7) // SIGBUS
+            } else {
+                Some(11) // SIGSEGV
+            }
+        }
         _ => None,
     } {
+        let handler = current_signal_handler(sig as usize);
+        if handler == SIG_IGN {
+            return;
+        }
+        if handler == SIG_DFL {
+            // Synchronous faults with default action terminate the whole process.
+            exit_group_and_run_next(-(sig as i32));
+        }
         if let Some(task) = crate::task::processor::current_task() {
             if let Some(bit) = signal_bit(sig) {
                 task.borrow_mut().pending_signals |= bit;
@@ -507,26 +630,29 @@ pub fn trap_return() -> ! {
     cx.sstatus.set_spp(sstatus::SPP::User);
     cx.sstatus.set_spie(true);
 
-    // Get the trap context virtual address for the current thread
-    let task = crate::task::processor::current_task().unwrap();
-    let trap_cx_ptr = {
-        let task_inner = task.borrow_mut();
-        if let Some(res) = task_inner.res.as_ref() {
-            res.trap_cx_user_va()
-        } else {
-            drop(task_inner);
-            exit_current_and_run_next(-1);
-            unreachable!("exit_current_and_run_next should not return");
-        }
+    // IMPORTANT: `trap_return()` never returns. Keep `Arc` owners in a short scope,
+    // otherwise every trap leaks one strong reference.
+    let (trap_cx_ptr, user_satp) = {
+        let task = crate::task::processor::current_task().unwrap();
+        let trap_cx_ptr = {
+            let task_inner = task.borrow_mut();
+            if let Some(res) = task_inner.res.as_ref() {
+                res.trap_cx_user_va()
+            } else {
+                drop(task_inner);
+                exit_current_and_run_next(-1);
+                unreachable!("exit_current_and_run_next should not return");
+            }
+        };
+        let user_satp = task
+            .process
+            .upgrade()
+            .unwrap()
+            .borrow_mut()
+            .memory_set
+            .token();
+        (trap_cx_ptr, user_satp)
     };
-
-    let user_satp = task
-        .process
-        .upgrade()
-        .unwrap()
-        .borrow_mut()
-        .memory_set
-        .token();
 
     let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
     if DEBUG_TRAP && cnt < 4 {

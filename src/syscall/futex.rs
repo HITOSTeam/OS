@@ -179,6 +179,14 @@ pub fn remove_futex_waiters(task: &Arc<TaskControlBlock>) {
     });
 }
 
+pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
+    FUTEX_QUEUES
+        .lock()
+        .values()
+        .map(|queue| queue.iter().filter(|w| Arc::ptr_eq(&w.task, task)).count())
+        .sum()
+}
+
 fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask: u32) -> isize {
     if uaddr == 0 {
         return EINVAL;

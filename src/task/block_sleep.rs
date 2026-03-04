@@ -239,6 +239,14 @@ pub fn add_timer(task: Arc<TaskControlBlock>, time_wait: usize) {
     TIMERS.lock().push(timer);
 }
 
+pub fn debug_count_task_refs_in_timers(task: &Arc<TaskControlBlock>) -> usize {
+    TIMERS
+        .lock()
+        .iter()
+        .filter(|entry| Arc::ptr_eq(&entry.task, task))
+        .count()
+}
+
 pub fn set_alarm_timer(pid: usize, delay_ms: Option<usize>) -> usize {
     let (remaining_ms, _) = set_itimer_timer(pid, 0, SIGALRM_NUM, delay_ms, 0);
     remaining_ms

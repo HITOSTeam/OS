@@ -52,6 +52,7 @@ pub fn last_syscall_snapshot() -> (usize, [usize; 6]) {
         ],
     )
 }
+
 const SYSCALL_EVENTFD2: usize = 19;
 const SYSCALL_EPOLL_CREATE1: usize = 20;
 const SYSCALL_EPOLL_CTL: usize = 21;

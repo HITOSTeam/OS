@@ -295,21 +295,30 @@ impl TaskManager {
         t
     }
     pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
+        let mut removed = 0usize;
         for rq in self.ready_queues.iter_mut() {
             for q in rq
                 .rt_queues
                 .iter_mut()
                 .chain(core::iter::once(&mut rq.fair_queue))
             {
-                if let Some((id, _)) = q
-                    .iter()
-                    .enumerate()
-                    .find(|(_, t)| Arc::as_ptr(t) == Arc::as_ptr(&task))
-                {
-                    q.remove(id);
-                    break;
-                }
+                let before = q.len();
+                q.retain(|t| !Arc::ptr_eq(t, &task));
+                removed = removed.saturating_add(before.saturating_sub(q.len()));
             }
+        }
+        if crate::debug_config::DEBUG_TASK_LIFECYCLE && removed > 1 {
+            let tid = task
+                .borrow_mut()
+                .res
+                .as_ref()
+                .map(|r| r.tid)
+                .unwrap_or(usize::MAX);
+            crate::println!(
+                "[sched-remove] tid={} removed_dup_entries={}",
+                tid,
+                removed
+            );
         }
         task.in_ready_queue
             .store(false, core::sync::atomic::Ordering::Release);
@@ -317,6 +326,23 @@ impl TaskManager {
 
     pub fn ready_queue_lengths(&self) -> alloc::vec::Vec<usize> {
         self.ready_queues.iter().map(HartRunQueue::len).collect()
+    }
+
+    fn debug_count_task_refs(&self, task: &Arc<TaskControlBlock>) -> usize {
+        self.ready_queues
+            .iter()
+            .map(|rq| {
+                rq.fair_queue
+                    .iter()
+                    .filter(|t| Arc::ptr_eq(t, task))
+                    .count()
+                    + rq
+                        .rt_queues
+                        .iter()
+                        .map(|q| q.iter().filter(|t| Arc::ptr_eq(t, task)).count())
+                        .sum::<usize>()
+            })
+            .sum()
     }
 
     fn has_ready_rt_higher_than(&self, hart_id: usize, priority: i32) -> bool {
@@ -428,6 +454,13 @@ pub fn remove_task(task: Arc<TaskControlBlock>) {
     arch::restore_interrupts(prev_sie);
 }
 
+pub fn debug_count_task_refs_in_runqueues(task: &Arc<TaskControlBlock>) -> usize {
+    let prev_sie = arch::disable_interrupts();
+    let count = TASK_MANAGER.lock().debug_count_task_refs(task);
+    arch::restore_interrupts(prev_sie);
+    count
+}
+
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     let prev_sie = arch::disable_interrupts();
     let hart_id = crate::task::processor::hart_id();
@@ -496,6 +529,7 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     // 这里可能会加入 todo
     crate::syscall::futex::remove_futex_waiters(&task);
+    crate::task::process_block::remove_task_from_wait_queues(&task);
     remove_timer(task.clone());
     remove_task(task.clone());
 }

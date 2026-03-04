@@ -68,7 +68,6 @@ const ERANGE: isize = -34;
 const EFBIG: isize = -27;
 const EAGAIN: isize = -11;
 const ENOSPC: isize = -28;
-const ENOSYS: isize = -38;
 
 pub fn msgmax_limit() -> usize {
     MSGMAX
@@ -624,11 +623,7 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
     let mgr = managers.entry(ipc_ns_id).or_default();
 
     if cmd == IPC_INFO || cmd == MSG_INFO {
-        let highest_index = if mgr.queues.is_empty() {
-            0
-        } else {
-            mgr.queues.len() - 1
-        };
+        let highest_index = mgr.queues.keys().next_back().copied().unwrap_or(0);
         let info = MsgInfoUser {
             msgmax: MSGMAX as i32,
             msgmnb: MSGMNB as i32,
@@ -948,11 +943,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
         IPC_INFO | SEM_INFO => {
             let mut managers = SEM_MANAGERS.lock();
             let mgr = managers.entry(ipc_ns_id).or_default();
-            let highest_index = if mgr.sets.is_empty() {
-                0
-            } else {
-                mgr.sets.len() - 1
-            };
+            let highest_index = mgr.sets.keys().next_back().copied().unwrap_or(0);
             let info = SemInfoUser {
                 semmni: SEMMNI as i32,
                 semmns: SEMMNS as i32,
@@ -1117,10 +1108,6 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
 }
 
 fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
-    // Keep current semop LTP pack skipped; semctl tests still use valid semop operations.
-    if semid == 0 && sops == 0 && nsops == 0 {
-        return ENOSYS;
-    }
     if nsops == 0 {
         return EINVAL;
     }
@@ -1165,12 +1152,18 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
             if (op.sem_flg as usize & IPC_NOWAIT) != 0 {
                 return EAGAIN;
             }
+            if has_pending_unmasked_signal() {
+                return EINTR;
+            }
             let Some(task) = current_task() else {
                 return EINVAL;
             };
             add_waiter_once(&mut sem.zcnt_waiters, &task);
             drop(managers);
             block_current_and_run_next();
+            if has_pending_unmasked_signal() {
+                return EINTR;
+            }
             continue;
         }
         let need = (-op.sem_op) as i32;
@@ -1184,12 +1177,18 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
         if (op.sem_flg as usize & IPC_NOWAIT) != 0 {
             return EAGAIN;
         }
+        if has_pending_unmasked_signal() {
+            return EINTR;
+        }
         let Some(task) = current_task() else {
             return EINVAL;
         };
         add_waiter_once(&mut sem.ncnt_waiters, &task);
         drop(managers);
         block_current_and_run_next();
+        if has_pending_unmasked_signal() {
+            return EINTR;
+        }
     }
 }
 
