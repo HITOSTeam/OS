@@ -168,6 +168,7 @@ const SYSCALL_SCHED_GET_PRIORITY_MIN: usize = 126;
 const SYSCALL_SCHED_RR_GET_INTERVAL: usize = 127;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SYNCFS: usize = 267;
+const SYSCALL_SETNS: usize = 268;
 const SYSCALL_CLOCK_ADJTIME64: usize = 405;
 const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
@@ -568,6 +569,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EXIT_GROUP => flow::syscall_exit_group(args[0]),
         SYSCALL_SET_TID_ADDRESS => misc::syscall_set_tid_address(args[0]),
         SYSCALL_UNSHARE => misc::syscall_unshare(args[0]),
+        SYSCALL_SETNS => misc::syscall_setns(args[0] as isize, args[1]),
         SYSCALL_FUTEX => futex::syscall_futex(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_SET_ROBUST_LIST => misc::syscall_set_robust_list(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => misc::syscall_get_robust_list(args[0], args[1], args[2]),

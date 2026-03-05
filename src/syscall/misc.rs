@@ -2,9 +2,14 @@ use crate::{
     arch,
     config::clock_freq,
     debug_config::DEBUG_PTHREAD,
-    fs::ext4_lock,
+    fs::{
+        ext4_lock, pseudo_block_is_read_only, pseudo_block_read_ahead, pseudo_block_set_read_ahead,
+        pseudo_block_set_read_only, LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind,
+        PseudoKindTag, PtyMasterFile, PtySlaveFile, TtyFile,
+    },
     mm::{
         read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
+        try_copy_to_user,
         try_read_user_value, try_write_user_value, write_user_value, MapPermission,
     },
     syscall::{
@@ -24,6 +29,7 @@ use crate::{
     time::{get_time, get_time_ms},
     trap::get_current_token,
 };
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -66,6 +72,17 @@ pub(crate) fn encode_linux_tid(tgid: usize, tid_index: usize) -> usize {
 pub(crate) fn decode_linux_tid(tgid: usize, tid: usize) -> Option<usize> {
     // Strip futex owner/waiter bits that user space may OR into the TID word.
     let tid = tid & 0x3fff_ffff;
+    if tid == tgid {
+        return Some(0);
+    }
+    let pid_part = tid >> LINUX_TID_PID_SHIFT;
+    if pid_part != tgid {
+        return None;
+    }
+    Some(tid & 0x7fff)
+}
+
+pub(crate) fn decode_linux_tid_strict(tgid: usize, tid: usize) -> Option<usize> {
     if tid == tgid {
         return Some(0);
     }
@@ -270,6 +287,11 @@ pub fn syscall_mount(
         return EPERM;
     }
     let token = get_current_token();
+    let special = if _special == 0 {
+        alloc::string::String::new()
+    } else {
+        translated_str(token, _special as *const u8)
+    };
     let fstype = if _fstype == 0 {
         alloc::string::String::new()
     } else {
@@ -285,6 +307,10 @@ pub fn syscall_mount(
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
     let abs = normalize_path(&cwd, &dir);
+    // Model `/dev/root` read-only toggling for BLKROSET/BLKROGET LTP coverage.
+    if special == "/dev/root" && (_flags & MS_RDONLY) == 0 && pseudo_block_is_read_only() {
+        return EACCES;
+    }
     let _ext4_guard = ext4_lock();
     let inode = match crate::fs::find_path_in_roots(&abs) {
         Some(v) => v,
@@ -337,8 +363,15 @@ const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const CAP_LAST_CAP: usize = 63;
 const CAP_SETPCAP: usize = 8;
+const PR_SET_PDEATHSIG: usize = 1;
+const PR_GET_PDEATHSIG: usize = 2;
 const PR_GET_DUMPABLE: usize = 3;
 const PR_SET_DUMPABLE: usize = 4;
+const PR_SET_NAME: usize = 15;
+const PR_GET_NAME: usize = 16;
+const PR_SET_SECUREBITS: usize = 28;
+const PR_SET_TIMERSLACK: usize = 29;
+const PR_GET_TIMERSLACK: usize = 30;
 const PR_CAPBSET_READ: usize = 23;
 const PR_CAPBSET_DROP: usize = 24;
 
@@ -487,11 +520,33 @@ pub fn syscall_capset(hdrp: usize, datap: usize) -> isize {
 pub fn syscall_prctl(
     option: usize,
     arg2: usize,
-    _arg3: usize,
-    _arg4: usize,
-    _arg5: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
 ) -> isize {
+    const MAX_SIGNAL_NUM: usize = 64;
     match option {
+        PR_SET_PDEATHSIG => {
+            if arg2 > MAX_SIGNAL_NUM {
+                return EINVAL;
+            }
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            inner.pdeath_signal = arg2 as i32;
+            0
+        }
+        PR_GET_PDEATHSIG => {
+            if arg2 == 0 {
+                return EFAULT;
+            }
+            let process = current_process();
+            let sig = process.borrow_mut().pdeath_signal;
+            let token = get_current_token();
+            if try_write_user_value(token, arg2 as *mut i32, &sig).is_err() {
+                return EFAULT;
+            }
+            0
+        }
         PR_GET_DUMPABLE => 1,
         PR_SET_DUMPABLE => {
             if arg2 > 1 {
@@ -499,6 +554,77 @@ pub fn syscall_prctl(
             } else {
                 0
             }
+        }
+        PR_SET_NAME => {
+            if arg2 == 0 {
+                return EFAULT;
+            }
+            let token = get_current_token();
+            let mut raw = [0u8; 16];
+            for (i, byte) in raw.iter_mut().enumerate() {
+                let ptr = arg2.saturating_add(i) as *const u8;
+                if try_copy_from_user(token, ptr, core::slice::from_mut(byte)).is_err() {
+                    return EFAULT;
+                }
+            }
+            let mut comm = String::new();
+            for b in raw.iter().copied().take(15) {
+                if b == 0 {
+                    break;
+                }
+                comm.push(b as char);
+            }
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            inner.comm = comm;
+            0
+        }
+        PR_GET_NAME => {
+            if arg2 == 0 {
+                return EFAULT;
+            }
+            let process = current_process();
+            let comm = process.borrow_mut().comm.clone();
+            let mut out = [0u8; 16];
+            let name = comm.as_bytes();
+            let n = core::cmp::min(name.len(), 15);
+            out[..n].copy_from_slice(&name[..n]);
+            let token = get_current_token();
+            if try_copy_to_user(token, arg2 as *mut u8, &out).is_err() {
+                return EFAULT;
+            }
+            0
+        }
+        PR_SET_TIMERSLACK => {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            if arg2 == 0 {
+                inner.timer_slack_ns = inner.timer_slack_default_ns;
+            } else {
+                inner.timer_slack_ns = arg2 as u64;
+            }
+            0
+        }
+        PR_GET_TIMERSLACK => {
+            let process = current_process();
+            let inner = process.borrow_mut();
+            let value = inner.timer_slack_ns;
+            if value > isize::MAX as u64 {
+                isize::MAX
+            } else {
+                value as isize
+            }
+        }
+        PR_SET_SECUREBITS => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return EINVAL;
+            }
+            let process = current_process();
+            let inner = process.borrow_mut();
+            if inner.euid != 0 || (inner.cap_effective & cap_bit(CAP_SETPCAP)) == 0 {
+                return EPERM;
+            }
+            0
         }
         PR_CAPBSET_READ => {
             if arg2 > CAP_LAST_CAP {
@@ -553,6 +679,58 @@ pub fn syscall_unshare(flags: usize) -> isize {
         process.unshare_files();
     }
     0
+}
+
+/// Linux `setns(2)` (syscall 268 on riscv64).
+///
+/// Minimal support:
+/// - IPC namespace fd from `/proc/<pid>/ns/ipc`
+/// - `nstype` of 0 or `CLONE_NEWIPC`
+pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
+    const EBADF: isize = -9;
+    const CLONE_NEWIPC: usize = 0x0800_0000;
+
+    if fd < 0 {
+        return EBADF;
+    }
+
+    let files_process = current_files_process();
+    let file = {
+        let files_inner = files_process.borrow_mut();
+        let idx = fd as usize;
+        if idx >= files_inner.fd_table.len() {
+            return EBADF;
+        }
+        let Some(file) = files_inner.fd_table[idx].as_ref().cloned() else {
+            return EBADF;
+        };
+        file
+    };
+
+    let Some(ns_file) = file.as_any().downcast_ref::<NamespaceFile>() else {
+        return EINVAL;
+    };
+
+    let expected = ns_file.kind().clone_flag();
+    if nstype != 0 && nstype != expected {
+        return EINVAL;
+    }
+
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if inner.euid != 0 {
+        return EPERM;
+    }
+
+    match ns_file.kind() {
+        NamespaceKind::Ipc => {
+            if expected != CLONE_NEWIPC {
+                return EINVAL;
+            }
+            inner.ipc_ns_id = ns_file.ns_id();
+            0
+        }
+    }
 }
 
 pub fn syscall_reboot(_magic1: usize, _magic2: usize, _cmd: usize, _arg: usize) -> isize {
@@ -1859,7 +2037,9 @@ pub fn syscall_ppoll(
             let inner = task.borrow_mut();
             (inner.pending_signals, inner.signal_mask)
         };
-        if has_unmasked_pending(pending, mask, false) {
+        // Keep poll-like waits aligned with epoll/pipe behavior: don't let
+        // default SIGCHLD bookkeeping spuriously interrupt readiness waits.
+        if has_unmasked_pending(pending, mask, true) {
             break EINTR;
         }
 
@@ -1969,7 +2149,24 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const EBADF: isize = -9;
     const ENOTTY: isize = -25;
     const EFAULT: isize = -14;
+    const EINVAL: isize = -22;
+    const TCGETS: usize = 0x5401;
+    const TCSETS: usize = 0x5402;
+    const TCSETSW: usize = 0x5403;
+    const TCSETSF: usize = 0x5404;
+    const TCGETA: usize = 0x5405;
+    const TCSETA: usize = 0x5406;
+    const TCSETAW: usize = 0x5407;
+    const TCSETAF: usize = 0x5408;
+    const TCFLSH: usize = 0x540b;
+    const TIOCGPTN: usize = 0x8004_5430;
+    const TIOCSPTLCK: usize = 0x4004_5431;
     const FIONREAD: usize = 0x541B;
+    const RNDGETENTCNT: usize = 0x8004_5200;
+    const BLKROSET: usize = 0x125d;
+    const BLKROGET: usize = 0x125e;
+    const BLKRASET: usize = 0x1262;
+    const BLKRAGET: usize = 0x1263;
     const BLKGETSIZE: usize = 0x1260;
     const BLKSSZGET: usize = 0x1268;
     const BLKGETSIZE64: usize = 0x8008_1272;
@@ -2010,6 +2207,194 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     let request = _request & 0xffff_ffffusize;
     let token = get_current_token();
 
+    if let Some(tty) = file.as_any().downcast_ref::<TtyFile>() {
+        match request {
+            TCGETS => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let termios = tty.termios();
+                if try_write_user_value(token, _argp as *mut LinuxTermios, &termios).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(termios) = try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
+                else {
+                    return EFAULT;
+                };
+                tty.set_termios(termios);
+                return 0;
+            }
+            TCGETA => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let termio = tty.termio();
+                if try_write_user_value(token, _argp as *mut LinuxTermio, &termio).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            TCSETA | TCSETAW | TCSETAF => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(termio) = try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
+                else {
+                    return EFAULT;
+                };
+                tty.set_termio(termio);
+                return 0;
+            }
+            TCFLSH => {
+                let queue_sel = _argp as i32;
+                return if queue_sel == 0 || queue_sel == 1 || queue_sel == 2 {
+                    0
+                } else {
+                    EINVAL
+                };
+            }
+            _ => return ENOTTY,
+        }
+    }
+
+    if let Some(pty) = file.as_any().downcast_ref::<PtyMasterFile>() {
+        match request {
+            TCGETS => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let termios = pty.termios();
+                if try_write_user_value(token, _argp as *mut LinuxTermios, &termios).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(termios) = try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
+                else {
+                    return EFAULT;
+                };
+                pty.set_termios(termios);
+                return 0;
+            }
+            TCGETA => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let termio = pty.termio();
+                if try_write_user_value(token, _argp as *mut LinuxTermio, &termio).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            TCSETA | TCSETAW | TCSETAF => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(termio) = try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
+                else {
+                    return EFAULT;
+                };
+                pty.set_termio(termio);
+                return 0;
+            }
+            TCFLSH => {
+                let queue_sel = _argp as i32;
+                return if queue_sel == 0 || queue_sel == 1 || queue_sel == 2 {
+                    0
+                } else {
+                    EINVAL
+                };
+            }
+            TIOCGPTN => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let index = pty.pty_index();
+                if try_write_user_value(token, _argp as *mut u32, &index).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            TIOCSPTLCK => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(lock_value) = try_read_user_value::<i32>(token, _argp as *const i32) else {
+                    return EFAULT;
+                };
+                pty.set_locked(lock_value != 0);
+                return 0;
+            }
+            _ => return ENOTTY,
+        }
+    }
+
+    if let Some(pty) = file.as_any().downcast_ref::<PtySlaveFile>() {
+        match request {
+            TCGETS => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let termios = pty.termios();
+                if try_write_user_value(token, _argp as *mut LinuxTermios, &termios).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(termios) = try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
+                else {
+                    return EFAULT;
+                };
+                pty.set_termios(termios);
+                return 0;
+            }
+            TCGETA => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let termio = pty.termio();
+                if try_write_user_value(token, _argp as *mut LinuxTermio, &termio).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            TCSETA | TCSETAW | TCSETAF => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(termio) = try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
+                else {
+                    return EFAULT;
+                };
+                pty.set_termio(termio);
+                return 0;
+            }
+            TCFLSH => {
+                let queue_sel = _argp as i32;
+                return if queue_sel == 0 || queue_sel == 1 || queue_sel == 2 {
+                    0
+                } else {
+                    EINVAL
+                };
+            }
+            _ => return ENOTTY,
+        }
+    }
+
     if request == FIONREAD {
         if _argp == 0 {
             return EFAULT;
@@ -2018,6 +2403,19 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
             // Linux reports unread bytes for both read and write pipe fds.
             let readable = pipe.queued_bytes() as i32;
             if try_write_user_value(token, _argp as *mut i32, &readable).is_err() {
+                return EFAULT;
+            }
+            return 0;
+        }
+    }
+
+    if let Some(pseudo) = file.as_any().downcast_ref::<crate::fs::PseudoFile>() {
+        if request == RNDGETENTCNT && pseudo.kind_tag() == PseudoKindTag::Urandom {
+            if _argp == 0 {
+                return EFAULT;
+            }
+            let entropy: i32 = 256;
+            if try_write_user_value(token, _argp as *mut i32, &entropy).is_err() {
                 return EFAULT;
             }
             return 0;
@@ -2150,17 +2548,54 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         .downcast_ref::<crate::fs::PseudoBlock>()
         .is_some()
     {
-        if _argp == 0 {
-            return EFAULT;
-        }
         match request {
+            BLKROGET => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let ro: i32 = if pseudo_block_is_read_only() { 1 } else { 0 };
+                if try_write_user_value(token, _argp as *mut i32, &ro).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            BLKROSET => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(ro) = try_read_user_value::<i32>(token, _argp as *const i32) else {
+                    return EFAULT;
+                };
+                pseudo_block_set_read_only(ro != 0);
+                return 0;
+            }
+            BLKRAGET => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let ra = pseudo_block_read_ahead() as usize;
+                if try_write_user_value(token, _argp as *mut usize, &ra).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            BLKRASET => {
+                pseudo_block_set_read_ahead(_argp as u64);
+                return 0;
+            }
             BLKGETSIZE64 | BLKGETSIZE64_COMPAT => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
                 if try_write_user_value(token, _argp as *mut u64, &PSEUDO_ROOT_DEV_BYTES).is_err() {
                     return EFAULT;
                 }
                 return 0;
             }
             BLKGETSIZE => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
                 let sectors: usize =
                     (PSEUDO_ROOT_DEV_BYTES / PSEUDO_ROOT_DEV_SECTOR_SIZE as u64) as usize;
                 if try_write_user_value(token, _argp as *mut usize, &sectors).is_err() {
@@ -2169,6 +2604,9 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 return 0;
             }
             BLKSSZGET => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
                 if try_write_user_value(token, _argp as *mut u32, &PSEUDO_ROOT_DEV_SECTOR_SIZE)
                     .is_err()
                 {
@@ -2177,6 +2615,9 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 return 0;
             }
             BLKPBSZGET => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
                 if try_write_user_value(token, _argp as *mut u32, &PSEUDO_ROOT_DEV_PHYS_BLOCK_SIZE)
                     .is_err()
                 {

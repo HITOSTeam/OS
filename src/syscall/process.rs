@@ -7,7 +7,7 @@ use core::{
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    fs::{ext4_lock, root_inode_for_path, secondary_root_inode},
+    fs::{ext4_lock, root_inode_for_path, secondary_root_inode, PidFdFile},
     mm::{
         kernel_token, try_read_user_value, try_write_user_value, write_user_value, MapPermission,
         MemorySet,
@@ -25,7 +25,7 @@ use crate::{
             add_task, pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
             PID2PCB,
         },
-        processor::{block_current_and_run_next, current_process, current_task},
+        processor::{block_current_and_run_next, current_files_process, current_process, current_task},
         signal::{
             pending_unmasked_bits, queue_process_signal, SignalFlags, MAX_SIG, RT_SIG_MAX,
             SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM, SIG_DFL, SIG_IGN,
@@ -1387,6 +1387,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     const P_ALL: usize = 0;
     const P_PID: usize = 1;
     const P_PGID: usize = 2;
+    const P_PIDFD: usize = 3;
     const WNOHANG: usize = 0x00000001;
     const WSTOPPED: usize = 0x00000002;
     const WEXITED: usize = 0x00000004;
@@ -1401,6 +1402,9 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     const ECHILD: isize = -10;
     const EINVAL: isize = -22;
     const EFAULT: isize = -14;
+    const EBADF: isize = -9;
+    const EAGAIN: isize = -11;
+    const O_NONBLOCK: u32 = 0x800;
 
     let allowed = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT;
     if (options & !allowed) != 0 {
@@ -1414,6 +1418,27 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     }
     if matches!(idtype, P_PID) && id == 0 {
         return EINVAL;
+    }
+    let mut pidfd_target_pid = 0usize;
+    let mut pidfd_nonblock = false;
+    if idtype == P_PIDFD {
+        let files_process = current_files_process();
+        let (file, fd_flags) = {
+            let files_inner = files_process.borrow_mut();
+            if id >= files_inner.fd_table.len() {
+                return EBADF;
+            }
+            let Some(file) = files_inner.fd_table[id].as_ref().cloned() else {
+                return EBADF;
+            };
+            let fd_flags = files_inner.fd_flags.get(id).copied().unwrap_or(0);
+            (file, fd_flags)
+        };
+        let Some(pidfd) = file.as_any().downcast_ref::<PidFdFile>() else {
+            return EBADF;
+        };
+        pidfd_target_pid = pidfd.target_pid();
+        pidfd_nonblock = (fd_flags & O_NONBLOCK) != 0;
     }
 
     let token = get_current_token();
@@ -1444,6 +1469,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
                     let target = if id == 0 { parent_pgid } else { id };
                     child_inner.pgid == target
                 }
+                P_PIDFD => child.pid.0 == pidfd_target_pid,
                 _ => return EINVAL,
             };
             if !matches {
@@ -1556,6 +1582,11 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             let info = SigInfo::default();
             write_user_value(token, infop as *mut SigInfo, &info);
             return 0;
+        }
+
+        if idtype == P_PIDFD && pidfd_nonblock {
+            drop(process_inner);
+            return EAGAIN;
         }
 
         let inserted = enqueue_waiter_once(&mut process_inner.wait_queue, &task);

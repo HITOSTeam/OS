@@ -11,7 +11,7 @@ use crate::{
     arch,
     debug_config::{DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     mm::{read_user_value, try_read_user_value, try_write_user_value, write_user_value},
-    syscall::misc::{decode_linux_tid, encode_linux_tid},
+    syscall::misc::{decode_linux_tid_strict, encode_linux_tid},
     task::{
         ProcessControlBlock,
         block_sleep::add_timer,
@@ -108,8 +108,6 @@ fn wake_parent_waiters() {
 }
 
 fn find_task_by_linux_tid(tid: usize) -> Option<(Arc<ProcessControlBlock>, Arc<TaskControlBlock>)> {
-    let tid = tid & 0x3fff_ffff;
-
     if let Some(proc) = pid2process(tid) {
         let main_task = {
             let inner = proc.borrow_mut();
@@ -330,11 +328,10 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
     if DEBUG_PTHREAD {
         crate::println!("[tgkill] tgid={} tid={} sig={}", tgid, tid, sig);
     }
-    let norm_tid = tid & 0x3fff_ffff;
     let Some(proc) = pid2process(tgid) else {
         return ESRCH;
     };
-    let Some(tid_index) = decode_linux_tid(tgid, norm_tid) else {
+    let Some(tid_index) = decode_linux_tid_strict(tgid, tid) else {
         return ESRCH;
     };
     if !can_signal_process(&proc, sig) {

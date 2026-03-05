@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -215,6 +215,8 @@ lazy_static! {
 // Minimal backing counters used by `/sys/block/root/stat`.
 static PSEUDO_BLOCK_SECTORS_WRITTEN: AtomicU64 = AtomicU64::new(8);
 static PSEUDO_BLOCK_IO_TICKS: AtomicU64 = AtomicU64::new(1);
+static PSEUDO_BLOCK_READ_ONLY: AtomicBool = AtomicBool::new(false);
+static PSEUDO_BLOCK_READ_AHEAD: AtomicU64 = AtomicU64::new(256);
 static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn bytes_to_sectors(bytes: usize) -> u64 {
@@ -243,6 +245,22 @@ pub(crate) fn pseudo_block_stat_snapshot() -> String {
     alloc::format!("1 0 8 0 1 0 {} 0 0 {} 0\n", sectors, io_ticks)
 }
 
+pub(crate) fn pseudo_block_is_read_only() -> bool {
+    PSEUDO_BLOCK_READ_ONLY.load(Ordering::Relaxed)
+}
+
+pub(crate) fn pseudo_block_set_read_only(read_only: bool) {
+    PSEUDO_BLOCK_READ_ONLY.store(read_only, Ordering::Relaxed);
+}
+
+pub(crate) fn pseudo_block_read_ahead() -> u64 {
+    PSEUDO_BLOCK_READ_AHEAD.load(Ordering::Relaxed)
+}
+
+pub(crate) fn pseudo_block_set_read_ahead(value: u64) {
+    PSEUDO_BLOCK_READ_AHEAD.store(value, Ordering::Relaxed);
+}
+
 pub(crate) fn shm_list() -> Vec<String> {
     SHM_OBJECTS.lock().keys().cloned().collect()
 }
@@ -268,11 +286,23 @@ pub(crate) fn shm_remove(name: &str) -> bool {
 
 /// A minimal block device node for `/dev/root` so tools like busybox `df`
 /// treat the root filesystem as a real device-backed mount.
-pub struct PseudoBlock;
+pub struct PseudoBlock {
+    offset: Mutex<usize>,
+}
 
 impl PseudoBlock {
     pub fn new() -> Self {
-        Self
+        Self {
+            offset: Mutex::new(0),
+        }
+    }
+
+    pub fn offset(&self) -> usize {
+        *self.offset.lock()
+    }
+
+    pub fn set_offset(&self, offset: usize) {
+        *self.offset.lock() = offset;
     }
 }
 

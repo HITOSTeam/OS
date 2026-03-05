@@ -7,6 +7,7 @@ mod procfs;
 mod pseudo;
 mod socketpair;
 mod stdio;
+mod tty;
 use crate::mm::UserBuffer;
 use core::any::Any;
 
@@ -23,7 +24,7 @@ pub trait File: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub use dummy::DummyFile;
+pub use dummy::{DummyFile, NamespaceFile, NamespaceKind, PidFdFile};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, register_deferred_unlink_cleanup,
     root_inode_for_path, secondary_root_inode,
@@ -40,9 +41,14 @@ pub use procfs::{
 };
 pub use pseudo::PseudoBlock;
 pub(crate) use pseudo::{
-    pseudo_block_note_sync, pseudo_block_stat_snapshot, shm_create, shm_create_anonymous, shm_get,
-    shm_list, shm_remove,
+    pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_read_ahead,
+    pseudo_block_set_read_ahead, pseudo_block_set_read_only, pseudo_block_stat_snapshot,
+    shm_create, shm_create_anonymous, shm_get, shm_list, shm_remove,
 };
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub use socketpair::{make_socketpair, SocketPairEnd};
 pub use stdio::{Stdin, Stdout};
+pub use tty::{
+    list_dev_pts, open_dev_ptmx, open_dev_pts, open_dev_tty, LinuxTermio, LinuxTermios,
+    PtyMasterFile, PtySlaveFile, TtyFile,
+};

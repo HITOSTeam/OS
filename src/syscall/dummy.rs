@@ -1,9 +1,9 @@
 use alloc::sync::Arc;
 
 use crate::{
-    fs::{shm_create_anonymous, DummyFile, File, PseudoShmFile},
+    fs::{shm_create_anonymous, DummyFile, File, PidFdFile, PseudoShmFile},
     mm::try_copy_from_user,
-    task::processor::current_files_process,
+    task::{manager::pid2process, processor::current_files_process},
     trap::get_current_token,
 };
 
@@ -12,6 +12,7 @@ const EMFILE: isize = -24;
 const EBADF: isize = -9;
 const EFAULT: isize = -14;
 const ENOSYS: isize = -38;
+const ESRCH: isize = -3;
 
 const O_NONBLOCK: u32 = 0x800;
 const O_PATH: u32 = 0x200000;
@@ -157,16 +158,24 @@ pub fn syscall_inotify_init1(flags: usize) -> isize {
     alloc_dummy_fd(fd_flags)
 }
 
-pub fn syscall_pidfd_open(_pid: usize, flags: usize) -> isize {
+pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {
     const PIDFD_NONBLOCK: usize = NONBLOCK_FLAG;
     if (flags & !PIDFD_NONBLOCK) != 0 {
         return EINVAL;
     }
+    if pid == 0 || (pid as isize) < 0 {
+        return EINVAL;
+    }
+    if pid2process(pid).is_none() {
+        return ESRCH;
+    }
     let mut fd_flags = 0u32;
+    // Linux pidfds are always close-on-exec.
+    fd_flags |= FD_CLOEXEC;
     if (flags & PIDFD_NONBLOCK) != 0 {
         fd_flags |= O_NONBLOCK;
     }
-    alloc_dummy_fd(fd_flags)
+    alloc_fd(Arc::new(PidFdFile::new(pid)), fd_flags)
 }
 
 pub fn syscall_fanotify_init(_flags: usize, _event_f_flags: usize) -> isize {

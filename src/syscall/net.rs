@@ -9,7 +9,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::fs::{
-    File, NetSocketFile, SocketPairEnd, ext4_lock, find_path_in_roots, make_socketpair,
+    File, NetSocketFile, PidFdFile, SocketPairEnd, ext4_lock, find_path_in_roots, make_socketpair,
 };
 use crate::mm::{
     UserBuffer, read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
@@ -799,6 +799,14 @@ fn visible_send_result(ret: isize, user_len: usize, had_pending: bool) -> isize 
 }
 
 pub(crate) fn poll_file_read_write(file: &Arc<dyn File + Send + Sync>) -> (bool, bool) {
+    if let Some(pidfd) = file.as_any().downcast_ref::<PidFdFile>() {
+        // pidfd becomes readable once the target exits (zombie or already reaped).
+        let readable = match pid2process(pidfd.target_pid()) {
+            Some(proc) => proc.borrow_mut().is_zombie,
+            None => true,
+        };
+        return (readable, false);
+    }
     if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
         return (pipe.poll_readable(), pipe.poll_writable());
     }
@@ -818,7 +826,8 @@ pub(crate) fn poll_file_read_write(file: &Arc<dyn File + Send + Sync>) -> (bool,
 }
 
 pub(crate) fn file_supports_poll(file: &Arc<dyn File + Send + Sync>) -> bool {
-    file.as_any().downcast_ref::<crate::fs::Pipe>().is_some()
+    file.as_any().downcast_ref::<PidFdFile>().is_some()
+        || file.as_any().downcast_ref::<crate::fs::Pipe>().is_some()
         || file.as_any().downcast_ref::<SocketPairEnd>().is_some()
         || file.as_any().downcast_ref::<NetSocketFile>().is_some()
         || file.as_any().downcast_ref::<UnixSocketFile>().is_some()

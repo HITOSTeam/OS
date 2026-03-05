@@ -12,10 +12,10 @@ use crate::task::manager::{wakeup_task, PID2PCB};
 use crate::{
     fs::{
         ext4_lock, find_path_in_roots, make_pipe, open_file, pseudo_block_note_sync,
-        pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
-        shm_create, shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe,
-        ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, RtcFile,
-        SocketPairEnd,
+        pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode, shm_create,
+        shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe, ProcPseudoFile,
+        PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile,
+        RtcFile, SocketPairEnd, TtyFile,
     },
     mm::{
         copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
@@ -864,6 +864,8 @@ fn is_pseudo_path(abs: &str) -> bool {
         || abs.starts_with("/sys/")
         || abs == "/dev"
         || abs.starts_with("/dev/")
+        || abs == "/proc/sys"
+        || abs.starts_with("/proc/sys/")
         || abs == "/etc"
         || abs.starts_with("/etc/")
 }
@@ -1209,7 +1211,7 @@ fn resolve_xattr_path_inode(
     resolve_at_inode(&at, fsuid, fsgid, follow_final)
 }
 
-fn resolve_xattr_fd_inode(fd: usize) -> Result<Arc<ext4_fs::Inode>, isize> {
+fn resolve_xattr_fd_inode(fd: usize) -> Result<Option<Arc<ext4_fs::Inode>>, isize> {
     if fd_has_o_path(fd) {
         return Err(EBADF);
     }
@@ -1217,9 +1219,10 @@ fn resolve_xattr_fd_inode(fd: usize) -> Result<Arc<ext4_fs::Inode>, isize> {
         return Err(EBADF);
     };
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return Err(EBADF);
+        // Valid fd but no inode-backed xattr storage (e.g. socket/fifo wrappers).
+        return Ok(None);
     };
-    Ok(os_inode.ext4_inode())
+    Ok(Some(os_inode.ext4_inode()))
 }
 
 fn do_setxattr(inode: &Arc<ext4_fs::Inode>, name: &str, value: &[u8], flags: usize) -> isize {
@@ -3518,6 +3521,75 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     if let Some(node) = crate::fs::open_proc_pseudo(path) {
         return Some(node);
     }
+    if path == "/proc/sys" || path == "/proc/sys/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("kernel"),
+                ino: 2,
+                dtype: 4
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/sys", entries)));
+    }
+    if path == "/proc/sys/kernel" || path == "/proc/sys/kernel/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("random"),
+                ino: 2,
+                dtype: 4
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/proc/sys/kernel",
+            entries,
+        )));
+    }
+    if path == "/proc/sys/kernel/random" || path == "/proc/sys/kernel/random/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("entropy_avail"),
+                ino: 2,
+                dtype: 8
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/proc/sys/kernel/random",
+            entries,
+        )));
+    }
+    if path == "/proc/sys/kernel/random/entropy_avail" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static("256\n")));
+    }
     if path == "/sys" || path == "/sys/" {
         let entries = alloc::vec![
             PseudoDirent {
@@ -3566,6 +3638,21 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                 dtype: 6
             },
             PseudoDirent {
+                name: alloc::string::String::from("ptmx"),
+                ino: 9,
+                dtype: 2
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("tty"),
+                ino: 10,
+                dtype: 2
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("pts"),
+                ino: 11,
+                dtype: 4
+            },
+            PseudoDirent {
                 name: alloc::string::String::from("shm"),
                 ino: 8,
                 dtype: 4
@@ -3597,6 +3684,37 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev", entries)));
+    }
+    if path == "/dev/pts" || path == "/dev/pts/" {
+        let mut entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+        ];
+        for idx in crate::fs::list_dev_pts() {
+            entries.push(PseudoDirent {
+                name: alloc::format!("{}", idx),
+                ino: 2000 + idx as u64,
+                dtype: 2,
+            });
+        }
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/pts", entries)));
+    }
+    if let Some(rest) = path.strip_prefix("/dev/pts/") {
+        if !rest.is_empty() && !rest.contains('/') && rest.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(idx) = rest.parse::<u32>() {
+                if let Some(node) = crate::fs::open_dev_pts(idx) {
+                    return Some(node);
+                }
+            }
+        }
     }
     if path == "/dev/shm" || path == "/dev/shm/" {
         let mut entries = alloc::vec![
@@ -3913,6 +4031,12 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
     }
     // /dev/*
+    if path == "/dev/ptmx" {
+        return Some(crate::fs::open_dev_ptmx());
+    }
+    if path == "/dev/tty" {
+        return Some(crate::fs::open_dev_tty());
+    }
     if path == "/dev/root" {
         return Some(alloc::sync::Arc::new(PseudoBlock::new()));
     }
@@ -4223,7 +4347,14 @@ pub fn syscall_fsetxattr(fd: usize, name: usize, value: usize, size: usize, flag
         Err(e) => return e,
     };
     let inode = match resolve_xattr_fd_inode(fd) {
-        Ok(v) => v,
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return if xattr_is_user_namespace(&name) {
+                EPERM
+            } else {
+                EOPNOTSUPP
+            };
+        }
         Err(e) => return e,
     };
     do_setxattr(&inode, &name, value.as_slice(), flags)
@@ -4265,7 +4396,8 @@ pub fn syscall_fgetxattr(fd: usize, name: usize, value: usize, size: usize) -> i
         Err(e) => return e,
     };
     let inode = match resolve_xattr_fd_inode(fd) {
-        Ok(v) => v,
+        Ok(Some(v)) => v,
+        Ok(None) => return ENODATA,
         Err(e) => return e,
     };
     do_getxattr(&inode, &name, value, size, token)
@@ -4295,7 +4427,8 @@ pub fn syscall_llistxattr(path: usize, list: usize, size: usize) -> isize {
 pub fn syscall_flistxattr(fd: usize, list: usize, size: usize) -> isize {
     let token = get_current_token();
     let inode = match resolve_xattr_fd_inode(fd) {
-        Ok(v) => v,
+        Ok(Some(v)) => v,
+        Ok(None) => return 0,
         Err(e) => return e,
     };
     do_listxattr(&inode, list, size, token)
@@ -4337,7 +4470,8 @@ pub fn syscall_fremovexattr(fd: usize, name: usize) -> isize {
         Err(e) => return e,
     };
     let inode = match resolve_xattr_fd_inode(fd) {
-        Ok(v) => v,
+        Ok(Some(v)) => v,
+        Ok(None) => return ENODATA,
         Err(e) => return e,
     };
     do_removexattr(&inode, &name)
@@ -7651,6 +7785,9 @@ fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
         || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
+        || file.as_any().downcast_ref::<TtyFile>().is_some()
+        || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
+        || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
         || file.as_any().downcast_ref::<Pipe>().is_some()
     {
         let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
@@ -7663,6 +7800,11 @@ fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
             0o100666
         } else if file.as_any().downcast_ref::<RtcFile>().is_some() {
             0o100666
+        } else if file.as_any().downcast_ref::<TtyFile>().is_some()
+            || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
+            || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
+        {
+            0o020666
         } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
             match pf.kind_tag() {
                 crate::fs::PseudoKindTag::Null => 0o020666,
@@ -7681,6 +7823,12 @@ fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
                 crate::fs::PseudoKindTag::Urandom => 0x109,
                 crate::fs::PseudoKindTag::Static => 0,
             }
+        } else if file.as_any().downcast_ref::<TtyFile>().is_some() {
+            0x500
+        } else if file.as_any().downcast_ref::<PtyMasterFile>().is_some() {
+            0x501
+        } else if file.as_any().downcast_ref::<PtySlaveFile>().is_some() {
+            0x502
         } else {
             0
         };
@@ -7780,6 +7928,9 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
         || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
+        || file.as_any().downcast_ref::<TtyFile>().is_some()
+        || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
+        || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
         || file.as_any().downcast_ref::<Pipe>().is_some()
     {
         let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
@@ -7792,6 +7943,11 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
             0o100666
         } else if file.as_any().downcast_ref::<RtcFile>().is_some() {
             0o100666
+        } else if file.as_any().downcast_ref::<TtyFile>().is_some()
+            || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
+            || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
+        {
+            0o020666
         } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
             match pf.kind_tag() {
                 // /dev/null, /dev/zero, /dev/{u}random should look like character devices
@@ -7812,6 +7968,12 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
                 crate::fs::PseudoKindTag::Urandom => 0x109,
                 crate::fs::PseudoKindTag::Static => 0,
             }
+        } else if file.as_any().downcast_ref::<TtyFile>().is_some() {
+            0x500
+        } else if file.as_any().downcast_ref::<PtyMasterFile>().is_some() {
+            0x501
+        } else if file.as_any().downcast_ref::<PtySlaveFile>().is_some() {
+            0x502
         } else {
             0
         };
@@ -8224,7 +8386,13 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
             0o060600
         } else if node.as_any().downcast_ref::<PseudoShmFile>().is_some() {
             0o100666
-        } else if abs == "/dev/null" || abs == "/dev/zero" || abs == "/dev/misc/rtc" {
+        } else if abs == "/dev/null"
+            || abs == "/dev/zero"
+            || abs == "/dev/misc/rtc"
+            || abs == "/dev/ptmx"
+            || abs == "/dev/tty"
+            || abs.starts_with("/dev/pts/")
+        {
             0o020666
         } else {
             0o100444
@@ -8237,6 +8405,12 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
             0x105
         } else if abs == "/dev/misc/rtc" {
             0x109
+        } else if abs == "/dev/ptmx" {
+            0x501
+        } else if abs == "/dev/tty" {
+            0x500
+        } else if abs.starts_with("/dev/pts/") {
+            0x502
         } else {
             0
         };
@@ -8446,7 +8620,13 @@ pub fn syscall_statx(
             0o060600
         } else if node.as_any().downcast_ref::<PseudoShmFile>().is_some() {
             0o100666
-        } else if abs == "/dev/null" || abs == "/dev/zero" || abs == "/dev/misc/rtc" {
+        } else if abs == "/dev/null"
+            || abs == "/dev/zero"
+            || abs == "/dev/misc/rtc"
+            || abs == "/dev/ptmx"
+            || abs == "/dev/tty"
+            || abs.starts_with("/dev/pts/")
+        {
             0o020666
         } else {
             0o100444
@@ -8459,6 +8639,12 @@ pub fn syscall_statx(
             0x105
         } else if abs == "/dev/misc/rtc" {
             0x109
+        } else if abs == "/dev/ptmx" {
+            0x501
+        } else if abs == "/dev/tty" {
+            0x500
+        } else if abs.starts_with("/dev/pts/") {
+            0x502
         } else {
             0
         };
@@ -8810,6 +8996,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     const SEEK_SET: usize = 0;
     const SEEK_CUR: usize = 1;
     const SEEK_END: usize = 2;
+    const PSEUDO_ROOT_DEV_BYTES: usize = 1024 * 1024 * 1024;
 
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
@@ -8877,6 +9064,22 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             return EINVAL;
         }
         os_inode.set_offset(new as usize);
+        return new;
+    }
+
+    if let Some(pblk) = file.as_any().downcast_ref::<PseudoBlock>() {
+        let cur = pblk.offset() as isize;
+        let end = PSEUDO_ROOT_DEV_BYTES as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        pblk.set_offset(new as usize);
         return new;
     }
 

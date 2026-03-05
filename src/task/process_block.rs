@@ -33,6 +33,7 @@ use lazy_static::lazy_static;
 use spin::{Mutex as SpinMutex, MutexGuard};
 
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
+const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
 static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FORK_PRE_COW_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPC_NS_ID: AtomicUsize = AtomicUsize::new(1);
@@ -93,6 +94,25 @@ fn fork_diag_cycles_to_us(delta_cycles: usize) -> usize {
 
 fn should_report_fork_impl_diag(seq: usize, total_us: usize) -> bool {
     seq <= 16 || seq % 128 == 0 || total_us >= 50_000
+}
+
+fn process_comm_from_argv(argv: &[String]) -> String {
+    let src = argv
+        .first()
+        .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
+        .unwrap_or("CongCore");
+    let mut out = String::new();
+    for b in src.as_bytes().iter().copied().take(15) {
+        if b == 0 {
+            break;
+        }
+        out.push(b as char);
+    }
+    if out.is_empty() {
+        String::from("CongCore")
+    } else {
+        out
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -721,6 +741,13 @@ pub struct ProcessControlBlockInner {
     pub exit_code: i32,
     /// Linux-like argv for `/proc/<pid>/cmdline` and ps.
     pub argv: Vec<String>,
+    /// Thread-group command name shown in /proc/*/{stat,status,comm}.
+    pub comm: String,
+    /// `PR_SET_PDEATHSIG` setting for this process.
+    pub pdeath_signal: i32,
+    /// Current/default timer slack used by `prctl(PR_*_TIMERSLACK)`.
+    pub timer_slack_ns: u64,
+    pub timer_slack_default_ns: u64,
     /// Process creation time since boot (ms).
     pub start_time_ms: usize,
     /// Accumulated CPU time of reaped children (ns), used by `times(2)`.
@@ -1181,6 +1208,10 @@ impl ProcessControlBlock {
                 children: Vec::new(),
                 exit_code: 0,
                 argv: args.clone(),
+                comm: process_comm_from_argv(&args),
+                pdeath_signal: 0,
+                timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+                timer_slack_default_ns: DEFAULT_TIMER_SLACK_NS,
                 start_time_ms: crate::time::get_time_ms(),
                 child_cpu_time_ns: 0,
                 uid: 0,
@@ -1388,6 +1419,7 @@ impl ProcessControlBlock {
             inner.mlocked_ranges.clear();
             inner.mlockall_future = false;
             inner.argv = args.clone();
+            inner.comm = process_comm_from_argv(&args);
             inner.did_exec = true;
         }
         let task = self.borrow_mut().get_task(0);
@@ -1457,6 +1489,7 @@ impl ProcessControlBlock {
             inner.mlocked_ranges.clear();
             inner.mlockall_future = false;
             inner.argv = args.clone();
+            inner.comm = process_comm_from_argv(&args);
             inner.did_exec = true;
         }
 
@@ -1636,6 +1669,10 @@ impl ProcessControlBlock {
                 children: Vec::new(),
                 exit_code: 0,
                 argv,
+                comm: parent.comm.clone(),
+                pdeath_signal: 0,
+                timer_slack_ns: parent.timer_slack_ns,
+                timer_slack_default_ns: parent.timer_slack_ns,
                 start_time_ms: crate::time::get_time_ms(),
                 child_cpu_time_ns: 0,
                 uid: parent.uid,

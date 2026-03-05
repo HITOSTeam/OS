@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -11,7 +11,7 @@ use spin::Mutex;
 use crate::config;
 use crate::fs::{
     ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, OSInode,
-    PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
+    NamespaceFile, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
 };
 use crate::mm::{UserBuffer, VirtAddr};
 use crate::task::manager::{pid2process, PID2PCB};
@@ -33,12 +33,14 @@ pub enum ProcFileKind {
     PidStat(u32),
     PidCmdline(u32),
     PidStatus(u32),
+    PidComm(u32),
     PidMaps(u32),
     PidPagemap(u32),
     PidSmaps(u32),
     PidCoredumpFilter(u32),
     PidMounts(u32),
     PidTaskStat(u32, u32),
+    PidTaskComm(u32, u32),
 }
 
 static PROC_ROOT_INO: AtomicU32 = AtomicU32::new(0);
@@ -438,6 +440,7 @@ fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
     for name in [
         "stat",
         "cmdline",
+        "comm",
         "status",
         "maps",
         "pagemap",
@@ -465,6 +468,31 @@ fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
         name: String::from("task"),
         ino: pid as u64,
         dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("ns"),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    entries
+}
+
+fn proc_pid_ns_entries(pid: u32) -> Vec<PseudoDirent> {
+    let mut entries = Vec::new();
+    entries.push(PseudoDirent {
+        name: String::from("."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from(".."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("ipc"),
+        ino: pid as u64,
+        dtype: 10,
     });
     entries
 }
@@ -625,6 +653,11 @@ fn proc_pid_task_tid_entries(pid: u32, tid: u32) -> Vec<PseudoDirent> {
     }
     entries.push(PseudoDirent {
         name: String::from("stat"),
+        ino: tid as u64,
+        dtype: 8,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("comm"),
         ino: tid as u64,
         dtype: 8,
     });
@@ -869,6 +902,12 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             proc_pid_task_entries(pid),
         )));
     }
+    if rest == "ns" {
+        return Some(Arc::new(PseudoDir::new(
+            &alloc::format!("/proc/{pid}/ns"),
+            proc_pid_ns_entries(pid),
+        )));
+    }
     if let Some(task_rest) = rest.strip_prefix("task/") {
         let mut parts = task_rest.splitn(2, '/');
         let tid_name = parts.next().unwrap_or("");
@@ -889,11 +928,23 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         if tail == "stat" {
             return Some(ProcPseudoFile::new(ProcFileKind::PidTaskStat(pid, tid)));
         }
+        if tail == "comm" {
+            return Some(ProcPseudoFile::new(ProcFileKind::PidTaskComm(pid, tid)));
+        }
+        return None;
+    }
+    if let Some(ns_name) = rest.strip_prefix("ns/") {
+        if ns_name == "ipc" {
+            let proc = pid2process(pid as usize)?;
+            let ipc_ns_id = proc.borrow_mut().ipc_ns_id;
+            return Some(Arc::new(NamespaceFile::new_ipc(ipc_ns_id)));
+        }
         return None;
     }
     match rest {
         "stat" => Some(ProcPseudoFile::new(ProcFileKind::PidStat(pid))),
         "cmdline" => Some(ProcPseudoFile::new(ProcFileKind::PidCmdline(pid))),
+        "comm" => Some(ProcPseudoFile::new(ProcFileKind::PidComm(pid))),
         "status" => Some(ProcPseudoFile::new(ProcFileKind::PidStatus(pid))),
         "maps" => Some(ProcPseudoFile::new(ProcFileKind::PidMaps(pid))),
         "pagemap" => Some(ProcPseudoFile::new(ProcFileKind::PidPagemap(pid))),
@@ -970,12 +1021,14 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::SysvipcShm => crate::syscall::sysv_shm::proc_sysvipc_shm(),
         ProcFileKind::PidStat(pid) => proc_pid_stat(*pid),
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
+        ProcFileKind::PidComm(pid) => proc_pid_comm(*pid),
         ProcFileKind::PidStatus(pid) => proc_pid_status(*pid),
         ProcFileKind::PidMaps(pid) => proc_pid_maps(*pid),
         ProcFileKind::PidPagemap(_) => String::new(),
         ProcFileKind::PidSmaps(pid) => proc_pid_smaps(*pid),
         ProcFileKind::PidCoredumpFilter(_) => String::from("00000033\n"),
         ProcFileKind::PidTaskStat(pid, tid) => proc_pid_task_stat(*pid, *tid),
+        ProcFileKind::PidTaskComm(pid, tid) => proc_pid_task_comm(*pid, *tid),
     }
 }
 
@@ -1132,6 +1185,30 @@ fn proc_pid_cmdline(pid: u32) -> String {
     s
 }
 
+fn proc_pid_comm(pid: u32) -> String {
+    let Some(proc) = pid2process(pid as usize) else {
+        return String::new();
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        if crate::debug_config::DEBUG_PROCFS {
+            crate::println!("[procfs] comm pid={} lock busy", pid);
+        }
+        return String::new();
+    };
+    let mut comm = inner.comm.clone();
+    if comm.is_empty() {
+        comm = inner
+            .argv
+            .first()
+            .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
+            .unwrap_or("CongCore")
+            .to_string();
+    }
+    comm = comm.replace(')', "_");
+    comm.push('\n');
+    comm
+}
+
 fn proc_pid_status(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
@@ -1148,7 +1225,6 @@ fn proc_pid_status(pid: u32) -> String {
         .and_then(|w| w.upgrade())
         .map(|p| p.getpid())
         .unwrap_or(0);
-    let argv = inner.argv.clone();
     let num_threads = inner.thread_count();
     let main_state = inner
         .tasks
@@ -1175,11 +1251,17 @@ fn proc_pid_status(pid: u32) -> String {
     let sgid = inner.sgid;
     let fsgid = inner.fsgid;
 
-    let comm = argv
-        .first()
-        .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
-        .unwrap_or("CongCore")
-        .replace(')', "_");
+    let comm = if inner.comm.is_empty() {
+        inner
+            .argv
+            .first()
+            .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
+            .unwrap_or("CongCore")
+            .to_string()
+    } else {
+        inner.comm.clone()
+    }
+    .replace(')', "_");
 
     let state_char = if inner.is_zombie {
         'Z'
@@ -1231,7 +1313,6 @@ fn proc_pid_stat(pid: u32) -> String {
         .and_then(|w| w.upgrade())
         .map(|p| p.getpid())
         .unwrap_or(0);
-    let argv = inner.argv.clone();
     let start_time_ms = inner.start_time_ms;
     let num_threads = inner.thread_count();
     let main_state = inner
@@ -1245,11 +1326,17 @@ fn proc_pid_stat(pid: u32) -> String {
     let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
     let vsize: u64 = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
 
-    let comm = argv
-        .first()
-        .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
-        .unwrap_or("CongCore")
-        .replace(')', "_");
+    let comm = if inner.comm.is_empty() {
+        inner
+            .argv
+            .first()
+            .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
+            .unwrap_or("CongCore")
+            .to_string()
+    } else {
+        inner.comm.clone()
+    }
+    .replace(')', "_");
 
     let state_char = if inner.is_zombie {
         'Z'
@@ -1378,12 +1465,17 @@ fn proc_pid_task_stat(pid: u32, tid: u32) -> String {
         .and_then(|w| w.upgrade())
         .map(|p| p.getpid())
         .unwrap_or(0);
-    let comm = inner
-        .argv
-        .first()
-        .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
-        .unwrap_or("CongCore")
-        .replace(')', "_");
+    let comm = if inner.comm.is_empty() {
+        inner
+            .argv
+            .first()
+            .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
+            .unwrap_or("CongCore")
+            .to_string()
+    } else {
+        inner.comm.clone()
+    }
+    .replace(')', "_");
     let state_char = if inner.is_zombie {
         'Z'
     } else if inner.stopped {
@@ -1396,6 +1488,13 @@ fn proc_pid_task_stat(pid: u32, tid: u32) -> String {
         }
     };
     alloc::format!("{tid} ({comm}) {state_char} {ppid}\n")
+}
+
+fn proc_pid_task_comm(pid: u32, tid: u32) -> String {
+    if !proc_pid_task_alive(pid, tid) {
+        return String::new();
+    }
+    proc_pid_comm(pid)
 }
 
 fn proc_pid_maps(pid: u32) -> String {
