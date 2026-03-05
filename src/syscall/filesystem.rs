@@ -53,6 +53,7 @@ const O_EXCL: usize = 0x80;
 const O_TRUNC: usize = 0x200;
 const O_APPEND: usize = 0x400;
 const O_NONBLOCK: usize = 0x800;
+const O_DIRECT: usize = 0x4000;
 const O_ASYNC: usize = 0x2000;
 const O_NOATIME: usize = 0x40000;
 const O_PATH: usize = 0x200000;
@@ -120,6 +121,7 @@ const SPLICE_F_MOVE: usize = 0x01;
 const SPLICE_F_NONBLOCK: usize = 0x02;
 const SPLICE_F_MORE: usize = 0x04;
 const SPLICE_F_GIFT: usize = 0x08;
+const DIRECT_IO_ALIGN: usize = 512;
 
 // fs/ioctl.h flags consumed by setxattr03.
 const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
@@ -699,6 +701,43 @@ fn fd_has_append(fd: usize) -> bool {
     (inner.fd_flags[fd] & O_APPEND as u32) != 0
 }
 
+fn fd_has_odirect(fd: usize) -> bool {
+    let process = current_files_process();
+    let inner = process.borrow_mut();
+    if fd >= inner.fd_flags.len() {
+        return false;
+    }
+    (inner.fd_flags[fd] & O_DIRECT as u32) != 0
+}
+
+fn validate_direct_io_request(
+    fd: usize,
+    file: &alloc::sync::Arc<dyn File + Send + Sync>,
+    user_ptr: usize,
+    len: usize,
+    offset: usize,
+) -> Result<(), isize> {
+    if !fd_has_odirect(fd) || len == 0 {
+        return Ok(());
+    }
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return Ok(());
+    };
+    let inode = os_inode.ext4_inode();
+    let is_regular = {
+        let _ext4_guard = ext4_lock();
+        inode.is_file()
+    };
+    if !is_regular {
+        return Ok(());
+    }
+    let mask = DIRECT_IO_ALIGN - 1;
+    if (user_ptr & mask) != 0 || (len & mask) != 0 || (offset & mask) != 0 {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
 fn read_optional_offset(ptr: usize) -> Result<Option<usize>, isize> {
     if ptr == 0 {
         return Ok(None);
@@ -767,6 +806,15 @@ fn open_fd_flags(flags: usize, o_path: bool) -> u32 {
     }
     if (flags & O_NONBLOCK) != 0 {
         fd_flags |= O_NONBLOCK as u32;
+    }
+    if (flags & O_APPEND) != 0 {
+        fd_flags |= O_APPEND as u32;
+    }
+    if (flags & O_DIRECT) != 0 {
+        fd_flags |= O_DIRECT as u32;
+    }
+    if (flags & O_ASYNC) != 0 {
+        fd_flags |= O_ASYNC as u32;
     }
     if o_path {
         fd_flags |= O_PATH as u32;
@@ -2545,6 +2593,9 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
             if (cur_flags & O_PATH as u32) != 0 {
                 flags |= O_PATH;
+            }
+            if (cur_flags & O_DIRECT as u32) != 0 {
+                flags |= O_DIRECT;
             }
             if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
                 if os_inode.append() {
@@ -4956,6 +5007,11 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         return 0;
     }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, os_inode.offset()) {
+            return e;
+        }
+    }
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
         let is_dir = {
             let _ext4_guard = ext4_lock();
@@ -5004,6 +5060,11 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if len == 0 {
         return 0;
+    }
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, os_inode.offset()) {
+            return e;
+        }
     }
     let write_start_off = file
         .as_any()
@@ -5212,6 +5273,9 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     if !file.readable() {
         return EBADF;
     }
+    if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, pos as usize) {
+        return e;
+    }
 
     // ext4 regular files
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
@@ -5314,6 +5378,9 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     }
     if !file.writable() {
         return EBADF;
+    }
+    if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, pos as usize) {
+        return e;
     }
 
     // ext4 regular files

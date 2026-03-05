@@ -11,6 +11,7 @@ const EINVAL: isize = -22;
 const EMFILE: isize = -24;
 const EBADF: isize = -9;
 const EFAULT: isize = -14;
+const ENOSYS: isize = -38;
 
 const O_NONBLOCK: u32 = 0x800;
 const O_PATH: u32 = 0x200000;
@@ -187,7 +188,7 @@ pub fn syscall_perf_event_open(
 }
 
 pub fn syscall_io_uring_setup(_entries: usize, _params: usize) -> isize {
-    alloc_dummy_fd(0)
+    ENOSYS
 }
 
 pub fn syscall_bpf(_cmd: usize, _attr: usize, _size: usize) -> isize {

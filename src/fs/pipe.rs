@@ -257,9 +257,7 @@ impl Pipe {
             }
             let avail = ring_buffer.available_write();
             let remaining = data.len() - written;
-            if avail == 0
-                || (nonblock && remaining <= PIPE_BUF && avail < remaining && written == 0)
-            {
+            if avail == 0 || (remaining <= PIPE_BUF && avail < remaining && written == 0) {
                 if nonblock {
                     ring_buffer.remove_writer(&task);
                     return if written > 0 {
@@ -281,18 +279,20 @@ impl Pipe {
             if nonblock && to_write > PIPE_BUF {
                 to_write = to_write.min(avail);
             }
-            let mut reader_to_wake: Option<Arc<crate::task::task_block::TaskControlBlock>> = None;
-            let mut async_notify: Option<(i32, i32, i32)> = None;
             for byte in data[written..written + to_write].iter().copied() {
                 ring_buffer.write_byte(byte);
-                if reader_to_wake.is_none() {
-                    reader_to_wake = ring_buffer.pop_reader();
-                }
-                if async_notify.is_none() {
-                    async_notify = ring_buffer.async_target();
-                }
             }
             written += to_write;
+            let reader_to_wake = if to_write > 0 {
+                ring_buffer.pop_reader()
+            } else {
+                None
+            };
+            let async_notify = if to_write > 0 {
+                ring_buffer.async_target()
+            } else {
+                None
+            };
             drop(ring_buffer);
             if let Some((owner_type, owner_pid, sig)) = async_notify {
                 notify_async_io(owner_type, owner_pid, sig);
@@ -905,7 +905,9 @@ impl File for Pipe {
                 return already_write;
             }
             let loop_write = ring_buffer.available_write();
-            if loop_write == 0 {
+            if loop_write == 0
+                || (already_write == 0 && want_to_write <= PIPE_BUF && loop_write < want_to_write)
+            {
                 if has_pending_signal() {
                     ring_buffer.remove_writer(&task);
                     crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] write abort (pending signal)");
@@ -954,46 +956,38 @@ impl File for Pipe {
                 block_current_and_run_next();
                 continue;
             }
-            // write at most loop_write bytes
-            let mut reader_to_wake: Option<Arc<crate::task::task_block::TaskControlBlock>> = None;
-            let mut async_notify: Option<(i32, i32, i32)> = None;
+            // Write at most loop_write bytes in this round, then wake a reader once.
+            let mut wrote_this_round = 0usize;
             for _ in 0..loop_write {
-                if let Some(byte) = buf_iter.next() {
-                    ring_buffer.write_byte(byte);
-                    already_write += 1;
-                    if reader_to_wake.is_none() {
-                        reader_to_wake = ring_buffer.pop_reader();
-                    }
-                    if async_notify.is_none() {
-                        async_notify = ring_buffer.async_target();
-                    }
-                    if already_write == want_to_write {
-                        drop(ring_buffer);
-                        if let Some((owner_type, owner_pid, sig)) = async_notify {
-                            notify_async_io(owner_type, owner_pid, sig);
-                        }
-                        if let Some(reader) = reader_to_wake {
-                            wakeup_task(reader);
-                        }
-                        return want_to_write;
-                    }
-                } else {
-                    drop(ring_buffer);
-                    if let Some((owner_type, owner_pid, sig)) = async_notify {
-                        notify_async_io(owner_type, owner_pid, sig);
-                    }
-                    if let Some(reader) = reader_to_wake {
-                        wakeup_task(reader);
-                    }
-                    return already_write;
-                }
+                let Some(byte) = buf_iter.next() else {
+                    break;
+                };
+                ring_buffer.write_byte(byte);
+                already_write += 1;
+                wrote_this_round += 1;
             }
+            let reader_to_wake = if wrote_this_round > 0 {
+                ring_buffer.pop_reader()
+            } else {
+                None
+            };
+            let async_notify = if wrote_this_round > 0 {
+                ring_buffer.async_target()
+            } else {
+                None
+            };
             drop(ring_buffer);
             if let Some((owner_type, owner_pid, sig)) = async_notify {
                 notify_async_io(owner_type, owner_pid, sig);
             }
             if let Some(reader) = reader_to_wake {
                 wakeup_task(reader);
+            }
+            if already_write == want_to_write {
+                return want_to_write;
+            }
+            if wrote_this_round == 0 {
+                return already_write;
             }
         }
     }

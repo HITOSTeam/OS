@@ -599,6 +599,7 @@ impl PseudoFile {
         let inner = self.inner.lock();
         match &inner.kind {
             PseudoKind::Static(data) => Some(data.len()),
+            PseudoKind::Null | PseudoKind::Zero => Some(0),
             _ => None,
         }
     }

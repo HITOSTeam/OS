@@ -235,6 +235,17 @@ fn page_overlaps_mmap_regions(page_start: usize, regions: &[MmapRegion]) -> bool
         .any(|region| page_end > region.start && page_start < region.end())
 }
 
+fn page_overlaps_sysv_shm_regions(
+    page_start: usize,
+    attaches: &[crate::syscall::sysv_shm::ShmAttach],
+) -> bool {
+    let page_end = page_start.saturating_add(PAGE_SIZE);
+    attaches.iter().any(|a| {
+        let a_end = a.addr.saturating_add(a.len);
+        page_end > a.addr && page_start < a_end
+    })
+}
+
 pub fn syscall_brk(addr: usize) -> isize {
     const BRK_RELATIVE_COMPAT_MAX: usize = 64 * 1024;
     let process = current_process();
@@ -302,10 +313,23 @@ pub fn syscall_brk(addr: usize) -> isize {
         );
     }
     let ok = if new_end > old_end {
+        // Keep legacy Linux behavior used by mmapstress03:
+        // brk may grow across mmap holes, but must fail on SysV SHM attachments.
         let perm = MapPermission::R | MapPermission::W | MapPermission::U;
         let mut cur = old_end;
         let mut ok = true;
         while cur < new_end {
+            if page_overlaps_sysv_shm_regions(cur, &inner.sysv_shm_attaches) {
+                if crate::debug_config::DEBUG_SYSCALL {
+                    crate::println!(
+                        "[brk] pid={} grow blocked by sysv_shm page={:#x}",
+                        pid,
+                        cur
+                    );
+                }
+                ok = false;
+                break;
+            }
             if page_overlaps_mmap_regions(cur, &inner.mmap_areas)
                 || inner
                     .memory_set
@@ -317,6 +341,7 @@ pub fn syscall_brk(addr: usize) -> isize {
             let run_start = cur;
             cur += PAGE_SIZE;
             while cur < new_end
+                && !page_overlaps_sysv_shm_regions(cur, &inner.sysv_shm_attaches)
                 && !page_overlaps_mmap_regions(cur, &inner.mmap_areas)
                 && !inner
                     .memory_set
