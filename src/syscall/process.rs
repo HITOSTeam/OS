@@ -21,21 +21,38 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        manager::{add_task, remove_inactive_task, select_hart_for_new_task, PID2PCB},
+        manager::{
+            add_task, pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
+            PID2PCB,
+        },
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::{pending_unmasked_bits, SignalFlags, MAX_SIG, SIG_DFL, SIG_IGN},
-        task_block::TaskControlBlock,
+        signal::{
+            pending_unmasked_bits, queue_process_signal, SignalFlags, MAX_SIG, RT_SIG_MAX,
+            SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM, SIG_DFL, SIG_IGN,
+        },
+        task_block::{TaskControlBlock, TaskStatus},
         ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
 
+const EPERM: isize = -1;
 const ENOENT: isize = -2;
+const ESRCH: isize = -3;
+const EIO: isize = -5;
 const EACCES: isize = -13;
 const EFAULT: isize = -14;
+const EINVAL: isize = -22;
 const ENAMETOOLONG: isize = -36;
 const E2BIG: isize = -7;
 const ETXTBSY: isize = -26;
+
+const PTRACE_TRACEME: usize = 0;
+const PTRACE_CONT: usize = 7;
+const PTRACE_KILL: usize = 8;
+const PTRACE_ATTACH: usize = 16;
+const PTRACE_DETACH: usize = 17;
+const PTRACE_SIGTRAP: i32 = 5;
 
 static FORK_DIAG_PARENT_PID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static FORK_DIAG_START_MS: AtomicUsize = AtomicUsize::new(0);
@@ -384,6 +401,7 @@ fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) 
     } else {
         process.exec(&interp_data, args, envs);
     }
+    maybe_stop_after_ptrace_exec();
     0
 }
 
@@ -1016,6 +1034,72 @@ fn path_basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+fn wake_waiters_on(process: &Arc<ProcessControlBlock>) {
+    queue_process_signal(process.getpid(), SIGCHLD_NUM);
+    let waiters = {
+        let mut inner = process.borrow_mut();
+        inner.wait_queue.drain(..).collect::<Vec<_>>()
+    };
+    for waiter in waiters {
+        wakeup_task(waiter);
+    }
+}
+
+fn wake_parent_waiters_for(process: &Arc<ProcessControlBlock>) {
+    let (parent, tracer_pid) = {
+        let inner = process.borrow_mut();
+        (
+            inner.parent.as_ref().and_then(|w| w.upgrade()),
+            inner.ptrace_tracer_pid,
+        )
+    };
+
+    let mut parent_pid = None;
+    if let Some(parent) = parent {
+        parent_pid = Some(parent.getpid());
+        wake_waiters_on(&parent);
+    }
+    if let Some(tracer_pid) = tracer_pid {
+        if parent_pid != Some(tracer_pid) {
+            if let Some(tracer) = pid2process(tracer_pid) {
+                wake_waiters_on(&tracer);
+            }
+        }
+    }
+}
+
+fn enter_ptrace_stop(process: &Arc<ProcessControlBlock>, signum: i32) {
+    let tasks = {
+        let mut inner = process.borrow_mut();
+        if inner.ptrace_tracer_pid.is_none() {
+            return;
+        }
+        inner.stopped = true;
+        inner.stop_signal = signum;
+        inner.stop_pending = true;
+        inner.continued = false;
+        inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<Vec<_>>()
+    };
+    for task in tasks {
+        let mut task_inner = task.borrow_mut();
+        if task_inner.task_status != TaskStatus::Blocked {
+            task_inner.task_status = TaskStatus::Blocked;
+            task_inner.stopped_by_signal = true;
+        }
+    }
+    wake_parent_waiters_for(process);
+    block_current_and_run_next();
+}
+
+fn maybe_stop_after_ptrace_exec() {
+    let process = current_process();
+    enter_ptrace_stop(&process, PTRACE_SIGTRAP);
+}
+
 fn try_exec_busybox_applet(path: &str, args: &[String], envs: &[String]) -> Option<isize> {
     let applet_src = args.get(0).map(|s| s.as_str()).unwrap_or(path);
     let applet = path_basename(applet_src);
@@ -1070,8 +1154,9 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
         let mut process_inner = cur_process.borrow_mut();
         remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
         let parent_pgid = process_inner.pgid;
-        let mut stop_event: Option<(usize, i32)> = None;
-        let mut cont_event: Option<usize> = None;
+        let parent_pid = cur_process.getpid();
+        let mut stop_event: Option<(Arc<ProcessControlBlock>, i32)> = None;
+        let mut cont_event: Option<Arc<ProcessControlBlock>> = None;
         let (has_matching_child, zombie_child) = if process_inner.children.is_empty() {
             (false, None)
         } else {
@@ -1101,21 +1186,22 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                     found = Some(index);
                     break;
                 }
+                let ptrace_stop_visible = child_inner.ptrace_tracer_pid == Some(parent_pid);
                 if matches
-                    && (options & WUNTRACED) != 0
                     && child_inner.stopped
                     && child_inner.stop_pending
+                    && ((options & WUNTRACED) != 0 || ptrace_stop_visible)
                 {
                     let sig = if child_inner.stop_signal != 0 {
                         child_inner.stop_signal
                     } else {
                         crate::task::signal::SIGSTOP_NUM as i32
                     };
-                    stop_event = Some((child.pid.0, sig));
+                    stop_event = Some((child.clone(), sig));
                     break;
                 }
                 if matches && (options & WCONTINUED) != 0 && child_inner.continued {
-                    cont_event = Some(child.pid.0);
+                    cont_event = Some(child.clone());
                     break;
                 }
             }
@@ -1127,17 +1213,52 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             }
         };
 
-        if let Some((pid, sig)) = stop_event {
-            let child = process_inner
-                .children
-                .iter()
-                .find(|c| c.getpid() == pid)
-                .cloned();
-            if let Some(child) = child {
-                let mut child_inner = child.borrow_mut();
-                child_inner.stop_pending = false;
-                child_inner.stop_signal = sig;
+        let mut has_matching_ptrace = false;
+        if stop_event.is_none() && zombie_child.is_none() {
+            let traced_processes = {
+                let map = PID2PCB.lock();
+                map.values().cloned().collect::<Vec<_>>()
+            };
+            for traced in traced_processes {
+                if Arc::ptr_eq(&traced, &cur_process) {
+                    continue;
+                }
+                let traced_pid = traced.getpid();
+                let traced_inner = traced.borrow_mut();
+                if traced_inner.ptrace_tracer_pid != Some(parent_pid) {
+                    continue;
+                }
+                let matches = match pid {
+                    -1 => true,
+                    p if p > 0 => traced_pid == p as usize,
+                    _ => false,
+                };
+                if !matches {
+                    continue;
+                }
+                has_matching_ptrace = true;
+                if traced_inner.stopped && traced_inner.stop_pending {
+                    let sig = if traced_inner.stop_signal != 0 {
+                        traced_inner.stop_signal
+                    } else {
+                        SIGSTOP_NUM as i32
+                    };
+                    stop_event = Some((traced.clone(), sig));
+                    break;
+                }
+                if (options & WCONTINUED) != 0 && traced_inner.continued {
+                    cont_event = Some(traced.clone());
+                    break;
+                }
             }
+        }
+
+        if let Some((target, sig)) = stop_event {
+            let pid = target.getpid();
+            let mut target_inner = target.borrow_mut();
+            target_inner.stop_pending = false;
+            target_inner.stop_signal = sig;
+            drop(target_inner);
             drop(process_inner);
             if wstatus_ptr != 0 {
                 let status = ((sig & 0xff) << 8) | 0x7f;
@@ -1145,16 +1266,11 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             }
             return pid as isize;
         }
-        if let Some(pid) = cont_event {
-            let child = process_inner
-                .children
-                .iter()
-                .find(|c| c.getpid() == pid)
-                .cloned();
-            if let Some(child) = child {
-                let mut child_inner = child.borrow_mut();
-                child_inner.continued = false;
-            }
+        if let Some(target) = cont_event {
+            let pid = target.getpid();
+            let mut target_inner = target.borrow_mut();
+            target_inner.continued = false;
+            drop(target_inner);
             drop(process_inner);
             if wstatus_ptr != 0 {
                 let status = 0xffff;
@@ -1206,18 +1322,35 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             return pid as isize;
         }
 
-        if !has_matching_child {
+        if !has_matching_child && !has_matching_ptrace {
             if DEBUG_PTHREAD {
                 let child_pids = process_inner
                     .children
                     .iter()
                     .map(|c| c.getpid())
                     .collect::<Vec<_>>();
+                let traced_pids = {
+                    let map = PID2PCB.lock();
+                    map.values()
+                        .filter_map(|p| {
+                            if Arc::ptr_eq(p, &cur_process) {
+                                return None;
+                            }
+                            let inner = p.borrow_mut();
+                            if inner.ptrace_tracer_pid == Some(parent_pid) {
+                                Some(p.getpid())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
                 log::debug!(
-                    "[wait4] pid={} wait_pid={} no matching child children={:?}",
+                    "[wait4] pid={} wait_pid={} no matching child children={:?} traced={:?}",
                     cur_process.getpid(),
                     pid,
-                    child_pids
+                    child_pids,
+                    traced_pids
                 );
             }
             drop(process_inner);
@@ -1495,6 +1628,7 @@ fn execve_with_inode(
             args_vec,
             envs_vec,
         );
+        maybe_stop_after_ptrace_exec();
         return 0;
     }
     if let Some(None) = interp {
@@ -1517,6 +1651,7 @@ fn execve_with_inode(
             envs_vec,
             elf_aux,
         );
+        maybe_stop_after_ptrace_exec();
         return 0;
     }
 
@@ -1630,6 +1765,7 @@ fn execve_with_inode(
             } else {
                 process.exec(&interp_data, new_args, envs_vec);
             }
+            maybe_stop_after_ptrace_exec();
             return 0;
         }
         return ENOEXEC;
@@ -1668,6 +1804,7 @@ fn execve_with_inode(
         } else {
             process.exec(&interp_data, new_args, envs_vec);
         }
+        maybe_stop_after_ptrace_exec();
         return 0;
     }
 
@@ -1829,4 +1966,197 @@ pub fn syscall_execveat(
 
 pub fn syscall_getpid() -> isize {
     current_task().unwrap().process.upgrade().unwrap().getpid() as isize
+}
+
+fn ptrace_target_for_current(pid: usize) -> Result<Arc<ProcessControlBlock>, isize> {
+    if pid == 0 {
+        return Err(ESRCH);
+    }
+    let Some(target) = pid2process(pid) else {
+        return Err(ESRCH);
+    };
+    let tracer_pid = current_process().getpid();
+    let traced_by_current = {
+        let inner = target.borrow_mut();
+        if inner.is_zombie {
+            return Err(ESRCH);
+        }
+        inner.ptrace_tracer_pid == Some(tracer_pid)
+    };
+    if !traced_by_current {
+        return Err(EPERM);
+    }
+    Ok(target)
+}
+
+pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> isize {
+    match request {
+        PTRACE_TRACEME => {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            if inner.ptrace_tracer_pid.is_some() {
+                return EPERM;
+            }
+            let Some(parent_pid) = inner
+                .parent
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .map(|p| p.getpid())
+            else {
+                return EPERM;
+            };
+            inner.ptrace_tracer_pid = Some(parent_pid);
+            0
+        }
+        PTRACE_ATTACH => {
+            let tracer_pid = current_process().getpid();
+            if pid == tracer_pid {
+                return EPERM;
+            }
+            let Some(target) = pid2process(pid) else {
+                return ESRCH;
+            };
+            if !crate::task::signal::can_signal_process(&target, SIGSTOP_NUM as i32) {
+                return EPERM;
+            }
+            let tasks = {
+                let mut inner = target.borrow_mut();
+                if inner.is_zombie {
+                    return ESRCH;
+                }
+                if inner.ptrace_tracer_pid.is_some() {
+                    return EPERM;
+                }
+                inner.ptrace_tracer_pid = Some(tracer_pid);
+                inner.stopped = true;
+                inner.stop_pending = true;
+                inner.stop_signal = SIGSTOP_NUM as i32;
+                inner.continued = false;
+                inner
+                    .tasks
+                    .iter()
+                    .filter_map(|t| t.as_ref().cloned())
+                    .collect::<Vec<_>>()
+            };
+            for task in tasks {
+                let mut task_inner = task.borrow_mut();
+                if task_inner.task_status != TaskStatus::Blocked {
+                    task_inner.task_status = TaskStatus::Blocked;
+                    task_inner.stopped_by_signal = true;
+                }
+            }
+            wake_parent_waiters_for(&target);
+            0
+        }
+        PTRACE_DETACH => {
+            let sig = data as isize;
+            if sig < 0 || sig as usize > RT_SIG_MAX {
+                return EINVAL;
+            }
+            let target = match ptrace_target_for_current(pid) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            let tasks = {
+                let mut inner = target.borrow_mut();
+                inner.ptrace_tracer_pid = None;
+                inner.stopped = false;
+                inner.stop_pending = false;
+                inner.stop_signal = 0;
+                inner.continued = true;
+                inner
+                    .tasks
+                    .iter()
+                    .filter_map(|t| t.as_ref().cloned())
+                    .collect::<Vec<_>>()
+            };
+            for task in tasks {
+                let mut task_inner = task.borrow_mut();
+                if !task_inner.stopped_by_signal {
+                    continue;
+                }
+                task_inner.stopped_by_signal = false;
+                drop(task_inner);
+                wakeup_task(task);
+            }
+            if sig != 0 {
+                queue_process_signal(pid, sig as usize);
+            }
+            wake_parent_waiters_for(&target);
+            0
+        }
+        PTRACE_CONT => {
+            let sig = data as isize;
+            if sig < 0 || sig as usize > RT_SIG_MAX {
+                return EINVAL;
+            }
+            let target = match ptrace_target_for_current(pid) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            let tasks = {
+                let mut inner = target.borrow_mut();
+                inner.stopped = false;
+                inner.stop_pending = false;
+                inner.stop_signal = 0;
+                inner.continued = true;
+                inner
+                    .tasks
+                    .iter()
+                    .filter_map(|t| t.as_ref().cloned())
+                    .collect::<Vec<_>>()
+            };
+            for task in tasks {
+                let mut task_inner = task.borrow_mut();
+                if !task_inner.stopped_by_signal {
+                    continue;
+                }
+                task_inner.stopped_by_signal = false;
+                drop(task_inner);
+                wakeup_task(task);
+            }
+            if sig != 0 {
+                queue_process_signal(pid, sig as usize);
+            }
+            wake_parent_waiters_for(&target);
+            0
+        }
+        PTRACE_KILL => {
+            let target = match ptrace_target_for_current(pid) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            let tasks = {
+                let mut inner = target.borrow_mut();
+                inner.stopped = false;
+                inner.stop_pending = false;
+                inner.stop_signal = 0;
+                inner.continued = false;
+                inner
+                    .tasks
+                    .iter()
+                    .filter_map(|t| t.as_ref().cloned())
+                    .collect::<Vec<_>>()
+            };
+            queue_process_signal(pid, SIGKILL_NUM);
+            for task in tasks {
+                let mut task_inner = task.borrow_mut();
+                if !task_inner.stopped_by_signal {
+                    continue;
+                }
+                task_inner.stopped_by_signal = false;
+                drop(task_inner);
+                wakeup_task(task);
+            }
+            0
+        }
+        _ => {
+            // Keep invalid memory/register ptrace operations Linux-like for LTP:
+            // return EIO (tests also accept EFAULT).
+            if let Err(e) = ptrace_target_for_current(pid) {
+                return e;
+            }
+            EIO
+        }
+    }
 }

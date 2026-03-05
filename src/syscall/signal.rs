@@ -20,10 +20,10 @@ use crate::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
         signal::{
-            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGSTOP_NUM,
-            SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags, can_signal_process,
-            has_unmasked_pending, kill, kill_current, pending_unmasked_bits, set_signal,
-            set_signal_mask, signal_bit, take_first_unmasked,
+            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGKILL_NUM,
+            SIGSTOP_NUM, SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags,
+            can_signal_process, has_unmasked_pending, kill, kill_current, pending_unmasked_bits,
+            set_signal, set_signal_mask, signal_bit, take_first_unmasked,
         },
         task_block::{SigSavedContext, TaskControlBlock, TaskStatus},
     },
@@ -70,20 +70,40 @@ fn is_stop_signal(signum: usize) -> bool {
 
 fn wake_parent_waiters() {
     let child = current_process();
-    let parent = {
+    let (parent, tracer_pid) = {
         let inner = child.borrow_mut();
-        inner.parent.as_ref().and_then(|p| p.upgrade())
+        (
+            inner.parent.as_ref().and_then(|p| p.upgrade()),
+            inner.ptrace_tracer_pid,
+        )
     };
-    let Some(parent) = parent else {
-        return;
-    };
-    crate::task::signal::queue_process_signal(parent.getpid(), SIGCHLD);
-    let waiters = {
-        let mut parent_inner = parent.borrow_mut();
-        parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
-    };
-    for waiter in waiters {
-        wakeup_task(waiter);
+
+    let mut parent_pid = None;
+    if let Some(parent) = parent {
+        parent_pid = Some(parent.getpid());
+        crate::task::signal::queue_process_signal(parent.getpid(), SIGCHLD);
+        let waiters = {
+            let mut parent_inner = parent.borrow_mut();
+            parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            wakeup_task(waiter);
+        }
+    }
+
+    if let Some(tracer_pid) = tracer_pid {
+        if parent_pid != Some(tracer_pid) {
+            if let Some(tracer) = pid2process(tracer_pid) {
+                crate::task::signal::queue_process_signal(tracer.getpid(), SIGCHLD);
+                let waiters = {
+                    let mut tracer_inner = tracer.borrow_mut();
+                    tracer_inner.wait_queue.drain(..).collect::<Vec<_>>()
+                };
+                for waiter in waiters {
+                    wakeup_task(waiter);
+                }
+            }
+        }
     }
 }
 
@@ -1246,6 +1266,40 @@ pub fn maybe_deliver_signal() {
             action.restorer,
             action.mask
         );
+    }
+    if signum != SIGKILL_NUM {
+        let trace_stop_tasks = {
+            let process = current_process();
+            let mut inner = process.borrow_mut();
+            if inner.ptrace_tracer_pid.is_some() {
+                inner.stopped = true;
+                inner.stop_signal = signum as i32;
+                inner.stop_pending = true;
+                inner.continued = false;
+                Some(
+                    inner
+                        .tasks
+                        .iter()
+                        .filter_map(|t| t.as_ref().cloned())
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(tasks) = trace_stop_tasks {
+            for t in tasks {
+                let mut t_inner = t.borrow_mut();
+                if t_inner.task_status != TaskStatus::Blocked {
+                    t_inner.task_status = TaskStatus::Blocked;
+                    t_inner.stopped_by_signal = true;
+                }
+            }
+            wake_parent_waiters();
+            restore_sigsuspend_mask(&task);
+            block_current_and_run_next();
+            return;
+        }
     }
     if signum == SIGCONT_NUM {
         let was_stopped = {

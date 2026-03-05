@@ -4,6 +4,7 @@ use super::File;
 use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
 use crate::mm::UserBuffer;
 use crate::println;
+use crate::task::manager::PID2PCB;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -369,7 +370,7 @@ impl OSInode {
         Ok(buf.len())
     }
 
-    pub fn flush(&self) -> Result<(), ()> {
+    pub fn flush_with_error(&self) -> Result<(), ext4_fs::Ext4Error> {
         let mut inner = self.inner.lock();
         if inner.write_buf.is_empty() {
             return Ok(());
@@ -410,13 +411,22 @@ impl OSInode {
         }
         match result {
             Ok(n) if n == data.len() => Ok(()),
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 // Restore buffer best-effort (so we don't silently drop data).
                 inner.write_buf_off = off;
                 inner.write_buf = data;
-                Err(())
+                Err(ext4_fs::Ext4Error::NoSpace)
+            }
+            Err(e) => {
+                inner.write_buf_off = off;
+                inner.write_buf = data;
+                Err(e)
             }
         }
+    }
+
+    pub fn flush(&self) -> Result<(), ()> {
+        self.flush_with_error().map_err(|_| ())
     }
 
     pub fn offset(&self) -> usize {
@@ -450,6 +460,35 @@ pub(crate) fn register_deferred_unlink_cleanup(
     DEFERRED_UNLINK_CLEANUP
         .lock()
         .insert(key, TmpfileCleanup { parent, name });
+}
+
+fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        if inner
+            .fd_table
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .any(|file| {
+                file.as_any()
+                    .downcast_ref::<OSInode>()
+                    .map(|o| {
+                        let inode = o.ext4_inode();
+                        inode.inode_num() == inode_num && inode.device_id() == device_id
+                    })
+                    .unwrap_or(false)
+            })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 lazy_static! {
@@ -901,11 +940,16 @@ impl Drop for OSInode {
                 cleanup.parent.unlink(&cleanup.name)
             };
         }
-        if let Some(cleanup) = DEFERRED_UNLINK_CLEANUP.lock().remove(&inode_key) {
-            let _ = {
-                let _fs_guard = ext4_lock();
-                cleanup.parent.unlink(&cleanup.name)
-            };
+        let deferred_cleanup = { DEFERRED_UNLINK_CLEANUP.lock().remove(&inode_key) };
+        if let Some(cleanup) = deferred_cleanup {
+            if has_open_inode_fd_refs(inode_key.0, inode_key.1) {
+                DEFERRED_UNLINK_CLEANUP.lock().insert(inode_key, cleanup);
+            } else {
+                let _ = {
+                    let _fs_guard = ext4_lock();
+                    cleanup.parent.unlink(&cleanup.name)
+                };
+            }
         }
     }
 }

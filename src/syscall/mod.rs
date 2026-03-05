@@ -150,6 +150,7 @@ const SYSCALL_TIMER_GETTIME: usize = 108;
 const SYSCALL_TIMER_GETOVERRUN: usize = 109;
 const SYSCALL_TIMER_SETTIME: usize = 110;
 const SYSCALL_TIMER_DELETE: usize = 111;
+const SYSCALL_PTRACE: usize = 117;
 const SYSCALL_SYSLOG: usize = 116;
 const SYSCALL_CLOCK_SETTIME: usize = 112;
 const SYSCALL_CLOCK_GETTIME: usize = 113;
@@ -592,6 +593,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             time_sys::syscall_clock_nanosleep(args[0], args[1], args[2], args[3])
         }
         SYSCALL_SYSLOG => misc::syscall_syslog(args[0], args[1], args[2]),
+        SYSCALL_PTRACE => process::syscall_ptrace(args[0], args[1], args[2], args[3]),
         SYSCALL_SCHED_SETPARAM => sched::syscall_sched_setparam(args[0], args[1]),
         SYSCALL_SCHED_SETSCHEDULER => sched::syscall_sched_setscheduler(args[0], args[1], args[2]),
         SYSCALL_SCHED_GETSCHEDULER => sched::syscall_sched_getscheduler(args[0]),

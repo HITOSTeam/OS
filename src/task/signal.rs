@@ -282,10 +282,10 @@ pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
         let Some(bit) = signal_bit(signum) else {
             continue;
         };
-        let handler = {
+        let (handler, traced) = {
             let process = current_process();
             let inner = process.borrow_mut();
-            if signum <= MAX_SIG {
+            let handler = if signum <= MAX_SIG {
                 let legacy = inner.signals_actions.table[signum].handler;
                 if legacy != 0 {
                     legacy
@@ -302,8 +302,14 @@ pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
                     .get(signum)
                     .map(|a| a.handler)
                     .unwrap_or(SIG_DFL)
-            }
+            };
+            (handler, inner.ptrace_tracer_pid.is_some())
         };
+        // Traced tasks should be intercepted in ptrace-stop first (except SIGKILL),
+        // so don't short-circuit to default fatal handling here.
+        if traced && signum != SIGKILL_NUM {
+            continue;
+        }
         if handler == SIG_IGN {
             // Ignored signals are discarded.
             let mut inner = task.borrow_mut();

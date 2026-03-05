@@ -5108,8 +5108,8 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
                 buffer,
                 written as usize,
             );
-            if os_inode.flush().is_err() {
-                return EIO;
+            if let Err(e) = os_inode.flush_with_error() {
+                return ext4_err_to_errno(e);
             }
         }
     }
@@ -6071,21 +6071,32 @@ fn flush_open_inode_views(target: &Arc<ext4_fs::Inode>) {
 fn has_open_inode_view(target: &Arc<ext4_fs::Inode>) -> bool {
     let target_ino = target.inode_num();
     let target_dev = target.device_id();
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    inner
-        .fd_table
-        .iter()
-        .filter_map(|f| f.as_ref())
-        .any(|file| {
-            file.as_any()
-                .downcast_ref::<OSInode>()
-                .map(|o| {
-                    let inode = o.ext4_inode();
-                    inode.inode_num() == target_ino && inode.device_id() == target_dev
-                })
-                .unwrap_or(false)
-        })
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        if inner
+            .fd_table
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .any(|file| {
+                file.as_any()
+                    .downcast_ref::<OSInode>()
+                    .map(|o| {
+                        let inode = o.ext4_inode();
+                        inode.inode_num() == target_ino && inode.device_id() == target_dev
+                    })
+                    .unwrap_or(false)
+            })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn defer_unlink_open_file(
