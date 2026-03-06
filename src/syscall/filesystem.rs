@@ -3,6 +3,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::cmp::min;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
@@ -11,7 +12,7 @@ use spin::Mutex;
 use crate::task::manager::{wakeup_task, PID2PCB};
 use crate::{
     fs::{
-        ext4_lock, find_path_in_roots, make_pipe, open_file, pseudo_block_note_sync,
+        ext4_lock, find_path_in_roots, make_pipe, open_file, pseudo_block_is_read_only, pseudo_block_note_sync,
         pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode, shm_create,
         shm_get, shm_list, shm_remove, File, NetSocketFile, OSInode, OpenFlags, Pipe, ProcPseudoFile,
         PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile,
@@ -64,6 +65,67 @@ const O_CLOEXEC: usize = 0x80000;
 const O_TMPFILE: usize = 0x410000;
 
 const FD_CLOEXEC: u32 = 1;
+
+const MS_RDONLY: usize = 0x1;
+const MS_NOSUID: usize = 0x2;
+const MS_NODEV: usize = 0x4;
+const MS_NOEXEC: usize = 0x8;
+const MS_REMOUNT: usize = 0x20;
+const MS_NOSYMFOLLOW: usize = 0x100;
+const MS_NOATIME: usize = 0x400;
+const MS_NODIRATIME: usize = 0x800;
+const MS_BIND: usize = 0x1000;
+const MS_MOVE: usize = 0x2000;
+const MS_PRIVATE: usize = 1 << 18;
+const MS_STRICTATIME: usize = 1 << 24;
+
+const MNT_FORCE: usize = 0x1;
+const MNT_DETACH: usize = 0x2;
+const MNT_EXPIRE: usize = 0x4;
+const UMOUNT_NOFOLLOW: usize = 0x8;
+
+const OPEN_TREE_CLONE: usize = 0x1;
+const MOVE_MOUNT_F_SYMLINKS: usize = 0x1;
+const MOVE_MOUNT_F_AUTOMOUNTS: usize = 0x2;
+const MOVE_MOUNT_F_EMPTY_PATH: usize = 0x4;
+const MOVE_MOUNT_T_SYMLINKS: usize = 0x10;
+const MOVE_MOUNT_T_AUTOMOUNTS: usize = 0x20;
+const MOVE_MOUNT_T_EMPTY_PATH: usize = 0x40;
+const MOVE_MOUNT__MASK: usize = 0x77;
+const FSOPEN_CLOEXEC: usize = 0x1;
+const FSMOUNT_CLOEXEC: usize = 0x1;
+const FSPICK_CLOEXEC: usize = 0x1;
+const FSPICK_SYMLINK_NOFOLLOW: usize = 0x2;
+const FSPICK_NO_AUTOMOUNT: usize = 0x4;
+const FSPICK_EMPTY_PATH: usize = 0x8;
+
+const FSCONFIG_SET_FLAG: usize = 0;
+const FSCONFIG_SET_STRING: usize = 1;
+const FSCONFIG_SET_BINARY: usize = 2;
+const FSCONFIG_SET_PATH: usize = 3;
+const FSCONFIG_SET_PATH_EMPTY: usize = 4;
+const FSCONFIG_SET_FD: usize = 5;
+const FSCONFIG_CMD_CREATE: usize = 6;
+const FSCONFIG_CMD_RECONFIGURE: usize = 7;
+
+const MOUNT_ATTR_RDONLY: usize = 0x00000001;
+const MOUNT_ATTR_NOSUID: usize = 0x00000002;
+const MOUNT_ATTR_NODEV: usize = 0x00000004;
+const MOUNT_ATTR_NOEXEC: usize = 0x00000008;
+const MOUNT_ATTR_NOATIME: usize = 0x00000010;
+const MOUNT_ATTR_STRICTATIME: usize = 0x00000020;
+const MOUNT_ATTR_NODIRATIME: usize = 0x00000080;
+const MOUNT_ATTR_NOSYMFOLLOW: usize = 0x00200000;
+const ST_NOSYMFOLLOW: usize = 0x2000;
+
+const FSMOUNT_SUPPORTED_ATTRS: usize = MOUNT_ATTR_RDONLY
+    | MOUNT_ATTR_NOSUID
+    | MOUNT_ATTR_NODEV
+    | MOUNT_ATTR_NOEXEC
+    | MOUNT_ATTR_NOATIME
+    | MOUNT_ATTR_STRICTATIME
+    | MOUNT_ATTR_NODIRATIME
+    | MOUNT_ATTR_NOSYMFOLLOW;
 const PATH_MAX: usize = 4096;
 const NAME_MAX: usize = 255;
 const MAX_SYMLINKS: usize = 40;
@@ -78,6 +140,7 @@ const S_IFIFO: u16 = 0o010000;
 // Linux errno (negative return in kernel ABI).
 const EBADF: isize = -9;
 const EFAULT: isize = -14;
+const ENOTBLK: isize = -15;
 const EFBIG: isize = -27;
 const EAGAIN: isize = -11;
 const EINTR: isize = -4;
@@ -85,6 +148,7 @@ const E2BIG: isize = -7;
 const ELOOP: isize = -40;
 const EPERM: isize = -1;
 const ENOENT: isize = -2;
+const ENODEV: isize = -19;
 const ENODATA: isize = -61;
 const EINVAL: isize = -22;
 const EBUSY: isize = -16;
@@ -320,9 +384,13 @@ lazy_static! {
     static ref INODE_XATTRS: Mutex<BTreeMap<u64, BTreeMap<String, Vec<u8>>>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_FSFLAGS: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
+    static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> = Mutex::new(BTreeMap::new());
     static ref FIFO_PIPE_STATES: Mutex<BTreeMap<u64, Arc<FifoPipeState>>> =
         Mutex::new(BTreeMap::new());
     static ref ROFS_MOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static ref MOUNT_TABLE: Mutex<Vec<MountRecord>> = Mutex::new(Vec::new());
+    static ref DEVICE_MOUNT_SOURCES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+    static ref TMPFS_REATTACH_SOURCES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
     static ref ACCT_STATE: Mutex<Option<AcctState>> = Mutex::new(None);
     static ref RECORD_LOCKS: Mutex<BTreeMap<FileLockKey, Vec<RecordLock>>> =
         Mutex::new(BTreeMap::new());
@@ -379,8 +447,628 @@ pub(crate) fn set_inode_fs_flags(ino: u64, flags: u32) {
     }
 }
 
+fn note_inode_path_hint(inode: &Arc<ext4_fs::Inode>, path: &str) {
+    INODE_PATH_HINTS
+        .lock()
+        .insert((inode.device_id(), inode.inode_num()), String::from(path));
+}
+
+fn inode_path_hint(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
+    INODE_PATH_HINTS
+        .lock()
+        .get(&(inode.device_id(), inode.inode_num()))
+        .cloned()
+}
+
 fn inode_is_immutable_or_append(inode: &Arc<ext4_fs::Inode>) -> bool {
     (inode_fs_flags(inode.inode_num() as u64) & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0
+}
+
+#[derive(Clone)]
+struct MountRecord {
+    target: String,
+    source: String,
+    source_display: String,
+    fs_type: String,
+    flags: usize,
+    access_seq: usize,
+    expire_mark_seq: Option<usize>,
+}
+
+fn mount_flags_to_proc_opts(flags: usize) -> String {
+    let mut opts = Vec::new();
+    opts.push(if (flags & MS_RDONLY) != 0 { "ro" } else { "rw" });
+    if (flags & MS_NOSUID) != 0 {
+        opts.push("nosuid");
+    }
+    if (flags & MS_NODEV) != 0 {
+        opts.push("nodev");
+    }
+    if (flags & MS_NOEXEC) != 0 {
+        opts.push("noexec");
+    }
+    if (flags & MS_NOATIME) != 0 {
+        opts.push("noatime");
+    }
+    if (flags & MS_NODIRATIME) != 0 {
+        opts.push("nodiratime");
+    }
+    if (flags & MS_STRICTATIME) != 0 {
+        opts.push("strictatime");
+    }
+    if (flags & MS_NOSYMFOLLOW) != 0 {
+        opts.push("nosymfollow");
+    }
+    if (flags & (MS_NOATIME | MS_STRICTATIME)) == 0 {
+        opts.push("relatime");
+    }
+    opts.join(",")
+}
+
+fn mount_flags_to_statfs(flags: usize) -> i64 {
+    const ST_VALID: usize = MS_REMOUNT;
+    let mut out = ST_VALID;
+    out |= flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | MS_NODIRATIME | MS_STRICTATIME);
+    if (flags & MS_NOSYMFOLLOW) != 0 {
+        out |= ST_NOSYMFOLLOW;
+    }
+    out as i64
+}
+
+fn mount_source_join(source: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        return String::from(source);
+    }
+    if source == "/" {
+        return alloc::format!("/{}", suffix.trim_start_matches('/'));
+    }
+    alloc::format!("{}/{}", source.trim_end_matches('/'), suffix.trim_start_matches('/'))
+}
+
+fn mount_lookup_for_abs(abs: &str) -> Option<MountRecord> {
+    let mounts = MOUNT_TABLE.lock();
+    let mut best: Option<MountRecord> = None;
+    for mount in mounts.iter() {
+        if !path_under_mount(abs, &mount.target) {
+            continue;
+        }
+        match best.as_ref() {
+            Some(cur) if mount.target.len() <= cur.target.len() => {}
+            _ => best = Some(mount.clone()),
+        }
+    }
+    best
+}
+
+fn mount_flags_for_abs(abs: &str) -> usize {
+    mount_lookup_for_abs(abs).map(|m| m.flags).unwrap_or(0)
+}
+
+fn translate_mount_abs(abs: &str) -> String {
+    let Some(mount) = mount_lookup_for_abs(abs) else {
+        return String::from(abs);
+    };
+    let suffix = if abs == mount.target {
+        ""
+    } else {
+        &abs[mount.target.len()..]
+    };
+    normalize_path("/", &mount_source_join(&mount.source, suffix))
+}
+
+fn upsert_mount_record(target: &str, source: &str, source_display: &str, fs_type: &str, flags: usize) {
+    let mut mounts = MOUNT_TABLE.lock();
+    let state = mounts
+        .iter()
+        .find(|m| m.target == target)
+        .map(|m| (m.access_seq, m.expire_mark_seq))
+        .unwrap_or((0, None));
+    mounts.retain(|m| m.target != target);
+    mounts.push(MountRecord {
+        target: String::from(target),
+        source: String::from(source),
+        source_display: String::from(source_display),
+        fs_type: String::from(fs_type),
+        flags,
+        access_seq: state.0,
+        expire_mark_seq: state.1,
+    });
+}
+
+fn remove_mount_record(target: &str) -> bool {
+    let mut mounts = MOUNT_TABLE.lock();
+    let old_len = mounts.len();
+    mounts.retain(|m| m.target != target);
+    mounts.len() != old_len
+}
+
+fn update_mount_record_flags(target: &str, flags: usize) -> bool {
+    let mut mounts = MOUNT_TABLE.lock();
+    let Some(record) = mounts.iter_mut().find(|m| m.target == target) else {
+        return false;
+    };
+    record.flags = flags;
+    true
+}
+
+fn move_mount_record_target(old_target: &str, new_target: &str) -> bool {
+    let mut mounts = MOUNT_TABLE.lock();
+    let Some(record) = mounts.iter_mut().find(|m| m.target == old_target) else {
+        return false;
+    };
+    record.target = String::from(new_target);
+    true
+}
+
+fn mount_display_abs(abs: &str) -> String {
+    let mounts = MOUNT_TABLE.lock();
+    let mut best: Option<&MountRecord> = None;
+    for mount in mounts.iter() {
+        if !path_under_mount(abs, &mount.source) {
+            continue;
+        }
+        match best {
+            Some(cur) if mount.source.len() <= cur.source.len() => {}
+            _ => best = Some(mount),
+        }
+    }
+    let Some(mount) = best else {
+        return String::from(abs);
+    };
+    let suffix = if abs == mount.source {
+        ""
+    } else {
+        &abs[mount.source.len()..]
+    };
+    normalize_path("/", &mount_source_join(&mount.target, suffix))
+}
+
+fn sync_rofs_mount_flag(target: &str, flags: usize) {
+    let mut mounts = ROFS_MOUNTS.lock();
+    mounts.retain(|m| m != target);
+    if (flags & MS_RDONLY) != 0 {
+        mounts.push(String::from(target));
+    }
+}
+
+fn mount_flag_mask() -> usize {
+    MS_RDONLY
+        | MS_NOSUID
+        | MS_NODEV
+        | MS_NOEXEC
+        | MS_NOSYMFOLLOW
+        | MS_NOATIME
+        | MS_NODIRATIME
+        | MS_STRICTATIME
+}
+
+fn mount_record_for_target(target: &str) -> Option<MountRecord> {
+    let mounts = MOUNT_TABLE.lock();
+    mounts.iter().find(|m| m.target == target).cloned()
+}
+
+fn note_mount_access(abs: &str) {
+    let mut mounts = MOUNT_TABLE.lock();
+    let mut best_idx = None;
+    let mut best_len = 0usize;
+    for (idx, mount) in mounts.iter().enumerate() {
+        if path_under_mount(abs, &mount.target) && mount.target.len() >= best_len {
+            best_idx = Some(idx);
+            best_len = mount.target.len();
+        }
+    }
+    if let Some(idx) = best_idx {
+        mounts[idx].access_seq = mounts[idx].access_seq.saturating_add(1);
+    }
+}
+
+fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Option<String> {
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        return Some(String::from(pdir.path()));
+    }
+    if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+        return match pf.kind_tag() {
+            crate::fs::PseudoKindTag::Null => Some(String::from("/dev/null")),
+            crate::fs::PseudoKindTag::Zero => Some(String::from("/dev/zero")),
+            crate::fs::PseudoKindTag::Urandom => Some(String::from("/dev/urandom")),
+            crate::fs::PseudoKindTag::Static => None,
+        };
+    }
+    if file.as_any().downcast_ref::<RtcFile>().is_some() {
+        return Some(String::from("/dev/misc/rtc"));
+    }
+    if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
+        return Some(String::from("/dev/shm"));
+    }
+    let os_inode = file.as_any().downcast_ref::<OSInode>()?;
+    inode_path_hint(&os_inode.ext4_inode()).map(|path| mount_display_abs(&path))
+}
+
+fn mount_is_busy(target: &str, writable_only: bool) -> bool {
+    let self_bind_root = mount_record_for_target(target)
+        .map(|record| record.source == target)
+        .unwrap_or(false);
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes {
+        let (cwd, root, fd_table, is_zombie) = match process.try_borrow_mut() {
+            Some(inner) => {
+                let (fd_table, _fd_flags) = inner.snapshot_fd_state();
+                (inner.cwd.clone(), inner.root.clone(), fd_table, inner.is_zombie)
+            }
+            None => continue,
+        };
+        if is_zombie {
+            continue;
+        }
+        let cwd_busy = path_under_mount(&cwd, target) && !(self_bind_root && cwd == target);
+        let root_busy = path_under_mount(&root, target) && !(self_bind_root && root == target);
+        if cwd_busy || root_busy {
+            return true;
+        }
+        for file in fd_table.into_iter().flatten() {
+            if writable_only && !file.writable() {
+                continue;
+            }
+            let Some(path) = mount_file_logical_path(&file) else {
+                continue;
+            };
+            if path_under_mount(&path, target) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn ensure_mount_source_root() -> Result<Arc<ext4_fs::Inode>, isize> {
+    let _ext4_guard = ext4_lock();
+    let root = crate::fs::root_inode_for_path("/");
+    if let Some(dir) = root.find(".ltp_mounts") {
+        if dir.is_dir() {
+            return Ok(dir);
+        }
+        return Err(ENOTDIR);
+    }
+    match root.create_dir(".ltp_mounts") {
+        Ok(dir) => {
+            dir.set_uid_gid(0, 0);
+            dir.set_mode(0o700);
+            Ok(dir)
+        }
+        Err(e) => Err(ext4_err_to_errno(e)),
+    }
+}
+
+fn source_for_device_mount(key: &str) -> Result<String, isize> {
+    let fresh_instance = key.starts_with("tmpfs:");
+    if fresh_instance {
+        if let Some(path) = TMPFS_REATTACH_SOURCES.lock().remove(key) {
+            return Ok(path);
+        }
+    } else if let Some(path) = DEVICE_MOUNT_SOURCES.lock().get(key).cloned() {
+        return Ok(path);
+    }
+    let root = ensure_mount_source_root()?;
+    loop {
+        let id = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = alloc::format!("mnt.{}", id);
+        let _ext4_guard = ext4_lock();
+        if root.find(&name).is_some() {
+            continue;
+        }
+        match root.create_dir(&name) {
+            Ok(dir) => {
+                dir.set_uid_gid(0, 0);
+                dir.set_mode(0o755);
+                let path = alloc::format!("/.ltp_mounts/{}", name);
+                if !fresh_instance {
+                    DEVICE_MOUNT_SOURCES
+                        .lock()
+                        .insert(String::from(key), path.clone());
+                }
+                return Ok(path);
+            }
+            Err(e) => return Err(ext4_err_to_errno(e)),
+        }
+    }
+}
+
+fn target_dir_exists(abs: &str) -> Result<(), isize> {
+    let _ext4_guard = ext4_lock();
+    let inode = find_path_in_roots(abs).ok_or(ENOENT)?;
+    if !inode.is_dir() {
+        return Err(ENOTDIR);
+    }
+    Ok(())
+}
+
+fn sync_mount_record_rofs(target: &str) {
+    if let Some(record) = mount_record_for_target(target) {
+        sync_rofs_mount_flag(target, record.flags);
+    } else {
+        sync_rofs_mount_flag(target, 0);
+    }
+}
+
+fn should_update_inode_atime(path: &str, is_dir: bool, times: InodeTimes, now_sec: i64) -> bool {
+    let flags = mount_flags_for_abs(path);
+    if (flags & MS_NOATIME) != 0 {
+        return false;
+    }
+    if is_dir && (flags & MS_NODIRATIME) != 0 {
+        return false;
+    }
+    if (flags & MS_STRICTATIME) != 0 {
+        return true;
+    }
+    times.atime_sec <= times.mtime_sec
+        || times.atime_sec <= times.ctime_sec
+        || now_sec.saturating_sub(times.atime_sec) >= 24 * 60 * 60
+}
+
+fn maybe_update_inode_atime(inode: &Arc<ext4_fs::Inode>, is_dir: bool) {
+    let Some(path) = inode_path_hint(inode) else {
+        return;
+    };
+    let logical_path = mount_display_abs(&path);
+    let ino = inode.inode_num() as u64;
+    let times = get_inode_times(ino);
+    let (sec, nsec) = current_timespec();
+    if !should_update_inode_atime(&logical_path, is_dir, times, sec) {
+        return;
+    }
+    let mut next = times;
+    next.atime_sec = sec;
+    next.atime_nsec = nsec;
+    set_inode_times(ino, next);
+}
+
+pub(crate) fn mount_note_path_access(abs: &str) {
+    note_mount_access(abs);
+}
+
+pub(crate) fn syscall_mount_impl(
+    special_ptr: usize,
+    dir_ptr: usize,
+    fstype_ptr: usize,
+    flags: usize,
+    _data: usize,
+) -> isize {
+    if current_process().borrow_mut().euid != 0 {
+        return EPERM;
+    }
+    let token = get_current_token();
+    let dir = match read_user_cstring(token, dir_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if dir.is_empty() {
+        return ENOENT;
+    }
+    let process = current_process();
+    let cwd = { process.borrow_mut().cwd.clone() };
+    let target = normalize_path(&cwd, &dir);
+
+    if (flags & MS_PRIVATE) != 0 {
+        return match target_dir_exists(&target) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
+    }
+
+    let special = if special_ptr == 0 {
+        None
+    } else {
+        match read_user_cstring(token, special_ptr) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+    let fstype = if fstype_ptr == 0 {
+        None
+    } else {
+        match read_user_cstring(token, fstype_ptr) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+
+    if let Some(fsname) = fstype.as_deref() {
+        if fsname == "cgroup" || fsname == "cgroup2" || fsname == "error" {
+            return ENODEV;
+        }
+    }
+
+    if let Err(e) = target_dir_exists(&target) {
+        return e;
+    }
+
+    if (flags & MS_MOVE) != 0 {
+        let Some(source) = special.as_deref() else {
+            return EINVAL;
+        };
+        if source.is_empty() {
+            return EINVAL;
+        }
+        let old_target = normalize_path(&cwd, source);
+        let Some(old_record) = mount_record_for_target(&old_target) else {
+            return EINVAL;
+        };
+        if mount_record_for_target(&target).is_some() {
+            return EBUSY;
+        }
+        if !move_mount_record_target(&old_target, &target) {
+            return EINVAL;
+        }
+        sync_rofs_mount_flag(&old_target, 0);
+        sync_rofs_mount_flag(&target, old_record.flags);
+        return 0;
+    }
+
+    if (flags & MS_REMOUNT) != 0 {
+        let Some(record) = mount_record_for_target(&target) else {
+            return EINVAL;
+        };
+        let new_flags = flags & mount_flag_mask();
+        if (new_flags & MS_RDONLY) != 0 && mount_is_busy(&target, true) {
+            return EBUSY;
+        }
+        let _ = update_mount_record_flags(&target, new_flags);
+        sync_rofs_mount_flag(&target, new_flags);
+        if record.source_display == "/dev/root" && (new_flags & MS_RDONLY) == 0 && pseudo_block_is_read_only() {
+            return EACCES;
+        }
+        return 0;
+    }
+
+    if mount_record_for_target(&target).is_some() {
+        return EBUSY;
+    }
+
+    if (flags & MS_BIND) != 0 {
+        let Some(source_display) = special.as_deref() else {
+            return EINVAL;
+        };
+        if source_display.is_empty() {
+            return EINVAL;
+        }
+        let source_abs = normalize_path(&cwd, source_display);
+        let source = translate_mount_abs(&source_abs);
+        let _ext4_guard = ext4_lock();
+        if find_path_in_roots(&source).is_none() {
+            return ENOENT;
+        }
+        let fsname = fstype.as_deref().unwrap_or("none");
+        let base_flags = mount_lookup_for_abs(&source_abs).map(|m| m.flags).unwrap_or(0);
+        let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
+        upsert_mount_record(&target, &source, &source_abs, fsname, bind_flags);
+        sync_mount_record_rofs(&target);
+        return 0;
+    }
+
+    let Some(source_display) = special.as_deref() else {
+        return EINVAL;
+    };
+    let Some(fsname) = fstype.as_deref() else {
+        return EINVAL;
+    };
+    if source_display.is_empty() || fsname.is_empty() {
+        return EINVAL;
+    }
+    if source_display == "/dev/root" && (flags & MS_RDONLY) == 0 && pseudo_block_is_read_only() {
+        return EACCES;
+    }
+    let special_abs = normalize_path(&cwd, source_display);
+    {
+        let _ext4_guard = ext4_lock();
+        if let Some(inode) = find_path_in_roots(&special_abs) {
+            if inode.is_chrdev() {
+                return ENOTBLK;
+            }
+        }
+    }
+    let key = alloc::format!("{}:{}", fsname, source_display);
+    let source = match source_for_device_mount(&key) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    upsert_mount_record(&target, &source, source_display, fsname, flags & mount_flag_mask());
+    sync_mount_record_rofs(&target);
+    0
+}
+
+pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
+    let valid = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
+    if (flags & !valid) != 0 {
+        return EINVAL;
+    }
+    if current_process().borrow_mut().euid != 0 {
+        return EPERM;
+    }
+    if (flags & MNT_EXPIRE) != 0 && (flags & (MNT_FORCE | MNT_DETACH)) != 0 {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let path = match read_user_cstring(token, special_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+    let process = current_process();
+    let cwd = { process.borrow_mut().cwd.clone() };
+    let abs = normalize_path(&cwd, &path);
+
+    if (flags & UMOUNT_NOFOLLOW) != 0 {
+        let at = match resolve_at_path(AT_FDCWD, &path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let (fsuid, fsgid) = current_fsuid_gid();
+        let _ext4_guard = ext4_lock();
+        if let Ok(inode) = resolve_at_inode(&at, fsuid, fsgid, false) {
+            if inode.is_symlink() {
+                return EINVAL;
+            }
+        }
+    }
+
+    let Some(record) = mount_record_for_target(&abs) else {
+        let _ext4_guard = ext4_lock();
+        return if find_path_in_roots(&abs).is_some() { EINVAL } else { ENOENT };
+    };
+
+    if (flags & MNT_EXPIRE) != 0 {
+        let mut mounts = MOUNT_TABLE.lock();
+        let Some(entry) = mounts.iter_mut().find(|m| m.target == abs) else {
+            return EINVAL;
+        };
+        if entry.expire_mark_seq != Some(entry.access_seq) {
+            entry.expire_mark_seq = Some(entry.access_seq);
+            return EAGAIN;
+        }
+    }
+
+    if (flags & MNT_DETACH) == 0 && mount_is_busy(&abs, false) {
+        return EBUSY;
+    }
+
+    if (flags & MNT_DETACH) != 0 && record.fs_type == "tmpfs" {
+        let key = alloc::format!("{}:{}", record.fs_type, record.source_display);
+        TMPFS_REATTACH_SOURCES.lock().insert(key, record.source.clone());
+    }
+    sync_rofs_mount_flag(&abs, 0);
+    let _ = remove_mount_record(&abs);
+    if (record.flags & MS_RDONLY) != 0 {
+        let mut mounts = ROFS_MOUNTS.lock();
+        mounts.retain(|m| m != &abs);
+    }
+    0
+}
+
+pub(crate) fn proc_mounts_snapshot() -> String {
+    let mut out = String::from("/dev/root / ext4 rw,relatime 0 0\n");
+    let mut mounts = {
+        let mounts = MOUNT_TABLE.lock();
+        mounts.iter().cloned().collect::<Vec<_>>()
+    };
+    mounts.sort_by(|a, b| a.target.cmp(&b.target));
+    for mount in mounts {
+        let opts = mount_flags_to_proc_opts(mount.flags);
+        out.push_str(&alloc::format!(
+            "{} {} {} {} 0 0\n",
+            mount.source_display, mount.target, mount.fs_type, opts
+        ));
+    }
+    out
+}
+
+pub(crate) fn statfs_mount_flags_for_abs(abs: &str) -> i64 {
+    mount_flags_to_statfs(mount_flags_for_abs(abs))
 }
 
 pub(crate) fn register_rofs_mount(abs: &str) {
@@ -388,24 +1076,38 @@ pub(crate) fn register_rofs_mount(abs: &str) {
     if !mounts.iter().any(|m| m == abs) {
         mounts.push(String::from(abs));
     }
+    let _ = update_mount_record_flags(abs, mount_flags_for_abs(abs) | MS_RDONLY);
 }
 
 pub(crate) fn unregister_rofs_mount(abs: &str) {
     let mut mounts = ROFS_MOUNTS.lock();
     mounts.retain(|m| m != abs);
+    if let Some(mut record) = mount_lookup_for_abs(abs) {
+        if record.target == abs {
+            record.flags &= !MS_RDONLY;
+            let _ = update_mount_record_flags(abs, record.flags);
+        }
+    }
 }
 
 fn path_is_rofs(abs: &str) -> bool {
+    if (mount_flags_for_abs(abs) & MS_RDONLY) != 0 {
+        return true;
+    }
     let mounts = ROFS_MOUNTS.lock();
-    mounts.iter().any(|mnt| {
-        if mnt == "/" {
-            return true;
-        }
-        if abs == mnt {
-            return true;
-        }
-        abs.starts_with(mnt) && abs.as_bytes().get(mnt.len()) == Some(&b'/')
-    })
+    mounts.iter().any(|mnt| path_under_mount(abs, mnt))
+}
+
+fn path_is_nodev(abs: &str) -> bool {
+    (mount_flags_for_abs(abs) & MS_NODEV) != 0
+}
+
+fn path_is_noexec(abs: &str) -> bool {
+    (mount_flags_for_abs(abs) & MS_NOEXEC) != 0
+}
+
+fn path_is_nosymfollow(abs: &str) -> bool {
+    (mount_flags_for_abs(abs) & MS_NOSYMFOLLOW) != 0
 }
 
 fn inode_is_rofs_mount_root(inode: &Arc<ext4_fs::Inode>) -> bool {
@@ -414,7 +1116,7 @@ fn inode_is_rofs_mount_root(inode: &Arc<ext4_fs::Inode>) -> bool {
         mounts.iter().cloned().collect()
     };
     for mount in mounts {
-        let Some(mount_inode) = find_path_in_roots(&mount) else {
+        let Some(mount_inode) = find_path_in_roots(&translate_mount_abs(&mount)) else {
             continue;
         };
         if mount_inode.device_id() == inode.device_id()
@@ -427,6 +1129,9 @@ fn inode_is_rofs_mount_root(inode: &Arc<ext4_fs::Inode>) -> bool {
 }
 
 fn path_is_mount_point(abs: &str) -> bool {
+    if MOUNT_TABLE.lock().iter().any(|mnt| mnt.target == abs) {
+        return true;
+    }
     let mounts = ROFS_MOUNTS.lock();
     mounts.iter().any(|mnt| mnt == abs)
 }
@@ -446,6 +1151,9 @@ fn final_non_empty_component(path: &str) -> Option<&str> {
 }
 
 fn rofs_mount_root_for_abs(abs: &str) -> Option<String> {
+    if let Some(mount) = mount_lookup_for_abs(abs) {
+        return Some(mount.target);
+    }
     let mounts = ROFS_MOUNTS.lock();
     let mut best: Option<&str> = None;
     for mnt in mounts.iter() {
@@ -458,6 +1166,7 @@ fn rofs_mount_root_for_abs(abs: &str) -> Option<String> {
     }
     best.map(String::from)
 }
+
 
 fn hardlink_cross_mount(old_abs: &str, new_abs: &str) -> bool {
     match (
@@ -912,7 +1621,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
-            AtPath::Ext4Abs(abs)
+            AtPath::Ext4Abs(translate_mount_abs(&abs))
         });
     }
 
@@ -924,11 +1633,28 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         if crate::fs::is_proc_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
         }
-        return Ok(if is_pseudo_path(&abs) {
-            AtPath::PseudoAbs(abs)
+        if is_pseudo_path(&abs) {
+            return Ok(AtPath::PseudoAbs(abs));
+        }
+        let rel = if let Some(mount) = mount_lookup_for_abs(&abs) {
+            let suffix = if abs == mount.target {
+                String::new()
+            } else {
+                String::from(abs[mount.target.len()..].trim_start_matches('/'))
+            };
+            let _ext4_guard = ext4_lock();
+            let Some(base) = find_path_in_roots(&mount.source) else {
+                return Err(ENOENT);
+            };
+            return Ok(AtPath::Ext4Rel { base, rel: suffix });
         } else {
-            AtPath::Ext4Abs(abs)
-        });
+            normalize_relative_path(path)
+        };
+        let _ext4_guard = ext4_lock();
+        let Some(base) = find_path_in_roots(&translate_mount_abs(&cwd)) else {
+            return Err(ENOENT);
+        };
+        return Ok(AtPath::Ext4Rel { base, rel });
     }
 
     if dirfd < 0 {
@@ -947,7 +1673,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
-            AtPath::Ext4Abs(abs)
+            AtPath::Ext4Abs(translate_mount_abs(&abs))
         });
     }
 
@@ -1420,8 +2146,9 @@ fn resolve_ext4_path(
                 new_path.push_str(&remaining);
             }
             if new_path.starts_with('/') {
+                let translated = translate_mount_abs(&new_path);
                 return resolve_ext4_abs_path(
-                    &new_path,
+                    &translated,
                     uid,
                     gid,
                     follow_final,
@@ -1469,6 +2196,11 @@ fn resolve_at_inode(
 }
 
 pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    if let Some(abs) = resolve_abs_path(AT_FDCWD, path) {
+        if path_is_noexec(&abs) {
+            return Err(EACCES);
+        }
+    }
     let at = resolve_at_path(AT_FDCWD, path)?;
     if let AtPath::PseudoAbs(_) = &at {
         return Err(ENOENT);
@@ -1494,6 +2226,13 @@ pub(crate) fn resolve_exec_inode_at(
     let valid_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
     if (flags & !valid_flags) != 0 {
         return Err(EINVAL);
+    }
+    if !path.is_empty() {
+        if let Some(abs) = resolve_abs_path(dirfd, path) {
+            if path_is_noexec(&abs) {
+                return Err(EACCES);
+            }
+        }
     }
     let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
@@ -3128,12 +3867,13 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     };
     let tmpfile_requested = (flags & O_TMPFILE) == O_TMPFILE;
     let write_intent = writable || (flags & (O_CREAT | O_TRUNC)) != 0 || tmpfile_requested;
-    let readonly_fs = rofs_for_path(dirfd, &path);
+    let raw_abs = resolve_abs_path(dirfd, &path);
+    let readonly_fs = raw_abs.as_deref().map(path_is_rofs).unwrap_or(false);
     if write_intent && readonly_fs {
         return EROFS;
     }
     // `/proc/self/fd/<n>` reopen path: used by memfd and shell helpers.
-    if let Some(abs) = resolve_abs_path(dirfd, &path) {
+    if let Some(abs) = raw_abs.as_deref() {
         if let Some(src_fd) = parse_proc_fd_for_current_process(&abs) {
             let Some(src_file) = get_fd_file(src_fd) else {
                 return ENOENT;
@@ -3177,6 +3917,15 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     let mut tmpfile_cleanup_parent: Option<alloc::sync::Arc<ext4_fs::Inode>> = None;
     let mut tmpfile_cleanup_name: Option<alloc::string::String> = None;
     let (fsuid, fsgid) = current_fsuid_gid();
+    if let Some(abs) = raw_abs.as_deref() {
+        if path_is_nosymfollow(abs) {
+            if let Ok(inode) = resolve_at_inode(&at, fsuid, fsgid, false) {
+                if inode.is_symlink() {
+                    return ELOOP;
+                }
+            }
+        }
+    }
 
     // Pseudo fs: `/sys`, `/dev`.
     if let AtPath::PseudoAbs(abs) = &at {
@@ -3377,6 +4126,19 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         None => return ENOENT,
     };
 
+    if !tmpfile_requested {
+        if let Some(abs) = raw_abs.as_deref() {
+            note_inode_path_hint(&inode, abs);
+        }
+    }
+
+    if let Some(abs) = raw_abs.as_deref() {
+        let mode = inode.mode() & S_IFMT;
+        if path_is_nodev(abs) && matches!(mode, S_IFCHR | S_IFBLK) {
+            return EACCES;
+        }
+    }
+
     if created {
         let created_gid = gid_for_created_inode(created_parent.as_deref(), fsgid);
         let created_mode = mode_for_created_file(create_mode, created_gid);
@@ -3520,6 +4282,15 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     if let Some(node) = crate::fs::open_proc_pseudo(path) {
         return Some(node);
+    }
+    if (path.starts_with("/proc/sys/kernel/")
+        || path.starts_with("/proc/sys/fs/")
+        || path.starts_with("/proc/sys/net/")
+        || path.starts_with("/proc/sys/vm/"))
+    {
+        if let Some(inode) = find_path_in_roots(path) {
+            return Some(alloc::sync::Arc::new(OSInode::new(true, true, inode)));
+        }
     }
     if path == "/proc/sys" || path == "/proc/sys/" {
         let entries = alloc::vec![
@@ -4128,6 +4899,9 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     }
     if !inode_mode_allows_uid_gid(&inode, mode, uid, gid) {
         return EACCES;
+    }
+    if let Some(abs) = resolve_abs_path(dirfd, &path) {
+        mount_note_path_access(&abs);
     }
     0
 }
@@ -5179,7 +5953,14 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         return EFAULT;
     };
     let buf = UserBuffer::new(user_bufs);
-    file.read(buf) as isize
+    let read_len = file.read(buf) as isize;
+    if read_len >= 0 {
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            let inode = os_inode.ext4_inode();
+            maybe_update_inode_atime(&inode, false);
+        }
+    }
+    read_len
 }
 
 pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
@@ -5445,6 +6226,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
                 break;
             }
         }
+        maybe_update_inode_atime(&inode, false);
         return total as isize;
     }
 
@@ -7339,7 +8121,7 @@ struct KStatFs {
     f_spare: [i64; 4],
 }
 
-fn fill_statfs(st_ptr: usize) -> isize {
+fn fill_statfs(st_ptr: usize, mount_flags: i64) -> isize {
     if st_ptr == 0 {
         return EFAULT;
     }
@@ -7365,7 +8147,7 @@ fn fill_statfs(st_ptr: usize) -> isize {
         f_fsid: [0, 0],
         f_namelen: 255,
         f_frsize: block_size,
-        f_flags: 0,
+        f_flags: mount_flags,
         f_spare: [0; 4],
     };
     let token = get_current_token();
@@ -7381,7 +8163,7 @@ pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
         return EBADF;
     }
     let _ext4_guard = ext4_lock();
-    fill_statfs(st_ptr)
+    fill_statfs(st_ptr, 0)
 }
 
 /// Linux `statfs(2)` (syscall 43 on riscv64).
@@ -7404,7 +8186,7 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
             if open_pseudo(&abs).is_none() {
                 return ENOENT;
             }
-            fill_statfs(st_ptr)
+            fill_statfs(st_ptr, statfs_mount_flags_for_abs(&abs))
         }
         AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
             let (fsuid, fsgid) = current_fsuid_gid();
@@ -7412,7 +8194,8 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
             if let Err(e) = resolve_at_inode(&at, fsuid, fsgid, true) {
                 return e;
             }
-            fill_statfs(st_ptr)
+            let abs = resolve_abs_path(AT_FDCWD, path.as_str()).unwrap_or_else(|| String::from("/"));
+            fill_statfs(st_ptr, statfs_mount_flags_for_abs(&abs))
         }
     }
 }
@@ -8866,6 +9649,9 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
             src_off = end;
         }
         os_inode.set_dir_offset(index);
+        if written > 0 {
+            maybe_update_inode_atime(&inode, true);
+        }
         return written as isize;
     }
 
@@ -8986,6 +9772,9 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
 
     os_inode.set_dir_offset(off);
     drop(ext4_guard);
+    if written > 0 {
+        maybe_update_inode_atime(&inode, true);
+    }
     written as isize
 }
 
@@ -9135,4 +9924,492 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     }
 
     ESPIPE
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FsContextMode {
+    Create,
+    Reconfigure,
+}
+
+struct FsContextState {
+    mode: FsContextMode,
+    fs_type: String,
+    source_display: String,
+    source_abs: Option<String>,
+    target_abs: Option<String>,
+    pending_flags: usize,
+    created: bool,
+}
+
+struct FsContextFile {
+    state: Mutex<FsContextState>,
+}
+
+impl FsContextFile {
+    fn new_create(fs_type: &str) -> Self {
+        Self {
+            state: Mutex::new(FsContextState {
+                mode: FsContextMode::Create,
+                fs_type: String::from(fs_type),
+                source_display: String::from("/dev/root"),
+                source_abs: None,
+                target_abs: None,
+                pending_flags: 0,
+                created: false,
+            }),
+        }
+    }
+
+    fn new_reconfigure(fs_type: &str, source_display: &str, source_abs: &str, target_abs: &str, flags: usize) -> Self {
+        Self {
+            state: Mutex::new(FsContextState {
+                mode: FsContextMode::Reconfigure,
+                fs_type: String::from(fs_type),
+                source_display: String::from(source_display),
+                source_abs: Some(String::from(source_abs)),
+                target_abs: Some(String::from(target_abs)),
+                pending_flags: flags,
+                created: false,
+            }),
+        }
+    }
+}
+
+impl File for FsContextFile {
+    fn readable(&self) -> bool { false }
+    fn writable(&self) -> bool { false }
+    fn read(&self, _buf: UserBuffer) -> usize { 0 }
+    fn write(&self, _buf: UserBuffer) -> usize { 0 }
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+struct MountHandleState {
+    source: String,
+    source_display: String,
+    fs_type: String,
+    flags: usize,
+}
+
+struct MountHandleFile {
+    state: Mutex<MountHandleState>,
+}
+
+impl MountHandleFile {
+    fn new(source: &str, source_display: &str, fs_type: &str, flags: usize) -> Self {
+        Self {
+            state: Mutex::new(MountHandleState {
+                source: String::from(source),
+                source_display: String::from(source_display),
+                fs_type: String::from(fs_type),
+                flags,
+            }),
+        }
+    }
+}
+
+impl File for MountHandleFile {
+    fn readable(&self) -> bool { false }
+    fn writable(&self) -> bool { false }
+    fn read(&self, _buf: UserBuffer) -> usize { 0 }
+    fn write(&self, _buf: UserBuffer) -> usize { 0 }
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KMountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+fn alloc_internal_fd(file: Arc<dyn File + Send + Sync>, fd_flags: u32) -> Result<isize, isize> {
+    let process = current_files_process();
+    let mut inner = process.borrow_mut();
+    let Some(fd) = inner.alloc_fd() else {
+        return Err(EMFILE);
+    };
+    inner.fd_table[fd] = Some(file);
+    inner.fd_flags[fd] = fd_flags;
+    Ok(fd as isize)
+}
+
+fn mount_attr_bits_to_legacy_flags(attrs: usize) -> usize {
+    let mut flags = 0usize;
+    if (attrs & MOUNT_ATTR_RDONLY) != 0 {
+        flags |= MS_RDONLY;
+    }
+    if (attrs & MOUNT_ATTR_NOSUID) != 0 {
+        flags |= MS_NOSUID;
+    }
+    if (attrs & MOUNT_ATTR_NODEV) != 0 {
+        flags |= MS_NODEV;
+    }
+    if (attrs & MOUNT_ATTR_NOEXEC) != 0 {
+        flags |= MS_NOEXEC;
+    }
+    if (attrs & MOUNT_ATTR_NOATIME) != 0 {
+        flags |= MS_NOATIME;
+    }
+    if (attrs & MOUNT_ATTR_STRICTATIME) != 0 {
+        flags |= MS_STRICTATIME;
+    }
+    if (attrs & MOUNT_ATTR_NODIRATIME) != 0 {
+        flags |= MS_NODIRATIME;
+    }
+    if (attrs & MOUNT_ATTR_NOSYMFOLLOW) != 0 {
+        flags |= MS_NOSYMFOLLOW;
+    }
+    flags
+}
+
+fn sync_rofs_state(target: &str, flags: usize) {
+    if (flags & MS_RDONLY) != 0 {
+        register_rofs_mount(target);
+    } else {
+        unregister_rofs_mount(target);
+    }
+}
+
+fn read_user_path_abs(dirfd: isize, ptr: usize) -> Result<String, isize> {
+    let token = get_current_token();
+    let path = read_user_cstring(token, ptr)?;
+    if path.is_empty() {
+        return Err(ENOENT);
+    }
+    resolve_abs_path(dirfd, &path).ok_or(EBADF)
+}
+
+fn ensure_mount_target_dir(abs: &str) -> Result<(), isize> {
+    let _ext4_guard = ext4_lock();
+    let Some(inode) = find_path_in_roots(abs) else {
+        return Err(ENOENT);
+    };
+    if !inode.is_dir() {
+        return Err(ENOTDIR);
+    }
+    Ok(())
+}
+
+fn mount_fs_type_for_abs(abs: &str) -> String {
+    mount_lookup_for_abs(abs)
+        .map(|m| m.fs_type)
+        .unwrap_or_else(|| String::from("ext4"))
+}
+
+fn mount_source_display_for_abs(abs: &str) -> String {
+    mount_lookup_for_abs(abs)
+        .map(|m| m.source_display)
+        .unwrap_or_else(|| String::from("/dev/root"))
+}
+
+pub fn syscall_fsopen(fsname: usize, flags: usize) -> isize {
+    if (flags & !FSOPEN_CLOEXEC) != 0 {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let fsname = match read_user_cstring(token, fsname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if fsname.is_empty() {
+        return EINVAL;
+    }
+    if fsname == "invalid" || fsname == "error" {
+        return ENODEV;
+    }
+    let mut fd_flags = 0u32;
+    if (flags & FSOPEN_CLOEXEC) != 0 {
+        fd_flags |= FD_CLOEXEC;
+    }
+    alloc_internal_fd(Arc::new(FsContextFile::new_create(&fsname)), fd_flags).unwrap_or_else(|e| e)
+}
+
+pub fn syscall_fsconfig(fd: usize, cmd: usize, key: usize, value: usize, aux: usize) -> isize {
+    let Some(file) = get_fd_file(fd) else {
+        return EINVAL;
+    };
+    let Some(ctx_file) = file.as_any().downcast_ref::<FsContextFile>() else {
+        return EINVAL;
+    };
+    let token = get_current_token();
+    let key_s = if key == 0 {
+        None
+    } else {
+        match read_user_cstring(token, key) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+    let value_s = if value == 0 {
+        None
+    } else {
+        match read_user_cstring(token, value) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+    let mut state = ctx_file.state.lock();
+    match cmd {
+        FSCONFIG_SET_FLAG => {
+            let Some(key_s) = key_s.as_deref() else { return EINVAL; };
+            if value_s.is_some() || aux != 0 {
+                return EINVAL;
+            }
+            match key_s {
+                "rw" => state.pending_flags &= !MS_RDONLY,
+                "ro" => state.pending_flags |= MS_RDONLY,
+                _ => return EINVAL,
+            }
+            0
+        }
+        FSCONFIG_SET_STRING => {
+            let Some(key_s) = key_s.as_deref() else { return EINVAL; };
+            let Some(value_s) = value_s.as_deref() else { return EINVAL; };
+            if aux != 0 || key_s.is_empty() || value_s.is_empty() {
+                return EINVAL;
+            }
+            match key_s {
+                "source" => {
+                    state.source_display = String::from(value_s);
+                    state.source_abs = Some(String::from("/"));
+                    0
+                }
+                "sync" => 0,
+                _ => EINVAL,
+            }
+        }
+        FSCONFIG_SET_BINARY => EINVAL,
+        FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY | FSCONFIG_SET_FD => {
+            if key_s.as_deref().unwrap_or("").is_empty() {
+                return EINVAL;
+            }
+            match cmd {
+                FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY => {
+                    if value_s.is_none() || aux == usize::MAX {
+                        return EINVAL;
+                    }
+                }
+                FSCONFIG_SET_FD => {
+                    if value_s.is_some() || aux == usize::MAX {
+                        return EINVAL;
+                    }
+                }
+                _ => {}
+            }
+            EOPNOTSUPP
+        }
+        FSCONFIG_CMD_CREATE => {
+            if key_s.is_some() || value_s.is_some() || aux != 0 {
+                return EINVAL;
+            }
+            if state.mode != FsContextMode::Create || state.source_abs.is_none() {
+                return EINVAL;
+            }
+            state.created = true;
+            0
+        }
+        FSCONFIG_CMD_RECONFIGURE => {
+            if key_s.is_some() || value_s.is_some() || aux != 0 {
+                return EINVAL;
+            }
+            if state.mode != FsContextMode::Reconfigure {
+                return EINVAL;
+            }
+            let Some(target_abs) = state.target_abs.clone() else {
+                return EINVAL;
+            };
+            if !update_mount_record_flags(&target_abs, state.pending_flags) {
+                return EINVAL;
+            }
+            sync_rofs_state(&target_abs, state.pending_flags);
+            0
+        }
+        _ => EOPNOTSUPP,
+    }
+}
+
+pub fn syscall_fsmount(fd: usize, flags: usize, mount_attrs: usize) -> isize {
+    if (flags & !FSMOUNT_CLOEXEC) != 0 {
+        return EINVAL;
+    }
+    if (mount_attrs & !FSMOUNT_SUPPORTED_ATTRS) != 0 {
+        return EINVAL;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    let Some(ctx_file) = file.as_any().downcast_ref::<FsContextFile>() else {
+        return EINVAL;
+    };
+    let state = ctx_file.state.lock();
+    if state.mode != FsContextMode::Create || !state.created {
+        return EINVAL;
+    }
+    let source = state.source_abs.clone().unwrap_or_else(|| String::from("/"));
+    let handle_flags = state.pending_flags | mount_attr_bits_to_legacy_flags(mount_attrs);
+    let mut fd_flags = 0u32;
+    if (flags & FSMOUNT_CLOEXEC) != 0 {
+        fd_flags |= FD_CLOEXEC;
+    }
+    alloc_internal_fd(
+        Arc::new(MountHandleFile::new(&source, &state.source_display, &state.fs_type, handle_flags)),
+        fd_flags,
+    )
+    .unwrap_or_else(|e| e)
+}
+
+pub fn syscall_fspick(dirfd: isize, path: usize, flags: usize) -> isize {
+    let valid_flags = FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    let abs = if path == 0 {
+        return EFAULT;
+    } else {
+        match read_user_path_abs(dirfd, path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    };
+    if let Err(e) = ensure_mount_target_dir(&translate_mount_abs(&abs)) {
+        return e;
+    }
+    let fs_type = mount_fs_type_for_abs(&abs);
+    let source_abs = translate_mount_abs(&abs);
+    let source_display = mount_source_display_for_abs(&abs);
+    let mut fd_flags = 0u32;
+    if (flags & FSPICK_CLOEXEC) != 0 {
+        fd_flags |= FD_CLOEXEC;
+    }
+    alloc_internal_fd(
+        Arc::new(FsContextFile::new_reconfigure(
+            &fs_type,
+            &source_display,
+            &source_abs,
+            &abs,
+            mount_flags_for_abs(&abs),
+        )),
+        fd_flags,
+    )
+    .unwrap_or_else(|e| e)
+}
+
+pub fn syscall_open_tree(dirfd: isize, path: usize, flags: usize) -> isize {
+    let valid_flags = OPEN_TREE_CLONE | O_CLOEXEC | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    let abs = if path == 0 {
+        return EFAULT;
+    } else {
+        match read_user_path_abs(dirfd, path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    };
+    if let Err(e) = ensure_mount_target_dir(&translate_mount_abs(&abs)) {
+        return e;
+    }
+    let source_abs = translate_mount_abs(&abs);
+    let source_display = mount_source_display_for_abs(&abs);
+    let fs_type = mount_fs_type_for_abs(&abs);
+    let mount_flags = mount_flags_for_abs(&abs);
+    let mut fd_flags = 0u32;
+    if (flags & O_CLOEXEC) != 0 {
+        fd_flags |= FD_CLOEXEC;
+    }
+    fd_flags |= O_PATH as u32;
+    alloc_internal_fd(
+        Arc::new(MountHandleFile::new(&source_abs, &source_display, &fs_type, mount_flags)),
+        fd_flags,
+    )
+    .unwrap_or_else(|e| e)
+}
+
+pub fn syscall_move_mount(from_dirfd: isize, from_path: usize, to_dirfd: isize, to_path: usize, flags: usize) -> isize {
+    if (flags & !MOVE_MOUNT__MASK) != 0 {
+        return EINVAL;
+    }
+    let from_path_s = if from_path == 0 {
+        return EFAULT;
+    } else {
+        match read_user_cstring(get_current_token(), from_path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    };
+    let to_abs = match read_user_path_abs(to_dirfd, to_path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = ensure_mount_target_dir(&to_abs) {
+        return e;
+    }
+    if from_dirfd < 0 {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(from_dirfd as usize) else {
+        return EBADF;
+    };
+    let Some(handle) = file.as_any().downcast_ref::<MountHandleFile>() else {
+        return EBADF;
+    };
+    if !from_path_s.is_empty() {
+        return ENOENT;
+    }
+    if (flags & MOVE_MOUNT_F_EMPTY_PATH) == 0 {
+        return ENOENT;
+    }
+    let state = handle.state.lock();
+    upsert_mount_record(&to_abs, &state.source, &state.source_display, &state.fs_type, state.flags);
+    sync_rofs_state(&to_abs, state.flags);
+    0
+}
+
+pub fn syscall_mount_setattr(dirfd: isize, path: usize, flags: usize, attr: usize, size: usize) -> isize {
+    if dirfd < 0 {
+        return EBADF;
+    }
+    if attr == 0 || size < core::mem::size_of::<KMountAttr>() {
+        return EINVAL;
+    }
+    let path_s = if path == 0 {
+        return EFAULT;
+    } else {
+        match read_user_cstring(get_current_token(), path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    };
+    if (flags & AT_EMPTY_PATH) == 0 || !path_s.is_empty() {
+        return EINVAL;
+    }
+    let Some(file) = get_fd_file(dirfd as usize) else {
+        return EBADF;
+    };
+    let Some(handle) = file.as_any().downcast_ref::<MountHandleFile>() else {
+        return EINVAL;
+    };
+    let mount_attr = match try_read_user_value(get_current_token(), attr as *const KMountAttr) {
+        Some(v) => v,
+        None => return EFAULT,
+    };
+    let attr_set = mount_attr.attr_set as usize;
+    let attr_clr = mount_attr.attr_clr as usize;
+    if (attr_set & !FSMOUNT_SUPPORTED_ATTRS) != 0 || (attr_clr & !FSMOUNT_SUPPORTED_ATTRS) != 0 {
+        return EINVAL;
+    }
+    let mut state = handle.state.lock();
+    state.flags |= mount_attr_bits_to_legacy_flags(attr_set);
+    state.flags &= !mount_attr_bits_to_legacy_flags(attr_clr);
+    0
+}
+pub fn syscall_mount(special: usize, dir: usize, fstype: usize, flags: usize, data: usize) -> isize {
+    syscall_mount_impl(special, dir, fstype, flags, data)
+}
+
+pub fn syscall_umount2(special: usize, flags: usize) -> isize {
+    syscall_umount2_impl(special, flags)
 }

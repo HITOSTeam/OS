@@ -179,7 +179,10 @@ pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {
 }
 
 pub fn syscall_fanotify_init(_flags: usize, _event_f_flags: usize) -> isize {
-    alloc_dummy_fd(0)
+    // We do not implement the fanotify subsystem yet. Linux reports ENOSYS
+    // when the syscall is unavailable, which lets LTP treat fanotify cases as
+    // TCONF instead of tripping later on a dummy fd.
+    ENOSYS
 }
 
 pub fn syscall_userfaultfd(_flags: usize) -> isize {

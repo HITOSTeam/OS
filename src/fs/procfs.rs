@@ -322,6 +322,34 @@ pub fn init_procfs() {
                 }
             }
         }
+        let vm_dir = ensure_dir(&sys_dir, "vm", 0o555);
+        if let Some(vm_dir) = vm_dir {
+            for (name, value) in [
+                ("drop_caches", "0\n"),
+                ("compact_memory", "0\n"),
+                ("vfs_cache_pressure", "100\n"),
+                ("min_free_kbytes", "1024\n"),
+                ("nr_hugepages", "0\n"),
+                ("nr_overcommit_hugepages", "0\n"),
+                ("nr_hugepages_mempolicy", "0\n"),
+                ("mmap_min_addr", "65536\n"),
+                ("overcommit_memory", "0\n"),
+                ("overcommit_ratio", "50\n"),
+                ("max_map_count", "65530\n"),
+                ("swappiness", "60\n"),
+                ("stat_refresh", "0\n"),
+                ("dirty_background_ratio", "10\n"),
+                ("dirty_ratio", "20\n"),
+                ("dirty_expire_centisecs", "3000\n"),
+                ("unprivileged_userfaultfd", "0\n"),
+                ("memory_failure_early_kill", "0\n"),
+            ] {
+                let file = ensure_file(&vm_dir, name, 0o644);
+                if let Some(file) = file {
+                    let _ = file.write_at(0, value.as_bytes());
+                }
+            }
+        }
         let net_dir = ensure_dir(&sys_dir, "net", 0o555);
         if let Some(net_dir) = net_dir {
             let ipv4_dir = ensure_dir(&net_dir, "ipv4", 0o555);
@@ -1131,7 +1159,7 @@ fn dt_type_from_ext4(ftype: u8) -> u8 {
 }
 
 fn proc_mounts() -> String {
-    String::from("/dev/root / ext4 rw 0 0\n")
+    crate::syscall::filesystem::proc_mounts_snapshot()
 }
 
 fn proc_meminfo() -> String {

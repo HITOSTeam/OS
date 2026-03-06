@@ -282,65 +282,11 @@ pub fn syscall_mount(
     _flags: usize,
     _data: usize,
 ) -> isize {
-    const MS_RDONLY: usize = 0x1;
-    if current_process().borrow_mut().euid != 0 {
-        return EPERM;
-    }
-    let token = get_current_token();
-    let special = if _special == 0 {
-        alloc::string::String::new()
-    } else {
-        translated_str(token, _special as *const u8)
-    };
-    let fstype = if _fstype == 0 {
-        alloc::string::String::new()
-    } else {
-        translated_str(token, _fstype as *const u8)
-    };
-    if fstype == "cgroup" || fstype == "cgroup2" {
-        return ENODEV;
-    }
-    let dir = translated_str(token, _dir as *const u8);
-    if dir.is_empty() {
-        return ENOENT;
-    }
-    let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
-    let abs = normalize_path(&cwd, &dir);
-    // Model `/dev/root` read-only toggling for BLKROSET/BLKROGET LTP coverage.
-    if special == "/dev/root" && (_flags & MS_RDONLY) == 0 && pseudo_block_is_read_only() {
-        return EACCES;
-    }
-    let _ext4_guard = ext4_lock();
-    let inode = match crate::fs::find_path_in_roots(&abs) {
-        Some(v) => v,
-        None => return ENOENT,
-    };
-    if !inode.is_dir() {
-        return ENOTDIR;
-    }
-    if (_flags & MS_RDONLY) != 0 {
-        register_rofs_mount(&abs);
-    } else {
-        unregister_rofs_mount(&abs);
-    }
-    0
+    crate::syscall::filesystem::syscall_mount_impl(_special, _dir, _fstype, _flags, _data)
 }
 
 pub fn syscall_umount2(_special: usize, _flags: usize) -> isize {
-    if current_process().borrow_mut().euid != 0 {
-        return EPERM;
-    }
-    let token = get_current_token();
-    let path = translated_str(token, _special as *const u8);
-    if path.is_empty() {
-        return ENOENT;
-    }
-    let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
-    let abs = normalize_path(&cwd, &path);
-    unregister_rofs_mount(&abs);
-    0
+    crate::syscall::filesystem::syscall_umount2_impl(_special, _flags)
 }
 
 #[repr(C)]

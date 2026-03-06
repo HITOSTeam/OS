@@ -278,8 +278,12 @@ const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 const SYSCALL_FANOTIFY_INIT: usize = 262;
 const SYSCALL_IO_URING_SETUP: usize = 425;
 const SYSCALL_OPEN_TREE: usize = 428;
+const SYSCALL_MOVE_MOUNT: usize = 429;
 const SYSCALL_FSOPEN: usize = 430;
+const SYSCALL_FSCONFIG: usize = 431;
+const SYSCALL_FSMOUNT: usize = 432;
 const SYSCALL_FSPICK: usize = 433;
+const SYSCALL_MOUNT_SETATTR: usize = 442;
 const SYSCALL_PIDFD_OPEN: usize = 434;
 const SYSCALL_MEMFD_SECRET: usize = 447;
 const SYSCALL_SIGACTION: usize = 134; // rt_sigaction
@@ -499,8 +503,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             filesystem::syscall_renameat(args[0] as isize, args[1], args[2] as isize, args[3])
         }
         SYSCALL_SYMLINKAT => filesystem::syscall_symlinkat(args[0], args[1] as isize, args[2]),
-        SYSCALL_UMOUNT2 => misc::syscall_umount2(args[0], args[1]),
-        SYSCALL_MOUNT => misc::syscall_mount(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_UMOUNT2 => filesystem::syscall_umount2(args[0], args[1]),
+        SYSCALL_MOUNT => filesystem::syscall_mount(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_FACCESSAT => {
             filesystem::syscall_faccessat(args[0] as isize, args[1], args[2], args[3])
         }
@@ -746,9 +750,25 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_VFORK => process::syscall_vfork(),
         SYSCALL_PIPE2 => filesystem::syscall_pipe2(args[0], args[1]),
         SYSCALL_IO_URING_SETUP => dummy::syscall_io_uring_setup(args[0], args[1]),
-        SYSCALL_OPEN_TREE => dummy::syscall_open_tree(args[0] as isize, args[1], args[2]),
-        SYSCALL_FSOPEN => dummy::syscall_fsopen(args[0], args[1]),
-        SYSCALL_FSPICK => dummy::syscall_fspick(args[0] as isize, args[1], args[2]),
+        SYSCALL_OPEN_TREE => filesystem::syscall_open_tree(args[0] as isize, args[1], args[2]),
+        SYSCALL_MOVE_MOUNT => filesystem::syscall_move_mount(
+            args[0] as isize,
+            args[1],
+            args[2] as isize,
+            args[3],
+            args[4],
+        ),
+        SYSCALL_FSOPEN => filesystem::syscall_fsopen(args[0], args[1]),
+        SYSCALL_FSCONFIG => filesystem::syscall_fsconfig(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_FSMOUNT => filesystem::syscall_fsmount(args[0], args[1], args[2]),
+        SYSCALL_FSPICK => filesystem::syscall_fspick(args[0] as isize, args[1], args[2]),
+        SYSCALL_MOUNT_SETATTR => filesystem::syscall_mount_setattr(
+            args[0] as isize,
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+        ),
         SYSCALL_PIDFD_OPEN => dummy::syscall_pidfd_open(args[0], args[1]),
         SYSCALL_MEMFD_SECRET => dummy::syscall_memfd_secret(args[0]),
         SYSCALL_REBOOT => misc::syscall_reboot(args[0], args[1], args[2], args[3]),
