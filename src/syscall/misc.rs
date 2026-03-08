@@ -1,6 +1,6 @@
 use crate::{
     arch,
-    config::clock_freq,
+    config::{PAGE_SIZE, clock_freq, phys_mem_end, phys_mem_start},
     debug_config::DEBUG_PTHREAD,
     fs::{
         LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind, PseudoKindTag, PtyMasterFile,
@@ -8,8 +8,9 @@ use crate::{
         pseudo_block_set_read_ahead, pseudo_block_set_read_only,
     },
     mm::{
-        MapPermission, read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
-        try_copy_to_user, try_read_user_value, try_write_user_value, write_user_value,
+        MapPermission, frame_available_pages, read_user_value, translated_byte_buffer,
+        translated_str, try_copy_from_user, try_copy_to_user, try_read_user_value,
+        try_write_user_value, write_user_value,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
@@ -141,6 +142,66 @@ lazy_static! {
     static ref UTS_CONFIG: Mutex<UtsConfig> = Mutex::new(UtsConfig::new());
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinuxSysinfo {
+    uptime: isize,
+    loads: [usize; 3],
+    totalram: usize,
+    freeram: usize,
+    sharedram: usize,
+    bufferram: usize,
+    totalswap: usize,
+    freeswap: usize,
+    procs: u16,
+    pad: u16,
+    totalhigh: usize,
+    freehigh: usize,
+    mem_unit: u32,
+    _f: [u8; 0],
+}
+
+const IOPRIO_CLASS_SHIFT: usize = 13;
+const IOPRIO_PRIO_MASK: usize = (1 << IOPRIO_CLASS_SHIFT) - 1;
+const IOPRIO_CLASS_NONE: usize = 0;
+const IOPRIO_CLASS_RT: usize = 1;
+const IOPRIO_CLASS_BE: usize = 2;
+const IOPRIO_CLASS_IDLE: usize = 3;
+const IOPRIO_PRIO_NUM: usize = 8;
+const IOPRIO_WHO_PROCESS: isize = 1;
+const IOPRIO_WHO_PGRP: isize = 2;
+const IOPRIO_WHO_USER: isize = 3;
+
+fn ioprio_class(ioprio: usize) -> usize {
+    ioprio >> IOPRIO_CLASS_SHIFT
+}
+
+fn ioprio_level(ioprio: usize) -> usize {
+    ioprio & IOPRIO_PRIO_MASK
+}
+
+fn valid_ioprio(ioprio: usize) -> bool {
+    match ioprio_class(ioprio) {
+        IOPRIO_CLASS_NONE => ioprio_level(ioprio) == 0,
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE => {
+            ioprio_level(ioprio) < IOPRIO_PRIO_NUM
+        }
+        _ => false,
+    }
+}
+
+fn collect_ioprio_targets(
+    which: isize,
+    who: isize,
+) -> Result<Vec<Arc<crate::task::ProcessControlBlock>>, isize> {
+    match which {
+        IOPRIO_WHO_PROCESS | IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => {
+            collect_priority_targets(which - 1, who)
+        }
+        _ => Err(EINVAL),
+    }
+}
+
 fn write_name_field(dst: &mut [u8; 65], src: &[u8]) {
     dst.fill(0);
     let n = src.len().min(64);
@@ -234,6 +295,74 @@ pub fn syscall_uname(buf: usize) -> isize {
         return EFAULT;
     }
     0
+}
+
+pub fn syscall_sysinfo(info: usize) -> isize {
+    if info == 0 {
+        return EFAULT;
+    }
+
+    let totalram = phys_mem_end().saturating_sub(phys_mem_start());
+    let freeram = frame_available_pages()
+        .saturating_mul(PAGE_SIZE)
+        .min(totalram);
+    let procs = PID2PCB.lock().len().min(u16::MAX as usize) as u16;
+    let sysinfo = LinuxSysinfo {
+        uptime: (get_time_ms() / 1000) as isize,
+        loads: [0; 3],
+        totalram,
+        freeram,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs,
+        pad: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        _f: [],
+    };
+    let token = get_current_token();
+    if try_write_user_value(token, info as *mut LinuxSysinfo, &sysinfo).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+pub fn syscall_ioprio_set(which: isize, who: isize, ioprio: usize) -> isize {
+    if !valid_ioprio(ioprio) {
+        return EINVAL;
+    }
+    if ioprio_class(ioprio) == IOPRIO_CLASS_RT && current_process().borrow_mut().euid != 0 {
+        return EPERM;
+    }
+
+    let targets = match collect_ioprio_targets(which, who) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ioprio = ioprio as u16;
+    for proc in targets {
+        proc.borrow_mut().ioprio = ioprio;
+    }
+    0
+}
+
+pub fn syscall_ioprio_get(which: isize, who: isize) -> isize {
+    let targets = match collect_ioprio_targets(which, who) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut best: Option<usize> = None;
+    for proc in targets {
+        let value = proc.borrow_mut().ioprio as usize;
+        best = Some(match best {
+            Some(cur) => cur.min(value),
+            None => value,
+        });
+    }
+    best.unwrap_or(0) as isize
 }
 
 /// Linux-compatible gethostname behavior used by some musl paths:

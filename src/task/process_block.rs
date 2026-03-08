@@ -859,6 +859,8 @@ pub struct ProcessControlBlockInner {
     pub cap_bounding: u64,
     /// Linux personality(2) flags (PER_LINUX by default).
     pub personality: u32,
+    /// Per-process I/O priority encoded like Linux `ioprio_get/set(2)`.
+    pub ioprio: u16,
     /// Per-process file mode creation mask (umask).
     pub umask: usize,
     //
@@ -1323,6 +1325,7 @@ impl ProcessControlBlock {
                 cap_inheritable: u64::MAX,
                 cap_bounding: u64::MAX,
                 personality: 0,
+                ioprio: 0,
                 umask: 0,
                 fd_table: vec![
                     // 0 -> stdin
@@ -1793,6 +1796,7 @@ impl ProcessControlBlock {
                 cap_inheritable: parent.cap_inheritable,
                 cap_bounding: parent.cap_bounding,
                 personality: parent.personality,
+                ioprio: parent.ioprio,
                 umask: parent.umask,
                 fd_table: new_fd_table,
                 fd_flags: new_fd_flags,

@@ -25,7 +25,8 @@ pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
 pub use dtb::init_phys_mem_from_dtb;
 pub use frame_allocator::{
-    FrameTracker, frame_alloc, frame_alloc_contiguous, frame_dealloc, frame_refcount_entries,
+    FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages, frame_dealloc,
+    frame_refcount_entries,
 };
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.

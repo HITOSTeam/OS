@@ -192,6 +192,11 @@ pub fn frame_refcount_entries() -> usize {
     FRAME_REFCOUNTS.lock().len()
 }
 
+pub fn frame_available_pages() -> usize {
+    let allocator = FRAME_ALLOCATOR.lock();
+    allocator.recycled.len() + allocator.end.saturating_sub(allocator.current)
+}
+
 pub fn frame_alloc_contiguous(pages: usize) -> Option<Vec<FrameTracker>> {
     let start = FRAME_ALLOCATOR.lock().alloc_contiguous(pages)?;
     let mut frames = Vec::with_capacity(pages);
