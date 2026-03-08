@@ -563,9 +563,17 @@ impl File for PseudoShmFile {
 
 impl PseudoFile {
     pub fn new_static(content: &str) -> Self {
+        Self::new_static_with_writable(content, false)
+    }
+
+    pub fn new_static_rw(content: &str) -> Self {
+        Self::new_static_with_writable(content, true)
+    }
+
+    fn new_static_with_writable(content: &str, writable: bool) -> Self {
         Self {
             readable: true,
-            writable: false,
+            writable,
             inner: Mutex::new(PseudoInner {
                 offset: 0,
                 kind: PseudoKind::Static(content.as_bytes().to_vec()),
@@ -706,8 +714,10 @@ impl File for PseudoFile {
     }
 
     fn write(&self, buf: UserBuffer) -> usize {
-        match self.inner.lock().kind {
+        let inner = self.inner.lock();
+        match inner.kind {
             PseudoKind::Null => buf.len(),
+            PseudoKind::Static(_) if self.writable => buf.len(),
             _ => 0,
         }
     }

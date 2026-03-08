@@ -148,14 +148,7 @@ pub fn syscall_inotify_init1(flags: usize) -> isize {
     if (flags & !(IN_NONBLOCK | IN_CLOEXEC)) != 0 {
         return EINVAL;
     }
-    let mut fd_flags = 0u32;
-    if (flags & IN_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK;
-    }
-    if (flags & IN_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
-    }
-    alloc_dummy_fd(fd_flags)
+    ENOSYS
 }
 
 pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {

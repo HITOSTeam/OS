@@ -901,7 +901,7 @@ pub(crate) fn syscall_mount_impl(
     };
 
     if let Some(fsname) = fstype.as_deref() {
-        if fsname == "cgroup" || fsname == "cgroup2" || fsname == "error" {
+        if fsname == "cgroup" || fsname == "cgroup2" || fsname == "error" || fsname == "overlay" {
             return ENODEV;
         }
     }
@@ -1462,6 +1462,15 @@ fn fd_has_odirect(fd: usize) -> bool {
     (inner.fd_flags[fd] & O_DIRECT as u32) != 0
 }
 
+fn fd_has_noatime(fd: usize) -> bool {
+    let process = current_files_process();
+    let inner = process.borrow_mut();
+    if fd >= inner.fd_flags.len() {
+        return false;
+    }
+    (inner.fd_flags[fd] & O_NOATIME as u32) != 0
+}
+
 fn validate_direct_io_request(
     fd: usize,
     file: &alloc::sync::Arc<dyn File + Send + Sync>,
@@ -1567,6 +1576,9 @@ fn open_fd_flags(flags: usize, o_path: bool) -> u32 {
     }
     if (flags & O_ASYNC) != 0 {
         fd_flags |= O_ASYNC as u32;
+    }
+    if (flags & O_NOATIME) != 0 {
+        fd_flags |= O_NOATIME as u32;
     }
     if o_path {
         fd_flags |= O_PATH as u32;
@@ -4387,6 +4399,11 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                 ino: 2,
                 dtype: 4
             },
+            PseudoDirent {
+                name: alloc::string::String::from("fs"),
+                ino: 3,
+                dtype: 4
+            },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/sys", entries)));
     }
@@ -4438,6 +4455,65 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     if path == "/proc/sys/kernel/random/entropy_avail" {
         return Some(alloc::sync::Arc::new(PseudoFile::new_static("256\n")));
+    }
+    if path == "/proc/sys/fs" || path == "/proc/sys/fs/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("inotify"),
+                ino: 2,
+                dtype: 4
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/sys/fs", entries)));
+    }
+    if path == "/proc/sys/fs/inotify" || path == "/proc/sys/fs/inotify/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("max_queued_events"),
+                ino: 2,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("max_user_instances"),
+                ino: 3,
+                dtype: 8
+            },
+            PseudoDirent {
+                name: alloc::string::String::from("max_user_watches"),
+                ino: 4,
+                dtype: 8
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/sys/fs/inotify", entries)));
+    }
+    if path == "/proc/sys/fs/inotify/max_queued_events" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static_rw("16384\n")));
+    }
+    if path == "/proc/sys/fs/inotify/max_user_instances" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static_rw("128\n")));
+    }
+    if path == "/proc/sys/fs/inotify/max_user_watches" {
+        return Some(alloc::sync::Arc::new(PseudoFile::new_static_rw("8192\n")));
     }
     if path == "/sys" || path == "/sys/" {
         let entries = alloc::vec![
@@ -6032,7 +6108,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     };
     let buf = UserBuffer::new(user_bufs);
     let read_len = file.read(buf) as isize;
-    if read_len >= 0 {
+    if read_len >= 0 && !fd_has_noatime(fd) {
         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
             let inode = os_inode.ext4_inode();
             maybe_update_inode_atime(&inode, false);
@@ -6307,7 +6383,9 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
                 break;
             }
         }
-        maybe_update_inode_atime(&inode, false);
+        if !fd_has_noatime(fd) {
+            maybe_update_inode_atime(&inode, false);
+        }
         return total as isize;
     }
 
