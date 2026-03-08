@@ -4,11 +4,11 @@ use crate::{
     debug_config::DEBUG_PTHREAD,
     fs::{
         LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind, PseudoKindTag, PtyMasterFile,
-        PtySlaveFile, TtyFile, ext4_lock, pseudo_block_is_read_only, pseudo_block_read_ahead,
-        pseudo_block_set_read_ahead, pseudo_block_set_read_only,
+        PtySlaveFile, TtyFile, UserfaultfdFile, ext4_lock, pseudo_block_is_read_only,
+        pseudo_block_read_ahead, pseudo_block_set_read_ahead, pseudo_block_set_read_only,
     },
     mm::{
-        MapPermission, frame_available_pages, read_user_value, translated_byte_buffer,
+        MapPermission, VirtAddr, frame_available_pages, read_user_value, translated_byte_buffer,
         translated_str, try_copy_from_user, try_copy_to_user, try_read_user_value,
         try_write_user_value, write_user_value,
     },
@@ -51,6 +51,7 @@ const LINUX_TID_PID_SHIFT: usize = 15;
 const EPERM: isize = -1;
 const EACCES: isize = -13;
 const EFAULT: isize = -14;
+const ENOMEM: isize = -12;
 const ENAMETOOLONG: isize = -36;
 const ENOENT: isize = -2;
 const ENODEV: isize = -19;
@@ -1985,6 +1986,39 @@ struct PollTimeSpec {
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UffdioApi {
+    api: u64,
+    features: u64,
+    ioctls: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UffdioRange {
+    start: u64,
+    len: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UffdioRegister {
+    range: UffdioRange,
+    mode: u64,
+    ioctls: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UffdioCopy {
+    dst: u64,
+    src: u64,
+    len: u64,
+    mode: u64,
+    copy: i64,
+}
+
 fn ppoll_now_ns() -> u64 {
     (get_time() as u64)
         .saturating_mul(NSEC_PER_SEC)
@@ -2216,6 +2250,12 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const TCFLSH: usize = 0x540b;
     const TIOCGPTN: usize = 0x8004_5430;
     const TIOCSPTLCK: usize = 0x4004_5431;
+    const UFFD_API: u64 = 0xAA;
+    const UFFDIO_API: usize = 0xc018_aa3f;
+    const UFFDIO_REGISTER: usize = 0xc020_aa00;
+    const UFFDIO_COPY: usize = 0xc028_aa03;
+    const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
+    const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1 << 0;
     const FIONREAD: usize = 0x541B;
     const RNDGETENTCNT: usize = 0x8004_5200;
     const BLKROSET: usize = 0x125d;
@@ -2261,6 +2301,99 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     // Compare on low 32 bits to accept both calling conventions.
     let request = _request & 0xffff_ffffusize;
     let token = get_current_token();
+
+    if let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() {
+        match request {
+            UFFDIO_API => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(mut api) = try_read_user_value::<UffdioApi>(token, _argp as *const UffdioApi) else {
+                    return EFAULT;
+                };
+                if api.api != UFFD_API {
+                    return EINVAL;
+                }
+                api.features = 0;
+                api.ioctls = uffd.enable_api();
+                if try_write_user_value(token, _argp as *mut UffdioApi, &api).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            UFFDIO_REGISTER => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(mut reg) = try_read_user_value::<UffdioRegister>(token, _argp as *const UffdioRegister) else {
+                    return EFAULT;
+                };
+                if reg.mode != UFFDIO_REGISTER_MODE_MISSING {
+                    return EINVAL;
+                }
+                let Ok(ioctls) = uffd.register_missing(reg.range.start as usize, reg.range.len as usize, reg.mode) else {
+                    return EINVAL;
+                };
+                reg.ioctls = ioctls;
+                if try_write_user_value(token, _argp as *mut UffdioRegister, &reg).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+            UFFDIO_COPY => {
+                if _argp == 0 {
+                    return EFAULT;
+                }
+                let Some(mut copy) = try_read_user_value::<UffdioCopy>(token, _argp as *const UffdioCopy) else {
+                    return EFAULT;
+                };
+                let len = copy.len as usize;
+                if len == 0 {
+                    copy.copy = 0;
+                    if try_write_user_value(token, _argp as *mut UffdioCopy, &copy).is_err() {
+                        return EFAULT;
+                    }
+                    return 0;
+                }
+                let mut data = alloc::vec![0u8; len];
+                if try_copy_from_user(token, copy.src as *const u8, &mut data).is_err() {
+                    return EFAULT;
+                }
+                {
+                    let process = current_process();
+                    let mut inner = process.borrow_mut();
+                    let start = copy.dst as usize & !(PAGE_SIZE - 1);
+                    let end = ((copy.dst as usize).saturating_add(len).saturating_add(PAGE_SIZE - 1)) & !(PAGE_SIZE - 1);
+                    let mut page = start;
+                    while page < end {
+                        let mapped = inner
+                            .memory_set
+                            .translate(VirtAddr::from(page).floor())
+                            .map(|pte| pte.is_valid())
+                            .unwrap_or(false);
+                        if !mapped {
+                            match inner.memory_set.resolve_lazy_fault(page, MapPermission::W) {
+                                crate::mm::LazyFaultResult::Resolved => {}
+                                crate::mm::LazyFaultResult::Oom => return ENOMEM,
+                                crate::mm::LazyFaultResult::Invalid => return EFAULT,
+                            }
+                        }
+                        page += PAGE_SIZE;
+                    }
+                }
+                if try_copy_to_user(token, copy.dst as *mut u8, &data).is_err() {
+                    return EFAULT;
+                }
+                copy.copy = len as i64;
+                if try_write_user_value(token, _argp as *mut UffdioCopy, &copy).is_err() {
+                    return EFAULT;
+                }
+                uffd.finish_copy(copy.dst as usize, len, (copy.mode & UFFDIO_COPY_MODE_DONTWAKE) == 0);
+                return 0;
+            }
+            _ => return ENOTTY,
+        }
+    }
 
     if let Some(tty) = file.as_any().downcast_ref::<TtyFile>() {
         match request {

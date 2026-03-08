@@ -2,7 +2,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) mod filesystem;
 
 mod condvar;
-mod dummy;
+pub(crate) mod dummy;
 mod epoll;
 mod flow;
 pub(crate) mod futex;
@@ -255,6 +255,7 @@ const SYSCALL_MQ_TIMEDSEND_TIME64: usize = 418;
 const SYSCALL_MQ_TIMEDRECEIVE_TIME64: usize = 419;
 const SYSCALL_BRK: usize = 214;
 const SYSCALL_MUNMAP: usize = 215;
+const SYSCALL_MREMAP: usize = 216;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_EXECVE: usize = 221;
 const SYSCALL_EXECVEAT: usize = 281;
@@ -710,6 +711,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHUTDOWN => net::syscall_shutdown(args[0], args[1]),
         SYSCALL_BRK => memory::syscall_brk(args[0]),
         SYSCALL_MUNMAP => memory::syscall_munmap(args[0], args[1]),
+        SYSCALL_MREMAP => memory::syscall_mremap(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_MMAP => memory::syscall_mmap(
             args[0],
             args[1],

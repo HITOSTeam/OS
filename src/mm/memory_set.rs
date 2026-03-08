@@ -1449,6 +1449,123 @@ impl MemorySet {
         };
     }
 
+    pub fn move_user_range(
+        &mut self,
+        old_start_va: VirtAddr,
+        old_end_va: VirtAddr,
+        new_start_va: VirtAddr,
+    ) -> bool {
+        let old_start_vpn = old_start_va.floor();
+        let old_end_vpn = old_end_va.ceil();
+        let new_start_vpn = new_start_va.floor();
+        if old_start_vpn >= old_end_vpn {
+            return true;
+        }
+        let delta = new_start_vpn.0 as isize - old_start_vpn.0 as isize;
+        let shifted_vpn = |vpn: VirtPageNum| -> Option<VirtPageNum> {
+            let next = vpn.0 as isize + delta;
+            (next >= 0).then_some(VirtPageNum(next as usize))
+        };
+
+        let mut moved_ptes: Vec<(VirtPageNum, PhysPageNum, PTEFlags)> = Vec::new();
+        let mut moved_areas: Vec<MapArea> = Vec::new();
+        let mut new_areas: Vec<MapArea> = Vec::new();
+        let mut found = false;
+
+        let mut areas = core::mem::take(&mut self.areas);
+        for mut area in areas.drain(..) {
+            if !area.map_perm.contains(MapPermission::U) {
+                new_areas.push(area);
+                continue;
+            }
+
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if old_end_vpn <= area_start || old_start_vpn >= area_end {
+                new_areas.push(area);
+                continue;
+            }
+
+            found = true;
+            let ov_start = core::cmp::max(old_start_vpn, area_start);
+            let ov_end = core::cmp::min(old_end_vpn, area_end);
+
+            for vpn in VPNRange::new(ov_start, ov_end) {
+                if let Some(pte) = self.page_table.translate(vpn) {
+                    if pte.is_valid() {
+                        let Some(new_vpn) = shifted_vpn(vpn) else {
+                            return false;
+                        };
+                        moved_ptes.push((new_vpn, pte.ppn(), pte.flags()));
+                        self.page_table.unmap_if_mapped(vpn);
+                    }
+                }
+            }
+
+            let mut left_frames = BTreeMap::new();
+            let mut mid_frames = BTreeMap::new();
+            let mut right_frames = BTreeMap::new();
+            if area.map_type != MapType::Identical {
+                let mut remaining = core::mem::take(&mut area.data_frames);
+                right_frames = remaining.split_off(&ov_end);
+                mid_frames = remaining.split_off(&ov_start);
+                left_frames = remaining;
+            }
+
+            if area_start < ov_start {
+                let mut left = MapArea::from_another(&area);
+                left.vpn_range = VPNRange::new(area_start, ov_start);
+                left.data_frames = left_frames;
+                new_areas.push(left);
+            }
+
+            let Some(new_mid_start) = shifted_vpn(ov_start) else {
+                return false;
+            };
+            let Some(new_mid_end) = shifted_vpn(ov_end) else {
+                return false;
+            };
+            let mut mid = MapArea::from_another(&area);
+            mid.vpn_range = VPNRange::new(new_mid_start, new_mid_end);
+            if ov_start != area_start {
+                mid.start_offset = 0;
+            }
+            if area.map_type != MapType::Identical {
+                let mut remapped = BTreeMap::new();
+                for (vpn, frame) in mid_frames {
+                    let Some(new_vpn) = shifted_vpn(vpn) else {
+                        return false;
+                    };
+                    remapped.insert(new_vpn, frame);
+                }
+                mid.data_frames = remapped;
+            }
+            moved_areas.push(mid);
+
+            if ov_end < area_end {
+                let mut right = MapArea::from_another(&area);
+                right.vpn_range = VPNRange::new(ov_end, area_end);
+                right.start_offset = 0;
+                right.data_frames = right_frames;
+                new_areas.push(right);
+            }
+        }
+
+        if !found {
+            self.areas = new_areas;
+            return false;
+        }
+
+        self.areas = new_areas;
+        for (vpn, ppn, flags) in moved_ptes {
+            self.page_table.map(vpn, ppn, flags);
+        }
+        self.areas.extend(moved_areas);
+        self.areas
+            .sort_unstable_by_key(|area| area.vpn_range.get_start().0);
+        true
+    }
+
     /// Unmap (best-effort) any user-mapped pages in `[start_va, end_va)`.
     ///
     /// This is primarily used to implement Linux `mmap(MAP_FIXED)` semantics, which

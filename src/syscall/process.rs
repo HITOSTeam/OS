@@ -232,6 +232,23 @@ fn read_user_str_array(token: usize, vec_ptr: usize) -> Result<Vec<String>, isiz
     Err(E2BIG)
 }
 
+pub(crate) fn is_inode_currently_executed(device_id: usize, inode_num: u32) -> bool {
+    let processes: Vec<_> = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+    for process in processes {
+        let inner = process.borrow_mut();
+        if !inner.is_zombie
+            && inner.exec_inode_num == inode_num
+            && inner.exec_inode_dev == device_id
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_inode_open_for_write(inode_num: u32) -> bool {
     let processes: Vec<_> = {
         let map = PID2PCB.lock();
@@ -1649,6 +1666,10 @@ fn execve_with_inode(
             Err(e) => return e,
         }
     };
+    let exec_inode = {
+        let _ext4_guard = ext4_lock();
+        (inode.device_id(), inode.inode_num())
+    };
     if let Some(Some(interp)) = interp {
         let interp_data = match load_interp_data(&interp) {
             Ok(data) => data,
@@ -1678,6 +1699,7 @@ fn execve_with_inode(
             &interp_data,
             args_vec,
             envs_vec,
+            exec_inode,
         );
         maybe_stop_after_ptrace_exec();
         return 0;
@@ -1701,6 +1723,7 @@ fn execve_with_inode(
             args_vec,
             envs_vec,
             elf_aux,
+            exec_inode,
         );
         maybe_stop_after_ptrace_exec();
         return 0;

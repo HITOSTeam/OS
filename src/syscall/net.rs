@@ -23,7 +23,7 @@ use crate::trap::get_current_token;
 use crate::{
     bpf::get_prog_clone,
     fs::{
-        File, NetSocketFile, PidFdFile, SocketPairEnd, ext4_lock, find_path_in_roots,
+        File, NetSocketFile, PidFdFile, SocketPairEnd, UserfaultfdFile, ext4_lock, find_path_in_roots,
         make_socketpair,
     },
 };
@@ -812,6 +812,9 @@ pub(crate) fn poll_file_read_write(file: &Arc<dyn File + Send + Sync>) -> (bool,
         };
         return (readable, false);
     }
+    if let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() {
+        return (uffd.poll_readable(), false);
+    }
     if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
         return (pipe.poll_readable(), pipe.poll_writable());
     }
@@ -832,6 +835,7 @@ pub(crate) fn poll_file_read_write(file: &Arc<dyn File + Send + Sync>) -> (bool,
 
 pub(crate) fn file_supports_poll(file: &Arc<dyn File + Send + Sync>) -> bool {
     file.as_any().downcast_ref::<PidFdFile>().is_some()
+        || file.as_any().downcast_ref::<UserfaultfdFile>().is_some()
         || file.as_any().downcast_ref::<crate::fs::Pipe>().is_some()
         || file.as_any().downcast_ref::<SocketPairEnd>().is_some()
         || file.as_any().downcast_ref::<NetSocketFile>().is_some()

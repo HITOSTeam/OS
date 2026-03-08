@@ -32,6 +32,7 @@ use crate::{
         task_block::TaskControlBlock,
         ProcessControlBlock,
     },
+    syscall::process::is_inode_currently_executed,
     time::get_time_ms,
     trap::get_current_token,
 };
@@ -62,6 +63,7 @@ const O_NOFOLLOW: usize = 0x20000;
 const O_CLOEXEC: usize = 0x80000;
 // __O_TMPFILE (020000000) | O_DIRECTORY from asm-generic/fcntl.h
 const O_TMPFILE: usize = 0x410000;
+const ETXTBSY: isize = -26;
 
 const FD_CLOEXEC: u32 = 1;
 
@@ -4296,6 +4298,14 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             );
         }
         return ENOTDIR;
+    }
+
+    let text_write_intent = writable || (flags & O_TRUNC) != 0;
+    if !o_path && inode.is_file() && text_write_intent {
+        let exec_busy = is_inode_currently_executed(inode.device_id(), inode.inode_num());
+        if exec_busy {
+            return ETXTBSY;
+        }
     }
 
     if !o_path && inode.is_file() {

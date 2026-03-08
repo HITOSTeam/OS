@@ -10,11 +10,12 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, NamespaceFile,
-    OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
+    File, NamespaceFile, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag,
+    PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, root_inode_for_path,
+    secondary_root_inode,
 };
-use crate::mm::{frame_available_pages, UserBuffer, VirtAddr};
-use crate::task::manager::{pid2process, PID2PCB};
+use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages};
+use crate::task::manager::{PID2PCB, pid2process};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
 
@@ -28,6 +29,7 @@ pub enum ProcFileKind {
     Uptime,
     Stat,
     Perf,
+    Kpageflags,
     SysvipcMsg,
     SysvipcSem,
     SysvipcShm,
@@ -136,7 +138,7 @@ impl ProcPseudoFile {
 
     pub fn seek_end(&self) -> isize {
         match self.kind {
-            ProcFileKind::PidPagemap(_) => isize::MAX,
+            ProcFileKind::PidPagemap(_) | ProcFileKind::Kpageflags => isize::MAX,
             _ => proc_file_len(&self.kind) as isize,
         }
     }
@@ -155,6 +157,9 @@ impl File for ProcPseudoFile {
         let mut inner = self.inner.lock();
         if let ProcFileKind::PidPagemap(pid) = self.kind {
             return proc_pid_pagemap_read(pid, &mut inner.offset, &mut buf);
+        }
+        if let ProcFileKind::Kpageflags = self.kind {
+            return proc_kpageflags_read(&mut inner.offset, &mut buf);
         }
         let data = proc_file_content(&self.kind);
         let bytes = data.as_bytes();
@@ -188,11 +193,7 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 {
-        None
-    } else {
-        Some(ino)
-    }
+    if ino == 0 { None } else { Some(ino) }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
@@ -231,6 +232,7 @@ pub fn init_procfs() {
     let _ = ensure_proc_file(&proc_inode, "uptime", ProcFileKind::Uptime, 0o444);
     let _ = ensure_proc_file(&proc_inode, "stat", ProcFileKind::Stat, 0o444);
     let _ = ensure_proc_file(&proc_inode, "perf", ProcFileKind::Perf, 0o444);
+    let _ = ensure_proc_file(&proc_inode, "kpageflags", ProcFileKind::Kpageflags, 0o444);
 
     let sys_dir = ensure_dir(&proc_inode, "sys", 0o555);
     if let Some(sys_dir) = sys_dir {
@@ -454,6 +456,7 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
         "uptime",
         "stat",
         "perf",
+        "kpageflags",
         "config.gz",
     ] {
         entries.push(PseudoDirent {
@@ -924,6 +927,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
         "/proc/perf" => return Some(ProcPseudoFile::new(ProcFileKind::Perf)),
+        "/proc/kpageflags" => return Some(ProcPseudoFile::new(ProcFileKind::Kpageflags)),
         "/proc/sysvipc/msg" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcMsg)),
         "/proc/sysvipc/sem" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcSem)),
         "/proc/sysvipc/shm" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcShm)),
@@ -1065,6 +1069,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
         ProcFileKind::Perf => proc_perf(),
+        ProcFileKind::Kpageflags => String::new(),
         ProcFileKind::SysvipcMsg => crate::syscall::sysv_ipc::proc_sysvipc_msg(),
         ProcFileKind::SysvipcSem => crate::syscall::sysv_ipc::proc_sysvipc_sem(),
         ProcFileKind::SysvipcShm => crate::syscall::sysv_shm::proc_sysvipc_shm(),
@@ -1675,11 +1680,56 @@ fn proc_pid_pagemap_entry(pid: u32, entry: usize) -> u64 {
     let vpn = VirtAddr::from(vaddr).floor();
     if let Some(pte) = inner.memory_set.translate(vpn) {
         if pte.is_valid() {
-            // Linux pagemap bit 63 indicates page present.
-            return 1u64 << 63;
+            return (1u64 << 63) | (pte.ppn().0 as u64 & ((1u64 << 55) - 1));
         }
     }
     0
+}
+
+fn proc_kpageflags_entry(pfn: usize) -> u64 {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        for (start, end) in inner.memory_set.user_mapped_ranges() {
+            let mut cur = start;
+            while cur < end {
+                let vpn = VirtAddr::from(cur).floor();
+                if let Some(pte) = inner.memory_set.translate(vpn) {
+                    if pte.is_valid() && pte.ppn().0 == pfn {
+                        let mut flags = 0u64;
+                        if pte.flags().contains(PTEFlags::D) {
+                            flags |= 1u64 << 4;
+                        }
+                        return flags;
+                    }
+                }
+                cur = cur.saturating_add(config::PAGE_SIZE);
+            }
+        }
+    }
+    0
+}
+
+fn proc_kpageflags_read(offset: &mut usize, buf: &mut UserBuffer) -> usize {
+    let mut total = 0usize;
+    for slice in buf.buffers.iter_mut() {
+        let mut i = 0usize;
+        while i < slice.len() {
+            let entry = (*offset) / 8;
+            let byte_in_entry = (*offset) % 8;
+            let val = proc_kpageflags_entry(entry);
+            slice[i] = ((val >> (byte_in_entry * 8)) & 0xff) as u8;
+            *offset += 1;
+            i += 1;
+            total += 1;
+        }
+    }
+    total
 }
 
 fn proc_pid_pagemap_read(pid: u32, offset: &mut usize, buf: &mut UserBuffer) -> usize {

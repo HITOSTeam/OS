@@ -482,6 +482,11 @@ fn handle_user_exception(code: usize, stval: usize) {
             return;
         }
     }
+    if (code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT)
+        && crate::syscall::dummy::try_handle_userfaultfd_page_fault(stval, code == STORE_PAGE_FAULT)
+    {
+        return;
+    }
     if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {
         let process = crate::task::processor::current_process();
         let mut inner = process.borrow_mut();

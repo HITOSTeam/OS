@@ -1,9 +1,9 @@
 use alloc::sync::Arc;
 
 use crate::{
-    fs::{DummyFile, File, PidFdFile, PseudoShmFile, shm_create_anonymous},
+    fs::{DummyFile, File, PidFdFile, PseudoShmFile, UserfaultfdFile, shm_create_anonymous},
     mm::try_copy_from_user,
-    task::{manager::pid2process, processor::current_files_process},
+    task::{manager::pid2process, processor::{current_files_process, current_process}},
     trap::get_current_token,
 };
 
@@ -178,8 +178,41 @@ pub fn syscall_fanotify_init(_flags: usize, _event_f_flags: usize) -> isize {
     ENOSYS
 }
 
-pub fn syscall_userfaultfd(_flags: usize) -> isize {
-    alloc_dummy_fd(0)
+pub fn syscall_userfaultfd(flags: usize) -> isize {
+    const UFFD_USER_MODE_ONLY: usize = 0x1;
+    let known = CLOEXEC_FLAG | NONBLOCK_FLAG | UFFD_USER_MODE_ONLY;
+    if (flags & !known) != 0 {
+        return EINVAL;
+    }
+    let mut fd_flags = 0u32;
+    if (flags & NONBLOCK_FLAG) != 0 {
+        fd_flags |= O_NONBLOCK;
+    }
+    if (flags & CLOEXEC_FLAG) != 0 {
+        fd_flags |= FD_CLOEXEC;
+    }
+    alloc_fd(Arc::new(UserfaultfdFile::new()), fd_flags)
+}
+
+pub fn try_handle_userfaultfd_page_fault(addr: usize, is_write: bool) -> bool {
+    let files = {
+        let process = current_process();
+        let inner = process.borrow_mut();
+        inner
+            .fd_table
+            .iter()
+            .filter_map(|file| file.as_ref().cloned())
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    for file in files {
+        let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() else {
+            continue;
+        };
+        if uffd.handle_page_fault(addr, is_write) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn syscall_perf_event_open(

@@ -236,6 +236,8 @@ pub struct MmapRegion {
     pub file_dev: usize,
     pub file_ino: u32,
     pub file_offset: usize,
+    /// Stable backing entry for file-backed mmap writeback after close(fd).
+    pub backing_id: usize,
     /// Non-zero for `PseudoShmFile`/memfd-backed mappings.
     pub memfd_id: u64,
     /// Whether this region should expand downward on guard-page faults.
@@ -856,6 +858,9 @@ pub struct ProcessControlBlockInner {
     pub comm: String,
     /// `PR_SET_PDEATHSIG` setting for this process.
     pub pdeath_signal: i32,
+    /// Executable inode identity for ETXTBSY checks on writable opens.
+    pub exec_inode_dev: usize,
+    pub exec_inode_num: u32,
     /// Current/default timer slack used by `prctl(PR_*_TIMERSLACK)`.
     pub timer_slack_ns: u64,
     pub timer_slack_default_ns: u64,
@@ -951,6 +956,8 @@ pub struct ProcessControlBlockInner {
     pub brk: usize,
     pub mmap_next: usize,
     pub mmap_areas: Vec<MmapRegion>,
+    pub mmap_backings: BTreeMap<usize, Arc<dyn File + Send + Sync>>,
+    pub next_mmap_backing_id: usize,
     /// Virtual ranges currently locked by mlock/mlockall.
     pub mlocked_ranges: Vec<(usize, usize)>,
     /// Whether MCL_FUTURE is currently enabled.
@@ -1333,6 +1340,8 @@ impl ProcessControlBlock {
                 argv: args.clone(),
                 comm: process_comm_from_argv(&args),
                 pdeath_signal: 0,
+                exec_inode_dev: 0,
+                exec_inode_num: 0,
                 timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                 timer_slack_default_ns: DEFAULT_TIMER_SLACK_NS,
                 start_time_ms: crate::time::get_time_ms(),
@@ -1404,6 +1413,8 @@ impl ProcessControlBlock {
                 // Keep anonymous/file mmaps high to avoid colliding with ELF segments.
                 mmap_next: DEFAULT_MMAP_BASE,
                 mmap_areas: Vec::new(),
+                mmap_backings: BTreeMap::new(),
+                next_mmap_backing_id: 1,
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
                 ipc_ns_id: 0,
@@ -1488,7 +1499,7 @@ impl ProcessControlBlock {
     /// Only support processes with a single thread.
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
-        self.exec_with_memory_set(memory_set, ustack_base, entry_point, args, envs, elf_aux);
+        self.exec_with_memory_set(memory_set, ustack_base, entry_point, args, envs, elf_aux, (0, 0));
     }
 
     /// Exec a dynamically-linked ELF (with PT_INTERP) in a Linux-like way:
@@ -1513,6 +1524,7 @@ impl ProcessControlBlock {
             interp_data,
             args,
             envs,
+            (0, 0),
         );
     }
 
@@ -1524,6 +1536,7 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
         elf_aux: ElfAux,
+        exec_inode: (usize, u32),
     ) {
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
@@ -1553,6 +1566,8 @@ impl ProcessControlBlock {
             inner.mlockall_future = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
+            inner.exec_inode_dev = exec_inode.0;
+            inner.exec_inode_num = exec_inode.1;
             inner.did_exec = true;
         }
         let task = self.borrow_mut().get_task(0);
@@ -1594,6 +1609,7 @@ impl ProcessControlBlock {
         interp_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
+        exec_inode: (usize, u32),
     ) {
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
@@ -1623,6 +1639,8 @@ impl ProcessControlBlock {
             inner.mlockall_future = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
+            inner.exec_inode_dev = exec_inode.0;
+            inner.exec_inode_num = exec_inode.1;
             inner.did_exec = true;
         }
 
@@ -1868,6 +1886,8 @@ impl ProcessControlBlock {
                 brk: parent.brk,
                 mmap_next: parent.mmap_next,
                 mmap_areas: parent.mmap_areas.clone(),
+                mmap_backings: parent.mmap_backings.clone(),
+                next_mmap_backing_id: parent.next_mmap_backing_id,
                 // Linux does not inherit mlock/mlockall locks across fork.
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
@@ -1877,6 +1897,8 @@ impl ProcessControlBlock {
                 pid_ns_vpid: pid_value,
                 pid_ns_init: false,
                 sysv_shm_attaches: inherited_shm.clone(),
+                exec_inode_dev: parent.exec_inode_dev,
+                exec_inode_num: parent.exec_inode_num,
                 // is right here?
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
