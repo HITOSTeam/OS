@@ -1,5 +1,5 @@
 use crate::{
-    config::{PAGE_SIZE, TRAP_CONTEXT},
+    config::{PAGE_SIZE, TRAP_CONTEXT, USER_HEAP_GAP},
     fs::{File, OSInode, PseudoShmFile, ext4_lock},
     mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked},
     task::MmapRegion,
@@ -57,6 +57,25 @@ fn align_up(x: usize, align: usize) -> usize {
 
 fn user_range_valid(start: usize, end: usize) -> bool {
     start < end && end <= USER_VA_TOP
+}
+
+fn find_free_user_range(ranges: &[(usize, usize)], min_start: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let mut cursor = align_up(min_start, PAGE_SIZE);
+    for (range_start, range_end) in ranges.iter().copied() {
+        if range_end <= cursor {
+            continue;
+        }
+        let end = cursor.checked_add(len)?;
+        if end <= range_start {
+            return user_range_valid(cursor, end).then_some(cursor);
+        }
+        cursor = align_up(range_end, PAGE_SIZE);
+    }
+    let end = cursor.checked_add(len)?;
+    user_range_valid(cursor, end).then_some(cursor)
 }
 
 fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
@@ -471,24 +490,47 @@ pub fn syscall_mmap(
             return EINVAL;
         }
         align_down(addr, PAGE_SIZE)
-    } else if addr != 0 {
-        let hinted = align_down(addr, PAGE_SIZE);
-        let hinted_end = hinted.checked_add(map_len);
-        if let Some(hinted_end) = hinted_end {
-            if user_range_valid(hinted, hinted_end)
-                && !inner
-                    .memory_set
-                    .range_overlaps(hinted.into(), hinted_end.into())
-            {
-                hinted
+    } else {
+        let preferred = align_up(inner.mmap_next, PAGE_SIZE);
+        let fallback = align_up(inner.brk.saturating_add(USER_HEAP_GAP), PAGE_SIZE);
+        let mapped = inner.memory_set.user_mapped_ranges();
+        if addr != 0 {
+            let hinted = align_down(addr, PAGE_SIZE);
+            let hinted_end = hinted.checked_add(map_len);
+            if let Some(hinted_end) = hinted_end {
+                if user_range_valid(hinted, hinted_end)
+                    && !inner
+                        .memory_set
+                        .range_overlaps(hinted.into(), hinted_end.into())
+                {
+                    hinted
+                } else {
+                    find_free_user_range(mapped.as_slice(), preferred, map_len)
+                        .or_else(|| {
+                            (fallback < preferred)
+                                .then(|| find_free_user_range(mapped.as_slice(), fallback, map_len))
+                                .flatten()
+                        })
+                        .unwrap_or(USER_VA_TOP)
+                }
             } else {
-                align_up(inner.mmap_next, PAGE_SIZE)
+                find_free_user_range(mapped.as_slice(), preferred, map_len)
+                    .or_else(|| {
+                        (fallback < preferred)
+                            .then(|| find_free_user_range(mapped.as_slice(), fallback, map_len))
+                            .flatten()
+                    })
+                    .unwrap_or(USER_VA_TOP)
             }
         } else {
-            align_up(inner.mmap_next, PAGE_SIZE)
+            find_free_user_range(mapped.as_slice(), preferred, map_len)
+                .or_else(|| {
+                    (fallback < preferred)
+                        .then(|| find_free_user_range(mapped.as_slice(), fallback, map_len))
+                        .flatten()
+                })
+                .unwrap_or(USER_VA_TOP)
         }
-    } else {
-        align_up(inner.mmap_next, PAGE_SIZE)
     };
     let Some(end) = start.checked_add(map_len) else {
         return ENOMEM;
