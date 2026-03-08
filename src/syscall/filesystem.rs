@@ -9,29 +9,28 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::task::manager::{PID2PCB, wakeup_task};
+use crate::task::manager::{wakeup_task, PID2PCB};
 use crate::{
     fs::{
-        File, NetSocketFile, OSInode, OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir,
-        PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
-        SocketPairEnd, TtyFile, ext4_lock, find_path_in_roots, make_pipe, open_file,
-        pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_stat_snapshot,
-        register_deferred_unlink_cleanup, secondary_root_inode, shm_create, shm_get, shm_list,
-        shm_remove,
+        ext4_lock, find_path_in_roots, make_pipe, open_file, pseudo_block_is_read_only,
+        pseudo_block_note_sync, pseudo_block_stat_snapshot, register_deferred_unlink_cleanup,
+        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove, File, NetSocketFile,
+        OSInode, OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
+        PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TtyFile,
     },
     mm::{
-        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
-        translated_byte_buffer, translated_mutref, translated_str, try_copy_from_user,
-        try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
-        try_translated_byte_buffer, try_write_user_value, write_user_value,
+        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
+        translated_str, try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked,
+        try_read_user_value, try_translated_byte_buffer, try_write_user_value, write_user_value,
+        MapPermission, UserBuffer,
     },
     task::processor::{
         block_current_and_run_next, current_files_process, current_process, current_task,
     },
     task::{
-        ProcessControlBlock,
-        signal::{SIGXFSZ_NUM, has_unmasked_pending, queue_process_signal},
+        signal::{has_unmasked_pending, queue_process_signal, SIGXFSZ_NUM},
         task_block::TaskControlBlock,
+        ProcessControlBlock,
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -5593,6 +5592,10 @@ pub fn syscall_linkat(
         }
     }
 
+    if rofs_for_path(newdirfd, &new_s) {
+        return EROFS;
+    }
+
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_old = (flags & AT_SYMLINK_FOLLOW) != 0;
     let _ext4_guard = ext4_lock();
@@ -7080,6 +7083,20 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     }
     let remove_dir = (flags & AT_REMOVEDIR) != 0;
 
+    if remove_dir {
+        if final_non_empty_component(&path) == Some(".") {
+            return EINVAL;
+        }
+        if final_non_empty_component(&path) == Some("..") {
+            return ENOTEMPTY;
+        }
+        if let Some(abs) = resolve_abs_path(dirfd, &path) {
+            if path_is_mount_point(&abs) {
+                return EBUSY;
+            }
+        }
+    }
+
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
@@ -7118,24 +7135,11 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
         return EACCES;
     }
-    if remove_dir && final_non_empty_component(&path) == Some(".") {
-        return EINVAL;
-    }
-    if remove_dir && final_non_empty_component(&path) == Some("..") {
-        return ENOTEMPTY;
-    }
     if remove_dir && name == "." {
         return EINVAL;
     }
     if remove_dir && name == ".." {
         return ENOTEMPTY;
-    }
-    if remove_dir {
-        if let Some(abs) = resolve_abs_path(dirfd, &path) {
-            if path_is_mount_point(&abs) {
-                return EBUSY;
-            }
-        }
     }
 
     // Validate target type: unlink vs rmdir semantics.
