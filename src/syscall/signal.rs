@@ -16,6 +16,7 @@ use crate::{
         ProcessControlBlock,
         block_sleep::add_timer,
         manager::{PID2PCB, pid2process, wakeup_task},
+        process_visible_in_pid_namespace,
         processor::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
         },
@@ -37,6 +38,28 @@ fn sigreturn_trampoline_va() -> usize {
         fn sigreturn_trampoline();
     }
     sigreturn_trampoline as usize - alltraps as usize + SIGRETURN_TRAMPOLINE
+}
+
+fn translate_sender_pid_for_receiver(sender_pid: i32) -> i32 {
+    if sender_pid <= 0 {
+        return 0;
+    }
+    let receiver = current_process();
+    let receiver_ns_id = receiver.pid_namespace_id();
+    let Some(sender) = pid2process(sender_pid as usize) else {
+        return 0;
+    };
+    if receiver_ns_id == 0 {
+        return sender.getpid() as i32;
+    }
+    if !process_visible_in_pid_namespace(&sender, receiver_ns_id) {
+        return 0;
+    }
+    if sender.pid_namespace_id() == receiver_ns_id {
+        sender.visible_pid() as i32
+    } else {
+        sender.getpid() as i32
+    }
 }
 
 const EINVAL: isize = -22;
@@ -249,43 +272,63 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
         return kill(pid as usize, signum);
     }
 
+    let current = current_process();
+    let self_pid = current.getpid();
+    let current_ns_id = current.pid_namespace_id();
+    let current_pgid = current.borrow_mut().pgid;
+    let procs: Vec<_> = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+
     let targets: Vec<usize> = match pid {
-        0 => {
-            let pgid = current_process().borrow_mut().pgid;
-            let procs: Vec<_> = {
-                let map = PID2PCB.lock();
-                map.values().cloned().collect()
-            };
-            procs
-                .into_iter()
-                .filter_map(|p| {
-                    let inner = p.borrow_mut();
-                    if inner.pgid == pgid {
-                        Some(p.getpid())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        }
-        -1 => {
-            let self_pid = current_process().getpid();
-            let map = PID2PCB.lock();
-            map.keys()
-                .copied()
-                .filter(|pid| *pid != 0 && *pid != self_pid)
-                .collect()
-        }
+        0 => procs
+            .into_iter()
+            .filter_map(|p| {
+                let inner = p.borrow_mut();
+                if p.getpid() == self_pid {
+                    return None;
+                }
+                if current_ns_id != 0
+                    && !crate::task::process_visible_in_pid_namespace(&p, current_ns_id)
+                {
+                    return None;
+                }
+                if inner.pgid == current_pgid {
+                    Some(p.getpid())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        -1 => procs
+            .into_iter()
+            .filter_map(|p| {
+                if p.getpid() == 0 || p.getpid() == self_pid {
+                    return None;
+                }
+                if current_ns_id != 0
+                    && !crate::task::process_visible_in_pid_namespace(&p, current_ns_id)
+                {
+                    return None;
+                }
+                Some(p.getpid())
+            })
+            .collect(),
         p if p < -1 => {
             let target_pgid = (-p) as usize;
-            let procs: Vec<_> = {
-                let map = PID2PCB.lock();
-                map.values().cloned().collect()
-            };
             procs
                 .into_iter()
                 .filter_map(|p| {
                     let inner = p.borrow_mut();
+                    if p.getpid() == self_pid {
+                        return None;
+                    }
+                    if current_ns_id != 0
+                        && !crate::task::process_visible_in_pid_namespace(&p, current_ns_id)
+                    {
+                        return None;
+                    }
                     if inner.pgid == target_pgid {
                         Some(p.getpid())
                     } else {
@@ -968,7 +1011,7 @@ fn write_siginfo(
     si.si_errno = 0;
     si.si_code = si_code;
     // siginfo_t kill/pid payload.
-    si.field[0] = sender_pid;
+    si.field[0] = translate_sender_pid_for_receiver(sender_pid);
     si.field[1] = sender_uid as i32;
     si.field[2] = sig_value as i32;
     si.field[3] = (sig_value >> 32) as i32;
@@ -1452,7 +1495,7 @@ pub fn maybe_deliver_signal() {
         let mut siginfo = LinuxSigInfo::default();
         siginfo.si_signo = signum as i32;
         siginfo.si_code = si_code;
-        siginfo.field[0] = sender_pid;
+        siginfo.field[0] = translate_sender_pid_for_receiver(sender_pid);
         siginfo.field[1] = sender_uid as i32;
         siginfo.field[2] = sig_value as i32;
         siginfo.field[3] = (sig_value >> 32) as i32;

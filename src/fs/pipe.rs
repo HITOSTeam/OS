@@ -13,7 +13,7 @@ use crate::{
     task::{
         manager::{wakeup_task, PID2PCB},
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::{has_unmasked_pending, queue_process_signal, signal_bit, SIGPIPE_NUM},
+        signal::{has_unmasked_pending, queue_process_signal_info, signal_bit, SIGPIPE_NUM},
         task_block::TaskControlBlock,
     },
 };
@@ -160,6 +160,15 @@ impl Pipe {
         Ok(())
     }
 
+    pub fn set_async_fd(&self, fd: i32) -> Result<(), isize> {
+        const EINVAL: isize = -22;
+        if !self.readable || fd < 0 {
+            return Err(EINVAL);
+        }
+        self.buffer.lock().async_fd = fd;
+        Ok(())
+    }
+
     pub fn get_async_signal(&self) -> i32 {
         self.buffer.lock().async_signal
     }
@@ -294,8 +303,8 @@ impl Pipe {
                 None
             };
             drop(ring_buffer);
-            if let Some((owner_type, owner_pid, sig)) = async_notify {
-                notify_async_io(owner_type, owner_pid, sig);
+            if let Some((owner_type, owner_pid, sig, fd)) = async_notify {
+                notify_async_io(owner_type, owner_pid, sig, fd);
             }
             if let Some(reader) = reader_to_wake {
                 wakeup_task(reader);
@@ -365,6 +374,7 @@ pub struct PipeRingBuffer {
     async_owner_type: i32,
     async_owner_pid: i32,
     async_signal: i32,
+    async_fd: i32,
 }
 
 impl PipeRingBuffer {
@@ -386,6 +396,7 @@ impl PipeRingBuffer {
             async_owner_type: F_OWNER_PID,
             async_owner_pid: 0,
             async_signal: 0,
+            async_fd: -1,
         }
     }
 
@@ -594,7 +605,7 @@ impl PipeRingBuffer {
         self.write_waiters.drain(..).collect()
     }
 
-    fn async_target(&self) -> Option<(i32, i32, i32)> {
+    fn async_target(&self) -> Option<(i32, i32, i32, i32)> {
         if !self.async_enabled || self.async_owner_pid <= 0 {
             return None;
         }
@@ -602,11 +613,13 @@ impl PipeRingBuffer {
             self.async_owner_type,
             self.async_owner_pid,
             self.async_signal,
+            self.async_fd,
         ))
     }
 }
 
-fn notify_async_io(owner_type: i32, owner_pid: i32, sig: i32) {
+fn notify_async_io(owner_type: i32, owner_pid: i32, sig: i32, fd: i32) {
+    const POLL_IN: i32 = 1;
     let signum = if sig == 0 { SIGIO_NUM } else { sig };
     if signum <= 0 || signum > 64 {
         return;
@@ -614,7 +627,7 @@ fn notify_async_io(owner_type: i32, owner_pid: i32, sig: i32) {
     match owner_type {
         // For now map TID to process leader PID in this single-thread use case.
         F_OWNER_TID | F_OWNER_PID => {
-            queue_process_signal(owner_pid as usize, signum as usize);
+            queue_process_signal_info(owner_pid as usize, signum as usize, 0, 0, POLL_IN, fd as usize);
         }
         F_OWNER_PGRP => {
             let targets = {
@@ -631,7 +644,7 @@ fn notify_async_io(owner_type: i32, owner_pid: i32, sig: i32) {
                     .collect::<Vec<_>>()
             };
             for pid in targets {
-                queue_process_signal(pid, signum as usize);
+                queue_process_signal_info(pid, signum as usize, 0, 0, POLL_IN, fd as usize);
             }
         }
         _ => {}
@@ -977,8 +990,8 @@ impl File for Pipe {
                 None
             };
             drop(ring_buffer);
-            if let Some((owner_type, owner_pid, sig)) = async_notify {
-                notify_async_io(owner_type, owner_pid, sig);
+            if let Some((owner_type, owner_pid, sig, fd)) = async_notify {
+                notify_async_io(owner_type, owner_pid, sig, fd);
             }
             if let Some(reader) = reader_to_wake {
                 wakeup_task(reader);

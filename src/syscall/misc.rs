@@ -3,27 +3,26 @@ use crate::{
     config::clock_freq,
     debug_config::DEBUG_PTHREAD,
     fs::{
-        ext4_lock, pseudo_block_is_read_only, pseudo_block_read_ahead, pseudo_block_set_read_ahead,
-        pseudo_block_set_read_only, LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind,
-        PseudoKindTag, PtyMasterFile, PtySlaveFile, TtyFile,
+        LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind, PseudoKindTag, PtyMasterFile,
+        PtySlaveFile, TtyFile, ext4_lock, pseudo_block_is_read_only, pseudo_block_read_ahead,
+        pseudo_block_set_read_ahead, pseudo_block_set_read_only,
     },
     mm::{
-        read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
-        try_copy_to_user,
-        try_read_user_value, try_write_user_value, write_user_value, MapPermission,
+        MapPermission, read_user_value, translated_byte_buffer, translated_str, try_copy_from_user,
+        try_copy_to_user, try_read_user_value, try_write_user_value, write_user_value,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
-        manager::{pid2process, refresh_process_runqueues, PID2PCB},
+        manager::{PID2PCB, pid2process, refresh_process_runqueues},
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
         signal::{
-            has_unmasked_pending, queue_process_signal, signal_bit, SIGKILL_NUM, SIGSTOP_NUM,
-            SIGXCPU_NUM,
+            SIGKILL_NUM, SIGSTOP_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal,
+            signal_bit,
         },
     },
     time::{get_time, get_time_ms},
@@ -463,13 +462,7 @@ pub fn syscall_capset(hdrp: usize, datap: usize) -> isize {
 }
 
 /// Linux `prctl(2)` subset needed by credential/capability tests.
-pub fn syscall_prctl(
-    option: usize,
-    arg2: usize,
-    arg3: usize,
-    arg4: usize,
-    arg5: usize,
-) -> isize {
+pub fn syscall_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> isize {
     const MAX_SIGNAL_NUM: usize = 64;
     match option {
         PR_SET_PDEATHSIG => {
@@ -688,22 +681,23 @@ pub fn syscall_reboot(_magic1: usize, _magic2: usize, _cmd: usize, _arg: usize) 
 
 pub fn syscall_getppid() -> isize {
     let process = current_process();
-    let parent = {
-        process
-            .borrow_mut()
-            .parent
-            .as_ref()
-            .and_then(|p| p.upgrade())
+    let (pid_ns_id, parent) = {
+        let inner = process.borrow_mut();
+        (
+            inner.pid_ns_id,
+            inner.parent.as_ref().and_then(|p| p.upgrade()),
+        )
     };
-    parent.map(|p| p.getpid() as isize).unwrap_or(0)
+    match parent {
+        Some(parent) if pid_ns_id == 0 || parent.pid_namespace_id() == pid_ns_id => {
+            parent.visible_pid() as isize
+        }
+        Some(_) | None => 0,
+    }
 }
 
 fn normalized_pgid(pid: usize, pgid: usize) -> usize {
-    if pgid == 0 && pid != 0 {
-        pid
-    } else {
-        pgid
-    }
+    if pgid == 0 && pid != 0 { pid } else { pgid }
 }
 
 fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {
@@ -797,6 +791,9 @@ pub fn syscall_getpgid(pid: usize) -> isize {
         return ESRCH;
     };
     let inner = target.borrow_mut();
+    if inner.is_zombie {
+        return ESRCH;
+    }
     normalized_pgid(target_pid, inner.pgid) as isize
 }
 
@@ -2169,7 +2166,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(termios) = try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
+                let Some(termios) =
+                    try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
                 else {
                     return EFAULT;
                 };
@@ -2190,7 +2188,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(termio) = try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
+                let Some(termio) =
+                    try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
                 else {
                     return EFAULT;
                 };
@@ -2225,7 +2224,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(termios) = try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
+                let Some(termios) =
+                    try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
                 else {
                     return EFAULT;
                 };
@@ -2246,7 +2246,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(termio) = try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
+                let Some(termio) =
+                    try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
                 else {
                     return EFAULT;
                 };
@@ -2275,7 +2276,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(lock_value) = try_read_user_value::<i32>(token, _argp as *const i32) else {
+                let Some(lock_value) = try_read_user_value::<i32>(token, _argp as *const i32)
+                else {
                     return EFAULT;
                 };
                 pty.set_locked(lock_value != 0);
@@ -2301,7 +2303,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(termios) = try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
+                let Some(termios) =
+                    try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
                 else {
                     return EFAULT;
                 };
@@ -2322,7 +2325,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(termio) = try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
+                let Some(termio) =
+                    try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
                 else {
                     return EFAULT;
                 };

@@ -16,6 +16,7 @@ pub const SIGTTOU_NUM: usize = 22;
 use bitflags::bitflags;
 
 use alloc::sync::Arc;
+use alloc::vec;
 
 use crate::{
     arch,
@@ -25,6 +26,7 @@ use crate::{
     task::processor::current_process,
     task::{
         manager::{pid2process, wakeup_task},
+        pid_namespace_member_pids, process_visible_in_pid_namespace, resolve_process_in_pid_namespace,
         process_block::ProcessControlBlock,
         processor::{current_task, suspend_current_and_run_next},
         task_block::{TaskControlBlock, TaskControlBlockInner},
@@ -450,11 +452,28 @@ pub fn set_signal(
 
 // insert the bit flag.. if already set  return -1
 pub fn kill(pid: usize, signum: i32) -> isize {
-    let Some(process) = pid2process(pid) else {
-        return -3; // ESRCH
-    };
+    let current = current_process();
     if signum < 0 || signum as usize > RT_SIG_MAX {
         return -22; // EINVAL
+    }
+    let current_ns_id = current.pid_namespace_id();
+    let process = if current_ns_id == 0 {
+        pid2process(pid)
+    } else {
+        resolve_process_in_pid_namespace(current_ns_id, pid)
+    };
+    let Some(process) = process else {
+        return -3; // ESRCH
+    };
+    if process.borrow_mut().is_zombie {
+        return -3; // ESRCH
+    }
+    if current_ns_id != 0
+        && current.is_pid_namespace_init()
+        && Arc::ptr_eq(&current, &process)
+        && matches!(signum as usize, SIGKILL_NUM | SIGSTOP_NUM)
+    {
+        return 0;
     }
     if !can_signal_process(&process, signum) {
         return -1; // EPERM
@@ -469,18 +488,43 @@ pub fn kill(pid: usize, signum: i32) -> isize {
         None
     };
     let (sender_pid, sender_uid, _, _) = current_sender_ids();
-    let tasks = {
-        let mut process_ref = process.borrow_mut();
-        if let Some(flag) = legacy_flag {
-            process_ref.signals.insert(flag);
+    let target_ns_id = process.pid_namespace_id();
+    let target_is_ns_init = process.is_pid_namespace_init();
+    let mut target_pids = vec![process.getpid()];
+    if signum as usize == SIGKILL_NUM && target_is_ns_init && target_ns_id != 0 {
+        for member_pid in pid_namespace_member_pids(target_ns_id) {
+            if !target_pids.contains(&member_pid) {
+                target_pids.push(member_pid);
+            }
         }
-        let tasks = process_ref
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<alloc::vec::Vec<_>>();
-        tasks
-    };
+    }
+    let tasks = target_pids
+        .into_iter()
+        .filter_map(pid2process)
+        .filter_map(|target: Arc<ProcessControlBlock>| {
+            if target.borrow_mut().is_zombie {
+                return None;
+            }
+            if !can_signal_process(&target, signum) {
+                return None;
+            }
+            if current_ns_id != 0 && !process_visible_in_pid_namespace(&target, current_ns_id) {
+                return None;
+            }
+            let mut process_ref = target.borrow_mut();
+            if let Some(flag) = legacy_flag {
+                process_ref.signals.insert(flag);
+            }
+            Some(
+                process_ref
+                    .tasks
+                    .iter()
+                    .filter_map(|task_slot: &Option<Arc<TaskControlBlock>>| task_slot.as_ref().cloned())
+                    .collect::<alloc::vec::Vec<Arc<TaskControlBlock>>>(),
+            )
+        })
+        .flatten()
+        .collect::<alloc::vec::Vec<Arc<TaskControlBlock>>>();
     crate::log_if!(
         DEBUG_SIGNAL,
         info,
@@ -491,9 +535,9 @@ pub fn kill(pid: usize, signum: i32) -> isize {
         get_time_ms()
     );
     if sig_bit != 0 {
-        for t in &tasks {
+        for t in tasks.iter() {
             let (tid, pending, mask) = {
-                let mut inner = t.borrow_mut();
+                let mut inner: spin::MutexGuard<'_, TaskControlBlockInner> = t.borrow_mut();
                 mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0, 0);
                 let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 (tid, inner.pending_signals, inner.signal_mask)
@@ -555,7 +599,14 @@ pub fn kill_current(signum: i32) -> isize {
 ///
 /// This mirrors the "one thread" delivery behavior used for alarms and keeps
 /// SIGCHLD visible to user-space job control (e.g., busybox/ash).
-pub fn queue_process_signal(pid: usize, signum: usize) {
+pub fn queue_process_signal_info(
+    pid: usize,
+    signum: usize,
+    sender_pid: i32,
+    sender_uid: u32,
+    si_code: i32,
+    sig_value: usize,
+) {
     if signum == 0 || signum > RT_SIG_MAX {
         return;
     }
@@ -593,7 +644,7 @@ pub fn queue_process_signal(pid: usize, signum: usize) {
     let (tid, on_cpu, queued) = {
         let mut inner = task.borrow_mut();
         let already = (inner.pending_signals & bit) != 0;
-        mark_pending_signal(&mut inner, signum, 0, 0, 0, 0);
+        mark_pending_signal(&mut inner, signum, sender_pid, sender_uid, si_code, sig_value);
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
         (
             tid,
@@ -617,6 +668,10 @@ pub fn queue_process_signal(pid: usize, signum: usize) {
             arch::send_ipi(on_cpu);
         }
     }
+}
+
+pub fn queue_process_signal(pid: usize, signum: usize) {
+    queue_process_signal_info(pid, signum, 0, 0, 0, 0);
 }
 
 // fn check_pending_signals() {

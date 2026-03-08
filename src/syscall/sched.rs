@@ -8,7 +8,7 @@ use crate::{
     task::{
         ProcessControlBlock,
         manager::{pid2process, refresh_process_runqueues},
-        processor::current_process,
+        processor::{current_process, hart_id, suspend_current_and_run_next},
         sched::{
             RR_TIMESLICE_MS, SCHED_BATCH, SCHED_DEADLINE, SCHED_IDLE, SCHED_OTHER, SchedClass,
             check_policy, clamp_nice, policy_priority_max, policy_priority_min, sched_class,
@@ -78,6 +78,14 @@ fn can_control_target(target: &Arc<ProcessControlBlock>) -> bool {
         (inner.uid, inner.euid)
     };
     caller_euid == target_uid || caller_euid == target_euid
+}
+
+fn full_affinity_mask() -> usize {
+    if MAX_HARTS >= usize::BITS as usize {
+        usize::MAX
+    } else {
+        (1usize << MAX_HARTS) - 1
+    }
 }
 
 fn resolve_process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
@@ -262,8 +270,17 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     // Avoid large kernel allocations from bogus cpusetsize values.
     const MAX_CPUSET_BYTES: usize = 128;
     let cpusetsize = core::cmp::min(cpusetsize, MAX_CPUSET_BYTES);
-    let Some(_process) = resolve_process(pid) else {
+    let Some(process) = resolve_process(pid) else {
         return ESRCH;
+    };
+    let affinity_mask = {
+        let inner = process.borrow_mut();
+        let mask = inner.cpu_affinity_mask;
+        if mask == 0 {
+            full_affinity_mask()
+        } else {
+            mask
+        }
     };
     let mut tmp = alloc::vec![0u8; cpusetsize];
     let max_bits = cpusetsize * 8;
@@ -271,7 +288,9 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
         if cpu >= max_bits {
             break;
         }
-        tmp[cpu / 8] |= 1u8 << (cpu % 8);
+        if (affinity_mask & (1usize << cpu)) != 0 {
+            tmp[cpu / 8] |= 1u8 << (cpu % 8);
+        }
     }
     let token = get_current_token();
     if try_copy_to_user(token, mask_ptr as *mut u8, tmp.as_slice()).is_err() {
@@ -311,17 +330,45 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     if try_copy_from_user(token, mask_ptr as *const u8, mask.as_mut_slice()).is_err() {
         return EFAULT;
     }
-    let mut has_valid_cpu = false;
+    let max_bits = cpusetsize * 8;
+    let mut requested_mask = 0usize;
     for cpu in 0..MAX_HARTS {
-        if (mask[cpu / 8] & (1u8 << (cpu % 8))) != 0 {
-            has_valid_cpu = true;
+        if cpu >= max_bits {
             break;
         }
+        if (mask[cpu / 8] & (1u8 << (cpu % 8))) != 0 {
+            requested_mask |= 1usize << cpu;
+        }
     }
-    if !has_valid_cpu {
+    if requested_mask == 0 {
         return EINVAL;
     }
-    // Best-effort: affinity mask is validated but not enforced yet.
+
+    let current_hart = hart_id() % MAX_HARTS;
+    let preferred_cpu = if (requested_mask & (1usize << current_hart)) != 0 {
+        current_hart
+    } else {
+        requested_mask.trailing_zeros() as usize
+    };
+
+    let tasks = {
+        let mut inner = process.borrow_mut();
+        inner.cpu_affinity_mask = requested_mask;
+        inner
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref().cloned())
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    for task in tasks {
+        task.set_cpu_id(preferred_cpu);
+    }
+    refresh_process_runqueues(&process);
+
+    if Arc::ptr_eq(&current_process(), &process) && (requested_mask & (1usize << current_hart)) == 0
+    {
+        suspend_current_and_run_next();
+    }
     0
 }
 

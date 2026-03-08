@@ -56,6 +56,28 @@ fn maybe_log_task_drop(event: &str) {
     }
 }
 
+fn kill_pid_namespace_members_on_init_exit(process: &Arc<ProcessControlBlock>) {
+    let (pid, ns_id, is_ns_init) = {
+        let inner = process.borrow_mut();
+        (process.getpid(), inner.pid_ns_id, inner.pid_ns_init)
+    };
+    if !is_ns_init || ns_id == 0 {
+        return;
+    }
+    for member_pid in crate::task::pid_namespace_member_pids(ns_id) {
+        if member_pid == pid {
+            continue;
+        }
+        let Some(member) = crate::task::manager::pid2process(member_pid) else {
+            continue;
+        };
+        if member.borrow_mut().is_zombie {
+            continue;
+        }
+        crate::task::signal::queue_process_signal(member_pid, crate::task::signal::SIGKILL_NUM);
+    }
+}
+
 fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
     if crate::debug_config::DEBUG_TASK_LIFECYCLE {
         let seq = TASK_DROP_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
@@ -896,6 +918,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             process_inner.exit_code = exit_code;
             process_inner.parent.as_ref().and_then(|p| p.upgrade())
         }; // drop child PCB lock before touching parent to avoid lock inversion
+        kill_pid_namespace_members_on_init_exit(&process);
         crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
         // ...then wake parent waiters (waitpid) without holding the child PCB lock.

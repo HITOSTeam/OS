@@ -1,9 +1,9 @@
 use crate::{
     config::{PAGE_SIZE, TRAP_CONTEXT},
-    fs::{ext4_lock, File, OSInode, PseudoShmFile},
-    mm::{frame_alloc, try_copy_to_user, try_copy_to_user_unchecked, MapPermission, PTEFlags},
-    task::processor::{current_files_process, current_process},
+    fs::{File, OSInode, PseudoShmFile, ext4_lock},
+    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked},
     task::MmapRegion,
+    task::processor::{current_files_process, current_process},
     trap::get_current_token,
 };
 use alloc::sync::Arc;
@@ -321,11 +321,7 @@ pub fn syscall_brk(addr: usize) -> isize {
         while cur < new_end {
             if page_overlaps_sysv_shm_regions(cur, &inner.sysv_shm_attaches) {
                 if crate::debug_config::DEBUG_SYSCALL {
-                    crate::println!(
-                        "[brk] pid={} grow blocked by sysv_shm page={:#x}",
-                        pid,
-                        cur
-                    );
+                    crate::println!("[brk] pid={} grow blocked by sysv_shm page={:#x}", pid, cur);
                 }
                 ok = false;
                 break;
@@ -399,14 +395,13 @@ pub fn syscall_mmap(
     fd: isize,
     off: usize,
 ) -> isize {
-    const MAP_KNOWN_MASK: usize =
-        MAP_TYPE_MASK
-            | MAP_FIXED
-            | MAP_ANONYMOUS
-            | MAP_GROWSDOWN
-            | MAP_LOCKED
-            | MAP_STACK
-            | MAP_FIXED_NOREPLACE;
+    const MAP_KNOWN_MASK: usize = MAP_TYPE_MASK
+        | MAP_FIXED
+        | MAP_ANONYMOUS
+        | MAP_GROWSDOWN
+        | MAP_LOCKED
+        | MAP_STACK
+        | MAP_FIXED_NOREPLACE;
     let map_type = flags & MAP_TYPE_MASK;
     if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
         return EINVAL;

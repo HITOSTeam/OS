@@ -1321,8 +1321,13 @@ fn validate_recv_flags(flags: usize) -> isize {
     if (flags & MSG_ERRQUEUE) != 0 {
         return EAGAIN;
     }
-    let known =
-        MSG_DONTWAIT | MSG_PEEK | MSG_ERRQUEUE | MSG_OOB | MSG_WAITFORONE | MSG_WAITALL | MSG_NOSIGNAL;
+    let known = MSG_DONTWAIT
+        | MSG_PEEK
+        | MSG_ERRQUEUE
+        | MSG_OOB
+        | MSG_WAITFORONE
+        | MSG_WAITALL
+        | MSG_NOSIGNAL;
     if (flags & !known) != 0 {
         return EOPNOTSUPP;
     }
@@ -1619,15 +1624,12 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
         };
         if msg.msg_name != 0 && msg.msg_namelen != 0 {
             let sa = netlink_sock.local_addr();
-            let r = write_msg_name_bytes(
-                msg,
-                unsafe {
-                    core::slice::from_raw_parts(
-                        (&sa as *const SockAddrNl) as *const u8,
-                        size_of::<SockAddrNl>(),
-                    )
-                },
-            );
+            let r = write_msg_name_bytes(msg, unsafe {
+                core::slice::from_raw_parts(
+                    (&sa as *const SockAddrNl) as *const u8,
+                    size_of::<SockAddrNl>(),
+                )
+            });
             if r != 0 {
                 return r;
             }

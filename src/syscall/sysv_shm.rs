@@ -8,8 +8,8 @@ use spin::Mutex;
 use crate::config::PAGE_SIZE;
 use crate::fs::find_path_in_roots;
 use crate::mm::{
-    frame_alloc, try_read_user_value, try_write_user_value, FrameTracker, MapPermission, PTEFlags,
-    VirtAddr,
+    FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc, try_read_user_value,
+    try_write_user_value,
 };
 use crate::task::processor::current_process;
 
@@ -96,7 +96,9 @@ fn runtime_shmall_limit() -> usize {
 }
 
 pub fn proc_sysvipc_shm() -> String {
-    let mut out = String::from("       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime rss swap\n");
+    let mut out = String::from(
+        "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime rss swap\n",
+    );
     let ipc_ns_id = current_ipc_namespace_id();
     let managers = SHM_MANAGERS.lock();
     let Some(mgr) = managers.get(&ipc_ns_id) else {

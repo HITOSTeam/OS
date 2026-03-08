@@ -188,6 +188,7 @@ const SYSCALL_SETPRIORITY: usize = 140;
 const SYSCALL_GETPRIORITY: usize = 141;
 const SYSCALL_UMASK: usize = 166;
 const SYSCALL_PRCTL: usize = 167;
+const SYSCALL_GETCPU: usize = 168;
 const SYSCALL_SETREGID: usize = 143;
 const SYSCALL_SETGID: usize = 144;
 const SYSCALL_SETREUID: usize = 145;
@@ -637,6 +638,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRESGID => misc::syscall_getresgid(args[0], args[1], args[2]),
         SYSCALL_SETFSUID => misc::syscall_setfsuid(args[0]),
         SYSCALL_SETFSGID => misc::syscall_setfsgid(args[0]),
+        SYSCALL_GETCPU => smp::syscall_getcpu(args[0], args[1], args[2]),
         SYSCALL_GETTIMEOFDAY => time_sys::syscall_gettimeofday(args[0], args[1]),
         SYSCALL_SETTIMEOFDAY => time_sys::syscall_settimeofday(args[0], args[1]),
         SYSCALL_WAIT4 => process::syscall_wait4(args[0] as isize, args[1], args[2], args[3]),
@@ -759,16 +761,14 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             args[4],
         ),
         SYSCALL_FSOPEN => filesystem::syscall_fsopen(args[0], args[1]),
-        SYSCALL_FSCONFIG => filesystem::syscall_fsconfig(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_FSCONFIG => {
+            filesystem::syscall_fsconfig(args[0], args[1], args[2], args[3], args[4])
+        }
         SYSCALL_FSMOUNT => filesystem::syscall_fsmount(args[0], args[1], args[2]),
         SYSCALL_FSPICK => filesystem::syscall_fspick(args[0] as isize, args[1], args[2]),
-        SYSCALL_MOUNT_SETATTR => filesystem::syscall_mount_setattr(
-            args[0] as isize,
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-        ),
+        SYSCALL_MOUNT_SETATTR => {
+            filesystem::syscall_mount_setattr(args[0] as isize, args[1], args[2], args[3], args[4])
+        }
         SYSCALL_PIDFD_OPEN => dummy::syscall_pidfd_open(args[0], args[1]),
         SYSCALL_MEMFD_SECRET => dummy::syscall_memfd_secret(args[0]),
         SYSCALL_REBOOT => misc::syscall_reboot(args[0], args[1], args[2], args[3]),

@@ -10,11 +10,12 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, OSInode,
-    NamespaceFile, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
+    File, NamespaceFile, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag,
+    PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, root_inode_for_path,
+    secondary_root_inode,
 };
 use crate::mm::{UserBuffer, VirtAddr};
-use crate::task::manager::{pid2process, PID2PCB};
+use crate::task::manager::{PID2PCB, pid2process};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
 
@@ -23,6 +24,7 @@ pub enum ProcFileKind {
     Mounts,
     Meminfo,
     Cpuinfo,
+    Cmdline,
     Loadavg,
     Uptime,
     Stat,
@@ -187,11 +189,7 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 {
-        None
-    } else {
-        Some(ino)
-    }
+    if ino == 0 { None } else { Some(ino) }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
@@ -225,6 +223,7 @@ pub fn init_procfs() {
     let _ = ensure_proc_file(&proc_inode, "mounts", ProcFileKind::Mounts, 0o444);
     let _ = ensure_proc_file(&proc_inode, "meminfo", ProcFileKind::Meminfo, 0o444);
     let _ = ensure_proc_file(&proc_inode, "cpuinfo", ProcFileKind::Cpuinfo, 0o444);
+    let _ = ensure_proc_file(&proc_inode, "cmdline", ProcFileKind::Cmdline, 0o444);
     let _ = ensure_proc_file(&proc_inode, "loadavg", ProcFileKind::Loadavg, 0o444);
     let _ = ensure_proc_file(&proc_inode, "uptime", ProcFileKind::Uptime, 0o444);
     let _ = ensure_proc_file(&proc_inode, "stat", ProcFileKind::Stat, 0o444);
@@ -431,6 +430,7 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
         "mounts",
         "meminfo",
         "cpuinfo",
+        "cmdline",
         "loadavg",
         "uptime",
         "stat",
@@ -900,6 +900,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "/proc/mounts" => return Some(ProcPseudoFile::new(ProcFileKind::Mounts)),
         "/proc/meminfo" => return Some(ProcPseudoFile::new(ProcFileKind::Meminfo)),
         "/proc/cpuinfo" => return Some(ProcPseudoFile::new(ProcFileKind::Cpuinfo)),
+        "/proc/cmdline" => return Some(ProcPseudoFile::new(ProcFileKind::Cmdline)),
         "/proc/loadavg" => return Some(ProcPseudoFile::new(ProcFileKind::Loadavg)),
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
@@ -1040,6 +1041,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::Mounts | ProcFileKind::PidMounts(_) => proc_mounts(),
         ProcFileKind::Meminfo => proc_meminfo(),
         ProcFileKind::Cpuinfo => proc_cpuinfo(),
+        ProcFileKind::Cmdline => proc_cmdline(),
         ProcFileKind::Loadavg => String::from("0.00 0.00 0.00 1/1 1\n"),
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
@@ -1175,6 +1177,10 @@ fn proc_cpuinfo() -> String {
     String::from(
         "processor\t: 0\nvendor_id\t: QEMU\nmodel name\t: QEMU Virtual CPU\ncpu MHz\t\t: 1000.000\n",
     )
+}
+
+fn proc_cmdline() -> String {
+    String::from("root=/dev/vda rw console=ttyS0\n")
 }
 
 fn proc_uptime() -> String {

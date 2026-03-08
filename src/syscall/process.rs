@@ -7,10 +7,10 @@ use core::{
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    fs::{ext4_lock, root_inode_for_path, secondary_root_inode, PidFdFile},
+    fs::{PidFdFile, ext4_lock, root_inode_for_path, secondary_root_inode},
     mm::{
-        kernel_token, try_read_user_value, try_write_user_value, write_user_value, MapPermission,
-        MemorySet,
+        MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
+        write_user_value,
     },
     println,
     syscall::{
@@ -21,17 +21,19 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
+        ProcessControlBlock,
         manager::{
-            add_task, pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
-            PID2PCB,
+            PID2PCB, add_task, pid2process, remove_inactive_task, select_hart_for_new_task,
+            wakeup_task,
         },
-        processor::{block_current_and_run_next, current_files_process, current_process, current_task},
+        processor::{
+            block_current_and_run_next, current_files_process, current_process, current_task,
+        },
         signal::{
-            pending_unmasked_bits, queue_process_signal, SignalFlags, MAX_SIG, RT_SIG_MAX,
-            SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM, SIG_DFL, SIG_IGN,
+            MAX_SIG, RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,
+            SignalFlags, pending_unmasked_bits, queue_process_signal,
         },
         task_block::{TaskControlBlock, TaskStatus},
-        ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
@@ -79,7 +81,8 @@ fn debug_task_ref_breakdown(
     let processor_refs = crate::task::processor::debug_count_task_refs_in_processors(task);
     let timer_refs = crate::task::block_sleep::debug_count_task_refs_in_timers(task);
     let futex_refs = crate::syscall::futex::debug_count_task_waiters(task);
-    let record_lock_refs = crate::syscall::filesystem::debug_count_record_lock_waiters_for_task(task);
+    let record_lock_refs =
+        crate::syscall::filesystem::debug_count_record_lock_waiters_for_task(task);
 
     let processes = {
         let map = PID2PCB.lock();
@@ -522,6 +525,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_NEWIPC: usize = 0x0800_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+    const CLONE_NEWPID: usize = 0x2000_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
     const EINVAL: isize = -22;
     const EFAULT: isize = -14;
@@ -682,6 +686,15 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let mut child_inner = child.borrow_mut();
         child_inner.sysv_shm_attaches.clear();
         child_inner.ipc_ns_id = crate::task::alloc_ipc_namespace_id();
+    }
+    if (flags & CLONE_NEWPID) != 0 {
+        let parent_ns_id = process.pid_namespace_id();
+        let child_ns_id = crate::task::alloc_pid_namespace_id();
+        crate::task::register_pid_namespace(parent_ns_id, child_ns_id);
+        let mut child_inner = child.borrow_mut();
+        child_inner.pid_ns_id = child_ns_id;
+        child_inner.pid_ns_vpid = 1;
+        child_inner.pid_ns_init = true;
     }
     let fork_elapsed_us = if DEBUG_FUTEX {
         let delta = crate::arch::read_time().wrapping_sub(fork_start_cycles) as u128;
@@ -1996,7 +2009,12 @@ pub fn syscall_execveat(
 }
 
 pub fn syscall_getpid() -> isize {
-    current_task().unwrap().process.upgrade().unwrap().getpid() as isize
+    current_task()
+        .unwrap()
+        .process
+        .upgrade()
+        .unwrap()
+        .visible_pid() as isize
 }
 
 fn ptrace_target_for_current(pid: usize) -> Result<Arc<ProcessControlBlock>, isize> {

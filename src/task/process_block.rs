@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
-use crate::config::{PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
+use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{
@@ -17,8 +17,8 @@ use crate::println;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidHandle, pid_alloc};
 use crate::task::manager::{
-    add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
-    PID2PCB,
+    PID2PCB, add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task,
+    wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
@@ -37,9 +37,90 @@ const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
 static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FORK_PRE_COW_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPC_NS_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_PID_NS_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub fn alloc_ipc_namespace_id() -> usize {
     NEXT_IPC_NS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn alloc_pid_namespace_id() -> usize {
+    NEXT_PID_NS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn register_pid_namespace(parent_ns_id: usize, child_ns_id: usize) {
+    if child_ns_id == 0 {
+        return;
+    }
+    PID_NAMESPACE_PARENTS
+        .lock()
+        .insert(child_ns_id, parent_ns_id);
+}
+
+pub fn pid_namespace_descends_from(ns_id: usize, ancestor_ns_id: usize) -> bool {
+    if ancestor_ns_id == 0 {
+        return true;
+    }
+    if ns_id == ancestor_ns_id {
+        return true;
+    }
+    let parents = PID_NAMESPACE_PARENTS.lock();
+    let mut current = ns_id;
+    while current != 0 {
+        let Some(parent) = parents.get(&current).copied() else {
+            break;
+        };
+        if parent == ancestor_ns_id {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+pub fn process_visible_in_pid_namespace(
+    process: &Arc<ProcessControlBlock>,
+    namespace_id: usize,
+) -> bool {
+    if namespace_id == 0 {
+        return true;
+    }
+    pid_namespace_descends_from(process.pid_namespace_id(), namespace_id)
+}
+
+pub fn resolve_process_in_pid_namespace(
+    namespace_id: usize,
+    pid: usize,
+) -> Option<Arc<ProcessControlBlock>> {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    if namespace_id == 0 {
+        return processes
+            .into_iter()
+            .find(|process| process.getpid() == pid);
+    }
+    for process in processes {
+        if process.pid_namespace_id() != namespace_id {
+            continue;
+        }
+        if process.visible_pid() == pid {
+            return Some(process);
+        }
+    }
+    None
+}
+
+pub fn pid_namespace_member_pids(namespace_id: usize) -> Vec<usize> {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    processes
+        .into_iter()
+        .filter(|process| process_visible_in_pid_namespace(process, namespace_id))
+        .map(|process| process.getpid())
+        .collect()
 }
 
 pub(crate) fn remove_task_from_wait_queues(task: &Arc<TaskControlBlock>) {
@@ -68,7 +149,10 @@ pub(crate) fn remove_task_from_wait_queues(task: &Arc<TaskControlBlock>) {
         }
 
         for sem in inner.semaphore_list.iter().filter_map(|s| s.as_ref()) {
-            sem.inner.lock().wait_queue.retain(|w| !Arc::ptr_eq(w, task));
+            sem.inner
+                .lock()
+                .wait_queue
+                .retain(|w| !Arc::ptr_eq(w, task));
         }
 
         for condvar in inner.condvar_list.iter().filter_map(|c| c.as_ref()) {
@@ -146,6 +230,9 @@ impl MmapRegion {
 lazy_static! {
     /// owner_pid -> processes currently sharing that owner's file table.
     static ref SHARED_FILES_SHARERS: SpinMutex<BTreeMap<usize, Vec<Weak<ProcessControlBlock>>>> =
+        SpinMutex::new(BTreeMap::new());
+    /// child pid namespace id -> parent pid namespace id.
+    static ref PID_NAMESPACE_PARENTS: SpinMutex<BTreeMap<usize, usize>> =
         SpinMutex::new(BTreeMap::new());
 }
 
@@ -844,6 +931,12 @@ pub struct ProcessControlBlockInner {
     pub mlockall_future: bool,
     /// IPC namespace id used by SysV IPC / POSIX MQ isolation.
     pub ipc_ns_id: usize,
+    /// PID namespace id; 0 is the initial namespace.
+    pub pid_ns_id: usize,
+    /// PID visible from within the process's own PID namespace.
+    pub pid_ns_vpid: usize,
+    /// Whether this process is PID 1 inside its PID namespace.
+    pub pid_ns_init: bool,
     /// System V shared memory attachments (shmat/shmdt).
     pub sysv_shm_attaches: Vec<crate::syscall::sysv_shm::ShmAttach>,
     pub signals: SignalFlags,
@@ -854,6 +947,8 @@ pub struct ProcessControlBlockInner {
     pub rt_sig_handlers: Vec<RtSigAction>,
     /// Linux-like scheduler state used by rt-tests (cyclictest/hackbench).
     pub sched_policy: i32,
+    /// Process-wide CPU affinity mask used by `sched_*affinity` and `getcpu`.
+    pub cpu_affinity_mask: usize,
     pub sched_priority: i32,
     pub sched_runtime: u64,
     pub sched_deadline: u64,
@@ -1283,6 +1378,9 @@ impl ProcessControlBlock {
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
                 ipc_ns_id: 0,
+                pid_ns_id: 0,
+                pid_ns_vpid: pid,
+                pid_ns_init: false,
                 sysv_shm_attaches: Vec::new(),
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
@@ -1290,6 +1388,11 @@ impl ProcessControlBlock {
                 handling_signal: -1,
                 rt_sig_handlers: vec![RtSigAction::default(); RT_SIG_MAX + 1],
                 sched_policy: 0,
+                cpu_affinity_mask: if MAX_HARTS >= usize::BITS as usize {
+                    usize::MAX
+                } else {
+                    (1usize << MAX_HARTS) - 1
+                },
                 sched_priority: 0,
                 sched_runtime: 0,
                 sched_deadline: 0,
@@ -1615,6 +1718,7 @@ impl ProcessControlBlock {
         }
         // alloc a pid
         let pid = pid_alloc();
+        let pid_value = pid.0;
         let inherited_owner = parent.files_owner.as_ref().and_then(Weak::upgrade);
         if parent.files_owner.is_some() && inherited_owner.is_none() {
             parent.files_owner = None;
@@ -1737,6 +1841,9 @@ impl ProcessControlBlock {
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
                 ipc_ns_id: parent.ipc_ns_id,
+                pid_ns_id: parent.pid_ns_id,
+                pid_ns_vpid: pid_value,
+                pid_ns_init: false,
                 sysv_shm_attaches: inherited_shm.clone(),
                 // is right here?
                 signals: SignalFlags::empty(),
@@ -1745,6 +1852,7 @@ impl ProcessControlBlock {
                 handling_signal: -1,
                 rt_sig_handlers,
                 sched_policy,
+                cpu_affinity_mask: parent.cpu_affinity_mask,
                 sched_priority,
                 sched_runtime,
                 sched_deadline,
@@ -1867,5 +1975,22 @@ impl ProcessControlBlock {
 
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    pub fn visible_pid(&self) -> usize {
+        let inner = self.borrow_mut();
+        if inner.pid_ns_id == 0 {
+            self.pid.0
+        } else {
+            inner.pid_ns_vpid
+        }
+    }
+
+    pub fn pid_namespace_id(&self) -> usize {
+        self.borrow_mut().pid_ns_id
+    }
+
+    pub fn is_pid_namespace_init(&self) -> bool {
+        self.borrow_mut().pid_ns_init
     }
 }
