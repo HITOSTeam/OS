@@ -4352,6 +4352,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         append,
         inode,
         readonly_fs,
+        false,
         tmpfile_cleanup,
     ));
     crate::fs::debug_track_iozone_inode(&path, inode_num);
@@ -4379,7 +4380,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         || path.starts_with("/proc/sys/vm/"))
     {
         if let Some(inode) = find_path_in_roots(path) {
-            return Some(alloc::sync::Arc::new(OSInode::new(true, true, inode)));
+            return Some(alloc::sync::Arc::new(OSInode::new_replace_on_write(true, true, inode)));
         }
     }
     if path == "/proc/sys" || path == "/proc/sys/" {

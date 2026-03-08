@@ -123,6 +123,30 @@ pub fn pid_namespace_member_pids(namespace_id: usize) -> Vec<usize> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+pub struct UtsNamespaceState {
+    pub nodename: [u8; 65],
+    pub domainname: [u8; 65],
+}
+
+impl UtsNamespaceState {
+    pub fn new() -> Self {
+        let mut state = Self {
+            nodename: [0; 65],
+            domainname: [0; 65],
+        };
+        Self::write_name_field(&mut state.nodename, b"localhost");
+        Self::write_name_field(&mut state.domainname, b"localdomain");
+        state
+    }
+
+    fn write_name_field(dst: &mut [u8; 65], src: &[u8]) {
+        dst.fill(0);
+        let n = src.len().min(64);
+        dst[..n].copy_from_slice(&src[..n]);
+    }
+}
+
 pub(crate) fn remove_task_from_wait_queues(task: &Arc<TaskControlBlock>) {
     let processes = {
         let map = PID2PCB.lock();
@@ -933,6 +957,8 @@ pub struct ProcessControlBlockInner {
     pub mlockall_future: bool,
     /// IPC namespace id used by SysV IPC / POSIX MQ isolation.
     pub ipc_ns_id: usize,
+    /// Shared UTS namespace state (hostname/domainname).
+    pub uts_ns: Arc<SpinMutex<UtsNamespaceState>>,
     /// PID namespace id; 0 is the initial namespace.
     pub pid_ns_id: usize,
     /// PID visible from within the process's own PID namespace.
@@ -1381,6 +1407,7 @@ impl ProcessControlBlock {
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
                 ipc_ns_id: 0,
+                uts_ns: Arc::new(SpinMutex::new(UtsNamespaceState::new())),
                 pid_ns_id: 0,
                 pid_ns_vpid: pid,
                 pid_ns_init: false,
@@ -1845,6 +1872,7 @@ impl ProcessControlBlock {
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
                 ipc_ns_id: parent.ipc_ns_id,
+                uts_ns: Arc::clone(&parent.uts_ns),
                 pid_ns_id: parent.pid_ns_id,
                 pid_ns_vpid: pid_value,
                 pid_ns_init: false,
@@ -1992,6 +2020,20 @@ impl ProcessControlBlock {
 
     pub fn pid_namespace_id(&self) -> usize {
         self.borrow_mut().pid_ns_id
+    }
+
+    pub fn uts_namespace(self: &Arc<Self>) -> Arc<SpinMutex<UtsNamespaceState>> {
+        let inner = self.borrow_mut();
+        Arc::clone(&inner.uts_ns)
+    }
+
+    pub fn unshare_uts_namespace(self: &Arc<Self>) {
+        let snapshot = {
+            let uts_ns = self.uts_namespace();
+            *uts_ns.lock()
+        };
+        let mut inner = self.borrow_mut();
+        inner.uts_ns = Arc::new(SpinMutex::new(snapshot));
     }
 
     pub fn is_pid_namespace_init(&self) -> bool {

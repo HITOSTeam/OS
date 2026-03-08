@@ -97,6 +97,7 @@ pub struct OSInode {
     writable: bool,
     append: bool,
     readonly_fs: bool,
+    replace_on_write: bool,
     tmpfile_cleanup: Option<TmpfileCleanup>,
     inner: Mutex<OSInodeInner>,
 }
@@ -144,7 +145,11 @@ impl OSInode {
         inode: Arc<Inode>,
         readonly_fs: bool,
     ) -> Self {
-        Self::new_with_append_rofs_tmp_cleanup(readable, writable, append, inode, readonly_fs, None)
+        Self::new_with_append_rofs_tmp_cleanup(readable, writable, append, inode, readonly_fs, false, None)
+    }
+
+    pub fn new_replace_on_write(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
+        Self::new_with_append_rofs_tmp_cleanup(readable, writable, false, inode, false, true, None)
     }
 
     pub fn new_with_append_rofs_tmp_cleanup(
@@ -153,6 +158,7 @@ impl OSInode {
         append: bool,
         inode: Arc<Inode>,
         readonly_fs: bool,
+        replace_on_write: bool,
         tmpfile_cleanup: Option<(Arc<Inode>, String)>,
     ) -> Self {
         Self {
@@ -160,6 +166,7 @@ impl OSInode {
             writable,
             append,
             readonly_fs,
+            replace_on_write,
             tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
             inner: Mutex::new(OSInodeInner {
                 offset: 0,
@@ -296,6 +303,9 @@ impl OSInode {
     /// Write to this inode at the given offset without updating the file offset.
     pub fn pwrite_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ()> {
         let mut inner = self.inner.lock();
+        if self.replace_on_write && offset == 0 && inner.write_buf.is_empty() {
+            self.clear_inode_for_replace_write(&mut inner, offset)?;
+        }
         // Writes via pwrite/pwritev must invalidate the buffered read cache.
         inner.read_buf_valid = 0;
         let inode_num = inner.inode.inode_num();
@@ -440,6 +450,23 @@ impl OSInode {
         let mut inner = self.inner.lock();
         inner.offset = offset;
         inner.read_buf_valid = 0;
+    }
+
+    fn clear_inode_for_replace_write(&self, inner: &mut OSInodeInner, write_offset: usize) -> Result<(), ()> {
+        if !self.replace_on_write || !inner.write_buf.is_empty() || write_offset != 0 {
+            return Ok(());
+        }
+        let result = {
+            let _fs_guard = ext4_lock();
+            inner.inode.clear()
+        };
+        match result {
+            Ok(_) => {
+                inner.read_buf_valid = 0;
+                Ok(())
+            }
+            Err(_) => Err(()),
+        }
     }
 
     pub fn dir_offset(&self) -> usize {
@@ -832,6 +859,11 @@ impl File for OSInode {
             inner.offset = inner.inode.size() as usize;
         }
         let mut total_write_size = 0usize;
+
+        let current_offset = inner.offset;
+        if self.clear_inode_for_replace_write(&mut inner, current_offset).is_err() {
+            return 0;
+        }
 
         for slice in _buf.buffers.iter() {
             // Flush on non-sequential writes.

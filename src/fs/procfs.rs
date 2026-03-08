@@ -334,6 +334,7 @@ pub fn init_procfs() {
                 ("mmap_min_addr", "65536\n"),
                 ("overcommit_memory", "0\n"),
                 ("overcommit_ratio", "50\n"),
+                ("panic_on_oom", "0\n"),
                 ("max_map_count", "65530\n"),
                 ("swappiness", "60\n"),
                 ("stat_refresh", "0\n"),

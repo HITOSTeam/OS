@@ -33,8 +33,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use lazy_static::lazy_static;
-use spin::Mutex;
 
 // ---- Linux-like TID encoding ------------------------------------------------
 //
@@ -120,28 +118,6 @@ struct UtsName {
     domainname: [u8; 65],
 }
 
-#[derive(Clone, Copy)]
-struct UtsConfig {
-    nodename: [u8; 65],
-    domainname: [u8; 65],
-}
-
-impl UtsConfig {
-    fn new() -> Self {
-        let mut cfg = Self {
-            nodename: [0; 65],
-            domainname: [0; 65],
-        };
-        write_name_field(&mut cfg.nodename, b"localhost");
-        write_name_field(&mut cfg.domainname, b"localdomain");
-        cfg
-    }
-}
-
-lazy_static! {
-    static ref UTS_CONFIG: Mutex<UtsConfig> = Mutex::new(UtsConfig::new());
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct LinuxSysinfo {
@@ -224,26 +200,30 @@ fn read_name_from_user(name: usize, len: usize) -> Result<[u8; 65], isize> {
 }
 
 pub fn syscall_sethostname(name: usize, len: usize) -> isize {
-    if current_process().borrow_mut().euid != 0 {
+    let process = current_process();
+    if process.borrow_mut().euid != 0 {
         return EPERM;
     }
     let new_name = match read_name_from_user(name, len) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    UTS_CONFIG.lock().nodename = new_name;
+    let uts_ns = process.uts_namespace();
+    uts_ns.lock().nodename = new_name;
     0
 }
 
 pub fn syscall_setdomainname(name: usize, len: usize) -> isize {
-    if current_process().borrow_mut().euid != 0 {
+    let process = current_process();
+    if process.borrow_mut().euid != 0 {
         return EPERM;
     }
     let new_name = match read_name_from_user(name, len) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    UTS_CONFIG.lock().domainname = new_name;
+    let uts_ns = process.uts_namespace();
+    uts_ns.lock().domainname = new_name;
     0
 }
 
@@ -285,7 +265,8 @@ pub fn syscall_uname(buf: usize) -> isize {
     };
     write_name_field(&mut un.machine, machine);
     {
-        let cfg = UTS_CONFIG.lock();
+        let uts_ns = current_process().uts_namespace();
+        let cfg = uts_ns.lock();
         un.nodename = cfg.nodename;
         un.domainname = cfg.domainname;
     }
@@ -372,7 +353,8 @@ pub fn syscall_gethostname(name: usize, len: usize) -> isize {
         return EFAULT;
     }
     let nodename = {
-        let cfg = UTS_CONFIG.lock();
+        let uts_ns = current_process().uts_namespace();
+        let cfg = uts_ns.lock();
         cfg.nodename
     };
     let host_len = nodename.iter().position(|&c| c == 0).unwrap_or(64);
@@ -732,19 +714,20 @@ pub fn syscall_unshare(flags: usize) -> isize {
     const CLONE_FS: usize = 0x0000_0200;
     const CLONE_FILES: usize = 0x0000_0400;
     const CLONE_NEWNS: usize = 0x0002_0000;
-    let valid = CLONE_FILES | CLONE_FS | CLONE_NEWNS;
+    const CLONE_NEWUTS: usize = 0x0400_0000;
+    let valid = CLONE_FILES | CLONE_FS | CLONE_NEWNS | CLONE_NEWUTS;
     if (flags & !valid) != 0 {
         return EINVAL;
     }
-    if (flags & CLONE_NEWNS) != 0 {
-        let process = current_process();
-        if process.borrow_mut().euid != 0 {
-            return EPERM;
-        }
+    let process = current_process();
+    if (flags & (CLONE_NEWNS | CLONE_NEWUTS)) != 0 && process.borrow_mut().euid != 0 {
+        return EPERM;
     }
     if (flags & CLONE_FILES) != 0 {
-        let process = current_process();
         process.unshare_files();
+    }
+    if (flags & CLONE_NEWUTS) != 0 {
+        process.unshare_uts_namespace();
     }
     0
 }

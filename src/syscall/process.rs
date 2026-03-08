@@ -524,6 +524,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     const CLONE_PARENT_SETTID: usize = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_NEWIPC: usize = 0x0800_0000;
+    const CLONE_NEWUTS: usize = 0x0400_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
     const CLONE_NEWPID: usize = 0x2000_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
@@ -551,6 +552,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     }
     if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
         return EINVAL;
+    }
+    if (flags & CLONE_NEWUTS) != 0 && current_process().borrow_mut().euid != 0 {
+        return EPERM;
     }
     if stack == 0 {
         // Linux permits fork-like clone(SIGCHLD, NULL, ...) but rejects NULL
@@ -686,6 +690,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let mut child_inner = child.borrow_mut();
         child_inner.sysv_shm_attaches.clear();
         child_inner.ipc_ns_id = crate::task::alloc_ipc_namespace_id();
+    }
+    if (flags & CLONE_NEWUTS) != 0 {
+        child.unshare_uts_namespace();
     }
     if (flags & CLONE_NEWPID) != 0 {
         let parent_ns_id = process.pid_namespace_id();
