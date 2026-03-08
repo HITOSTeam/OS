@@ -8,9 +8,6 @@ use core::mem::size_of;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::fs::{
-    File, NetSocketFile, PidFdFile, SocketPairEnd, ext4_lock, find_path_in_roots, make_socketpair,
-};
 use crate::mm::{
     UserBuffer, read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
     try_write_user_value,
@@ -23,6 +20,13 @@ use crate::task::processor::{
 };
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::trap::get_current_token;
+use crate::{
+    bpf::get_prog_clone,
+    fs::{
+        File, NetSocketFile, PidFdFile, SocketPairEnd, ext4_lock, find_path_in_roots,
+        make_socketpair,
+    },
+};
 
 const AF_UNIX: u16 = 1;
 const AF_INET: u16 = 2;
@@ -49,6 +53,7 @@ const SO_OOBINLINE: usize = 10;
 const SO_PEERCRED: usize = 17;
 const SO_SNDBUFFORCE: usize = 32;
 const SO_RCVBUFFORCE: usize = 33;
+const SO_ATTACH_BPF: usize = 50;
 const MCAST_JOIN_GROUP: usize = 42;
 const MCAST_LEAVE_GROUP: usize = 45;
 
@@ -2516,6 +2521,35 @@ pub fn syscall_setsockopt(
         Ok(f) => f,
         Err(e) => return e,
     };
+    if level == SOL_SOCKET && optname == SO_ATTACH_BPF {
+        if optlen < size_of::<i32>() {
+            return EINVAL;
+        }
+        if optval == 0 {
+            return EFAULT;
+        }
+        let token = get_current_token();
+        let Some(prog_fd) = try_read_user_value::<i32>(token, optval as *const i32) else {
+            return EFAULT;
+        };
+        if prog_fd < 0 {
+            return EBADF;
+        }
+        let Some(prog) = get_prog_clone(prog_fd as usize) else {
+            return EBADF;
+        };
+        if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
+            sock.attach_bpf(prog);
+            return 0;
+        }
+        if let Some(sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
+            if let Some(end) = sock.stream_end() {
+                end.attach_bpf(prog);
+                return 0;
+            }
+            return ENOTSOCK;
+        }
+    }
     if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
         return 0;
     }

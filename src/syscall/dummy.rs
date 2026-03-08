@@ -196,8 +196,8 @@ pub fn syscall_io_uring_setup(_entries: usize, _params: usize) -> isize {
     ENOSYS
 }
 
-pub fn syscall_bpf(_cmd: usize, _attr: usize, _size: usize) -> isize {
-    alloc_dummy_fd(0)
+pub fn syscall_bpf(cmd: usize, attr: usize, size: usize) -> isize {
+    crate::bpf::syscall_bpf(cmd, attr, size)
 }
 
 pub fn syscall_fsopen(_fsname: usize, _flags: usize) -> isize {

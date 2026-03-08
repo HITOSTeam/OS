@@ -4,6 +4,7 @@
 pub mod utils;
 extern crate alloc;
 mod arch;
+pub mod bpf;
 mod config;
 mod console;
 pub mod debug_config;

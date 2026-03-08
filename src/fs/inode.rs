@@ -145,7 +145,15 @@ impl OSInode {
         inode: Arc<Inode>,
         readonly_fs: bool,
     ) -> Self {
-        Self::new_with_append_rofs_tmp_cleanup(readable, writable, append, inode, readonly_fs, false, None)
+        Self::new_with_append_rofs_tmp_cleanup(
+            readable,
+            writable,
+            append,
+            inode,
+            readonly_fs,
+            false,
+            None,
+        )
     }
 
     pub fn new_replace_on_write(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
@@ -452,7 +460,11 @@ impl OSInode {
         inner.read_buf_valid = 0;
     }
 
-    fn clear_inode_for_replace_write(&self, inner: &mut OSInodeInner, write_offset: usize) -> Result<(), ()> {
+    fn clear_inode_for_replace_write(
+        &self,
+        inner: &mut OSInodeInner,
+        write_offset: usize,
+    ) -> Result<(), ()> {
         if !self.replace_on_write || !inner.write_buf.is_empty() || write_offset != 0 {
             return Ok(());
         }
@@ -861,7 +873,10 @@ impl File for OSInode {
         let mut total_write_size = 0usize;
 
         let current_offset = inner.offset;
-        if self.clear_inode_for_replace_write(&mut inner, current_offset).is_err() {
+        if self
+            .clear_inode_for_replace_write(&mut inner, current_offset)
+            .is_err()
+        {
             return 0;
         }
 

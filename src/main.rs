@@ -8,6 +8,7 @@ extern crate alloc;
 use crate::fs::list_apps;
 use core::sync::atomic::{AtomicBool, Ordering};
 mod arch;
+mod bpf;
 mod config;
 mod console;
 mod debug_config;

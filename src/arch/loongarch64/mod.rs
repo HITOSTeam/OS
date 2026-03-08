@@ -1,11 +1,11 @@
 pub mod mm;
 pub mod trap;
 
+use crate::task::task_block::TaskControlBlock;
 use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
-use crate::task::task_block::TaskControlBlock;
 
 global_asm!(include_str!("tlb_refill.S"));
 

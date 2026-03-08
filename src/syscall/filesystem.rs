@@ -4380,7 +4380,9 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         || path.starts_with("/proc/sys/vm/"))
     {
         if let Some(inode) = find_path_in_roots(path) {
-            return Some(alloc::sync::Arc::new(OSInode::new_replace_on_write(true, true, inode)));
+            return Some(alloc::sync::Arc::new(OSInode::new_replace_on_write(
+                true, true, inode,
+            )));
         }
     }
     if path == "/proc/sys" || path == "/proc/sys/" {
@@ -4475,7 +4477,10 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                 dtype: 4
             },
         ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/sys/fs", entries)));
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/proc/sys/fs",
+            entries,
+        )));
     }
     if path == "/proc/sys/fs/inotify" || path == "/proc/sys/fs/inotify/" {
         let entries = alloc::vec![
@@ -4505,7 +4510,10 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                 dtype: 8
             },
         ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/sys/fs/inotify", entries)));
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/proc/sys/fs/inotify",
+            entries,
+        )));
     }
     if path == "/proc/sys/fs/inotify/max_queued_events" {
         return Some(alloc::sync::Arc::new(PseudoFile::new_static_rw("16384\n")));

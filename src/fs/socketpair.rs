@@ -1,10 +1,10 @@
 use alloc::sync::Arc;
 use core::any::Any;
 
-use crate::mm::UserBuffer;
+use crate::{bpf::BpfProgFile, mm::UserBuffer};
 
-use super::pipe::{make_pipe, Pipe};
 use super::File;
+use super::pipe::{Pipe, make_pipe};
 
 /// A minimal full-duplex endpoint used to implement `socketpair(AF_UNIX, SOCK_STREAM, ...)`.
 ///
@@ -36,6 +36,10 @@ impl SocketPairEnd {
 
     pub fn write_from_slice(&self, data: &[u8], nonblock: bool) -> Result<usize, isize> {
         self.write_end.write_from_slice(data, nonblock)
+    }
+
+    pub fn attach_bpf(&self, prog: Arc<BpfProgFile>) {
+        self.read_end.attach_bpf(prog);
     }
 }
 

@@ -98,7 +98,8 @@ impl PtyManager {
 
 lazy_static! {
     static ref PTY_MANAGER: Mutex<PtyManager> = Mutex::new(PtyManager::new());
-    static ref DEV_TTY_STATE: Arc<Mutex<TtyAttrState>> = Arc::new(Mutex::new(TtyAttrState::default()));
+    static ref DEV_TTY_STATE: Arc<Mutex<TtyAttrState>> =
+        Arc::new(Mutex::new(TtyAttrState::default()));
 }
 
 pub struct TtyFile {

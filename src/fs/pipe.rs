@@ -7,13 +7,14 @@ use alloc::{
 use spin::Mutex;
 
 use crate::{
+    bpf::BpfProgFile,
     debug_config::DEBUG_UNIXBENCH,
-    fs::{find_path_in_roots, File},
+    fs::{File, find_path_in_roots},
     mm::UserBuffer,
     task::{
-        manager::{wakeup_task, PID2PCB},
+        manager::{PID2PCB, wakeup_task},
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::{has_unmasked_pending, queue_process_signal_info, signal_bit, SIGPIPE_NUM},
+        signal::{SIGPIPE_NUM, has_unmasked_pending, queue_process_signal_info, signal_bit},
         task_block::TaskControlBlock,
     },
 };
@@ -129,6 +130,14 @@ impl Pipe {
 
     pub fn set_end_ref_bias(&self, read_bias: usize, write_bias: usize) {
         self.buffer.lock().set_end_ref_bias(read_bias, write_bias);
+    }
+
+    pub fn attach_bpf(&self, prog: Arc<BpfProgFile>) {
+        self.buffer.lock().attached_bpf = Some(prog);
+    }
+
+    pub fn attached_bpf(&self) -> Option<Arc<BpfProgFile>> {
+        self.buffer.lock().attached_bpf.clone()
     }
 
     pub fn set_async_enabled(&self, enabled: bool) {
@@ -261,6 +270,9 @@ impl Pipe {
         loop {
             let mut ring_buffer = self.buffer.lock();
             if ring_buffer.all_read_ends_closed() {
+                if let Some(bit) = signal_bit(SIGPIPE_NUM) {
+                    task.borrow_mut().pending_signals |= bit;
+                }
                 ring_buffer.remove_writer(&task);
                 return Ok(written);
             }
@@ -302,7 +314,20 @@ impl Pipe {
             } else {
                 None
             };
+            let attached_bpf = if to_write > 0 {
+                ring_buffer.attached_bpf.clone()
+            } else {
+                None
+            };
+            let bpf_packet = if to_write > 0 && attached_bpf.is_some() {
+                Some(data[written - to_write..written].to_vec())
+            } else {
+                None
+            };
             drop(ring_buffer);
+            if let (Some(prog), Some(packet)) = (attached_bpf, bpf_packet) {
+                prog.run_packet(packet.as_slice());
+            }
             if let Some((owner_type, owner_pid, sig, fd)) = async_notify {
                 notify_async_io(owner_type, owner_pid, sig, fd);
             }
@@ -360,6 +385,7 @@ enum RingBufferStatus {
 
 pub struct PipeRingBuffer {
     arr: Vec<u8>,
+    attached_bpf: Option<Arc<BpfProgFile>>,
     capacity: usize,
     head: usize,
     tail: usize,
@@ -382,6 +408,7 @@ impl PipeRingBuffer {
         let capacity = default_pipe_capacity_for_current();
         Self {
             arr: vec![0; MAX_PIPE_CAPACITY],
+            attached_bpf: None,
             capacity,
             head: 0,
             tail: 0,
@@ -627,7 +654,14 @@ fn notify_async_io(owner_type: i32, owner_pid: i32, sig: i32, fd: i32) {
     match owner_type {
         // For now map TID to process leader PID in this single-thread use case.
         F_OWNER_TID | F_OWNER_PID => {
-            queue_process_signal_info(owner_pid as usize, signum as usize, 0, 0, POLL_IN, fd as usize);
+            queue_process_signal_info(
+                owner_pid as usize,
+                signum as usize,
+                0,
+                0,
+                POLL_IN,
+                fd as usize,
+            );
         }
         F_OWNER_PGRP => {
             let targets = {
@@ -893,138 +927,16 @@ impl File for Pipe {
         if want_to_write == 0 {
             return 0;
         }
-        let task = current_task().unwrap();
-        let has_pending_signal = || {
-            let inner = task.borrow_mut();
-            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
-        };
-        // Copy user data up front to avoid holding user pointers across blocking writes.
         let mut data = Vec::with_capacity(want_to_write);
         for byte_ref in buf.into_iter() {
             unsafe {
                 data.push(*byte_ref);
             }
         }
-        let mut buf_iter = data.into_iter();
-        let mut already_write = 0usize;
-        loop {
-            let mut ring_buffer = self.buffer.lock();
-            if ring_buffer.all_read_ends_closed() {
-                crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] write to closed read end");
-                if let Some(bit) = signal_bit(SIGPIPE_NUM) {
-                    task.borrow_mut().pending_signals |= bit;
-                }
-                ring_buffer.remove_writer(&task);
-                return already_write;
-            }
-            let loop_write = ring_buffer.available_write();
-            if loop_write == 0
-                || (already_write == 0 && want_to_write <= PIPE_BUF && loop_write < want_to_write)
-            {
-                if has_pending_signal() {
-                    ring_buffer.remove_writer(&task);
-                    crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] write abort (pending signal)");
-                    return already_write;
-                }
-                let task_for_log = task.clone();
-                let inserted = ring_buffer.push_writer(task.clone());
-                let mut waiters = 0usize;
-                let mut readers = 0usize;
-                let mut read_end: Option<Arc<Pipe>> = None;
-                if DEBUG_UNIXBENCH && inserted {
-                    waiters = ring_buffer.write_waiters.len();
-                    readers = ring_buffer.read_end_count();
-                    if readers > 0 {
-                        read_end = ring_buffer.read_end.as_ref().and_then(|w| w.upgrade());
-                    }
-                }
-                drop(ring_buffer);
-                if DEBUG_UNIXBENCH && inserted {
-                    let pid = task_for_log
-                        .process
-                        .upgrade()
-                        .map(|p| p.getpid())
-                        .unwrap_or(usize::MAX);
-                    let tid = task_for_log
-                        .borrow_mut()
-                        .res
-                        .as_ref()
-                        .map(|r| r.tid)
-                        .unwrap_or(usize::MAX);
-                    crate::log_if!(
-                        DEBUG_UNIXBENCH,
-                        info,
-                        "[pipe] wait write pid={} tid={} waiters={} readers={}",
-                        pid,
-                        tid,
-                        waiters,
-                        readers
-                    );
-                    if readers > 0 {
-                        if let Some(end) = read_end {
-                            log_pipe_end_owners(&end, "read");
-                        }
-                    }
-                }
-                block_current_and_run_next();
-                continue;
-            }
-            // Write at most loop_write bytes in this round, then wake a reader once.
-            let mut wrote_this_round = 0usize;
-            for _ in 0..loop_write {
-                let Some(byte) = buf_iter.next() else {
-                    break;
-                };
-                ring_buffer.write_byte(byte);
-                already_write += 1;
-                wrote_this_round += 1;
-            }
-            let reader_to_wake = if wrote_this_round > 0 {
-                ring_buffer.pop_reader()
-            } else {
-                None
-            };
-            let async_notify = if wrote_this_round > 0 {
-                ring_buffer.async_target()
-            } else {
-                None
-            };
-            drop(ring_buffer);
-            if let Some((owner_type, owner_pid, sig, fd)) = async_notify {
-                notify_async_io(owner_type, owner_pid, sig, fd);
-            }
-            if let Some(reader) = reader_to_wake {
-                wakeup_task(reader);
-            }
-            if already_write == want_to_write {
-                return want_to_write;
-            }
-            if wrote_this_round == 0 {
-                return already_write;
-            }
-        }
+        self.write_from_slice(data.as_slice(), false).unwrap_or(0)
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
-    }
-}
-
-impl Drop for Pipe {
-    fn drop(&mut self) {
-        let mut ring = self.buffer.lock();
-        if self.readable {
-            let writers = ring.drain_writers();
-            drop(ring);
-            for task in writers {
-                wakeup_task(task);
-            }
-        } else if self.writable {
-            let readers = ring.drain_readers();
-            drop(ring);
-            for task in readers {
-                wakeup_task(task);
-            }
-        }
     }
 }

@@ -8,8 +8,8 @@ use crate::{
         INITPROC,
         id::{KernelStack, TaskUserRes},
         manager::{
-            TASK_MANAGER, add_task, fetch_task, has_ready_rt_at_or_above, has_ready_rt_higher_than,
-            remove_inactive_task, wakeup_task, PID2PCB,
+            PID2PCB, TASK_MANAGER, add_task, fetch_task, has_ready_rt_at_or_above,
+            has_ready_rt_higher_than, remove_inactive_task, wakeup_task,
         },
         process_block::ProcessControlBlock,
         sched::{RR_TIMESLICE_TICKS, RT_PRIO_MIN, SchedClass, sched_class},
@@ -568,8 +568,7 @@ pub fn idle_task() {
             arch::restore_user_fp_state(&task);
             if crate::debug_config::DEBUG_TASK_LIFECYCLE {
                 let seq =
-                    TASK_FETCH_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-                        + 1;
+                    TASK_FETCH_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                 if seq <= 32 || (seq & (seq - 1)) == 0 {
                     let strong = Arc::strong_count(&task);
                     let pid = task

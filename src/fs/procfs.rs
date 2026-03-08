@@ -251,6 +251,21 @@ pub fn init_procfs() {
             if let Some(tainted_file) = tainted_file {
                 let _ = tainted_file.write_at(0, b"0\n");
             }
+            let keys_dir = ensure_dir(&kernel_dir, "keys", 0o555);
+            if let Some(keys_dir) = keys_dir {
+                for (name, value) in [
+                    ("gc_delay", "300\n"),
+                    ("maxkeys", "200\n"),
+                    ("maxbytes", "20000\n"),
+                    ("root_maxkeys", "100000\n"),
+                    ("root_maxbytes", "25000000\n"),
+                ] {
+                    let file = ensure_file(&keys_dir, name, 0o644);
+                    if let Some(file) = file {
+                        let _ = file.write_at(0, value.as_bytes());
+                    }
+                }
+            }
             let shmmax_file = ensure_file(&kernel_dir, "shmmax", 0o644);
             if let Some(shmmax_file) = shmmax_file {
                 let value = alloc::format!("{}\n", crate::syscall::sysv_shm::shmmax_limit());

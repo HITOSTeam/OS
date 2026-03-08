@@ -26,9 +26,11 @@ use crate::{
     task::processor::current_process,
     task::{
         manager::{pid2process, wakeup_task},
-        pid_namespace_member_pids, process_visible_in_pid_namespace, resolve_process_in_pid_namespace,
+        pid_namespace_member_pids,
         process_block::ProcessControlBlock,
+        process_visible_in_pid_namespace,
         processor::{current_task, suspend_current_and_run_next},
+        resolve_process_in_pid_namespace,
         task_block::{TaskControlBlock, TaskControlBlockInner},
     },
     time::get_time_ms,
@@ -519,7 +521,9 @@ pub fn kill(pid: usize, signum: i32) -> isize {
                 process_ref
                     .tasks
                     .iter()
-                    .filter_map(|task_slot: &Option<Arc<TaskControlBlock>>| task_slot.as_ref().cloned())
+                    .filter_map(|task_slot: &Option<Arc<TaskControlBlock>>| {
+                        task_slot.as_ref().cloned()
+                    })
                     .collect::<alloc::vec::Vec<Arc<TaskControlBlock>>>(),
             )
         })
@@ -644,7 +648,9 @@ pub fn queue_process_signal_info(
     let (tid, on_cpu, queued) = {
         let mut inner = task.borrow_mut();
         let already = (inner.pending_signals & bit) != 0;
-        mark_pending_signal(&mut inner, signum, sender_pid, sender_uid, si_code, sig_value);
+        mark_pending_signal(
+            &mut inner, signum, sender_pid, sender_uid, si_code, sig_value,
+        );
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
         (
             tid,

@@ -314,11 +314,7 @@ impl TaskManager {
                 .as_ref()
                 .map(|r| r.tid)
                 .unwrap_or(usize::MAX);
-            crate::println!(
-                "[sched-remove] tid={} removed_dup_entries={}",
-                tid,
-                removed
-            );
+            crate::println!("[sched-remove] tid={} removed_dup_entries={}", tid, removed);
         }
         task.in_ready_queue
             .store(false, core::sync::atomic::Ordering::Release);
@@ -336,8 +332,7 @@ impl TaskManager {
                     .iter()
                     .filter(|t| Arc::ptr_eq(t, task))
                     .count()
-                    + rq
-                        .rt_queues
+                    + rq.rt_queues
                         .iter()
                         .map(|q| q.iter().filter(|t| Arc::ptr_eq(t, task)).count())
                         .sum::<usize>()
