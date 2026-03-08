@@ -3,8 +3,8 @@ use core::any::Any;
 
 use crate::{bpf::BpfProgFile, mm::UserBuffer};
 
+use super::pipe::{make_pipe, Pipe};
 use super::File;
-use super::pipe::{Pipe, make_pipe};
 
 /// A minimal full-duplex endpoint used to implement `socketpair(AF_UNIX, SOCK_STREAM, ...)`.
 ///

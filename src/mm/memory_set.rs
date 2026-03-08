@@ -1,12 +1,12 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
-use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
+use super::{frame_alloc, try_copy_to_user_unchecked, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
-    MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
-    USER_STACK_SIZE, phys_mem_end,
+    phys_mem_end, MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
+    USER_STACK_SIZE,
 };
 use crate::println;
 use alloc::collections::BTreeMap;
@@ -1352,7 +1352,11 @@ impl MemorySet {
     }
 
     /// Resolve a lazy anonymous mapping fault by allocating a page on demand.
-    pub fn resolve_lazy_fault(&mut self, fault_va: usize, access: MapPermission) -> bool {
+    pub fn resolve_lazy_fault(
+        &mut self,
+        fault_va: usize,
+        access: MapPermission,
+    ) -> LazyFaultResult {
         let vpn: VirtPageNum = VirtAddr::from(fault_va).floor();
         for area in self.areas.iter_mut() {
             if area.map_type != MapType::Lazy {
@@ -1362,16 +1366,16 @@ impl MemorySet {
                 continue;
             }
             if !area.map_perm.contains(access) {
-                return false;
+                return LazyFaultResult::Invalid;
             }
             if let Some(pte) = self.page_table.translate(vpn) {
                 if pte.is_valid() {
-                    return false;
+                    return LazyFaultResult::Invalid;
                 }
             }
             let Some(frame) = frame_alloc() else {
                 crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
-                return false;
+                return LazyFaultResult::Oom;
             };
             let pte_flags = PTEFlags::from(area.map_perm);
             self.page_table.map(vpn, frame.ppn, pte_flags);
@@ -1384,9 +1388,9 @@ impl MemorySet {
             unsafe {
                 core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
             }
-            return true;
+            return LazyFaultResult::Resolved;
         }
-        false
+        LazyFaultResult::Invalid
     }
     pub fn activate(&self) {
         #[cfg(target_arch = "riscv64")]
@@ -1960,6 +1964,19 @@ impl MapArea {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum LazyFaultResult {
+    Resolved,
+    Oom,
+    Invalid,
+}
+
+impl LazyFaultResult {
+    pub fn is_resolved(self) -> bool {
+        matches!(self, Self::Resolved)
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical, framed, or lazy (on-demand)
 pub enum MapType {
@@ -2001,26 +2018,20 @@ pub fn remap_test() {
     let mid_text: VirtAddr = ((stext as usize + etext as usize) / 2).into();
     let mid_rodata: VirtAddr = ((srodata as usize + erodata as usize) / 2).into();
     let mid_data: VirtAddr = ((sdata as usize + edata as usize) / 2).into();
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_text.floor())
-            .unwrap()
-            .writable(),
-    );
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_rodata.floor())
-            .unwrap()
-            .writable(),
-    );
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_data.floor())
-            .unwrap()
-            .executable(),
-    );
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_text.floor())
+        .unwrap()
+        .writable(),);
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_rodata.floor())
+        .unwrap()
+        .writable(),);
+    assert!(!kernel_space
+        .page_table
+        .translate(mid_data.floor())
+        .unwrap()
+        .executable(),);
     println!("remap_test passed!");
 }

@@ -1,9 +1,12 @@
 use crate::{
-    config::{PAGE_SIZE, TRAP_CONTEXT, USER_HEAP_GAP},
-    fs::{File, OSInode, PseudoShmFile, ext4_lock},
-    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked},
-    task::MmapRegion,
+    config::{phys_mem_end, phys_mem_start, PAGE_SIZE, TRAP_CONTEXT, USER_HEAP_GAP},
+    fs::{
+        ext4_lock, vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory, File,
+        OSInode, PseudoShmFile,
+    },
+    mm::{frame_alloc, try_copy_to_user, try_copy_to_user_unchecked, MapPermission, PTEFlags},
     task::processor::{current_files_process, current_process},
+    task::MmapRegion,
     trap::get_current_token,
 };
 use alloc::sync::Arc;
@@ -57,6 +60,38 @@ fn align_up(x: usize, align: usize) -> usize {
 
 fn user_range_valid(start: usize, end: usize) -> bool {
     start < end && end <= USER_VA_TOP
+}
+
+fn anon_private_commit_charge(
+    map_len: usize,
+    prot: usize,
+    is_anon: bool,
+    is_shared: bool,
+) -> usize {
+    if is_anon && !is_shared && (prot & PROT_WRITE) != 0 {
+        map_len
+    } else {
+        0
+    }
+}
+
+fn overcommit_limit_bytes() -> Option<usize> {
+    match vm_overcommit_memory() {
+        0 => Some(phys_mem_end().saturating_sub(phys_mem_start())),
+        1 => None,
+        2 => Some(vm_commit_limit_bytes()),
+        _ => None,
+    }
+}
+
+fn exceeds_overcommit_limit(additional_bytes: usize) -> bool {
+    if additional_bytes == 0 {
+        return false;
+    }
+    let Some(limit) = overcommit_limit_bytes() else {
+        return false;
+    };
+    vm_committed_as_bytes().saturating_add(additional_bytes) > limit
 }
 
 fn find_free_user_range(ranges: &[(usize, usize)], min_start: usize, len: usize) -> Option<usize> {
@@ -320,6 +355,9 @@ pub fn syscall_brk(addr: usize) -> isize {
     let heap_start = inner.heap_start;
     let old_end = align_up(old_brk, PAGE_SIZE);
     let new_end = align_up(new_brk, PAGE_SIZE);
+    if new_end > old_end && exceeds_overcommit_limit(new_end.saturating_sub(old_end)) {
+        return old_brk as isize;
+    }
     if crate::debug_config::DEBUG_SYSCALL {
         crate::println!(
             "[brk] pid={} heap_start={:#x} old_brk={:#x} new_brk={:#x} old_end={:#x} new_end={:#x}",
@@ -476,6 +514,10 @@ pub fn syscall_mmap(
         (false, 0, 0, 0)
     };
     let map_len = align_up(len, PAGE_SIZE);
+    let commit_charge = anon_private_commit_charge(map_len, prot, is_anon, is_shared);
+    if exceeds_overcommit_limit(commit_charge) {
+        return ENOMEM;
+    }
 
     let process = current_process();
     let mut inner = process.borrow_mut();

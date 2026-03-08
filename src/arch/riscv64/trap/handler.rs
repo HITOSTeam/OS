@@ -6,14 +6,14 @@ use core::{
 use super::context::TrapContext;
 use crate::config::{PAGE_SIZE, TRAMPOLINE};
 use crate::debug_config::DEBUG_TRAP;
-use crate::mm::{MapPermission, PageTable, VirtAddr};
+use crate::mm::{LazyFaultResult, MapPermission, PageTable, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
 use crate::task::block_sleep::check_timer;
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
-use crate::task::signal::{MAX_SIG, SIG_DFL, SIG_IGN, check_if_current_signals_error, signal_bit};
+use crate::task::signal::{check_if_current_signals_error, signal_bit, MAX_SIG, SIG_DFL, SIG_IGN};
 use crate::time::set_next_trigger;
 use riscv::{
     interrupt::Trap,
@@ -196,7 +196,15 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
         Trap::Exception(INSTRUCTION_PAGE_FAULT) => MapPermission::X,
         _ => return false,
     };
-    inner.memory_set.resolve_lazy_fault(stval, access)
+    match inner.memory_set.resolve_lazy_fault(stval, access) {
+        LazyFaultResult::Resolved => true,
+        LazyFaultResult::Oom => {
+            drop(inner);
+            exit_group_and_run_next(-9);
+            false
+        }
+        LazyFaultResult::Invalid => false,
+    }
 }
 // todo : avoid cloning here..
 fn get_trap_context() -> &'static mut TrapContext {
@@ -402,7 +410,15 @@ fn try_expand_mmap_growsdown(fault_va: usize, access: MapPermission) -> bool {
         let grown = region.start - fault_page;
         inner.mmap_areas[idx].start = fault_page;
         inner.mmap_areas[idx].len += grown;
-        return inner.memory_set.resolve_lazy_fault(fault_va, access);
+        return match inner.memory_set.resolve_lazy_fault(fault_va, access) {
+            LazyFaultResult::Resolved => true,
+            LazyFaultResult::Oom => {
+                drop(inner);
+                exit_group_and_run_next(-9);
+                false
+            }
+            LazyFaultResult::Invalid => false,
+        };
     }
     false
 }
@@ -475,8 +491,13 @@ fn handle_user_exception(code: usize, stval: usize) {
             INSTRUCTION_PAGE_FAULT => MapPermission::X,
             _ => MapPermission::R,
         };
-        if inner.memory_set.resolve_lazy_fault(stval, access) {
-            return;
+        match inner.memory_set.resolve_lazy_fault(stval, access) {
+            LazyFaultResult::Resolved => return,
+            LazyFaultResult::Oom => {
+                drop(inner);
+                exit_group_and_run_next(-9);
+            }
+            LazyFaultResult::Invalid => {}
         }
     }
     if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {

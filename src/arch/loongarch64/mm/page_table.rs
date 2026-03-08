@@ -2,8 +2,8 @@
 
 use crate::config::PAGE_SIZE;
 use crate::mm::{
-    FrameTracker, MapPermission, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
-    frame_alloc,
+    frame_alloc, FrameTracker, LazyFaultResult, MapPermission, PhysAddr, PhysPageNum, StepByOne,
+    VirtAddr, VirtPageNum,
 };
 use crate::task::processor::current_task;
 use alloc::string::String;
@@ -413,7 +413,11 @@ fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool
     if token != inner.memory_set.token() {
         return false;
     }
-    inner.memory_set.resolve_lazy_fault(va, access)
+    match inner.memory_set.resolve_lazy_fault(va, access) {
+        LazyFaultResult::Resolved => true,
+        LazyFaultResult::Oom => crate::task::processor::exit_group_and_run_next(-9),
+        LazyFaultResult::Invalid => false,
+    }
 }
 
 fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool {
@@ -432,7 +436,11 @@ fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool
     if access.contains(MapPermission::W) && inner.memory_set.resolve_cow_fault(va) {
         return true;
     }
-    inner.memory_set.resolve_lazy_fault(va, access)
+    match inner.memory_set.resolve_lazy_fault(va, access) {
+        LazyFaultResult::Resolved => true,
+        LazyFaultResult::Oom => crate::task::processor::exit_group_and_run_next(-9),
+        LazyFaultResult::Invalid => false,
+    }
 }
 
 fn user_access_fail(va: usize, access: MapPermission) -> ! {

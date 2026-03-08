@@ -10,12 +10,11 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    File, NamespaceFile, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag,
-    PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, root_inode_for_path,
-    secondary_root_inode,
+    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, NamespaceFile,
+    OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
 };
-use crate::mm::{UserBuffer, VirtAddr};
-use crate::task::manager::{PID2PCB, pid2process};
+use crate::mm::{frame_available_pages, UserBuffer, VirtAddr};
+use crate::task::manager::{pid2process, PID2PCB};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
 
@@ -189,7 +188,11 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 { None } else { Some(ino) }
+    if ino == 0 {
+        None
+    } else {
+        Some(ino)
+    }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
@@ -1180,12 +1183,71 @@ fn proc_mounts() -> String {
     crate::syscall::filesystem::proc_mounts_snapshot()
 }
 
+fn read_vm_tunable_usize(name: &str, default: usize) -> usize {
+    let path = alloc::format!("/proc/sys/vm/{}", name);
+    let Some(inode) = find_path_in_roots(&path) else {
+        return default;
+    };
+    let mut buf = [0u8; 32];
+    let len = inode.read_at(0, &mut buf);
+    if len == 0 {
+        return default;
+    }
+    let Ok(raw) = core::str::from_utf8(&buf[..len]) else {
+        return default;
+    };
+    raw.trim().parse::<usize>().unwrap_or(default)
+}
+
+pub fn vm_overcommit_memory() -> usize {
+    read_vm_tunable_usize("overcommit_memory", 0).min(2)
+}
+
+pub fn vm_overcommit_ratio() -> usize {
+    read_vm_tunable_usize("overcommit_ratio", 50)
+}
+
+pub fn vm_commit_limit_bytes() -> usize {
+    let totalram = config::phys_mem_end().saturating_sub(config::phys_mem_start());
+    totalram
+        .saturating_mul(vm_overcommit_ratio())
+        .saturating_div(100)
+}
+
+pub fn vm_committed_as_bytes() -> usize {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    processes.iter().fold(0usize, |acc, process| {
+        let Some(inner) = process.try_borrow_mut() else {
+            return acc;
+        };
+        let heap = inner.brk.saturating_sub(inner.heap_start);
+        let anon_private = inner.mmap_areas.iter().fold(0usize, |sum, region| {
+            if !region.shared && !region.file_backed && (region.prot & 0x2) != 0 {
+                sum.saturating_add(region.len)
+            } else {
+                sum
+            }
+        });
+        acc.saturating_add(heap).saturating_add(anon_private)
+    })
+}
+
 fn proc_meminfo() -> String {
-    let mem_total_kb = ((config::phys_mem_end() - config::phys_mem_start()) / 1024) as u64;
+    let totalram = config::phys_mem_end().saturating_sub(config::phys_mem_start());
+    let mem_total_kb = (totalram / 1024) as u64;
+    let mem_free_kb =
+        ((frame_available_pages().saturating_mul(config::PAGE_SIZE)).min(totalram) / 1024) as u64;
+    let commit_limit_kb = (vm_commit_limit_bytes() / 1024) as u64;
+    let committed_as_kb = (vm_committed_as_bytes() / 1024) as u64;
     alloc::format!(
-        "MemTotal:       {} kB\nMemFree:        {} kB\nBuffers:        0 kB\nCached:         0 kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n",
+        "MemTotal:       {} kB\nMemFree:        {} kB\nBuffers:        0 kB\nCached:         0 kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\nCommitLimit:    {} kB\nCommitted_AS:   {} kB\n",
         mem_total_kb,
-        mem_total_kb / 2
+        mem_free_kb,
+        commit_limit_kb,
+        committed_as_kb
     )
 }
 

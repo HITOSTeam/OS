@@ -6,11 +6,13 @@ use core::{
 use super::context::TrapContext;
 use crate::config::TRAMPOLINE;
 use crate::debug_config::DEBUG_TRAP;
-use crate::mm::{MapPermission, VirtAddr};
+use crate::mm::{LazyFaultResult, MapPermission, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
 use crate::task::block_sleep::check_timer;
-use crate::task::processor::{exit_current_and_run_next, suspend_current_and_run_next};
+use crate::task::processor::{
+    exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
+};
 use crate::task::signal::check_if_current_signals_error;
 use crate::time::set_next_trigger;
 
@@ -137,8 +139,13 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
             _ => MapPermission::W,
         };
-        if inner.memory_set.resolve_lazy_fault(badv, access) {
-            return;
+        match inner.memory_set.resolve_lazy_fault(badv, access) {
+            LazyFaultResult::Resolved => return,
+            LazyFaultResult::Oom => {
+                drop(inner);
+                exit_group_and_run_next(-9);
+            }
+            LazyFaultResult::Invalid => {}
         }
     }
     if let Some((errno, msg)) = check_if_current_signals_error() {
