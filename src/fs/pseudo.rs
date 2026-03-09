@@ -210,6 +210,7 @@ pub(crate) type ShmData = Arc<Mutex<ShmDataInner>>;
 
 lazy_static! {
     static ref SHM_OBJECTS: Mutex<BTreeMap<String, ShmData>> = Mutex::new(BTreeMap::new());
+    static ref PSEUDO_DEV_DIRS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 }
 
 // Minimal backing counters used by `/sys/block/root/stat`.
@@ -217,7 +218,88 @@ static PSEUDO_BLOCK_SECTORS_WRITTEN: AtomicU64 = AtomicU64::new(8);
 static PSEUDO_BLOCK_IO_TICKS: AtomicU64 = AtomicU64::new(1);
 static PSEUDO_BLOCK_READ_ONLY: AtomicBool = AtomicBool::new(false);
 static PSEUDO_BLOCK_READ_AHEAD: AtomicU64 = AtomicU64::new(256);
+static PSEUDO_DEV_DIR_NEXT_INO: AtomicU64 = AtomicU64::new(0x52_0000);
 static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+const EEXIST: isize = -17;
+const ENOENT: isize = -2;
+const EROFS: isize = -30;
+
+const PSEUDO_DEV_DIR_RESERVED: &[&str] = &[
+    "root", "ptmx", "tty", "pts", "shm", "cgroup", "null", "zero", "urandom", "random", "misc",
+];
+
+fn pseudo_dev_dir_name(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/dev/")?;
+    if rest.is_empty() || rest.contains('/') || matches!(rest, "." | "..") {
+        return None;
+    }
+    Some(rest)
+}
+
+pub(crate) fn pseudo_dev_dir_entries() -> Vec<PseudoDirent> {
+    PSEUDO_DEV_DIRS
+        .lock()
+        .iter()
+        .map(|(name, ino)| PseudoDirent {
+            name: name.clone(),
+            ino: *ino,
+            dtype: 4,
+        })
+        .collect()
+}
+
+pub(crate) fn pseudo_dev_dir_exists(path: &str) -> bool {
+    let Some(name) = pseudo_dev_dir_name(path) else {
+        return false;
+    };
+    PSEUDO_DEV_DIRS.lock().contains_key(name)
+}
+
+pub(crate) fn open_pseudo_dev_dir(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    let name = pseudo_dev_dir_name(path)?;
+    let ino = *PSEUDO_DEV_DIRS.lock().get(name)?;
+    let entries = alloc::vec![
+        PseudoDirent {
+            name: String::from("."),
+            ino,
+            dtype: 4,
+        },
+        PseudoDirent {
+            name: String::from(".."),
+            ino: 1,
+            dtype: 4,
+        },
+    ];
+    Some(Arc::new(PseudoDir::new(path, entries)))
+}
+
+pub(crate) fn pseudo_dev_dir_mkdir(path: &str) -> isize {
+    let Some(name) = pseudo_dev_dir_name(path) else {
+        return EROFS;
+    };
+    if PSEUDO_DEV_DIR_RESERVED.contains(&name) {
+        return EEXIST;
+    }
+    let mut dirs = PSEUDO_DEV_DIRS.lock();
+    if dirs.contains_key(name) {
+        return EEXIST;
+    }
+    let ino = PSEUDO_DEV_DIR_NEXT_INO.fetch_add(1, Ordering::Relaxed);
+    dirs.insert(String::from(name), ino);
+    0
+}
+
+pub(crate) fn pseudo_dev_dir_rmdir(path: &str) -> isize {
+    let Some(name) = pseudo_dev_dir_name(path) else {
+        return EROFS;
+    };
+    if PSEUDO_DEV_DIRS.lock().remove(name).is_some() {
+        0
+    } else {
+        ENOENT
+    }
+}
 
 fn bytes_to_sectors(bytes: usize) -> u64 {
     let bytes = bytes as u64;

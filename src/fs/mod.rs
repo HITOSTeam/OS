@@ -50,6 +50,8 @@ pub use procfs::{
 };
 pub use pseudo::PseudoBlock;
 pub(crate) use pseudo::{
+    open_pseudo_dev_dir, pseudo_dev_dir_entries, pseudo_dev_dir_exists, pseudo_dev_dir_mkdir,
+    pseudo_dev_dir_rmdir,
     pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_read_ahead,
     pseudo_block_set_read_ahead, pseudo_block_set_read_only, pseudo_block_stat_snapshot,
     shm_create, shm_create_anonymous, shm_get, shm_list, shm_remove,

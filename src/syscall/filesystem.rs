@@ -4679,7 +4679,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
         return Some(alloc::sync::Arc::new(PseudoDir::new("/sys", entries)));
     }
     if path == "/dev" || path == "/dev/" {
-        let entries = alloc::vec![
+        let mut entries = alloc::vec![
             PseudoDirent {
                 name: alloc::string::String::from("."),
                 ino: 1,
@@ -4746,6 +4746,7 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                 dtype: 4
             },
         ];
+        entries.extend(crate::fs::pseudo_dev_dir_entries());
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev", entries)));
     }
     if path == "/dev/cgroup" || path == "/dev/cgroup/" {
@@ -5135,6 +5136,9 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     if path == "/dev/misc/rtc" {
         return Some(alloc::sync::Arc::new(RtcFile::new()));
+    }
+    if let Some(node) = crate::fs::open_pseudo_dev_dir(path) {
+        return Some(node);
     }
     None
 }
@@ -7207,6 +7211,10 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
         if crate::fs::is_cgroup_pseudo_path(abs) {
             return cgroup_mkdir(abs);
         }
+        let rc = crate::fs::pseudo_dev_dir_mkdir(abs);
+        if rc != EROFS {
+            return rc;
+        }
         return EROFS;
     }
 
@@ -7319,6 +7327,13 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
                 return ENOTDIR;
             }
             return if shm_remove(name) { 0 } else { ENOENT };
+        }
+        if crate::fs::pseudo_dev_dir_exists(abs) {
+            return if remove_dir {
+                crate::fs::pseudo_dev_dir_rmdir(abs)
+            } else {
+                EISDIR
+            };
         }
         return EROFS;
     }

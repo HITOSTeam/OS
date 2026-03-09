@@ -122,7 +122,7 @@ struct CgroupMountState {
     kind: CgroupMountKind,
     nodes: BTreeMap<String, CgroupNode>,
     assignments: BTreeMap<usize, String>,
-    process_anon_bytes: BTreeMap<usize, usize>,
+    process_anon_bytes: BTreeMap<usize, BTreeMap<String, usize>>,
     process_cpu_account_ns: BTreeMap<usize, u64>,
 }
 
@@ -244,9 +244,13 @@ impl CgroupMountState {
     fn subtree_anon_bytes(&self, path: &str) -> usize {
         self.process_anon_bytes
             .iter()
-            .filter_map(|(pid, bytes)| {
-                let pid_path = self.assignments.get(pid).map(|s| s.as_str()).unwrap_or("/");
-                Self::is_descendant_or_self(pid_path, path).then_some(*bytes)
+            .map(|(_pid, charges)| {
+                charges
+                    .iter()
+                    .filter_map(|(charge_path, bytes)| {
+                        Self::is_descendant_or_self(charge_path, path).then_some(*bytes)
+                    })
+                    .sum::<usize>()
             })
             .sum()
     }
@@ -616,6 +620,8 @@ enum CgroupFileKind {
     PidsMax,
     PidsCurrent,
     CpuAcctUsage,
+    MemoryLimitInBytes,
+    MemoryUsageInBytes,
     MemoryCurrent,
     MemoryMax,
     MemorySwapMax,
@@ -662,6 +668,12 @@ impl CgroupFileKind {
                     CgroupMountKind::LegacyCpuAcct if name == "cpuacct.usage" => {
                         Some(Self::CpuAcctUsage)
                     }
+                    CgroupMountKind::LegacyMemory if name == "memory.limit_in_bytes" => {
+                        Some(Self::MemoryLimitInBytes)
+                    }
+                    CgroupMountKind::LegacyMemory if name == "memory.usage_in_bytes" => {
+                        Some(Self::MemoryUsageInBytes)
+                    }
                     CgroupMountKind::LegacyCpuset if name == "cpuset.cpus" => {
                         Some(Self::CpusetCpus)
                     }
@@ -679,6 +691,7 @@ impl CgroupFileKind {
             Self::Controllers
             | Self::PidsCurrent
             | Self::CpuAcctUsage
+            | Self::MemoryUsageInBytes
             | Self::MemoryCurrent
             | Self::MemoryEvents
             | Self::MemoryStat => 0o100444,
@@ -692,6 +705,7 @@ impl CgroupFileKind {
             | Self::CpusetMems
             | Self::Kill
             | Self::PidsMax
+            | Self::MemoryLimitInBytes
             | Self::MemoryMax
             | Self::MemorySwapMax
             | Self::MemoryMin
@@ -933,6 +947,13 @@ impl CgroupFile {
             CgroupFileKind::CpuAcctUsage => {
                 alloc::format!("{}\n", state.subtree_cpu_usage_ns(&self.rel_path))
             }
+            CgroupFileKind::MemoryLimitInBytes => match node.memory_max {
+                Some(limit) => alloc::format!("{limit}\n"),
+                None => String::from("-1\n"),
+            },
+            CgroupFileKind::MemoryUsageInBytes => {
+                alloc::format!("{}\n", state.subtree_memory_usage(&self.rel_path))
+            }
             CgroupFileKind::MemoryCurrent => {
                 alloc::format!("{}\n", state.subtree_memory_usage(&self.rel_path))
             }
@@ -986,6 +1007,7 @@ impl CgroupFile {
             CgroupFileKind::Controllers
             | CgroupFileKind::PidsCurrent
             | CgroupFileKind::CpuAcctUsage
+            | CgroupFileKind::MemoryUsageInBytes
             | CgroupFileKind::MemoryCurrent
             | CgroupFileKind::MemoryEvents
             | CgroupFileKind::MemoryStat => Err(EROFS),
@@ -1119,6 +1141,15 @@ impl CgroupFile {
                 node.memory_max = parse_memory_value(text)?;
                 Ok(data.len())
             }
+            CgroupFileKind::MemoryLimitInBytes => {
+                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                node.memory_max = if text == "-1" {
+                    None
+                } else {
+                    parse_memory_value(text)?
+                };
+                Ok(data.len())
+            }
             CgroupFileKind::MemorySwapMax => {
                 let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
                 node.memory_swap_max = parse_memory_value(text)?;
@@ -1149,6 +1180,7 @@ impl File for CgroupFile {
             CgroupFileKind::Controllers
                 | CgroupFileKind::PidsCurrent
                 | CgroupFileKind::CpuAcctUsage
+                | CgroupFileKind::MemoryUsageInBytes
                 | CgroupFileKind::MemoryCurrent
                 | CgroupFileKind::MemoryEvents
                 | CgroupFileKind::MemoryStat
@@ -1254,6 +1286,14 @@ fn build_dir_entries(
             "cgroup.clone_children",
             "notify_on_release",
             "freezer.state",
+        ],
+        CgroupMountKind::LegacyMemory => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
         ],
         CgroupMountKind::LegacyCpuset => &[
             "tasks",
@@ -1551,15 +1591,26 @@ pub fn cgroup_charge_anon_current(pid: usize, bytes: usize) -> bool {
     let mut mounts = CGROUP_MOUNTS.lock();
     for state in mounts.values_mut() {
         let path = state.path_for_pid(pid);
-        let previous = state.process_anon_bytes.get(&pid).copied().unwrap_or(0);
+        let previous = state
+            .process_anon_bytes
+            .get(&pid)
+            .and_then(|charges| charges.get(&path).copied())
+            .unwrap_or(0);
         state
             .process_anon_bytes
-            .insert(pid, previous.saturating_add(bytes));
+            .entry(pid)
+            .or_default()
+            .insert(path.clone(), previous.saturating_add(bytes));
         if !state.enforce_memory_limits(&path) {
-            if previous == 0 {
-                state.process_anon_bytes.remove(&pid);
-            } else {
-                state.process_anon_bytes.insert(pid, previous);
+            if let Some(charges) = state.process_anon_bytes.get_mut(&pid) {
+                if previous == 0 {
+                    charges.remove(&path);
+                } else {
+                    charges.insert(path.clone(), previous);
+                }
+                if charges.is_empty() {
+                    state.process_anon_bytes.remove(&pid);
+                }
             }
             return false;
         }
