@@ -54,7 +54,6 @@ pub fn signal_has_core_dump(signum: usize) -> bool {
             | 7  // SIGBUS
             | 8  // SIGFPE
             | 11 // SIGSEGV
-            | 16 // SIGSTKFLT
             | 24 // SIGXCPU
             | 25 // SIGXFSZ
             | 31 // SIGSYS
