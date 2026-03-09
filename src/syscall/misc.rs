@@ -2355,6 +2355,13 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                     }
                     return 0;
                 }
+                if len % PAGE_SIZE != 0 {
+                    return EINVAL;
+                }
+                const UFFDIO_COPY_MAX_LEN: usize = 64 * 1024 * 1024;
+                if len > UFFDIO_COPY_MAX_LEN {
+                    return ENOMEM;
+                }
                 let mut data = alloc::vec![0u8; len];
                 if try_copy_from_user(token, copy.src as *const u8, &mut data).is_err() {
                     return EFAULT;

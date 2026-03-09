@@ -11,7 +11,7 @@ pub(crate) mod misc;
 mod mutex;
 mod net;
 mod posix_mq;
-mod process;
+pub(crate) mod process;
 pub(crate) mod robust_list;
 mod sched;
 mod semaphore;

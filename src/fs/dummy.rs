@@ -277,7 +277,7 @@ impl UserfaultfdFile {
             inner.read_waiters.retain(|waiter| {
                 if let Some(task) = waiter.upgrade() {
                     ready.push(task);
-                    true
+                    false
                 } else {
                     false
                 }

@@ -1,5 +1,5 @@
 use crate::{
-    config::{PAGE_SIZE, TRAP_CONTEXT, USER_HEAP_GAP, phys_mem_end, phys_mem_start},
+    config::{PAGE_SIZE, TRAP_CONTEXT, USER_HEAP_GAP},
     fs::{
         File, OSInode, PseudoShmFile, ext4_lock, vm_commit_limit_bytes, vm_committed_as_bytes,
         vm_overcommit_memory,
@@ -84,7 +84,7 @@ fn anon_private_commit_charge(
 
 fn overcommit_limit_bytes() -> Option<usize> {
     match vm_overcommit_memory() {
-        0 => Some(phys_mem_end().saturating_sub(phys_mem_start())),
+        0 => None,
         1 => None,
         2 => Some(vm_commit_limit_bytes()),
         _ => None,
@@ -1129,7 +1129,7 @@ pub fn syscall_mremap(
     if let Some(region) = inner
         .mmap_areas
         .iter_mut()
-        .find(|region| region.start == target_start && region.file_offset == src_region.file_offset)
+        .find(|region| region.start == target_start)
     {
         region.len = new_len;
     }

@@ -913,6 +913,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         // Mark zombie and capture parent pointer first...
         let parent = {
             let mut process_inner = process.borrow_mut();
+            crate::syscall::process::unregister_executing_inode(
+                process_inner.exec_inode_dev,
+                process_inner.exec_inode_num,
+            );
             process_inner.is_zombie = true;
             process_inner.exit_code = exit_code;
             process_inner.parent.as_ref().and_then(|p| p.upgrade())
@@ -1090,6 +1094,10 @@ pub fn exit_group_and_run_next(exit_code: i32) {
 
     let parent = {
         let mut process_inner = process.borrow_mut();
+        crate::syscall::process::unregister_executing_inode(
+            process_inner.exec_inode_dev,
+            process_inner.exec_inode_num,
+        );
         process_inner.is_zombie = true;
         process_inner.exit_code = exit_code;
         process_inner.parent.as_ref().and_then(|p| p.upgrade())

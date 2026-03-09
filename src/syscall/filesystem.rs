@@ -32,7 +32,7 @@ use crate::{
         task_block::TaskControlBlock,
         ProcessControlBlock,
     },
-    syscall::process::is_inode_currently_executed,
+    syscall::process::{is_inode_currently_executed_locked, lock_executing_inodes},
     time::get_time_ms,
     trap::get_current_token,
 };
@@ -4301,12 +4301,16 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     let text_write_intent = writable || (flags & O_TRUNC) != 0;
-    if !o_path && inode.is_file() && text_write_intent {
-        let exec_busy = is_inode_currently_executed(inode.device_id(), inode.inode_num());
+    let exec_inode_guard = if !o_path && inode.is_file() && text_write_intent {
+        let guard = lock_executing_inodes();
+        let exec_busy = is_inode_currently_executed_locked(&guard, inode.device_id(), inode.inode_num());
         if exec_busy {
             return ETXTBSY;
         }
-    }
+        Some(guard)
+    } else {
+        None
+    };
 
     if !o_path && inode.is_file() {
         maybe_signal_lease_break(
@@ -4364,6 +4368,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         false,
         tmpfile_cleanup,
     ));
+    drop(exec_inode_guard);
     crate::fs::debug_track_iozone_inode(&path, inode_num);
     drop(ext4_guard);
     let fd = match install_open_file_fd(os_inode, flags, o_path) {

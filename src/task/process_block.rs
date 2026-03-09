@@ -1566,8 +1566,19 @@ impl ProcessControlBlock {
             inner.mlockall_future = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
+            let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
+            crate::syscall::process::unregister_executing_inode_locked(
+                &mut executing_inodes,
+                inner.exec_inode_dev,
+                inner.exec_inode_num,
+            );
             inner.exec_inode_dev = exec_inode.0;
             inner.exec_inode_num = exec_inode.1;
+            crate::syscall::process::register_executing_inode_locked(
+                &mut executing_inodes,
+                exec_inode.0,
+                exec_inode.1,
+            );
             inner.did_exec = true;
         }
         let task = self.borrow_mut().get_task(0);
@@ -1639,8 +1650,19 @@ impl ProcessControlBlock {
             inner.mlockall_future = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
+            let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
+            crate::syscall::process::unregister_executing_inode_locked(
+                &mut executing_inodes,
+                inner.exec_inode_dev,
+                inner.exec_inode_num,
+            );
             inner.exec_inode_dev = exec_inode.0;
             inner.exec_inode_num = exec_inode.1;
+            crate::syscall::process::register_executing_inode_locked(
+                &mut executing_inodes,
+                exec_inode.0,
+                exec_inode.1,
+            );
             inner.did_exec = true;
         }
 
@@ -1976,6 +1998,13 @@ impl ProcessControlBlock {
         drop(task_inner);
         if diag_enabled {
             after_task_cycles = crate::arch::read_time();
+        }
+        {
+            let child_inner = child.borrow_mut();
+            crate::syscall::process::register_executing_inode(
+                child_inner.exec_inode_dev,
+                child_inner.exec_inode_num,
+            );
         }
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add child to parent's children list (after success)

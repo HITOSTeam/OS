@@ -1,8 +1,10 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{
     mem::size_of,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use lazy_static::lazy_static;
+use spin::{Mutex, MutexGuard};
 
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
@@ -37,6 +39,13 @@ use crate::{
     },
     trap::{get_current_token, trap_handler},
 };
+
+lazy_static! {
+    static ref EXECUTING_INODES: Mutex<BTreeMap<(usize, u32), usize>> =
+        Mutex::new(BTreeMap::new());
+}
+
+pub(crate) type ExecutingInodesGuard = MutexGuard<'static, BTreeMap<(usize, u32), usize>>;
 
 const EPERM: isize = -1;
 const ENOENT: isize = -2;
@@ -233,20 +242,64 @@ fn read_user_str_array(token: usize, vec_ptr: usize) -> Result<Vec<String>, isiz
 }
 
 pub(crate) fn is_inode_currently_executed(device_id: usize, inode_num: u32) -> bool {
-    let processes: Vec<_> = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect()
-    };
-    for process in processes {
-        let inner = process.borrow_mut();
-        if !inner.is_zombie
-            && inner.exec_inode_num == inode_num
-            && inner.exec_inode_dev == device_id
-        {
-            return true;
+    if device_id == 0 && inode_num == 0 {
+        return false;
+    }
+    let guard = lock_executing_inodes();
+    is_inode_currently_executed_locked(&guard, device_id, inode_num)
+}
+
+pub(crate) fn lock_executing_inodes() -> ExecutingInodesGuard {
+    EXECUTING_INODES.lock()
+}
+
+pub(crate) fn is_inode_currently_executed_locked(
+    guard: &ExecutingInodesGuard,
+    device_id: usize,
+    inode_num: u32,
+) -> bool {
+    guard
+        .get(&(device_id, inode_num))
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
+pub(crate) fn register_executing_inode(dev: usize, ino: u32) {
+    let mut guard = lock_executing_inodes();
+    register_executing_inode_locked(&mut guard, dev, ino);
+}
+
+pub(crate) fn unregister_executing_inode(dev: usize, ino: u32) {
+    let mut guard = lock_executing_inodes();
+    unregister_executing_inode_locked(&mut guard, dev, ino);
+}
+
+pub(crate) fn register_executing_inode_locked(
+    guard: &mut ExecutingInodesGuard,
+    dev: usize,
+    ino: u32,
+) {
+    if dev != 0 || ino != 0 {
+        let count = guard.entry((dev, ino)).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+}
+
+pub(crate) fn unregister_executing_inode_locked(
+    guard: &mut ExecutingInodesGuard,
+    dev: usize,
+    ino: u32,
+) {
+    if dev != 0 || ino != 0 {
+        if let Some(count) = guard.get_mut(&(dev, ino)) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                guard.remove(&(dev, ino));
+            }
         }
     }
-    false
 }
 
 fn is_inode_open_for_write(inode_num: u32) -> bool {
