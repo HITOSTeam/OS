@@ -26,7 +26,7 @@ fn main() {
     };
     let mut num_app = 0;
     if let Some(entries) = entries {
-        for (num, entry) in entries.enumerate() {
+        for entry in entries {
             let entry = entry.unwrap();
             let path = entry.path();
             if path.is_file() {
@@ -36,7 +36,7 @@ fn main() {
                     writeln!(file, ".section .rodata").unwrap();
                     writeln!(file, ".align 3");
 
-                    writeln!(file, "app_{}_name:", num).unwrap();
+                    writeln!(file, "app_{}_name:", num_app).unwrap();
                     writeln!(file, "    .asciz \"{}\"", app_name).unwrap();
                     // writeln!(file, ".align 3");
 

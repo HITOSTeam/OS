@@ -14,8 +14,10 @@ use crate::fs::{File, PseudoDir, PseudoDirent};
 use crate::mm::UserBuffer;
 use crate::task::{
     manager::pid2process,
-    processor::current_process,
+    manager::wakeup_task,
+    processor::{block_current_and_run_next, current_process, current_task},
     signal::{queue_process_signal, SIGKILL_NUM},
+    task_block::TaskStatus,
 };
 
 const EEXIST: isize = -17;
@@ -63,6 +65,7 @@ struct CgroupNode {
     subtree_control: u32,
     clone_children: bool,
     notify_on_release: bool,
+    freezer_state: LegacyFreezerState,
     cpuset_cpus: String,
     cpuset_mems: String,
     pids_max: Option<usize>,
@@ -83,6 +86,7 @@ impl CgroupNode {
             subtree_control: 0,
             clone_children: false,
             notify_on_release: false,
+            freezer_state: LegacyFreezerState::Thawed,
             cpuset_cpus: String::from("0"),
             cpuset_mems: String::from("0"),
             pids_max: None,
@@ -94,6 +98,21 @@ impl CgroupNode {
             memory_events_oom: 0,
             local_file_bytes: 0,
             local_cpu_usage_ns: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegacyFreezerState {
+    Thawed,
+    Frozen,
+}
+
+impl LegacyFreezerState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Thawed => "THAWED",
+            Self::Frozen => "FROZEN",
         }
     }
 }
@@ -168,6 +187,18 @@ impl CgroupMountState {
             .assignments
             .iter()
             .filter_map(|(pid, pid_path)| (*pid_path == path).then_some(*pid))
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids
+    }
+
+    fn subtree_member_pids(&self, path: &str) -> Vec<usize> {
+        let mut pids = self
+            .assignments
+            .iter()
+            .filter_map(|(pid, pid_path)| {
+                Self::is_descendant_or_self(pid_path, path).then_some(*pid)
+            })
             .collect::<Vec<_>>();
         pids.sort_unstable();
         pids
@@ -578,6 +609,7 @@ enum CgroupFileKind {
     Tasks,
     CloneChildren,
     NotifyOnRelease,
+    FreezerState,
     CpusetCpus,
     CpusetMems,
     Kill,
@@ -618,6 +650,9 @@ impl CgroupFileKind {
                     "cgroup.procs" => Some(Self::Procs),
                     "cgroup.clone_children" => Some(Self::CloneChildren),
                     "notify_on_release" => Some(Self::NotifyOnRelease),
+                    "freezer.state" if kind == CgroupMountKind::LegacyFreezer => {
+                        Some(Self::FreezerState)
+                    }
                     _ => None,
                 };
                 if base.is_some() {
@@ -652,6 +687,7 @@ impl CgroupFileKind {
             | Self::Tasks
             | Self::CloneChildren
             | Self::NotifyOnRelease
+            | Self::FreezerState
             | Self::CpusetCpus
             | Self::CpusetMems
             | Self::Kill
@@ -704,6 +740,103 @@ fn parse_memory_value(text: &str) -> Result<Option<usize>, isize> {
     };
     let value = digits.parse::<usize>().map_err(|_| EINVAL)?;
     value.checked_mul(multiplier).map(Some).ok_or(EINVAL)
+}
+
+fn legacy_freezer_path_frozen(state: &CgroupMountState, path: &str) -> bool {
+    if state.kind != CgroupMountKind::LegacyFreezer {
+        return false;
+    }
+    CgroupMountState::ancestor_paths(path).into_iter().any(|ancestor| {
+        state
+            .nodes
+            .get(&ancestor)
+            .map(|node| node.freezer_state == LegacyFreezerState::Frozen)
+            .unwrap_or(false)
+    })
+}
+
+fn set_process_freezer_state(pid: usize, frozen: bool) -> bool {
+    let Some(process) = pid2process(pid) else {
+        return false;
+    };
+    let tasks = {
+        let inner = process.borrow_mut();
+        inner
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref().cloned())
+            .collect::<Vec<_>>()
+    };
+    let current_tid = current_task().and_then(|task| task.try_borrow_mut().and_then(|inner| inner.res.as_ref().map(|res| res.tid)));
+    let mut should_block_current = false;
+    for task in tasks {
+        let is_current = task
+            .try_borrow_mut()
+            .and_then(|inner| inner.res.as_ref().map(|res| Some(res.tid) == current_tid))
+            .unwrap_or(false);
+        let mut inner = task.borrow_mut();
+        if frozen {
+            inner.cgroup_frozen = true;
+            inner.wake_on_cgroup_thaw = false;
+            if inner.task_status != TaskStatus::Blocked {
+                inner.task_status = TaskStatus::Blocked;
+                inner.parked_by_cgroup = true;
+                if is_current {
+                    should_block_current = true;
+                }
+            }
+        } else {
+            let should_wake = inner.parked_by_cgroup || inner.wake_on_cgroup_thaw;
+            inner.cgroup_frozen = false;
+            inner.parked_by_cgroup = false;
+            inner.wake_on_cgroup_thaw = false;
+            drop(inner);
+            if should_wake {
+                wakeup_task(task);
+            }
+        }
+    }
+    should_block_current
+}
+
+fn apply_legacy_freezer_state(
+    mount_target: &str,
+    path: &str,
+    frozen: bool,
+) -> Result<bool, isize> {
+    let mut mounts = CGROUP_MOUNTS.lock();
+    let Some(state) = mounts.get_mut(mount_target) else {
+        return Err(ENOENT);
+    };
+    if state.kind != CgroupMountKind::LegacyFreezer {
+        return Err(EOPNOTSUPP);
+    }
+    let node = state.nodes.get_mut(path).ok_or(ENOENT)?;
+    node.freezer_state = if frozen {
+        LegacyFreezerState::Frozen
+    } else {
+        LegacyFreezerState::Thawed
+    };
+    let pids = state.subtree_member_pids(path);
+    drop(mounts);
+    let mut should_block_current = false;
+    for pid in pids {
+        should_block_current |= set_process_freezer_state(pid, frozen);
+    }
+    Ok(should_block_current)
+}
+
+pub fn cgroup_maybe_block_current() {
+    let Some(task) = current_task() else {
+        return;
+    };
+    let should_block = task
+        .try_borrow_mut()
+        .map(|inner| inner.cgroup_frozen && inner.parked_by_cgroup)
+        .unwrap_or(false);
+    if should_block {
+        block_current_and_run_next();
+    }
 }
 
 struct CgroupFileInner {
@@ -786,6 +919,7 @@ impl CgroupFile {
             CgroupFileKind::NotifyOnRelease => {
                 alloc::format!("{}\n", if node.notify_on_release { 1 } else { 0 })
             }
+            CgroupFileKind::FreezerState => alloc::format!("{}\n", node.freezer_state.as_str()),
             CgroupFileKind::CpusetCpus => alloc::format!("{}\n", node.cpuset_cpus),
             CgroupFileKind::CpusetMems => alloc::format!("{}\n", node.cpuset_mems),
             CgroupFileKind::Kill => String::new(),
@@ -828,6 +962,18 @@ impl CgroupFile {
     pub fn write_payload(&self, data: &[u8]) -> Result<usize, isize> {
         let raw = core::str::from_utf8(data).map_err(|_| EINVAL)?;
         let text = raw.trim_matches(|c| c == '\n' || c == '\r' || c == ' ' || c == '\t');
+        if self.kind == CgroupFileKind::FreezerState {
+            let should_block_current = match text {
+                "THAWED" => apply_legacy_freezer_state(&self.mount_target, &self.rel_path, false)?,
+                "FROZEN" => apply_legacy_freezer_state(&self.mount_target, &self.rel_path, true)?,
+                "FREEZING" => return Err(-5),
+                _ => return Err(EINVAL),
+            };
+            if should_block_current {
+                block_current_and_run_next();
+            }
+            return Ok(data.len());
+        }
         let mut mounts = CGROUP_MOUNTS.lock();
         let Some(state) = mounts.get_mut(&self.mount_target) else {
             return Err(ENOENT);
@@ -861,6 +1007,7 @@ impl CgroupFile {
                 };
                 Ok(data.len())
             }
+            CgroupFileKind::FreezerState => Err(EINVAL),
             CgroupFileKind::CpusetCpus => {
                 let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
                 if text.is_empty() {
@@ -911,12 +1058,13 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::Procs | CgroupFileKind::Tasks => {
-                if text.is_empty() {
-                    return Err(EINVAL);
-                }
-                let pid = match text.parse::<usize>().map_err(|_| EINVAL)? {
-                    0 => current_process().getpid(),
-                    pid => pid,
+                let pid = if text.is_empty() {
+                    current_process().getpid()
+                } else {
+                    match text.parse::<usize>().map_err(|_| EINVAL)? {
+                        0 => current_process().getpid(),
+                        pid => pid,
+                    }
                 };
                 if pid2process(pid).is_none() {
                     return Err(ESRCH);
@@ -934,6 +1082,11 @@ impl CgroupFile {
                     }
                 }
                 let old_path = state.path_for_pid(pid);
+                if legacy_freezer_path_frozen(state, &old_path)
+                    || legacy_freezer_path_frozen(state, &self.rel_path)
+                {
+                    return Err(EBUSY);
+                }
                 if state.assignments.contains_key(&pid) {
                     state.flush_process_cpu_usage(pid, &old_path);
                 }
@@ -1094,6 +1247,13 @@ fn build_dir_entries(
             "cgroup.clone_children",
             "notify_on_release",
             "cpuacct.usage",
+        ],
+        CgroupMountKind::LegacyFreezer => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+            "freezer.state",
         ],
         CgroupMountKind::LegacyCpuset => &[
             "tasks",

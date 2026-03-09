@@ -1353,13 +1353,13 @@ fn proc_pid_status(pid: u32) -> String {
         .map(|p| p.getpid())
         .unwrap_or(0);
     let num_threads = inner.thread_count();
-    let main_state = inner
+    let (main_state, cgroup_frozen) = inner
         .tasks
         .iter()
         .flatten()
         .next()
-        .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
-        .unwrap_or(TaskStatus::Ready);
+        .and_then(|t| t.try_borrow_mut().map(|ti| (ti.task_status, ti.cgroup_frozen)))
+        .unwrap_or((TaskStatus::Ready, false));
     let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
     let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
     let vmlck_bytes: usize = inner
@@ -1394,6 +1394,8 @@ fn proc_pid_status(pid: u32) -> String {
         'Z'
     } else if inner.stopped {
         'T'
+    } else if cgroup_frozen {
+        'D'
     } else {
         match main_state {
             TaskStatus::Running => 'R',
@@ -1404,6 +1406,7 @@ fn proc_pid_status(pid: u32) -> String {
     let state_desc = match state_char {
         'R' => "R (running)",
         'S' => "S (sleeping)",
+        'D' => "D (disk sleep)",
         'T' => "T (stopped)",
         'Z' => "Z (zombie)",
         _ => "R (running)",
@@ -1442,13 +1445,13 @@ fn proc_pid_stat(pid: u32) -> String {
         .unwrap_or(0);
     let start_time_ms = inner.start_time_ms;
     let num_threads = inner.thread_count();
-    let main_state = inner
+    let (main_state, cgroup_frozen) = inner
         .tasks
         .iter()
         .flatten()
         .next()
-        .and_then(|t| t.try_borrow_mut().map(|ti| ti.task_status))
-        .unwrap_or(TaskStatus::Ready);
+        .and_then(|t| t.try_borrow_mut().map(|ti| (ti.task_status, ti.cgroup_frozen)))
+        .unwrap_or((TaskStatus::Ready, false));
     let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
     let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
     let vsize: u64 = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
@@ -1469,6 +1472,8 @@ fn proc_pid_stat(pid: u32) -> String {
         'Z'
     } else if inner.stopped {
         'T'
+    } else if cgroup_frozen {
+        'D'
     } else {
         match main_state {
             TaskStatus::Running => 'R',
@@ -1569,7 +1574,7 @@ fn proc_pid_task_stat(pid: u32, tid: u32) -> String {
     let Some(tid_index) = decode_proc_linux_tid(pid, tid) else {
         return String::new();
     };
-    let Some(task_state) = inner
+    let Some((task_state, cgroup_frozen)) = inner
         .tasks
         .get(tid_index)
         .and_then(|t| t.as_ref())
@@ -1578,7 +1583,7 @@ fn proc_pid_task_stat(pid: u32, tid: u32) -> String {
                 if ti.res.is_none() || ti.exit_code.is_some() {
                     None
                 } else {
-                    Some(ti.task_status)
+                    Some((ti.task_status, ti.cgroup_frozen))
                 }
             })
         })
@@ -1607,6 +1612,8 @@ fn proc_pid_task_stat(pid: u32, tid: u32) -> String {
         'Z'
     } else if inner.stopped {
         'T'
+    } else if cgroup_frozen {
+        'D'
     } else {
         match task_state {
             TaskStatus::Running => 'R',

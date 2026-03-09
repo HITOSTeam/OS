@@ -484,6 +484,12 @@ pub struct TaskControlBlockInner {
     pub last_syscall_valid: bool,
     /// Task was blocked due to a job-control stop signal.
     pub stopped_by_signal: bool,
+    /// Task is logically frozen by the cgroup freezer.
+    pub cgroup_frozen: bool,
+    /// Task was runnable but parked by the cgroup freezer.
+    pub parked_by_cgroup: bool,
+    /// A wakeup event happened while the task was cgroup-frozen.
+    pub wake_on_cgroup_thaw: bool,
     /// Number of timer ticks consumed in current SCHED_RR round.
     pub rr_ticks: usize,
     /// Best-effort per-thread CPU runtime used for *_CPUTIME clocks.
@@ -568,6 +574,9 @@ impl TaskControlBlock {
                 last_syscall_args: [0; 6],
                 last_syscall_valid: false,
                 stopped_by_signal: false,
+                cgroup_frozen: false,
+                parked_by_cgroup: false,
+                wake_on_cgroup_thaw: false,
                 rr_ticks: 0,
                 cpu_time_ns: 0,
                 nice: process_nice,
@@ -641,6 +650,9 @@ impl TaskControlBlock {
                 last_syscall_args: [0; 6],
                 last_syscall_valid: false,
                 stopped_by_signal: false,
+                cgroup_frozen: false,
+                parked_by_cgroup: false,
+                wake_on_cgroup_thaw: false,
                 rr_ticks: 0,
                 cpu_time_ns: 0,
                 nice: process_nice,

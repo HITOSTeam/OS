@@ -34,18 +34,22 @@ static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
 // The base image ships `/bin/busybox` but not individual applet symlinks.
 // Allow a conservative subset of common LTP shell dependencies to fall back
 // to busybox when the standalone binary path is absent.
-const BUSYBOX_APPLET_ALLOWLIST: [&str; 12] = [
+const BUSYBOX_APPLET_ALLOWLIST: [&str; 16] = [
     "awk",
+    "bash",
     "dmesg",
     "find",
     "grep",
     "mount",
     "mountpoint",
+    "pgrep",
+    "pkill",
     "ps",
     "seq",
     "umount",
     "wc",
     "which",
+    "xargs",
     "zcat",
 ];
 

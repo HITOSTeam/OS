@@ -466,6 +466,28 @@ fn find_busybox_shell() -> Result<Option<(String, Vec<u8>)>, isize> {
     Ok(None)
 }
 
+fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static str {
+    let shell_name = if interp_name == "env" {
+        opt_arg.unwrap_or("sh")
+    } else {
+        interp_name
+    };
+    match shell_name {
+        "bash" => "bash",
+        "dash" | "sh" => "sh",
+        "busybox" => "sh",
+        _ => "sh",
+    }
+}
+
+fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> Option<&'a str> {
+    if interp_name == "env" && matches!(opt_arg, Some("sh") | Some("bash")) {
+        None
+    } else {
+        opt_arg
+    }
+}
+
 fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) -> isize {
     let process = current_process();
     if let Some(interp_interp) = elf_interp_path(&interp_data) {
@@ -1812,12 +1834,30 @@ fn execve_with_inode(
             interp_name == "env" && matches!(opt_arg.as_deref(), Some("sh") | Some("bash"));
         let wants_shell = matches!(interp_name, "sh" | "bash" | "busybox") || env_shell;
         let opt_arg_ref = opt_arg.as_deref();
+        let extra_shell_arg = shebang_shell_extra_arg(interp_name, opt_arg_ref);
+        match load_file_from_path(&interp) {
+            Ok(interp_data) if is_elf(&interp_data) => {
+                let mut new_args: Vec<String> = Vec::new();
+                new_args.push(interp.clone());
+                if let Some(a) = opt_arg_ref {
+                    new_args.push(String::from(a));
+                }
+                new_args.push(path.clone());
+                for a in args_vec.iter().skip(1) {
+                    new_args.push(a.clone());
+                }
+                return exec_interpreter(interp_data, new_args, envs_vec);
+            }
+            Ok(_) => {}
+            Err(ENOENT) => {}
+            Err(e) => return e,
+        }
         if wants_shell && is_system_shell_path(&interp) {
             if let Ok(Some((bb_path, bb_data))) = find_busybox_shell() {
                 let mut new_args: Vec<String> = Vec::new();
                 new_args.push(bb_path);
-                new_args.push(String::from("sh"));
-                if let Some(a) = opt_arg_ref {
+                new_args.push(String::from(busybox_shell_applet(interp_name, opt_arg_ref)));
+                if let Some(a) = extra_shell_arg {
                     new_args.push(String::from(a));
                 }
                 new_args.push(path.clone());
@@ -1834,10 +1874,10 @@ fn execve_with_inode(
                 }
                 let mut new_args: Vec<String> = Vec::new();
                 new_args.push(interp_path.clone());
-                if needs_sh_arg && opt_arg_ref != Some("sh") {
-                    new_args.push(String::from("sh"));
+                if needs_sh_arg {
+                    new_args.push(String::from(busybox_shell_applet(interp_name, opt_arg_ref)));
                 }
-                if let Some(a) = opt_arg_ref {
+                if let Some(a) = extra_shell_arg {
                     new_args.push(String::from(a));
                 }
                 new_args.push(path.clone());

@@ -415,7 +415,15 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
             return;
         }
         if task_inner.task_status == TaskStatus::Blocked {
+            if task_inner.cgroup_frozen {
+                task_inner.wake_on_cgroup_thaw = true;
+                task.wakeup_pending
+                    .store(false, core::sync::atomic::Ordering::Release);
+                return;
+            }
             task_inner.task_status = TaskStatus::Ready;
+            task_inner.parked_by_cgroup = false;
+            task_inner.wake_on_cgroup_thaw = false;
             task.wakeup_pending
                 .store(false, core::sync::atomic::Ordering::Release);
             drop(task_inner);

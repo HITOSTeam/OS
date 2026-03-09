@@ -302,6 +302,7 @@ pub fn trap_handler() {
                 println!("[kernel] {}", msg);
                 exit_current_and_run_next(errno);
             }
+            crate::fs::cgroup_maybe_block_current();
             if crate::task::processor::should_preempt_current_on_tick() {
                 suspend_current_and_run_next();
             }
@@ -329,6 +330,7 @@ pub fn trap_handler() {
     // from starving `sleep()/nanosleep()` wakeups.
     check_timer();
     crate::syscall::signal::maybe_deliver_signal();
+    crate::fs::cgroup_maybe_block_current();
     trap_return();
 }
 
