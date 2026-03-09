@@ -16,7 +16,7 @@ use crate::{
         cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots, make_pipe,
         open_cgroup_pseudo, open_file, pseudo_block_is_read_only, pseudo_block_note_sync,
         pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
-        shm_create, shm_get, shm_list, shm_remove, CgroupFile, CgroupMountKind, File,
+        shm_create, shm_get, shm_list, shm_remove, CgroupFile, CgroupMountSpec, File,
         NetSocketFile, OSInode, OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir,
         PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
         SocketPairEnd, TtyFile,
@@ -27,6 +27,7 @@ use crate::{
         try_read_user_value, try_translated_byte_buffer, try_write_user_value, write_user_value,
         MapPermission, UserBuffer,
     },
+    syscall::process::{is_inode_currently_executed_locked, lock_executing_inodes},
     task::processor::{
         block_current_and_run_next, current_files_process, current_process, current_task,
     },
@@ -35,7 +36,6 @@ use crate::{
         task_block::TaskControlBlock,
         ProcessControlBlock,
     },
-    syscall::process::{is_inode_currently_executed_locked, lock_executing_inodes},
     time::get_time_ms,
     trap::get_current_token,
 };
@@ -1009,7 +1009,8 @@ pub(crate) fn syscall_mount_impl(
         return EINVAL;
     }
     if fsname == "cgroup2" {
-        let rc = cgroup_mount(&target, CgroupMountKind::Unified);
+        let spec = CgroupMountSpec::unified();
+        let rc = cgroup_mount(&target, &spec);
         if rc != 0 {
             return rc;
         }
@@ -1025,47 +1026,18 @@ pub(crate) fn syscall_mount_impl(
     }
     if fsname == "cgroup" {
         let options = data.as_deref().unwrap_or("");
-        let mut source = String::from("none");
-        let mut kind = CgroupMountKind::LegacyDebug;
-        let mut found_controller = false;
-        for token in options.split(',').map(str::trim).filter(|token| !token.is_empty()) {
-            let parsed = match token {
-                "none" => None,
-                "debug" => Some((token, CgroupMountKind::LegacyDebug)),
-                "cpuset" => Some((token, CgroupMountKind::LegacyCpuset)),
-                "cpu" => Some((token, CgroupMountKind::LegacyCpu)),
-                "cpuacct" => Some((token, CgroupMountKind::LegacyCpuAcct)),
-                "memory" => Some((token, CgroupMountKind::LegacyMemory)),
-                "freezer" => Some((token, CgroupMountKind::LegacyFreezer)),
-                "devices" => Some((token, CgroupMountKind::LegacyDevices)),
-                "blkio" => Some((token, CgroupMountKind::LegacyBlkio)),
-                "net_cls" => Some((token, CgroupMountKind::LegacyNetCls)),
-                "perf_event" => Some((token, CgroupMountKind::LegacyPerfEvent)),
-                "net_prio" => Some((token, CgroupMountKind::LegacyNetPrio)),
-                "hugetlb" => Some((token, CgroupMountKind::LegacyHugetlb)),
-                _ if token.starts_with("name=") => {
-                    source = String::from(token);
-                    None
-                }
-                _ => return ENODEV,
-            };
-            if let Some((controller, mount_kind)) = parsed {
-                source = String::from(controller);
-                kind = mount_kind;
-                found_controller = true;
-            }
-        }
-        if !found_controller && options.is_empty() {
-            source = String::from("none");
-        }
-        let rc = cgroup_mount(&target, kind);
+        let spec = match CgroupMountSpec::parse_legacy_options(options) {
+            Ok(spec) => spec,
+            Err(e) => return e,
+        };
+        let rc = cgroup_mount(&target, &spec);
         if rc != 0 {
             return rc;
         }
         upsert_mount_record(
             &target,
             &target,
-            &source,
+            spec.source_label(),
             "cgroup",
             flags & mount_flag_mask(),
         );
@@ -4410,7 +4382,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     let text_write_intent = writable || (flags & O_TRUNC) != 0;
     let exec_inode_guard = if !o_path && inode.is_file() && text_write_intent {
         let guard = lock_executing_inodes();
-        let exec_busy = is_inode_currently_executed_locked(&guard, inode.device_id(), inode.inode_num());
+        let exec_busy =
+            is_inode_currently_executed_locked(&guard, inode.device_id(), inode.inode_num());
         if exec_busy {
             return ETXTBSY;
         }
@@ -4762,7 +4735,10 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                 dtype: 4
             },
         ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/cgroup", entries)));
+        return Some(alloc::sync::Arc::new(PseudoDir::new(
+            "/dev/cgroup",
+            entries,
+        )));
     }
     if path == "/dev/pts" || path == "/dev/pts/" {
         let mut entries = alloc::vec![
@@ -5869,8 +5845,7 @@ fn do_renameat(
     };
 
     if let (AtPath::PseudoAbs(old_abs), AtPath::PseudoAbs(new_abs)) = (&old_at, &new_at) {
-        if crate::fs::is_cgroup_pseudo_path(old_abs) && crate::fs::is_cgroup_pseudo_path(new_abs)
-        {
+        if crate::fs::is_cgroup_pseudo_path(old_abs) && crate::fs::is_cgroup_pseudo_path(new_abs) {
             return cgroup_rename(old_abs, new_abs, no_replace);
         }
     }

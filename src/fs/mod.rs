@@ -25,15 +25,14 @@ pub trait File: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub use dummy::{DummyFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
 pub use cgroupfs::{
-    CgroupFile, CgroupMountKind, cgroup_attach_fork_child, cgroup_charge_anon_current,
-    cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process, cgroup_fork_precheck,
-    cgroup_logical_path_for_file, cgroup_maybe_block_current, cgroup_mkdir, cgroup_mount,
-    cgroup_proc_cgroups_content, cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir,
-    cgroup_umount,
-    is_cgroup_pseudo_path, open_cgroup_pseudo,
+    cgroup_attach_fork_child, cgroup_charge_anon_current, cgroup_charge_file_write,
+    cgroup_current_path, cgroup_exit_process, cgroup_fork_precheck, cgroup_logical_path_for_file,
+    cgroup_maybe_block_current, cgroup_mkdir, cgroup_mount, cgroup_proc_cgroups_content,
+    cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
+    open_cgroup_pseudo, CgroupFile, CgroupMountKind, CgroupMountSpec,
 };
+pub use dummy::{DummyFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, register_deferred_unlink_cleanup,
     root_inode_for_path, secondary_root_inode,
@@ -50,11 +49,11 @@ pub use procfs::{
 };
 pub use pseudo::PseudoBlock;
 pub(crate) use pseudo::{
-    open_pseudo_dev_dir, pseudo_dev_dir_entries, pseudo_dev_dir_exists, pseudo_dev_dir_mkdir,
-    pseudo_dev_dir_rmdir,
-    pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_read_ahead,
-    pseudo_block_set_read_ahead, pseudo_block_set_read_only, pseudo_block_stat_snapshot,
-    shm_create, shm_create_anonymous, shm_get, shm_list, shm_remove,
+    open_pseudo_dev_dir, pseudo_block_is_read_only, pseudo_block_note_sync,
+    pseudo_block_read_ahead, pseudo_block_set_read_ahead, pseudo_block_set_read_only,
+    pseudo_block_stat_snapshot, pseudo_dev_dir_entries, pseudo_dev_dir_exists,
+    pseudo_dev_dir_mkdir, pseudo_dev_dir_rmdir, shm_create, shm_create_anonymous, shm_get,
+    shm_list, shm_remove,
 };
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub use socketpair::{make_socketpair, SocketPairEnd};

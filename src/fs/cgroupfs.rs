@@ -24,7 +24,7 @@ const EEXIST: isize = -17;
 const EACCES: isize = -13;
 const EINVAL: isize = -22;
 const ENOENT: isize = -2;
-const ENOTDIR: isize = -20;
+const ENODEV: isize = -19;
 const ENOTEMPTY: isize = -39;
 const EBUSY: isize = -16;
 const EAGAIN: isize = -11;
@@ -35,14 +35,14 @@ const EOPNOTSUPP: isize = -95;
 static NEXT_CGROUP_INO: AtomicU64 = AtomicU64::new(0x63_0000);
 
 lazy_static! {
-    static ref CGROUP_MOUNTS: Mutex<BTreeMap<String, CgroupMountState>> = Mutex::new(BTreeMap::new());
+    static ref CGROUP_REGISTRY: Mutex<CgroupRegistry> = Mutex::new(CgroupRegistry::new());
 }
 
 const CTRL_PIDS: u32 = 1 << 0;
 const CTRL_MEMORY: u32 = 1 << 1;
 const ROOT_CONTROLLERS: u32 = CTRL_PIDS | CTRL_MEMORY;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CgroupMountKind {
     Unified,
     LegacyDebug,
@@ -57,6 +57,136 @@ pub enum CgroupMountKind {
     LegacyPerfEvent,
     LegacyNetPrio,
     LegacyHugetlb,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CgroupHierarchyKey {
+    Unified,
+    Legacy {
+        source_label: String,
+        kind: CgroupMountKind,
+    },
+}
+
+#[derive(Clone)]
+pub struct CgroupMountSpec {
+    kind: CgroupMountKind,
+    source_label: String,
+    hierarchy_key: CgroupHierarchyKey,
+}
+
+impl CgroupMountSpec {
+    pub fn unified() -> Self {
+        Self {
+            kind: CgroupMountKind::Unified,
+            source_label: String::from("cgroup2"),
+            hierarchy_key: CgroupHierarchyKey::Unified,
+        }
+    }
+
+    pub fn parse_legacy_options(options: &str) -> Result<Self, isize> {
+        let mut source_label = String::from("none");
+        let mut kind = CgroupMountKind::LegacyDebug;
+        let mut found_controller = false;
+        for token in options
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let parsed = match token {
+                "none" => None,
+                "debug" => Some((token, CgroupMountKind::LegacyDebug)),
+                "cpuset" => Some((token, CgroupMountKind::LegacyCpuset)),
+                "cpu" => Some((token, CgroupMountKind::LegacyCpu)),
+                "cpuacct" => Some((token, CgroupMountKind::LegacyCpuAcct)),
+                "memory" => Some((token, CgroupMountKind::LegacyMemory)),
+                "freezer" => Some((token, CgroupMountKind::LegacyFreezer)),
+                "devices" => Some((token, CgroupMountKind::LegacyDevices)),
+                "blkio" => Some((token, CgroupMountKind::LegacyBlkio)),
+                "net_cls" => Some((token, CgroupMountKind::LegacyNetCls)),
+                "perf_event" => Some((token, CgroupMountKind::LegacyPerfEvent)),
+                "net_prio" => Some((token, CgroupMountKind::LegacyNetPrio)),
+                "hugetlb" => Some((token, CgroupMountKind::LegacyHugetlb)),
+                _ if token.starts_with("name=") => {
+                    source_label = String::from(token);
+                    None
+                }
+                _ => return Err(ENODEV),
+            };
+            if let Some((controller, mount_kind)) = parsed {
+                source_label = String::from(controller);
+                kind = mount_kind;
+                found_controller = true;
+            }
+        }
+        if !found_controller && options.is_empty() {
+            source_label = String::from("none");
+        }
+        Ok(Self {
+            kind,
+            hierarchy_key: CgroupHierarchyKey::Legacy {
+                source_label: source_label.clone(),
+                kind,
+            },
+            source_label,
+        })
+    }
+
+    fn kind(&self) -> CgroupMountKind {
+        self.kind
+    }
+
+    pub fn source_label(&self) -> &str {
+        &self.source_label
+    }
+
+    fn hierarchy_key(&self) -> &CgroupHierarchyKey {
+        &self.hierarchy_key
+    }
+}
+
+struct CgroupRegistry {
+    mounts: BTreeMap<String, CgroupHierarchyKey>,
+    hierarchies: BTreeMap<CgroupHierarchyKey, CgroupMountState>,
+}
+
+impl CgroupRegistry {
+    fn new() -> Self {
+        Self {
+            mounts: BTreeMap::new(),
+            hierarchies: BTreeMap::new(),
+        }
+    }
+
+    fn mount(&mut self, target: &str, spec: &CgroupMountSpec) -> isize {
+        if self.mounts.contains_key(target) {
+            return EBUSY;
+        }
+        self.hierarchies
+            .entry(spec.hierarchy_key().clone())
+            .or_insert_with(|| CgroupMountState::new(spec.kind()));
+        self.mounts
+            .insert(String::from(target), spec.hierarchy_key().clone());
+        0
+    }
+
+    fn umount(&mut self, target: &str) -> isize {
+        let Some(key) = self.mounts.remove(target) else {
+            return 0;
+        };
+        let hierarchy_still_mounted = self.mounts.values().any(|mounted_key| mounted_key == &key);
+        if !hierarchy_still_mounted {
+            self.hierarchies.remove(&key);
+        }
+        0
+    }
+
+    fn preferred_proc_hierarchy(&self) -> Option<&CgroupMountState> {
+        self.hierarchies
+            .values()
+            .find(|state| state.is_unified())
+            .or_else(|| self.hierarchies.values().next())
+    }
 }
 
 #[derive(Clone)]
@@ -285,7 +415,11 @@ impl CgroupMountState {
                     return None;
                 }
                 let current = process_cpu_time_ns(*pid);
-                let snap = self.process_cpu_account_ns.get(pid).copied().unwrap_or(current);
+                let snap = self
+                    .process_cpu_account_ns
+                    .get(pid)
+                    .copied()
+                    .unwrap_or(current);
                 Some(current.saturating_sub(snap))
             })
             .fold(0u64, |acc, ns| acc.saturating_add(ns));
@@ -406,14 +540,16 @@ impl CgroupMountState {
             .iter()
             .map(|(child, _usage, eff)| (child.clone(), *eff))
             .collect::<Vec<_>>();
-        let budgets = Self::distribute_weighted_budget(protection_inputs.as_slice(), protected_budget);
+        let budgets =
+            Self::distribute_weighted_budget(protection_inputs.as_slice(), protected_budget);
         let child_budget_total = budgets.values().copied().sum::<usize>();
         let local_file_bytes = self
             .nodes
             .get(path)
             .map(|node| node.local_file_bytes)
             .unwrap_or(0);
-        let local_reclaimable = local_file_bytes.min(current_usage.saturating_sub(protected_budget));
+        let local_reclaimable =
+            local_file_bytes.min(current_usage.saturating_sub(protected_budget));
         let mut reclaimable_inputs = children
             .iter()
             .filter_map(|(child, usage, _eff)| {
@@ -427,8 +563,11 @@ impl CgroupMountState {
         if local_reclaimable > 0 {
             reclaimable_inputs.push((String::from("."), local_reclaimable));
         }
-        let remaining_reclaimable =
-            reclaimable_inputs.iter().map(|(_, weight)| *weight).sum::<usize>().saturating_sub(need);
+        let remaining_reclaimable = reclaimable_inputs
+            .iter()
+            .map(|(_, weight)| *weight)
+            .sum::<usize>()
+            .saturating_sub(need);
         let extra_targets =
             Self::distribute_weighted_budget(reclaimable_inputs.as_slice(), remaining_reclaimable);
         for (child, usage, _eff) in children {
@@ -506,26 +645,6 @@ impl CgroupMountState {
     }
 }
 
-impl CgroupMountKind {
-    fn controller_name(self) -> Option<&'static str> {
-        match self {
-            Self::Unified => None,
-            Self::LegacyDebug => Some("debug"),
-            Self::LegacyCpuset => Some("cpuset"),
-            Self::LegacyCpu => Some("cpu"),
-            Self::LegacyCpuAcct => Some("cpuacct"),
-            Self::LegacyMemory => Some("memory"),
-            Self::LegacyFreezer => Some("freezer"),
-            Self::LegacyDevices => Some("devices"),
-            Self::LegacyBlkio => Some("blkio"),
-            Self::LegacyNetCls => Some("net_cls"),
-            Self::LegacyPerfEvent => Some("perf_event"),
-            Self::LegacyNetPrio => Some("net_prio"),
-            Self::LegacyHugetlb => Some("hugetlb"),
-        }
-    }
-}
-
 fn process_cpu_time_ns(pid: usize) -> u64 {
     let Some(process) = pid2process(pid) else {
         return 0;
@@ -550,12 +669,7 @@ fn process_cpu_time_ns(pid: usize) -> u64 {
 fn path_under_mount(abs: &str, mount: &str) -> bool {
     abs == mount
         || (abs.starts_with(mount)
-            && abs
-                .as_bytes()
-                .get(mount.len())
-                .copied()
-                .unwrap_or_default()
-                == b'/')
+            && abs.as_bytes().get(mount.len()).copied().unwrap_or_default() == b'/')
 }
 
 fn normalize_rel_path(rel: &str) -> String {
@@ -584,25 +698,25 @@ fn split_rel_parent(path: &str) -> Option<(String, String)> {
     Some((parent, name))
 }
 
-fn split_mount_path(abs: &str) -> Option<(String, String)> {
-    let mounts = CGROUP_MOUNTS.lock();
-    let mut best: Option<&str> = None;
-    for target in mounts.keys() {
+fn split_mount_path(abs: &str) -> Option<(String, String, CgroupHierarchyKey)> {
+    let registry = CGROUP_REGISTRY.lock();
+    let mut best: Option<(&str, &CgroupHierarchyKey)> = None;
+    for (target, hierarchy_key) in registry.mounts.iter() {
         if !path_under_mount(abs, target) {
             continue;
         }
         match best {
-            Some(cur) if cur.len() >= target.len() => {}
-            _ => best = Some(target.as_str()),
+            Some((cur, _)) if cur.len() >= target.len() => {}
+            _ => best = Some((target.as_str(), hierarchy_key)),
         }
     }
-    let target = best?;
+    let (target, hierarchy_key) = best?;
     let rel = if abs == target {
         String::from("/")
     } else {
         normalize_rel_path(&abs[target.len()..])
     };
-    Some((String::from(target), rel))
+    Some((String::from(target), rel, hierarchy_key.clone()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -760,13 +874,15 @@ fn legacy_freezer_path_frozen(state: &CgroupMountState, path: &str) -> bool {
     if state.kind != CgroupMountKind::LegacyFreezer {
         return false;
     }
-    CgroupMountState::ancestor_paths(path).into_iter().any(|ancestor| {
-        state
-            .nodes
-            .get(&ancestor)
-            .map(|node| node.freezer_state == LegacyFreezerState::Frozen)
-            .unwrap_or(false)
-    })
+    CgroupMountState::ancestor_paths(path)
+        .into_iter()
+        .any(|ancestor| {
+            state
+                .nodes
+                .get(&ancestor)
+                .map(|node| node.freezer_state == LegacyFreezerState::Frozen)
+                .unwrap_or(false)
+        })
 }
 
 fn set_process_freezer_state(pid: usize, frozen: bool) -> bool {
@@ -781,7 +897,10 @@ fn set_process_freezer_state(pid: usize, frozen: bool) -> bool {
             .filter_map(|task| task.as_ref().cloned())
             .collect::<Vec<_>>()
     };
-    let current_tid = current_task().and_then(|task| task.try_borrow_mut().and_then(|inner| inner.res.as_ref().map(|res| res.tid)));
+    let current_tid = current_task().and_then(|task| {
+        task.try_borrow_mut()
+            .and_then(|inner| inner.res.as_ref().map(|res| res.tid))
+    });
     let mut should_block_current = false;
     for task in tasks {
         let is_current = task
@@ -814,12 +933,12 @@ fn set_process_freezer_state(pid: usize, frozen: bool) -> bool {
 }
 
 fn apply_legacy_freezer_state(
-    mount_target: &str,
+    hierarchy_key: &CgroupHierarchyKey,
     path: &str,
     frozen: bool,
 ) -> Result<bool, isize> {
-    let mut mounts = CGROUP_MOUNTS.lock();
-    let Some(state) = mounts.get_mut(mount_target) else {
+    let mut registry = CGROUP_REGISTRY.lock();
+    let Some(state) = registry.hierarchies.get_mut(hierarchy_key) else {
         return Err(ENOENT);
     };
     if state.kind != CgroupMountKind::LegacyFreezer {
@@ -832,7 +951,7 @@ fn apply_legacy_freezer_state(
         LegacyFreezerState::Thawed
     };
     let pids = state.subtree_member_pids(path);
-    drop(mounts);
+    drop(registry);
     let mut should_block_current = false;
     for pid in pids {
         should_block_current |= set_process_freezer_state(pid, frozen);
@@ -859,7 +978,7 @@ struct CgroupFileInner {
 
 pub struct CgroupFile {
     path: String,
-    mount_target: String,
+    hierarchy_key: CgroupHierarchyKey,
     rel_path: String,
     kind: CgroupFileKind,
     open_euid: u32,
@@ -870,7 +989,7 @@ pub struct CgroupFile {
 impl CgroupFile {
     fn new(
         path: &str,
-        mount_target: &str,
+        hierarchy_key: CgroupHierarchyKey,
         rel_path: &str,
         kind: CgroupFileKind,
         open_euid: u32,
@@ -878,7 +997,7 @@ impl CgroupFile {
     ) -> Arc<Self> {
         Arc::new(Self {
             path: String::from(path),
-            mount_target: String::from(mount_target),
+            hierarchy_key,
             rel_path: String::from(rel_path),
             kind,
             open_euid,
@@ -908,8 +1027,8 @@ impl CgroupFile {
     }
 
     fn read_string(&self) -> String {
-        let mounts = CGROUP_MOUNTS.lock();
-        let Some(state) = mounts.get(&self.mount_target) else {
+        let registry = CGROUP_REGISTRY.lock();
+        let Some(state) = registry.hierarchies.get(&self.hierarchy_key) else {
             return String::new();
         };
         let Some(node) = state.nodes.get(&self.rel_path) else {
@@ -985,8 +1104,8 @@ impl CgroupFile {
         let text = raw.trim_matches(|c| c == '\n' || c == '\r' || c == ' ' || c == '\t');
         if self.kind == CgroupFileKind::FreezerState {
             let should_block_current = match text {
-                "THAWED" => apply_legacy_freezer_state(&self.mount_target, &self.rel_path, false)?,
-                "FROZEN" => apply_legacy_freezer_state(&self.mount_target, &self.rel_path, true)?,
+                "THAWED" => apply_legacy_freezer_state(&self.hierarchy_key, &self.rel_path, false)?,
+                "FROZEN" => apply_legacy_freezer_state(&self.hierarchy_key, &self.rel_path, true)?,
                 "FREEZING" => return Err(-5),
                 _ => return Err(EINVAL),
             };
@@ -995,8 +1114,8 @@ impl CgroupFile {
             }
             return Ok(data.len());
         }
-        let mut mounts = CGROUP_MOUNTS.lock();
-        let Some(state) = mounts.get_mut(&self.mount_target) else {
+        let mut registry = CGROUP_REGISTRY.lock();
+        let Some(state) = registry.hierarchies.get_mut(&self.hierarchy_key) else {
             return Err(ENOENT);
         };
         let available = state.available_controllers(&self.rel_path);
@@ -1130,7 +1249,7 @@ impl CgroupFile {
                             .then_some(*pid)
                     })
                     .collect::<Vec<_>>();
-                drop(mounts);
+                drop(registry);
                 for pid in victims {
                     queue_process_signal(pid, SIGKILL_NUM);
                 }
@@ -1250,7 +1369,11 @@ fn build_dir_entries(
         } else {
             alloc::format!("{rel_path}/{child}")
         };
-        let child_ino = state.nodes.get(&child_path).map(|node| node.ino).unwrap_or(1);
+        let child_ino = state
+            .nodes
+            .get(&child_path)
+            .map(|node| node.ino)
+            .unwrap_or(1);
         entries.push(PseudoDirent {
             name: child,
             ino: child_ino,
@@ -1321,19 +1444,12 @@ fn build_dir_entries(
     entries
 }
 
-pub fn cgroup_mount(target: &str, kind: CgroupMountKind) -> isize {
-    let mut mounts = CGROUP_MOUNTS.lock();
-    if mounts.contains_key(target) {
-        return EBUSY;
-    }
-    mounts.insert(String::from(target), CgroupMountState::new(kind));
-    0
+pub fn cgroup_mount(target: &str, spec: &CgroupMountSpec) -> isize {
+    CGROUP_REGISTRY.lock().mount(target, spec)
 }
 
 pub fn cgroup_umount(target: &str) -> isize {
-    let mut mounts = CGROUP_MOUNTS.lock();
-    mounts.remove(target);
-    0
+    CGROUP_REGISTRY.lock().umount(target)
 }
 
 pub fn is_cgroup_pseudo_path(abs: &str) -> bool {
@@ -1341,9 +1457,9 @@ pub fn is_cgroup_pseudo_path(abs: &str) -> bool {
 }
 
 pub fn open_cgroup_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
-    let (mount_target, rel_path) = split_mount_path(path)?;
-    let mounts = CGROUP_MOUNTS.lock();
-    let state = mounts.get(&mount_target)?;
+    let (mount_target, rel_path, hierarchy_key) = split_mount_path(path)?;
+    let registry = CGROUP_REGISTRY.lock();
+    let state = registry.hierarchies.get(&hierarchy_key)?;
     if state.nodes.contains_key(&rel_path) {
         let entries = build_dir_entries(path, &mount_target, &rel_path, state);
         return Some(Arc::new(PseudoDir::new(path, entries)));
@@ -1358,7 +1474,7 @@ pub fn open_cgroup_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     };
     Some(CgroupFile::new(
         path,
-        &mount_target,
+        hierarchy_key,
         &parent,
         kind,
         open_euid,
@@ -1367,7 +1483,7 @@ pub fn open_cgroup_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
 }
 
 pub fn cgroup_mkdir(abs: &str) -> isize {
-    let Some((mount_target, rel_path)) = split_mount_path(abs) else {
+    let Some((_mount_target, rel_path, hierarchy_key)) = split_mount_path(abs) else {
         return EROFS;
     };
     if rel_path == "/" {
@@ -1376,8 +1492,8 @@ pub fn cgroup_mkdir(abs: &str) -> isize {
     let Some((parent, _name)) = split_rel_parent(&rel_path) else {
         return EINVAL;
     };
-    let mut mounts = CGROUP_MOUNTS.lock();
-    let Some(state) = mounts.get_mut(&mount_target) else {
+    let mut registry = CGROUP_REGISTRY.lock();
+    let Some(state) = registry.hierarchies.get_mut(&hierarchy_key) else {
         return ENOENT;
     };
     if !state.nodes.contains_key(&parent) {
@@ -1396,14 +1512,14 @@ pub fn cgroup_mkdir(abs: &str) -> isize {
 }
 
 pub fn cgroup_rmdir(abs: &str) -> isize {
-    let Some((mount_target, rel_path)) = split_mount_path(abs) else {
+    let Some((_mount_target, rel_path, hierarchy_key)) = split_mount_path(abs) else {
         return EROFS;
     };
     if rel_path == "/" {
         return EBUSY;
     }
-    let mut mounts = CGROUP_MOUNTS.lock();
-    let Some(state) = mounts.get_mut(&mount_target) else {
+    let mut registry = CGROUP_REGISTRY.lock();
+    let Some(state) = registry.hierarchies.get_mut(&hierarchy_key) else {
         return ENOENT;
     };
     if !state.nodes.contains_key(&rel_path) {
@@ -1428,13 +1544,13 @@ fn rename_subtree_path(path: &str, old_prefix: &str, new_prefix: &str) -> String
 }
 
 pub fn cgroup_rename(old_abs: &str, new_abs: &str, no_replace: bool) -> isize {
-    let Some((old_mount, old_rel)) = split_mount_path(old_abs) else {
+    let Some((old_mount, old_rel, hierarchy_key)) = split_mount_path(old_abs) else {
         return EROFS;
     };
-    let Some((new_mount, new_rel)) = split_mount_path(new_abs) else {
+    let Some((new_mount, new_rel, new_hierarchy_key)) = split_mount_path(new_abs) else {
         return EROFS;
     };
-    if old_mount != new_mount {
+    if old_mount != new_mount || hierarchy_key != new_hierarchy_key {
         return EROFS;
     }
     if old_rel == "/" || new_rel == "/" {
@@ -1456,8 +1572,8 @@ pub fn cgroup_rename(old_abs: &str, new_abs: &str, no_replace: bool) -> isize {
         return EROFS;
     }
 
-    let mut mounts = CGROUP_MOUNTS.lock();
-    let Some(state) = mounts.get_mut(&old_mount) else {
+    let mut registry = CGROUP_REGISTRY.lock();
+    let Some(state) = registry.hierarchies.get_mut(&hierarchy_key) else {
         return ENOENT;
     };
     if !state.nodes.contains_key(&old_rel) {
@@ -1513,12 +1629,8 @@ pids\t0\t1\t1\n",
 }
 
 pub fn cgroup_proc_pid_content(pid: usize) -> String {
-    let mounts = CGROUP_MOUNTS.lock();
-    let Some((_target, state)) = mounts
-        .iter()
-        .find(|(_, state)| state.is_unified())
-        .or_else(|| mounts.iter().next())
-    else {
+    let registry = CGROUP_REGISTRY.lock();
+    let Some(state) = registry.preferred_proc_hierarchy() else {
         return String::from("0::/\n");
     };
     let path = state
@@ -1530,20 +1642,16 @@ pub fn cgroup_proc_pid_content(pid: usize) -> String {
 }
 
 pub fn cgroup_current_path(pid: usize) -> String {
-    let mounts = CGROUP_MOUNTS.lock();
-    let Some((_target, state)) = mounts
-        .iter()
-        .find(|(_, state)| state.is_unified())
-        .or_else(|| mounts.iter().next())
-    else {
+    let registry = CGROUP_REGISTRY.lock();
+    let Some(state) = registry.preferred_proc_hierarchy() else {
         return String::from("/");
     };
     state.path_for_pid(pid)
 }
 
 pub fn cgroup_fork_precheck(parent_pid: usize) -> Result<(), isize> {
-    let mounts = CGROUP_MOUNTS.lock();
-    for state in mounts.values() {
+    let registry = CGROUP_REGISTRY.lock();
+    for state in registry.hierarchies.values() {
         let Some(path) = state.assignments.get(&parent_pid) else {
             continue;
         };
@@ -1563,8 +1671,8 @@ pub fn cgroup_fork_precheck(parent_pid: usize) -> Result<(), isize> {
 }
 
 pub fn cgroup_attach_fork_child(parent_pid: usize, child_pid: usize) {
-    let mut mounts = CGROUP_MOUNTS.lock();
-    for state in mounts.values_mut() {
+    let mut registry = CGROUP_REGISTRY.lock();
+    for state in registry.hierarchies.values_mut() {
         if let Some(path) = state.assignments.get(&parent_pid).cloned() {
             state.assignments.insert(child_pid, path);
             state.process_cpu_account_ns.insert(child_pid, 0);
@@ -1573,8 +1681,8 @@ pub fn cgroup_attach_fork_child(parent_pid: usize, child_pid: usize) {
 }
 
 pub fn cgroup_exit_process(pid: usize) {
-    let mut mounts = CGROUP_MOUNTS.lock();
-    for state in mounts.values_mut() {
+    let mut registry = CGROUP_REGISTRY.lock();
+    for state in registry.hierarchies.values_mut() {
         if let Some(path) = state.assignments.get(&pid).cloned() {
             state.flush_process_cpu_usage(pid, &path);
         }
@@ -1588,8 +1696,8 @@ pub fn cgroup_charge_anon_current(pid: usize, bytes: usize) -> bool {
     if bytes == 0 {
         return true;
     }
-    let mut mounts = CGROUP_MOUNTS.lock();
-    for state in mounts.values_mut() {
+    let mut registry = CGROUP_REGISTRY.lock();
+    for state in registry.hierarchies.values_mut() {
         let path = state.path_for_pid(pid);
         let previous = state
             .process_anon_bytes
@@ -1622,8 +1730,8 @@ pub fn cgroup_charge_file_write(pid: usize, bytes: usize) {
     if bytes == 0 {
         return;
     }
-    let mut mounts = CGROUP_MOUNTS.lock();
-    for state in mounts.values_mut() {
+    let mut registry = CGROUP_REGISTRY.lock();
+    for state in registry.hierarchies.values_mut() {
         let path = state.path_for_pid(pid);
         if let Some(node) = state.nodes.get_mut(&path) {
             node.local_file_bytes = node.local_file_bytes.saturating_add(bytes);
