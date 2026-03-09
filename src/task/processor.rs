@@ -887,6 +887,16 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         exit_code
     );
 
+    let dumped_core = {
+        let inner = process.borrow_mut();
+        if exit_code >= 0 {
+            false
+        } else {
+            let signum = (-exit_code) as usize;
+            inner.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
+        }
+    };
+
     // 已经从current_task拿走了 所以 对于一般的 线程,可以了.
     //  对于主线程,我们需要处理一些 清理工作
     // 对于系统进程,直接推出
@@ -920,6 +930,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
                 process_inner.exec_inode_num,
             );
             process_inner.is_zombie = true;
+            process_inner.dumped_core = dumped_core;
             process_inner.exit_code = exit_code;
             process_inner.parent.as_ref().and_then(|p| p.upgrade())
         }; // drop child PCB lock before touching parent to avoid lock inversion
@@ -1082,6 +1093,16 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         exit_code
     );
 
+    let dumped_core = {
+        let inner = process.borrow_mut();
+        if exit_code >= 0 {
+            false
+        } else {
+            let signum = (-exit_code) as usize;
+            inner.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
+        }
+    };
+
     let pid = process.getpid();
     if pid == IDLE_PID {
         println!(
@@ -1102,6 +1123,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
             process_inner.exec_inode_num,
         );
         process_inner.is_zombie = true;
+        process_inner.dumped_core = dumped_core;
         process_inner.exit_code = exit_code;
         process_inner.parent.as_ref().and_then(|p| p.upgrade())
     };

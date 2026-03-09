@@ -835,6 +835,8 @@ pub struct ProcessControlBlock {
 // 里面存放线程共用的 资源
 pub struct ProcessControlBlockInner {
     pub is_zombie: bool,
+    /// Whether the terminating signal should be reported as a core-dumping one.
+    pub dumped_core: bool,
     /// Process group ID (PGID).
     pub pgid: usize,
     /// Session ID (SID).
@@ -1326,6 +1328,7 @@ impl ProcessControlBlock {
             pid: pid_handle,
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
+                dumped_core: false,
                 // Keep init/user space in a Linux-like non-zero job-control domain.
                 pgid: if pid == 0 { 1 } else { pid },
                 sid: if pid == 0 { 1 } else { pid },
@@ -1833,6 +1836,7 @@ impl ProcessControlBlock {
             pid,
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
+                dumped_core: false,
                 pgid: parent.pgid,
                 sid: parent.sid,
                 did_exec: false,

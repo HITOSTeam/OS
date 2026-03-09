@@ -1308,9 +1308,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                     } else {
                         None
                     };
-                    // Only report WCOREDUMP when a core file is actually emitted.
-                    // Current kernel path does not materialize core files yet.
-                    temp_coredump = false;
+                    temp_coredump = child_inner.dumped_core;
                     found = Some(index);
                     break;
                 }
@@ -1611,9 +1609,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
                 } else {
                     None
                 };
-                // Keep waitid() consistent with wait4(): no synthetic CLD_DUMPED
-                // without real core-file generation support.
-                let coredump = false;
+                let coredump = child_inner.dumped_core;
                 found_zombie = Some((index, exit_code, signal, coredump, child_inner.uid));
                 break;
             }

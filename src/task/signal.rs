@@ -44,6 +44,23 @@ pub fn signal_bit(signum: usize) -> Option<u64> {
     Some(1u64 << (signum - 1))
 }
 
+pub fn signal_has_core_dump(signum: usize) -> bool {
+    matches!(
+        signum,
+        3  // SIGQUIT
+            | 4  // SIGILL
+            | 5  // SIGTRAP
+            | 6  // SIGABRT / SIGIOT
+            | 7  // SIGBUS
+            | 8  // SIGFPE
+            | 11 // SIGSEGV
+            | 16 // SIGSTKFLT
+            | 24 // SIGXCPU
+            | 25 // SIGXFSZ
+            | 31 // SIGSYS
+    )
+}
+
 fn current_sender_ids() -> (i32, u32, u32, usize) {
     let proc = current_process();
     let pid = proc.getpid() as i32;
