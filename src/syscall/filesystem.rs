@@ -13,12 +13,13 @@ use crate::task::manager::{wakeup_task, PID2PCB};
 use crate::{
     fs::{
         cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount,
-        cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots, make_pipe,
+        cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots, make_pipe,
         open_cgroup_pseudo, open_file, pseudo_block_is_read_only, pseudo_block_note_sync,
         pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
-        shm_create, shm_get, shm_list, shm_remove, CgroupFile, File, NetSocketFile, OSInode,
-        OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
-        PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TtyFile,
+        shm_create, shm_get, shm_list, shm_remove, CgroupFile, CgroupMountKind, File,
+        NetSocketFile, OSInode, OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir,
+        PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
+        SocketPairEnd, TtyFile,
     },
     mm::{
         copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
@@ -807,6 +808,12 @@ fn source_for_device_mount(key: &str) -> Result<String, isize> {
 }
 
 fn target_dir_exists(abs: &str) -> Result<(), isize> {
+    if let Some(node) = open_pseudo(abs) {
+        if node.as_any().downcast_ref::<PseudoDir>().is_some() {
+            return Ok(());
+        }
+        return Err(ENOTDIR);
+    }
     let _ext4_guard = ext4_lock();
     let inode = find_path_in_roots(abs).ok_or(ENOENT)?;
     if !inode.is_dir() {
@@ -865,7 +872,7 @@ pub(crate) fn syscall_mount_impl(
     dir_ptr: usize,
     fstype_ptr: usize,
     flags: usize,
-    _data: usize,
+    data_ptr: usize,
 ) -> isize {
     if current_process().borrow_mut().euid != 0 {
         return EPERM;
@@ -905,9 +912,17 @@ pub(crate) fn syscall_mount_impl(
             Err(e) => return e,
         }
     };
+    let data = if data_ptr == 0 {
+        None
+    } else {
+        match read_user_cstring(token, data_ptr) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
 
     if let Some(fsname) = fstype.as_deref() {
-        if fsname == "cgroup" || fsname == "error" || fsname == "overlay" {
+        if fsname == "error" || fsname == "overlay" {
             return ENODEV;
         }
     }
@@ -994,7 +1009,7 @@ pub(crate) fn syscall_mount_impl(
         return EINVAL;
     }
     if fsname == "cgroup2" {
-        let rc = cgroup_mount(&target);
+        let rc = cgroup_mount(&target, CgroupMountKind::Unified);
         if rc != 0 {
             return rc;
         }
@@ -1003,6 +1018,55 @@ pub(crate) fn syscall_mount_impl(
             &target,
             "cgroup2",
             "cgroup2",
+            flags & mount_flag_mask(),
+        );
+        sync_mount_record_rofs(&target);
+        return 0;
+    }
+    if fsname == "cgroup" {
+        let options = data.as_deref().unwrap_or("");
+        let mut source = String::from("none");
+        let mut kind = CgroupMountKind::LegacyDebug;
+        let mut found_controller = false;
+        for token in options.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+            let parsed = match token {
+                "none" => None,
+                "debug" => Some((token, CgroupMountKind::LegacyDebug)),
+                "cpuset" => Some((token, CgroupMountKind::LegacyCpuset)),
+                "cpu" => Some((token, CgroupMountKind::LegacyCpu)),
+                "cpuacct" => Some((token, CgroupMountKind::LegacyCpuAcct)),
+                "memory" => Some((token, CgroupMountKind::LegacyMemory)),
+                "freezer" => Some((token, CgroupMountKind::LegacyFreezer)),
+                "devices" => Some((token, CgroupMountKind::LegacyDevices)),
+                "blkio" => Some((token, CgroupMountKind::LegacyBlkio)),
+                "net_cls" => Some((token, CgroupMountKind::LegacyNetCls)),
+                "perf_event" => Some((token, CgroupMountKind::LegacyPerfEvent)),
+                "net_prio" => Some((token, CgroupMountKind::LegacyNetPrio)),
+                "hugetlb" => Some((token, CgroupMountKind::LegacyHugetlb)),
+                _ if token.starts_with("name=") => {
+                    source = String::from(token);
+                    None
+                }
+                _ => return ENODEV,
+            };
+            if let Some((controller, mount_kind)) = parsed {
+                source = String::from(controller);
+                kind = mount_kind;
+                found_controller = true;
+            }
+        }
+        if !found_controller && options.is_empty() {
+            source = String::from("none");
+        }
+        let rc = cgroup_mount(&target, kind);
+        if rc != 0 {
+            return rc;
+        }
+        upsert_mount_record(
+            &target,
+            &target,
+            &source,
+            "cgroup",
             flags & mount_flag_mask(),
         );
         sync_mount_record_rofs(&target);
@@ -1103,7 +1167,7 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
             .lock()
             .insert(key, record.source.clone());
     }
-    if record.fs_type == "cgroup2" {
+    if record.fs_type == "cgroup2" || record.fs_type == "cgroup" {
         let _ = cgroup_umount(&abs);
     }
     sync_rofs_mount_flag(&abs, 0);
@@ -1123,7 +1187,11 @@ pub(crate) fn proc_mounts_snapshot() -> String {
     };
     mounts.sort_by(|a, b| a.target.cmp(&b.target));
     for mount in mounts {
-        let opts = mount_flags_to_proc_opts(mount.flags);
+        let mut opts = mount_flags_to_proc_opts(mount.flags);
+        if mount.fs_type == "cgroup" && !mount.source_display.is_empty() {
+            opts.push(',');
+            opts.push_str(&mount.source_display);
+        }
         out.push_str(&alloc::format!(
             "{} {} {} {} 0 0\n",
             mount.source_display,
@@ -1699,7 +1767,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
             return Ok(AtPath::PseudoAbs(abs));
         }
         if let Some(mount) = mount_lookup_for_abs(&abs) {
-            if mount.fs_type == "cgroup2" {
+            if mount.fs_type == "cgroup2" || mount.fs_type == "cgroup" {
                 return Ok(AtPath::PseudoAbs(abs));
             }
         }
@@ -1719,7 +1787,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
             return Ok(AtPath::PseudoAbs(abs));
         }
         if let Some(mount) = mount_lookup_for_abs(&abs) {
-            if mount.fs_type == "cgroup2" {
+            if mount.fs_type == "cgroup2" || mount.fs_type == "cgroup" {
                 return Ok(AtPath::PseudoAbs(abs));
             }
         }
@@ -1761,7 +1829,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
             return Ok(AtPath::PseudoAbs(abs));
         }
         if let Some(mount) = mount_lookup_for_abs(&abs) {
-            if mount.fs_type == "cgroup2" {
+            if mount.fs_type == "cgroup2" || mount.fs_type == "cgroup" {
                 return Ok(AtPath::PseudoAbs(abs));
             }
         }
@@ -4648,6 +4716,11 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
                 dtype: 4
             },
             PseudoDirent {
+                name: alloc::string::String::from("cgroup"),
+                ino: 12,
+                dtype: 4
+            },
+            PseudoDirent {
                 name: alloc::string::String::from("null"),
                 ino: 2,
                 dtype: 8
@@ -4674,6 +4747,21 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
             },
         ];
         return Some(alloc::sync::Arc::new(PseudoDir::new("/dev", entries)));
+    }
+    if path == "/dev/cgroup" || path == "/dev/cgroup/" {
+        let entries = alloc::vec![
+            PseudoDirent {
+                name: alloc::string::String::from("."),
+                ino: 12,
+                dtype: 4
+            },
+            PseudoDirent {
+                name: alloc::string::String::from(".."),
+                ino: 1,
+                dtype: 4
+            },
+        ];
+        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/cgroup", entries)));
     }
     if path == "/dev/pts" || path == "/dev/pts/" {
         let mut entries = alloc::vec![
@@ -5776,6 +5864,12 @@ fn do_renameat(
         Err(e) => return e,
     };
 
+    if let (AtPath::PseudoAbs(old_abs), AtPath::PseudoAbs(new_abs)) = (&old_at, &new_at) {
+        if crate::fs::is_cgroup_pseudo_path(old_abs) && crate::fs::is_cgroup_pseudo_path(new_abs)
+        {
+            return cgroup_rename(old_abs, new_abs, no_replace);
+        }
+    }
     if matches!(old_at, AtPath::PseudoAbs(_)) || matches!(new_at, AtPath::PseudoAbs(_)) {
         return EROFS;
     }

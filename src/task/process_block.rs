@@ -966,6 +966,8 @@ pub struct ProcessControlBlockInner {
     pub ipc_ns_id: usize,
     /// Shared UTS namespace state (hostname/domainname).
     pub uts_ns: Arc<SpinMutex<UtsNamespaceState>>,
+    /// cgroup namespace root path. "/" means the initial namespace.
+    pub cgroup_ns_root: String,
     /// PID namespace id; 0 is the initial namespace.
     pub pid_ns_id: usize,
     /// PID visible from within the process's own PID namespace.
@@ -1419,6 +1421,7 @@ impl ProcessControlBlock {
                 mlockall_future: false,
                 ipc_ns_id: 0,
                 uts_ns: Arc::new(SpinMutex::new(UtsNamespaceState::new())),
+                cgroup_ns_root: String::from("/"),
                 pid_ns_id: 0,
                 pid_ns_vpid: pid,
                 pid_ns_init: false,
@@ -1915,6 +1918,7 @@ impl ProcessControlBlock {
                 mlockall_future: false,
                 ipc_ns_id: parent.ipc_ns_id,
                 uts_ns: Arc::clone(&parent.uts_ns),
+                cgroup_ns_root: parent.cgroup_ns_root.clone(),
                 pid_ns_id: parent.pid_ns_id,
                 pid_ns_vpid: pid_value,
                 pid_ns_init: false,
@@ -2077,6 +2081,14 @@ impl ProcessControlBlock {
     pub fn uts_namespace(self: &Arc<Self>) -> Arc<SpinMutex<UtsNamespaceState>> {
         let inner = self.borrow_mut();
         Arc::clone(&inner.uts_ns)
+    }
+
+    pub fn cgroup_namespace_root(&self) -> String {
+        self.borrow_mut().cgroup_ns_root.clone()
+    }
+
+    pub fn set_cgroup_namespace_root(&self, path: String) {
+        self.borrow_mut().cgroup_ns_root = path;
     }
 
     pub fn unshare_uts_namespace(self: &Arc<Self>) {

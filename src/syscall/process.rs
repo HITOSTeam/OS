@@ -9,7 +9,10 @@ use spin::{Mutex, MutexGuard};
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    fs::{PidFdFile, cgroup_fork_precheck, ext4_lock, root_inode_for_path, secondary_root_inode},
+    fs::{
+        PidFdFile, cgroup_current_path, cgroup_fork_precheck, ext4_lock, root_inode_for_path,
+        secondary_root_inode,
+    },
     mm::{
         MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
         write_user_value,
@@ -593,6 +596,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     const CLONE_SETTLS: usize = 0x0008_0000;
     const CLONE_PARENT_SETTID: usize = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+    const CLONE_NEWCGROUP: usize = 0x0200_0000;
     const CLONE_NEWIPC: usize = 0x0800_0000;
     const CLONE_NEWUTS: usize = 0x0400_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
@@ -623,7 +627,8 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
         return EINVAL;
     }
-    if (flags & CLONE_NEWUTS) != 0 && current_process().borrow_mut().euid != 0 {
+    if (flags & (CLONE_NEWUTS | CLONE_NEWCGROUP)) != 0 && current_process().borrow_mut().euid != 0
+    {
         return EPERM;
     }
     if stack == 0 {
@@ -766,6 +771,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     }
     if (flags & CLONE_NEWUTS) != 0 {
         child.unshare_uts_namespace();
+    }
+    if (flags & CLONE_NEWCGROUP) != 0 {
+        child.set_cgroup_namespace_root(cgroup_current_path(child.getpid()));
     }
     if (flags & CLONE_NEWPID) != 0 {
         let parent_ns_id = process.pid_namespace_id();
