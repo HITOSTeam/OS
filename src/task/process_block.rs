@@ -9,7 +9,7 @@ use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
-use crate::fs::{File, Stdin, Stdout};
+use crate::fs::{File, Stdin, Stdout, cgroup_attach_fork_child};
 use crate::mm::{
     ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
 };
@@ -1970,6 +1970,7 @@ impl ProcessControlBlock {
         let mut child_inner = child.borrow_mut();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
+        cgroup_attach_fork_child(self.getpid(), child.getpid());
         // Seed trap context from the calling thread when available.
         let parent_trap_cx =
             crate::task::processor::current_task().map(|t| *t.borrow_mut().get_trap_cx());

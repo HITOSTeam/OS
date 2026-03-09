@@ -1,4 +1,5 @@
 //! File system in os
+mod cgroupfs;
 mod dummy;
 mod inode;
 mod net_socket;
@@ -25,6 +26,12 @@ pub trait File: Send + Sync {
 }
 
 pub use dummy::{DummyFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
+pub use cgroupfs::{
+    CgroupFile, cgroup_attach_fork_child, cgroup_exit_process, cgroup_fork_precheck,
+    cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_proc_cgroups_content,
+    cgroup_proc_pid_content, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
+    open_cgroup_pseudo,
+};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, register_deferred_unlink_cleanup,
     root_inode_for_path, secondary_root_inode,

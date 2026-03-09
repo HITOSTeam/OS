@@ -1,6 +1,7 @@
 use crate::{
     arch,
     config::MAX_HARTS,
+    fs::cgroup_exit_process,
     mm::{MemorySet, try_write_user_value},
     println,
     syscall::futex::futex_wake_private_and_shared,
@@ -922,6 +923,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             process_inner.parent.as_ref().and_then(|p| p.upgrade())
         }; // drop child PCB lock before touching parent to avoid lock inversion
         kill_pid_namespace_members_on_init_exit(&process);
+        cgroup_exit_process(pid);
         crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
         // ...then wake parent waiters (waitpid) without holding the child PCB lock.
@@ -1102,6 +1104,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         process_inner.exit_code = exit_code;
         process_inner.parent.as_ref().and_then(|p| p.upgrade())
     };
+    cgroup_exit_process(pid);
     crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
     if let Some(parent) = parent {

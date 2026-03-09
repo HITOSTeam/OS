@@ -9,7 +9,7 @@ use spin::{Mutex, MutexGuard};
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    fs::{PidFdFile, ext4_lock, root_inode_for_path, secondary_root_inode},
+    fs::{PidFdFile, cgroup_fork_precheck, ext4_lock, root_inode_for_path, secondary_root_inode},
     mm::{
         MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
         write_user_value,
@@ -746,6 +746,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     } else {
         0
     };
+    if let Err(e) = cgroup_fork_precheck(process.getpid()) {
+        return e;
+    }
     let Some((child, task)) = process.fork_with_task(share_files, share_vm) else {
         return -12;
     };
@@ -892,6 +895,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
 /// parent-blocking/VM-sharing semantics of true vfork.
 pub fn syscall_vfork() -> isize {
     let process = current_process();
+    if let Err(e) = cgroup_fork_precheck(process.getpid()) {
+        return e;
+    }
     match process.fork() {
         Some(child) => {
             crate::log_if!(

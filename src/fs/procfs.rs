@@ -22,6 +22,7 @@ use crate::task::task_block::TaskStatus;
 #[derive(Clone, Debug)]
 pub enum ProcFileKind {
     Mounts,
+    Cgroups,
     Meminfo,
     Cpuinfo,
     Cmdline,
@@ -42,6 +43,7 @@ pub enum ProcFileKind {
     PidSmaps(u32),
     PidCoredumpFilter(u32),
     PidMounts(u32),
+    PidCgroup(u32),
     PidTaskStat(u32, u32),
     PidTaskComm(u32, u32),
 }
@@ -225,6 +227,7 @@ pub fn init_procfs() {
     PROC_ROOT_DEV.store(proc_inode.device_id(), Ordering::Relaxed);
 
     let _ = ensure_proc_file(&proc_inode, "mounts", ProcFileKind::Mounts, 0o444);
+    let _ = ensure_proc_file(&proc_inode, "cgroups", ProcFileKind::Cgroups, 0o444);
     let _ = ensure_proc_file(&proc_inode, "meminfo", ProcFileKind::Meminfo, 0o444);
     let _ = ensure_proc_file(&proc_inode, "cpuinfo", ProcFileKind::Cpuinfo, 0o444);
     let _ = ensure_proc_file(&proc_inode, "cmdline", ProcFileKind::Cmdline, 0o444);
@@ -449,6 +452,7 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
     });
     for name in [
         "mounts",
+        "cgroups",
         "meminfo",
         "cpuinfo",
         "cmdline",
@@ -497,6 +501,7 @@ fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
         "smaps",
         "coredump_filter",
         "mounts",
+        "cgroup",
     ] {
         entries.push(PseudoDirent {
             name: String::from(name),
@@ -920,6 +925,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
 
     match trimmed {
         "/proc/mounts" => return Some(ProcPseudoFile::new(ProcFileKind::Mounts)),
+        "/proc/cgroups" => return Some(ProcPseudoFile::new(ProcFileKind::Cgroups)),
         "/proc/meminfo" => return Some(ProcPseudoFile::new(ProcFileKind::Meminfo)),
         "/proc/cpuinfo" => return Some(ProcPseudoFile::new(ProcFileKind::Cpuinfo)),
         "/proc/cmdline" => return Some(ProcPseudoFile::new(ProcFileKind::Cmdline)),
@@ -1003,6 +1009,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "smaps" => Some(ProcPseudoFile::new(ProcFileKind::PidSmaps(pid))),
         "coredump_filter" => Some(ProcPseudoFile::new(ProcFileKind::PidCoredumpFilter(pid))),
         "mounts" => Some(ProcPseudoFile::new(ProcFileKind::PidMounts(pid))),
+        "cgroup" => Some(ProcPseudoFile::new(ProcFileKind::PidCgroup(pid))),
         _ => None,
     }
 }
@@ -1062,6 +1069,7 @@ pub fn collect_pids() -> Vec<usize> {
 pub fn proc_file_content(kind: &ProcFileKind) -> String {
     match kind {
         ProcFileKind::Mounts | ProcFileKind::PidMounts(_) => proc_mounts(),
+        ProcFileKind::Cgroups => crate::fs::cgroup_proc_cgroups_content(),
         ProcFileKind::Meminfo => proc_meminfo(),
         ProcFileKind::Cpuinfo => proc_cpuinfo(),
         ProcFileKind::Cmdline => proc_cmdline(),
@@ -1081,6 +1089,7 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::PidPagemap(_) => String::new(),
         ProcFileKind::PidSmaps(pid) => proc_pid_smaps(*pid),
         ProcFileKind::PidCoredumpFilter(_) => String::from("00000033\n"),
+        ProcFileKind::PidCgroup(pid) => crate::fs::cgroup_proc_pid_content(*pid as usize),
         ProcFileKind::PidTaskStat(pid, tid) => proc_pid_task_stat(*pid, *tid),
         ProcFileKind::PidTaskComm(pid, tid) => proc_pid_task_comm(*pid, *tid),
     }
@@ -1141,6 +1150,7 @@ fn sync_proc_pid(pid: usize) {
         0o644,
     );
     let _ = ensure_proc_file(&pid_dir, "mounts", ProcFileKind::PidMounts(pid_u32), 0o444);
+    let _ = ensure_proc_file(&pid_dir, "cgroup", ProcFileKind::PidCgroup(pid_u32), 0o444);
     if crate::debug_config::DEBUG_PROCFS {
         crate::println!("[procfs] sync pid={} end", pid);
     }

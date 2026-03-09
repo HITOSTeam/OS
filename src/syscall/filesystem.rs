@@ -12,10 +12,12 @@ use spin::Mutex;
 use crate::task::manager::{wakeup_task, PID2PCB};
 use crate::{
     fs::{
-        ext4_lock, find_path_in_roots, make_pipe, open_file, pseudo_block_is_read_only,
-        pseudo_block_note_sync, pseudo_block_stat_snapshot, register_deferred_unlink_cleanup,
-        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove, File, NetSocketFile,
-        OSInode, OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
+        cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rmdir, cgroup_umount,
+        ext4_lock, find_path_in_roots, make_pipe, open_cgroup_pseudo, open_file,
+        pseudo_block_is_read_only, pseudo_block_note_sync,
+        pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
+        shm_create, shm_get, shm_list, shm_remove, CgroupFile, File, NetSocketFile, OSInode,
+        OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
         PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TtyFile,
     },
     mm::{
@@ -686,6 +688,9 @@ fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Option<String>
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         return Some(String::from(pdir.path()));
     }
+    if let Some(path) = cgroup_logical_path_for_file(file) {
+        return Some(path);
+    }
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         return match pf.kind_tag() {
             crate::fs::PseudoKindTag::Null => Some(String::from("/dev/null")),
@@ -902,7 +907,7 @@ pub(crate) fn syscall_mount_impl(
     };
 
     if let Some(fsname) = fstype.as_deref() {
-        if fsname == "cgroup" || fsname == "cgroup2" || fsname == "error" || fsname == "overlay" {
+        if fsname == "cgroup" || fsname == "error" || fsname == "overlay" {
             return ENODEV;
         }
     }
@@ -987,6 +992,21 @@ pub(crate) fn syscall_mount_impl(
     };
     if source_display.is_empty() || fsname.is_empty() {
         return EINVAL;
+    }
+    if fsname == "cgroup2" {
+        let rc = cgroup_mount(&target);
+        if rc != 0 {
+            return rc;
+        }
+        upsert_mount_record(
+            &target,
+            &target,
+            "cgroup2",
+            "cgroup2",
+            flags & mount_flag_mask(),
+        );
+        sync_mount_record_rofs(&target);
+        return 0;
     }
     if source_display == "/dev/root" && (flags & MS_RDONLY) == 0 && pseudo_block_is_read_only() {
         return EACCES;
@@ -1082,6 +1102,9 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
         TMPFS_REATTACH_SOURCES
             .lock()
             .insert(key, record.source.clone());
+    }
+    if record.fs_type == "cgroup2" {
+        let _ = cgroup_umount(&abs);
     }
     sync_rofs_mount_flag(&abs, 0);
     let _ = remove_mount_record(&abs);
@@ -1625,7 +1648,8 @@ fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
 }
 
 fn is_pseudo_path(abs: &str) -> bool {
-    abs == "/sys"
+    crate::fs::is_cgroup_pseudo_path(abs)
+        || abs == "/sys"
         || abs.starts_with("/sys/")
         || abs == "/dev"
         || abs.starts_with("/dev/")
@@ -1674,6 +1698,11 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         if crate::fs::is_proc_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
         }
+        if let Some(mount) = mount_lookup_for_abs(&abs) {
+            if mount.fs_type == "cgroup2" {
+                return Ok(AtPath::PseudoAbs(abs));
+            }
+        }
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
         } else {
@@ -1688,6 +1717,11 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         let abs = rewrite_proc_self(&normalize_path(&cwd, path));
         if crate::fs::is_proc_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
+        }
+        if let Some(mount) = mount_lookup_for_abs(&abs) {
+            if mount.fs_type == "cgroup2" {
+                return Ok(AtPath::PseudoAbs(abs));
+            }
         }
         if is_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
@@ -1725,6 +1759,11 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         let abs = rewrite_proc_self(&normalize_path(pdir.path(), path));
         if crate::fs::is_proc_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
+        }
+        if let Some(mount) = mount_lookup_for_abs(&abs) {
+            if mount.fs_type == "cgroup2" {
+                return Ok(AtPath::PseudoAbs(abs));
+            }
         }
         return Ok(if is_pseudo_path(&abs) {
             AtPath::PseudoAbs(abs)
@@ -4385,6 +4424,9 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 }
 
 fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
+    if let Some(node) = open_cgroup_pseudo(path) {
+        return Some(node);
+    }
     if let Some(node) = crate::fs::open_proc_pseudo(path) {
         return Some(node);
     }
@@ -6157,6 +6199,24 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if len == 0 {
         return 0;
     }
+    if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return EFAULT;
+        };
+        let mut data = Vec::with_capacity(len);
+        for slice in user_bufs {
+            data.extend_from_slice(slice);
+        }
+        return match cgroup.write_payload(&data) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, os_inode.offset()) {
             return e;
@@ -6609,6 +6669,28 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         return n;
     }
 
+    if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+        if pos != 0 {
+            return EINVAL;
+        }
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return EFAULT;
+        };
+        let mut data = Vec::with_capacity(len);
+        for slice in user_bufs {
+            data.extend_from_slice(slice);
+        }
+        return match cgroup.write_payload(&data) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
+
     ESPIPE
 }
 
@@ -7024,6 +7106,9 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
         if open_pseudo(abs).is_some() || crate::fs::proc_readlink(abs).is_some() {
             return EEXIST;
         }
+        if crate::fs::is_cgroup_pseudo_path(abs) {
+            return cgroup_mkdir(abs);
+        }
         return EROFS;
     }
 
@@ -7121,6 +7206,15 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         // Minimal `/dev/shm` support for POSIX `shm_unlink`.
         if abs == "/dev/shm" || abs == "/dev/shm/" {
             return if remove_dir { EROFS } else { EISDIR };
+        }
+        if crate::fs::is_cgroup_pseudo_path(abs) {
+            return if remove_dir {
+                cgroup_rmdir(abs)
+            } else if open_pseudo(abs).is_some() {
+                EISDIR
+            } else {
+                ENOENT
+            };
         }
         if let Some(name) = shm_object_name(abs) {
             if remove_dir {
@@ -8753,6 +8847,7 @@ fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
     // Pseudo nodes.
     if file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
+        || file.as_any().downcast_ref::<CgroupFile>().is_some()
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
         || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
@@ -8763,6 +8858,8 @@ fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
     {
         let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
             0o040555
+        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.mode()
         } else if file.as_any().downcast_ref::<Pipe>().is_some() {
             0o010600
         } else if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
@@ -8805,6 +8902,8 @@ fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
         };
         let st_size: i64 = if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
             shm.len() as i64
+        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.len() as i64
         } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
             pf.len().unwrap_or(0) as i64
         } else {
@@ -8896,6 +8995,7 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     // Pseudo nodes: return minimal metadata so libc/busybox can `opendir()` them.
     if file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
+        || file.as_any().downcast_ref::<CgroupFile>().is_some()
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
         || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
@@ -8906,6 +9006,8 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     {
         let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
             0o040555
+        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.mode()
         } else if file.as_any().downcast_ref::<Pipe>().is_some() {
             0o010600
         } else if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
@@ -8950,6 +9052,8 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
         };
         let st_size: i64 = if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
             shm.len() as i64
+        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.len() as i64
         } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
             match pf.kind_tag() {
                 crate::fs::PseudoKindTag::Static => pf.len().unwrap_or(0) as i64,
@@ -9203,6 +9307,7 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
     if file.as_any().downcast_ref::<Pipe>().is_some()
         || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
+        || file.as_any().downcast_ref::<CgroupFile>().is_some()
         || file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
@@ -9353,6 +9458,8 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         };
         let mode: u32 = if node.as_any().downcast_ref::<PseudoDir>().is_some() {
             0o040555
+        } else if let Some(cgroup) = node.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.mode()
         } else if abs == "/dev/root" {
             0o060600
         } else if node.as_any().downcast_ref::<PseudoShmFile>().is_some() {
@@ -9387,6 +9494,8 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         };
         let st_size: i64 = if let Some(shm) = node.as_any().downcast_ref::<PseudoShmFile>() {
             shm.len() as i64
+        } else if let Some(cgroup) = node.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.len() as i64
         } else if let Some(pf) = node.as_any().downcast_ref::<PseudoFile>() {
             match pf.kind_tag() {
                 crate::fs::PseudoKindTag::Static => pf.len().unwrap_or(0) as i64,
@@ -9587,6 +9696,8 @@ pub fn syscall_statx(
         };
         let mode: u32 = if node.as_any().downcast_ref::<PseudoDir>().is_some() {
             0o040555
+        } else if let Some(cgroup) = node.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.mode()
         } else if abs == "/dev/root" {
             0o060600
         } else if node.as_any().downcast_ref::<PseudoShmFile>().is_some() {
@@ -9621,6 +9732,8 @@ pub fn syscall_statx(
         };
         let st_size: i64 = if let Some(shm) = node.as_any().downcast_ref::<PseudoShmFile>() {
             shm.len() as i64
+        } else if let Some(cgroup) = node.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.len() as i64
         } else {
             0
         };
@@ -10108,6 +10221,22 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             return EINVAL;
         }
         proc_file.set_offset(new as usize);
+        return new;
+    }
+
+    if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+        let cur = cgroup.offset() as isize;
+        let end = cgroup.len() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        cgroup.set_offset(new as usize);
         return new;
     }
 

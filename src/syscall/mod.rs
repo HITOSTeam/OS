@@ -31,7 +31,23 @@ static LAST_SYSCALL_A3: AtomicUsize = AtomicUsize::new(0);
 static LAST_SYSCALL_A4: AtomicUsize = AtomicUsize::new(0);
 static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
 
-const BUSYBOX_APPLET_ALLOWLIST: [&str; 1] = ["zcat"];
+// The base image ships `/bin/busybox` but not individual applet symlinks.
+// Allow a conservative subset of common LTP shell dependencies to fall back
+// to busybox when the standalone binary path is absent.
+const BUSYBOX_APPLET_ALLOWLIST: [&str; 12] = [
+    "awk",
+    "dmesg",
+    "find",
+    "grep",
+    "mount",
+    "mountpoint",
+    "ps",
+    "seq",
+    "umount",
+    "wc",
+    "which",
+    "zcat",
+];
 
 pub(crate) fn busybox_applet_allowed(name: &str) -> bool {
     BUSYBOX_APPLET_ALLOWLIST
