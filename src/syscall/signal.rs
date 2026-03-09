@@ -13,20 +13,21 @@ use crate::{
     mm::{read_user_value, try_read_user_value, try_write_user_value, write_user_value},
     syscall::misc::{decode_linux_tid_strict, encode_linux_tid},
     task::{
-        ProcessControlBlock,
         block_sleep::add_timer,
-        manager::{PID2PCB, pid2process, wakeup_task},
+        manager::{pid2process, wakeup_task, PID2PCB},
         process_visible_in_pid_namespace,
         processor::{
             block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
+            exit_group_and_run_next,
         },
         signal::{
-            RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGKILL_NUM,
-            SIGSTOP_NUM, SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags,
             can_signal_process, has_unmasked_pending, kill, kill_current, pending_unmasked_bits,
-            set_signal, set_signal_mask, signal_bit, take_first_unmasked,
+            set_signal, set_signal_mask, signal_bit, take_first_unmasked, RtSigAction,
+            SignalAction, SignalFlags, RT_SIG_MAX, SIGALRM_NUM, SIGCONT_NUM, SIGKILL_NUM,
+            SIGSTOP_NUM, SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SIG_DFL, SIG_IGN,
         },
         task_block::{SigSavedContext, TaskControlBlock, TaskStatus},
+        ProcessControlBlock,
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -1451,7 +1452,7 @@ pub fn maybe_deliver_signal() {
                 if let Some((errno, msg)) = flag.check_error() {
                     let _ = kill_current(signum as i32);
                     crate::println!("[kernel] {}", msg);
-                    exit_current_and_run_next(errno);
+                    exit_group_and_run_next(errno);
                 }
             }
         }

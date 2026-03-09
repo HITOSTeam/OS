@@ -213,6 +213,7 @@ struct CgroupNode {
     memory_events_oom: usize,
     local_file_bytes: usize,
     local_cpu_usage_ns: u64,
+    subtree_thread_count: usize,
 }
 
 impl CgroupNode {
@@ -234,6 +235,7 @@ impl CgroupNode {
             memory_events_oom: 0,
             local_file_bytes: 0,
             local_cpu_usage_ns: 0,
+            subtree_thread_count: 0,
         }
     }
 }
@@ -380,10 +382,10 @@ impl CgroupMountState {
     }
 
     fn subtree_pid_count(&self, path: &str) -> usize {
-        self.thread_assignments
-            .values()
-            .filter(|thread_path| Self::is_descendant_or_self(thread_path, path))
-            .count()
+        self.nodes
+            .get(path)
+            .map(|node| node.subtree_thread_count)
+            .unwrap_or(0)
     }
 
     fn ancestor_paths(path: &str) -> Vec<String> {
@@ -423,25 +425,49 @@ impl CgroupMountState {
             .unwrap_or_else(|| self.path_for_pid(thread_id.tgid))
     }
 
+    fn adjust_subtree_thread_count(&mut self, path: &str, add: bool) {
+        for ancestor in Self::ancestor_paths(path) {
+            let Some(node) = self.nodes.get_mut(&ancestor) else {
+                continue;
+            };
+            if add {
+                node.subtree_thread_count = node.subtree_thread_count.saturating_add(1);
+            } else {
+                node.subtree_thread_count = node.subtree_thread_count.saturating_sub(1);
+            }
+        }
+    }
+
+    fn set_thread_assignment(&mut self, thread_id: CgroupThreadId, path: &str) {
+        let new_path = String::from(path);
+        let old_path = self.thread_assignments.insert(thread_id, new_path.clone());
+        if old_path.as_deref() != Some(new_path.as_str()) {
+            if let Some(old_path) = old_path {
+                self.adjust_subtree_thread_count(&old_path, false);
+            }
+            self.adjust_subtree_thread_count(&new_path, true);
+        }
+    }
+
     fn attach_process(&mut self, pid: usize, path: &str) {
         self.process_assignments.insert(pid, String::from(path));
         for thread_id in live_thread_ids_for_process(pid) {
-            self.thread_assignments
-                .insert(thread_id, String::from(path));
+            self.set_thread_assignment(thread_id, path);
             self.thread_cpu_account_ns
                 .insert(thread_id, thread_cpu_time_ns(thread_id));
         }
     }
 
     fn attach_thread(&mut self, thread_id: CgroupThreadId, path: &str) {
-        self.thread_assignments
-            .insert(thread_id, String::from(path));
+        self.set_thread_assignment(thread_id, path);
         self.thread_cpu_account_ns
             .insert(thread_id, thread_cpu_time_ns(thread_id));
     }
 
     fn remove_thread(&mut self, thread_id: CgroupThreadId) {
-        self.thread_assignments.remove(&thread_id);
+        if let Some(old_path) = self.thread_assignments.remove(&thread_id) {
+            self.adjust_subtree_thread_count(&old_path, false);
+        }
         self.thread_cpu_account_ns.remove(&thread_id);
     }
 

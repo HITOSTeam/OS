@@ -150,7 +150,7 @@ fn handle_user_exception(ecode: usize, badv: usize) {
     }
     if let Some((errno, msg)) = check_if_current_signals_error() {
         println!("[kernel] {}", msg);
-        exit_current_and_run_next(errno);
+        exit_group_and_run_next(errno);
     }
     let cx = get_trap_context();
     println!(
@@ -211,7 +211,7 @@ pub fn trap_handler() {
             crate::syscall::signal::maybe_deliver_signal();
             if let Some((errno, msg)) = check_if_current_signals_error() {
                 println!("[kernel] {}", msg);
-                exit_current_and_run_next(errno);
+                exit_group_and_run_next(errno);
             }
             crate::fs::cgroup_maybe_block_current();
             if crate::task::processor::should_preempt_current_on_tick() {
@@ -247,7 +247,7 @@ pub fn trap_handler() {
 
     if let Some((errno, msg)) = check_if_current_signals_error() {
         println!("[kernel] {}", msg);
-        exit_current_and_run_next(errno);
+        exit_group_and_run_next(errno);
     }
     check_timer();
     crate::syscall::signal::maybe_deliver_signal();

@@ -218,10 +218,12 @@ fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
 }
 
 fn fair_timeslice_ticks(nice: i32) -> usize {
-    // A 1-tick fair slice causes excessive context-switch churn under heavy
-    // fork/futex workloads. Use a slightly larger base slice while preserving
-    // longer quanta for higher-priority (negative nice) threads.
-    const FAIR_BASE_SLICE_TICKS: usize = 4;
+    // A very short fair slice causes excessive context-switch churn under
+    // fork-heavy workloads (e.g. LTP msgstress) where many sleepers wake up
+    // briefly and can starve the task that is still constructing the workload.
+    // Keep a coarser minimum granularity while preserving longer quanta for
+    // higher-priority (negative nice) threads.
+    const FAIR_BASE_SLICE_TICKS: usize = 12;
     if nice < 0 {
         (FAIR_BASE_SLICE_TICKS + (-nice as usize)).min(20)
     } else {
@@ -712,7 +714,7 @@ pub fn suspend_current_and_run_next() {
     // Use `try_borrow_mut` to avoid deadlocking if the caller already holds the PCB lock.
     if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
         crate::println!("[kernel] {}", msg);
-        exit_current_and_run_next(errno);
+        exit_group_and_run_next(errno);
     }
     // There must be an application running.
     let task = take_current_task().unwrap();
@@ -741,7 +743,7 @@ pub fn block_current_and_run_next() {
     // yielding within a syscall (interrupts disabled), so handle fatal signals here.
     if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
         crate::println!("[kernel] {}", msg);
-        exit_current_and_run_next(errno);
+        exit_group_and_run_next(errno);
     }
     // There must be an application running.
     let task = take_current_task().unwrap();

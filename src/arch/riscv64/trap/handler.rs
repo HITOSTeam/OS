@@ -300,7 +300,7 @@ pub fn trap_handler() {
             // signals like SIGINT/SIGKILL and could run forever.
             if let Some((errno, msg)) = check_if_current_signals_error() {
                 println!("[kernel] {}", msg);
-                exit_current_and_run_next(errno);
+                exit_group_and_run_next(errno);
             }
             crate::fs::cgroup_maybe_block_current();
             if crate::task::processor::should_preempt_current_on_tick() {
@@ -323,7 +323,7 @@ pub fn trap_handler() {
 
     if let Some((errno, msg)) = check_if_current_signals_error() {
         println!("[kernel] {}", msg);
-        exit_current_and_run_next(errno);
+        exit_group_and_run_next(errno);
     }
     // Progress timers even if S-mode timer interrupts are disabled during syscalls.
     // This avoids long-running syscall-heavy workloads (e.g., hackbench fork storms)
