@@ -367,18 +367,6 @@ impl CgroupMountState {
             .collect()
     }
 
-    fn subtree_member_processes(&self, path: &str) -> Vec<usize> {
-        let mut pids = self
-            .process_assignments
-            .iter()
-            .filter_map(|(pid, pid_path)| {
-                Self::is_descendant_or_self(pid_path, path).then_some(*pid)
-            })
-            .collect::<Vec<_>>();
-        pids.sort_unstable();
-        pids
-    }
-
     fn subtree_member_threads(&self, path: &str) -> Vec<CgroupThreadId> {
         let mut tids = self
             .thread_assignments
@@ -834,6 +822,54 @@ fn split_rel_parent(path: &str) -> Option<(String, String)> {
     };
     let name = String::from(&trimmed[idx + 1..]);
     Some((parent, name))
+}
+
+fn namespace_resolve_rel_path(ns_root: &str, mount_rel: &str) -> Option<String> {
+    if ns_root == "/" {
+        return Some(String::from(mount_rel));
+    }
+    let actual = if mount_rel == "/" {
+        String::from(ns_root)
+    } else {
+        alloc::format!(
+            "{}/{}",
+            ns_root.trim_end_matches('/'),
+            mount_rel.trim_start_matches('/')
+        )
+    };
+    CgroupMountState::is_descendant_or_self(&actual, ns_root).then_some(actual)
+}
+
+fn namespace_visible_path(actual_path: &str, ns_root: &str) -> String {
+    if ns_root == "/" {
+        return String::from(actual_path);
+    }
+    if actual_path == ns_root {
+        return String::from("/");
+    }
+    if let Some(suffix) = actual_path.strip_prefix(ns_root) {
+        if suffix.starts_with('/') {
+            return normalize_rel_path(suffix);
+        }
+    }
+    String::from("/")
+}
+
+fn current_cgroup_namespace_root() -> String {
+    current_process().cgroup_namespace_root()
+}
+
+fn resolve_mount_path_in_namespace(
+    ns_root: &str,
+    abs: &str,
+) -> Result<(String, String, CgroupHierarchyKey), isize> {
+    let Some((mount_target, mount_rel_path, hierarchy_key)) = split_mount_path(abs) else {
+        return Err(EROFS);
+    };
+    let Some(rel_path) = namespace_resolve_rel_path(ns_root, &mount_rel_path) else {
+        return Err(ENOENT);
+    };
+    Ok((mount_target, rel_path, hierarchy_key))
 }
 
 fn split_mount_path(abs: &str) -> Option<(String, String, CgroupHierarchyKey)> {
@@ -1502,14 +1538,9 @@ impl File for CgroupFile {
     }
 }
 
-fn build_dir_entries(
-    abs: &str,
-    target: &str,
-    rel_path: &str,
-    state: &CgroupMountState,
-) -> Vec<PseudoDirent> {
+fn build_dir_entries(rel_path: &str, ns_root: &str, state: &CgroupMountState) -> Vec<PseudoDirent> {
     let ino = state.nodes.get(rel_path).map(|node| node.ino).unwrap_or(1);
-    let parent_ino = if rel_path == "/" {
+    let parent_ino = if rel_path == "/" || rel_path == ns_root {
         ino
     } else {
         split_rel_parent(rel_path)
@@ -1604,7 +1635,6 @@ fn build_dir_entries(
             dtype: 8,
         });
     }
-    let _ = (abs, target);
     entries
 }
 
@@ -1621,21 +1651,22 @@ pub fn is_cgroup_pseudo_path(abs: &str) -> bool {
 }
 
 pub fn open_cgroup_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
-    let (mount_target, rel_path, hierarchy_key) = split_mount_path(path)?;
-    let registry = CGROUP_REGISTRY.lock();
-    let state = registry.hierarchies.get(&hierarchy_key)?;
-    if state.nodes.contains_key(&rel_path) {
-        let entries = build_dir_entries(path, &mount_target, &rel_path, state);
-        return Some(Arc::new(PseudoDir::new(path, entries)));
-    }
-    let (parent, name) = split_rel_parent(&rel_path)?;
-    state.nodes.get(&parent)?;
-    let kind = CgroupFileKind::from_name(&name, state.kind)?;
+    let (_mount_target, mount_rel_path, hierarchy_key) = split_mount_path(path)?;
     let process = current_process();
     let (open_euid, open_cgroup_ns_root) = {
         let inner = process.borrow_mut();
         (inner.euid, inner.cgroup_ns_root.clone())
     };
+    let rel_path = namespace_resolve_rel_path(&open_cgroup_ns_root, &mount_rel_path)?;
+    let registry = CGROUP_REGISTRY.lock();
+    let state = registry.hierarchies.get(&hierarchy_key)?;
+    if state.nodes.contains_key(&rel_path) {
+        let entries = build_dir_entries(&rel_path, &open_cgroup_ns_root, state);
+        return Some(Arc::new(PseudoDir::new(path, entries)));
+    }
+    let (parent, name) = split_rel_parent(&rel_path)?;
+    state.nodes.get(&parent)?;
+    let kind = CgroupFileKind::from_name(&name, state.kind)?;
     Some(CgroupFile::new(
         path,
         hierarchy_key,
@@ -1647,10 +1678,12 @@ pub fn open_cgroup_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
 }
 
 pub fn cgroup_mkdir(abs: &str) -> isize {
-    let Some((_mount_target, rel_path, hierarchy_key)) = split_mount_path(abs) else {
-        return EROFS;
+    let ns_root = current_cgroup_namespace_root();
+    let (.., rel_path, hierarchy_key) = match resolve_mount_path_in_namespace(&ns_root, abs) {
+        Ok(resolved) => resolved,
+        Err(err) => return err,
     };
-    if rel_path == "/" {
+    if rel_path == ns_root {
         return EEXIST;
     }
     let Some((parent, _name)) = split_rel_parent(&rel_path) else {
@@ -1676,10 +1709,12 @@ pub fn cgroup_mkdir(abs: &str) -> isize {
 }
 
 pub fn cgroup_rmdir(abs: &str) -> isize {
-    let Some((_mount_target, rel_path, hierarchy_key)) = split_mount_path(abs) else {
-        return EROFS;
+    let ns_root = current_cgroup_namespace_root();
+    let (.., rel_path, hierarchy_key) = match resolve_mount_path_in_namespace(&ns_root, abs) {
+        Ok(resolved) => resolved,
+        Err(err) => return err,
     };
-    if rel_path == "/" {
+    if rel_path == ns_root {
         return EBUSY;
     }
     let mut registry = CGROUP_REGISTRY.lock();
@@ -1716,16 +1751,21 @@ fn rename_subtree_path(path: &str, old_prefix: &str, new_prefix: &str) -> String
 }
 
 pub fn cgroup_rename(old_abs: &str, new_abs: &str, no_replace: bool) -> isize {
-    let Some((old_mount, old_rel, hierarchy_key)) = split_mount_path(old_abs) else {
-        return EROFS;
-    };
-    let Some((new_mount, new_rel, new_hierarchy_key)) = split_mount_path(new_abs) else {
-        return EROFS;
-    };
+    let ns_root = current_cgroup_namespace_root();
+    let (old_mount, old_rel, hierarchy_key) =
+        match resolve_mount_path_in_namespace(&ns_root, old_abs) {
+            Ok(resolved) => resolved,
+            Err(err) => return err,
+        };
+    let (new_mount, new_rel, new_hierarchy_key) =
+        match resolve_mount_path_in_namespace(&ns_root, new_abs) {
+            Ok(resolved) => resolved,
+            Err(err) => return err,
+        };
     if old_mount != new_mount || hierarchy_key != new_hierarchy_key {
         return EROFS;
     }
-    if old_rel == "/" || new_rel == "/" {
+    if old_rel == ns_root || new_rel == ns_root {
         return EBUSY;
     }
     if old_rel == new_rel {
@@ -1806,11 +1846,14 @@ pids\t0\t1\t1\n",
 }
 
 pub fn cgroup_proc_pid_content(pid: usize) -> String {
+    let ns_root = pid2process(pid)
+        .map(|process| process.cgroup_namespace_root())
+        .unwrap_or_else(|| String::from("/"));
     let registry = CGROUP_REGISTRY.lock();
     let Some(state) = registry.preferred_proc_hierarchy() else {
         return String::from("0::/\n");
     };
-    let path = state.path_for_pid(pid);
+    let path = namespace_visible_path(&state.path_for_pid(pid), &ns_root);
     alloc::format!("0::{path}\n")
 }
 

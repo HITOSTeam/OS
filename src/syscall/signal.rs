@@ -1106,14 +1106,25 @@ pub fn syscall_rt_sigtimedwait(
 
     let sigchld_bit = sig_bit(SIGCHLD).unwrap();
     let task = current_task().unwrap();
+    {
+        let mut inner = task.borrow_mut();
+        inner.sigwait_mask = Some(mask);
+    }
+    let clear_sigwait_mask = |task: &Arc<TaskControlBlock>| {
+        task.borrow_mut().sigwait_mask = None;
+    };
 
     let deadline_ms = if timeout != 0 {
         let Some(ts) = try_read_user_value(token, timeout as *const TimeSpec) else {
+            clear_sigwait_mask(&task);
             return EFAULT;
         };
         let timeout_ms = match timespec_to_ms(ts) {
             Some(ms) => ms,
-            None => return EINVAL,
+            None => {
+                clear_sigwait_mask(&task);
+                return EINVAL;
+            }
         };
         Some(get_time_ms().saturating_add(timeout_ms))
     } else {
@@ -1126,26 +1137,32 @@ pub fn syscall_rt_sigtimedwait(
             take_pending_in_set(&task, mask)
         {
             if write_siginfo(info, sig, sender_pid, sender_uid, si_code, sig_value).is_err() {
+                clear_sigwait_mask(&task);
                 return EFAULT;
             }
+            clear_sigwait_mask(&task);
             return sig as isize;
         }
 
         // SIGCHLD may be observed via waitable zombie state even before queueing.
         if (mask & sigchld_bit) != 0 && has_zombie_child() {
             if write_siginfo(info, SIGCHLD, 0, 0, 0, 0).is_err() {
+                clear_sigwait_mask(&task);
                 return EFAULT;
             }
+            clear_sigwait_mask(&task);
             return SIGCHLD as isize;
         }
 
         // Non-target signals interrupt the wait.
         if has_nonwait_interrupt(&task, mask) {
+            clear_sigwait_mask(&task);
             return EINTR;
         }
 
         if let Some(deadline_ms) = deadline_ms {
             if get_time_ms() >= deadline_ms {
+                clear_sigwait_mask(&task);
                 return EAGAIN;
             }
         }
@@ -1161,6 +1178,7 @@ pub fn syscall_rt_sigtimedwait(
                 let wait_ms = deadline_ms.saturating_sub(now_ms);
                 if wait_ms == 0 {
                     remove_waiter(&task);
+                    clear_sigwait_mask(&task);
                     return EAGAIN;
                 }
                 add_timer(Arc::clone(&task), wait_ms);
@@ -1189,6 +1207,15 @@ pub fn maybe_deliver_signal() {
             // dropping stale frames and continuing normal delivery.
             inner.sig_saved_ctx.clear();
             inner.sigsuspend_old_mask = None;
+        }
+        if inner.sigwait_mask.is_some() {
+            let pending = inner.pending_signals;
+            let sigkill_bit = signal_bit(SIGKILL_NUM).unwrap_or(0);
+            let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
+            let sigcont_bit = signal_bit(SIGCONT_NUM).unwrap_or(0);
+            if (pending & (sigkill_bit | sigstop_bit | sigcont_bit)) == 0 {
+                return;
+            }
         }
         let mask = inner.signal_mask;
         let pending = inner.pending_signals;

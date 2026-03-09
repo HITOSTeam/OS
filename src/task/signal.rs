@@ -389,15 +389,9 @@ pub fn set_signal_mask(mask: u32) -> isize {
 
 // check if the signal num is valid (and action)
 fn check_sigaction_error(signal: SignalFlags, action: usize, old_action: usize) -> bool {
-    if action == 0
-        || old_action == 0
-        || signal == SignalFlags::SIGKILL
-        || signal == SignalFlags::SIGSTOP
-    {
-        true
-    } else {
-        false
-    }
+    let _ = action;
+    let _ = old_action;
+    signal == SignalFlags::SIGKILL || signal == SignalFlags::SIGSTOP
 }
 
 pub fn set_signal(
@@ -412,7 +406,7 @@ pub fn set_signal(
         return -1;
     }
     let signum = signum as usize;
-    if action.is_null() || old_action.is_null() || signum == SIGKILL_NUM || signum == SIGSTOP_NUM {
+    if signum == SIGKILL_NUM || signum == SIGSTOP_NUM {
         -1
     } else {
         let prev_rt = inner
@@ -428,25 +422,29 @@ pub fn set_signal(
                 mask: SignalFlags::from_bits_truncate(prev_rt.mask as u32),
             }
         };
-        write_user_value(token, old_action, &prev_action);
-
-        let new_action = read_user_value(token, action as *const SignalAction);
-        if signum <= MAX_SIG {
-            if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
-                if check_sigaction_error(flag, action as usize, old_action as usize) {
-                    return -1;
-                }
-            }
-            inner.signals_actions.table[signum] = new_action;
+        if !old_action.is_null() {
+            write_user_value(token, old_action, &prev_action);
         }
-        // Keep rt_sigaction table in sync so delivery uses the latest handler.
-        if signum < inner.rt_sig_handlers.len() {
-            inner.rt_sig_handlers[signum] = RtSigAction {
-                handler: new_action.handler,
-                flags: 0,
-                restorer: 0,
-                mask: new_action.mask.bits() as u64,
-            };
+
+        if !action.is_null() {
+            let new_action = read_user_value(token, action as *const SignalAction);
+            if signum <= MAX_SIG {
+                if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
+                    if check_sigaction_error(flag, action as usize, old_action as usize) {
+                        return -1;
+                    }
+                }
+                inner.signals_actions.table[signum] = new_action;
+            }
+            // Keep rt_sigaction table in sync so delivery uses the latest handler.
+            if signum < inner.rt_sig_handlers.len() {
+                inner.rt_sig_handlers[signum] = RtSigAction {
+                    handler: new_action.handler,
+                    flags: 0,
+                    restorer: 0,
+                    mask: new_action.mask.bits() as u64,
+                };
+            }
         }
         0
     }
@@ -467,9 +465,6 @@ pub fn kill(pid: usize, signum: i32) -> isize {
     let Some(process) = process else {
         return -3; // ESRCH
     };
-    if process.borrow_mut().is_zombie {
-        return -3; // ESRCH
-    }
     if current_ns_id != 0
         && current.is_pid_namespace_init()
         && Arc::ptr_eq(&current, &process)
@@ -504,9 +499,6 @@ pub fn kill(pid: usize, signum: i32) -> isize {
         .into_iter()
         .filter_map(pid2process)
         .filter_map(|target: Arc<ProcessControlBlock>| {
-            if target.borrow_mut().is_zombie {
-                return None;
-            }
             if !can_signal_process(&target, signum) {
                 return None;
             }
@@ -514,6 +506,11 @@ pub fn kill(pid: usize, signum: i32) -> isize {
                 return None;
             }
             let mut process_ref = target.borrow_mut();
+            if process_ref.is_zombie {
+                // Linux keeps unreaped zombies visible by PID and killable in
+                // the sense that kill(2) succeeds, but no signal is delivered.
+                return None;
+            }
             if let Some(flag) = legacy_flag {
                 process_ref.signals.insert(flag);
             }

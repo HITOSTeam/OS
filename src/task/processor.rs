@@ -1,22 +1,22 @@
 use crate::{
     arch,
     config::MAX_HARTS,
-    fs::cgroup_exit_process,
-    mm::{MemorySet, try_write_user_value},
+    fs::{cgroup_exit_process, cgroup_exit_thread},
+    mm::{try_write_user_value, MemorySet},
     println,
     syscall::futex::futex_wake_private_and_shared,
     task::{
-        INITPROC,
         id::{KernelStack, TaskUserRes},
         manager::{
-            PID2PCB, TASK_MANAGER, add_task, fetch_task, has_ready_rt_at_or_above,
-            has_ready_rt_higher_than, remove_inactive_task, wakeup_task,
+            add_task, fetch_task, has_ready_rt_at_or_above, has_ready_rt_higher_than,
+            remove_inactive_task, wakeup_task, PID2PCB, TASK_MANAGER,
         },
         process_block::ProcessControlBlock,
-        sched::{RR_TIMESLICE_TICKS, RT_PRIO_MIN, SchedClass, sched_class},
+        sched::{sched_class, SchedClass, RR_TIMESLICE_TICKS, RT_PRIO_MIN},
         switch,
         task_block::{TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
+        INITPROC,
     },
     trap::init_trap,
 };
@@ -864,6 +864,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             );
         }
         if is_linux_thread {
+            cgroup_exit_thread(process.getpid(), tid);
             // For Linux threads, remove from the process task table immediately.
             // Joiners use futexes instead of waittid, so we don't need the slot.
             let mut process_inner = process.borrow_mut();

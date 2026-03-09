@@ -699,6 +699,9 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
 }
 
 pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) -> isize {
+    if (msgsz as isize) < 0 {
+        return EINVAL;
+    }
     let cred = current_cred();
     let token = get_current_token();
     let Some(mtype) = try_read_user_value(token, msgp as *const i64) else {
@@ -766,6 +769,9 @@ pub fn syscall_msgrcv(
     msgtyp: isize,
     msgflg: usize,
 ) -> isize {
+    if (msgsz as isize) < 0 {
+        return EINVAL;
+    }
     let cred = current_cred();
     let token = get_current_token();
     let msg_copy = (msgflg & MSG_COPY) != 0;
@@ -774,7 +780,7 @@ pub fn syscall_msgrcv(
         if (msgflg & IPC_NOWAIT) == 0 || msg_except || msgtyp < 0 {
             return EINVAL;
         }
-    } else if msg_except && msgtyp <= 0 {
+    } else if msg_except && msgtyp == 0 {
         return EINVAL;
     }
 
@@ -1053,6 +1059,9 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             if try_copy_from_user(token, arg as *const u8, bytes).is_err() {
                 return EFAULT;
             }
+            if vals.iter().any(|&val| (val as i32) > SEMVMX) {
+                return ERANGE;
+            }
             for (sem, val) in set.sems.iter_mut().zip(vals.into_iter()) {
                 sem.val = val as i32;
                 sem.last_pid = cred.pid;
@@ -1074,10 +1083,11 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             let Some(sem) = set.sems.get_mut(semnum) else {
                 return EINVAL;
             };
-            if (arg as i32) > SEMVMX {
+            let val = arg as i32;
+            if val < 0 || val > SEMVMX {
                 return ERANGE;
             }
-            sem.val = arg as i32;
+            sem.val = val;
             sem.last_pid = cred.pid;
             wake_sem_waiters(sem);
             set.otime = now_secs();
@@ -1120,12 +1130,13 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
     };
     let cred = current_cred();
     let ipc_ns_id = current_ipc_namespace_id();
+    let mut waited = false;
 
     loop {
         let mut managers = SEM_MANAGERS.lock();
         let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(set) = mgr.sets.get_mut(&semid) else {
-            return EINVAL;
+            return if waited { EIDRM } else { EINVAL };
         };
         let Some(sem) = set.sems.get_mut(op.sem_num as usize) else {
             return EFBIG;
@@ -1161,6 +1172,7 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
             add_waiter_once(&mut sem.zcnt_waiters, &task);
             drop(managers);
             block_current_and_run_next();
+            waited = true;
             if has_pending_unmasked_signal() {
                 return EINTR;
             }
@@ -1186,6 +1198,7 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
         add_waiter_once(&mut sem.ncnt_waiters, &task);
         drop(managers);
         block_current_and_run_next();
+        waited = true;
         if has_pending_unmasked_signal() {
             return EINTR;
         }

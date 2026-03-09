@@ -516,7 +516,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             filesystem::syscall_fchmodat(args[0] as isize, args[1], args[2], args[3])
         }
         SYSCALL_FCHMODAT2 => {
-            filesystem::syscall_fchmodat(args[0] as isize, args[1], args[2], args[3])
+            filesystem::syscall_fchmodat2(args[0] as isize, args[1], args[2], args[3])
         }
         SYSCALL_FCHOWNAT => {
             filesystem::syscall_fchownat(args[0] as isize, args[1], args[2], args[3], args[4])

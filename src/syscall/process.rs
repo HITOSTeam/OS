@@ -10,12 +10,12 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{
-        PidFdFile, cgroup_current_path, cgroup_fork_precheck, ext4_lock, root_inode_for_path,
-        secondary_root_inode,
+        cgroup_attach_thread, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
+        root_inode_for_path, secondary_root_inode, PidFdFile,
     },
     mm::{
-        MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
-        write_user_value,
+        kernel_token, try_read_user_value, try_write_user_value, write_user_value, MapPermission,
+        MemorySet,
     },
     println,
     syscall::{
@@ -26,26 +26,25 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        ProcessControlBlock,
         manager::{
-            PID2PCB, add_task, pid2process, remove_inactive_task, select_hart_for_new_task,
-            wakeup_task,
+            add_task, pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
+            PID2PCB,
         },
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
         signal::{
-            MAX_SIG, RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,
-            SignalFlags, pending_unmasked_bits, queue_process_signal,
+            pending_unmasked_bits, queue_process_signal, SignalFlags, MAX_SIG, RT_SIG_MAX,
+            SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM, SIG_DFL, SIG_IGN,
         },
         task_block::{TaskControlBlock, TaskStatus},
+        ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };
 
 lazy_static! {
-    static ref EXECUTING_INODES: Mutex<BTreeMap<(usize, u32), usize>> =
-        Mutex::new(BTreeMap::new());
+    static ref EXECUTING_INODES: Mutex<BTreeMap<(usize, u32), usize>> = Mutex::new(BTreeMap::new());
 }
 
 pub(crate) type ExecutingInodesGuard = MutexGuard<'static, BTreeMap<(usize, u32), usize>>;
@@ -261,11 +260,7 @@ pub(crate) fn is_inode_currently_executed_locked(
     device_id: usize,
     inode_num: u32,
 ) -> bool {
-    guard
-        .get(&(device_id, inode_num))
-        .copied()
-        .unwrap_or(0)
-        > 0
+    guard.get(&(device_id, inode_num)).copied().unwrap_or(0) > 0
 }
 
 pub(crate) fn register_executing_inode(dev: usize, ino: u32) {
@@ -649,8 +644,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
         return EINVAL;
     }
-    if (flags & (CLONE_NEWUTS | CLONE_NEWCGROUP)) != 0 && current_process().borrow_mut().euid != 0
-    {
+    if (flags & (CLONE_NEWUTS | CLONE_NEWCGROUP)) != 0 && current_process().borrow_mut().euid != 0 {
         return EPERM;
     }
     if stack == 0 {
@@ -674,11 +668,18 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             let inner = task.borrow_mut();
             inner.signal_mask
         };
+        let parent_tid_index = {
+            let inner = task.borrow_mut();
+            inner.res.as_ref().map(|res| res.tid).unwrap_or(0)
+        };
         let parent_cx = {
             let inner = task.borrow_mut();
             *inner.get_trap_cx()
         };
         let process = current_process();
+        if let Err(e) = cgroup_fork_precheck(process.getpid()) {
+            return e;
+        }
         let Some(new_task) =
             TaskControlBlock::try_new_linux_thread(Arc::clone(&process)).map(Arc::new)
         else {
@@ -718,6 +719,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
                 new_inner.clear_child_tid = Some(_ctid);
             }
+            cgroup_attach_thread(process.getpid(), parent_tid_index, tid_index);
             (tid_index, linux_tid)
         };
 

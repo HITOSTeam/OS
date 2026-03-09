@@ -469,6 +469,11 @@ pub struct TaskControlBlockInner {
     pub pending_signal_value: [usize; RT_SIG_MAX + 1],
     /// Signal mask for this thread (bitmask of blocked signals).
     pub signal_mask: u64,
+    /// Active `sigwaitinfo()/sigtimedwait()/sigwait()` interest set.
+    /// While present, normal signal delivery defers matching and interrupting
+    /// signals back to the waiting syscall so it can return Linux-like
+    /// results instead of consuming them via handlers first.
+    pub sigwait_mask: Option<u64>,
     /// Saved mask to restore after a `sigsuspend`-delivered signal.
     pub sigsuspend_old_mask: Option<u64>,
     /// Saved user contexts when running nested signal handlers (stack).
@@ -564,6 +569,7 @@ impl TaskControlBlock {
                 pending_signal_code: [0; RT_SIG_MAX + 1],
                 pending_signal_value: [0; RT_SIG_MAX + 1],
                 signal_mask: 0,
+                sigwait_mask: None,
                 sigsuspend_old_mask: None,
                 sig_saved_ctx: alloc::vec::Vec::new(),
                 sigaltstack_sp: 0,
@@ -640,6 +646,7 @@ impl TaskControlBlock {
                 pending_signal_code: [0; RT_SIG_MAX + 1],
                 pending_signal_value: [0; RT_SIG_MAX + 1],
                 signal_mask: 0,
+                sigwait_mask: None,
                 sigsuspend_old_mask: None,
                 sig_saved_ctx: alloc::vec::Vec::new(),
                 sigaltstack_sp: 0,

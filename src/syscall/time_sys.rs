@@ -29,6 +29,7 @@ static CLOCK_NS_LOGS: AtomicUsize = AtomicUsize::new(0);
 const DEFAULT_REALTIME_EPOCH_NS: i64 = 1_700_000_000_000_000_000;
 static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(DEFAULT_REALTIME_EPOCH_NS);
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+const CPU_CLOCK_FINE_GRANULARITY_NS: u64 = 10_000_000;
 
 const CLOCK_REALTIME: usize = 0;
 const CLOCK_MONOTONIC: usize = 1;
@@ -203,6 +204,10 @@ fn current_thread_cpu_time_ns() -> u64 {
     current_task()
         .map(|task| task_cpu_time_ns(&task))
         .unwrap_or(0)
+}
+
+fn running_cpu_time_fine_adjust_ns() -> u64 {
+    now_ns() % CPU_CLOCK_FINE_GRANULARITY_NS
 }
 
 fn resolve_thread_cpu_time_ns(target_tid_like: usize) -> Option<u64> {
@@ -609,8 +614,10 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
             CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
                 now_ns()
             }
-            CLOCK_PROCESS_CPUTIME_ID => process_cpu_time_ns(&current_process()),
-            CLOCK_THREAD_CPUTIME_ID => current_thread_cpu_time_ns(),
+            CLOCK_PROCESS_CPUTIME_ID => process_cpu_time_ns(&current_process())
+                .saturating_add(running_cpu_time_fine_adjust_ns()),
+            CLOCK_THREAD_CPUTIME_ID => current_thread_cpu_time_ns()
+                .saturating_add(running_cpu_time_fine_adjust_ns()),
             _ => return EINVAL,
         }
     };

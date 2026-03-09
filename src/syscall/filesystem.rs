@@ -5221,8 +5221,11 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
     0
 }
 
-/// Linux `fchmodat(2)` (syscall 53 on riscv64).
-pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
+fn do_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize, strict_flags: bool) -> isize {
+    let valid_flags = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if strict_flags && (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
         Ok(p) => p,
@@ -5268,6 +5271,21 @@ pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize
     }
     inode.set_mode(new_mode);
     0
+}
+
+/// Legacy Linux `fchmodat(2)` syscall entry.
+///
+/// The original syscall does not define a flags argument. User-space `chmod()`
+/// wrappers may still route through this number and leave `a3` unspecified, so
+/// the kernel must not reject non-zero garbage here. Flag validation belongs to
+/// `fchmodat2(2)`.
+pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
+    do_fchmodat(dirfd, pathname, mode, flags, false)
+}
+
+/// Linux `fchmodat2(2)` (syscall 452 on riscv64).
+pub fn syscall_fchmodat2(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
+    do_fchmodat(dirfd, pathname, mode, flags, true)
 }
 
 /// Linux `fchown(2)` (syscall 55 on riscv64).

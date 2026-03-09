@@ -31,7 +31,7 @@ pub use cgroupfs::{
     cgroup_fork_precheck, cgroup_logical_path_for_file, cgroup_maybe_block_current, cgroup_mkdir,
     cgroup_mount, cgroup_proc_cgroups_content, cgroup_proc_pid_content, cgroup_rename,
     cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path, open_cgroup_pseudo, CgroupFile,
-    CgroupMountKind, CgroupMountSpec,
+    CgroupMountSpec,
 };
 pub use dummy::{DummyFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
 pub(crate) use inode::{
