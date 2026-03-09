@@ -1,6 +1,8 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
 use super::{frame_alloc, try_copy_to_user_unchecked, FrameTracker};
+use crate::fs::cgroup_charge_anon_current;
+use crate::task::processor::current_process;
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -1373,6 +1375,23 @@ impl MemorySet {
                     return LazyFaultResult::Invalid;
                 }
             }
+            let total_pages = area
+                .vpn_range
+                .get_end()
+                .0
+                .saturating_sub(area.vpn_range.get_start().0);
+            let accounted_pages = area.charged_pages.max(area.data_frames.len());
+            let new_charge_pages = total_pages.saturating_sub(accounted_pages);
+            if new_charge_pages > 0
+                && area.map_perm.contains(MapPermission::U)
+                && area.map_perm.contains(MapPermission::W)
+            {
+                let charge_bytes = new_charge_pages.saturating_mul(crate::config::PAGE_SIZE);
+                if !cgroup_charge_anon_current(current_process().getpid(), charge_bytes) {
+                    return LazyFaultResult::Oom;
+                }
+                area.charged_pages = accounted_pages.saturating_add(new_charge_pages);
+            }
             let Some(frame) = frame_alloc() else {
                 crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
                 return LazyFaultResult::Oom;
@@ -1931,6 +1950,7 @@ impl MemorySet {
 pub struct MapArea {
     vpn_range: VPNRange,
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    charged_pages: usize,
     map_type: MapType,
     map_perm: MapPermission,
     start_offset: usize,
@@ -1948,6 +1968,7 @@ impl MapArea {
         Self {
             vpn_range: VPNRange::new(start_vpn, end_vpn),
             data_frames: BTreeMap::new(),
+            charged_pages: 0,
             map_type,
             map_perm,
             start_offset: start_va.page_offset(),
@@ -1957,6 +1978,7 @@ impl MapArea {
         Self {
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
             data_frames: BTreeMap::new(),
+            charged_pages: another.charged_pages,
             map_type: another.map_type,
             map_perm: another.map_perm,
             start_offset: another.start_offset,

@@ -12,9 +12,9 @@ use spin::Mutex;
 use crate::task::manager::{wakeup_task, PID2PCB};
 use crate::{
     fs::{
-        cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rmdir, cgroup_umount,
-        ext4_lock, find_path_in_roots, make_pipe, open_cgroup_pseudo, open_file,
-        pseudo_block_is_read_only, pseudo_block_note_sync,
+        cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount,
+        cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots, make_pipe,
+        open_cgroup_pseudo, open_file, pseudo_block_is_read_only, pseudo_block_note_sync,
         pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
         shm_create, shm_get, shm_list, shm_remove, CgroupFile, File, NetSocketFile, OSInode,
         OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
@@ -6319,6 +6319,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if written > 0 {
         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            cgroup_charge_file_write(current_process().getpid(), written as usize);
             mirror_inode_write_to_current_mmaps(
                 os_inode,
                 write_start_off.unwrap_or(0),
@@ -6617,6 +6618,9 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         if hit_fsize_limit {
             let pid = current_process().getpid();
             queue_process_signal(pid, SIGXFSZ_NUM);
+        }
+        if total > 0 {
+            cgroup_charge_file_write(current_process().getpid(), total);
         }
         return total as isize;
     }
