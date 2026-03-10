@@ -22,6 +22,7 @@ pub(crate) mod sysv_ipc;
 pub(crate) mod sysv_shm;
 mod thread;
 mod time_sys;
+pub(crate) use time_sys::timer_clock_now_ns;
 static CYCLIC_SYSCALL_LOGS: AtomicUsize = AtomicUsize::new(1024);
 static LAST_SYSCALL_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static LAST_SYSCALL_A0: AtomicUsize = AtomicUsize::new(0);

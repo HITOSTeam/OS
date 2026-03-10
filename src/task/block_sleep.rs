@@ -92,9 +92,10 @@ struct PosixTimer {
     pid: usize,
     timer_id: usize,
     clock_id: usize,
+    thread_tid: Option<usize>,
     signum: usize,
-    deadline_ms: Option<usize>,
-    interval_ms: usize,
+    deadline_ns: Option<u64>,
+    interval_ns: u64,
     overrun: usize,
 }
 
@@ -104,7 +105,12 @@ lazy_static! {
 
 static NEXT_POSIX_TIMER_ID: AtomicUsize = AtomicUsize::new(1);
 
-pub fn create_posix_timer(pid: usize, clock_id: usize, signum: usize) -> Option<usize> {
+pub fn create_posix_timer(
+    pid: usize,
+    clock_id: usize,
+    signum: usize,
+    thread_tid: Option<usize>,
+) -> Option<usize> {
     if signum == 0 || signum > 64 {
         return None;
     }
@@ -113,9 +119,10 @@ pub fn create_posix_timer(pid: usize, clock_id: usize, signum: usize) -> Option<
         pid,
         timer_id,
         clock_id,
+        thread_tid,
         signum,
-        deadline_ms: None,
-        interval_ms: 0,
+        deadline_ns: None,
+        interval_ns: 0,
         overrun: 0,
     });
     Some(timer_id)
@@ -124,12 +131,11 @@ pub fn create_posix_timer(pid: usize, clock_id: usize, signum: usize) -> Option<
 pub fn set_posix_timer(
     pid: usize,
     timer_id: usize,
-    delay_ms: Option<usize>,
-    interval_ms: usize,
+    deadline_ns: Option<u64>,
+    interval_ns: u64,
     initial_overrun: usize,
-) -> Result<(usize, usize), isize> {
+) -> Result<(u64, u64), isize> {
     const EINVAL: isize = -22;
-    let now = get_time_ms();
     let mut timers = POSIX_TIMERS.lock();
     let Some(timer) = timers
         .iter_mut()
@@ -137,13 +143,16 @@ pub fn set_posix_timer(
     else {
         return Err(EINVAL);
     };
+    let Some(now_ns) = crate::syscall::timer_clock_now_ns(timer.clock_id, timer.pid, timer.thread_tid) else {
+        return Err(EINVAL);
+    };
     let prev_remain = timer
-        .deadline_ms
-        .map(|d| d.saturating_sub(now))
+        .deadline_ns
+        .map(|d| d.saturating_sub(now_ns))
         .unwrap_or(0);
-    let prev_interval = timer.interval_ms;
-    timer.interval_ms = interval_ms;
-    timer.deadline_ms = delay_ms.map(|d| now.saturating_add(d));
+    let prev_interval = timer.interval_ns;
+    timer.interval_ns = interval_ns;
+    timer.deadline_ns = deadline_ns;
     timer.overrun = initial_overrun.min(i32::MAX as usize);
     Ok((prev_remain, prev_interval))
 }
@@ -164,7 +173,7 @@ pub fn delete_posix_timer(pid: usize, timer_id: usize) -> isize {
 pub fn query_posix_timer(
     pid: usize,
     timer_id: usize,
-) -> Result<(usize, Option<usize>, usize), isize> {
+) -> Result<(usize, Option<u64>, u64, Option<usize>), isize> {
     const EINVAL: isize = -22;
     let timers = POSIX_TIMERS.lock();
     let Some(timer) = timers
@@ -173,7 +182,12 @@ pub fn query_posix_timer(
     else {
         return Err(EINVAL);
     };
-    Ok((timer.clock_id, timer.deadline_ms, timer.interval_ms))
+    Ok((
+        timer.clock_id,
+        timer.deadline_ns,
+        timer.interval_ns,
+        timer.thread_tid,
+    ))
 }
 
 pub fn take_posix_timer_overrun(pid: usize, timer_id: usize) -> Result<isize, isize> {
@@ -389,29 +403,47 @@ fn process_alarm_timers(current_ms: usize) {
     }
 }
 
-fn process_posix_timers(current_ms: usize) {
+fn process_posix_timers() {
     loop {
         let fired = {
             let mut timers = POSIX_TIMERS.lock();
-            if let Some(timer) = timers
-                .iter_mut()
-                .find(|t| t.deadline_ms.map(|d| d <= current_ms).unwrap_or(false))
-            {
+            let idx = timers.iter().position(|t| {
+                let Some(deadline_ns) = t.deadline_ns else {
+                    return false;
+                };
+                let Some(now_ns) =
+                    crate::syscall::timer_clock_now_ns(t.clock_id, t.pid, t.thread_tid)
+                else {
+                    return false;
+                };
+                deadline_ns <= now_ns
+            });
+            if let Some(idx) = idx {
+                let timer = &mut timers[idx];
                 let pid = timer.pid;
                 let signum = timer.signum;
-                if timer.interval_ms == 0 {
-                    timer.deadline_ms = None;
+                let now_ns = crate::syscall::timer_clock_now_ns(
+                    timer.clock_id,
+                    timer.pid,
+                    timer.thread_tid,
+                )
+                .unwrap_or(0);
+                if timer.interval_ns == 0 {
+                    timer.deadline_ns = None;
                 } else {
-                    let interval = timer.interval_ms.max(1);
-                    let base = timer.deadline_ms.unwrap_or(current_ms);
-                    let elapsed = current_ms.saturating_sub(base);
-                    let expirations = elapsed / interval + 1;
+                    let base = timer.deadline_ns.unwrap_or(now_ns);
+                    let elapsed = now_ns.saturating_sub(base);
+                    let expirations = elapsed / timer.interval_ns + 1;
                     let extra = expirations.saturating_sub(1);
                     if extra > 0 {
-                        timer.overrun = timer.overrun.saturating_add(extra).min(i32::MAX as usize);
+                        timer.overrun = timer
+                            .overrun
+                            .saturating_add(extra as usize)
+                            .min(i32::MAX as usize);
                     }
-                    timer.deadline_ms =
-                        Some(base.saturating_add(expirations.saturating_mul(interval)));
+                    timer.deadline_ns = Some(
+                        base.saturating_add(expirations.saturating_mul(timer.interval_ns)),
+                    );
                 }
                 Some((pid, signum))
             } else {
@@ -506,12 +538,12 @@ pub fn check_timer() {
 
     process_delayed_tid_clears(current_ms);
     process_alarm_timers(current_ms);
-    process_posix_timers(current_ms);
+    process_posix_timers();
 }
 
 pub fn has_pending_timers() -> bool {
     !TIMERS.lock().is_empty()
         || !ALARM_TIMERS.lock().is_empty()
-        || POSIX_TIMERS.lock().iter().any(|t| t.deadline_ms.is_some())
+        || POSIX_TIMERS.lock().iter().any(|t| t.deadline_ns.is_some())
         || !DELAYED_TID_CLEARS.lock().is_empty()
 }

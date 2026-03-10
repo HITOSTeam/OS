@@ -129,6 +129,33 @@ fn realtime_now_ns() -> u64 {
     }
 }
 
+fn posix_timer_process_cpu_time_ns(pid: usize) -> Option<u64> {
+    let process = pid2process(pid)?;
+    Some(process_cpu_time_ns(&process))
+}
+
+fn posix_timer_thread_cpu_time_ns(pid: usize, tid: usize) -> Option<u64> {
+    let process = pid2process(pid)?;
+    let task = {
+        let inner = process.borrow_mut();
+        inner.tasks.get(tid)?.as_ref().cloned()
+    }?;
+    Some(task_cpu_time_ns(&task))
+}
+
+pub(crate) fn timer_clock_now_ns(clock_id: usize, pid: usize, thread_tid: Option<usize>) -> Option<u64> {
+    match clock_id {
+        CLOCK_REALTIME => Some(realtime_now_ns()),
+        CLOCK_MONOTONIC => Some(now_ns()),
+        CLOCK_PROCESS_CPUTIME_ID => posix_timer_process_cpu_time_ns(pid),
+        CLOCK_THREAD_CPUTIME_ID => {
+            let tid = thread_tid?;
+            posix_timer_thread_cpu_time_ns(pid, tid)
+        }
+        _ => None,
+    }
+}
+
 pub fn realtime_now_seconds() -> u64 {
     realtime_now_ns() / NSEC_PER_SEC
 }
@@ -154,10 +181,6 @@ fn ns_to_timespec(ns: u64) -> TimeSpec {
         sec: (ns / NSEC_PER_SEC) as i64,
         nsec: (ns % NSEC_PER_SEC) as i64,
     }
-}
-
-fn ns_to_ms_ceil(ns: u64) -> usize {
-    ((ns.saturating_add(999_999)) / 1_000_000) as usize
 }
 
 #[derive(Clone, Copy)]
@@ -712,7 +735,16 @@ pub fn syscall_timer_create(clock_id: usize, sevp_ptr: usize, timerid_ptr: usize
         sev.sigev_signo as usize
     };
     let pid = current_process().getpid();
-    let Some(timer_id) = create_posix_timer(pid, clock_id, signum) else {
+    let thread_tid = if clock_id == CLOCK_THREAD_CPUTIME_ID {
+        let Some(task) = current_task() else {
+            return EINVAL;
+        };
+        let inner = task.borrow_mut();
+        inner.res.as_ref().map(|res| res.tid)
+    } else {
+        None
+    };
+    let Some(timer_id) = create_posix_timer(pid, clock_id, signum, thread_tid) else {
         return EINVAL;
     };
     let timer_id_i32 = timer_id as i32;
@@ -730,15 +762,17 @@ pub fn syscall_timer_gettime(timer_id: isize, curr_ptr: usize) -> isize {
         return EFAULT;
     }
     let pid = current_process().getpid();
-    let Ok((_clock_id, deadline_ms, interval_ms)) = query_posix_timer(pid, timer_id as usize)
+    let Ok((clock_id, deadline_ns, interval_ns, thread_tid)) = query_posix_timer(pid, timer_id as usize)
     else {
         return EINVAL;
     };
-    let now_ms = crate::time::get_time_ms();
-    let value_ms = deadline_ms.map(|d| d.saturating_sub(now_ms)).unwrap_or(0);
+    let Some(now_ns) = timer_clock_now_ns(clock_id, pid, thread_tid) else {
+        return EINVAL;
+    };
+    let value_ns = deadline_ns.map(|d| d.saturating_sub(now_ns)).unwrap_or(0);
     let spec = ITimerSpec {
-        it_interval: ns_to_timespec((interval_ms as u64).saturating_mul(1_000_000)),
-        it_value: ns_to_timespec((value_ms as u64).saturating_mul(1_000_000)),
+        it_interval: ns_to_timespec(interval_ns),
+        it_value: ns_to_timespec(value_ns),
     };
     let token = get_current_token();
     if try_write_user_value(token, curr_ptr as *mut ITimerSpec, &spec).is_err() {
@@ -767,7 +801,7 @@ pub fn syscall_timer_settime(
         return EFAULT;
     };
     let pid = current_process().getpid();
-    let Ok((clock_id, _, _)) = query_posix_timer(pid, timer_id as usize) else {
+    let Ok((clock_id, _, _, thread_tid)) = query_posix_timer(pid, timer_id as usize) else {
         return EINVAL;
     };
     let Some(value_ns) = timespec_to_ns(new_spec.it_value) else {
@@ -776,46 +810,35 @@ pub fn syscall_timer_settime(
     let Some(interval_ns) = timespec_to_ns(new_spec.it_interval) else {
         return EINVAL;
     };
+    let Some(now_base) = timer_clock_now_ns(clock_id, pid, thread_tid) else {
+        return EINVAL;
+    };
     let mut initial_overrun = 0usize;
-    let delay_ms = if value_ns == 0 {
+    let deadline_ns = if value_ns == 0 {
         None
     } else if (flags & TIMER_ABSTIME) != 0 {
-        let now_base = match clock_id {
-            CLOCK_REALTIME => realtime_now_ns(),
-            CLOCK_MONOTONIC | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => now_ns(),
-            _ => return EINVAL,
-        };
-        if value_ns <= now_base {
-            if interval_ns > 0 {
-                let overdue_ns = now_base.saturating_sub(value_ns);
-                let expirations = overdue_ns / interval_ns + 1;
-                initial_overrun = expirations.saturating_sub(1).min(i32::MAX as u64) as usize;
-            }
-            Some(0)
-        } else {
-            Some(ns_to_ms_ceil(value_ns - now_base).max(1))
+        if value_ns <= now_base && interval_ns > 0 {
+            let overdue_ns = now_base.saturating_sub(value_ns);
+            let expirations = overdue_ns / interval_ns + 1;
+            initial_overrun = expirations.saturating_sub(1).min(i32::MAX as u64) as usize;
         }
+        Some(value_ns)
     } else {
-        Some(ns_to_ms_ceil(value_ns).max(1))
+        Some(now_base.saturating_add(value_ns))
     };
-    let interval_ms = if interval_ns == 0 {
-        0
-    } else {
-        ns_to_ms_ceil(interval_ns).max(1)
-    };
-    let Ok((prev_remain_ms, prev_interval_ms)) = set_posix_timer(
+    let Ok((prev_remain_ns, prev_interval_ns)) = set_posix_timer(
         pid,
         timer_id as usize,
-        delay_ms,
-        interval_ms,
+        deadline_ns,
+        interval_ns,
         initial_overrun,
     ) else {
         return EINVAL;
     };
     if old_ptr != 0 {
         let old_spec = ITimerSpec {
-            it_interval: ns_to_timespec((prev_interval_ms as u64).saturating_mul(1_000_000)),
-            it_value: ns_to_timespec((prev_remain_ms as u64).saturating_mul(1_000_000)),
+            it_interval: ns_to_timespec(prev_interval_ns),
+            it_value: ns_to_timespec(prev_remain_ns),
         };
         if try_write_user_value(token, old_ptr as *mut ITimerSpec, &old_spec).is_err() {
             return EFAULT;
