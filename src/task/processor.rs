@@ -2,21 +2,21 @@ use crate::{
     arch,
     config::MAX_HARTS,
     fs::{cgroup_exit_process, cgroup_exit_thread},
-    mm::{try_write_user_value, MemorySet},
+    mm::{MemorySet, try_write_user_value},
     println,
     syscall::futex::futex_wake_private_and_shared,
     task::{
+        INITPROC,
         id::{KernelStack, TaskUserRes},
         manager::{
-            add_task, fetch_task, has_ready_rt_at_or_above, has_ready_rt_higher_than,
-            remove_inactive_task, wakeup_task, PID2PCB, TASK_MANAGER,
+            PID2PCB, TASK_MANAGER, add_task, fetch_task, has_ready_rt_at_or_above,
+            has_ready_rt_higher_than, remove_inactive_task, wakeup_task,
         },
         process_block::ProcessControlBlock,
-        sched::{sched_class, SchedClass, RR_TIMESLICE_TICKS, RT_PRIO_MIN},
+        sched::{RR_TIMESLICE_TICKS, RT_PRIO_MIN, SchedClass, sched_class},
         switch,
         task_block::{TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
-        INITPROC,
     },
     trap::init_trap,
 };
@@ -215,6 +215,112 @@ fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
     }
     let _ = try_write_user_value(token, ctid as *mut i32, &0);
     let _ = futex_wake_private_and_shared(pid, token, ctid, 1);
+}
+
+struct ThreadExitCleanup {
+    tid: usize,
+    is_linux_thread: bool,
+    res_to_drop: Option<TaskUserRes>,
+    join_waiters: Vec<Arc<TaskControlBlock>>,
+    clear_child_tid_addr: Option<usize>,
+    robust_list_head: usize,
+}
+
+fn take_thread_exit_cleanup(task: &Arc<TaskControlBlock>, exit_code: i32) -> ThreadExitCleanup {
+    let mut task_inner = task.borrow_mut();
+    task_inner.exit_code = Some(exit_code);
+    ThreadExitCleanup {
+        tid: task_inner
+            .res
+            .as_ref()
+            .map(|res| res.tid)
+            .unwrap_or(usize::MAX),
+        is_linux_thread: task_inner
+            .res
+            .as_ref()
+            .map(|res| res.is_linux_thread())
+            .unwrap_or(false),
+        res_to_drop: task_inner.res.take(),
+        join_waiters: task_inner.join_waiters.drain(..).collect::<Vec<_>>(),
+        clear_child_tid_addr: task_inner.clear_child_tid.take(),
+        robust_list_head: task_inner.robust_list_head,
+    }
+}
+
+fn finish_thread_exit_cleanup(
+    process: &Arc<ProcessControlBlock>,
+    cleanup: ThreadExitCleanup,
+) -> (usize, bool, Option<usize>) {
+    let pid = process.getpid();
+    let token = {
+        let inner = process.borrow_mut();
+        inner.memory_set.token()
+    };
+
+    if cleanup.robust_list_head != 0 {
+        let linux_tid = crate::syscall::misc::encode_linux_tid(pid, cleanup.tid) as u32;
+        crate::syscall::robust_list::exit_robust_list(
+            pid,
+            token,
+            cleanup.robust_list_head,
+            linux_tid,
+        );
+    }
+
+    if let Some(ctid) = cleanup.clear_child_tid_addr {
+        clear_child_tid_now(pid, token, ctid);
+    }
+    drop(cleanup.res_to_drop);
+    for waiter in cleanup.join_waiters {
+        wakeup_task(waiter);
+    }
+
+    (
+        cleanup.tid,
+        cleanup.is_linux_thread || cleanup.clear_child_tid_addr.is_some(),
+        cleanup.clear_child_tid_addr,
+    )
+}
+
+fn process_dumped_core(process: &Arc<ProcessControlBlock>, exit_code: i32) -> bool {
+    if exit_code >= 0 {
+        return false;
+    }
+    let signum = (-exit_code) as usize;
+    let inner = process.borrow_mut();
+    inner.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
+}
+
+fn cleanup_process_threads_for_group_exit(
+    process: &Arc<ProcessControlBlock>,
+    current_task: &Arc<TaskControlBlock>,
+    exit_code: i32,
+) -> Vec<TaskUserRes> {
+    let members = {
+        let process_inner = process.borrow_mut();
+        process_inner
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref().cloned())
+            .collect::<Vec<_>>()
+    };
+
+    let mut recycle_res = Vec::<TaskUserRes>::new();
+    for member in &members {
+        remove_inactive_task(Arc::clone(member));
+        if Arc::ptr_eq(member, current_task) {
+            continue;
+        }
+        let cleanup = take_thread_exit_cleanup(member, exit_code);
+        let _ = finish_thread_exit_cleanup(process, cleanup);
+    }
+    for member in members {
+        let mut member_inner = member.borrow_mut();
+        if let Some(res) = member_inner.res.take() {
+            recycle_res.push(res);
+        }
+    }
+    recycle_res
 }
 
 fn fair_timeslice_ticks(nice: i32) -> usize {
@@ -802,58 +908,10 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         return;
     };
 
-    // Extract tid in a separate scope to release the borrow early.
-    // Also drop TaskUserRes *after* releasing the TCB lock to avoid deadlocks with sys_waittid.
-    let (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head, is_linux_thread) = {
-        let mut task_inner = task.borrow_mut();
-        task_inner.exit_code = Some(exit_code);
-        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-        let is_linux_thread = task_inner
-            .res
-            .as_ref()
-            .map(|r| r.is_linux_thread())
-            .unwrap_or(false);
-        let res_to_drop = task_inner.res.take();
-        let clear_child_tid = task_inner.clear_child_tid.take();
-        let robust_list_head = task_inner.robust_list_head;
-        let join_waiters = task_inner.join_waiters.drain(..).collect::<Vec<_>>();
-        (
-            tid,
-            res_to_drop,
-            join_waiters,
-            clear_child_tid,
-            robust_list_head,
-            is_linux_thread,
-        )
-    }; // task_inner dropped here
-
-    let clear_child_tid_addr = clear_child_tid;
-    let is_linux_thread = is_linux_thread || clear_child_tid_addr.is_some();
-
-    let token = {
-        let inner = process.borrow_mut();
-        inner.memory_set.token()
-    };
-
-    if robust_list_head != 0 {
-        let linux_tid = crate::syscall::misc::encode_linux_tid(process.getpid(), tid) as u32;
-        crate::syscall::robust_list::exit_robust_list(
-            process.getpid(),
-            token,
-            robust_list_head,
-            linux_tid,
-        );
-    }
-
-    // Linux pthreads expect CLONE_CHILD_CLEARTID/set_tid_address semantics:
-    // clear *ctid to 0 and wake any futex waiters.
-    if let Some(ctid) = clear_child_tid_addr {
-        clear_child_tid_now(process.getpid(), token, ctid);
-    }
-    drop(res_to_drop);
-    for waiter in join_waiters {
-        wakeup_task(waiter);
-    }
+    // Extract exit bookkeeping first, then perform Linux-thread cleanup without
+    // holding the TCB lock so the same logic can be reused by exit_group().
+    let (tid, is_linux_thread, clear_child_tid_addr) =
+        finish_thread_exit_cleanup(&process, take_thread_exit_cleanup(&task, exit_code));
 
     if tid != 0 && tid != usize::MAX {
         if DEBUG_PTHREAD {
@@ -889,15 +947,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         exit_code
     );
 
-    let dumped_core = {
-        let inner = process.borrow_mut();
-        if exit_code >= 0 {
-            false
-        } else {
-            let signum = (-exit_code) as usize;
-            inner.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
-        }
-    };
+    let dumped_core = process_dumped_core(&process, exit_code);
 
     // 已经从current_task拿走了 所以 对于一般的 线程,可以了.
     //  对于主线程,我们需要处理一些 清理工作
@@ -955,11 +1005,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             }
         }
 
-        let mut process_inner = process.borrow_mut();
-
-        // 非 系统进程,执行之前的 将 子进程 交给 initproc 进程  过程
         {
-            // move all child processes under init process
+            let process_inner = process.borrow_mut();
             let mut initproc_inner = INITPROC.borrow_mut();
             for child in process_inner.children.iter() {
                 child.borrow_mut().parent = Some(Arc::downgrade(&INITPROC));
@@ -967,30 +1014,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             }
         }
 
-        // deallocate user res (including tid/trap_cx/ustack) of all threads
-        // it has to be done before we dealloc the whole memory_set
-        // otherwise they will be deallocated twice
-        // 接下来,处理 线程资源回收
-        // 首先先将 所有子线程的资源 载入
-        let mut recycle_res = Vec::<TaskUserRes>::new();
-        for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
-            let task = task.as_ref().unwrap();
-            // if other tasks are Ready in TaskManager or waiting for a timer to be
-            // expired, we should remove them.
-            //
-            // Mention that we do not need to consider Mutex/Semaphore since they
-            // are limited in a single process. Therefore, the blocked tasks are
-            // removed when the PCB is deallocated.
-            remove_inactive_task(Arc::clone(&task));
-            let mut task_inner = task.borrow_mut();
-            if let Some(res) = task_inner.res.take() {
-                recycle_res.push(res);
-            }
-        }
-        // dealloc_tid and dealloc_user_res require access to PCB inner, so we
-        // need to collect those user res first, then release process_inner
-        // for now to avoid deadlock/double borrow problem.
-        drop(process_inner);
+        // Deallocate user-thread resources only after each member has run the
+        // same exit-side futex/join cleanup as the current thread.
+        let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
         recycle_res.clear();
         process.handoff_files_owner_on_exit();
 
@@ -1046,47 +1072,8 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         return;
     };
 
-    let (tid, res_to_drop, join_waiters, clear_child_tid, robust_list_head) = {
-        let mut task_inner = task.borrow_mut();
-        task_inner.exit_code = Some(exit_code);
-        let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-        let res_to_drop = task_inner.res.take();
-        let clear_child_tid = task_inner.clear_child_tid.take();
-        let robust_list_head = task_inner.robust_list_head;
-        let join_waiters = task_inner.join_waiters.drain(..).collect::<Vec<_>>();
-        (
-            tid,
-            res_to_drop,
-            join_waiters,
-            clear_child_tid,
-            robust_list_head,
-        )
-    };
-
-    let clear_child_tid_addr = clear_child_tid;
-
-    let token = {
-        let inner = process.borrow_mut();
-        inner.memory_set.token()
-    };
-
-    if robust_list_head != 0 {
-        let linux_tid = crate::syscall::misc::encode_linux_tid(process.getpid(), tid) as u32;
-        crate::syscall::robust_list::exit_robust_list(
-            process.getpid(),
-            token,
-            robust_list_head,
-            linux_tid,
-        );
-    }
-
-    if let Some(ctid) = clear_child_tid_addr {
-        clear_child_tid_now(process.getpid(), token, ctid);
-    }
-    drop(res_to_drop);
-    for waiter in join_waiters {
-        wakeup_task(waiter);
-    }
+    let (tid, _is_linux_thread, _clear_child_tid_addr) =
+        finish_thread_exit_cleanup(&process, take_thread_exit_cleanup(&task, exit_code));
 
     log::debug!(
         "[exit_group] pid={} tid={} exit_code={}",
@@ -1095,15 +1082,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         exit_code
     );
 
-    let dumped_core = {
-        let inner = process.borrow_mut();
-        if exit_code >= 0 {
-            false
-        } else {
-            let signum = (-exit_code) as usize;
-            inner.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
-        }
-    };
+    let dumped_core = process_dumped_core(&process, exit_code);
 
     let pid = process.getpid();
     if pid == IDLE_PID {
@@ -1146,8 +1125,8 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         }
     }
 
-    let mut process_inner = process.borrow_mut();
     {
+        let process_inner = process.borrow_mut();
         let mut initproc_inner = INITPROC.borrow_mut();
         for child in process_inner.children.iter() {
             child.borrow_mut().parent = Some(Arc::downgrade(&INITPROC));
@@ -1155,16 +1134,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         }
     }
 
-    let mut recycle_res = Vec::<TaskUserRes>::new();
-    for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
-        let task = task.as_ref().unwrap();
-        remove_inactive_task(Arc::clone(&task));
-        let mut task_inner = task.borrow_mut();
-        if let Some(res) = task_inner.res.take() {
-            recycle_res.push(res);
-        }
-    }
-    drop(process_inner);
+    let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();
     process.handoff_files_owner_on_exit();
 

@@ -15,9 +15,9 @@ use crate::mm::UserBuffer;
 use crate::syscall::misc::{decode_linux_tid_strict, encode_linux_tid};
 use crate::task::{
     manager::wakeup_task,
-    manager::{pid2process, PID2PCB},
+    manager::{PID2PCB, pid2process},
     processor::{block_current_and_run_next, current_process, current_task},
-    signal::{queue_process_signal, SIGKILL_NUM},
+    signal::{SIGKILL_NUM, queue_process_signal},
     task_block::TaskStatus,
 };
 
@@ -1776,6 +1776,23 @@ fn rename_subtree_path(path: &str, old_prefix: &str, new_prefix: &str) -> String
     alloc::format!("{new_prefix}{suffix}")
 }
 
+fn rename_cgroup_namespace_roots(old_prefix: &str, new_prefix: &str) {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes {
+        let current_root = process.cgroup_namespace_root();
+        if CgroupMountState::is_descendant_or_self(&current_root, old_prefix) {
+            process.set_cgroup_namespace_root(rename_subtree_path(
+                &current_root,
+                old_prefix,
+                new_prefix,
+            ));
+        }
+    }
+}
+
 pub fn cgroup_rename(old_abs: &str, new_abs: &str, no_replace: bool) -> isize {
     let ns_root = current_cgroup_namespace_root();
     let (old_mount, old_rel, hierarchy_key) =
@@ -1849,6 +1866,8 @@ pub fn cgroup_rename(old_abs: &str, new_abs: &str, no_replace: bool) -> isize {
             *path = rename_subtree_path(path, &old_rel, &new_rel);
         }
     }
+    drop(registry);
+    rename_cgroup_namespace_roots(&old_rel, &new_rel);
     0
 }
 

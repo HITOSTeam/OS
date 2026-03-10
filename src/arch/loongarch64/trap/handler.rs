@@ -162,7 +162,7 @@ fn handle_user_exception(ecode: usize, badv: usize) {
         cx.x[super::super::REG_SP],
         cx.x[super::super::REG_TP]
     );
-    exit_current_and_run_next(-11);
+    exit_group_and_run_next(-11);
 }
 
 #[unsafe(no_mangle)]
