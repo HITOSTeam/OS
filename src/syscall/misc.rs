@@ -1538,16 +1538,28 @@ struct RUsage64 {
     ru_nivcsw: i64,
 }
 
-fn ms_to_rusage_timeval(ms: usize) -> RUsageTimeVal {
+fn ns_to_rusage_timeval(ns: u64) -> RUsageTimeVal {
     RUsageTimeVal {
-        tv_sec: (ms / 1000) as i64,
-        tv_usec: ((ms % 1000) * 1000) as i64,
+        tv_sec: (ns / 1_000_000_000) as i64,
+        tv_usec: ((ns % 1_000_000_000) / 1_000) as i64,
     }
+}
+
+fn process_cpu_time_ns(process: &Arc<crate::task::ProcessControlBlock>) -> u64 {
+    let inner = process.borrow_mut();
+    inner
+        .tasks
+        .iter()
+        .filter_map(|task| task.as_ref())
+        .map(|task| task.borrow_mut().cpu_time_ns)
+        .fold(0u64, |acc, ns| acc.saturating_add(ns))
 }
 
 /// Linux `getrusage(2)` (syscall 165 on riscv64).
 ///
-/// Provide basic accounting for current process/thread elapsed wall time.
+/// Report best-effort CPU time based on the scheduler's per-thread runtime
+/// accounting. We do not yet split user/system time, so all CPU time is
+/// exposed via `ru_utime` and `ru_stime` stays zero.
 pub fn syscall_getrusage(who: isize, usage: usize) -> isize {
     const RUSAGE_SELF: isize = 0;
     const RUSAGE_CHILDREN: isize = -1;
@@ -1557,19 +1569,15 @@ pub fn syscall_getrusage(who: isize, usage: usize) -> isize {
         return EFAULT;
     }
 
-    let now_ms = get_time_ms();
-    let (utime, stime) = match who {
-        RUSAGE_SELF | RUSAGE_THREAD => {
-            let process = current_process();
-            let start_ms = process.borrow_mut().start_time_ms;
-            (
-                ms_to_rusage_timeval(now_ms.saturating_sub(start_ms)),
-                ms_to_rusage_timeval(0),
-            )
-        }
-        RUSAGE_CHILDREN => (ms_to_rusage_timeval(0), ms_to_rusage_timeval(0)),
+    let cpu_ns = match who {
+        RUSAGE_SELF => process_cpu_time_ns(&current_process()),
+        RUSAGE_THREAD => current_task()
+            .map(|task| task.borrow_mut().cpu_time_ns)
+            .unwrap_or(0),
+        RUSAGE_CHILDREN => current_process().borrow_mut().child_cpu_time_ns,
         _ => return EINVAL,
     };
+    let (utime, stime) = (ns_to_rusage_timeval(cpu_ns), ns_to_rusage_timeval(0));
 
     let ru = RUsage64 {
         ru_utime: utime,

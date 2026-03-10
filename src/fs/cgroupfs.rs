@@ -17,6 +17,7 @@ use crate::task::{
     manager::wakeup_task,
     manager::{PID2PCB, pid2process},
     processor::{block_current_and_run_next, current_process, current_task},
+    sched::{SchedClass, sched_class},
     signal::{SIGKILL_NUM, queue_process_signal},
     task_block::TaskStatus,
 };
@@ -43,6 +44,12 @@ lazy_static! {
 const CTRL_PIDS: u32 = 1 << 0;
 const CTRL_MEMORY: u32 = 1 << 1;
 const ROOT_CONTROLLERS: u32 = CTRL_PIDS | CTRL_MEMORY;
+const LEGACY_CPU_SHARES_DEFAULT: u64 = 1024;
+const LEGACY_CPU_SHARES_MIN: u64 = 2;
+const LEGACY_CPU_SHARES_MAX: u64 = 262_144;
+const LEGACY_CPU_RT_PERIOD_DEFAULT_US: u64 = 1_000_000;
+const LEGACY_CPU_RT_RUNTIME_DEFAULT_US: i64 = 0;
+const LEGACY_CPU_RT_RUNTIME_ROOT_DEFAULT_US: i64 = 950_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CgroupMountKind {
@@ -202,6 +209,9 @@ struct CgroupNode {
     clone_children: bool,
     notify_on_release: bool,
     freezer_state: LegacyFreezerState,
+    cpu_shares: u64,
+    cpu_rt_runtime_us: i64,
+    cpu_rt_period_us: u64,
     cpuset_cpus: String,
     cpuset_mems: String,
     pids_max: Option<usize>,
@@ -224,6 +234,9 @@ impl CgroupNode {
             clone_children: false,
             notify_on_release: false,
             freezer_state: LegacyFreezerState::Thawed,
+            cpu_shares: LEGACY_CPU_SHARES_DEFAULT,
+            cpu_rt_runtime_us: LEGACY_CPU_RT_RUNTIME_DEFAULT_US,
+            cpu_rt_period_us: LEGACY_CPU_RT_PERIOD_DEFAULT_US,
             cpuset_cpus: String::from("0"),
             cpuset_mems: String::from("0"),
             pids_max: None,
@@ -284,7 +297,11 @@ struct CgroupMountState {
 impl CgroupMountState {
     fn new(kind: CgroupMountKind) -> Self {
         let mut nodes = BTreeMap::new();
-        nodes.insert(String::from("/"), CgroupNode::new());
+        let mut root = CgroupNode::new();
+        if kind == CgroupMountKind::LegacyCpu {
+            root.cpu_rt_runtime_us = LEGACY_CPU_RT_RUNTIME_ROOT_DEFAULT_US;
+        }
+        nodes.insert(String::from("/"), root);
         Self {
             kind,
             nodes,
@@ -805,6 +822,49 @@ fn current_cgroup_thread_id() -> Option<CgroupThreadId> {
     Some(CgroupThreadId::new(tgid, tid_index))
 }
 
+fn process_sched_class(tgid: usize) -> Option<SchedClass> {
+    let process = pid2process(tgid)?;
+    let policy = process.borrow_mut().sched_policy;
+    sched_class(policy)
+}
+
+fn parse_decimal_u64_strict(text: &str) -> Result<u64, isize> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(EINVAL);
+    }
+    text.parse::<u64>().map_err(|_| EINVAL)
+}
+
+fn normalize_legacy_cpu_shares(value: u64) -> u64 {
+    value.clamp(LEGACY_CPU_SHARES_MIN, LEGACY_CPU_SHARES_MAX)
+}
+
+fn parse_legacy_cpu_shares(text: &str) -> Result<u64, isize> {
+    Ok(normalize_legacy_cpu_shares(parse_decimal_u64_strict(text)?))
+}
+
+fn parse_legacy_cpu_rt_runtime_us(text: &str, period_us: u64) -> Result<i64, isize> {
+    if text == "-1" {
+        return Ok(-1);
+    }
+    let runtime = parse_decimal_u64_strict(text)?;
+    if runtime > period_us {
+        return Err(EINVAL);
+    }
+    i64::try_from(runtime).map_err(|_| EINVAL)
+}
+
+fn parse_legacy_cpu_rt_period_us(text: &str, runtime_us: i64) -> Result<u64, isize> {
+    let period = parse_decimal_u64_strict(text)?;
+    if period == 0 {
+        return Err(EINVAL);
+    }
+    if runtime_us >= 0 && u64::try_from(runtime_us).map_err(|_| EINVAL)? > period {
+        return Err(EINVAL);
+    }
+    Ok(period)
+}
+
 fn thread_cpu_time_ns(thread_id: CgroupThreadId) -> u64 {
     let Some(process) = pid2process(thread_id.tgid) else {
         return 0;
@@ -928,6 +988,9 @@ enum CgroupFileKind {
     CloneChildren,
     NotifyOnRelease,
     FreezerState,
+    CpuShares,
+    CpuRtRuntimeUs,
+    CpuRtPeriodUs,
     CpusetCpus,
     CpusetMems,
     Kill,
@@ -970,6 +1033,13 @@ impl CgroupFileKind {
                     "cgroup.procs" => Some(Self::Procs),
                     "cgroup.clone_children" => Some(Self::CloneChildren),
                     "notify_on_release" => Some(Self::NotifyOnRelease),
+                    "cpu.shares" if kind == CgroupMountKind::LegacyCpu => Some(Self::CpuShares),
+                    "cpu.rt_runtime_us" if kind == CgroupMountKind::LegacyCpu => {
+                        Some(Self::CpuRtRuntimeUs)
+                    }
+                    "cpu.rt_period_us" if kind == CgroupMountKind::LegacyCpu => {
+                        Some(Self::CpuRtPeriodUs)
+                    }
                     "freezer.state" if kind == CgroupMountKind::LegacyFreezer => {
                         Some(Self::FreezerState)
                     }
@@ -1015,6 +1085,9 @@ impl CgroupFileKind {
             | Self::CloneChildren
             | Self::NotifyOnRelease
             | Self::FreezerState
+            | Self::CpuShares
+            | Self::CpuRtRuntimeUs
+            | Self::CpuRtPeriodUs
             | Self::CpusetCpus
             | Self::CpusetMems
             | Self::Kill
@@ -1255,6 +1328,9 @@ impl CgroupFile {
                 alloc::format!("{}\n", if node.notify_on_release { 1 } else { 0 })
             }
             CgroupFileKind::FreezerState => alloc::format!("{}\n", node.freezer_state.as_str()),
+            CgroupFileKind::CpuShares => alloc::format!("{}\n", node.cpu_shares),
+            CgroupFileKind::CpuRtRuntimeUs => alloc::format!("{}\n", node.cpu_rt_runtime_us),
+            CgroupFileKind::CpuRtPeriodUs => alloc::format!("{}\n", node.cpu_rt_period_us),
             CgroupFileKind::CpusetCpus => alloc::format!("{}\n", node.cpuset_cpus),
             CgroupFileKind::CpusetMems => alloc::format!("{}\n", node.cpuset_mems),
             CgroupFileKind::Kill => String::new(),
@@ -1351,6 +1427,26 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::FreezerState => Err(EINVAL),
+            CgroupFileKind::CpuShares => {
+                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                if self.rel_path == "/" {
+                    return Err(EINVAL);
+                }
+                node.cpu_shares = parse_legacy_cpu_shares(text)?;
+                Ok(data.len())
+            }
+            CgroupFileKind::CpuRtRuntimeUs => {
+                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                node.cpu_rt_runtime_us =
+                    parse_legacy_cpu_rt_runtime_us(text, node.cpu_rt_period_us)?;
+                Ok(data.len())
+            }
+            CgroupFileKind::CpuRtPeriodUs => {
+                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                node.cpu_rt_period_us =
+                    parse_legacy_cpu_rt_period_us(text, node.cpu_rt_runtime_us)?;
+                Ok(data.len())
+            }
             CgroupFileKind::CpusetCpus => {
                 let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
                 if text.is_empty() {
@@ -1412,6 +1508,14 @@ impl CgroupFile {
                 if pid2process(pid).is_none() {
                     return Err(ESRCH);
                 }
+                if state.kind == CgroupMountKind::LegacyCpu {
+                    let has_rt_threads = live_thread_ids_for_process(pid)
+                        .into_iter()
+                        .any(|thread_id| process_sched_class(thread_id.tgid) != Some(SchedClass::Fair));
+                    if has_rt_threads {
+                        return Err(EINVAL);
+                    }
+                }
                 if !CgroupMountState::is_descendant_or_self(
                     &self.rel_path,
                     &self.open_cgroup_ns_root,
@@ -1444,6 +1548,11 @@ impl CgroupFile {
                     };
                     visible_tid_to_thread_id(raw_tid).ok_or(ESRCH)?
                 };
+                if state.kind == CgroupMountKind::LegacyCpu
+                    && process_sched_class(thread_id.tgid) != Some(SchedClass::Fair)
+                {
+                    return Err(EINVAL);
+                }
                 if !CgroupMountState::is_descendant_or_self(
                     &self.rel_path,
                     &self.open_cgroup_ns_root,
@@ -1623,6 +1732,15 @@ fn build_dir_entries(rel_path: &str, ns_root: &str, state: &CgroupMountState) ->
             "cgroup.clone_children",
             "notify_on_release",
             "cpuacct.usage",
+        ],
+        CgroupMountKind::LegacyCpu => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+            "cpu.shares",
+            "cpu.rt_runtime_us",
+            "cpu.rt_period_us",
         ],
         CgroupMountKind::LegacyFreezer => &[
             "tasks",
