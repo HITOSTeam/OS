@@ -499,6 +499,9 @@ pub struct TaskControlBlockInner {
     pub rr_ticks: usize,
     /// Best-effort per-thread CPU runtime used for *_CPUTIME clocks.
     pub cpu_time_ns: u64,
+    /// CPU runtime snapshot used to charge fair-group virtual runtime when the
+    /// task returns to a runqueue.
+    pub fair_runtime_checkpoint_ns: u64,
     /// Per-thread nice value (Linux/NPTL semantics).
     pub nice: i32,
     /// Hint that libc just queried self priority and may issue `nice()`.
@@ -585,6 +588,7 @@ impl TaskControlBlock {
                 wake_on_cgroup_thaw: false,
                 rr_ticks: 0,
                 cpu_time_ns: 0,
+                fair_runtime_checkpoint_ns: 0,
                 nice: process_nice,
                 nice_query_hint: false,
                 fp_regs: [0; 32],
@@ -662,6 +666,7 @@ impl TaskControlBlock {
                 wake_on_cgroup_thaw: false,
                 rr_ticks: 0,
                 cpu_time_ns: 0,
+                fair_runtime_checkpoint_ns: 0,
                 nice: process_nice,
                 nice_query_hint: false,
                 fp_regs: [0; 32],

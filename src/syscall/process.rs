@@ -32,7 +32,9 @@ use crate::{
         },
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
+            hart_id, suspend_current_and_run_next,
         },
+        sched::{SchedClass, sched_class},
         signal::{
             pending_unmasked_bits, queue_process_signal, SignalFlags, MAX_SIG, RT_SIG_MAX,
             SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM, SIG_DFL, SIG_IGN,
@@ -883,8 +885,19 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             Arc::strong_count(&task)
         );
     }
+    let child_same_hart = task.get_cpu_id() == hart_id();
     add_task(task);
     record_fork_diag(process.getpid(), child_pid, flags, fork_elapsed_us);
+
+    if !is_thread_like && (flags & CLONE_VFORK) == 0 {
+        let parent_fair = sched_class(process.borrow_mut().sched_policy) == Some(SchedClass::Fair);
+        let child_fair = sched_class(child.borrow_mut().sched_policy) == Some(SchedClass::Fair);
+        if parent_fair && child_fair && child_same_hart {
+            // Let a freshly forked fair child run promptly so it can finish
+            // exec/signal setup before the parent races ahead in user space.
+            suspend_current_and_run_next();
+        }
+    }
 
     if (flags & CLONE_VFORK) != 0 {
         let parent_task = current_task().unwrap();
@@ -939,6 +952,11 @@ pub fn syscall_vfork() -> isize {
                 process.getpid(),
                 child.getpid()
             );
+            if sched_class(process.borrow_mut().sched_policy) == Some(SchedClass::Fair)
+                && sched_class(child.borrow_mut().sched_policy) == Some(SchedClass::Fair)
+            {
+                suspend_current_and_run_next();
+            }
             child.getpid() as isize
         }
         None => -12,

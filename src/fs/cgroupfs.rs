@@ -14,8 +14,9 @@ use crate::fs::{File, PseudoDir, PseudoDirent};
 use crate::mm::UserBuffer;
 use crate::syscall::misc::{decode_linux_tid_strict, encode_linux_tid};
 use crate::task::{
-    manager::wakeup_task,
+    manager::{refresh_process_runqueues, wakeup_task},
     manager::{PID2PCB, pid2process},
+    process_visible_in_pid_namespace, resolve_process_in_pid_namespace,
     processor::{block_current_and_run_next, current_process, current_task},
     sched::{SchedClass, sched_class},
     signal::{SIGKILL_NUM, queue_process_signal},
@@ -279,8 +280,8 @@ impl CgroupThreadId {
         Self { tgid, tid_index }
     }
 
-    fn visible_tid(self) -> usize {
-        encode_linux_tid(self.tgid, self.tid_index)
+    fn visible_tid(self, pid_ns_id: usize) -> Option<usize> {
+        visible_tid_in_pid_namespace(self, pid_ns_id)
     }
 }
 
@@ -365,22 +366,30 @@ impl CgroupMountState {
         pids
     }
 
-    fn direct_member_threads(&self, path: &str) -> Vec<usize> {
+    fn direct_member_threads(&self, path: &str, pid_ns_id: usize) -> Vec<usize> {
         let mut tids = self
             .thread_assignments
             .iter()
             .filter_map(|(thread_id, thread_path)| {
-                (*thread_path == path).then_some(thread_id.visible_tid())
+                if *thread_path != path {
+                    return None;
+                }
+                thread_id.visible_tid(pid_ns_id)
             })
             .collect::<Vec<_>>();
         tids.sort_unstable();
         tids
     }
 
-    fn direct_member_legacy_procs(&self, path: &str) -> Vec<usize> {
+    fn direct_member_legacy_procs(&self, path: &str, pid_ns_id: usize) -> Vec<usize> {
         self.thread_assignments
             .iter()
-            .filter_map(|(thread_id, thread_path)| (*thread_path == path).then_some(thread_id.tgid))
+            .filter_map(|(thread_id, thread_path)| {
+                if *thread_path != path {
+                    return None;
+                }
+                visible_pid_in_namespace(thread_id.tgid, pid_ns_id)
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -795,13 +804,64 @@ fn live_process_ids() -> Vec<usize> {
     pids
 }
 
-fn visible_tid_to_thread_id(tid: usize) -> Option<CgroupThreadId> {
-    if pid2process(tid).is_some() {
-        return Some(CgroupThreadId::new(tid, 0));
+fn visible_pid_in_namespace(pid: usize, pid_ns_id: usize) -> Option<usize> {
+    let process = pid2process(pid)?;
+    if pid_ns_id == 0 {
+        return Some(pid);
     }
-    let tgid = tid >> LINUX_TID_PID_SHIFT;
-    let tid_index = decode_linux_tid_strict(tgid, tid)?;
-    let process = pid2process(tgid)?;
+    process_visible_in_pid_namespace(&process, pid_ns_id).then(|| process.visible_pid())
+}
+
+fn visible_tid_in_pid_namespace(thread_id: CgroupThreadId, pid_ns_id: usize) -> Option<usize> {
+    let visible_pid = visible_pid_in_namespace(thread_id.tgid, pid_ns_id)?;
+    Some(encode_linux_tid(visible_pid, thread_id.tid_index))
+}
+
+fn visible_tid_to_thread_id(pid_ns_id: usize, tid: usize) -> Option<CgroupThreadId> {
+    if pid_ns_id == 0 {
+        if pid2process(tid).is_some() {
+            return Some(CgroupThreadId::new(tid, 0));
+        }
+        let tgid = tid >> LINUX_TID_PID_SHIFT;
+        let tid_index = decode_linux_tid_strict(tgid, tid)?;
+        let process = pid2process(tgid)?;
+        let inner = process.borrow_mut();
+        inner
+            .tasks
+            .get(tid_index)
+            .and_then(|task| task.as_ref())
+            .and_then(|task| {
+                task.try_borrow_mut().and_then(|task_inner| {
+                    (task_inner.res.is_some() && task_inner.exit_code.is_none()).then_some(())
+                })
+            })?;
+        return Some(CgroupThreadId::new(tgid, tid_index));
+    }
+
+    if let Some(process) = resolve_process_in_pid_namespace(pid_ns_id, tid) {
+        let tgid = process.getpid();
+        let main_alive = {
+            let inner = process.borrow_mut();
+            inner
+                .tasks
+                .first()
+                .and_then(|task| task.as_ref())
+                .and_then(|task| {
+                    task.try_borrow_mut().and_then(|task_inner| {
+                        (task_inner.res.is_some() && task_inner.exit_code.is_none()).then_some(())
+                    })
+                })
+                .is_some()
+        };
+        if main_alive {
+            return Some(CgroupThreadId::new(tgid, 0));
+        }
+    }
+
+    let visible_tgid = tid >> LINUX_TID_PID_SHIFT;
+    let process = resolve_process_in_pid_namespace(pid_ns_id, visible_tgid)?;
+    let tgid = process.getpid();
+    let tid_index = decode_linux_tid_strict(visible_tgid, tid)?;
     let inner = process.borrow_mut();
     inner
         .tasks
@@ -826,6 +886,17 @@ fn process_sched_class(tgid: usize) -> Option<SchedClass> {
     let process = pid2process(tgid)?;
     let policy = process.borrow_mut().sched_policy;
     sched_class(policy)
+}
+
+fn descendant_processes(state: &CgroupMountState, path: &str) -> Vec<usize> {
+    state.thread_assignments
+        .iter()
+        .filter_map(|(thread_id, thread_path)| {
+            CgroupMountState::is_descendant_or_self(thread_path, path).then_some(thread_id.tgid)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn parse_decimal_u64_strict(text: &str) -> Result<u64, isize> {
@@ -1303,11 +1374,16 @@ impl CgroupFile {
             }
             CgroupFileKind::SubtreeControl => controller_mask_to_string(node.subtree_control),
             CgroupFileKind::Procs => {
+                let pid_ns_id = current_process().pid_namespace_id();
                 let mut out = String::new();
                 let members = if state.is_unified() {
-                    state.direct_member_processes(&self.rel_path)
+                    state
+                        .direct_member_processes(&self.rel_path)
+                        .into_iter()
+                        .filter_map(|pid| visible_pid_in_namespace(pid, pid_ns_id))
+                        .collect::<Vec<_>>()
                 } else {
-                    state.direct_member_legacy_procs(&self.rel_path)
+                    state.direct_member_legacy_procs(&self.rel_path, pid_ns_id)
                 };
                 for pid in members {
                     out.push_str(&alloc::format!("{pid}\n"));
@@ -1315,8 +1391,9 @@ impl CgroupFile {
                 out
             }
             CgroupFileKind::Tasks => {
+                let pid_ns_id = current_process().pid_namespace_id();
                 let mut out = String::new();
-                for tid in state.direct_member_threads(&self.rel_path) {
+                for tid in state.direct_member_threads(&self.rel_path, pid_ns_id) {
                     out.push_str(&alloc::format!("{tid}\n"));
                 }
                 out
@@ -1433,6 +1510,13 @@ impl CgroupFile {
                     return Err(EINVAL);
                 }
                 node.cpu_shares = parse_legacy_cpu_shares(text)?;
+                let affected = descendant_processes(state, &self.rel_path);
+                drop(registry);
+                for pid in affected {
+                    if let Some(process) = pid2process(pid) {
+                        refresh_process_runqueues(&process);
+                    }
+                }
                 Ok(data.len())
             }
             CgroupFileKind::CpuRtRuntimeUs => {
@@ -1497,12 +1581,17 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::Procs => {
+                let pid_ns_id = current_process().pid_namespace_id();
                 let pid = if text.is_empty() {
                     current_process().getpid()
                 } else {
                     match text.parse::<usize>().map_err(|_| EINVAL)? {
                         0 => current_process().getpid(),
-                        pid => pid,
+                        visible_pid => {
+                            let process =
+                                resolve_process_in_pid_namespace(pid_ns_id, visible_pid).ok_or(ESRCH)?;
+                            process.getpid()
+                        }
                     }
                 };
                 if pid2process(pid).is_none() {
@@ -1536,17 +1625,27 @@ impl CgroupFile {
                     state.flush_thread_cpu_usage(thread_id, &thread_old_path);
                 }
                 state.attach_process(pid, &self.rel_path);
+                let should_refresh = state.kind == CgroupMountKind::LegacyCpu;
+                drop(registry);
+                if should_refresh {
+                    if let Some(process) = pid2process(pid) {
+                        refresh_process_runqueues(&process);
+                    }
+                }
                 Ok(data.len())
             }
             CgroupFileKind::Tasks => {
+                let pid_ns_id = current_process().pid_namespace_id();
                 let thread_id = if text.is_empty() {
                     current_cgroup_thread_id().ok_or(ESRCH)?
                 } else {
                     let raw_tid = match text.parse::<usize>().map_err(|_| EINVAL)? {
-                        0 => current_cgroup_thread_id().ok_or(ESRCH)?.visible_tid(),
+                        0 => current_cgroup_thread_id()
+                            .and_then(|thread_id| thread_id.visible_tid(pid_ns_id))
+                            .ok_or(ESRCH)?,
                         tid => tid,
                     };
-                    visible_tid_to_thread_id(raw_tid).ok_or(ESRCH)?
+                    visible_tid_to_thread_id(pid_ns_id, raw_tid).ok_or(ESRCH)?
                 };
                 if state.kind == CgroupMountKind::LegacyCpu
                     && process_sched_class(thread_id.tgid) != Some(SchedClass::Fair)
@@ -1570,6 +1669,13 @@ impl CgroupFile {
                 }
                 state.flush_thread_cpu_usage(thread_id, &old_path);
                 state.attach_thread(thread_id, &self.rel_path);
+                let should_refresh = state.kind == CgroupMountKind::LegacyCpu;
+                drop(registry);
+                if should_refresh {
+                    if let Some(process) = pid2process(thread_id.tgid) {
+                        refresh_process_runqueues(&process);
+                    }
+                }
                 Ok(data.len())
             }
             CgroupFileKind::Kill => {
@@ -2073,6 +2179,24 @@ pub fn cgroup_exit_thread(process_pid: usize, tid_index: usize) {
         state.flush_thread_cpu_usage(thread_id, &path);
         state.remove_thread(thread_id);
     }
+}
+
+pub fn legacy_cpu_fair_group(tgid: usize, tid_index: usize) -> (u64, u64) {
+    let thread_id = CgroupThreadId::new(tgid, tid_index);
+    let registry = CGROUP_REGISTRY.lock();
+    for state in registry.hierarchies.values() {
+        if state.kind != CgroupMountKind::LegacyCpu {
+            continue;
+        }
+        let path = state.path_for_thread(thread_id);
+        if let Some(node) = state.nodes.get(&path) {
+            return (node.ino, node.cpu_shares);
+        }
+        if let Some(root) = state.nodes.get("/") {
+            return (root.ino, root.cpu_shares);
+        }
+    }
+    (0, LEGACY_CPU_SHARES_DEFAULT)
 }
 
 pub fn cgroup_exit_process(pid: usize) {

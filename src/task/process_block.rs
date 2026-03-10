@@ -1978,6 +1978,9 @@ impl ProcessControlBlock {
         let mut child_inner = child.borrow_mut();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
+        // Publish the child before cgroup inheritance so per-thread membership
+        // can resolve the freshly created main task.
+        insert_into_pid2process(child.getpid(), Arc::clone(&child));
         cgroup_attach_fork_child(self.getpid(), child.getpid());
         // Seed trap context from the calling thread when available.
         let parent_trap_cx =
@@ -2015,7 +2018,6 @@ impl ProcessControlBlock {
                 child_inner.exec_inode_num,
             );
         }
-        insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add child to parent's children list (after success)
         self.borrow_mut().children.push(Arc::clone(&child));
         if diag_enabled {

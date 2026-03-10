@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch;
 use crate::config::MAX_HARTS;
 use crate::debug_config::DEBUG_SCHED;
+use crate::fs::legacy_cpu_fair_group;
 use crate::task::block_sleep::{TIMERS, TimeWrap};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::sched::{
@@ -126,21 +127,33 @@ pub fn dump_system_state() {
 }
 
 #[derive(Default)]
+struct FairGroupQueue {
+    shares: u64,
+    vruntime: u128,
+    tasks: VecDeque<Arc<TaskControlBlock>>,
+}
+
+#[derive(Default)]
 struct HartRunQueue {
     rt_queues: alloc::vec::Vec<VecDeque<Arc<TaskControlBlock>>>,
-    fair_queue: VecDeque<Arc<TaskControlBlock>>,
+    fair_groups: BTreeMap<u64, FairGroupQueue>,
 }
 
 impl HartRunQueue {
     fn new() -> Self {
         Self {
             rt_queues: (0..RT_PRIO_LEVELS).map(|_| VecDeque::new()).collect(),
-            fair_queue: VecDeque::new(),
+            fair_groups: BTreeMap::new(),
         }
     }
 
     fn len(&self) -> usize {
-        self.fair_queue.len() + self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
+        self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
+            + self
+                .fair_groups
+                .values()
+                .map(|group| group.tasks.len())
+                .sum::<usize>()
     }
 }
 
@@ -163,6 +176,26 @@ fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
         }
         Some(SchedClass::Fair) | None => ReadyQueueSlot::Fair,
     }
+}
+
+fn fair_group_id_and_shares(task: &Arc<TaskControlBlock>) -> Option<(u64, u64)> {
+    let process = task.process.upgrade()?;
+    let tgid = process.getpid();
+    let tid_index = task.borrow_mut().res.as_ref()?.tid;
+    Some(legacy_cpu_fair_group(tgid, tid_index))
+}
+
+fn account_fair_task_enqueue(group: &mut FairGroupQueue, task: &Arc<TaskControlBlock>) {
+    const DEFAULT_SHARES: u128 = 1024;
+    let mut inner = task.borrow_mut();
+    let current_ns = inner.cpu_time_ns;
+    let delta_ns = current_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
+    if delta_ns > 0 {
+        let shares = u128::from(group.shares.max(1));
+        let scaled = ((u128::from(delta_ns) * DEFAULT_SHARES) / shares).max(1);
+        group.vruntime = group.vruntime.saturating_add(scaled);
+    }
+    inner.fair_runtime_checkpoint_ns = current_ns;
 }
 
 pub struct TaskManager {
@@ -216,7 +249,13 @@ impl TaskManager {
         }
         match task_queue_slot(&task) {
             ReadyQueueSlot::Rt(idx) => hart_rq.rt_queues[idx].push_back(task),
-            ReadyQueueSlot::Fair => hart_rq.fair_queue.push_back(task),
+            ReadyQueueSlot::Fair => {
+                let (group_id, shares) = fair_group_id_and_shares(&task).unwrap_or((0, 1024));
+                let group = hart_rq.fair_groups.entry(group_id).or_default();
+                group.shares = shares.max(1);
+                account_fair_task_enqueue(group, &task);
+                group.tasks.push_back(task);
+            }
         }
         if DEBUG_SCHED {
             log::debug!(
@@ -259,6 +298,38 @@ impl TaskManager {
         None
     }
 
+    fn prune_fair_group_front(
+        queue: &mut VecDeque<Arc<TaskControlBlock>>,
+        hart_id: usize,
+    ) -> Option<Arc<TaskControlBlock>> {
+        while let Some(candidate) = queue.front().cloned() {
+            let status = candidate.borrow_mut().task_status;
+            if status == TaskStatus::Ready {
+                return Some(candidate);
+            }
+            queue.pop_front();
+            candidate
+                .in_ready_queue
+                .store(false, core::sync::atomic::Ordering::Release);
+            if DEBUG_SCHED {
+                let tid = candidate
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX);
+                log::debug!(
+                    "[sched] drop stale fair entry tid={} hart={} status={:?} remaining_len={}",
+                    tid,
+                    hart_id,
+                    status,
+                    queue.len()
+                );
+            }
+        }
+        None
+    }
+
     pub fn fetch(&mut self, hart_id: usize) -> Option<Arc<TaskControlBlock>> {
         // Skip stale entries: under SMP, bugs or races can temporarily leave
         // non-ready tasks (Blocked/Running) in the ready queue. Never schedule them.
@@ -272,7 +343,44 @@ impl TaskManager {
                 }
             }
             if picked.is_none() {
-                picked = Self::pop_ready_candidate(&mut rq.fair_queue, hart_id);
+                let group_ids = rq.fair_groups.keys().copied().collect::<alloc::vec::Vec<_>>();
+                let mut best_group = None;
+                let mut best_vruntime = u128::MAX;
+                let mut empty_groups = alloc::vec::Vec::new();
+                for group_id in group_ids {
+                    let Some(group) = rq.fair_groups.get_mut(&group_id) else {
+                        continue;
+                    };
+                    if Self::prune_fair_group_front(&mut group.tasks, hart_id).is_none() {
+                        if group.tasks.is_empty() {
+                            empty_groups.push(group_id);
+                        }
+                        continue;
+                    }
+                    if group.vruntime < best_vruntime {
+                        best_vruntime = group.vruntime;
+                        best_group = Some(group_id);
+                    }
+                }
+                for group_id in empty_groups {
+                    rq.fair_groups.remove(&group_id);
+                }
+                if let Some(group_id) = best_group {
+                    if let Some(group) = rq.fair_groups.get_mut(&group_id) {
+                        if let Some(task) = group.tasks.pop_front() {
+                            task.in_ready_queue
+                                .store(false, core::sync::atomic::Ordering::Release);
+                            {
+                                let mut inner = task.borrow_mut();
+                                inner.fair_runtime_checkpoint_ns = inner.cpu_time_ns;
+                            }
+                            if group.tasks.is_empty() {
+                                rq.fair_groups.remove(&group_id);
+                            }
+                            picked = Some(task);
+                        }
+                    }
+                }
             }
             picked
         };
@@ -297,14 +405,23 @@ impl TaskManager {
     pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
         let mut removed = 0usize;
         for rq in self.ready_queues.iter_mut() {
-            for q in rq
-                .rt_queues
-                .iter_mut()
-                .chain(core::iter::once(&mut rq.fair_queue))
-            {
+            for q in rq.rt_queues.iter_mut() {
                 let before = q.len();
                 q.retain(|t| !Arc::ptr_eq(t, &task));
                 removed = removed.saturating_add(before.saturating_sub(q.len()));
+            }
+            let fair_group_ids = rq.fair_groups.keys().copied().collect::<alloc::vec::Vec<_>>();
+            for group_id in fair_group_ids {
+                let mut should_remove_group = false;
+                if let Some(group) = rq.fair_groups.get_mut(&group_id) {
+                    let before = group.tasks.len();
+                    group.tasks.retain(|t| !Arc::ptr_eq(t, &task));
+                    removed = removed.saturating_add(before.saturating_sub(group.tasks.len()));
+                    should_remove_group = group.tasks.is_empty();
+                }
+                if should_remove_group {
+                    rq.fair_groups.remove(&group_id);
+                }
             }
         }
         if crate::debug_config::DEBUG_TASK_LIFECYCLE && removed > 1 {
@@ -328,13 +445,14 @@ impl TaskManager {
         self.ready_queues
             .iter()
             .map(|rq| {
-                rq.fair_queue
+                rq.rt_queues
                     .iter()
-                    .filter(|t| Arc::ptr_eq(t, task))
-                    .count()
-                    + rq.rt_queues
-                        .iter()
-                        .map(|q| q.iter().filter(|t| Arc::ptr_eq(t, task)).count())
+                    .map(|q| q.iter().filter(|t| Arc::ptr_eq(t, task)).count())
+                    .sum::<usize>()
+                    + rq
+                        .fair_groups
+                        .values()
+                        .map(|group| group.tasks.iter().filter(|t| Arc::ptr_eq(t, task)).count())
                         .sum::<usize>()
             })
             .sum()
