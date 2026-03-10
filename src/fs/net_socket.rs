@@ -1,15 +1,19 @@
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cmp::min;
+use lazy_static::lazy_static;
 use spin::Mutex;
 
+use crate::fs::{wake_tasks, File, PollWaitQueue, POLLIN, POLLOUT, POLLRDHUP};
 use crate::mm::UserBuffer;
 use crate::task::processor::current_task;
+use crate::task::task_block::TaskControlBlock;
 use crate::task::signal::has_unmasked_pending;
 
-use smoltcp::iface::SocketHandle;
+use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
@@ -75,6 +79,119 @@ pub struct SocketOptions {
     rcvbuf: u32,
     mcast_joined: bool,
     rd_shutdown: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PollRegistrationKind {
+    TcpStream,
+    TcpListener,
+    Udp,
+}
+
+struct PollRegistration {
+    kind: PollRegistrationKind,
+    last_mask: i16,
+    waiters: PollWaitQueue,
+}
+
+lazy_static! {
+    static ref NET_POLL_WAITERS: Mutex<BTreeMap<SocketHandle, PollRegistration>> =
+        Mutex::new(BTreeMap::new());
+}
+
+fn poll_mask_for_registered_handle(
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    kind: PollRegistrationKind,
+) -> i16 {
+    match kind {
+        PollRegistrationKind::TcpStream => {
+            let s = sockets.get::<tcp::Socket>(handle);
+            let mut mask = 0;
+            if s.can_recv() || !s.may_recv() {
+                mask |= POLLIN;
+            }
+            if s.can_send() || !s.may_send() {
+                mask |= POLLOUT;
+            }
+            if !s.may_recv() {
+                mask |= POLLRDHUP;
+            }
+            mask
+        }
+        PollRegistrationKind::TcpListener => {
+            let s = sockets.get::<tcp::Socket>(handle);
+            let mut mask = POLLOUT;
+            if tcp_accept_ready(s.state()) {
+                mask |= POLLIN;
+            }
+            mask
+        }
+        PollRegistrationKind::Udp => {
+            let s = sockets.get::<udp::Socket>(handle);
+            let mut mask = 0;
+            if s.can_recv() {
+                mask |= POLLIN;
+            }
+            if s.can_send() {
+                mask |= POLLOUT;
+            }
+            mask
+        }
+    }
+}
+
+fn register_poll_waiter_for_handle(
+    handle: SocketHandle,
+    kind: PollRegistrationKind,
+    task: &Arc<TaskControlBlock>,
+) -> bool {
+    let mut registrations = NET_POLL_WAITERS.lock();
+    let entry = registrations.entry(handle).or_insert_with(|| PollRegistration {
+        kind,
+        last_mask: 0,
+        waiters: PollWaitQueue::default(),
+    });
+    entry.kind = kind;
+    entry.waiters.register_waiter(task)
+}
+
+fn unregister_poll_waiters(handles: &[SocketHandle]) {
+    let mut registrations = NET_POLL_WAITERS.lock();
+    for handle in handles {
+        registrations.remove(handle);
+    }
+}
+
+pub(crate) fn notify_net_poll_events() {
+    let mut wake = Vec::new();
+    let mut registrations = NET_POLL_WAITERS.lock();
+    registrations.retain(|_, entry| entry.waiters.has_waiters());
+    if registrations.is_empty() {
+        return;
+    }
+    let masks = crate::net::with_sockets_mut(|_iface, _dev, sockets| {
+        registrations
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    *handle,
+                    poll_mask_for_registered_handle(sockets, *handle, entry.kind),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    for (handle, mask) in masks {
+        let Some(entry) = registrations.get_mut(&handle) else {
+            continue;
+        };
+        if mask != entry.last_mask {
+            entry.last_mask = mask;
+            wake.extend(entry.waiters.take_wakeups());
+        }
+    }
+    drop(registrations);
+    wake_tasks(wake);
 }
 
 impl NetSocketFile {
@@ -157,57 +274,93 @@ impl NetSocketFile {
         }
     }
 
-    pub fn poll_readable(&self) -> bool {
-        crate::net::poll();
-        let snapshot = match &*self.inner.lock() {
-            Inner::TcpStream { handle } => Snapshot::TcpStream(*handle),
+    fn snapshot(&self) -> Snapshot {
+        let inner = self.inner.lock();
+        match &*inner {
+            Inner::TcpStream { handle } => Snapshot::TcpStream {
+                handle: *handle,
+                rd_shutdown: self.opts.lock().rd_shutdown,
+            },
             Inner::TcpListener { listen, .. } => Snapshot::TcpListener(listen.clone()),
             Inner::Udp { handle, .. } => Snapshot::Udp(*handle),
-        };
-        crate::net::with_sockets_mut(|_iface, _dev, sockets| match snapshot {
-            Snapshot::TcpStream(handle) => {
-                let s = sockets.get::<tcp::Socket>(handle);
-                s.can_recv() || !s.may_recv()
+        }
+    }
+
+    fn poll_mask_for_snapshot(snapshot: &Snapshot, sockets: &mut SocketSet<'_>) -> i16 {
+        match snapshot {
+            Snapshot::TcpStream {
+                handle,
+                rd_shutdown,
+            } => {
+                let s = sockets.get::<tcp::Socket>(*handle);
+                let mut mask = 0;
+                if s.can_recv() || !s.may_recv() {
+                    mask |= POLLIN;
+                }
+                if s.can_send() || !s.may_send() {
+                    mask |= POLLOUT;
+                }
+                if *rd_shutdown || !s.may_recv() {
+                    mask |= POLLRDHUP;
+                }
+                mask
             }
-            Snapshot::TcpListener(listen) => listen.iter().any(|h| {
-                let s = sockets.get::<tcp::Socket>(*h);
-                tcp_accept_ready(s.state())
-            }),
-            Snapshot::Udp(handle) => sockets.get::<udp::Socket>(handle).can_recv(),
-            Snapshot::ListenerOnly => false,
+            Snapshot::TcpListener(listen) => {
+                let mut mask = POLLOUT;
+                if listen.iter().any(|handle| {
+                    let s = sockets.get::<tcp::Socket>(*handle);
+                    tcp_accept_ready(s.state())
+                }) {
+                    mask |= POLLIN;
+                }
+                mask
+            }
+            Snapshot::Udp(handle) => {
+                let s = sockets.get::<udp::Socket>(*handle);
+                let mut mask = 0;
+                if s.can_recv() {
+                    mask |= POLLIN;
+                }
+                if s.can_send() {
+                    mask |= POLLOUT;
+                }
+                mask
+            }
+        }
+    }
+
+    fn current_poll_mask(&self) -> i16 {
+        let snapshot = self.snapshot();
+        crate::net::with_sockets_mut(|_iface, _dev, sockets| {
+            Self::poll_mask_for_snapshot(&snapshot, sockets)
         })
+    }
+
+    fn poll_registration_handles(&self) -> Vec<(SocketHandle, PollRegistrationKind)> {
+        match &*self.inner.lock() {
+            Inner::TcpStream { handle } => vec![(*handle, PollRegistrationKind::TcpStream)],
+            Inner::TcpListener { listen, .. } => listen
+                .iter()
+                .copied()
+                .map(|handle| (handle, PollRegistrationKind::TcpListener))
+                .collect(),
+            Inner::Udp { handle, .. } => vec![(*handle, PollRegistrationKind::Udp)],
+        }
+    }
+
+    pub fn poll_readable(&self) -> bool {
+        crate::net::poll();
+        (self.current_poll_mask() & POLLIN) != 0
     }
 
     pub fn poll_writable(&self) -> bool {
         crate::net::poll();
-        let snapshot = match &*self.inner.lock() {
-            Inner::TcpStream { handle } => Snapshot::TcpStream(*handle),
-            Inner::TcpListener { .. } => Snapshot::ListenerOnly,
-            Inner::Udp { handle, .. } => Snapshot::Udp(*handle),
-        };
-        crate::net::with_sockets_mut(|_iface, _dev, sockets| match snapshot {
-            Snapshot::TcpStream(handle) => {
-                let s = sockets.get::<tcp::Socket>(handle);
-                s.can_send() || !s.may_send()
-            }
-            Snapshot::TcpListener(_) | Snapshot::ListenerOnly => true,
-            Snapshot::Udp(handle) => sockets.get::<udp::Socket>(handle).can_send(),
-        })
+        (self.current_poll_mask() & POLLOUT) != 0
     }
 
     pub fn poll_rdhup(&self) -> bool {
-        if self.opts.lock().rd_shutdown {
-            return true;
-        }
         crate::net::poll();
-        let handle = match &*self.inner.lock() {
-            Inner::TcpStream { handle } => *handle,
-            _ => return false,
-        };
-        crate::net::with_sockets_mut(|_iface, _dev, sockets| {
-            let s = sockets.get::<tcp::Socket>(handle);
-            !s.may_recv()
-        })
+        (self.current_poll_mask() & POLLRDHUP) != 0
     }
 
     pub fn shutdown_read(&self) {
@@ -500,6 +653,7 @@ impl NetSocketFile {
                 continue;
             }
             off += sent;
+            crate::net::poll();
         }
         Ok(off)
     }
@@ -526,6 +680,9 @@ impl NetSocketFile {
                 });
             let res = res?;
             if let Some(n) = res {
+                if n > 0 {
+                    crate::net::poll();
+                }
                 return Ok(n);
             }
             crate::task::processor::suspend_current_and_run_next();
@@ -764,6 +921,7 @@ impl Drop for NetSocketFile {
             Inner::Udp { handle, .. } => vec![*handle],
             Inner::TcpListener { listen, .. } => listen.clone(),
         };
+        unregister_poll_waiters(handles.as_slice());
         crate::net::with_sockets_mut(|_iface, _dev, sockets| {
             for h in handles {
                 sockets.remove(h);
@@ -774,13 +932,12 @@ impl Drop for NetSocketFile {
 
 #[derive(Clone)]
 enum Snapshot {
-    TcpStream(SocketHandle),
+    TcpStream { handle: SocketHandle, rd_shutdown: bool },
     TcpListener(Vec<SocketHandle>),
     Udp(SocketHandle),
-    ListenerOnly,
 }
 
-impl crate::fs::File for NetSocketFile {
+impl File for NetSocketFile {
     fn readable(&self) -> bool {
         true
     }
@@ -828,6 +985,9 @@ impl crate::fs::File for NetSocketFile {
                         match res {
                             ReadStep::Data(n) => {
                                 total += n;
+                                if n > 0 {
+                                    crate::net::poll();
+                                }
                                 break;
                             }
                             ReadStep::Eof => return total,
@@ -900,6 +1060,7 @@ impl crate::fs::File for NetSocketFile {
                         }
                         off += sent;
                         total += sent;
+                        crate::net::poll();
                     }
                 }
                 total
@@ -958,21 +1119,20 @@ impl crate::fs::File for NetSocketFile {
     }
 
     fn poll_mask(&self) -> i16 {
-        let mut mask = 0;
-        if self.poll_readable() {
-            mask |= crate::fs::POLLIN;
-        }
-        if self.poll_writable() {
-            mask |= crate::fs::POLLOUT;
-        }
-        if self.poll_rdhup() {
-            mask |= crate::fs::POLLRDHUP;
-        }
-        mask
+        crate::net::poll();
+        self.current_poll_mask()
     }
 
     fn supports_poll(&self) -> bool {
         true
+    }
+
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        self.poll_registration_handles()
+            .into_iter()
+            .fold(false, |armed, (handle, kind)| {
+                register_poll_waiter_for_handle(handle, kind, task) || armed
+            })
     }
 
     fn as_any(&self) -> &dyn Any {

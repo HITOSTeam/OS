@@ -13,7 +13,7 @@ use crate::mm::{
     try_write_user_value, UserBuffer,
 };
 use crate::syscall::filesystem::normalize_path;
-use crate::task::manager::{pid2process, wakeup_task};
+use crate::task::manager::pid2process;
 use crate::task::processor::{
     block_current_and_run_next, current_files_process, current_process, current_task,
     suspend_current_and_run_next,
@@ -23,8 +23,8 @@ use crate::trap::get_current_token;
 use crate::{
     bpf::get_prog_clone,
     fs::{
-        ext4_lock, find_path_in_roots, make_socketpair, File, NetSocketFile, SocketPairEnd,
-        POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDHUP,
+        ext4_lock, find_path_in_roots, make_socketpair, wake_tasks, File, NetSocketFile,
+        PollWaitQueue, SocketPairEnd, POLLIN, POLLOUT,
     },
 };
 
@@ -172,6 +172,7 @@ struct UnixSocketState {
     peer_cred: Option<UCred>,
     dgram_peer: Option<UnixBoundAddr>,
     dgram_queue: VecDeque<UnixDatagram>,
+    poll_waiters: PollWaitQueue,
 }
 
 impl UnixSocketState {
@@ -186,6 +187,7 @@ impl UnixSocketState {
             peer_cred: None,
             dgram_peer: None,
             dgram_queue: VecDeque::new(),
+            poll_waiters: PollWaitQueue::default(),
         }
     }
 }
@@ -310,6 +312,9 @@ impl UnixSocketFile {
                     Some(client_cred),
                 ));
                 peer_st.pending_accept.push_back(accepted);
+                let wake = peer_st.poll_waiters.take_wakeups();
+                drop(peer_st);
+                wake_tasks(wake);
             }
             let mut st = self.state.lock();
             if st.stream_end.is_some() {
@@ -360,10 +365,12 @@ impl UnixSocketFile {
             return EPROTONOSUPPORT;
         }
         let n = payload.len();
-        peer.state
-            .lock()
-            .dgram_queue
-            .push_back(UnixDatagram { from, payload });
+        let wake = {
+            let mut peer_st = peer.state.lock();
+            peer_st.dgram_queue.push_back(UnixDatagram { from, payload });
+            peer_st.poll_waiters.take_wakeups()
+        };
+        wake_tasks(wake);
         n as isize
     }
 
@@ -518,6 +525,27 @@ impl File for UnixSocketFile {
         true
     }
 
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        if self.is_stream_like() {
+            let mut st = self.state.lock();
+            if st.listening {
+                st.poll_waiters.register_waiter(task);
+                return true;
+            }
+            let end = st.stream_end.clone();
+            drop(st);
+            return end
+                .as_ref()
+                .is_some_and(|end| end.register_poll_waiter(task));
+        }
+        if self.is_dgram() {
+            let mut st = self.state.lock();
+            st.poll_waiters.register_waiter(task);
+            return true;
+        }
+        false
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -536,6 +564,7 @@ struct NetlinkSocketState {
     bound: Option<SockAddrNl>,
     messages: VecDeque<[u8; MQ_THREAD_NOTIFY_COOKIE_LEN]>,
     recv_waiters: VecDeque<Weak<TaskControlBlock>>,
+    poll_waiters: PollWaitQueue,
 }
 
 pub(crate) struct NetlinkSocketFile {
@@ -549,6 +578,7 @@ impl NetlinkSocketFile {
                 bound: None,
                 messages: VecDeque::new(),
                 recv_waiters: VecDeque::new(),
+                poll_waiters: PollWaitQueue::default(),
             }),
         }
     }
@@ -621,10 +651,9 @@ impl NetlinkSocketFile {
                     wake.push(task);
                 }
             }
+            wake.extend(st.poll_waiters.take_wakeups());
         }
-        for task in wake {
-            wakeup_task(task);
-        }
+        wake_tasks(wake);
     }
 
     fn recv_packet(
@@ -700,6 +729,11 @@ impl File for NetlinkSocketFile {
 
     fn supports_poll(&self) -> bool {
         true
+    }
+
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        let mut st = self.state.lock();
+        st.poll_waiters.register_waiter(task)
     }
 
     fn as_any(&self) -> &dyn Any {

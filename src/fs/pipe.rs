@@ -9,7 +9,7 @@ use spin::Mutex;
 use crate::{
     bpf::BpfProgFile,
     debug_config::DEBUG_UNIXBENCH,
-    fs::{find_path_in_roots, File, POLLERR, POLLHUP, POLLIN, POLLOUT},
+    fs::{find_path_in_roots, wake_tasks, File, PollWaitQueue, POLLERR, POLLHUP, POLLIN, POLLOUT},
     mm::UserBuffer,
     task::{
         manager::{wakeup_task, PID2PCB},
@@ -125,7 +125,18 @@ impl Pipe {
     }
 
     pub fn set_pipe_size(&self, size: usize) -> Result<usize, isize> {
-        self.buffer.lock().set_pipe_size(size)
+        let (ret, pollers) = {
+            let mut ring = self.buffer.lock();
+            let ret = ring.set_pipe_size(size);
+            let pollers = if ret.is_ok() {
+                ring.drain_poll_waiters()
+            } else {
+                Vec::new()
+            };
+            (ret, pollers)
+        };
+        wake_tasks(pollers);
+        ret
     }
 
     pub fn set_end_ref_bias(&self, read_bias: usize, write_bias: usize) {
@@ -247,10 +258,12 @@ impl Pipe {
                 *byte = ring_buffer.read_byte();
             }
             let writer = ring_buffer.pop_writer();
+            let pollers = ring_buffer.drain_poll_waiters();
             drop(ring_buffer);
             if let Some(writer) = writer {
                 wakeup_task(writer);
             }
+            wake_tasks(pollers);
             return Ok(to_read);
         }
     }
@@ -309,6 +322,11 @@ impl Pipe {
             } else {
                 None
             };
+            let pollers = if to_write > 0 {
+                ring_buffer.drain_poll_waiters()
+            } else {
+                Vec::new()
+            };
             let async_notify = if to_write > 0 {
                 ring_buffer.async_target()
             } else {
@@ -334,6 +352,7 @@ impl Pipe {
             if let Some(reader) = reader_to_wake {
                 wakeup_task(reader);
             }
+            wake_tasks(pollers);
             if written == data.len() || nonblock {
                 return Ok(written);
             }
@@ -396,6 +415,7 @@ pub struct PipeRingBuffer {
     write_end_ref_bias: usize,
     read_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
     write_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
+    poll_waiters: PollWaitQueue,
     async_enabled: bool,
     async_owner_type: i32,
     async_owner_pid: i32,
@@ -419,6 +439,7 @@ impl PipeRingBuffer {
             write_end_ref_bias: 0,
             read_waiters: VecDeque::new(),
             write_waiters: VecDeque::new(),
+            poll_waiters: PollWaitQueue::default(),
             async_enabled: false,
             async_owner_type: F_OWNER_PID,
             async_owner_pid: 0,
@@ -632,6 +653,25 @@ impl PipeRingBuffer {
         self.write_waiters.drain(..).collect()
     }
 
+    fn add_poll_waiter_once(
+        &mut self,
+        task: &Arc<crate::task::task_block::TaskControlBlock>,
+    ) -> bool {
+        self.poll_waiters.add_waiter_once(task)
+    }
+
+    fn register_poll_waiter(
+        &mut self,
+        task: &Arc<crate::task::task_block::TaskControlBlock>,
+    ) -> bool {
+        let _ = self.add_poll_waiter_once(task);
+        true
+    }
+
+    fn drain_poll_waiters(&mut self) -> Vec<Arc<crate::task::task_block::TaskControlBlock>> {
+        self.poll_waiters.take_wakeups()
+    }
+
     fn async_target(&self) -> Option<(i32, i32, i32, i32)> {
         if !self.async_enabled || self.async_owner_pid <= 0 {
             return None;
@@ -820,6 +860,22 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
     (read_end, write_end)
 }
 
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        let (readers, writers, pollers) = {
+            let mut ring = self.buffer.lock();
+            (
+                ring.drain_readers(),
+                ring.drain_writers(),
+                ring.drain_poll_waiters(),
+            )
+        };
+        wake_tasks(readers);
+        wake_tasks(writers);
+        wake_tasks(pollers);
+    }
+}
+
 impl File for Pipe {
     fn readable(&self) -> bool {
         self.readable
@@ -914,10 +970,16 @@ impl File for Pipe {
             } else {
                 None
             };
+            let pollers = if read_now > 0 {
+                ring_buffer.drain_poll_waiters()
+            } else {
+                Vec::new()
+            };
             drop(ring_buffer);
             if let Some(writer) = writer {
                 wakeup_task(writer);
             }
+            wake_tasks(pollers);
             return read_now;
         }
     }
@@ -959,6 +1021,10 @@ impl File for Pipe {
 
     fn supports_poll(&self) -> bool {
         true
+    }
+
+    fn register_poll_waiter(&self, task: &Arc<crate::task::task_block::TaskControlBlock>) -> bool {
+        self.buffer.lock().register_poll_waiter(task)
     }
 
     fn as_any(&self) -> &dyn core::any::Any {

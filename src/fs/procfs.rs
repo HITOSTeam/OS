@@ -10,12 +10,11 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    File, NamespaceFile, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag,
-    PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, root_inode_for_path,
-    secondary_root_inode,
+    ext4_lock, find_path_in_roots, root_inode_for_path, secondary_root_inode, File, NamespaceFile,
+    OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile,
 };
-use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages};
-use crate::task::manager::{PID2PCB, pid2process};
+use crate::mm::{frame_available_pages, PTEFlags, UserBuffer, VirtAddr};
+use crate::task::manager::{pid2process, PID2PCB};
 use crate::task::processor::current_process;
 use crate::task::task_block::TaskStatus;
 
@@ -195,7 +194,11 @@ impl File for ProcPseudoFile {
 
 pub fn proc_root_inode_num() -> Option<u32> {
     let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 { None } else { Some(ino) }
+    if ino == 0 {
+        None
+    } else {
+        Some(ino)
+    }
 }
 
 pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
@@ -1358,7 +1361,10 @@ fn proc_pid_status(pid: u32) -> String {
         .iter()
         .flatten()
         .next()
-        .and_then(|t| t.try_borrow_mut().map(|ti| (ti.task_status, ti.cgroup_frozen)))
+        .and_then(|t| {
+            t.try_borrow_mut()
+                .map(|ti| (ti.task_status, ti.cgroup_frozen))
+        })
         .unwrap_or((TaskStatus::Ready, false));
     let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
     let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
@@ -1450,7 +1456,10 @@ fn proc_pid_stat(pid: u32) -> String {
         .iter()
         .flatten()
         .next()
-        .and_then(|t| t.try_borrow_mut().map(|ti| (ti.task_status, ti.cgroup_frozen)))
+        .and_then(|t| {
+            t.try_borrow_mut()
+                .map(|ti| (ti.task_status, ti.cgroup_frozen))
+        })
         .unwrap_or((TaskStatus::Ready, false));
     let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
     let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();

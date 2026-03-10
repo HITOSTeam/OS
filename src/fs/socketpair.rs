@@ -83,6 +83,15 @@ impl File for SocketPairEnd {
         true
     }
 
+    fn register_poll_waiter(
+        &self,
+        task: &alloc::sync::Arc<crate::task::task_block::TaskControlBlock>,
+    ) -> bool {
+        let _ = self.read_end.register_poll_waiter(task);
+        let _ = self.write_end.register_poll_waiter(task);
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

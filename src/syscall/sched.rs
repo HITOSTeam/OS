@@ -6,14 +6,14 @@ use crate::{
     mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value},
     syscall::misc::decode_linux_tid,
     task::{
-        ProcessControlBlock,
         manager::{pid2process, refresh_process_runqueues},
         processor::{current_process, hart_id, suspend_current_and_run_next},
         sched::{
-            RR_TIMESLICE_MS, SCHED_BATCH, SCHED_DEADLINE, SCHED_IDLE, SCHED_OTHER, SchedClass,
             check_policy, clamp_nice, policy_priority_max, policy_priority_min, sched_class,
-            valid_priority_for_policy,
+            valid_priority_for_policy, SchedClass, RR_TIMESLICE_MS, SCHED_BATCH, SCHED_DEADLINE,
+            SCHED_IDLE, SCHED_OTHER,
         },
+        ProcessControlBlock,
     },
     trap::get_current_token,
 };

@@ -9,7 +9,16 @@ mod pseudo;
 mod socketpair;
 mod stdio;
 mod tty;
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use crate::mm::UserBuffer;
+use crate::task::{
+    manager::wakeup_task,
+    task_block::{TaskControlBlock, TaskStatus},
+};
 use core::any::Any;
 
 pub(crate) const POLLIN: i16 = 0x0001;
@@ -45,7 +54,67 @@ pub trait File: Send + Sync {
     fn supports_poll(&self) -> bool {
         false
     }
+    /// Register a task that should be woken when this file's readiness may have changed.
+    ///
+    /// Returns true when the file supports a real waiter path and can actively wake the task.
+    fn register_poll_waiter(&self, _task: &Arc<TaskControlBlock>) -> bool {
+        false
+    }
     fn as_any(&self) -> &dyn Any;
+}
+
+#[derive(Default)]
+pub(crate) struct PollWaitQueue {
+    waiters: VecDeque<Weak<TaskControlBlock>>,
+}
+
+impl PollWaitQueue {
+    fn retain_waitable(&mut self) {
+        self.waiters.retain(|waiter| {
+            let Some(task) = waiter.upgrade() else {
+                return false;
+            };
+            let inner = task.borrow_mut();
+            inner.res.is_some() && inner.task_status != TaskStatus::Ready
+        });
+    }
+
+    pub(crate) fn add_waiter_once(&mut self, task: &Arc<TaskControlBlock>) -> bool {
+        self.retain_waitable();
+        if self
+            .waiters
+            .iter()
+            .any(|waiter| waiter.upgrade().is_some_and(|t| Arc::ptr_eq(&t, task)))
+        {
+            return false;
+        }
+        self.waiters.push_back(Arc::downgrade(task));
+        true
+    }
+
+    pub(crate) fn register_waiter(&mut self, task: &Arc<TaskControlBlock>) -> bool {
+        let _ = self.add_waiter_once(task);
+        true
+    }
+
+    pub(crate) fn has_waiters(&mut self) -> bool {
+        self.retain_waitable();
+        !self.waiters.is_empty()
+    }
+
+    pub(crate) fn take_wakeups(&mut self) -> Vec<Arc<TaskControlBlock>> {
+        self.retain_waitable();
+        self.waiters
+            .drain(..)
+            .filter_map(|waiter| waiter.upgrade())
+            .collect()
+    }
+}
+
+pub(crate) fn wake_tasks(tasks: Vec<Arc<TaskControlBlock>>) {
+    for task in tasks {
+        wakeup_task(task);
+    }
 }
 
 pub use cgroupfs::{
@@ -56,12 +125,14 @@ pub use cgroupfs::{
     cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path, legacy_cpu_fair_group, open_cgroup_pseudo,
     CgroupFile, CgroupMountSpec,
 };
+pub(crate) use dummy::wake_pidfd_poll_waiters;
 pub use dummy::{DummyFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, register_deferred_unlink_cleanup,
     root_inode_for_path, secondary_root_inode,
 };
 pub use inode::{list_apps, open_file, OSInode, OpenFlags, EXT4_FS, ROOT_INODE, USER_INODE};
+pub(crate) use net_socket::notify_net_poll_events;
 pub use net_socket::{NetSocketFile, NetSocketKind};
 pub(crate) use pipe::remove_task_waiters as remove_pipe_waiters_for_task;
 pub use pipe::{debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe, Pipe};

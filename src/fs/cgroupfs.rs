@@ -14,12 +14,13 @@ use crate::fs::{File, PseudoDir, PseudoDirent};
 use crate::mm::UserBuffer;
 use crate::syscall::misc::{decode_linux_tid_strict, encode_linux_tid};
 use crate::task::{
+    manager::{pid2process, PID2PCB},
     manager::{refresh_process_runqueues, wakeup_task},
-    manager::{PID2PCB, pid2process},
-    process_visible_in_pid_namespace, resolve_process_in_pid_namespace,
+    process_visible_in_pid_namespace,
     processor::{block_current_and_run_next, current_process, current_task},
-    sched::{SchedClass, sched_class},
-    signal::{SIGKILL_NUM, queue_process_signal},
+    resolve_process_in_pid_namespace,
+    sched::{sched_class, SchedClass},
+    signal::{queue_process_signal, SIGKILL_NUM},
     task_block::TaskStatus,
 };
 
@@ -889,7 +890,8 @@ fn process_sched_class(tgid: usize) -> Option<SchedClass> {
 }
 
 fn descendant_processes(state: &CgroupMountState, path: &str) -> Vec<usize> {
-    state.thread_assignments
+    state
+        .thread_assignments
         .iter()
         .filter_map(|(thread_id, thread_path)| {
             CgroupMountState::is_descendant_or_self(thread_path, path).then_some(thread_id.tgid)
@@ -1588,8 +1590,8 @@ impl CgroupFile {
                     match text.parse::<usize>().map_err(|_| EINVAL)? {
                         0 => current_process().getpid(),
                         visible_pid => {
-                            let process =
-                                resolve_process_in_pid_namespace(pid_ns_id, visible_pid).ok_or(ESRCH)?;
+                            let process = resolve_process_in_pid_namespace(pid_ns_id, visible_pid)
+                                .ok_or(ESRCH)?;
                             process.getpid()
                         }
                     }
@@ -1598,9 +1600,12 @@ impl CgroupFile {
                     return Err(ESRCH);
                 }
                 if state.kind == CgroupMountKind::LegacyCpu {
-                    let has_rt_threads = live_thread_ids_for_process(pid)
-                        .into_iter()
-                        .any(|thread_id| process_sched_class(thread_id.tgid) != Some(SchedClass::Fair));
+                    let has_rt_threads =
+                        live_thread_ids_for_process(pid)
+                            .into_iter()
+                            .any(|thread_id| {
+                                process_sched_class(thread_id.tgid) != Some(SchedClass::Fair)
+                            });
                     if has_rt_threads {
                         return Err(EINVAL);
                     }

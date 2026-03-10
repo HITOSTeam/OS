@@ -9,7 +9,7 @@ use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
-use crate::fs::{File, Stdin, Stdout, cgroup_attach_fork_child};
+use crate::fs::{cgroup_attach_fork_child, File, PollWaitQueue, Stdin, Stdout};
 use crate::mm::{
     ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
 };
@@ -1003,6 +1003,8 @@ pub struct ProcessControlBlockInner {
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
     /// Tasks waiting in `waitpid(-1/...)` for this process's children.
     pub wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    /// Tasks waiting on pidfd readiness for this process to become waitable.
+    pub pidfd_poll_waiters: PollWaitQueue,
 }
 
 impl ProcessControlBlockInner {
@@ -1451,6 +1453,7 @@ impl ProcessControlBlock {
                 semaphore_list: Vec::new(),
                 condvar_list: Vec::new(),
                 wait_queue: VecDeque::new(),
+                pidfd_poll_waiters: PollWaitQueue::default(),
             }),
         });
         // new只会被主线程调用?,反正这里我们要手动创建一个 Task线程
@@ -1948,6 +1951,7 @@ impl ProcessControlBlock {
                 semaphore_list: Vec::new(),
                 condvar_list: Vec::new(),
                 wait_queue: VecDeque::new(),
+                pidfd_poll_waiters: PollWaitQueue::default(),
             }),
         });
         if share_files {

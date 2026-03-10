@@ -34,7 +34,7 @@ use crate::{
             block_current_and_run_next, current_files_process, current_process, current_task,
             hart_id, suspend_current_and_run_next,
         },
-        sched::{SchedClass, sched_class},
+        sched::{sched_class, SchedClass},
         signal::{
             pending_unmasked_bits, queue_process_signal, SignalFlags, MAX_SIG, RT_SIG_MAX,
             SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM, SIG_DFL, SIG_IGN,

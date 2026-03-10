@@ -351,6 +351,12 @@ impl File for FifoDuplexFile {
         true
     }
 
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        let _ = self.read_end.register_poll_waiter(task);
+        let _ = self.write_end.register_poll_waiter(task);
+        true
+    }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }

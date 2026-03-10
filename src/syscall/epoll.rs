@@ -9,11 +9,12 @@ use spin::Mutex;
 
 use crate::{
     config::clock_freq,
-    fs::File,
+    fs::{wake_tasks, File, PollWaitQueue, POLLIN},
     mm::{try_read_user_value, try_write_user_value, UserBuffer},
     task::{
-        processor::{current_files_process, current_task},
+        processor::{block_current_and_run_next, current_files_process, current_task},
         signal::{has_unmasked_pending, signal_bit, SIGKILL_NUM, SIGSTOP_NUM},
+        task_block::TaskControlBlock,
     },
     time::get_time,
     trap::get_current_token,
@@ -90,12 +91,14 @@ struct EntryUpdate {
 
 pub(crate) struct EpollFile {
     interests: Mutex<BTreeMap<usize, EpollInterest>>,
+    poll_waiters: Mutex<PollWaitQueue>,
 }
 
 impl EpollFile {
     pub fn new() -> Self {
         Self {
             interests: Mutex::new(BTreeMap::new()),
+            poll_waiters: Mutex::new(PollWaitQueue::default()),
         }
     }
 
@@ -194,6 +197,11 @@ impl EpollFile {
                 entry.oneshot_disabled = true;
             }
         }
+    }
+
+    fn notify_poll_waiters(&self) {
+        let waiters = self.poll_waiters.lock().take_wakeups();
+        wake_tasks(waiters);
     }
 
     fn contains_epoll_recursive(&self, target_id: usize, visited: &mut BTreeSet<usize>) -> bool {
@@ -325,6 +333,38 @@ impl EpollFile {
         }
         (events, updates)
     }
+
+    fn register_poll_waiter_internal(
+        &self,
+        task: &Arc<TaskControlBlock>,
+        visited: &mut BTreeSet<usize>,
+    ) -> bool {
+        let my_id = self.id();
+        if !visited.insert(my_id) {
+            return true;
+        }
+        let _ = self.poll_waiters.lock().register_waiter(task);
+        let snapshots = self.snapshot_interests();
+        for snap in snapshots {
+            if snap.oneshot_disabled {
+                continue;
+            }
+            if Self::event_watch_mask(snap.events) == 0 {
+                continue;
+            }
+            let supported = if let Some(child) = snap.file.as_any().downcast_ref::<EpollFile>() {
+                child.register_poll_waiter_internal(task, visited)
+            } else {
+                snap.file.register_poll_waiter(task)
+            };
+            if !supported {
+                visited.remove(&my_id);
+                return false;
+            }
+        }
+        visited.remove(&my_id);
+        true
+    }
 }
 
 impl File for EpollFile {
@@ -344,8 +384,22 @@ impl File for EpollFile {
         0
     }
 
+    fn poll_mask(&self) -> i16 {
+        let mut visited = BTreeSet::new();
+        if self.peek_has_ready_internal(&mut visited) {
+            POLLIN
+        } else {
+            0
+        }
+    }
+
     fn supports_poll(&self) -> bool {
         true
+    }
+
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        let mut visited = BTreeSet::new();
+        self.register_poll_waiter_internal(task, &mut visited)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -507,6 +561,33 @@ fn epoll_wait_common(
             _ => {}
         }
 
+        let waiter_armed = {
+            let ep = fd_to_epoll_ref(&epoll_file);
+            let snapshots = ep.snapshot_interests();
+            let mut armed = false;
+            let mut unsupported = false;
+            for snap in snapshots {
+                if snap.oneshot_disabled {
+                    continue;
+                }
+                if EpollFile::event_watch_mask(snap.events) == 0 {
+                    continue;
+                }
+                if snap.file.register_poll_waiter(&task) {
+                    armed = true;
+                } else {
+                    unsupported = true;
+                }
+            }
+            armed && !unsupported
+        };
+
+        match should_block(&epoll_file, maxevents as usize, token, events_ptr) {
+            Ok(ready) if ready > 0 => break ready,
+            Err(e) => break e,
+            _ => {}
+        }
+
         if let Some(deadline) = deadline_ns {
             let now = now_ns();
             if now >= deadline {
@@ -527,6 +608,8 @@ fn epoll_wait_common(
                     break EINTR;
                 }
             }
+        } else if waiter_armed {
+            block_current_and_run_next();
         } else {
             // We do not have wait-queue registration for all epoll targets yet,
             // so keep the task in a stable sleeping state long enough for
@@ -615,7 +698,7 @@ pub fn syscall_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) ->
         }
     }
 
-    match op {
+    let ret = match op {
         EPOLL_CTL_ADD => {
             let ev = event.expect("ADD has event");
             match ep.add_interest(fd, &target_file, ev.events, ev.data) {
@@ -635,7 +718,11 @@ pub fn syscall_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) ->
             Err(e) => e,
         },
         _ => EINVAL,
+    };
+    if ret == 0 {
+        ep.notify_poll_waiters();
     }
+    ret
 }
 
 pub fn syscall_epoll_pwait(

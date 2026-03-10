@@ -1,10 +1,9 @@
 use alloc::vec;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use lazy_static::lazy_static;
 use smoltcp::{
-    iface::{Config, Interface, SocketHandle, SocketSet},
+    iface::{Config, Interface, SocketSet},
     phy::{Loopback, Medium},
     time::Instant,
     wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address},
@@ -59,6 +58,8 @@ pub fn poll() {
         return;
     };
     let _ = stack.iface.poll(now(), &mut stack.dev, &mut stack.sockets);
+    drop(net);
+    crate::fs::notify_net_poll_events();
 }
 
 pub fn alloc_ephemeral_port() -> u16 {

@@ -1,9 +1,12 @@
 use alloc::sync::Arc;
 
 use crate::{
-    fs::{DummyFile, File, PidFdFile, PseudoShmFile, UserfaultfdFile, shm_create_anonymous},
+    fs::{shm_create_anonymous, DummyFile, File, PidFdFile, PseudoShmFile, UserfaultfdFile},
     mm::try_copy_from_user,
-    task::{manager::pid2process, processor::{current_files_process, current_process}},
+    task::{
+        manager::pid2process,
+        processor::{current_files_process, current_process},
+    },
     trap::get_current_token,
 };
 

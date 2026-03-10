@@ -10,13 +10,13 @@ use crate::{
     config::PAGE_SIZE,
     mm::UserBuffer,
     task::{
-        manager::wakeup_task,
+        manager::{pid2process, wakeup_task},
         processor::{block_current_and_run_next, current_task},
         task_block::TaskControlBlock,
     },
 };
 
-use super::{File, POLLIN};
+use super::{wake_tasks, File, PollWaitQueue, POLLIN};
 
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const UFFD_PAGEFAULT_FLAG_WRITE: u64 = 1 << 0;
@@ -132,6 +132,13 @@ impl PidFdFile {
     pub fn target_pid(&self) -> usize {
         self.target_pid
     }
+
+    fn poll_readable(&self) -> bool {
+        match pid2process(self.target_pid()) {
+            Some(proc) => proc.borrow_mut().is_zombie,
+            None => true,
+        }
+    }
 }
 
 impl File for PidFdFile {
@@ -152,11 +159,7 @@ impl File for PidFdFile {
     }
 
     fn poll_mask(&self) -> i16 {
-        let readable = match crate::task::manager::pid2process(self.target_pid()) {
-            Some(proc) => proc.borrow_mut().is_zombie,
-            None => true,
-        };
-        if readable {
+        if self.poll_readable() {
             POLLIN
         } else {
             0
@@ -164,6 +167,20 @@ impl File for PidFdFile {
     }
 
     fn supports_poll(&self) -> bool {
+        true
+    }
+
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        if self.poll_readable() {
+            return true;
+        }
+        if let Some(process) = pid2process(self.target_pid()) {
+            let mut inner = process.borrow_mut();
+            if inner.is_zombie {
+                return true;
+            }
+            let _ = inner.pidfd_poll_waiters.register_waiter(task);
+        }
         true
     }
 
@@ -219,6 +236,7 @@ struct UserfaultfdInner {
     pending: VecDeque<UffdMsg>,
     blocked_pages: BTreeMap<usize, Vec<Weak<TaskControlBlock>>>,
     read_waiters: Vec<Weak<TaskControlBlock>>,
+    poll_waiters: PollWaitQueue,
 }
 
 pub struct UserfaultfdFile {
@@ -234,6 +252,7 @@ impl UserfaultfdFile {
                 pending: VecDeque::new(),
                 blocked_pages: BTreeMap::new(),
                 read_waiters: Vec::new(),
+                poll_waiters: PollWaitQueue::default(),
             }),
         }
     }
@@ -302,11 +321,10 @@ impl UserfaultfdFile {
                     false
                 }
             });
+            ready.extend(inner.poll_waiters.take_wakeups());
             ready
         };
-        for task in waiters {
-            wakeup_task(task);
-        }
+        wake_tasks(waiters);
         block_current_and_run_next();
         true
     }
@@ -397,7 +415,27 @@ impl File for UserfaultfdFile {
         true
     }
 
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner.pending.is_empty() {
+            return true;
+        }
+        let _ = inner.poll_waiters.register_waiter(task);
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+pub(crate) fn wake_pidfd_poll_waiters(pid: usize) {
+    let Some(process) = pid2process(pid) else {
+        return;
+    };
+    let waiters = {
+        let mut inner = process.borrow_mut();
+        inner.pidfd_poll_waiters.take_wakeups()
+    };
+    wake_tasks(waiters);
 }
