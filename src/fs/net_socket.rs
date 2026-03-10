@@ -957,6 +957,24 @@ impl crate::fs::File for NetSocketFile {
         }
     }
 
+    fn poll_mask(&self) -> i16 {
+        let mut mask = 0;
+        if self.poll_readable() {
+            mask |= crate::fs::POLLIN;
+        }
+        if self.poll_writable() {
+            mask |= crate::fs::POLLOUT;
+        }
+        if self.poll_rdhup() {
+            mask |= crate::fs::POLLRDHUP;
+        }
+        mask
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

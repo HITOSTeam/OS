@@ -10,10 +10,10 @@ use spin::Mutex;
 use crate::{
     config::clock_freq,
     fs::File,
-    mm::{UserBuffer, try_read_user_value, try_write_user_value},
+    mm::{try_read_user_value, try_write_user_value, UserBuffer},
     task::{
         processor::{current_files_process, current_task},
-        signal::{SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
+        signal::{has_unmasked_pending, signal_bit, SIGKILL_NUM, SIGSTOP_NUM},
     },
     time::get_time,
     trap::get_current_token,
@@ -24,12 +24,16 @@ const EPOLL_CTL_DEL: isize = 2;
 const EPOLL_CTL_MOD: isize = 3;
 
 const EPOLLIN: u32 = 0x001;
+const EPOLLPRI: u32 = 0x002;
 const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
 const EPOLLRDHUP: u32 = 0x2000;
 const EPOLLET: u32 = 1u32 << 31;
 const EPOLLONESHOT: u32 = 1u32 << 30;
 
-const EPOLL_READY_MASK: u32 = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+const EPOLL_READY_MASK: u32 = EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLRDHUP;
+const EPOLL_ALWAYS_REPORT_MASK: u32 = EPOLLERR | EPOLLHUP;
 const EPOLL_CLOEXEC: usize = 0x80000;
 const FD_CLOEXEC: u32 = 1;
 const MAX_EPOLL_NESTING: usize = 5;
@@ -43,6 +47,7 @@ const EMFILE: isize = -24;
 const ENOENT: isize = -2;
 const EPERM: isize = -1;
 const ELOOP: isize = -40;
+const EPOLL_IDLE_SLEEP_MS: usize = 10;
 
 type FileArc = Arc<dyn File + Send + Sync>;
 
@@ -51,6 +56,13 @@ type FileArc = Arc<dyn File + Send + Sync>;
 struct UserEpollEvent {
     events: u32,
     data: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct EpollTimeSpec {
+    sec: i64,
+    nsec: i64,
 }
 
 struct EpollInterest {
@@ -225,7 +237,7 @@ impl EpollFile {
     }
 
     fn event_watch_mask(events: u32) -> u32 {
-        events & EPOLL_READY_MASK
+        (events & EPOLL_READY_MASK) | EPOLL_ALWAYS_REPORT_MASK
     }
 
     fn is_edge_trigger(events: u32) -> bool {
@@ -237,24 +249,15 @@ impl EpollFile {
     }
 
     fn file_ready_mask(file: &FileArc, watch_mask: u32, visited: &mut BTreeSet<usize>) -> u32 {
-        let mut ready = 0u32;
         if let Some(child) = file.as_any().downcast_ref::<EpollFile>() {
+            let mut ready = 0u32;
             if (watch_mask & EPOLLIN) != 0 && child.peek_has_ready_internal(visited) {
                 ready |= EPOLLIN;
             }
             return ready;
         }
-        let (readable, writable, rdhup) = crate::syscall::net::poll_file_epoll(file);
-        if readable && (watch_mask & EPOLLIN) != 0 {
-            ready |= EPOLLIN;
-        }
-        if writable && (watch_mask & EPOLLOUT) != 0 {
-            ready |= EPOLLOUT;
-        }
-        if rdhup && (watch_mask & EPOLLRDHUP) != 0 {
-            ready |= EPOLLRDHUP;
-        }
-        ready
+        let ready = file.poll_mask() as u16 as u32;
+        ready & watch_mask
     }
 
     fn peek_has_ready_internal(&self, visited: &mut BTreeSet<usize>) -> bool {
@@ -341,6 +344,10 @@ impl File for EpollFile {
         0
     }
 
+    fn supports_poll(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -419,6 +426,126 @@ fn now_ns() -> u64 {
     (get_time() as u64)
         .saturating_mul(1_000_000_000)
         .saturating_div(clock_freq() as u64)
+}
+
+fn timespec_to_deadline_ns(ts: EpollTimeSpec) -> Result<u64, isize> {
+    if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1_000_000_000 {
+        return Err(EINVAL);
+    }
+    let delta_ns = (ts.sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.nsec as u64);
+    Ok(now_ns().saturating_add(delta_ns))
+}
+
+fn install_sigmask(
+    token: usize,
+    task: &crate::task::task_block::TaskControlBlock,
+    sigmask: usize,
+    sigsetsize: usize,
+) -> Result<Option<u64>, isize> {
+    if sigmask == 0 {
+        return Ok(None);
+    }
+    if sigsetsize < size_of::<u64>() {
+        return Err(EINVAL);
+    }
+    let Some(mut new_mask) = try_read_user_value::<u64>(token, sigmask as *const u64) else {
+        return Err(EFAULT);
+    };
+    let sigkill_bit = signal_bit(SIGKILL_NUM).unwrap_or(0);
+    let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
+    new_mask &= !(sigkill_bit | sigstop_bit);
+    let old_mask = {
+        let mut inner = task.borrow_mut();
+        let old = inner.signal_mask;
+        inner.signal_mask = new_mask;
+        old
+    };
+    Ok(Some(old_mask))
+}
+
+fn restore_sigmask(task: &crate::task::task_block::TaskControlBlock, old_mask: Option<u64>) {
+    if let Some(old_mask) = old_mask {
+        let mut inner = task.borrow_mut();
+        inner.signal_mask = old_mask;
+    }
+}
+
+fn epoll_wait_common(
+    epoll_file: FileArc,
+    events_ptr: usize,
+    maxevents: usize,
+    deadline_ns: Option<u64>,
+    sigmask: usize,
+    sigsetsize: usize,
+) -> isize {
+    let maxevents = maxevents as isize;
+    if maxevents <= 0 || maxevents > i32::MAX as isize {
+        return EINVAL;
+    }
+
+    let token = get_current_token();
+    let task = current_task().unwrap();
+    let restore_mask = match install_sigmask(token, &task, sigmask, sigsetsize) {
+        Ok(mask) => mask,
+        Err(e) => return e,
+    };
+
+    let ret = loop {
+        let (pending, mask) = {
+            let inner = task.borrow_mut();
+            (inner.pending_signals, inner.signal_mask)
+        };
+        if has_unmasked_pending(pending, mask, true) {
+            break EINTR;
+        }
+
+        match should_block(&epoll_file, maxevents as usize, token, events_ptr) {
+            Ok(ready) if ready > 0 => break ready,
+            Err(e) => break e,
+            _ => {}
+        }
+
+        if let Some(deadline) = deadline_ns {
+            let now = now_ns();
+            if now >= deadline {
+                break 0;
+            }
+            let remain_ns = deadline.saturating_sub(now);
+            let mut sleep_ms = ((remain_ns.saturating_add(999_999)) / 1_000_000) as usize;
+            if sleep_ms == 0 {
+                sleep_ms = 1;
+            }
+            let r = crate::syscall::thread::sys_sleep(sleep_ms);
+            if r == EINTR {
+                let (pending, mask) = {
+                    let inner = task.borrow_mut();
+                    (inner.pending_signals, inner.signal_mask)
+                };
+                if has_unmasked_pending(pending, mask, true) {
+                    break EINTR;
+                }
+            }
+        } else {
+            // We do not have wait-queue registration for all epoll targets yet,
+            // so keep the task in a stable sleeping state long enough for
+            // signal/peer-driven wakeup tests to observe it as blocked.
+            let r = crate::syscall::thread::sys_sleep(EPOLL_IDLE_SLEEP_MS);
+            if r == EINTR {
+                let (pending, mask) = {
+                    let inner = task.borrow_mut();
+                    (inner.pending_signals, inner.signal_mask)
+                };
+                if has_unmasked_pending(pending, mask, true) {
+                    break EINTR;
+                }
+            }
+        }
+    };
+
+    restore_sigmask(&task, restore_mask);
+    ret
 }
 
 pub fn syscall_epoll_create1(flags: usize) -> isize {
@@ -523,10 +650,6 @@ pub fn syscall_epoll_pwait(
         Ok(f) => f,
         Err(e) => return e,
     };
-    let maxevents = maxevents as isize;
-    if maxevents <= 0 || maxevents > i32::MAX as isize {
-        return EINVAL;
-    }
     let timeout = timeout as isize;
     let deadline_ns = if timeout < -1 {
         return EINVAL;
@@ -535,81 +658,48 @@ pub fn syscall_epoll_pwait(
     } else {
         Some(now_ns().saturating_add((timeout as u64).saturating_mul(1_000_000)))
     };
+    epoll_wait_common(
+        epoll_file,
+        events_ptr,
+        maxevents,
+        deadline_ns,
+        sigmask,
+        sigsetsize,
+    )
+}
 
-    let token = get_current_token();
-    let task = current_task().unwrap();
-    let mut restore_mask = None;
-    if sigmask != 0 {
-        if sigsetsize < size_of::<u64>() {
-            return EINVAL;
-        }
-        let Some(mut new_mask) = try_read_user_value::<u64>(token, sigmask as *const u64) else {
+pub fn syscall_epoll_pwait2(
+    epfd: usize,
+    events_ptr: usize,
+    maxevents: usize,
+    timeout_ptr: usize,
+    sigmask: usize,
+    sigsetsize: usize,
+) -> isize {
+    let epoll_file = match get_epoll_file(epfd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let deadline_ns = if timeout_ptr == 0 {
+        None
+    } else {
+        let token = get_current_token();
+        let Some(ts) =
+            try_read_user_value::<EpollTimeSpec>(token, timeout_ptr as *const EpollTimeSpec)
+        else {
             return EFAULT;
         };
-        let sigkill_bit = signal_bit(SIGKILL_NUM).unwrap_or(0);
-        let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
-        new_mask &= !(sigkill_bit | sigstop_bit);
-        let old_mask = {
-            let mut inner = task.borrow_mut();
-            let old = inner.signal_mask;
-            inner.signal_mask = new_mask;
-            old
-        };
-        restore_mask = Some(old_mask);
-    }
-
-    let ret = loop {
-        let (pending, mask) = {
-            let inner = task.borrow_mut();
-            (inner.pending_signals, inner.signal_mask)
-        };
-        if has_unmasked_pending(pending, mask, true) {
-            break EINTR;
-        }
-
-        match should_block(&epoll_file, maxevents as usize, token, events_ptr) {
-            Ok(ready) if ready > 0 => break ready,
-            Err(e) => break e,
-            _ => {}
-        }
-
-        if let Some(deadline) = deadline_ns {
-            let now = now_ns();
-            if now >= deadline {
-                break 0;
-            }
-            let remain_ns = deadline.saturating_sub(now);
-            let mut sleep_ms = ((remain_ns.saturating_add(999_999)) / 1_000_000) as usize;
-            if sleep_ms == 0 {
-                sleep_ms = 1;
-            }
-            let r = crate::syscall::thread::sys_sleep(sleep_ms);
-            if r == EINTR {
-                let (pending, mask) = {
-                    let inner = task.borrow_mut();
-                    (inner.pending_signals, inner.signal_mask)
-                };
-                if has_unmasked_pending(pending, mask, true) {
-                    break EINTR;
-                }
-            }
-        } else {
-            let r = crate::syscall::thread::sys_sleep(1);
-            if r == EINTR {
-                let (pending, mask) = {
-                    let inner = task.borrow_mut();
-                    (inner.pending_signals, inner.signal_mask)
-                };
-                if has_unmasked_pending(pending, mask, true) {
-                    break EINTR;
-                }
-            }
+        match timespec_to_deadline_ns(ts) {
+            Ok(deadline) => Some(deadline),
+            Err(e) => return e,
         }
     };
-
-    if let Some(old_mask) = restore_mask {
-        let mut inner = task.borrow_mut();
-        inner.signal_mask = old_mask;
-    }
-    ret
+    epoll_wait_common(
+        epoll_file,
+        events_ptr,
+        maxevents,
+        deadline_ns,
+        sigmask,
+        sigsetsize,
+    )
 }

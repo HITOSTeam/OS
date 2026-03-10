@@ -340,6 +340,17 @@ impl File for FifoDuplexFile {
         self.write_end.write(buf)
     }
 
+    fn poll_mask(&self) -> i16 {
+        let read_mask = self.read_end.poll_mask();
+        let write_mask = self.write_end.poll_mask();
+        (read_mask & (crate::fs::POLLIN | crate::fs::POLLHUP))
+            | (write_mask & (crate::fs::POLLOUT | crate::fs::POLLERR))
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -5221,7 +5232,13 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
     0
 }
 
-fn do_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize, strict_flags: bool) -> isize {
+fn do_fchmodat(
+    dirfd: isize,
+    pathname: usize,
+    mode: usize,
+    flags: usize,
+    strict_flags: bool,
+) -> isize {
     let valid_flags = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
     if strict_flags && (flags & !valid_flags) != 0 {
         return EINVAL;

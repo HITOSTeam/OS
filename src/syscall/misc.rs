@@ -1,29 +1,30 @@
 use crate::{
     arch,
-    config::{PAGE_SIZE, clock_freq, phys_mem_end, phys_mem_start},
+    config::{clock_freq, phys_mem_end, phys_mem_start, PAGE_SIZE},
     debug_config::DEBUG_PTHREAD,
     fs::{
-        LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind, PseudoKindTag, PtyMasterFile,
-        PtySlaveFile, TtyFile, UserfaultfdFile, ext4_lock, pseudo_block_is_read_only,
-        pseudo_block_read_ahead, pseudo_block_set_read_ahead, pseudo_block_set_read_only,
+        ext4_lock, pseudo_block_is_read_only, pseudo_block_read_ahead, pseudo_block_set_read_ahead,
+        pseudo_block_set_read_only, LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind,
+        PseudoKindTag, PtyMasterFile, PtySlaveFile, TtyFile, UserfaultfdFile, POLLERR, POLLHUP,
+        POLLNVAL,
     },
     mm::{
-        MapPermission, VirtAddr, frame_available_pages, read_user_value, translated_byte_buffer,
-        translated_str, try_copy_from_user, try_copy_to_user, try_read_user_value,
-        try_write_user_value, write_user_value,
+        frame_available_pages, read_user_value, translated_byte_buffer, translated_str,
+        try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
+        write_user_value, MapPermission, VirtAddr,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
-        manager::{PID2PCB, pid2process, refresh_process_runqueues},
+        manager::{pid2process, refresh_process_runqueues, PID2PCB},
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
         signal::{
-            SIGKILL_NUM, SIGSTOP_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal,
-            signal_bit,
+            has_unmasked_pending, queue_process_signal, signal_bit, SIGKILL_NUM, SIGSTOP_NUM,
+            SIGXCPU_NUM,
         },
     },
     time::{get_time, get_time_ms},
@@ -810,7 +811,11 @@ pub fn syscall_getppid() -> isize {
 }
 
 fn normalized_pgid(pid: usize, pgid: usize) -> usize {
-    if pgid == 0 && pid != 0 { pid } else { pgid }
+    if pgid == 0 && pid != 0 {
+        pid
+    } else {
+        pgid
+    }
 }
 
 fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {
@@ -2065,9 +2070,6 @@ pub fn syscall_ppoll(
     _sigmask: usize,
     _sigsetsize: usize,
 ) -> isize {
-    const POLLIN: i16 = 0x0001;
-    const POLLOUT: i16 = 0x0004;
-    const POLLNVAL: i16 = 0x0020;
     const EINTR: isize = -4;
     if (nfds as isize) < 0 {
         return EINVAL;
@@ -2162,13 +2164,8 @@ pub fn syscall_ppoll(
             };
 
             let mut revents: i16 = 0;
-            let (readable, writable) = crate::syscall::net::poll_file_read_write(&file);
-            if (pfd.events & POLLIN) != 0 && readable {
-                revents |= POLLIN;
-            }
-            if (pfd.events & POLLOUT) != 0 && writable {
-                revents |= POLLOUT;
-            }
+            let mask = file.poll_mask();
+            revents |= mask & (pfd.events | POLLERR | POLLHUP);
             pfd.revents = revents;
             if revents != 0 {
                 ready += 1;
@@ -2191,7 +2188,13 @@ pub fn syscall_ppoll(
                 }
                 let r = crate::syscall::thread::sys_sleep(sleep_ms);
                 if r == EINTR {
-                    break EINTR;
+                    let (pending, mask) = {
+                        let inner = task.borrow_mut();
+                        (inner.pending_signals, inner.signal_mask)
+                    };
+                    if has_unmasked_pending(pending, mask, true) {
+                        break EINTR;
+                    }
                 }
             } else {
                 crate::task::processor::suspend_current_and_run_next();
@@ -2316,7 +2319,9 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(mut api) = try_read_user_value::<UffdioApi>(token, _argp as *const UffdioApi) else {
+                let Some(mut api) =
+                    try_read_user_value::<UffdioApi>(token, _argp as *const UffdioApi)
+                else {
                     return EFAULT;
                 };
                 if api.api != UFFD_API {
@@ -2333,13 +2338,19 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(mut reg) = try_read_user_value::<UffdioRegister>(token, _argp as *const UffdioRegister) else {
+                let Some(mut reg) =
+                    try_read_user_value::<UffdioRegister>(token, _argp as *const UffdioRegister)
+                else {
                     return EFAULT;
                 };
                 if reg.mode != UFFDIO_REGISTER_MODE_MISSING {
                     return EINVAL;
                 }
-                let Ok(ioctls) = uffd.register_missing(reg.range.start as usize, reg.range.len as usize, reg.mode) else {
+                let Ok(ioctls) = uffd.register_missing(
+                    reg.range.start as usize,
+                    reg.range.len as usize,
+                    reg.mode,
+                ) else {
                     return EINVAL;
                 };
                 reg.ioctls = ioctls;
@@ -2352,7 +2363,9 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if _argp == 0 {
                     return EFAULT;
                 }
-                let Some(mut copy) = try_read_user_value::<UffdioCopy>(token, _argp as *const UffdioCopy) else {
+                let Some(mut copy) =
+                    try_read_user_value::<UffdioCopy>(token, _argp as *const UffdioCopy)
+                else {
                     return EFAULT;
                 };
                 let len = copy.len as usize;
@@ -2378,7 +2391,10 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                     let process = current_process();
                     let mut inner = process.borrow_mut();
                     let start = copy.dst as usize & !(PAGE_SIZE - 1);
-                    let end = ((copy.dst as usize).saturating_add(len).saturating_add(PAGE_SIZE - 1)) & !(PAGE_SIZE - 1);
+                    let end = ((copy.dst as usize)
+                        .saturating_add(len)
+                        .saturating_add(PAGE_SIZE - 1))
+                        & !(PAGE_SIZE - 1);
                     let mut page = start;
                     while page < end {
                         let mapped = inner
@@ -2403,7 +2419,11 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 if try_write_user_value(token, _argp as *mut UffdioCopy, &copy).is_err() {
                     return EFAULT;
                 }
-                uffd.finish_copy(copy.dst as usize, len, (copy.mode & UFFDIO_COPY_MODE_DONTWAKE) == 0);
+                uffd.finish_copy(
+                    copy.dst as usize,
+                    len,
+                    (copy.mode & UFFDIO_COPY_MODE_DONTWAKE) == 0,
+                );
                 return 0;
             }
             _ => return ENOTTY,

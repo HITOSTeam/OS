@@ -3,8 +3,10 @@ use core::any::Any;
 
 use crate::{bpf::BpfProgFile, mm::UserBuffer};
 
-use super::pipe::{make_pipe, Pipe};
-use super::File;
+use super::{
+    pipe::{make_pipe, Pipe},
+    File, POLLERR, POLLHUP, POLLIN, POLLOUT,
+};
 
 /// A minimal full-duplex endpoint used to implement `socketpair(AF_UNIX, SOCK_STREAM, ...)`.
 ///
@@ -69,6 +71,16 @@ impl File for SocketPairEnd {
 
     fn write(&self, buf: UserBuffer) -> usize {
         self.write_end.write(buf)
+    }
+
+    fn poll_mask(&self) -> i16 {
+        let read_mask = self.read_end.poll_mask();
+        let write_mask = self.write_end.poll_mask();
+        (read_mask & (POLLIN | POLLHUP)) | (write_mask & (POLLOUT | POLLERR))
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -9,8 +9,8 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::mm::{
-    UserBuffer, read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
-    try_write_user_value,
+    read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
+    try_write_user_value, UserBuffer,
 };
 use crate::syscall::filesystem::normalize_path;
 use crate::task::manager::{pid2process, wakeup_task};
@@ -23,8 +23,8 @@ use crate::trap::get_current_token;
 use crate::{
     bpf::get_prog_clone,
     fs::{
-        File, NetSocketFile, PidFdFile, SocketPairEnd, UserfaultfdFile, ext4_lock, find_path_in_roots,
-        make_socketpair,
+        ext4_lock, find_path_in_roots, make_socketpair, File, NetSocketFile, SocketPairEnd,
+        POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDHUP,
     },
 };
 
@@ -486,6 +486,38 @@ impl File for UnixSocketFile {
         n
     }
 
+    fn poll_mask(&self) -> i16 {
+        if self.is_stream_like() {
+            let (listening, pending_accept, stream_end) = {
+                let st = self.state.lock();
+                (
+                    st.listening,
+                    !st.pending_accept.is_empty(),
+                    st.stream_end.clone(),
+                )
+            };
+            if listening {
+                return if pending_accept { POLLIN } else { 0 };
+            }
+            if let Some(end) = stream_end {
+                return end.poll_mask();
+            }
+            return 0;
+        }
+        if self.is_dgram() {
+            let mut mask = POLLOUT;
+            if !self.state.lock().dgram_queue.is_empty() {
+                mask |= POLLIN;
+            }
+            return mask;
+        }
+        0
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -658,6 +690,18 @@ impl File for NetlinkSocketFile {
         copy_user_buffer_to_vec(buf).len()
     }
 
+    fn poll_mask(&self) -> i16 {
+        let mut mask = POLLOUT;
+        if !self.state.lock().messages.is_empty() {
+            mask |= POLLIN;
+        }
+        mask
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -803,53 +847,8 @@ fn visible_send_result(ret: isize, user_len: usize, had_pending: bool) -> isize 
     }
 }
 
-pub(crate) fn poll_file_read_write(file: &Arc<dyn File + Send + Sync>) -> (bool, bool) {
-    if let Some(pidfd) = file.as_any().downcast_ref::<PidFdFile>() {
-        // pidfd becomes readable once the target exits (zombie or already reaped).
-        let readable = match pid2process(pidfd.target_pid()) {
-            Some(proc) => proc.borrow_mut().is_zombie,
-            None => true,
-        };
-        return (readable, false);
-    }
-    if let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() {
-        return (uffd.poll_readable(), false);
-    }
-    if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
-        return (pipe.poll_readable(), pipe.poll_writable());
-    }
-    if let Some(sp) = file.as_any().downcast_ref::<SocketPairEnd>() {
-        return (sp.poll_readable(), sp.poll_writable());
-    }
-    if let Some(ns) = file.as_any().downcast_ref::<NetSocketFile>() {
-        return (ns.poll_readable(), ns.poll_writable());
-    }
-    if let Some(us) = file.as_any().downcast_ref::<UnixSocketFile>() {
-        return (us.poll_readable(), us.poll_writable());
-    }
-    if let Some(nl) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
-        return (nl.poll_readable(), nl.poll_writable());
-    }
-    (file.readable(), file.writable())
-}
-
 pub(crate) fn file_supports_poll(file: &Arc<dyn File + Send + Sync>) -> bool {
-    file.as_any().downcast_ref::<PidFdFile>().is_some()
-        || file.as_any().downcast_ref::<UserfaultfdFile>().is_some()
-        || file.as_any().downcast_ref::<crate::fs::Pipe>().is_some()
-        || file.as_any().downcast_ref::<SocketPairEnd>().is_some()
-        || file.as_any().downcast_ref::<NetSocketFile>().is_some()
-        || file.as_any().downcast_ref::<UnixSocketFile>().is_some()
-        || file.as_any().downcast_ref::<NetlinkSocketFile>().is_some()
-}
-
-pub(crate) fn poll_file_epoll(file: &Arc<dyn File + Send + Sync>) -> (bool, bool, bool) {
-    let (readable, writable) = poll_file_read_write(file);
-    let mut rdhup = false;
-    if let Some(ns) = file.as_any().downcast_ref::<NetSocketFile>() {
-        rdhup = ns.poll_rdhup();
-    }
-    (readable, writable, rdhup)
+    file.supports_poll()
 }
 
 fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {

@@ -12,6 +12,14 @@ mod tty;
 use crate::mm::UserBuffer;
 use core::any::Any;
 
+pub(crate) const POLLIN: i16 = 0x0001;
+pub(crate) const POLLPRI: i16 = 0x0002;
+pub(crate) const POLLOUT: i16 = 0x0004;
+pub(crate) const POLLERR: i16 = 0x0008;
+pub(crate) const POLLHUP: i16 = 0x0010;
+pub(crate) const POLLNVAL: i16 = 0x0020;
+pub(crate) const POLLRDHUP: i16 = 0x2000;
+
 /// File trait
 pub trait File: Send + Sync {
     /// If readable
@@ -22,6 +30,21 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// Write `UserBuffer` to file
     fn write(&self, buf: UserBuffer) -> usize;
+    /// Linux-style readiness mask used by select/poll/epoll family syscalls.
+    fn poll_mask(&self) -> i16 {
+        let mut mask = 0;
+        if self.readable() {
+            mask |= POLLIN;
+        }
+        if self.writable() {
+            mask |= POLLOUT;
+        }
+        mask
+    }
+    /// Whether this file can be registered in an epoll set.
+    fn supports_poll(&self) -> bool {
+        false
+    }
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -30,8 +53,8 @@ pub use cgroupfs::{
     cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process, cgroup_exit_thread,
     cgroup_fork_precheck, cgroup_logical_path_for_file, cgroup_maybe_block_current, cgroup_mkdir,
     cgroup_mount, cgroup_proc_cgroups_content, cgroup_proc_pid_content, cgroup_rename,
-    cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path, legacy_cpu_fair_group,
-    open_cgroup_pseudo, CgroupFile, CgroupMountSpec,
+    cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path, legacy_cpu_fair_group, open_cgroup_pseudo,
+    CgroupFile, CgroupMountSpec,
 };
 pub use dummy::{DummyFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
 pub(crate) use inode::{

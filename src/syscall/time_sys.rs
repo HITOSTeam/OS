@@ -1,6 +1,7 @@
 use crate::{
     config::clock_freq,
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
+    fs::{POLLIN, POLLOUT, POLLPRI},
     mm::{
         read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
         try_write_user_value, write_user_value,
@@ -11,11 +12,11 @@ use crate::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
     },
-    task::signal::{SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
+    task::signal::{has_unmasked_pending, signal_bit, SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM},
     task::{
-        ProcessControlBlock,
         manager::pid2process,
         processor::{current_files_process, current_process, current_task},
+        ProcessControlBlock,
     },
     time::get_time,
     trap::get_current_token,
@@ -143,7 +144,11 @@ fn posix_timer_thread_cpu_time_ns(pid: usize, tid: usize) -> Option<u64> {
     Some(task_cpu_time_ns(&task))
 }
 
-pub(crate) fn timer_clock_now_ns(clock_id: usize, pid: usize, thread_tid: Option<usize>) -> Option<u64> {
+pub(crate) fn timer_clock_now_ns(
+    clock_id: usize,
+    pid: usize,
+    thread_tid: Option<usize>,
+) -> Option<u64> {
     match clock_id {
         CLOCK_REALTIME => Some(realtime_now_ns()),
         CLOCK_MONOTONIC => Some(now_ns()),
@@ -639,8 +644,9 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
             }
             CLOCK_PROCESS_CPUTIME_ID => process_cpu_time_ns(&current_process())
                 .saturating_add(running_cpu_time_fine_adjust_ns()),
-            CLOCK_THREAD_CPUTIME_ID => current_thread_cpu_time_ns()
-                .saturating_add(running_cpu_time_fine_adjust_ns()),
+            CLOCK_THREAD_CPUTIME_ID => {
+                current_thread_cpu_time_ns().saturating_add(running_cpu_time_fine_adjust_ns())
+            }
             _ => return EINVAL,
         }
     };
@@ -762,7 +768,8 @@ pub fn syscall_timer_gettime(timer_id: isize, curr_ptr: usize) -> isize {
         return EFAULT;
     }
     let pid = current_process().getpid();
-    let Ok((clock_id, deadline_ns, interval_ns, thread_tid)) = query_posix_timer(pid, timer_id as usize)
+    let Ok((clock_id, deadline_ns, interval_ns, thread_tid)) =
+        query_posix_timer(pid, timer_id as usize)
     else {
         return EINVAL;
     };
@@ -1323,14 +1330,20 @@ pub fn syscall_pselect6(
                 break;
             };
 
-            let (r_ok, w_ok) = crate::syscall::net::poll_file_read_write(&file);
-
-            if want_r && r_ok {
+            let mask_now = file.poll_mask();
+            if want_r && (mask_now & crate::fs::POLLHUP) != 0 {
+                out_r[byte] |= mask;
+                ready += 1;
+            } else if want_r && (mask_now & POLLIN) != 0 {
                 out_r[byte] |= mask;
                 ready += 1;
             }
-            if want_w && w_ok {
+            if want_w && (mask_now & POLLOUT) != 0 {
                 out_w[byte] |= mask;
+                ready += 1;
+            }
+            if want_e && (mask_now & POLLPRI) != 0 {
+                out_e[byte] |= mask;
                 ready += 1;
             }
         }

@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-use super::File;
+use super::{File, POLLIN};
 
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const UFFD_PAGEFAULT_FLAG_WRITE: u64 = 1 << 0;
@@ -151,6 +151,22 @@ impl File for PidFdFile {
         0
     }
 
+    fn poll_mask(&self) -> i16 {
+        let readable = match crate::task::manager::pid2process(self.target_pid()) {
+            Some(proc) => proc.borrow_mut().is_zombie,
+            None => true,
+        };
+        if readable {
+            POLLIN
+        } else {
+            0
+        }
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -241,7 +257,9 @@ impl UserfaultfdFile {
         if !inner.api_enabled {
             return Err(EINVAL);
         }
-        inner.registrations.push(UffdRegistration { start, end, mode });
+        inner
+            .registrations
+            .push(UffdRegistration { start, end, mode });
         Ok(UFFD_REGISTER_IOCTLS)
     }
 
@@ -250,12 +268,11 @@ impl UserfaultfdFile {
         let waiters = {
             let mut inner = self.inner.lock();
             if !inner.api_enabled
-                || !inner
-                    .registrations
-                    .iter()
-                    .any(|reg| reg.mode == UFFDIO_REGISTER_MODE_MISSING
+                || !inner.registrations.iter().any(|reg| {
+                    reg.mode == UFFDIO_REGISTER_MODE_MISSING
                         && fault_addr >= reg.start
-                        && fault_addr < reg.end)
+                        && fault_addr < reg.end
+                })
             {
                 return false;
             }
@@ -266,9 +283,12 @@ impl UserfaultfdFile {
                     .or_default()
                     .push(Arc::downgrade(&task));
             }
-            if !inner.blocked_pages.contains_key(&page) || !inner.pending.iter().any(|msg| {
-                msg.event == UFFD_EVENT_PAGEFAULT && (msg.pagefault.address as usize & !(PAGE_SIZE - 1)) == page
-            }) {
+            if !inner.blocked_pages.contains_key(&page)
+                || !inner.pending.iter().any(|msg| {
+                    msg.event == UFFD_EVENT_PAGEFAULT
+                        && (msg.pagefault.address as usize & !(PAGE_SIZE - 1)) == page
+                })
+            {
                 inner
                     .pending
                     .push_back(UffdMsg::pagefault(fault_addr, is_write));
@@ -363,6 +383,18 @@ impl File for UserfaultfdFile {
 
     fn write(&self, _buf: UserBuffer) -> usize {
         0
+    }
+
+    fn poll_mask(&self) -> i16 {
+        if self.poll_readable() {
+            POLLIN
+        } else {
+            0
+        }
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
     }
 
     fn as_any(&self) -> &dyn Any {

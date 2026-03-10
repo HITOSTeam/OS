@@ -9,7 +9,7 @@ use spin::Mutex;
 use crate::{
     bpf::BpfProgFile,
     debug_config::DEBUG_UNIXBENCH,
-    fs::{find_path_in_roots, File},
+    fs::{find_path_in_roots, File, POLLERR, POLLHUP, POLLIN, POLLOUT},
     mm::UserBuffer,
     task::{
         manager::{wakeup_task, PID2PCB},
@@ -934,6 +934,31 @@ impl File for Pipe {
             }
         }
         self.write_from_slice(data.as_slice(), false).unwrap_or(0)
+    }
+
+    fn poll_mask(&self) -> i16 {
+        let ring = self.buffer.lock();
+        let mut mask = 0;
+        if self.readable {
+            if ring.available_read() > 0 {
+                mask |= POLLIN;
+            }
+            if ring.all_write_ends_closed() {
+                mask |= POLLHUP;
+            }
+        }
+        if self.writable {
+            if ring.all_read_ends_closed() {
+                mask |= POLLERR;
+            } else if ring.available_write() >= ring.poll_writable_threshold() {
+                mask |= POLLOUT;
+            }
+        }
+        mask
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
     }
 
     fn as_any(&self) -> &dyn core::any::Any {

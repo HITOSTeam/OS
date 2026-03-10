@@ -78,6 +78,7 @@ const SYSCALL_EVENTFD2: usize = 19;
 const SYSCALL_EPOLL_CREATE1: usize = 20;
 const SYSCALL_EPOLL_CTL: usize = 21;
 const SYSCALL_EPOLL_PWAIT: usize = 22;
+const SYSCALL_EPOLL_PWAIT2: usize = 441;
 const SYSCALL_INOTIFY_INIT1: usize = 26;
 const SYSCALL_SETXATTR: usize = 5;
 const SYSCALL_LSETXATTR: usize = 6;
@@ -358,7 +359,11 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         if is_cyclic {
             let left = CYCLIC_SYSCALL_LOGS
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    if val == 0 { None } else { Some(val - 1) }
+                    if val == 0 {
+                        None
+                    } else {
+                        Some(val - 1)
+                    }
                 })
                 .unwrap_or(0);
             if left > 0 {
@@ -482,6 +487,9 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_EPOLL_CTL => epoll::syscall_epoll_ctl(args[0], args[1], args[2], args[3]),
         SYSCALL_EPOLL_PWAIT => {
             epoll::syscall_epoll_pwait(args[0], args[1], args[2], args[3], args[4], args[5])
+        }
+        SYSCALL_EPOLL_PWAIT2 => {
+            epoll::syscall_epoll_pwait2(args[0], args[1], args[2], args[3], args[4], args[5])
         }
         SYSCALL_INOTIFY_INIT1 => dummy::syscall_inotify_init1(args[0]),
         SYSCALL_SETXATTR => {
