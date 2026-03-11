@@ -942,13 +942,11 @@ fn thread_cpu_time_ns(thread_id: CgroupThreadId) -> u64 {
     let Some(process) = pid2process(thread_id.tgid) else {
         return 0;
     };
-    let inner = process.borrow_mut();
-    inner
-        .tasks
-        .get(thread_id.tid_index)
-        .and_then(|task| task.as_ref())
-        .map(|task| task.borrow_mut().cpu_time_ns)
-        .unwrap_or(0)
+    let Some(task) = crate::task::runtime::process_task_by_index(&process, thread_id.tid_index)
+    else {
+        return 0;
+    };
+    crate::task::runtime::task_cpu_time_ns(&task)
 }
 
 fn path_under_mount(abs: &str, mount: &str) -> bool {

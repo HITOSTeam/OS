@@ -499,6 +499,8 @@ pub struct TaskControlBlockInner {
     pub rr_ticks: usize,
     /// Best-effort per-thread CPU runtime used for *_CPUTIME clocks.
     pub cpu_time_ns: u64,
+    /// Monotonic timestamp captured when the task most recently started running.
+    pub runtime_start_ns: u64,
     /// CPU runtime snapshot used to charge fair-group virtual runtime when the
     /// task returns to a runqueue.
     pub fair_runtime_checkpoint_ns: u64,
@@ -588,6 +590,7 @@ impl TaskControlBlock {
                 wake_on_cgroup_thaw: false,
                 rr_ticks: 0,
                 cpu_time_ns: 0,
+                runtime_start_ns: 0,
                 fair_runtime_checkpoint_ns: 0,
                 nice: process_nice,
                 nice_query_hint: false,
@@ -666,6 +669,7 @@ impl TaskControlBlock {
                 wake_on_cgroup_thaw: false,
                 rr_ticks: 0,
                 cpu_time_ns: 0,
+                runtime_start_ns: 0,
                 fair_runtime_checkpoint_ns: 0,
                 nice: process_nice,
                 nice_query_hint: false,
@@ -690,6 +694,36 @@ impl Drop for TaskControlBlock {
     fn drop(&mut self) {
         TASK_TCB_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         maybe_log_tcb_inflight("drop");
+    }
+}
+
+impl TaskControlBlock {
+    /// Account runtime consumed since the last charge point while the task is running.
+    pub(crate) fn account_runtime_until(&self, now_ns: u64) -> u64 {
+        let mut inner = self.borrow_mut();
+        let delta_ns = now_ns.saturating_sub(inner.runtime_start_ns);
+        if delta_ns > 0 {
+            inner.cpu_time_ns = inner.cpu_time_ns.saturating_add(delta_ns);
+            inner.runtime_start_ns = now_ns;
+        }
+        delta_ns
+    }
+
+    /// Mark the task as newly running from `now_ns`.
+    pub(crate) fn begin_runtime_slice(&self, now_ns: u64) {
+        self.borrow_mut().runtime_start_ns = now_ns;
+    }
+
+    /// Return total charged CPU time, including the currently running slice.
+    pub(crate) fn cpu_time_total_ns(&self, now_ns: u64) -> u64 {
+        let inner = self.borrow_mut();
+        if self.on_cpu.load(Ordering::Acquire) != Self::OFF_CPU {
+            inner
+                .cpu_time_ns
+                .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
+        } else {
+            inner.cpu_time_ns
+        }
     }
 }
 

@@ -23,6 +23,12 @@ pub fn get_time() -> usize {
     read_time()
 }
 
+/// get current time in nanoseconds from the monotonic clock source
+pub fn get_time_ns() -> u64 {
+    let freq = clock_freq() as u128;
+    ((read_time() as u128).saturating_mul(1_000_000_000u128) / freq) as u64
+}
+
 /// get current time in milliseconds
 pub fn get_time_ms() -> usize {
     read_time() / (clock_freq() / MSEC_PER_SEC)

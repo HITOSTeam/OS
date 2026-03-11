@@ -13,6 +13,7 @@ use crate::{
             has_ready_rt_higher_than, remove_inactive_task, wakeup_task,
         },
         process_block::ProcessControlBlock,
+        runtime::{charge_running_task, monotonic_time_ns, start_task_runtime_slice},
         sched::{RR_TIMESLICE_TICKS, RT_PRIO_MIN, SchedClass, sched_class},
         switch,
         task_block::{TaskControlBlock, TaskStatus},
@@ -339,12 +340,10 @@ fn fair_timeslice_ticks(nice: i32) -> usize {
 
 /// Best-effort per-thread CPU accounting used by *_CPUTIME clocks.
 pub fn account_current_task_tick() {
-    const TICK_NS: u64 = 10_000_000; // 100Hz
     let Some(task) = current_task() else {
         return;
     };
-    let mut inner = task.borrow_mut();
-    inner.cpu_time_ns = inner.cpu_time_ns.saturating_add(TICK_NS);
+    charge_running_task(&task);
 }
 pub struct Processor {
     now_task_block: Option<Arc<TaskControlBlock>>,
@@ -705,6 +704,8 @@ pub fn idle_task() {
             }
             let mut processor = local_processor().lock();
             let idle_task_cx_ptr = processor.get_idle_task_ptr();
+            let now_ns = monotonic_time_ns();
+            start_task_runtime_slice(&task, now_ns);
             // access coming task TCB exclusively
             let mut task_inner = task.borrow_mut();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
@@ -824,6 +825,7 @@ pub fn suspend_current_and_run_next() {
     }
     // There must be an application running.
     let task = take_current_task().unwrap();
+    charge_running_task(&task);
 
     // ---- access current TCB exclusively
     let mut task_inner = task.borrow_mut();
@@ -853,6 +855,7 @@ pub fn block_current_and_run_next() {
     }
     // There must be an application running.
     let task = take_current_task().unwrap();
+    charge_running_task(&task);
 
     // ---- access current TCB exclusively
     let mut task_inner = task.borrow_mut();
@@ -896,6 +899,7 @@ pub const IDLE_PID: usize = 0;
 pub fn exit_current_and_run_next(exit_code: i32) {
     // 标记线程状态,
     let task = take_current_task().unwrap();
+    charge_running_task(&task);
     // This task will never be scheduled again; ensure it is considered off CPU.
     task.clear_on_cpu();
     let Some(process) = task.process.upgrade() else {

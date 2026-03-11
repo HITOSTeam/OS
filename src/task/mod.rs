@@ -28,6 +28,7 @@ pub(crate) use process_block::{
     register_pid_namespace, resolve_process_in_pid_namespace,
 };
 pub mod processor;
+pub mod runtime;
 pub mod sched;
 pub mod semaphore;
 pub mod signal;

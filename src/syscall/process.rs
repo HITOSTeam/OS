@@ -1018,15 +1018,13 @@ fn enqueue_waiter_once(
 fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     // Main-thread resources are already detached in exit path; this aggressively
     // drops lingering task Arcs so kernel stacks are reclaimed on reap.
-    let (tasks, cpu_ns) = {
+    let cpu_ns = crate::task::runtime::process_cpu_time_ns_at(
+        child,
+        crate::task::runtime::monotonic_time_ns(),
+    );
+    let tasks = {
         let mut inner = child.borrow_mut();
-        let cpu_ns = inner
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref())
-            .map(|task| task.borrow_mut().cpu_time_ns)
-            .fold(0u64, |acc, v| acc.saturating_add(v));
-        (core::mem::take(&mut inner.tasks), cpu_ns)
+        core::mem::take(&mut inner.tasks)
     };
     let child_pid = child.getpid();
     for task in tasks.into_iter().flatten() {

@@ -17,8 +17,11 @@ use crate::{
         ProcessControlBlock,
         manager::pid2process,
         processor::{current_files_process, current_process, current_task},
+        runtime::{
+            current_task_cpu_time_ns, process_cpu_time_ns, process_task_by_index, task_cpu_time_ns,
+        },
     },
-    time::get_time,
+    time::{get_time, get_time_ns},
     trap::get_current_token,
 };
 use alloc::sync::Arc;
@@ -30,8 +33,6 @@ static CLOCK_NS_LOGS: AtomicUsize = AtomicUsize::new(0);
 const DEFAULT_REALTIME_EPOCH_NS: i64 = 1_700_000_000_000_000_000;
 static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(DEFAULT_REALTIME_EPOCH_NS);
 const NSEC_PER_SEC: u64 = 1_000_000_000;
-const CPU_CLOCK_FINE_GRANULARITY_NS: u64 = 10_000_000;
-
 const CLOCK_REALTIME: usize = 0;
 const CLOCK_MONOTONIC: usize = 1;
 const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
@@ -108,13 +109,8 @@ impl AdjtimexState {
 
 static ADJTIMEX_STATE: Mutex<AdjtimexState> = Mutex::new(AdjtimexState::new());
 
-fn ticks_to_ns(ticks: u64) -> u64 {
-    let freq = clock_freq() as u128;
-    ((ticks as u128).saturating_mul(NSEC_PER_SEC as u128) / freq) as u64
-}
-
 fn now_ns() -> u64 {
-    ticks_to_ns(get_time() as u64)
+    get_time_ns()
 }
 
 fn realtime_now_ns() -> u64 {
@@ -137,10 +133,7 @@ fn posix_timer_process_cpu_time_ns(pid: usize) -> Option<u64> {
 
 fn posix_timer_thread_cpu_time_ns(pid: usize, tid: usize) -> Option<u64> {
     let process = pid2process(pid)?;
-    let task = {
-        let inner = process.borrow_mut();
-        inner.tasks.get(tid)?.as_ref().cloned()
-    }?;
+    let task = process_task_by_index(&process, tid)?;
     Some(task_cpu_time_ns(&task))
 }
 
@@ -208,36 +201,6 @@ fn decode_dynamic_cpu_clock(clk_id: i32) -> Option<DynamicCpuClock> {
     })
 }
 
-fn task_cpu_time_ns(task: &Arc<crate::task::task_block::TaskControlBlock>) -> u64 {
-    let inner = task.borrow_mut();
-    inner.cpu_time_ns
-}
-
-fn process_cpu_time_ns(process: &Arc<ProcessControlBlock>) -> u64 {
-    let tasks = {
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<alloc::vec::Vec<_>>()
-    };
-    tasks
-        .into_iter()
-        .map(|task| task_cpu_time_ns(&task))
-        .fold(0u64, |acc, ns| acc.saturating_add(ns))
-}
-
-fn current_thread_cpu_time_ns() -> u64 {
-    current_task()
-        .map(|task| task_cpu_time_ns(&task))
-        .unwrap_or(0)
-}
-
-fn running_cpu_time_fine_adjust_ns() -> u64 {
-    now_ns() % CPU_CLOCK_FINE_GRANULARITY_NS
-}
-
 fn resolve_thread_cpu_time_ns(target_tid_like: usize) -> Option<u64> {
     let process = current_process();
     let cur_pid = process.getpid();
@@ -249,13 +212,7 @@ fn resolve_thread_cpu_time_ns(target_tid_like: usize) -> Option<u64> {
         // Accept raw per-process thread indices as a compatibility fallback.
         Some(target_tid_like)
     }?;
-    let task = {
-        let inner = process.borrow_mut();
-        if tid >= inner.tasks.len() {
-            return None;
-        }
-        inner.tasks[tid].as_ref().cloned()
-    }?;
+    let task = process_task_by_index(&process, tid)?;
     Some(task_cpu_time_ns(&task))
 }
 
@@ -643,11 +600,8 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
             CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
                 now_ns()
             }
-            CLOCK_PROCESS_CPUTIME_ID => process_cpu_time_ns(&current_process())
-                .saturating_add(running_cpu_time_fine_adjust_ns()),
-            CLOCK_THREAD_CPUTIME_ID => {
-                current_thread_cpu_time_ns().saturating_add(running_cpu_time_fine_adjust_ns())
-            }
+            CLOCK_PROCESS_CPUTIME_ID => process_cpu_time_ns(&current_process()),
+            CLOCK_THREAD_CPUTIME_ID => current_task_cpu_time_ns(),
             _ => return EINVAL,
         }
     };

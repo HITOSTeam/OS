@@ -22,6 +22,7 @@ use crate::{
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
+        runtime::{current_task_cpu_time_ns, process_cpu_time_ns},
         signal::{
             SIGKILL_NUM, SIGSTOP_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal,
             signal_bit,
@@ -1546,16 +1547,6 @@ fn ns_to_rusage_timeval(ns: u64) -> RUsageTimeVal {
     }
 }
 
-fn process_cpu_time_ns(process: &Arc<crate::task::ProcessControlBlock>) -> u64 {
-    let inner = process.borrow_mut();
-    inner
-        .tasks
-        .iter()
-        .filter_map(|task| task.as_ref())
-        .map(|task| task.borrow_mut().cpu_time_ns)
-        .fold(0u64, |acc, ns| acc.saturating_add(ns))
-}
-
 /// Linux `getrusage(2)` (syscall 165 on riscv64).
 ///
 /// Report best-effort CPU time based on the scheduler's per-thread runtime
@@ -1572,9 +1563,7 @@ pub fn syscall_getrusage(who: isize, usage: usize) -> isize {
 
     let cpu_ns = match who {
         RUSAGE_SELF => process_cpu_time_ns(&current_process()),
-        RUSAGE_THREAD => current_task()
-            .map(|task| task.borrow_mut().cpu_time_ns)
-            .unwrap_or(0),
+        RUSAGE_THREAD => current_task_cpu_time_ns(),
         RUSAGE_CHILDREN => current_process().borrow_mut().child_cpu_time_ns,
         _ => return EINVAL,
     };
