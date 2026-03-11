@@ -13,7 +13,7 @@ use crate::task::block_sleep::check_timer;
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
-use crate::task::signal::{check_if_current_signals_error, signal_bit, MAX_SIG, SIG_DFL, SIG_IGN};
+use crate::task::signal::{MAX_SIG, SIG_DFL, SIG_IGN, check_if_current_signals_error, signal_bit};
 use crate::time::set_next_trigger;
 use riscv::{
     interrupt::Trap,

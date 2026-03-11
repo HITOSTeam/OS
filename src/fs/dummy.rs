@@ -4,6 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{any::Any, mem::size_of};
+use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::{
@@ -16,8 +17,10 @@ use crate::{
     },
 };
 
-use super::{wake_tasks, File, PollWaitQueue, POLLIN, POLLOUT};
+use super::{File, POLLIN, POLLOUT, PollWaitQueue, wake_tasks};
 
+const CLOCK_REALTIME: usize = 0;
+const CLOCK_MONOTONIC: usize = 1;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const UFFD_PAGEFAULT_FLAG_WRITE: u64 = 1 << 0;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
@@ -25,6 +28,7 @@ const UFFD_API_IOCTLS: u64 = (1u64 << 0) | (1u64 << 3) | (1u64 << 0x3f);
 const UFFD_REGISTER_IOCTLS: u64 = 1u64 << 3;
 const EINVAL: isize = -22;
 const EAGAIN: isize = -11;
+const ECANCELED: isize = -125;
 const EVENTFD_COUNTER_MAX: u64 = u64::MAX - 1;
 
 /// A minimal no-op file for stubbed syscalls.
@@ -100,7 +104,10 @@ impl EventFdFile {
         self.inner.lock().counter < EVENTFD_COUNTER_MAX
     }
 
-    fn add_waiter_once(waiters: &mut VecDeque<Weak<TaskControlBlock>>, task: &Arc<TaskControlBlock>) {
+    fn add_waiter_once(
+        waiters: &mut VecDeque<Weak<TaskControlBlock>>,
+        task: &Arc<TaskControlBlock>,
+    ) {
         waiters.retain(|waiter| waiter.upgrade().is_some());
         if waiters
             .iter()
@@ -256,6 +263,272 @@ impl File for EventFdFile {
     }
 }
 
+lazy_static! {
+    static ref TIMERFD_FILES: Mutex<Vec<Weak<TimerFdFile>>> = Mutex::new(Vec::new());
+}
+
+struct TimerFdInner {
+    deadline_ns: Option<u64>,
+    interval_ns: u64,
+    expirations: u64,
+    cancel_on_set: bool,
+    canceled: bool,
+    read_waiters: VecDeque<Weak<TaskControlBlock>>,
+    poll_waiters: PollWaitQueue,
+}
+
+pub struct TimerFdFile {
+    clock_id: usize,
+    inner: Mutex<TimerFdInner>,
+}
+
+impl TimerFdFile {
+    pub fn new(clock_id: usize) -> Arc<Self> {
+        let file = Arc::new(Self {
+            clock_id,
+            inner: Mutex::new(TimerFdInner {
+                deadline_ns: None,
+                interval_ns: 0,
+                expirations: 0,
+                cancel_on_set: false,
+                canceled: false,
+                read_waiters: VecDeque::new(),
+                poll_waiters: PollWaitQueue::default(),
+            }),
+        });
+        TIMERFD_FILES.lock().push(Arc::downgrade(&file));
+        file
+    }
+
+    pub fn clock_id(&self) -> usize {
+        self.clock_id
+    }
+
+    fn now_ns(clock_id: usize) -> Option<u64> {
+        match clock_id {
+            CLOCK_REALTIME | CLOCK_MONOTONIC => {
+                crate::syscall::timer_clock_now_ns(clock_id, 0, None)
+            }
+            _ => None,
+        }
+    }
+
+    fn add_waiter_once(
+        waiters: &mut VecDeque<Weak<TaskControlBlock>>,
+        task: &Arc<TaskControlBlock>,
+    ) {
+        waiters.retain(|waiter| waiter.upgrade().is_some());
+        if waiters
+            .iter()
+            .any(|waiter| waiter.upgrade().is_some_and(|t| Arc::ptr_eq(&t, task)))
+        {
+            return;
+        }
+        waiters.push_back(Arc::downgrade(task));
+    }
+
+    fn wake_read_waiters(
+        waiters: &mut VecDeque<Weak<TaskControlBlock>>,
+    ) -> Vec<Arc<TaskControlBlock>> {
+        let mut ready = Vec::new();
+        waiters.retain(|waiter| {
+            let Some(task) = waiter.upgrade() else {
+                return false;
+            };
+            ready.push(task);
+            false
+        });
+        ready
+    }
+
+    fn update_expirations_locked(inner: &mut TimerFdInner, now_ns: u64) -> bool {
+        if inner.canceled {
+            return false;
+        }
+        let prev_ready = inner.expirations > 0;
+        let Some(deadline_ns) = inner.deadline_ns else {
+            return false;
+        };
+        if now_ns < deadline_ns {
+            return false;
+        }
+        if inner.interval_ns == 0 {
+            inner.expirations = inner.expirations.saturating_add(1);
+            inner.deadline_ns = None;
+        } else {
+            let elapsed = now_ns.saturating_sub(deadline_ns);
+            let expirations = elapsed / inner.interval_ns + 1;
+            inner.expirations = inner.expirations.saturating_add(expirations);
+            inner.deadline_ns =
+                Some(deadline_ns.saturating_add(expirations.saturating_mul(inner.interval_ns)));
+        }
+        !prev_ready && inner.expirations > 0
+    }
+
+    fn flush_expirations(&self, inner: &mut TimerFdInner) -> bool {
+        let Some(now_ns) = Self::now_ns(self.clock_id) else {
+            return false;
+        };
+        Self::update_expirations_locked(inner, now_ns)
+    }
+
+    fn poll_mask_locked(&self, inner: &mut TimerFdInner) -> i16 {
+        let _ = self.flush_expirations(inner);
+        if inner.canceled || inner.expirations > 0 {
+            POLLIN
+        } else {
+            0
+        }
+    }
+
+    pub fn poll_readable(&self) -> bool {
+        let mut inner = self.inner.lock();
+        self.poll_mask_locked(&mut inner) != 0
+    }
+
+    pub fn read_counter(&self, nonblock: bool) -> Result<u64, isize> {
+        loop {
+            let mut inner = self.inner.lock();
+            let _ = self.flush_expirations(&mut inner);
+            if inner.canceled {
+                return Err(ECANCELED);
+            }
+            if inner.expirations > 0 {
+                let value = inner.expirations;
+                inner.expirations = 0;
+                return Ok(value);
+            }
+            if nonblock {
+                return Err(EAGAIN);
+            }
+            let Some(task) = current_task() else {
+                return Err(EAGAIN);
+            };
+            Self::add_waiter_once(&mut inner.read_waiters, &task);
+            drop(inner);
+            block_current_and_run_next();
+        }
+    }
+
+    pub fn get_time(&self) -> Result<(u64, u64), isize> {
+        let mut inner = self.inner.lock();
+        let _ = self.flush_expirations(&mut inner);
+        let remain_ns = if inner.canceled {
+            0
+        } else if let Some(deadline_ns) = inner.deadline_ns {
+            let Some(now_ns) = Self::now_ns(self.clock_id) else {
+                return Err(EINVAL);
+            };
+            deadline_ns.saturating_sub(now_ns)
+        } else {
+            0
+        };
+        Ok((remain_ns, inner.interval_ns))
+    }
+
+    pub fn set_time(
+        &self,
+        deadline_ns: Option<u64>,
+        interval_ns: u64,
+        cancel_on_set: bool,
+    ) -> Result<(u64, u64, bool), isize> {
+        let mut inner = self.inner.lock();
+        let _ = self.flush_expirations(&mut inner);
+        let was_canceled = inner.canceled;
+        let remain_ns = if inner.canceled {
+            0
+        } else if let Some(old_deadline_ns) = inner.deadline_ns {
+            let Some(now_ns) = Self::now_ns(self.clock_id) else {
+                return Err(EINVAL);
+            };
+            old_deadline_ns.saturating_sub(now_ns)
+        } else {
+            0
+        };
+        let old_interval_ns = inner.interval_ns;
+        inner.deadline_ns = deadline_ns;
+        inner.interval_ns = interval_ns;
+        inner.expirations = 0;
+        inner.cancel_on_set = cancel_on_set;
+        inner.canceled = false;
+        let became_ready = self.flush_expirations(&mut inner);
+        if became_ready {
+            let mut waiters = Self::wake_read_waiters(&mut inner.read_waiters);
+            waiters.extend(inner.poll_waiters.take_wakeups());
+            drop(inner);
+            wake_tasks(waiters);
+        }
+        Ok((remain_ns, old_interval_ns, was_canceled))
+    }
+
+    fn cancel_on_realtime_set(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if self.clock_id != CLOCK_REALTIME || !inner.cancel_on_set || inner.canceled {
+            return false;
+        }
+        inner.canceled = true;
+        inner.deadline_ns = None;
+        inner.expirations = 0;
+        let mut waiters = Self::wake_read_waiters(&mut inner.read_waiters);
+        waiters.extend(inner.poll_waiters.take_wakeups());
+        drop(inner);
+        wake_tasks(waiters);
+        true
+    }
+}
+
+impl File for TimerFdFile {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        false
+    }
+
+    fn read(&self, mut buf: UserBuffer) -> usize {
+        let Ok(value) = self.read_counter(false) else {
+            return 0;
+        };
+        let bytes = value.to_ne_bytes();
+        let mut copied = 0usize;
+        for slice in buf.buffers.iter_mut() {
+            let n = slice.len().min(bytes.len().saturating_sub(copied));
+            slice[..n].copy_from_slice(&bytes[copied..copied + n]);
+            copied += n;
+            if copied >= bytes.len() {
+                break;
+            }
+        }
+        copied
+    }
+
+    fn write(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn poll_mask(&self) -> i16 {
+        let mut inner = self.inner.lock();
+        self.poll_mask_locked(&mut inner)
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
+    }
+
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        let mut inner = self.inner.lock();
+        if self.poll_mask_locked(&mut inner) != 0 {
+            return true;
+        }
+        inner.poll_waiters.register_waiter(task)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NamespaceKind {
     Ipc,
@@ -356,11 +629,7 @@ impl File for PidFdFile {
     }
 
     fn poll_mask(&self) -> i16 {
-        if self.poll_readable() {
-            POLLIN
-        } else {
-            0
-        }
+        if self.poll_readable() { POLLIN } else { 0 }
     }
 
     fn supports_poll(&self) -> bool {
@@ -601,11 +870,7 @@ impl File for UserfaultfdFile {
     }
 
     fn poll_mask(&self) -> i16 {
-        if self.poll_readable() {
-            POLLIN
-        } else {
-            0
-        }
+        if self.poll_readable() { POLLIN } else { 0 }
     }
 
     fn supports_poll(&self) -> bool {
@@ -635,4 +900,49 @@ pub(crate) fn wake_pidfd_poll_waiters(pid: usize) {
         inner.pidfd_poll_waiters.take_wakeups()
     };
     wake_tasks(waiters);
+}
+
+pub(crate) fn process_timerfd_expirations() {
+    let files = {
+        let mut files = TIMERFD_FILES.lock();
+        let mut live = Vec::new();
+        files.retain(|file| {
+            let Some(file) = file.upgrade() else {
+                return false;
+            };
+            live.push(file);
+            true
+        });
+        live
+    };
+    for file in files {
+        let waiters = {
+            let mut inner = file.inner.lock();
+            if !file.flush_expirations(&mut inner) {
+                continue;
+            }
+            let mut waiters = TimerFdFile::wake_read_waiters(&mut inner.read_waiters);
+            waiters.extend(inner.poll_waiters.take_wakeups());
+            waiters
+        };
+        wake_tasks(waiters);
+    }
+}
+
+pub(crate) fn cancel_realtime_timerfds_on_set() {
+    let files = {
+        let mut files = TIMERFD_FILES.lock();
+        let mut live = Vec::new();
+        files.retain(|file| {
+            let Some(file) = file.upgrade() else {
+                return false;
+            };
+            live.push(file);
+            true
+        });
+        live
+    };
+    for file in files {
+        let _ = file.cancel_on_realtime_set();
+    }
 }

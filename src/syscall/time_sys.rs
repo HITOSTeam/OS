@@ -12,11 +12,11 @@ use crate::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
     },
-    task::signal::{has_unmasked_pending, signal_bit, SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM},
+    task::signal::{SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
     task::{
+        ProcessControlBlock,
         manager::pid2process,
         processor::{current_files_process, current_process, current_task},
-        ProcessControlBlock,
     },
     time::get_time,
     trap::get_current_token,
@@ -499,6 +499,7 @@ pub fn syscall_settimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
         .saturating_sub(current_mono_ns as i128)
         .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
+    crate::fs::cancel_realtime_timerfds_on_set();
     0
 }
 
@@ -686,6 +687,7 @@ pub fn syscall_clock_settime(clk_id: usize, tp_ptr: usize) -> isize {
         .saturating_sub(current_mono_ns as i128)
         .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
+    crate::fs::cancel_realtime_timerfds_on_set();
     0
 }
 

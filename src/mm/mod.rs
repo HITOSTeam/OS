@@ -25,8 +25,8 @@ pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
 pub use dtb::init_phys_mem_from_dtb;
 pub use frame_allocator::{
-    frame_alloc, frame_alloc_contiguous, frame_available_pages, frame_dealloc,
-    frame_refcount_entries, FrameTracker,
+    FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages, frame_dealloc,
+    frame_refcount_entries,
 };
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.
@@ -47,17 +47,17 @@ pub fn activate_kernel_space() {
 }
 pub(crate) use memory_set::elf_interp_path_from_reader;
 pub use memory_set::remap_test;
-pub use memory_set::{ElfAux, LazyFaultResult, MapPermission, MemorySet, KERNEL_SPACE};
+pub use memory_set::{ElfAux, KERNEL_SPACE, LazyFaultResult, MapPermission, MemorySet};
+pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub use page_table::{
-    copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
-    translated_single_address, translated_str, try_translated_byte_buffer, write_user_value,
-    PageTableEntry,
+    PageTableEntry, copy_from_user, copy_to_user, read_user_value, translated_byte_buffer,
+    translated_mutref, translated_single_address, translated_str, try_translated_byte_buffer,
+    write_user_value,
 };
 pub use page_table::{
     try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
     try_write_user_value,
 };
-pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub struct UserBuffer {
     pub buffers: Vec<&'static mut [u8]>,
 }

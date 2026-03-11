@@ -10,12 +10,12 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{
-        cgroup_attach_thread, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
-        root_inode_for_path, secondary_root_inode, PidFdFile,
+        PidFdFile, cgroup_attach_thread, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
+        root_inode_for_path, secondary_root_inode,
     },
     mm::{
-        kernel_token, try_read_user_value, try_write_user_value, write_user_value, MapPermission,
-        MemorySet,
+        MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
+        write_user_value,
     },
     println,
     syscall::{
@@ -26,21 +26,21 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
+        ProcessControlBlock,
         manager::{
-            add_task, pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
-            PID2PCB,
+            PID2PCB, add_task, pid2process, remove_inactive_task, select_hart_for_new_task,
+            wakeup_task,
         },
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
             hart_id, suspend_current_and_run_next,
         },
-        sched::{sched_class, SchedClass},
+        sched::{SchedClass, sched_class},
         signal::{
-            pending_unmasked_bits, queue_process_signal, SignalFlags, MAX_SIG, RT_SIG_MAX,
-            SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM, SIG_DFL, SIG_IGN,
+            MAX_SIG, RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,
+            SignalFlags, pending_unmasked_bits, queue_process_signal,
         },
         task_block::{TaskControlBlock, TaskStatus},
-        ProcessControlBlock,
     },
     trap::{get_current_token, trap_handler},
 };

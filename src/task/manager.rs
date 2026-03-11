@@ -343,7 +343,11 @@ impl TaskManager {
                 }
             }
             if picked.is_none() {
-                let group_ids = rq.fair_groups.keys().copied().collect::<alloc::vec::Vec<_>>();
+                let group_ids = rq
+                    .fair_groups
+                    .keys()
+                    .copied()
+                    .collect::<alloc::vec::Vec<_>>();
                 let mut best_group = None;
                 let mut best_vruntime = u128::MAX;
                 let mut empty_groups = alloc::vec::Vec::new();
@@ -410,7 +414,11 @@ impl TaskManager {
                 q.retain(|t| !Arc::ptr_eq(t, &task));
                 removed = removed.saturating_add(before.saturating_sub(q.len()));
             }
-            let fair_group_ids = rq.fair_groups.keys().copied().collect::<alloc::vec::Vec<_>>();
+            let fair_group_ids = rq
+                .fair_groups
+                .keys()
+                .copied()
+                .collect::<alloc::vec::Vec<_>>();
             for group_id in fair_group_ids {
                 let mut should_remove_group = false;
                 if let Some(group) = rq.fair_groups.get_mut(&group_id) {
@@ -449,8 +457,7 @@ impl TaskManager {
                     .iter()
                     .map(|q| q.iter().filter(|t| Arc::ptr_eq(t, task)).count())
                     .sum::<usize>()
-                    + rq
-                        .fair_groups
+                    + rq.fair_groups
                         .values()
                         .map(|group| group.tasks.iter().filter(|t| Arc::ptr_eq(t, task)).count())
                         .sum::<usize>()

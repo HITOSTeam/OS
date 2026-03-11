@@ -148,6 +148,8 @@ const SYSCALL_FSYNC: usize = 82;
 const SYSCALL_FDATASYNC: usize = 83;
 const SYSCALL_SYNC_FILE_RANGE: usize = 84;
 const SYSCALL_TIMERFD_CREATE: usize = 85;
+const SYSCALL_TIMERFD_SETTIME: usize = 86;
+const SYSCALL_TIMERFD_GETTIME: usize = 87;
 const SYSCALL_STATX: usize = 291;
 // riscv64 Linux syscall numbers (match upstream): statfs=43, fstatfs=44.
 const SYSCALL_STATFS: usize = 43;
@@ -359,11 +361,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         if is_cyclic {
             let left = CYCLIC_SYSCALL_LOGS
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    if val == 0 {
-                        None
-                    } else {
-                        Some(val - 1)
-                    }
+                    if val == 0 { None } else { Some(val - 1) }
                 })
                 .unwrap_or(0);
             if left > 0 {
@@ -595,6 +593,10 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSTATFS => filesystem::syscall_fstatfs(args[0], args[1]),
         SYSCALL_STATFS => filesystem::syscall_statfs(args[0], args[1]),
         SYSCALL_TIMERFD_CREATE => dummy::syscall_timerfd_create(args[0], args[1]),
+        SYSCALL_TIMERFD_SETTIME => {
+            dummy::syscall_timerfd_settime(args[0], args[1], args[2], args[3])
+        }
+        SYSCALL_TIMERFD_GETTIME => dummy::syscall_timerfd_gettime(args[0], args[1]),
         SYSCALL_UTIMENSAT => {
             filesystem::syscall_utimensat(args[0] as isize, args[1], args[2], args[3])
         }

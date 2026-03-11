@@ -9,15 +9,15 @@ mod pseudo;
 mod socketpair;
 mod stdio;
 mod tty;
-use alloc::{
-    collections::VecDeque,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
 use crate::mm::UserBuffer;
 use crate::task::{
     manager::wakeup_task,
     task_block::{TaskControlBlock, TaskStatus},
+};
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::any::Any;
 
@@ -118,31 +118,36 @@ pub(crate) fn wake_tasks(tasks: Vec<Arc<TaskControlBlock>>) {
 }
 
 pub use cgroupfs::{
-    cgroup_attach_fork_child, cgroup_attach_thread, cgroup_charge_anon_current,
-    cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process, cgroup_exit_thread,
-    cgroup_fork_precheck, cgroup_logical_path_for_file, cgroup_maybe_block_current, cgroup_mkdir,
-    cgroup_mount, cgroup_proc_cgroups_content, cgroup_proc_pid_content, cgroup_rename,
-    cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path, legacy_cpu_fair_group, open_cgroup_pseudo,
-    CgroupFile, CgroupMountSpec,
+    CgroupFile, CgroupMountSpec, cgroup_attach_fork_child, cgroup_attach_thread,
+    cgroup_charge_anon_current, cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process,
+    cgroup_exit_thread, cgroup_fork_precheck, cgroup_logical_path_for_file,
+    cgroup_maybe_block_current, cgroup_mkdir, cgroup_mount, cgroup_proc_cgroups_content,
+    cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
+    legacy_cpu_fair_group, open_cgroup_pseudo,
 };
-pub(crate) use dummy::wake_pidfd_poll_waiters;
-pub use dummy::{DummyFile, EventFdFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
+pub use dummy::{
+    DummyFile, EventFdFile, NamespaceFile, NamespaceKind, PidFdFile, TimerFdFile, UserfaultfdFile,
+};
+pub(crate) use dummy::{
+    cancel_realtime_timerfds_on_set, process_timerfd_expirations, wake_pidfd_poll_waiters,
+};
+pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, register_deferred_unlink_cleanup,
     root_inode_for_path, secondary_root_inode,
 };
-pub use inode::{list_apps, open_file, OSInode, OpenFlags, EXT4_FS, ROOT_INODE, USER_INODE};
 pub(crate) use net_socket::notify_net_poll_events;
 pub use net_socket::{NetSocketFile, NetSocketKind};
 pub(crate) use pipe::remove_task_waiters as remove_pipe_waiters_for_task;
-pub use pipe::{debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe, Pipe};
+pub use pipe::{Pipe, debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe};
 pub use procfs::{
-    build_proc_root_entries, collect_pids, init_procfs, is_proc_pseudo_path, is_proc_root,
-    open_proc_pseudo, proc_file_content, proc_file_kind, proc_file_len, proc_readlink,
-    sync_proc_path, vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory,
-    vm_overcommit_ratio, ProcPseudoFile,
+    ProcPseudoFile, build_proc_root_entries, collect_pids, init_procfs, is_proc_pseudo_path,
+    is_proc_root, open_proc_pseudo, proc_file_content, proc_file_kind, proc_file_len,
+    proc_readlink, sync_proc_path, vm_commit_limit_bytes, vm_committed_as_bytes,
+    vm_overcommit_memory, vm_overcommit_ratio,
 };
 pub use pseudo::PseudoBlock;
+pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub(crate) use pseudo::{
     open_pseudo_dev_dir, pseudo_block_is_read_only, pseudo_block_note_sync,
     pseudo_block_read_ahead, pseudo_block_set_read_ahead, pseudo_block_set_read_only,
@@ -150,10 +155,9 @@ pub(crate) use pseudo::{
     pseudo_dev_dir_mkdir, pseudo_dev_dir_rmdir, shm_create, shm_create_anonymous, shm_get,
     shm_list, shm_remove,
 };
-pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
-pub use socketpair::{make_socketpair, SocketPairEnd};
+pub use socketpair::{SocketPairEnd, make_socketpair};
 pub use stdio::{Stdin, Stdout};
 pub use tty::{
-    list_dev_pts, open_dev_ptmx, open_dev_pts, open_dev_tty, LinuxTermio, LinuxTermios,
-    PtyMasterFile, PtySlaveFile, TtyFile,
+    LinuxTermio, LinuxTermios, PtyMasterFile, PtySlaveFile, TtyFile, list_dev_pts, open_dev_ptmx,
+    open_dev_pts, open_dev_tty,
 };

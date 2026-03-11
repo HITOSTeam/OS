@@ -9,32 +9,32 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::task::manager::{wakeup_task, PID2PCB};
+use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
+        CgroupFile, CgroupMountSpec, EventFdFile, File, NetSocketFile, OSInode, OpenFlags, Pipe,
+        ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile,
+        PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TimerFdFile, TtyFile,
         cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount,
         cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots, make_pipe,
         open_cgroup_pseudo, open_file, pseudo_block_is_read_only, pseudo_block_note_sync,
         pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
-        shm_create, shm_get, shm_list, shm_remove, CgroupFile, CgroupMountSpec, EventFdFile,
-        File, NetSocketFile, OSInode, OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir,
-        PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
-        SocketPairEnd, TtyFile,
+        shm_create, shm_get, shm_list, shm_remove,
     },
     mm::{
-        copy_from_user, copy_to_user, read_user_value, translated_byte_buffer, translated_mutref,
-        translated_str, try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked,
-        try_read_user_value, try_translated_byte_buffer, try_write_user_value, write_user_value,
-        MapPermission, UserBuffer,
+        MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
+        translated_byte_buffer, translated_mutref, translated_str, try_copy_from_user,
+        try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
+        try_translated_byte_buffer, try_write_user_value, write_user_value,
     },
     syscall::process::{is_inode_currently_executed_locked, lock_executing_inodes},
     task::processor::{
         block_current_and_run_next, current_files_process, current_process, current_task,
     },
     task::{
-        signal::{has_unmasked_pending, queue_process_signal, SIGXFSZ_NUM},
-        task_block::TaskControlBlock,
         ProcessControlBlock,
+        signal::{SIGXFSZ_NUM, has_unmasked_pending, queue_process_signal},
+        task_block::TaskControlBlock,
     },
     time::get_time_ms,
     trap::get_current_token,
@@ -6283,13 +6283,30 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             if !eventfd.poll_readable() {
                 return EAGAIN;
             }
+        } else if let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() {
+            if !timerfd.poll_readable() {
+                return EAGAIN;
+            }
         }
     }
     if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
-        if len != core::mem::size_of::<u64>() {
+        if len < core::mem::size_of::<u64>() {
             return EINVAL;
         }
         let value = match eventfd.read_counter(fd_has_nonblock(fd)) {
+            Ok(value) => value,
+            Err(e) => return e,
+        };
+        if try_write_user_value(get_current_token(), buffer as *mut u64, &value).is_err() {
+            return EFAULT;
+        }
+        return core::mem::size_of::<u64>() as isize;
+    }
+    if let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() {
+        if len < core::mem::size_of::<u64>() {
+            return EINVAL;
+        }
+        let value = match timerfd.read_counter(fd_has_nonblock(fd)) {
             Ok(value) => value,
             Err(e) => return e,
         };
@@ -6324,6 +6341,9 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return EBADF;
     };
+    if file.as_any().downcast_ref::<TimerFdFile>().is_some() {
+        return EINVAL;
+    }
     if !file.writable() {
         return EBADF;
     }
@@ -6400,7 +6420,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         }
     }
     if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
-        if len != core::mem::size_of::<u64>() {
+        if len < core::mem::size_of::<u64>() {
             return EINVAL;
         }
         let Some(value) = try_read_user_value(get_current_token(), buffer as *const u64) else {

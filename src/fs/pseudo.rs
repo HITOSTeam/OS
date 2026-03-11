@@ -10,7 +10,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
-use crate::mm::{frame_alloc, FrameTracker, UserBuffer};
+use crate::mm::{FrameTracker, UserBuffer, frame_alloc};
 
 use super::File;
 

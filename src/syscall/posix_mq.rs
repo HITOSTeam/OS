@@ -10,16 +10,16 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::clock_freq;
-use crate::fs::{find_path_in_roots, wake_tasks, File, PollWaitQueue, POLLIN, POLLOUT};
+use crate::fs::{File, POLLIN, POLLOUT, PollWaitQueue, find_path_in_roots, wake_tasks};
 use crate::mm::{
-    try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value, UserBuffer,
+    UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
 };
 use crate::task::block_sleep::add_timer;
 use crate::task::manager::wakeup_task;
 use crate::task::processor::{
     block_current_and_run_next, current_files_process, current_process, current_task,
 };
-use crate::task::signal::{has_unmasked_pending, signal_bit, RT_SIG_MAX};
+use crate::task::signal::{RT_SIG_MAX, has_unmasked_pending, signal_bit};
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::time::get_time;
 use crate::trap::get_current_token;
@@ -643,13 +643,13 @@ pub fn syscall_mq_open(name: usize, oflag: usize, mode: usize, attr: usize) -> i
                     },
                     maxmsg: mq_maxmsg,
                     msgsize: mq_msgsize,
-                messages: VecDeque::new(),
-                recv_waiters: VecDeque::new(),
-                send_waiters: VecDeque::new(),
-                poll_waiters: PollWaitQueue::default(),
-                notify: None,
-            }),
-        });
+                    messages: VecDeque::new(),
+                    recv_waiters: VecDeque::new(),
+                    send_waiters: VecDeque::new(),
+                    poll_waiters: PollWaitQueue::default(),
+                    notify: None,
+                }),
+            });
             mgr.by_name.insert(qname.clone(), id);
             mgr.by_id.insert(id, queue.clone());
             created_new_queue = true;

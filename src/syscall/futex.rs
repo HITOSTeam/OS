@@ -11,7 +11,7 @@ use spin::Mutex;
 use crate::{
     config::clock_freq,
     debug_config::DEBUG_FUTEX,
-    mm::{read_user_value, PageTable, VirtAddr},
+    mm::{PageTable, VirtAddr, read_user_value},
     syscall::time_sys::realtime_now_timespec,
     task::block_sleep::add_timer,
     task::{

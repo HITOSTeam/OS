@@ -14,13 +14,13 @@ use crate::fs::{File, PseudoDir, PseudoDirent};
 use crate::mm::UserBuffer;
 use crate::syscall::misc::{decode_linux_tid_strict, encode_linux_tid};
 use crate::task::{
-    manager::{pid2process, PID2PCB},
+    manager::{PID2PCB, pid2process},
     manager::{refresh_process_runqueues, wakeup_task},
     process_visible_in_pid_namespace,
     processor::{block_current_and_run_next, current_process, current_task},
     resolve_process_in_pid_namespace,
-    sched::{sched_class, SchedClass},
-    signal::{queue_process_signal, SIGKILL_NUM},
+    sched::{SchedClass, sched_class},
+    signal::{SIGKILL_NUM, queue_process_signal},
     task_block::TaskStatus,
 };
 

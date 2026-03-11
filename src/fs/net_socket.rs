@@ -7,11 +7,11 @@ use core::cmp::min;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::fs::{wake_tasks, File, PollWaitQueue, POLLIN, POLLOUT, POLLRDHUP};
+use crate::fs::{File, POLLIN, POLLOUT, POLLRDHUP, PollWaitQueue, wake_tasks};
 use crate::mm::UserBuffer;
 use crate::task::processor::current_task;
-use crate::task::task_block::TaskControlBlock;
 use crate::task::signal::has_unmasked_pending;
+use crate::task::task_block::TaskControlBlock;
 
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -148,11 +148,13 @@ fn register_poll_waiter_for_handle(
     task: &Arc<TaskControlBlock>,
 ) -> bool {
     let mut registrations = NET_POLL_WAITERS.lock();
-    let entry = registrations.entry(handle).or_insert_with(|| PollRegistration {
-        kind,
-        last_mask: 0,
-        waiters: PollWaitQueue::default(),
-    });
+    let entry = registrations
+        .entry(handle)
+        .or_insert_with(|| PollRegistration {
+            kind,
+            last_mask: 0,
+            waiters: PollWaitQueue::default(),
+        });
     entry.kind = kind;
     entry.waiters.register_waiter(task)
 }
@@ -950,7 +952,10 @@ impl Drop for NetSocketFile {
 
 #[derive(Clone)]
 enum Snapshot {
-    TcpStream { handle: SocketHandle, rd_shutdown: bool },
+    TcpStream {
+        handle: SocketHandle,
+        rd_shutdown: bool,
+    },
     TcpListener(Vec<SocketHandle>),
     Udp(SocketHandle),
 }
@@ -1151,7 +1156,9 @@ impl File for NetSocketFile {
         for (handle, kind) in self.poll_registration_handles() {
             armed = register_poll_waiter_for_handle(handle, kind, task) || armed;
         }
-        armed || self.current_poll_mask() != 0 || matches!(&*self.inner.lock(), Inner::TcpListener { .. })
+        armed
+            || self.current_poll_mask() != 0
+            || matches!(&*self.inner.lock(), Inner::TcpListener { .. })
     }
 
     fn as_any(&self) -> &dyn Any {

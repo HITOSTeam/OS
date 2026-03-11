@@ -160,9 +160,13 @@ app_39_name:
     .asciz "eventfd_epoll_smoke"
 .section .rodata
 .align 3
+app_40_name:
+    .asciz "timerfd_epoll_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 40
+    .quad 41
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -203,3 +207,4 @@ num_user_apps:
     .quad app_37_name
     .quad app_38_name
     .quad app_39_name
+    .quad app_40_name

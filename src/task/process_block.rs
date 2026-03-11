@@ -9,7 +9,7 @@ use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
-use crate::fs::{cgroup_attach_fork_child, File, PollWaitQueue, Stdin, Stdout};
+use crate::fs::{File, PollWaitQueue, Stdin, Stdout, cgroup_attach_fork_child};
 use crate::mm::{
     ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
 };
@@ -1508,7 +1508,15 @@ impl ProcessControlBlock {
     /// Only support processes with a single thread.
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
-        self.exec_with_memory_set(memory_set, ustack_base, entry_point, args, envs, elf_aux, (0, 0));
+        self.exec_with_memory_set(
+            memory_set,
+            ustack_base,
+            entry_point,
+            args,
+            envs,
+            elf_aux,
+            (0, 0),
+        );
     }
 
     /// Exec a dynamically-linked ELF (with PT_INTERP) in a Linux-like way:

@@ -143,7 +143,9 @@ pub fn set_posix_timer(
     else {
         return Err(EINVAL);
     };
-    let Some(now_ns) = crate::syscall::timer_clock_now_ns(timer.clock_id, timer.pid, timer.thread_tid) else {
+    let Some(now_ns) =
+        crate::syscall::timer_clock_now_ns(timer.clock_id, timer.pid, timer.thread_tid)
+    else {
         return Err(EINVAL);
     };
     let prev_remain = timer
@@ -422,12 +424,9 @@ fn process_posix_timers() {
                 let timer = &mut timers[idx];
                 let pid = timer.pid;
                 let signum = timer.signum;
-                let now_ns = crate::syscall::timer_clock_now_ns(
-                    timer.clock_id,
-                    timer.pid,
-                    timer.thread_tid,
-                )
-                .unwrap_or(0);
+                let now_ns =
+                    crate::syscall::timer_clock_now_ns(timer.clock_id, timer.pid, timer.thread_tid)
+                        .unwrap_or(0);
                 if timer.interval_ns == 0 {
                     timer.deadline_ns = None;
                 } else {
@@ -441,9 +440,8 @@ fn process_posix_timers() {
                             .saturating_add(extra as usize)
                             .min(i32::MAX as usize);
                     }
-                    timer.deadline_ns = Some(
-                        base.saturating_add(expirations.saturating_mul(timer.interval_ns)),
-                    );
+                    timer.deadline_ns =
+                        Some(base.saturating_add(expirations.saturating_mul(timer.interval_ns)));
                 }
                 Some((pid, signum))
             } else {
@@ -539,6 +537,7 @@ pub fn check_timer() {
     process_delayed_tid_clears(current_ms);
     process_alarm_timers(current_ms);
     process_posix_timers();
+    crate::fs::process_timerfd_expirations();
 }
 
 pub fn has_pending_timers() -> bool {

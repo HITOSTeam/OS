@@ -1,30 +1,30 @@
 use crate::{
     arch,
-    config::{clock_freq, phys_mem_end, phys_mem_start, PAGE_SIZE},
+    config::{PAGE_SIZE, clock_freq, phys_mem_end, phys_mem_start},
     debug_config::DEBUG_PTHREAD,
     fs::{
-        ext4_lock, pseudo_block_is_read_only, pseudo_block_read_ahead, pseudo_block_set_read_ahead,
-        pseudo_block_set_read_only, LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind,
-        PseudoKindTag, PtyMasterFile, PtySlaveFile, TtyFile, UserfaultfdFile, POLLERR, POLLHUP,
-        POLLNVAL,
+        LinuxTermio, LinuxTermios, NamespaceFile, NamespaceKind, POLLERR, POLLHUP, POLLNVAL,
+        PseudoKindTag, PtyMasterFile, PtySlaveFile, TtyFile, UserfaultfdFile, ext4_lock,
+        pseudo_block_is_read_only, pseudo_block_read_ahead, pseudo_block_set_read_ahead,
+        pseudo_block_set_read_only,
     },
     mm::{
-        frame_available_pages, read_user_value, translated_byte_buffer, translated_str,
-        try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
-        write_user_value, MapPermission, VirtAddr,
+        MapPermission, VirtAddr, frame_available_pages, read_user_value, translated_byte_buffer,
+        translated_str, try_copy_from_user, try_copy_to_user, try_read_user_value,
+        try_write_user_value, write_user_value,
     },
     syscall::{
         filesystem::{normalize_path, register_rofs_mount, unregister_rofs_mount},
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
-        manager::{pid2process, refresh_process_runqueues, PID2PCB},
+        manager::{PID2PCB, pid2process, refresh_process_runqueues},
         processor::{
             block_current_and_run_next, current_files_process, current_process, current_task,
         },
         signal::{
-            has_unmasked_pending, queue_process_signal, signal_bit, SIGKILL_NUM, SIGSTOP_NUM,
-            SIGXCPU_NUM,
+            SIGKILL_NUM, SIGSTOP_NUM, SIGXCPU_NUM, has_unmasked_pending, queue_process_signal,
+            signal_bit,
         },
     },
     time::{get_time, get_time_ms},
@@ -811,11 +811,7 @@ pub fn syscall_getppid() -> isize {
 }
 
 fn normalized_pgid(pid: usize, pgid: usize) -> usize {
-    if pgid == 0 && pid != 0 {
-        pid
-    } else {
-        pgid
-    }
+    if pgid == 0 && pid != 0 { pid } else { pgid }
 }
 
 fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {

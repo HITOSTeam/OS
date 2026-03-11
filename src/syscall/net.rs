@@ -9,8 +9,8 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::mm::{
-    read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
-    try_write_user_value, UserBuffer,
+    UserBuffer, read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
+    try_write_user_value,
 };
 use crate::syscall::filesystem::normalize_path;
 use crate::task::manager::pid2process;
@@ -23,8 +23,8 @@ use crate::trap::get_current_token;
 use crate::{
     bpf::get_prog_clone,
     fs::{
-        ext4_lock, find_path_in_roots, make_socketpair, wake_tasks, File, NetSocketFile,
-        PollWaitQueue, SocketPairEnd, POLLIN, POLLOUT,
+        File, NetSocketFile, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, ext4_lock,
+        find_path_in_roots, make_socketpair, wake_tasks,
     },
 };
 
@@ -376,7 +376,9 @@ impl UnixSocketFile {
         let n = payload.len();
         let wake = {
             let mut peer_st = peer.state.lock();
-            peer_st.dgram_queue.push_back(UnixDatagram { from, payload });
+            peer_st
+                .dgram_queue
+                .push_back(UnixDatagram { from, payload });
             peer_st.poll_waiters.take_wakeups()
         };
         wake_tasks(wake);

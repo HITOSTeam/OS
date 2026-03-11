@@ -2,10 +2,10 @@ use alloc::sync::Arc;
 
 use crate::{
     fs::{
-        shm_create_anonymous, DummyFile, EventFdFile, File, PidFdFile, PseudoShmFile,
-        UserfaultfdFile,
+        DummyFile, EventFdFile, File, PidFdFile, PseudoShmFile, TimerFdFile, UserfaultfdFile,
+        shm_create_anonymous,
     },
-    mm::try_copy_from_user,
+    mm::{try_copy_from_user, try_read_user_value, try_write_user_value},
     task::{
         manager::pid2process,
         processor::{current_files_process, current_process},
@@ -17,6 +17,7 @@ const EINVAL: isize = -22;
 const EMFILE: isize = -24;
 const EBADF: isize = -9;
 const EFAULT: isize = -14;
+const ECANCELED: isize = -125;
 const ENOSYS: isize = -38;
 const ESRCH: isize = -3;
 
@@ -26,6 +27,24 @@ const FD_CLOEXEC: u32 = 1;
 
 const CLOEXEC_FLAG: usize = 0x80000;
 const NONBLOCK_FLAG: usize = 0x800;
+const CLOCK_REALTIME: usize = 0;
+const CLOCK_MONOTONIC: usize = 1;
+const TFD_TIMER_ABSTIME: usize = 0x1;
+const TFD_TIMER_CANCEL_ON_SET: usize = 0x2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TimeSpec {
+    sec: i64,
+    nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ITimerSpec {
+    it_interval: TimeSpec,
+    it_value: TimeSpec,
+}
 
 fn alloc_fd(file: Arc<dyn File + Send + Sync>, fd_flags: u32) -> isize {
     let process = current_files_process();
@@ -60,6 +79,24 @@ fn validate_user_cstr(name: usize, max_len: usize) -> Result<(), isize> {
     }
     // Linux memfd_create rejects unterminated or overlong names with EINVAL.
     Err(EINVAL)
+}
+
+fn timespec_to_ns(ts: TimeSpec) -> Option<u64> {
+    if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1_000_000_000 {
+        return None;
+    }
+    Some(
+        (ts.sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.nsec as u64),
+    )
+}
+
+fn ns_to_timespec(ns: u64) -> TimeSpec {
+    TimeSpec {
+        sec: (ns / 1_000_000_000) as i64,
+        nsec: (ns % 1_000_000_000) as i64,
+    }
 }
 
 pub fn syscall_epoll_create(size: isize) -> isize {
@@ -135,8 +172,6 @@ pub fn syscall_signalfd4(_fd: isize, _mask: usize, _sigsetsize: usize, flags: us
 }
 
 pub fn syscall_timerfd_create(clockid: usize, flags: usize) -> isize {
-    const CLOCK_REALTIME: usize = 0;
-    const CLOCK_MONOTONIC: usize = 1;
     const TFD_NONBLOCK: usize = NONBLOCK_FLAG;
     const TFD_CLOEXEC: usize = CLOEXEC_FLAG;
     if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
@@ -152,7 +187,110 @@ pub fn syscall_timerfd_create(clockid: usize, flags: usize) -> isize {
     if (flags & TFD_CLOEXEC) != 0 {
         fd_flags |= FD_CLOEXEC;
     }
-    alloc_dummy_fd(fd_flags)
+    alloc_fd(TimerFdFile::new(clockid), fd_flags)
+}
+
+pub fn syscall_timerfd_gettime(fd: usize, curr_value: usize) -> isize {
+    let process = current_files_process();
+    let file = {
+        let inner = process.borrow_mut();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        inner.fd_table[fd].clone().ok_or(EBADF)
+    };
+    let Ok(file) = file else {
+        return EBADF;
+    };
+    let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() else {
+        return EINVAL;
+    };
+    if curr_value == 0 {
+        return EFAULT;
+    }
+    let Ok((remain_ns, interval_ns)) = timerfd.get_time() else {
+        return EINVAL;
+    };
+    let spec = ITimerSpec {
+        it_interval: ns_to_timespec(interval_ns),
+        it_value: ns_to_timespec(remain_ns),
+    };
+    let token = get_current_token();
+    if try_write_user_value(token, curr_value as *mut ITimerSpec, &spec).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+pub fn syscall_timerfd_settime(
+    fd: usize,
+    flags: usize,
+    new_value: usize,
+    old_value: usize,
+) -> isize {
+    if (flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET)) != 0 {
+        return EINVAL;
+    }
+    let process = current_files_process();
+    let file = {
+        let inner = process.borrow_mut();
+        if fd >= inner.fd_table.len() {
+            return EBADF;
+        }
+        inner.fd_table[fd].clone().ok_or(EBADF)
+    };
+    let Ok(file) = file else {
+        return EBADF;
+    };
+    let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() else {
+        return EINVAL;
+    };
+    if new_value == 0 {
+        return EFAULT;
+    }
+    if (flags & TFD_TIMER_CANCEL_ON_SET) != 0
+        && ((flags & TFD_TIMER_ABSTIME) == 0 || timerfd.clock_id() != CLOCK_REALTIME)
+    {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let Some(new_spec) = try_read_user_value(token, new_value as *const ITimerSpec) else {
+        return EFAULT;
+    };
+    let Some(value_ns) = timespec_to_ns(new_spec.it_value) else {
+        return EINVAL;
+    };
+    let Some(interval_ns) = timespec_to_ns(new_spec.it_interval) else {
+        return EINVAL;
+    };
+    let now_ns = crate::syscall::timer_clock_now_ns(timerfd.clock_id(), 0, None).ok_or(EINVAL);
+    let Ok(now_ns) = now_ns else {
+        return EINVAL;
+    };
+    let deadline_ns = if value_ns == 0 {
+        None
+    } else if (flags & TFD_TIMER_ABSTIME) != 0 {
+        Some(value_ns)
+    } else {
+        Some(now_ns.saturating_add(value_ns))
+    };
+    let Ok((prev_remain_ns, prev_interval_ns, was_canceled)) = timerfd.set_time(
+        deadline_ns,
+        interval_ns,
+        (flags & TFD_TIMER_CANCEL_ON_SET) != 0,
+    ) else {
+        return EINVAL;
+    };
+    if old_value != 0 {
+        let spec = ITimerSpec {
+            it_interval: ns_to_timespec(prev_interval_ns),
+            it_value: ns_to_timespec(prev_remain_ns),
+        };
+        if try_write_user_value(token, old_value as *mut ITimerSpec, &spec).is_err() {
+            return EFAULT;
+        }
+    }
+    if was_canceled { ECANCELED } else { 0 }
 }
 
 pub fn syscall_inotify_init1(flags: usize) -> isize {
