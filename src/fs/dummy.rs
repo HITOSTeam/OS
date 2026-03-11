@@ -1,9 +1,9 @@
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, VecDeque},
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, mem::size_of};
+use core::{any::Any, cmp::Ordering, mem::size_of};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -264,7 +264,57 @@ impl File for EventFdFile {
 }
 
 lazy_static! {
-    static ref TIMERFD_FILES: Mutex<Vec<Weak<TimerFdFile>>> = Mutex::new(Vec::new());
+    static ref TIMERFD_SCHEDULE: Mutex<TimerFdScheduleState> =
+        Mutex::new(TimerFdScheduleState::default());
+}
+
+#[derive(Clone)]
+struct TimerFdScheduleEntry {
+    deadline_ns: u64,
+    sequence: u64,
+    file: Weak<TimerFdFile>,
+}
+
+impl PartialEq for TimerFdScheduleEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline_ns == other.deadline_ns && self.sequence == other.sequence
+    }
+}
+
+impl Eq for TimerFdScheduleEntry {}
+
+impl PartialOrd for TimerFdScheduleEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimerFdScheduleEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .deadline_ns
+            .cmp(&self.deadline_ns)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+#[derive(Default)]
+struct TimerFdScheduleState {
+    monotonic: BinaryHeap<TimerFdScheduleEntry>,
+    realtime: BinaryHeap<TimerFdScheduleEntry>,
+}
+
+impl TimerFdScheduleState {
+    fn live_realtime_files(&self) -> Vec<Arc<TimerFdFile>> {
+        let mut live = BTreeMap::new();
+        for entry in self.realtime.iter() {
+            let Some(file) = entry.file.upgrade() else {
+                continue;
+            };
+            live.entry(Arc::as_ptr(&file) as usize).or_insert(file);
+        }
+        live.into_values().collect()
+    }
 }
 
 struct TimerFdInner {
@@ -273,31 +323,33 @@ struct TimerFdInner {
     expirations: u64,
     cancel_on_set: bool,
     canceled: bool,
+    schedule_seq: u64,
     read_waiters: VecDeque<Weak<TaskControlBlock>>,
     poll_waiters: PollWaitQueue,
 }
 
 pub struct TimerFdFile {
     clock_id: usize,
+    self_ref: Weak<TimerFdFile>,
     inner: Mutex<TimerFdInner>,
 }
 
 impl TimerFdFile {
     pub fn new(clock_id: usize) -> Arc<Self> {
-        let file = Arc::new(Self {
+        Arc::new_cyclic(|weak| Self {
             clock_id,
+            self_ref: weak.clone(),
             inner: Mutex::new(TimerFdInner {
                 deadline_ns: None,
                 interval_ns: 0,
                 expirations: 0,
                 cancel_on_set: false,
                 canceled: false,
+                schedule_seq: 0,
                 read_waiters: VecDeque::new(),
                 poll_waiters: PollWaitQueue::default(),
             }),
-        });
-        TIMERFD_FILES.lock().push(Arc::downgrade(&file));
-        file
+        })
     }
 
     pub fn clock_id(&self) -> usize {
@@ -341,6 +393,33 @@ impl TimerFdFile {
         ready
     }
 
+    fn schedule_heap_mut(
+        state: &mut TimerFdScheduleState,
+        clock_id: usize,
+    ) -> Option<&mut BinaryHeap<TimerFdScheduleEntry>> {
+        match clock_id {
+            CLOCK_MONOTONIC => Some(&mut state.monotonic),
+            CLOCK_REALTIME => Some(&mut state.realtime),
+            _ => None,
+        }
+    }
+
+    fn reschedule_locked(&self, inner: &mut TimerFdInner) {
+        inner.schedule_seq = inner.schedule_seq.wrapping_add(1);
+        let Some(deadline_ns) = inner.deadline_ns.filter(|_| !inner.canceled) else {
+            return;
+        };
+        let mut state = TIMERFD_SCHEDULE.lock();
+        let Some(heap) = Self::schedule_heap_mut(&mut state, self.clock_id) else {
+            return;
+        };
+        heap.push(TimerFdScheduleEntry {
+            deadline_ns,
+            sequence: inner.schedule_seq,
+            file: self.self_ref.clone(),
+        });
+    }
+
     fn update_expirations_locked(inner: &mut TimerFdInner, now_ns: u64) -> bool {
         if inner.canceled {
             return false;
@@ -365,11 +444,20 @@ impl TimerFdFile {
         !prev_ready && inner.expirations > 0
     }
 
+    fn advance_to_ns_locked(&self, inner: &mut TimerFdInner, now_ns: u64) -> bool {
+        let prev_deadline = inner.deadline_ns;
+        let became_ready = Self::update_expirations_locked(inner, now_ns);
+        if inner.deadline_ns != prev_deadline {
+            self.reschedule_locked(inner);
+        }
+        became_ready
+    }
+
     fn flush_expirations(&self, inner: &mut TimerFdInner) -> bool {
         let Some(now_ns) = Self::now_ns(self.clock_id) else {
             return false;
         };
-        Self::update_expirations_locked(inner, now_ns)
+        self.advance_to_ns_locked(inner, now_ns)
     }
 
     fn poll_mask_locked(&self, inner: &mut TimerFdInner) -> i16 {
@@ -451,6 +539,7 @@ impl TimerFdFile {
         inner.expirations = 0;
         inner.cancel_on_set = cancel_on_set;
         inner.canceled = false;
+        self.reschedule_locked(&mut inner);
         let became_ready = self.flush_expirations(&mut inner);
         if became_ready {
             let mut waiters = Self::wake_read_waiters(&mut inner.read_waiters);
@@ -469,6 +558,7 @@ impl TimerFdFile {
         inner.canceled = true;
         inner.deadline_ns = None;
         inner.expirations = 0;
+        self.reschedule_locked(&mut inner);
         let mut waiters = Self::wake_read_waiters(&mut inner.read_waiters);
         waiters.extend(inner.poll_waiters.take_wakeups());
         drop(inner);
@@ -903,45 +993,47 @@ pub(crate) fn wake_pidfd_poll_waiters(pid: usize) {
 }
 
 pub(crate) fn process_timerfd_expirations() {
-    let files = {
-        let mut files = TIMERFD_FILES.lock();
-        let mut live = Vec::new();
-        files.retain(|file| {
-            let Some(file) = file.upgrade() else {
-                return false;
-            };
-            live.push(file);
-            true
-        });
-        live
-    };
-    for file in files {
-        let waiters = {
-            let mut inner = file.inner.lock();
-            if !file.flush_expirations(&mut inner) {
-                continue;
-            }
-            let mut waiters = TimerFdFile::wake_read_waiters(&mut inner.read_waiters);
-            waiters.extend(inner.poll_waiters.take_wakeups());
-            waiters
+    for clock_id in [CLOCK_MONOTONIC, CLOCK_REALTIME] {
+        let Some(now_ns) = TimerFdFile::now_ns(clock_id) else {
+            continue;
         };
-        wake_tasks(waiters);
+        loop {
+            let entry = {
+                let mut state = TIMERFD_SCHEDULE.lock();
+                let Some(heap) = TimerFdFile::schedule_heap_mut(&mut state, clock_id) else {
+                    break;
+                };
+                match heap.peek() {
+                    Some(entry) if entry.deadline_ns <= now_ns => heap.pop(),
+                    _ => None,
+                }
+            };
+            let Some(entry) = entry else {
+                break;
+            };
+            let Some(file) = entry.file.upgrade() else {
+                continue;
+            };
+            let waiters = {
+                let mut inner = file.inner.lock();
+                if inner.schedule_seq != entry.sequence || inner.canceled || inner.deadline_ns.is_none()
+                {
+                    continue;
+                }
+                if !file.advance_to_ns_locked(&mut inner, now_ns) {
+                    continue;
+                }
+                let mut waiters = TimerFdFile::wake_read_waiters(&mut inner.read_waiters);
+                waiters.extend(inner.poll_waiters.take_wakeups());
+                waiters
+            };
+            wake_tasks(waiters);
+        }
     }
 }
 
 pub(crate) fn cancel_realtime_timerfds_on_set() {
-    let files = {
-        let mut files = TIMERFD_FILES.lock();
-        let mut live = Vec::new();
-        files.retain(|file| {
-            let Some(file) = file.upgrade() else {
-                return false;
-            };
-            live.push(file);
-            true
-        });
-        live
-    };
+    let files = TIMERFD_SCHEDULE.lock().live_realtime_files();
     for file in files {
         let _ = file.cancel_on_realtime_set();
     }
