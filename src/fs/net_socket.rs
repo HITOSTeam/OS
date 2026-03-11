@@ -71,6 +71,7 @@ enum Inner {
 pub struct NetSocketFile {
     inner: Mutex<Inner>,
     opts: Mutex<SocketOptions>,
+    poll_waiters: Mutex<PollWaitQueue>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -210,6 +211,7 @@ impl NetSocketFile {
                 mcast_joined: false,
                 rd_shutdown: false,
             }),
+            poll_waiters: Mutex::new(PollWaitQueue::default()),
         })
     }
 
@@ -237,7 +239,13 @@ impl NetSocketFile {
                 mcast_joined: false,
                 rd_shutdown: false,
             }),
+            poll_waiters: Mutex::new(PollWaitQueue::default()),
         })
+    }
+
+    fn notify_poll_waiters(&self) {
+        let waiters = self.poll_waiters.lock().take_wakeups();
+        wake_tasks(waiters);
     }
 
     pub fn set_sockbuf(&self, sndbuf: Option<u32>, rcvbuf: Option<u32>) {
@@ -365,6 +373,7 @@ impl NetSocketFile {
 
     pub fn shutdown_read(&self) {
         self.opts.lock().rd_shutdown = true;
+        self.notify_poll_waiters();
     }
 
     pub fn bind_v4(&self, ip: Ipv4Address, port: u16) -> Result<(), isize> {
@@ -464,6 +473,8 @@ impl NetSocketFile {
             backlog,
             listen: listen_handles,
         };
+        drop(inner);
+        self.notify_poll_waiters();
         Ok(())
     }
 
@@ -507,6 +518,7 @@ impl NetSocketFile {
                     listen.push(new_h);
                 }
                 drop(inner);
+                self.notify_poll_waiters();
                 return Ok(Arc::new(NetSocketFile {
                     inner: Mutex::new(Inner::TcpStream { handle: h }),
                     opts: Mutex::new(SocketOptions {
@@ -515,6 +527,7 @@ impl NetSocketFile {
                         mcast_joined: false,
                         rd_shutdown: false,
                     }),
+                    poll_waiters: Mutex::new(PollWaitQueue::default()),
                 }));
             }
             drop(inner);
@@ -588,12 +601,15 @@ impl NetSocketFile {
                     sockets.get::<tcp::Socket>(handle).state()
                 });
                 if matches!(st, tcp::State::Established) {
+                    self.notify_poll_waiters();
                     break;
                 }
                 if matches!(st, tcp::State::Closed) {
+                    self.notify_poll_waiters();
                     return Err(ECONNREFUSED);
                 }
                 if crate::time::get_time_ms() >= deadline {
+                    self.notify_poll_waiters();
                     return Err(ETIMEDOUT);
                 }
                 crate::task::processor::suspend_current_and_run_next();
@@ -618,6 +634,8 @@ impl NetSocketFile {
         let mut inner = self.inner.lock();
         if let Inner::Udp { connected, .. } = &mut *inner {
             *connected = Some(remote);
+            drop(inner);
+            self.notify_poll_waiters();
             Ok(())
         } else {
             Err(EOPNOTSUPP)
@@ -1128,11 +1146,12 @@ impl File for NetSocketFile {
     }
 
     fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
-        self.poll_registration_handles()
-            .into_iter()
-            .fold(false, |armed, (handle, kind)| {
-                register_poll_waiter_for_handle(handle, kind, task) || armed
-            })
+        let _ = self.poll_waiters.lock().register_waiter(task);
+        let mut armed = false;
+        for (handle, kind) in self.poll_registration_handles() {
+            armed = register_poll_waiter_for_handle(handle, kind, task) || armed;
+        }
+        armed || self.current_poll_mask() != 0 || matches!(&*self.inner.lock(), Inner::TcpListener { .. })
     }
 
     fn as_any(&self) -> &dyn Any {

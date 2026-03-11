@@ -246,6 +246,11 @@ impl UnixSocketFile {
         self.state.lock().peer_cred
     }
 
+    fn notify_poll_waiters(&self) {
+        let waiters = self.state.lock().poll_waiters.take_wakeups();
+        wake_tasks(waiters);
+    }
+
     fn set_listening(&self, backlog: usize) -> isize {
         if !self.is_stream_like() {
             return EOPNOTSUPP;
@@ -256,6 +261,8 @@ impl UnixSocketFile {
         }
         st.listening = true;
         st.backlog = backlog.max(1).min(32);
+        drop(st);
+        self.notify_poll_waiters();
         0
     }
 
@@ -322,6 +329,8 @@ impl UnixSocketFile {
             }
             st.stream_end = Some(client_end);
             st.peer_addr = Some(addr);
+            drop(st);
+            self.notify_poll_waiters();
             return 0;
         }
         if !self.is_dgram() {
@@ -528,19 +537,20 @@ impl File for UnixSocketFile {
     fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
         if self.is_stream_like() {
             let mut st = self.state.lock();
+            let _ = st.poll_waiters.register_waiter(task);
             if st.listening {
-                st.poll_waiters.register_waiter(task);
                 return true;
             }
             let end = st.stream_end.clone();
             drop(st);
-            return end
-                .as_ref()
-                .is_some_and(|end| end.register_poll_waiter(task));
+            if let Some(end) = end.as_ref() {
+                let _ = end.register_poll_waiter(task);
+            }
+            return true;
         }
         if self.is_dgram() {
             let mut st = self.state.lock();
-            st.poll_waiters.register_waiter(task);
+            let _ = st.poll_waiters.register_waiter(task);
             return true;
         }
         false

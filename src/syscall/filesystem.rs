@@ -16,8 +16,8 @@ use crate::{
         cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots, make_pipe,
         open_cgroup_pseudo, open_file, pseudo_block_is_read_only, pseudo_block_note_sync,
         pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
-        shm_create, shm_get, shm_list, shm_remove, CgroupFile, CgroupMountSpec, File,
-        NetSocketFile, OSInode, OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir,
+        shm_create, shm_get, shm_list, shm_remove, CgroupFile, CgroupMountSpec, EventFdFile,
+        File, NetSocketFile, OSInode, OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir,
         PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
         SocketPairEnd, TtyFile,
     },
@@ -6279,7 +6279,24 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             if !duplex.poll_readable() {
                 return EAGAIN;
             }
+        } else if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
+            if !eventfd.poll_readable() {
+                return EAGAIN;
+            }
         }
+    }
+    if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
+        if len != core::mem::size_of::<u64>() {
+            return EINVAL;
+        }
+        let value = match eventfd.read_counter(fd_has_nonblock(fd)) {
+            Ok(value) => value,
+            Err(e) => return e,
+        };
+        if try_write_user_value(get_current_token(), buffer as *mut u64, &value).is_err() {
+            return EFAULT;
+        }
+        return core::mem::size_of::<u64>() as isize;
     }
     let Ok(user_bufs) = try_translated_byte_buffer(
         get_current_token(),
@@ -6376,6 +6393,22 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             } else {
                 write_len = write_len.min(avail);
             }
+        } else if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
+            if !eventfd.poll_writable() {
+                return EAGAIN;
+            }
+        }
+    }
+    if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
+        if len != core::mem::size_of::<u64>() {
+            return EINVAL;
+        }
+        let Some(value) = try_read_user_value(get_current_token(), buffer as *const u64) else {
+            return EFAULT;
+        };
+        match eventfd.write_counter(value, fd_has_nonblock(fd)) {
+            Ok(()) => return core::mem::size_of::<u64>() as isize,
+            Err(e) => return e,
         }
     }
     let mut hit_fsize_limit = false;

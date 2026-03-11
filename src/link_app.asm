@@ -148,9 +148,21 @@ app_36_name:
     .asciz "ps"
 .section .rodata
 .align 3
+app_37_name:
+    .asciz "nested_epoll_smoke"
+.section .rodata
+.align 3
+app_38_name:
+    .asciz "epoll_ctl_wakeup_smoke"
+.section .rodata
+.align 3
+app_39_name:
+    .asciz "eventfd_epoll_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 37
+    .quad 40
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -188,3 +200,6 @@ num_user_apps:
     .quad app_34_name
     .quad app_35_name
     .quad app_36_name
+    .quad app_37_name
+    .quad app_38_name
+    .quad app_39_name

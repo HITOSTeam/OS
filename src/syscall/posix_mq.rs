@@ -10,7 +10,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::clock_freq;
-use crate::fs::{find_path_in_roots, File};
+use crate::fs::{find_path_in_roots, wake_tasks, File, PollWaitQueue, POLLIN, POLLOUT};
 use crate::mm::{
     try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value, UserBuffer,
 };
@@ -185,6 +185,7 @@ struct MqQueueState {
     messages: VecDeque<MqMessage>,
     recv_waiters: VecDeque<Weak<TaskControlBlock>>,
     send_waiters: VecDeque<Weak<TaskControlBlock>>,
+    poll_waiters: PollWaitQueue,
     notify: Option<NotifyRegistration>,
 }
 
@@ -262,6 +263,17 @@ impl MqDescriptor {
                 .fetch_and(!(O_NONBLOCK as u32), Ordering::Relaxed);
         }
     }
+
+    fn poll_mask_from_state(&self, state: &MqQueueState) -> i16 {
+        let mut mask = 0;
+        if self.readable && !state.messages.is_empty() {
+            mask |= POLLIN;
+        }
+        if self.writable && state.messages.len() < state.maxmsg {
+            mask |= POLLOUT;
+        }
+        mask
+    }
 }
 
 impl Drop for MqDescriptor {
@@ -286,6 +298,23 @@ impl File for MqDescriptor {
 
     fn write(&self, _buf: UserBuffer) -> usize {
         0
+    }
+
+    fn poll_mask(&self) -> i16 {
+        let state = self.queue.state.lock();
+        self.poll_mask_from_state(&state)
+    }
+
+    fn supports_poll(&self) -> bool {
+        true
+    }
+
+    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
+        let mut state = self.queue.state.lock();
+        if self.poll_mask_from_state(&state) != 0 {
+            return true;
+        }
+        state.poll_waiters.register_waiter(task)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -366,6 +395,11 @@ fn wake_all_waiters(waiters: &mut VecDeque<Weak<TaskControlBlock>>) {
     for task in wake {
         wakeup_task(task);
     }
+}
+
+fn wake_poll_waiters(state: &mut MqQueueState) {
+    let waiters = state.poll_waiters.take_wakeups();
+    wake_tasks(waiters);
 }
 
 fn mq_queues_max_limit() -> usize {
@@ -609,12 +643,13 @@ pub fn syscall_mq_open(name: usize, oflag: usize, mode: usize, attr: usize) -> i
                     },
                     maxmsg: mq_maxmsg,
                     msgsize: mq_msgsize,
-                    messages: VecDeque::new(),
-                    recv_waiters: VecDeque::new(),
-                    send_waiters: VecDeque::new(),
-                    notify: None,
-                }),
-            });
+                messages: VecDeque::new(),
+                recv_waiters: VecDeque::new(),
+                send_waiters: VecDeque::new(),
+                poll_waiters: PollWaitQueue::default(),
+                notify: None,
+            }),
+        });
             mgr.by_name.insert(qname.clone(), id);
             mgr.by_id.insert(id, queue.clone());
             created_new_queue = true;
@@ -892,6 +927,7 @@ pub fn syscall_mq_timedsend(
                 },
             );
             wake_all_waiters(&mut state.recv_waiters);
+            wake_poll_waiters(&mut state);
             let notify = if was_empty { state.notify.take() } else { None };
             drop(state);
             if let Some(reg) = notify {
@@ -958,6 +994,7 @@ pub fn syscall_mq_timedreceive(
             }
             let msg = state.messages.pop_front().unwrap();
             wake_all_waiters(&mut state.send_waiters);
+            wake_poll_waiters(&mut state);
             drop(state);
             if !msg.data.is_empty()
                 && try_copy_to_user(token, msg_ptr as *mut u8, msg.data.as_slice()).is_err()

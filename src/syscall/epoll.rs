@@ -563,23 +563,8 @@ fn epoll_wait_common(
 
         let waiter_armed = {
             let ep = fd_to_epoll_ref(&epoll_file);
-            let snapshots = ep.snapshot_interests();
-            let mut armed = false;
-            let mut unsupported = false;
-            for snap in snapshots {
-                if snap.oneshot_disabled {
-                    continue;
-                }
-                if EpollFile::event_watch_mask(snap.events) == 0 {
-                    continue;
-                }
-                if snap.file.register_poll_waiter(&task) {
-                    armed = true;
-                } else {
-                    unsupported = true;
-                }
-            }
-            armed && !unsupported
+            let mut visited = BTreeSet::new();
+            ep.register_poll_waiter_internal(&task, &mut visited)
         };
 
         match should_block(&epoll_file, maxevents as usize, token, events_ptr) {

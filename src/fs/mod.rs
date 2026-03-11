@@ -126,7 +126,7 @@ pub use cgroupfs::{
     CgroupFile, CgroupMountSpec,
 };
 pub(crate) use dummy::wake_pidfd_poll_waiters;
-pub use dummy::{DummyFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
+pub use dummy::{DummyFile, EventFdFile, NamespaceFile, NamespaceKind, PidFdFile, UserfaultfdFile};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, register_deferred_unlink_cleanup,
     root_inode_for_path, secondary_root_inode,

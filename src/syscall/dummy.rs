@@ -1,7 +1,10 @@
 use alloc::sync::Arc;
 
 use crate::{
-    fs::{shm_create_anonymous, DummyFile, File, PidFdFile, PseudoShmFile, UserfaultfdFile},
+    fs::{
+        shm_create_anonymous, DummyFile, EventFdFile, File, PidFdFile, PseudoShmFile,
+        UserfaultfdFile,
+    },
     mm::try_copy_from_user,
     task::{
         manager::pid2process,
@@ -92,7 +95,14 @@ pub fn syscall_eventfd2(_count: u64, flags: usize) -> isize {
     if (flags & EFD_CLOEXEC) != 0 {
         fd_flags |= FD_CLOEXEC;
     }
-    alloc_dummy_fd(fd_flags)
+    alloc_fd(
+        Arc::new(EventFdFile::new(
+            _count,
+            (flags & EFD_SEMAPHORE) != 0,
+            (flags & EFD_NONBLOCK) != 0,
+        )),
+        fd_flags,
+    )
 }
 
 pub fn syscall_signalfd4(_fd: isize, _mask: usize, _sigsetsize: usize, flags: usize) -> isize {
