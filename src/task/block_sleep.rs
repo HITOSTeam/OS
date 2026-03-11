@@ -2,6 +2,11 @@
 use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use core::{cmp::Ordering, time};
 
+use alloc::{
+    collections::{BTreeMap, BinaryHeap},
+    sync::Arc,
+    vec::Vec,
+};
 use crate::task::signal::{SIGALRM_NUM, pick_task_for_signal, queue_process_signal, signal_bit};
 use crate::{
     task::{manager::wakeup_task, task_block::TaskControlBlock},
@@ -10,15 +15,17 @@ use crate::{
 use lazy_static::*;
 use spin::Mutex;
 
-use alloc::vec::Vec;
-use alloc::{collections::BinaryHeap, sync::Arc};
-
 use crate::debug_config::{DEBUG_TIMER, DEBUG_UNIXBENCH};
 use crate::task::process_block::ProcessControlBlock;
 use crate::{
     arch, mm::write_user_value, syscall::futex::futex_wake_private_and_shared,
     task::manager::pid2process,
 };
+
+const CLOCK_REALTIME: usize = 0;
+const CLOCK_MONOTONIC: usize = 1;
+const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+const CLOCK_THREAD_CPUTIME_ID: usize = 3;
 pub struct TimeWrap {
     pub task: Arc<TaskControlBlock>,
     pub tid: usize,
@@ -97,13 +104,317 @@ struct PosixTimer {
     deadline_ns: Option<u64>,
     interval_ns: u64,
     overrun: usize,
+    schedule_seq: u64,
 }
 
 lazy_static! {
-    static ref POSIX_TIMERS: Mutex<Vec<PosixTimer>> = Mutex::new(Vec::new());
+    static ref POSIX_TIMERS: Mutex<PosixTimerState> = Mutex::new(PosixTimerState::default());
+    static ref POSIX_CPU_TIMER_STATE: Mutex<PosixCpuTimerState> =
+        Mutex::new(PosixCpuTimerState::default());
+    static ref POSIX_TIMER_SCHEDULE: Mutex<PosixTimerScheduleState> =
+        Mutex::new(PosixTimerScheduleState::default());
 }
 
 static NEXT_POSIX_TIMER_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Default)]
+struct PosixTimerState {
+    timers: Vec<PosixTimer>,
+    timer_index: BTreeMap<(usize, usize), usize>,
+}
+
+impl PosixTimerState {
+    fn insert(&mut self, timer: PosixTimer) {
+        let idx = self.timers.len();
+        self.timer_index.insert((timer.pid, timer.timer_id), idx);
+        self.timers.push(timer);
+    }
+
+    fn get(&self, pid: usize, timer_id: usize) -> Option<&PosixTimer> {
+        let idx = *self.timer_index.get(&(pid, timer_id))?;
+        self.timers.get(idx)
+    }
+
+    fn get_mut(&mut self, pid: usize, timer_id: usize) -> Option<&mut PosixTimer> {
+        let idx = *self.timer_index.get(&(pid, timer_id))?;
+        self.timers.get_mut(idx)
+    }
+
+    fn remove(&mut self, pid: usize, timer_id: usize) -> Option<PosixTimer> {
+        let idx = self.timer_index.remove(&(pid, timer_id))?;
+        let timer = self.timers.swap_remove(idx);
+        if let Some(moved) = self.timers.get(idx) {
+            self.timer_index.insert((moved.pid, moved.timer_id), idx);
+        }
+        Some(timer)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PosixCpuTimerBucketKey {
+    Process { pid: usize },
+    Thread { pid: usize, tid: usize },
+}
+
+struct PosixCpuTimerBucket {
+    timers: BTreeMap<(usize, usize), u64>,
+    next_deadline_ns: u64,
+}
+
+impl Default for PosixCpuTimerBucket {
+    fn default() -> Self {
+        Self {
+            timers: BTreeMap::new(),
+            next_deadline_ns: u64::MAX,
+        }
+    }
+}
+
+impl PosixCpuTimerBucket {
+    fn refresh_next_deadline(&mut self) {
+        self.next_deadline_ns = self.timers.values().copied().min().unwrap_or(u64::MAX);
+    }
+}
+
+#[derive(Clone)]
+struct PosixCpuTimerBucketSnapshot {
+    clock_id: usize,
+    pid: usize,
+    thread_tid: Option<usize>,
+    next_deadline_ns: u64,
+    timers: Vec<(usize, usize)>,
+}
+
+#[derive(Default)]
+struct PosixCpuTimerState {
+    process: BTreeMap<usize, PosixCpuTimerBucket>,
+    thread: BTreeMap<(usize, usize), PosixCpuTimerBucket>,
+}
+
+impl PosixCpuTimerState {
+    fn bucket_mut(&mut self, key: PosixCpuTimerBucketKey) -> &mut PosixCpuTimerBucket {
+        match key {
+            PosixCpuTimerBucketKey::Process { pid } => self.process.entry(pid).or_default(),
+            PosixCpuTimerBucketKey::Thread { pid, tid } => self.thread.entry((pid, tid)).or_default(),
+        }
+    }
+
+    fn insert_or_update(
+        &mut self,
+        key: PosixCpuTimerBucketKey,
+        timer_key: (usize, usize),
+        deadline_ns: u64,
+    ) {
+        let bucket = self.bucket_mut(key);
+        bucket.timers.insert(timer_key, deadline_ns);
+        bucket.refresh_next_deadline();
+    }
+
+    fn remove(&mut self, key: PosixCpuTimerBucketKey, timer_key: (usize, usize)) {
+        match key {
+            PosixCpuTimerBucketKey::Process { pid } => {
+                let Some(bucket) = self.process.get_mut(&pid) else {
+                    return;
+                };
+                bucket.timers.remove(&timer_key);
+                if bucket.timers.is_empty() {
+                    self.process.remove(&pid);
+                } else {
+                    bucket.refresh_next_deadline();
+                }
+            }
+            PosixCpuTimerBucketKey::Thread { pid, tid } => {
+                let Some(bucket) = self.thread.get_mut(&(pid, tid)) else {
+                    return;
+                };
+                bucket.timers.remove(&timer_key);
+                if bucket.timers.is_empty() {
+                    self.thread.remove(&(pid, tid));
+                } else {
+                    bucket.refresh_next_deadline();
+                }
+            }
+        }
+    }
+
+    fn snapshots(&self) -> Vec<PosixCpuTimerBucketSnapshot> {
+        let mut snapshots = Vec::new();
+        for (&pid, bucket) in self.process.iter() {
+            snapshots.push(PosixCpuTimerBucketSnapshot {
+                clock_id: CLOCK_PROCESS_CPUTIME_ID,
+                pid,
+                thread_tid: None,
+                next_deadline_ns: bucket.next_deadline_ns,
+                timers: bucket.timers.keys().copied().collect(),
+            });
+        }
+        for (&(pid, tid), bucket) in self.thread.iter() {
+            snapshots.push(PosixCpuTimerBucketSnapshot {
+                clock_id: CLOCK_THREAD_CPUTIME_ID,
+                pid,
+                thread_tid: Some(tid),
+                next_deadline_ns: bucket.next_deadline_ns,
+                timers: bucket.timers.keys().copied().collect(),
+            });
+        }
+        snapshots
+    }
+
+    fn has_armed_timers(&self) -> bool {
+        !self.process.is_empty() || !self.thread.is_empty()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PosixTimerScheduleEntry {
+    deadline_ns: u64,
+    sequence: u64,
+    pid: usize,
+    timer_id: usize,
+}
+
+impl PartialEq for PosixTimerScheduleEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline_ns == other.deadline_ns
+            && self.sequence == other.sequence
+            && self.pid == other.pid
+            && self.timer_id == other.timer_id
+    }
+}
+
+impl Eq for PosixTimerScheduleEntry {}
+
+impl PartialOrd for PosixTimerScheduleEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PosixTimerScheduleEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .deadline_ns
+            .cmp(&self.deadline_ns)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+            .then_with(|| other.pid.cmp(&self.pid))
+            .then_with(|| other.timer_id.cmp(&self.timer_id))
+    }
+}
+
+#[derive(Default)]
+struct PosixTimerScheduleState {
+    monotonic: BinaryHeap<PosixTimerScheduleEntry>,
+    realtime: BinaryHeap<PosixTimerScheduleEntry>,
+    monotonic_armed: usize,
+    realtime_armed: usize,
+}
+
+impl PosixTimerScheduleState {
+    fn adjust_armed(&mut self, clock_id: usize, was_armed: bool, is_armed: bool) {
+        if was_armed == is_armed {
+            return;
+        }
+        let armed = match clock_id {
+            CLOCK_MONOTONIC => &mut self.monotonic_armed,
+            CLOCK_REALTIME => &mut self.realtime_armed,
+            _ => return,
+        };
+        if is_armed {
+            *armed = armed.saturating_add(1);
+        } else {
+            *armed = armed.saturating_sub(1);
+        }
+    }
+
+    fn has_live_timers(&self) -> bool {
+        self.monotonic_armed != 0 || self.realtime_armed != 0
+    }
+}
+
+fn posix_timer_now_ns(timer: &PosixTimer) -> Option<u64> {
+    crate::syscall::timer_clock_now_ns(timer.clock_id, timer.pid, timer.thread_tid)
+}
+
+fn posix_schedule_heap_mut(
+    state: &mut PosixTimerScheduleState,
+    clock_id: usize,
+) -> Option<&mut BinaryHeap<PosixTimerScheduleEntry>> {
+    match clock_id {
+        CLOCK_MONOTONIC => Some(&mut state.monotonic),
+        CLOCK_REALTIME => Some(&mut state.realtime),
+        _ => None,
+    }
+}
+
+fn posix_timer_uses_deadline_heap(clock_id: usize) -> bool {
+    matches!(clock_id, CLOCK_MONOTONIC | CLOCK_REALTIME)
+}
+
+fn posix_timer_uses_cpu_bucket(clock_id: usize) -> bool {
+    matches!(clock_id, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID)
+}
+
+fn posix_timer_cpu_bucket(timer: &PosixTimer) -> Option<PosixCpuTimerBucketKey> {
+    match timer.clock_id {
+        CLOCK_PROCESS_CPUTIME_ID => Some(PosixCpuTimerBucketKey::Process { pid: timer.pid }),
+        CLOCK_THREAD_CPUTIME_ID => Some(PosixCpuTimerBucketKey::Thread {
+            pid: timer.pid,
+            tid: timer.thread_tid?,
+        }),
+        _ => None,
+    }
+}
+
+fn posix_timer_heap_armed(timer: &PosixTimer) -> bool {
+    timer.deadline_ns.is_some() && posix_timer_uses_deadline_heap(timer.clock_id)
+}
+
+fn posix_update_cpu_timer_state(
+    timer: &PosixTimer,
+    old_deadline_ns: Option<u64>,
+    new_deadline_ns: Option<u64>,
+) {
+    if !posix_timer_uses_cpu_bucket(timer.clock_id) {
+        return;
+    }
+    let Some(bucket_key) = posix_timer_cpu_bucket(timer) else {
+        return;
+    };
+    let timer_key = (timer.pid, timer.timer_id);
+    let mut state = POSIX_CPU_TIMER_STATE.lock();
+    match (old_deadline_ns, new_deadline_ns) {
+        (_, Some(deadline_ns)) => state.insert_or_update(bucket_key, timer_key, deadline_ns),
+        (Some(_), None) => state.remove(bucket_key, timer_key),
+        (None, None) => {}
+    }
+}
+
+fn posix_reschedule_timer_locked(timer: &mut PosixTimer, was_armed: bool) {
+    let is_armed = posix_timer_heap_armed(timer);
+    timer.schedule_seq = timer.schedule_seq.wrapping_add(1);
+    if !was_armed && !is_armed {
+        return;
+    }
+    let Some(deadline_ns) = timer.deadline_ns else {
+        let mut schedule = POSIX_TIMER_SCHEDULE.lock();
+        schedule.adjust_armed(timer.clock_id, was_armed, is_armed);
+        return;
+    };
+    let mut schedule = POSIX_TIMER_SCHEDULE.lock();
+    schedule.adjust_armed(timer.clock_id, was_armed, is_armed);
+    if !is_armed {
+        return;
+    }
+    let Some(heap) = posix_schedule_heap_mut(&mut schedule, timer.clock_id) else {
+        return;
+    };
+    heap.push(PosixTimerScheduleEntry {
+        deadline_ns,
+        sequence: timer.schedule_seq,
+        pid: timer.pid,
+        timer_id: timer.timer_id,
+    });
+}
 
 pub fn create_posix_timer(
     pid: usize,
@@ -115,7 +426,7 @@ pub fn create_posix_timer(
         return None;
     }
     let timer_id = NEXT_POSIX_TIMER_ID.fetch_add(1, AtomicOrdering::Relaxed);
-    POSIX_TIMERS.lock().push(PosixTimer {
+    POSIX_TIMERS.lock().insert(PosixTimer {
         pid,
         timer_id,
         clock_id,
@@ -124,6 +435,7 @@ pub fn create_posix_timer(
         deadline_ns: None,
         interval_ns: 0,
         overrun: 0,
+        schedule_seq: 0,
     });
     Some(timer_id)
 }
@@ -137,15 +449,10 @@ pub fn set_posix_timer(
 ) -> Result<(u64, u64), isize> {
     const EINVAL: isize = -22;
     let mut timers = POSIX_TIMERS.lock();
-    let Some(timer) = timers
-        .iter_mut()
-        .find(|t| t.pid == pid && t.timer_id == timer_id)
-    else {
+    let Some(timer) = timers.get_mut(pid, timer_id) else {
         return Err(EINVAL);
     };
-    let Some(now_ns) =
-        crate::syscall::timer_clock_now_ns(timer.clock_id, timer.pid, timer.thread_tid)
-    else {
+    let Some(now_ns) = posix_timer_now_ns(timer) else {
         return Err(EINVAL);
     };
     let prev_remain = timer
@@ -153,20 +460,26 @@ pub fn set_posix_timer(
         .map(|d| d.saturating_sub(now_ns))
         .unwrap_or(0);
     let prev_interval = timer.interval_ns;
+    let old_deadline_ns = timer.deadline_ns;
+    let was_armed = posix_timer_heap_armed(timer);
     timer.interval_ns = interval_ns;
     timer.deadline_ns = deadline_ns;
     timer.overrun = initial_overrun.min(i32::MAX as usize);
+    posix_update_cpu_timer_state(timer, old_deadline_ns, timer.deadline_ns);
+    posix_reschedule_timer_locked(timer, was_armed);
     Ok((prev_remain, prev_interval))
 }
 
 pub fn delete_posix_timer(pid: usize, timer_id: usize) -> isize {
     const EINVAL: isize = -22;
     let mut timers = POSIX_TIMERS.lock();
-    if let Some(idx) = timers
-        .iter()
-        .position(|t| t.pid == pid && t.timer_id == timer_id)
-    {
-        timers.swap_remove(idx);
+    if let Some(timer) = timers.remove(pid, timer_id) {
+        posix_update_cpu_timer_state(&timer, timer.deadline_ns, None);
+        if posix_timer_heap_armed(&timer) {
+            POSIX_TIMER_SCHEDULE
+                .lock()
+                .adjust_armed(timer.clock_id, true, false);
+        }
         return 0;
     }
     EINVAL
@@ -178,10 +491,7 @@ pub fn query_posix_timer(
 ) -> Result<(usize, Option<u64>, u64, Option<usize>), isize> {
     const EINVAL: isize = -22;
     let timers = POSIX_TIMERS.lock();
-    let Some(timer) = timers
-        .iter()
-        .find(|t| t.pid == pid && t.timer_id == timer_id)
-    else {
+    let Some(timer) = timers.get(pid, timer_id) else {
         return Err(EINVAL);
     };
     Ok((
@@ -195,10 +505,7 @@ pub fn query_posix_timer(
 pub fn take_posix_timer_overrun(pid: usize, timer_id: usize) -> Result<isize, isize> {
     const EINVAL: isize = -22;
     let mut timers = POSIX_TIMERS.lock();
-    let Some(timer) = timers
-        .iter_mut()
-        .find(|t| t.pid == pid && t.timer_id == timer_id)
-    else {
+    let Some(timer) = timers.get_mut(pid, timer_id) else {
         return Err(EINVAL);
     };
     let overrun = timer.overrun.min(i32::MAX as usize) as isize;
@@ -406,32 +713,48 @@ fn process_alarm_timers(current_ms: usize) {
 }
 
 fn process_posix_timers() {
-    loop {
-        let fired = {
-            let mut timers = POSIX_TIMERS.lock();
-            let idx = timers.iter().position(|t| {
-                let Some(deadline_ns) = t.deadline_ns else {
-                    return false;
+    for clock_id in [CLOCK_MONOTONIC, CLOCK_REALTIME] {
+        loop {
+            let entry = {
+                let Some(now_ns) = crate::syscall::timer_clock_now_ns(clock_id, 0, None) else {
+                    break;
                 };
-                let Some(now_ns) =
-                    crate::syscall::timer_clock_now_ns(t.clock_id, t.pid, t.thread_tid)
-                else {
-                    return false;
+                let mut schedule = POSIX_TIMER_SCHEDULE.lock();
+                let Some(heap) = posix_schedule_heap_mut(&mut schedule, clock_id) else {
+                    break;
                 };
-                deadline_ns <= now_ns
-            });
-            if let Some(idx) = idx {
-                let timer = &mut timers[idx];
+                match heap.peek() {
+                    Some(entry) if entry.deadline_ns <= now_ns => heap.pop(),
+                    _ => None,
+                }
+            };
+            let Some(entry) = entry else {
+                break;
+            };
+            let fired = {
+                let mut timers = POSIX_TIMERS.lock();
+                let Some(timer) = timers.get_mut(entry.pid, entry.timer_id) else {
+                    continue;
+                };
+                if timer.clock_id != clock_id
+                    || timer.schedule_seq != entry.sequence
+                    || timer.deadline_ns != Some(entry.deadline_ns)
+                {
+                    continue;
+                }
+                let Some(now_ns) = posix_timer_now_ns(timer) else {
+                    continue;
+                };
+                if entry.deadline_ns > now_ns {
+                    continue;
+                }
+                let was_armed = posix_timer_heap_armed(timer);
                 let pid = timer.pid;
                 let signum = timer.signum;
-                let now_ns =
-                    crate::syscall::timer_clock_now_ns(timer.clock_id, timer.pid, timer.thread_tid)
-                        .unwrap_or(0);
                 if timer.interval_ns == 0 {
                     timer.deadline_ns = None;
                 } else {
-                    let base = timer.deadline_ns.unwrap_or(now_ns);
-                    let elapsed = now_ns.saturating_sub(base);
+                    let elapsed = now_ns.saturating_sub(entry.deadline_ns);
                     let expirations = elapsed / timer.interval_ns + 1;
                     let extra = expirations.saturating_sub(1);
                     if extra > 0 {
@@ -440,10 +763,73 @@ fn process_posix_timers() {
                             .saturating_add(extra as usize)
                             .min(i32::MAX as usize);
                     }
-                    timer.deadline_ns =
-                        Some(base.saturating_add(expirations.saturating_mul(timer.interval_ns)));
+                    timer.deadline_ns = Some(
+                        entry
+                            .deadline_ns
+                            .saturating_add(expirations.saturating_mul(timer.interval_ns)),
+                    );
                 }
+                posix_reschedule_timer_locked(timer, was_armed);
                 Some((pid, signum))
+            };
+            let Some((pid, signum)) = fired else {
+                continue;
+            };
+            queue_process_signal(pid, signum);
+        }
+    }
+
+    loop {
+        let bucket = {
+            let snapshots = POSIX_CPU_TIMER_STATE.lock().snapshots();
+            snapshots.into_iter().find_map(|snapshot| {
+                let now_ns =
+                    crate::syscall::timer_clock_now_ns(snapshot.clock_id, snapshot.pid, snapshot.thread_tid)?;
+                (snapshot.next_deadline_ns <= now_ns).then_some((snapshot, now_ns))
+            })
+        };
+        let Some((bucket, now_ns)) = bucket else {
+            break;
+        };
+        let fired = {
+            let mut timers = POSIX_TIMERS.lock();
+            let due_key = bucket.timers.into_iter().find(|(pid, timer_id)| {
+                let Some(timer) = timers.get(*pid, *timer_id) else {
+                    return false;
+                };
+                timer.clock_id == bucket.clock_id
+                    && timer.thread_tid == bucket.thread_tid
+                    && timer.deadline_ns.is_some_and(|deadline_ns| deadline_ns <= now_ns)
+            });
+            if let Some((pid, timer_id)) = due_key {
+                if let Some(timer) = timers.get_mut(pid, timer_id) {
+                    let old_deadline_ns = timer.deadline_ns;
+                    let was_armed = posix_timer_heap_armed(timer);
+                    let pid = timer.pid;
+                    let signum = timer.signum;
+                    if timer.interval_ns == 0 {
+                        timer.deadline_ns = None;
+                    } else {
+                        let base = timer.deadline_ns.unwrap_or(now_ns);
+                        let elapsed = now_ns.saturating_sub(base);
+                        let expirations = elapsed / timer.interval_ns + 1;
+                        let extra = expirations.saturating_sub(1);
+                        if extra > 0 {
+                            timer.overrun = timer
+                                .overrun
+                                .saturating_add(extra as usize)
+                                .min(i32::MAX as usize);
+                        }
+                        timer.deadline_ns = Some(
+                            base.saturating_add(expirations.saturating_mul(timer.interval_ns)),
+                        );
+                    }
+                    posix_update_cpu_timer_state(timer, old_deadline_ns, timer.deadline_ns);
+                    posix_reschedule_timer_locked(timer, was_armed);
+                    Some((pid, signum))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -541,8 +927,13 @@ pub fn check_timer() {
 }
 
 pub fn has_pending_timers() -> bool {
+    let posix_pending = {
+        let cpu_timer_armed = POSIX_CPU_TIMER_STATE.lock().has_armed_timers();
+        let schedule = POSIX_TIMER_SCHEDULE.lock();
+        cpu_timer_armed || schedule.has_live_timers()
+    };
     !TIMERS.lock().is_empty()
         || !ALARM_TIMERS.lock().is_empty()
-        || POSIX_TIMERS.lock().iter().any(|t| t.deadline_ns.is_some())
+        || posix_pending
         || !DELAYED_TID_CLEARS.lock().is_empty()
 }
