@@ -1066,6 +1066,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 /// Terminate the entire process, even when called from a non-main thread.
 pub fn exit_group_and_run_next(exit_code: i32) {
     let task = take_current_task().unwrap();
+    charge_running_task(&task);
     task.clear_on_cpu();
     let Some(process) = task.process.upgrade() else {
         if DEBUG_SCHED {
