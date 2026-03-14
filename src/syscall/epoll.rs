@@ -462,6 +462,9 @@ fn should_block(
     let ep = fd_to_epoll_ref(file);
     let (ready_events, updates) = ep.gather_ready_events(maxevents);
     if ready_events.is_empty() {
+        // Edge-triggered entries still need their last_ready snapshot refreshed
+        // when readiness drops to zero, otherwise the next edge can be missed.
+        ep.apply_updates(&updates);
         return Ok(0);
     }
     write_ready_events(token, events_ptr, &ready_events)?;

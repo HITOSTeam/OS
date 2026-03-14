@@ -164,9 +164,37 @@ app_40_name:
     .asciz "timerfd_epoll_smoke"
 .section .rodata
 .align 3
+app_41_name:
+    .asciz "mq_epoll_smoke"
+.section .rodata
+.align 3
+app_42_name:
+    .asciz "mq_unlink_epoll_smoke"
+.section .rodata
+.align 3
+app_43_name:
+    .asciz "mq_notify_signal_smoke"
+.section .rodata
+.align 3
+app_44_name:
+    .asciz "nested_epoll_ctl_wakeup_smoke"
+.section .rodata
+.align 3
+app_45_name:
+    .asciz "nested_epoll_oneshot_smoke"
+.section .rodata
+.align 3
+app_46_name:
+    .asciz "nested_epoll_ctl_del_smoke"
+.section .rodata
+.align 3
+app_47_name:
+    .asciz "nested_epoll_et_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 41
+    .quad 48
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -208,3 +236,10 @@ num_user_apps:
     .quad app_38_name
     .quad app_39_name
     .quad app_40_name
+    .quad app_41_name
+    .quad app_42_name
+    .quad app_43_name
+    .quad app_44_name
+    .quad app_45_name
+    .quad app_46_name
+    .quad app_47_name
