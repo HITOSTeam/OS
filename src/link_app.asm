@@ -192,9 +192,13 @@ app_47_name:
     .asciz "nested_epoll_et_smoke"
 .section .rodata
 .align 3
+app_48_name:
+    .asciz "nested_epoll_et_maxevents_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 48
+    .quad 49
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -243,3 +247,4 @@ num_user_apps:
     .quad app_45_name
     .quad app_46_name
     .quad app_47_name
+    .quad app_48_name

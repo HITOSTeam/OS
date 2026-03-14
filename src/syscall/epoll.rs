@@ -321,14 +321,11 @@ impl EpollFile {
                 last_ready: ready_now,
                 disable_oneshot: fired && Self::is_oneshot(snap.events),
             });
-            if fired {
+            if fired && events.len() < maxevents {
                 events.push(UserEpollEvent {
                     events: ready_now & watch_mask,
                     data: snap.data,
                 });
-                if events.len() >= maxevents {
-                    break;
-                }
             }
         }
         (events, updates)
