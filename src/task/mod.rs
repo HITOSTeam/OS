@@ -18,7 +18,7 @@ use lazy_static::lazy_static;
 pub mod block_sleep;
 pub mod condvar;
 mod id;
-pub(crate) use id::{pid_max, set_pid_max};
+pub(crate) use id::{pid_max, pid_max_bounds, set_pid_max};
 pub mod manager;
 pub mod mutex;
 mod process_block;

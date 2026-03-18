@@ -3,9 +3,11 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+use crate::fs::parse_proc_sys_usize;
 use crate::mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value};
 use crate::task::manager::wakeup_task;
 use crate::task::processor::{block_current_and_run_next, current_process, current_task};
@@ -53,6 +55,17 @@ const SEMOPM: usize = 500;
 const MSGMNB: usize = 16384;
 const MSGMNI: usize = 4096;
 const MSGMAX: usize = 8192;
+const PROCFS_MSGMAX: &str = "/proc/sys/kernel/msgmax";
+const PROCFS_MSGMNB: &str = "/proc/sys/kernel/msgmnb";
+const PROCFS_MSGMNI: &str = "/proc/sys/kernel/msgmni";
+const PROCFS_SEM: &str = "/proc/sys/kernel/sem";
+static RUNTIME_MSGMAX_LIMIT: AtomicUsize = AtomicUsize::new(MSGMAX);
+static RUNTIME_MSGMNB_LIMIT: AtomicUsize = AtomicUsize::new(MSGMNB);
+static RUNTIME_MSGMNI_LIMIT: AtomicUsize = AtomicUsize::new(MSGMNI);
+static RUNTIME_SEMMSL_LIMIT: AtomicUsize = AtomicUsize::new(SEMMSL);
+static RUNTIME_SEMMNS_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNS);
+static RUNTIME_SEMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNI);
+static RUNTIME_SEMOPM_LIMIT: AtomicUsize = AtomicUsize::new(SEMOPM);
 
 const EPERM: isize = -1;
 const ENOENT: isize = -2;
@@ -95,6 +108,98 @@ pub fn semopm_limit() -> usize {
 
 pub fn semmni_limit() -> usize {
     SEMMNI
+}
+
+fn runtime_msgmax_limit() -> usize {
+    RUNTIME_MSGMAX_LIMIT.load(Ordering::Relaxed)
+}
+
+fn runtime_msgmnb_limit() -> usize {
+    RUNTIME_MSGMNB_LIMIT.load(Ordering::Relaxed)
+}
+
+fn runtime_msgmni_limit() -> usize {
+    RUNTIME_MSGMNI_LIMIT.load(Ordering::Relaxed)
+}
+
+fn runtime_sem_limits() -> (usize, usize, usize, usize) {
+    (
+        RUNTIME_SEMMSL_LIMIT.load(Ordering::Relaxed),
+        RUNTIME_SEMMNS_LIMIT.load(Ordering::Relaxed),
+        RUNTIME_SEMOPM_LIMIT.load(Ordering::Relaxed),
+        RUNTIME_SEMMNI_LIMIT.load(Ordering::Relaxed),
+    )
+}
+
+pub fn runtime_msgmax_for_procfs() -> usize {
+    runtime_msgmax_limit()
+}
+
+pub fn runtime_msgmnb_for_procfs() -> usize {
+    runtime_msgmnb_limit()
+}
+
+pub fn runtime_msgmni_for_procfs() -> usize {
+    runtime_msgmni_limit()
+}
+
+pub fn runtime_sem_limits_for_procfs() -> (usize, usize, usize, usize) {
+    runtime_sem_limits()
+}
+
+pub fn write_msg_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let slot = match path {
+        PROCFS_MSGMAX => &RUNTIME_MSGMAX_LIMIT,
+        PROCFS_MSGMNB => &RUNTIME_MSGMNB_LIMIT,
+        PROCFS_MSGMNI => &RUNTIME_MSGMNI_LIMIT,
+        _ => return Err(EINVAL),
+    };
+    let value = parse_proc_sys_usize(data)?;
+    if value == 0 || value > i32::MAX as usize {
+        return Err(EINVAL);
+    }
+    slot.store(value, Ordering::Relaxed);
+    Ok(alloc::format!("{}\n", value).into_bytes())
+}
+
+pub fn write_sem_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    if path != PROCFS_SEM {
+        return Err(EINVAL);
+    }
+    let Ok(raw) = core::str::from_utf8(data) else {
+        return Err(EINVAL);
+    };
+    let mut parts = raw.split_whitespace();
+    let Some(semmsl) = parts.next().and_then(|v| v.parse::<usize>().ok()) else {
+        return Err(EINVAL);
+    };
+    let Some(semmns) = parts.next().and_then(|v| v.parse::<usize>().ok()) else {
+        return Err(EINVAL);
+    };
+    let Some(semopm) = parts.next().and_then(|v| v.parse::<usize>().ok()) else {
+        return Err(EINVAL);
+    };
+    let Some(semmni) = parts.next().and_then(|v| v.parse::<usize>().ok()) else {
+        return Err(EINVAL);
+    };
+    if parts.next().is_some() {
+        return Err(EINVAL);
+    }
+    let values = [semmsl, semmns, semopm, semmni];
+    if values
+        .iter()
+        .any(|value| *value == 0 || *value > i32::MAX as usize)
+    {
+        return Err(EINVAL);
+    }
+    if semmns < semmsl {
+        return Err(EINVAL);
+    }
+    RUNTIME_SEMMSL_LIMIT.store(semmsl, Ordering::Relaxed);
+    RUNTIME_SEMMNS_LIMIT.store(semmns, Ordering::Relaxed);
+    RUNTIME_SEMOPM_LIMIT.store(semopm, Ordering::Relaxed);
+    RUNTIME_SEMMNI_LIMIT.store(semmni, Ordering::Relaxed);
+    Ok(alloc::format!("{}\t{}\t{}\t{}\n", semmsl, semmns, semopm, semmni).into_bytes())
 }
 
 pub fn proc_sysvipc_msg() -> String {
@@ -575,7 +680,7 @@ pub fn syscall_msgget(key: usize, msgflg: usize) -> isize {
             return ENOENT;
         }
     }
-    if mgr.queues.len() >= MSGMNI {
+    if mgr.queues.len() >= runtime_msgmni_limit() {
         return ENOSPC;
     }
 
@@ -601,7 +706,7 @@ pub fn syscall_msgget(key: usize, msgflg: usize) -> isize {
         recv_waiters: VecDeque::new(),
         send_waiters: VecDeque::new(),
         cbytes: 0,
-        qbytes: MSGMNB,
+        qbytes: runtime_msgmnb_limit(),
         lspid: 0,
         lrpid: 0,
         stime: 0,
@@ -625,9 +730,9 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
     if cmd == IPC_INFO || cmd == MSG_INFO {
         let highest_index = mgr.queues.keys().next_back().copied().unwrap_or(0);
         let info = MsgInfoUser {
-            msgmax: MSGMAX as i32,
-            msgmnb: MSGMNB as i32,
-            msgmni: MSGMNI as i32,
+            msgmax: runtime_msgmax_limit() as i32,
+            msgmnb: runtime_msgmnb_limit() as i32,
+            msgmni: runtime_msgmni_limit() as i32,
             msgssz: 16,
             msgseg: 1024,
             msgtql: mgr.queues.len() as i32,
@@ -700,6 +805,9 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
 
 pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) -> isize {
     if (msgsz as isize) < 0 {
+        return EINVAL;
+    }
+    if msgsz > runtime_msgmax_limit() {
         return EINVAL;
     }
     let cred = current_cred();
@@ -905,8 +1013,19 @@ pub fn syscall_semget(key: usize, nsems: usize, semflg: usize) -> isize {
         }
     }
 
-    if nsems == 0 || nsems > SEMMSL {
+    let (semmsl, semmns, _semopm, semmni) = runtime_sem_limits();
+    if nsems == 0 || nsems > semmsl {
         return EINVAL;
+    }
+    if mgr.sets.len() >= semmni {
+        return ENOSPC;
+    }
+    let total_sems = mgr
+        .sets
+        .values()
+        .fold(0usize, |acc, set| acc.saturating_add(set.sems.len()));
+    if total_sems.saturating_add(nsems) > semmns {
+        return ENOSPC;
     }
     let id = mgr.alloc_id();
     let mode = (semflg & 0o777) as u16;
@@ -950,11 +1069,12 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             let mut managers = SEM_MANAGERS.lock();
             let mgr = managers.entry(ipc_ns_id).or_default();
             let highest_index = mgr.sets.keys().next_back().copied().unwrap_or(0);
+            let (semmsl, semmns, semopm, semmni) = runtime_sem_limits();
             let info = SemInfoUser {
-                semmni: SEMMNI as i32,
-                semmns: SEMMNS as i32,
-                semmsl: SEMMSL as i32,
-                semopm: SEMOPM as i32,
+                semmni: semmni as i32,
+                semmns: semmns as i32,
+                semmsl: semmsl as i32,
+                semopm: semopm as i32,
                 semusz: mgr.sets.len() as i32,
                 semvmx: SEMVMX,
                 ..SemInfoUser::default()

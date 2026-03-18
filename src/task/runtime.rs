@@ -1,11 +1,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
-    task::{
-        ProcessControlBlock,
-        processor::current_task,
-        task_block::TaskControlBlock,
-    },
+    task::{ProcessControlBlock, processor::current_task, task_block::TaskControlBlock},
     time::get_time_ns,
 };
 
@@ -80,5 +76,7 @@ pub fn process_cpu_time_ns(process: &Arc<ProcessControlBlock>) -> u64 {
 
 /// Return total CPU runtime for the current task, including the running slice.
 pub fn current_task_cpu_time_ns() -> u64 {
-    current_task().map(|task| task_cpu_time_ns(&task)).unwrap_or(0)
+    current_task()
+        .map(|task| task_cpu_time_ns(&task))
+        .unwrap_or(0)
 }

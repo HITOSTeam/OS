@@ -1,5 +1,7 @@
+use alloc::vec::Vec;
+
 use crate::{
-    mm::try_read_user_value,
+    mm::{try_copy_from_user, try_read_user_value},
     println,
     task::processor::{
         exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
@@ -138,6 +140,41 @@ where
     total
 }
 
+fn copy_iov_bytes(iov_ptr: usize, iovcnt_raw: usize) -> Result<Vec<u8>, isize> {
+    let iovcnt = validate_iovcnt(iovcnt_raw)?;
+    if iovcnt == 0 {
+        return Ok(Vec::new());
+    }
+
+    let token = get_current_token();
+    let mut total_len = 0usize;
+    let mut iovecs = Vec::with_capacity(iovcnt);
+    for index in 0..iovcnt {
+        let iv = read_iovec(token, iov_ptr, index)?;
+        if iv.len > isize::MAX as usize {
+            return Err(EINVAL);
+        }
+        total_len = match total_len.checked_add(iv.len) {
+            Some(value) if value <= isize::MAX as usize => value,
+            _ => return Err(EINVAL),
+        };
+        iovecs.push(iv);
+    }
+
+    let mut data = Vec::with_capacity(total_len);
+    for iv in iovecs {
+        if iv.len == 0 {
+            continue;
+        }
+        let start = data.len();
+        data.resize(start + iv.len, 0);
+        if try_copy_from_user(token, iv.base as *const u8, &mut data[start..]).is_err() {
+            return Err(EFAULT);
+        }
+    }
+    Ok(data)
+}
+
 pub fn syscall_read(_fd: usize, buf: *mut u8, len: usize) -> isize {
     super::filesystem::syscall_read(_fd, buf as usize, len)
 }
@@ -146,6 +183,15 @@ pub fn syscall_write(fd: usize, buf: *const u8, len: usize) -> isize {
 }
 
 pub fn syscall_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
+    if super::filesystem::fd_is_writable_proc_pseudo(fd) {
+        let data = match copy_iov_bytes(iov_ptr, iovcnt) {
+            Ok(data) => data,
+            Err(err) => return err,
+        };
+        if let Some(ret) = super::filesystem::write_proc_pseudo_fd(fd, &data, None) {
+            return ret;
+        }
+    }
     do_iov(iov_ptr, iovcnt, |base, len| {
         syscall_write(fd, base as *const u8, len)
     })
@@ -164,6 +210,19 @@ pub fn syscall_preadv(fd: usize, iov_ptr: usize, iovcnt: usize, offset: isize) -
 }
 
 pub fn syscall_pwritev(fd: usize, iov_ptr: usize, iovcnt: usize, offset: isize) -> isize {
+    if offset < 0 {
+        return EINVAL;
+    }
+    if super::filesystem::fd_is_writable_proc_pseudo(fd) {
+        let data = match copy_iov_bytes(iov_ptr, iovcnt) {
+            Ok(data) => data,
+            Err(err) => return err,
+        };
+        if let Some(ret) = super::filesystem::write_proc_pseudo_fd(fd, &data, Some(offset as usize))
+        {
+            return ret;
+        }
+    }
     do_iov_with_offset(iov_ptr, iovcnt, offset, |base, len, off| {
         super::filesystem::syscall_pwrite64(fd, base, len, off)
     })

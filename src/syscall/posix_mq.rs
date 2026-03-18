@@ -4,13 +4,13 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::clock_freq;
-use crate::fs::{File, POLLIN, POLLOUT, PollWaitQueue, find_path_in_roots, wake_tasks};
+use crate::fs::{File, POLLIN, POLLOUT, PollWaitQueue, parse_proc_sys_usize, wake_tasks};
 use crate::mm::{
     UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
 };
@@ -67,6 +67,7 @@ const MQ_NOTIFY_WOKENUP: u8 = 1;
 const MQ_NOTIFY_REMOVED: u8 = 2;
 const PROCFS_QUEUES_MAX: &str = "/proc/sys/fs/mqueue/queues_max";
 const NSEC_PER_SEC: u64 = 1_000_000_000;
+static MQ_QUEUES_MAX_LIMIT: AtomicUsize = AtomicUsize::new(MQ_DEFAULT_QUEUES_MAX);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -403,21 +404,23 @@ fn wake_poll_waiters(state: &mut MqQueueState) {
 }
 
 fn mq_queues_max_limit() -> usize {
-    let Some(inode) = find_path_in_roots(PROCFS_QUEUES_MAX) else {
-        return MQ_DEFAULT_QUEUES_MAX;
-    };
-    let mut buf = [0u8; 64];
-    let len = inode.read_at(0, &mut buf);
-    if len == 0 {
-        return MQ_DEFAULT_QUEUES_MAX;
+    MQ_QUEUES_MAX_LIMIT.load(Ordering::Relaxed)
+}
+
+pub fn queues_max_limit_for_procfs() -> usize {
+    mq_queues_max_limit()
+}
+
+pub fn write_mqueue_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    if path != PROCFS_QUEUES_MAX {
+        return Err(EINVAL);
     }
-    let Ok(raw) = core::str::from_utf8(&buf[..len]) else {
-        return MQ_DEFAULT_QUEUES_MAX;
-    };
-    let Ok(value) = raw.trim().parse::<usize>() else {
-        return MQ_DEFAULT_QUEUES_MAX;
-    };
-    value.clamp(1, MQ_HARD_QUEUES_MAX)
+    let value = parse_proc_sys_usize(data)?;
+    if !(1..=MQ_HARD_QUEUES_MAX).contains(&value) {
+        return Err(EINVAL);
+    }
+    MQ_QUEUES_MAX_LIMIT.store(value, Ordering::Relaxed);
+    Ok(alloc::format!("{}\n", value).into_bytes())
 }
 
 fn monotonic_now_ns() -> u64 {

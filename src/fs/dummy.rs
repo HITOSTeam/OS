@@ -1016,7 +1016,9 @@ pub(crate) fn process_timerfd_expirations() {
             };
             let waiters = {
                 let mut inner = file.inner.lock();
-                if inner.schedule_seq != entry.sequence || inner.canceled || inner.deadline_ns.is_none()
+                if inner.schedule_seq != entry.sequence
+                    || inner.canceled
+                    || inner.deadline_ns.is_none()
                 {
                     continue;
                 }

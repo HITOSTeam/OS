@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 const PID_MAX_DEFAULT: usize = 32768;
+const PID_MAX_MIN: usize = 2;
 const PID_MAX_HARD_LIMIT: usize = 4 * 1024 * 1024;
 
 static PID_MAX_VALUE: AtomicUsize = AtomicUsize::new(PID_MAX_DEFAULT);
@@ -35,7 +36,7 @@ fn maybe_log_kstack_inflight(event: &str) {
 }
 
 fn clamp_pid_max(pid_max: usize) -> usize {
-    pid_max.clamp(2, PID_MAX_HARD_LIMIT)
+    pid_max.clamp(PID_MAX_MIN, PID_MAX_HARD_LIMIT)
 }
 
 fn maybe_log_pid_active(event: &str, len: usize) {
@@ -93,6 +94,10 @@ pub struct PidHandle(pub usize);
 
 pub fn pid_max() -> usize {
     clamp_pid_max(PID_MAX_VALUE.load(Ordering::Relaxed))
+}
+
+pub fn pid_max_bounds() -> (usize, usize) {
+    (PID_MAX_MIN, PID_MAX_HARD_LIMIT)
 }
 
 pub fn set_pid_max(pid_max: usize) -> usize {

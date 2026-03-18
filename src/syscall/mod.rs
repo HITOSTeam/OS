@@ -10,7 +10,7 @@ mod memory;
 pub(crate) mod misc;
 mod mutex;
 mod net;
-mod posix_mq;
+pub(crate) mod posix_mq;
 pub(crate) mod process;
 pub(crate) mod robust_list;
 mod sched;

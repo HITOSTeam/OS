@@ -2,11 +2,12 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
-use crate::fs::find_path_in_roots;
+use crate::fs::parse_proc_sys_usize;
 use crate::mm::{
     FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc, try_read_user_value,
     try_write_user_value,
@@ -43,6 +44,9 @@ const SHM_MMAP_MIN_ADDR: usize = 0x10000;
 const PROCFS_SHMMAX: &str = "/proc/sys/kernel/shmmax";
 const PROCFS_SHMMNI: &str = "/proc/sys/kernel/shmmni";
 const PROCFS_SHMALL: &str = "/proc/sys/kernel/shmall";
+static RUNTIME_SHMMAX_LIMIT: AtomicUsize = AtomicUsize::new(SHMMAX);
+static RUNTIME_SHMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SHMMNI);
+static RUNTIME_SHMALL_LIMIT: AtomicUsize = AtomicUsize::new(SHMALL);
 
 const EACCES: isize = -13;
 const EFAULT: isize = -14;
@@ -65,34 +69,43 @@ pub fn shmall_limit() -> usize {
     SHMALL
 }
 
-fn read_proc_sys_limit(path: &str, default: usize, min: usize, max: usize) -> usize {
-    let Some(inode) = find_path_in_roots(path) else {
-        return default;
+pub fn write_shm_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let (slot, min, max) = match path {
+        PROCFS_SHMMAX => (&RUNTIME_SHMMAX_LIMIT, SHMMIN, SHMMAX),
+        PROCFS_SHMMNI => (&RUNTIME_SHMMNI_LIMIT, 1, SHMMNI),
+        PROCFS_SHMALL => (&RUNTIME_SHMALL_LIMIT, 1, SHMALL),
+        _ => return Err(EINVAL),
     };
-    let mut buf = [0u8; 64];
-    let len = inode.read_at(0, &mut buf);
-    if len == 0 {
-        return default;
+    let value = parse_proc_sys_usize(data)?;
+    if value < min || value > max {
+        return Err(EINVAL);
     }
-    let Ok(raw) = core::str::from_utf8(&buf[..len]) else {
-        return default;
-    };
-    let Ok(value) = raw.trim().parse::<usize>() else {
-        return default;
-    };
-    value.clamp(min, max)
+    slot.store(value, Ordering::Relaxed);
+    Ok(format!("{}\n", value).into_bytes())
 }
 
 fn runtime_shmmax_limit() -> usize {
-    read_proc_sys_limit(PROCFS_SHMMAX, SHMMAX, SHMMIN, SHMMAX)
+    RUNTIME_SHMMAX_LIMIT.load(Ordering::Relaxed)
 }
 
 fn runtime_shmmni_limit() -> usize {
-    read_proc_sys_limit(PROCFS_SHMMNI, SHMMNI, 1, SHMMNI)
+    RUNTIME_SHMMNI_LIMIT.load(Ordering::Relaxed)
 }
 
 fn runtime_shmall_limit() -> usize {
-    read_proc_sys_limit(PROCFS_SHMALL, SHMALL, 1, SHMALL)
+    RUNTIME_SHMALL_LIMIT.load(Ordering::Relaxed)
+}
+
+pub fn runtime_shmmax_for_procfs() -> usize {
+    runtime_shmmax_limit()
+}
+
+pub fn runtime_shmmni_for_procfs() -> usize {
+    runtime_shmmni_limit()
+}
+
+pub fn runtime_shmall_for_procfs() -> usize {
+    runtime_shmall_limit()
 }
 
 pub fn proc_sysvipc_shm() -> String {

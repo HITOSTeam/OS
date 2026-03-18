@@ -2,15 +2,15 @@
 use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use core::{cmp::Ordering, time};
 
-use alloc::{
-    collections::{BTreeMap, BinaryHeap},
-    sync::Arc,
-    vec::Vec,
-};
 use crate::task::signal::{SIGALRM_NUM, pick_task_for_signal, queue_process_signal, signal_bit};
 use crate::{
     task::{manager::wakeup_task, task_block::TaskControlBlock},
     time::get_time_ms,
+};
+use alloc::{
+    collections::{BTreeMap, BinaryHeap},
+    sync::Arc,
+    vec::Vec,
 };
 use lazy_static::*;
 use spin::Mutex;
@@ -195,7 +195,9 @@ impl PosixCpuTimerState {
     fn bucket_mut(&mut self, key: PosixCpuTimerBucketKey) -> &mut PosixCpuTimerBucket {
         match key {
             PosixCpuTimerBucketKey::Process { pid } => self.process.entry(pid).or_default(),
-            PosixCpuTimerBucketKey::Thread { pid, tid } => self.thread.entry((pid, tid)).or_default(),
+            PosixCpuTimerBucketKey::Thread { pid, tid } => {
+                self.thread.entry((pid, tid)).or_default()
+            }
         }
     }
 
@@ -783,8 +785,11 @@ fn process_posix_timers() {
         let bucket = {
             let snapshots = POSIX_CPU_TIMER_STATE.lock().snapshots();
             snapshots.into_iter().find_map(|snapshot| {
-                let now_ns =
-                    crate::syscall::timer_clock_now_ns(snapshot.clock_id, snapshot.pid, snapshot.thread_tid)?;
+                let now_ns = crate::syscall::timer_clock_now_ns(
+                    snapshot.clock_id,
+                    snapshot.pid,
+                    snapshot.thread_tid,
+                )?;
                 (snapshot.next_deadline_ns <= now_ns).then_some((snapshot, now_ns))
             })
         };
@@ -799,7 +804,9 @@ fn process_posix_timers() {
                 };
                 timer.clock_id == bucket.clock_id
                     && timer.thread_tid == bucket.thread_tid
-                    && timer.deadline_ns.is_some_and(|deadline_ns| deadline_ns <= now_ns)
+                    && timer
+                        .deadline_ns
+                        .is_some_and(|deadline_ns| deadline_ns <= now_ns)
             });
             if let Some((pid, timer_id)) = due_key {
                 if let Some(timer) = timers.get_mut(pid, timer_id) {

@@ -4,12 +4,15 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::{
     bpf::BpfProgFile,
     debug_config::DEBUG_UNIXBENCH,
-    fs::{File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, find_path_in_roots, wake_tasks},
+    fs::{
+        File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, parse_proc_sys_usize, wake_tasks,
+    },
     mm::UserBuffer,
     task::{
         manager::{PID2PCB, wakeup_task},
@@ -24,11 +27,13 @@ use crate::{
 const PIPE_BUF: usize = 4096;
 const DEFAULT_PIPE_CAPACITY: usize = 16 * PIPE_BUF;
 const MAX_PIPE_CAPACITY: usize = DEFAULT_PIPE_CAPACITY;
+static PIPE_MAX_SIZE_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_CAPACITY);
 const SIGIO_NUM: i32 = 29;
 const CAP_SYS_RESOURCE: usize = 24;
 const F_OWNER_TID: i32 = 0;
 const F_OWNER_PID: i32 = 1;
 const F_OWNER_PGRP: i32 = 2;
+const EINVAL: isize = -22;
 
 fn has_cap_sys_resource() -> bool {
     let proc = current_process();
@@ -37,21 +42,23 @@ fn has_cap_sys_resource() -> bool {
 }
 
 fn pipe_max_size_limit() -> usize {
-    let Some(inode) = find_path_in_roots("/proc/sys/fs/pipe-max-size") else {
-        return DEFAULT_PIPE_CAPACITY;
-    };
-    let mut buf = [0u8; 32];
-    let len = inode.read_at(0, &mut buf);
-    if len == 0 {
-        return DEFAULT_PIPE_CAPACITY;
+    PIPE_MAX_SIZE_LIMIT.load(Ordering::Relaxed)
+}
+
+pub fn pipe_max_size_limit_for_procfs() -> usize {
+    pipe_max_size_limit()
+}
+
+pub fn write_pipe_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    if path != "/proc/sys/fs/pipe-max-size" {
+        return Err(EINVAL);
     }
-    let Ok(raw) = core::str::from_utf8(&buf[..len]) else {
-        return DEFAULT_PIPE_CAPACITY;
-    };
-    let Ok(value) = raw.trim().parse::<usize>() else {
-        return DEFAULT_PIPE_CAPACITY;
-    };
-    value.clamp(PIPE_BUF, MAX_PIPE_CAPACITY)
+    let value = parse_proc_sys_usize(data)?;
+    if !(PIPE_BUF..=MAX_PIPE_CAPACITY).contains(&value) {
+        return Err(EINVAL);
+    }
+    PIPE_MAX_SIZE_LIMIT.store(value, Ordering::Relaxed);
+    Ok(alloc::format!("{}\n", value).into_bytes())
 }
 
 fn default_pipe_capacity_for_current() -> usize {
