@@ -135,7 +135,6 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();
         list_apps();
-        fs::init_procfs();
         task::task_start();
     } else {
         secondary_main(hart_id, dtb_pa);
@@ -166,7 +165,6 @@ fn rust_main(hart_id: usize) -> ! {
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();
         list_apps();
-        fs::init_procfs();
         task::task_start();
     }
     loop {

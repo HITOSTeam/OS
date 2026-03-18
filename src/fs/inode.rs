@@ -249,16 +249,6 @@ impl OSInode {
         }
         let mut inner = self.inner.lock();
         let inode_num = inner.inode.inode_num();
-        if let Some(kind) = crate::fs::proc_file_kind(inode_num) {
-            let data = crate::fs::proc_file_content(&kind);
-            let bytes = data.as_bytes();
-            if offset >= bytes.len() {
-                return 0;
-            }
-            let n = core::cmp::min(buf.len(), bytes.len() - offset);
-            buf[..n].copy_from_slice(&bytes[offset..offset + n]);
-            return n;
-        }
 
         if inner.read_buf.len() < READBUF_MAX {
             inner.read_buf.resize(READBUF_MAX, 0);
@@ -751,29 +741,6 @@ impl File for OSInode {
     fn read(&self, mut buf: UserBuffer) -> usize {
         if self.writable {
             let _ = self.flush();
-        }
-        let inode_num = self.ext4_inode().inode_num();
-        if let Some(kind) = crate::fs::proc_file_kind(inode_num) {
-            let data = crate::fs::proc_file_content(&kind);
-            let bytes = data.as_bytes();
-            let mut inner = self.inner.lock();
-            if inner.offset >= bytes.len() {
-                return 0;
-            }
-            let mut total = 0usize;
-            for slice in buf.buffers.iter_mut() {
-                if inner.offset >= bytes.len() {
-                    break;
-                }
-                let n = core::cmp::min(slice.len(), bytes.len() - inner.offset);
-                slice[..n].copy_from_slice(&bytes[inner.offset..inner.offset + n]);
-                inner.offset += n;
-                total += n;
-                if n < slice.len() {
-                    break;
-                }
-            }
-            return total;
         }
         let mut inner = self.inner.lock();
         let mut total_read_size = 0usize;
