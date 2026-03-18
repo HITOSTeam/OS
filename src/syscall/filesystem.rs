@@ -13,13 +13,14 @@ use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
         CgroupFile, CgroupMountSpec, EventFdFile, File, NamespaceFile, NetSocketFile, OSInode,
-        OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
-        PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TimerFdFile, TtyFile,
-        cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount,
-        cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots, make_pipe,
-        open_cgroup_pseudo, open_file, pseudo_block_is_read_only, pseudo_block_note_sync,
-        pseudo_block_stat_snapshot, register_deferred_unlink_cleanup, secondary_root_inode,
-        shm_create, shm_get, shm_list, shm_remove,
+        OpenFlags, Pipe, ProcMagicLinkFile, ProcMagicLinkFollowTarget, ProcPseudoFile, PseudoBlock,
+        PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
+        SocketPairEnd, TimerFdFile, TtyFile, cgroup_charge_file_write,
+        cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
+        cgroup_umount, ext4_lock, find_path_in_roots, make_pipe, open_cgroup_pseudo, open_file,
+        pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_stat_snapshot,
+        register_deferred_unlink_cleanup, secondary_root_inode, shm_create, shm_get, shm_list,
+        shm_remove,
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
@@ -1460,6 +1461,108 @@ fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
     }
 }
 
+fn proc_magic_link_parent_path(link_path: &str) -> &str {
+    split_parent_and_name(link_path)
+        .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+        .unwrap_or("/")
+}
+
+fn proc_magic_link_target_path(link_path: &str, target: &str, remainder: &str) -> String {
+    let base = if target.starts_with('/') {
+        String::from(target)
+    } else {
+        normalize_path(proc_magic_link_parent_path(link_path), target)
+    };
+    if remainder.is_empty() {
+        base
+    } else {
+        normalize_path(&base, remainder)
+    }
+}
+
+fn proc_magic_link_dir_target_path(
+    link_path: &str,
+    file: &Arc<dyn File + Send + Sync>,
+) -> Result<String, isize> {
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        return Ok(String::from(pdir.path()));
+    }
+
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return Err(ENOTDIR);
+    };
+    let inode = os_inode.ext4_inode();
+    let is_dir = {
+        let _ext4_guard = ext4_lock();
+        inode.is_dir()
+    };
+    if !is_dir {
+        return Err(ENOTDIR);
+    }
+    if let Some(path) = crate::fs::proc_readlink(link_path).filter(|path| path.starts_with('/')) {
+        return Ok(path);
+    }
+    inode_path_hint(&inode)
+        .map(|path| mount_display_abs(&path))
+        .ok_or(ENOENT)
+}
+
+fn follow_proc_magic_link_target(
+    link_path: &str,
+    target: ProcMagicLinkFollowTarget,
+    remainder: &str,
+) -> Result<String, isize> {
+    match target {
+        ProcMagicLinkFollowTarget::Path(target) => {
+            Ok(proc_magic_link_target_path(link_path, &target, remainder))
+        }
+        ProcMagicLinkFollowTarget::File(file) => {
+            let base = proc_magic_link_dir_target_path(link_path, &file)?;
+            Ok(if remainder.is_empty() {
+                base
+            } else {
+                normalize_path(&base, remainder)
+            })
+        }
+    }
+}
+
+fn resolve_next_proc_magic_intermediate_component(abs: &str) -> Result<Option<String>, isize> {
+    if !crate::fs::is_proc_pseudo_path(abs) {
+        return Ok(None);
+    }
+
+    let components: Vec<&str> = abs
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    if components.len() < 2 || components[0] != "proc" {
+        return Ok(None);
+    }
+
+    let mut prefix = String::new();
+    for idx in 0..components.len() - 1 {
+        prefix.push('/');
+        prefix.push_str(components[idx]);
+        if let Some(target) = crate::fs::proc_magic_link_follow_target(&prefix) {
+            let remainder = components[idx + 1..].join("/");
+            return follow_proc_magic_link_target(&prefix, target, &remainder).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_proc_magic_intermediate_abs_path(abs: &str) -> Result<String, isize> {
+    let mut current = String::from(abs);
+    for _ in 0..MAX_SYMLINKS {
+        let Some(next) = resolve_next_proc_magic_intermediate_component(&current)? else {
+            return Ok(current);
+        };
+        current = next;
+    }
+    Err(ELOOP)
+}
+
 fn resolve_final_symlink_abs_path(abs: &str) -> String {
     let mut current = String::from(abs);
     for _ in 0..MAX_SYMLINKS {
@@ -1778,6 +1881,22 @@ enum AtPath {
     PseudoAbs(String),
 }
 
+fn classify_abs_at_path(abs: String) -> AtPath {
+    if crate::fs::is_proc_pseudo_path(&abs) {
+        return AtPath::PseudoAbs(abs);
+    }
+    if let Some(mount) = mount_lookup_for_abs(&abs) {
+        if mount.fs_type == "cgroup2" || mount.fs_type == "cgroup" {
+            return AtPath::PseudoAbs(abs);
+        }
+    }
+    if is_pseudo_path(&abs) {
+        AtPath::PseudoAbs(abs)
+    } else {
+        AtPath::Ext4Abs(translate_mount_abs(&abs))
+    }
+}
+
 fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     if path.is_empty() {
         return Err(ENOENT);
@@ -1790,37 +1909,21 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     // Absolute path: ignore dirfd.
     if path.starts_with('/') {
         let jail_abs = normalize_path("/", path);
-        let abs = crate::fs::normalize_proc_magic_path(&apply_process_root(&jail_abs)).into_owned();
-        if crate::fs::is_proc_pseudo_path(&abs) {
-            return Ok(AtPath::PseudoAbs(abs));
-        }
-        if let Some(mount) = mount_lookup_for_abs(&abs) {
-            if mount.fs_type == "cgroup2" || mount.fs_type == "cgroup" {
-                return Ok(AtPath::PseudoAbs(abs));
-            }
-        }
-        return Ok(if is_pseudo_path(&abs) {
-            AtPath::PseudoAbs(abs)
-        } else {
-            AtPath::Ext4Abs(translate_mount_abs(&abs))
-        });
+        let abs = resolve_proc_magic_intermediate_abs_path(&apply_process_root(&jail_abs))?;
+        return Ok(classify_abs_at_path(abs));
     }
 
     // Relative path.
     if dirfd == AT_FDCWD {
         let process = current_process();
         let cwd = { process.borrow_mut().cwd.clone() };
-        let abs = crate::fs::normalize_proc_magic_path(&normalize_path(&cwd, path)).into_owned();
-        if crate::fs::is_proc_pseudo_path(&abs) {
+        let logical_abs = normalize_path(&cwd, path);
+        let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
+        if let AtPath::PseudoAbs(_) = classify_abs_at_path(abs.clone()) {
             return Ok(AtPath::PseudoAbs(abs));
         }
-        if let Some(mount) = mount_lookup_for_abs(&abs) {
-            if mount.fs_type == "cgroup2" || mount.fs_type == "cgroup" {
-                return Ok(AtPath::PseudoAbs(abs));
-            }
-        }
-        if is_pseudo_path(&abs) {
-            return Ok(AtPath::PseudoAbs(abs));
+        if abs != logical_abs {
+            return Ok(AtPath::Ext4Abs(translate_mount_abs(&abs)));
         }
         let rel = if let Some(mount) = mount_lookup_for_abs(&abs) {
             let suffix = if abs == mount.target {
@@ -1852,27 +1955,22 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     };
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
-        let abs =
-            crate::fs::normalize_proc_magic_path(&normalize_path(pdir.path(), path)).into_owned();
-        if crate::fs::is_proc_pseudo_path(&abs) {
-            return Ok(AtPath::PseudoAbs(abs));
-        }
-        if let Some(mount) = mount_lookup_for_abs(&abs) {
-            if mount.fs_type == "cgroup2" || mount.fs_type == "cgroup" {
-                return Ok(AtPath::PseudoAbs(abs));
-            }
-        }
-        return Ok(if is_pseudo_path(&abs) {
-            AtPath::PseudoAbs(abs)
-        } else {
-            AtPath::Ext4Abs(translate_mount_abs(&abs))
-        });
+        let abs = resolve_proc_magic_intermediate_abs_path(&normalize_path(pdir.path(), path))?;
+        return Ok(classify_abs_at_path(abs));
     }
 
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let base = os_inode.ext4_inode();
         if !base.is_dir() {
             return Err(ENOTDIR);
+        }
+        if let Some(base_path) = inode_path_hint(&base) {
+            let logical_base = mount_display_abs(&base_path);
+            let logical_abs = normalize_path(&logical_base, path);
+            let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
+            if abs != logical_abs {
+                return Ok(classify_abs_at_path(abs));
+            }
         }
         if let Some(abs) = pseudo_abs_for_ext4_dirfd(&base, path) {
             return Ok(AtPath::PseudoAbs(abs));
@@ -2730,7 +2828,7 @@ fn resolve_abs_path(dirfd: isize, path: &str) -> Option<String> {
     } else {
         return None;
     };
-    Some(abs)
+    Some(resolve_proc_magic_intermediate_abs_path(&abs).unwrap_or(abs))
 }
 
 fn rofs_for_path(dirfd: isize, path: &str) -> bool {
@@ -4328,7 +4426,21 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
             if crate::fs::proc_magic_link_exists(proc_path) {
                 if nofollow {
-                    return ELOOP;
+                    if !o_path {
+                        return ELOOP;
+                    }
+                    if (flags & O_DIRECTORY) != 0 {
+                        return ENOTDIR;
+                    }
+                    let Some(target) = crate::fs::proc_readlink(proc_path) else {
+                        return ENOENT;
+                    };
+                    let fd = match install_open_file_fd(ProcMagicLinkFile::new(target), flags, true)
+                    {
+                        Ok(fd) => fd,
+                        Err(e) => return e,
+                    };
+                    return fd as isize;
                 }
                 if let Some(target) = crate::fs::proc_readlink(proc_path) {
                     if target.starts_with('/') {
@@ -5690,6 +5802,14 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
         let Some(file) = get_fd_file(dirfd as usize) else {
             return EBADF;
         };
+        if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
+            let bytes = link.target().as_bytes();
+            let len = min(bytes.len(), bufsiz);
+            if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
+                return EFAULT;
+            }
+            return len as isize;
+        }
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
             return EINVAL;
         };
@@ -9160,6 +9280,10 @@ fn proc_symlink_kstat(link_len: usize) -> KStat {
 }
 
 fn kstat_from_file(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> Result<KStat, isize> {
+    if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
+        return Ok(proc_symlink_kstat(link.target().len()));
+    }
+
     if file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
         || file.as_any().downcast_ref::<ProcPseudoFile>().is_some()

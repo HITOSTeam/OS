@@ -200,9 +200,13 @@ app_49_name:
     .asciz "nested_epoll_parent_oneshot_smoke"
 .section .rodata
 .align 3
+app_50_name:
+    .asciz "proc_magic_links_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 50
+    .quad 51
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -253,3 +257,4 @@ num_user_apps:
     .quad app_47_name
     .quad app_48_name
     .quad app_49_name
+    .quad app_50_name

@@ -146,9 +146,10 @@ pub use pipe::{
 };
 pub(crate) use procfs::parse_proc_sys_usize;
 pub use procfs::{
-    ProcPseudoFile, is_proc_pseudo_path, normalize_proc_magic_path, open_proc_pseudo,
-    proc_fd_link_file, proc_magic_link_exists, proc_readlink, vm_commit_limit_bytes,
-    vm_committed_as_bytes, vm_overcommit_memory,
+    ProcMagicLinkFile, ProcMagicLinkFollowTarget, ProcPseudoFile, is_proc_pseudo_path,
+    normalize_proc_magic_path, open_proc_pseudo, proc_fd_link_file, proc_magic_link_exists,
+    proc_magic_link_follow_target, proc_readlink, vm_commit_limit_bytes, vm_committed_as_bytes,
+    vm_overcommit_memory,
 };
 pub use pseudo::PseudoBlock;
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};

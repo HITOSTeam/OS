@@ -136,8 +136,8 @@ fn record_proc_pid_stat_diag(pid: u32, state_char: char, elapsed_cycles: usize, 
 const PROC_CONFIG_GZ: &[u8] = &[
     31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 115, 246, 247, 115, 243, 116, 143, 119, 10, 118, 137, 15, 8,
     242, 119, 118, 13, 14, 142, 119, 116, 118, 14, 177, 173, 228, 82, 86, 112, 198, 46, 23, 31,
-    102, 172, 144, 89, 172, 144, 151, 95, 162, 80, 156, 90, 194, 5, 85, 5, 82, 17, 239, 22, 12, 212,
-    8, 21, 8, 142, 12, 118, 14, 241, 1, 242, 1, 240, 171, 117, 110, 99, 0, 0, 0,
+    102, 172, 144, 89, 172, 144, 151, 95, 162, 80, 156, 90, 194, 5, 85, 5, 82, 17, 239, 22, 12,
+    212, 8, 21, 8, 142, 12, 118, 14, 241, 1, 242, 1, 240, 171, 117, 110, 99, 0, 0, 0,
 ];
 
 struct ProcPseudoInner {
@@ -147,6 +147,10 @@ struct ProcPseudoInner {
 pub struct ProcPseudoFile {
     kind: ProcFileKind,
     inner: Mutex<ProcPseudoInner>,
+}
+
+pub struct ProcMagicLinkFile {
+    target: String,
 }
 
 impl ProcPseudoFile {
@@ -227,6 +231,16 @@ impl ProcPseudoFile {
     }
 }
 
+impl ProcMagicLinkFile {
+    pub fn new(target: String) -> Arc<Self> {
+        Arc::new(Self { target })
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
+
 impl File for ProcPseudoFile {
     fn readable(&self) -> bool {
         true
@@ -281,6 +295,28 @@ impl File for ProcPseudoFile {
             }
         }
         total
+    }
+
+    fn write(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl File for ProcMagicLinkFile {
+    fn readable(&self) -> bool {
+        false
+    }
+
+    fn writable(&self) -> bool {
+        false
+    }
+
+    fn read(&self, _buf: UserBuffer) -> usize {
+        0
     }
 
     fn write(&self, _buf: UserBuffer) -> usize {
@@ -1044,6 +1080,9 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     if let Some(ns) = file.as_any().downcast_ref::<NamespaceFile>() {
         return Some(alloc::format!("ipc:[{}]", ns.ns_id()));
     }
+    if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
+        return Some(String::from(link.target()));
+    }
     if file.as_any().downcast_ref::<RtcFile>().is_some() {
         return Some(String::from("/dev/misc/rtc"));
     }
@@ -1085,6 +1124,12 @@ fn proc_pid_ipc_ns_target(pid: u32) -> Option<String> {
     Some(alloc::format!("ipc:[{}]", inner.ipc_ns_id))
 }
 
+fn proc_pid_ipc_ns_file(pid: u32) -> Option<Arc<dyn File + Send + Sync>> {
+    let proc = pid2process(pid as usize)?;
+    let inner = proc.try_borrow_mut()?;
+    Some(Arc::new(NamespaceFile::new_ipc(inner.ipc_ns_id)))
+}
+
 fn parse_proc_fd_component(fd_name: &str) -> Option<usize> {
     if fd_name.is_empty() || fd_name.contains('/') || !fd_name.chars().all(|c| c.is_ascii_digit()) {
         return None;
@@ -1102,6 +1147,55 @@ fn proc_pid_task_rest(rest: &str) -> Option<(u32, &str)> {
     let tid = tid_name.parse::<u32>().ok()?;
     let tail = parts.next().unwrap_or("");
     Some((tid, tail))
+}
+
+pub enum ProcMagicLinkFollowTarget {
+    Path(String),
+    File(Arc<dyn File + Send + Sync>),
+}
+
+pub fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget> {
+    let trimmed = trim_proc_path(path);
+
+    if trimmed == "/proc/self" {
+        let pid = current_process().getpid();
+        return Some(ProcMagicLinkFollowTarget::Path(alloc::format!("{pid}")));
+    }
+    if trimmed == "/proc/thread-self" {
+        return current_thread_self_target().map(ProcMagicLinkFollowTarget::Path);
+    }
+
+    let normalized = normalize_proc_magic_path(trimmed);
+    let trimmed = normalized.as_ref();
+
+    let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
+    if !proc_pid_exists(pid) {
+        return None;
+    }
+    if rest == "cwd" {
+        return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
+    }
+    if rest == "ns/ipc" {
+        return proc_pid_ipc_ns_file(pid).map(ProcMagicLinkFollowTarget::File);
+    }
+    if let Some(fd_name) = rest.strip_prefix("fd/") {
+        let fd = parse_proc_fd_component(fd_name)?;
+        return proc_pid_fd_file(pid, fd).map(ProcMagicLinkFollowTarget::File);
+    }
+
+    let (tid, tail) = proc_pid_task_rest(rest)?;
+    if !proc_pid_task_alive(pid, tid) {
+        return None;
+    }
+    if tail == "cwd" {
+        return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
+    }
+    if tail == "ns/ipc" {
+        return proc_pid_ipc_ns_file(pid).map(ProcMagicLinkFollowTarget::File);
+    }
+    let fd_name = tail.strip_prefix("fd/")?;
+    let fd = parse_proc_fd_component(fd_name)?;
+    proc_pid_fd_file(pid, fd).map(ProcMagicLinkFollowTarget::File)
 }
 
 pub fn proc_magic_link_exists(path: &str) -> bool {
