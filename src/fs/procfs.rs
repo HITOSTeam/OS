@@ -5,21 +5,21 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    File, NamespaceFile, OSInode, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag,
+    File, NamespaceFile, OSInode, Pipe, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag,
     PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, root_inode_for_path,
     secondary_root_inode,
 };
 use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages};
 use crate::task::manager::{PID2PCB, pid2process};
-use crate::task::processor::current_process;
+use crate::task::processor::{current_process, current_task};
 use crate::task::task_block::TaskStatus;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum ProcFileKind {
     Mounts,
     Cgroups,
@@ -34,6 +34,21 @@ pub enum ProcFileKind {
     SysvipcMsg,
     SysvipcSem,
     SysvipcShm,
+    VmOvercommitMemory,
+    VmOvercommitRatio,
+    VmDropCaches,
+    VmCompactMemory,
+    FsPipeMaxSize,
+    FsMqueueQueuesMax,
+    KernelPidMax,
+    KernelMsgmax,
+    KernelMsgmnb,
+    KernelMsgmni,
+    KernelSem,
+    KernelShmmax,
+    KernelShmmni,
+    KernelShmall,
+    SimpleText(&'static str),
     PidStat(u32),
     PidCmdline(u32),
     PidStatus(u32),
@@ -41,16 +56,14 @@ pub enum ProcFileKind {
     PidMaps(u32),
     PidPagemap(u32),
     PidSmaps(u32),
-    PidCoredumpFilter(u32),
-    PidMounts(u32),
+    PidCoredumpFilter,
+    PidMounts,
     PidCgroup(u32),
     PidTaskStat(u32, u32),
     PidTaskComm(u32, u32),
 }
 
-static PROC_ROOT_INO: AtomicU32 = AtomicU32::new(0);
-static PROC_ROOT_DEV: AtomicUsize = AtomicUsize::new(0);
-static PROC_FILES: Mutex<BTreeMap<u32, ProcFileKind>> = Mutex::new(BTreeMap::new());
+static PROC_SIMPLE_TEXT_FILES: Mutex<BTreeMap<&'static str, Vec<u8>>> = Mutex::new(BTreeMap::new());
 const PROC_LINUX_TID_PID_SHIFT: usize = 15;
 static PROC_PID_STAT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PROC_PID_STAT_STATE_S: AtomicUsize = AtomicUsize::new(0);
@@ -58,6 +71,13 @@ static PROC_PID_STAT_STATE_R: AtomicUsize = AtomicUsize::new(0);
 static PROC_PID_STAT_STATE_Z: AtomicUsize = AtomicUsize::new(0);
 static PROC_PID_STAT_LOCK_BUSY: AtomicUsize = AtomicUsize::new(0);
 static PROC_PID_STAT_TOTAL_CYCLES: AtomicUsize = AtomicUsize::new(0);
+const VM_OVERCOMMIT_MEMORY_DEFAULT: usize = 0;
+const VM_OVERCOMMIT_MEMORY_MAX: usize = 2;
+const VM_OVERCOMMIT_RATIO_DEFAULT: usize = 50;
+const VM_OVERCOMMIT_RATIO_MAX: usize = 100;
+const EINVAL: isize = -22;
+static VM_OVERCOMMIT_MEMORY: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_MEMORY_DEFAULT);
+static VM_OVERCOMMIT_RATIO: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_RATIO_DEFAULT);
 
 fn should_report_proc_pid_stat_diag(calls: usize) -> bool {
     calls <= 16 || calls % 2048 == 0
@@ -144,6 +164,65 @@ impl ProcPseudoFile {
             _ => proc_file_len(&self.kind) as isize,
         }
     }
+
+    pub fn len(&self) -> Option<usize> {
+        match self.kind {
+            ProcFileKind::PidPagemap(_) | ProcFileKind::Kpageflags => None,
+            _ => Some(proc_file_len(&self.kind)),
+        }
+    }
+
+    pub fn pwrite_bytes(&self, offset: usize, data: &[u8]) -> Result<usize, isize> {
+        if offset != 0 {
+            return Err(EINVAL);
+        }
+        let normalized = match self.kind {
+            ProcFileKind::VmOvercommitMemory => {
+                write_vm_sysctl("/proc/sys/vm/overcommit_memory", data)?
+            }
+            ProcFileKind::VmOvercommitRatio => {
+                write_vm_sysctl("/proc/sys/vm/overcommit_ratio", data)?
+            }
+            ProcFileKind::VmDropCaches => {
+                write_vm_trigger_sysctl("/proc/sys/vm/drop_caches", data)?
+            }
+            ProcFileKind::VmCompactMemory => {
+                write_vm_trigger_sysctl("/proc/sys/vm/compact_memory", data)?
+            }
+            ProcFileKind::FsPipeMaxSize => {
+                crate::fs::write_pipe_sysctl("/proc/sys/fs/pipe-max-size", data)?
+            }
+            ProcFileKind::FsMqueueQueuesMax => crate::syscall::posix_mq::write_mqueue_sysctl(
+                "/proc/sys/fs/mqueue/queues_max",
+                data,
+            )?,
+            ProcFileKind::KernelPidMax => write_pid_max_sysctl(data)?,
+            ProcFileKind::KernelMsgmax => {
+                crate::syscall::sysv_ipc::write_msg_sysctl("/proc/sys/kernel/msgmax", data)?
+            }
+            ProcFileKind::KernelMsgmnb => {
+                crate::syscall::sysv_ipc::write_msg_sysctl("/proc/sys/kernel/msgmnb", data)?
+            }
+            ProcFileKind::KernelMsgmni => {
+                crate::syscall::sysv_ipc::write_msg_sysctl("/proc/sys/kernel/msgmni", data)?
+            }
+            ProcFileKind::KernelSem => {
+                crate::syscall::sysv_ipc::write_sem_sysctl("/proc/sys/kernel/sem", data)?
+            }
+            ProcFileKind::KernelShmmax => {
+                crate::syscall::sysv_shm::write_shm_sysctl("/proc/sys/kernel/shmmax", data)?
+            }
+            ProcFileKind::KernelShmmni => {
+                crate::syscall::sysv_shm::write_shm_sysctl("/proc/sys/kernel/shmmni", data)?
+            }
+            ProcFileKind::KernelShmall => {
+                crate::syscall::sysv_shm::write_shm_sysctl("/proc/sys/kernel/shmall", data)?
+            }
+            ProcFileKind::SimpleText(path) => write_proc_simple_text(path, data)?,
+            _ => return Err(EINVAL),
+        };
+        Ok(normalized.len())
+    }
 }
 
 impl File for ProcPseudoFile {
@@ -152,7 +231,24 @@ impl File for ProcPseudoFile {
     }
 
     fn writable(&self) -> bool {
-        false
+        match self.kind {
+            ProcFileKind::VmOvercommitMemory
+            | ProcFileKind::VmOvercommitRatio
+            | ProcFileKind::VmDropCaches
+            | ProcFileKind::VmCompactMemory
+            | ProcFileKind::FsPipeMaxSize
+            | ProcFileKind::FsMqueueQueuesMax
+            | ProcFileKind::KernelPidMax
+            | ProcFileKind::KernelMsgmax
+            | ProcFileKind::KernelMsgmnb
+            | ProcFileKind::KernelMsgmni
+            | ProcFileKind::KernelSem
+            | ProcFileKind::KernelShmmax
+            | ProcFileKind::KernelShmmni
+            | ProcFileKind::KernelShmall => true,
+            ProcFileKind::SimpleText(path) => proc_simple_text_is_writable(path),
+            _ => false,
+        }
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
@@ -193,234 +289,12 @@ impl File for ProcPseudoFile {
     }
 }
 
-pub fn proc_root_inode_num() -> Option<u32> {
-    let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    if ino == 0 { None } else { Some(ino) }
-}
-
-pub fn is_proc_root(inode: &ext4_fs::Inode) -> bool {
-    let ino = PROC_ROOT_INO.load(Ordering::Relaxed);
-    let dev = PROC_ROOT_DEV.load(Ordering::Relaxed);
-    ino != 0 && dev != 0 && inode.inode_num() == ino && inode.device_id() == dev
-}
-
-pub fn proc_file_kind(inode_num: u32) -> Option<ProcFileKind> {
-    PROC_FILES.lock().get(&inode_num).cloned()
-}
-
-pub fn proc_file_len(kind: &ProcFileKind) -> usize {
+fn proc_file_len(kind: &ProcFileKind) -> usize {
     proc_file_content(kind).len()
 }
 
-pub fn init_procfs() {
-    let _guard = ext4_lock();
-    let root = root_inode_for_path("/");
-    let proc_inode = match root.find("proc") {
-        Some(v) => v,
-        None => match root.create_dir("proc") {
-            Ok(v) => v,
-            Err(_) => return,
-        },
-    };
-    proc_inode.set_mode(0o555);
-    PROC_ROOT_INO.store(proc_inode.inode_num(), Ordering::Relaxed);
-    PROC_ROOT_DEV.store(proc_inode.device_id(), Ordering::Relaxed);
-
-    let _ = ensure_proc_file(&proc_inode, "mounts", ProcFileKind::Mounts, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "cgroups", ProcFileKind::Cgroups, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "meminfo", ProcFileKind::Meminfo, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "cpuinfo", ProcFileKind::Cpuinfo, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "cmdline", ProcFileKind::Cmdline, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "loadavg", ProcFileKind::Loadavg, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "uptime", ProcFileKind::Uptime, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "stat", ProcFileKind::Stat, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "perf", ProcFileKind::Perf, 0o444);
-    let _ = ensure_proc_file(&proc_inode, "kpageflags", ProcFileKind::Kpageflags, 0o444);
-
-    let sys_dir = ensure_dir(&proc_inode, "sys", 0o555);
-    if let Some(sys_dir) = sys_dir {
-        let kernel_dir = ensure_dir(&sys_dir, "kernel", 0o555);
-        if let Some(kernel_dir) = kernel_dir {
-            let core_pattern = ensure_file(&kernel_dir, "core_pattern", 0o644);
-            if let Some(core_pattern) = core_pattern {
-                let _ = core_pattern.write_at(0, b"core\n");
-            }
-            let pid_max_file = ensure_file(&kernel_dir, "pid_max", 0o644);
-            if let Some(pid_max_file) = pid_max_file {
-                let value = alloc::format!("{}\n", crate::task::pid_max());
-                let _ = pid_max_file.write_at(0, value.as_bytes());
-            }
-            let threads_max_file = ensure_file(&kernel_dir, "threads-max", 0o644);
-            if let Some(threads_max_file) = threads_max_file {
-                let value = alloc::format!("{}\n", crate::task::pid_max());
-                let _ = threads_max_file.write_at(0, value.as_bytes());
-            }
-            let tainted_file = ensure_file(&kernel_dir, "tainted", 0o444);
-            if let Some(tainted_file) = tainted_file {
-                let _ = tainted_file.write_at(0, b"0\n");
-            }
-            let keys_dir = ensure_dir(&kernel_dir, "keys", 0o555);
-            if let Some(keys_dir) = keys_dir {
-                for (name, value) in [
-                    ("gc_delay", "300\n"),
-                    ("maxkeys", "200\n"),
-                    ("maxbytes", "20000\n"),
-                    ("root_maxkeys", "100000\n"),
-                    ("root_maxbytes", "25000000\n"),
-                ] {
-                    let file = ensure_file(&keys_dir, name, 0o644);
-                    if let Some(file) = file {
-                        let _ = file.write_at(0, value.as_bytes());
-                    }
-                }
-            }
-            let shmmax_file = ensure_file(&kernel_dir, "shmmax", 0o644);
-            if let Some(shmmax_file) = shmmax_file {
-                let value = alloc::format!("{}\n", crate::syscall::sysv_shm::shmmax_limit());
-                let _ = shmmax_file.write_at(0, value.as_bytes());
-            }
-            let shmmni_file = ensure_file(&kernel_dir, "shmmni", 0o644);
-            if let Some(shmmni_file) = shmmni_file {
-                let value = alloc::format!("{}\n", crate::syscall::sysv_shm::shmmni_limit());
-                let _ = shmmni_file.write_at(0, value.as_bytes());
-            }
-            let shmall_file = ensure_file(&kernel_dir, "shmall", 0o644);
-            if let Some(shmall_file) = shmall_file {
-                let value = alloc::format!("{}\n", crate::syscall::sysv_shm::shmall_limit());
-                let _ = shmall_file.write_at(0, value.as_bytes());
-            }
-            let msgmax_file = ensure_file(&kernel_dir, "msgmax", 0o644);
-            if let Some(msgmax_file) = msgmax_file {
-                let value = alloc::format!("{}\n", crate::syscall::sysv_ipc::msgmax_limit());
-                let _ = msgmax_file.write_at(0, value.as_bytes());
-            }
-            let msgmnb_file = ensure_file(&kernel_dir, "msgmnb", 0o644);
-            if let Some(msgmnb_file) = msgmnb_file {
-                let value = alloc::format!("{}\n", crate::syscall::sysv_ipc::msgmnb_limit());
-                let _ = msgmnb_file.write_at(0, value.as_bytes());
-            }
-            let msgmni_file = ensure_file(&kernel_dir, "msgmni", 0o644);
-            if let Some(msgmni_file) = msgmni_file {
-                let value = alloc::format!("{}\n", crate::syscall::sysv_ipc::msgmni_limit());
-                let _ = msgmni_file.write_at(0, value.as_bytes());
-            }
-            let sem_file = ensure_file(&kernel_dir, "sem", 0o644);
-            if let Some(sem_file) = sem_file {
-                let value = alloc::format!(
-                    "{}\t{}\t{}\t{}\n",
-                    crate::syscall::sysv_ipc::semmsl_limit(),
-                    crate::syscall::sysv_ipc::semmns_limit(),
-                    crate::syscall::sysv_ipc::semopm_limit(),
-                    crate::syscall::sysv_ipc::semmni_limit()
-                );
-                let _ = sem_file.write_at(0, value.as_bytes());
-            }
-        }
-        let fs_dir = ensure_dir(&sys_dir, "fs", 0o555);
-        if let Some(fs_dir) = fs_dir {
-            let pipe_max = ensure_file(&fs_dir, "pipe-max-size", 0o644);
-            if let Some(pipe_max) = pipe_max {
-                let _ = pipe_max.write_at(0, b"65536\n");
-            }
-            let pipe_user_pages_soft = ensure_file(&fs_dir, "pipe-user-pages-soft", 0o644);
-            if let Some(pipe_user_pages_soft) = pipe_user_pages_soft {
-                // Keep this low enough to avoid huge per-test setup while still
-                // exercising soft-limit behavior.
-                let _ = pipe_user_pages_soft.write_at(0, b"128\n");
-            }
-            let pipe_user_pages_hard = ensure_file(&fs_dir, "pipe-user-pages-hard", 0o644);
-            if let Some(pipe_user_pages_hard) = pipe_user_pages_hard {
-                let _ = pipe_user_pages_hard.write_at(0, b"0\n");
-            }
-            let lease_break_time = ensure_file(&fs_dir, "lease-break-time", 0o644);
-            if let Some(lease_break_time) = lease_break_time {
-                let _ = lease_break_time.write_at(0, b"45\n");
-            }
-            let mqueue_dir = ensure_dir(&fs_dir, "mqueue", 0o555);
-            if let Some(mqueue_dir) = mqueue_dir {
-                let queues_max = ensure_file(&mqueue_dir, "queues_max", 0o644);
-                if let Some(queues_max) = queues_max {
-                    let _ = queues_max.write_at(0, b"256\n");
-                }
-            }
-        }
-        let vm_dir = ensure_dir(&sys_dir, "vm", 0o555);
-        if let Some(vm_dir) = vm_dir {
-            for (name, value) in [
-                ("drop_caches", "0\n"),
-                ("compact_memory", "0\n"),
-                ("vfs_cache_pressure", "100\n"),
-                ("min_free_kbytes", "1024\n"),
-                ("nr_hugepages", "0\n"),
-                ("nr_overcommit_hugepages", "0\n"),
-                ("nr_hugepages_mempolicy", "0\n"),
-                ("mmap_min_addr", "65536\n"),
-                ("overcommit_memory", "0\n"),
-                ("overcommit_ratio", "50\n"),
-                ("panic_on_oom", "0\n"),
-                ("max_map_count", "65530\n"),
-                ("swappiness", "60\n"),
-                ("stat_refresh", "0\n"),
-                ("dirty_background_ratio", "10\n"),
-                ("dirty_ratio", "20\n"),
-                ("dirty_expire_centisecs", "3000\n"),
-                ("unprivileged_userfaultfd", "0\n"),
-                ("memory_failure_early_kill", "0\n"),
-            ] {
-                let file = ensure_file(&vm_dir, name, 0o644);
-                if let Some(file) = file {
-                    let _ = file.write_at(0, value.as_bytes());
-                }
-            }
-        }
-        let net_dir = ensure_dir(&sys_dir, "net", 0o555);
-        if let Some(net_dir) = net_dir {
-            let ipv4_dir = ensure_dir(&net_dir, "ipv4", 0o555);
-            if let Some(ipv4_dir) = ipv4_dir {
-                let conf_dir = ensure_dir(&ipv4_dir, "conf", 0o555);
-                if let Some(conf_dir) = conf_dir {
-                    let lo_dir = ensure_dir(&conf_dir, "lo", 0o555);
-                    if let Some(lo_dir) = lo_dir {
-                        let tag = ensure_file(&lo_dir, "tag", 0o644);
-                        if let Some(tag) = tag {
-                            let _ = tag.write_at(0, b"0\n");
-                        }
-                    }
-                    let default_dir = ensure_dir(&conf_dir, "default", 0o555);
-                    if let Some(default_dir) = default_dir {
-                        let tag = ensure_file(&default_dir, "tag", 0o644);
-                        if let Some(tag) = tag {
-                            let _ = tag.write_at(0, b"0\n");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if proc_inode.find("config.gz").is_none() {
-        if find_path_in_roots("/config.gz").is_some() {
-            let _ = proc_inode.create_symlink("config.gz", "/config.gz");
-        }
-    }
-}
-
-pub fn sync_proc_path(abs: &str) {
-    let pid = match proc_pid_from_path(abs) {
-        Some(v) => v,
-        None => return,
-    };
-    if pid == 0 {
-        return;
-    }
-    sync_proc_pid(pid);
-}
-
 pub fn is_proc_pseudo_path(abs: &str) -> bool {
-    if abs == "/proc" || abs.starts_with("/proc/") {
-        return !(abs == "/proc/sys" || abs.starts_with("/proc/sys/"));
-    }
-    false
+    abs == "/proc" || abs.starts_with("/proc/")
 }
 
 fn proc_root_entries() -> Vec<PseudoDirent> {
@@ -437,6 +311,11 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
     });
     entries.push(PseudoDirent {
         name: String::from("self"),
+        ino: 1,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("thread-self"),
         ino: 1,
         dtype: 10,
     });
@@ -477,6 +356,273 @@ fn proc_root_entries() -> Vec<PseudoDirent> {
         });
     }
     entries
+}
+
+fn proc_dir_entries(children: &[(&str, u8)]) -> Vec<PseudoDirent> {
+    let mut entries = Vec::with_capacity(children.len() + 2);
+    entries.push(PseudoDirent {
+        name: String::from("."),
+        ino: 1,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from(".."),
+        ino: 1,
+        dtype: 4,
+    });
+    for (name, dtype) in children {
+        entries.push(PseudoDirent {
+            name: String::from(*name),
+            ino: 1,
+            dtype: *dtype,
+        });
+    }
+    entries
+}
+
+fn proc_sys_kernel_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[
+        ("core_pattern", 8),
+        ("pid_max", 8),
+        ("threads-max", 8),
+        ("tainted", 8),
+        ("keys", 4),
+        ("random", 4),
+        ("shmmax", 8),
+        ("shmmni", 8),
+        ("shmall", 8),
+        ("msgmax", 8),
+        ("msgmnb", 8),
+        ("msgmni", 8),
+        ("sem", 8),
+    ])
+}
+
+fn proc_sys_kernel_keys_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[
+        ("gc_delay", 8),
+        ("maxkeys", 8),
+        ("maxbytes", 8),
+        ("root_maxkeys", 8),
+        ("root_maxbytes", 8),
+    ])
+}
+
+fn proc_sys_fs_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[
+        ("inotify", 4),
+        ("mqueue", 4),
+        ("pipe-max-size", 8),
+        ("pipe-user-pages-soft", 8),
+        ("pipe-user-pages-hard", 8),
+        ("lease-break-time", 8),
+    ])
+}
+
+fn proc_sys_vm_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[
+        ("drop_caches", 8),
+        ("compact_memory", 8),
+        ("vfs_cache_pressure", 8),
+        ("min_free_kbytes", 8),
+        ("nr_hugepages", 8),
+        ("nr_overcommit_hugepages", 8),
+        ("nr_hugepages_mempolicy", 8),
+        ("mmap_min_addr", 8),
+        ("overcommit_memory", 8),
+        ("overcommit_ratio", 8),
+        ("panic_on_oom", 8),
+        ("max_map_count", 8),
+        ("swappiness", 8),
+        ("stat_refresh", 8),
+        ("dirty_background_ratio", 8),
+        ("dirty_ratio", 8),
+        ("dirty_expire_centisecs", 8),
+        ("unprivileged_userfaultfd", 8),
+        ("memory_failure_early_kill", 8),
+    ])
+}
+
+fn proc_sys_net_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("ipv4", 4)])
+}
+
+fn proc_sys_net_ipv4_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("conf", 4)])
+}
+
+fn proc_sys_net_ipv4_conf_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("lo", 4), ("default", 4)])
+}
+
+fn proc_sys_net_ipv4_conf_if_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("tag", 8)])
+}
+
+fn proc_simple_text_path(path: &str) -> Option<&'static str> {
+    match path {
+        "/proc/sys/kernel/core_pattern" => Some("/proc/sys/kernel/core_pattern"),
+        "/proc/sys/kernel/threads-max" => Some("/proc/sys/kernel/threads-max"),
+        "/proc/sys/kernel/tainted" => Some("/proc/sys/kernel/tainted"),
+        "/proc/sys/kernel/keys/gc_delay" => Some("/proc/sys/kernel/keys/gc_delay"),
+        "/proc/sys/kernel/keys/maxkeys" => Some("/proc/sys/kernel/keys/maxkeys"),
+        "/proc/sys/kernel/keys/maxbytes" => Some("/proc/sys/kernel/keys/maxbytes"),
+        "/proc/sys/kernel/keys/root_maxkeys" => Some("/proc/sys/kernel/keys/root_maxkeys"),
+        "/proc/sys/kernel/keys/root_maxbytes" => Some("/proc/sys/kernel/keys/root_maxbytes"),
+        "/proc/sys/fs/inotify/max_queued_events" => Some("/proc/sys/fs/inotify/max_queued_events"),
+        "/proc/sys/fs/inotify/max_user_instances" => {
+            Some("/proc/sys/fs/inotify/max_user_instances")
+        }
+        "/proc/sys/fs/inotify/max_user_watches" => Some("/proc/sys/fs/inotify/max_user_watches"),
+        "/proc/sys/fs/pipe-user-pages-soft" => Some("/proc/sys/fs/pipe-user-pages-soft"),
+        "/proc/sys/fs/pipe-user-pages-hard" => Some("/proc/sys/fs/pipe-user-pages-hard"),
+        "/proc/sys/fs/lease-break-time" => Some("/proc/sys/fs/lease-break-time"),
+        "/proc/sys/vm/vfs_cache_pressure" => Some("/proc/sys/vm/vfs_cache_pressure"),
+        "/proc/sys/vm/min_free_kbytes" => Some("/proc/sys/vm/min_free_kbytes"),
+        "/proc/sys/vm/nr_hugepages" => Some("/proc/sys/vm/nr_hugepages"),
+        "/proc/sys/vm/nr_overcommit_hugepages" => Some("/proc/sys/vm/nr_overcommit_hugepages"),
+        "/proc/sys/vm/nr_hugepages_mempolicy" => Some("/proc/sys/vm/nr_hugepages_mempolicy"),
+        "/proc/sys/vm/mmap_min_addr" => Some("/proc/sys/vm/mmap_min_addr"),
+        "/proc/sys/vm/panic_on_oom" => Some("/proc/sys/vm/panic_on_oom"),
+        "/proc/sys/vm/max_map_count" => Some("/proc/sys/vm/max_map_count"),
+        "/proc/sys/vm/swappiness" => Some("/proc/sys/vm/swappiness"),
+        "/proc/sys/vm/stat_refresh" => Some("/proc/sys/vm/stat_refresh"),
+        "/proc/sys/vm/dirty_background_ratio" => Some("/proc/sys/vm/dirty_background_ratio"),
+        "/proc/sys/vm/dirty_ratio" => Some("/proc/sys/vm/dirty_ratio"),
+        "/proc/sys/vm/dirty_expire_centisecs" => Some("/proc/sys/vm/dirty_expire_centisecs"),
+        "/proc/sys/vm/unprivileged_userfaultfd" => Some("/proc/sys/vm/unprivileged_userfaultfd"),
+        "/proc/sys/vm/memory_failure_early_kill" => Some("/proc/sys/vm/memory_failure_early_kill"),
+        "/proc/sys/net/ipv4/conf/lo/tag" => Some("/proc/sys/net/ipv4/conf/lo/tag"),
+        "/proc/sys/net/ipv4/conf/default/tag" => Some("/proc/sys/net/ipv4/conf/default/tag"),
+        _ => None,
+    }
+}
+
+fn proc_simple_text_default(path: &'static str) -> Vec<u8> {
+    match path {
+        "/proc/sys/kernel/core_pattern" => b"core\n".to_vec(),
+        "/proc/sys/kernel/threads-max" => {
+            alloc::format!("{}\n", crate::task::pid_max()).into_bytes()
+        }
+        "/proc/sys/kernel/tainted" => b"0\n".to_vec(),
+        "/proc/sys/kernel/keys/gc_delay" => b"300\n".to_vec(),
+        "/proc/sys/kernel/keys/maxkeys" => b"200\n".to_vec(),
+        "/proc/sys/kernel/keys/maxbytes" => b"20000\n".to_vec(),
+        "/proc/sys/kernel/keys/root_maxkeys" => b"100000\n".to_vec(),
+        "/proc/sys/kernel/keys/root_maxbytes" => b"25000000\n".to_vec(),
+        "/proc/sys/fs/inotify/max_queued_events" => b"16384\n".to_vec(),
+        "/proc/sys/fs/inotify/max_user_instances" => b"128\n".to_vec(),
+        "/proc/sys/fs/inotify/max_user_watches" => b"8192\n".to_vec(),
+        "/proc/sys/fs/pipe-user-pages-soft" => b"128\n".to_vec(),
+        "/proc/sys/fs/pipe-user-pages-hard" => b"0\n".to_vec(),
+        "/proc/sys/fs/lease-break-time" => b"45\n".to_vec(),
+        "/proc/sys/vm/vfs_cache_pressure" => b"100\n".to_vec(),
+        "/proc/sys/vm/min_free_kbytes" => b"1024\n".to_vec(),
+        "/proc/sys/vm/nr_hugepages" => b"0\n".to_vec(),
+        "/proc/sys/vm/nr_overcommit_hugepages" => b"0\n".to_vec(),
+        "/proc/sys/vm/nr_hugepages_mempolicy" => b"0\n".to_vec(),
+        "/proc/sys/vm/mmap_min_addr" => b"65536\n".to_vec(),
+        "/proc/sys/vm/panic_on_oom" => b"0\n".to_vec(),
+        "/proc/sys/vm/max_map_count" => b"65530\n".to_vec(),
+        "/proc/sys/vm/swappiness" => b"60\n".to_vec(),
+        "/proc/sys/vm/stat_refresh" => b"0\n".to_vec(),
+        "/proc/sys/vm/dirty_background_ratio" => b"10\n".to_vec(),
+        "/proc/sys/vm/dirty_ratio" => b"20\n".to_vec(),
+        "/proc/sys/vm/dirty_expire_centisecs" => b"3000\n".to_vec(),
+        "/proc/sys/vm/unprivileged_userfaultfd" => b"0\n".to_vec(),
+        "/proc/sys/vm/memory_failure_early_kill" => b"0\n".to_vec(),
+        "/proc/sys/net/ipv4/conf/lo/tag" => b"0\n".to_vec(),
+        "/proc/sys/net/ipv4/conf/default/tag" => b"0\n".to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+fn proc_simple_text_is_writable(path: &str) -> bool {
+    !matches!(path, "/proc/sys/kernel/tainted") && proc_simple_text_path(path).is_some()
+}
+
+fn proc_simple_text_is_numeric(path: &str) -> bool {
+    !matches!(path, "/proc/sys/kernel/core_pattern")
+}
+
+fn ensure_proc_simple_text_entry(path: &'static str) {
+    let mut files = PROC_SIMPLE_TEXT_FILES.lock();
+    files
+        .entry(path)
+        .or_insert_with(|| proc_simple_text_default(path));
+}
+
+fn proc_simple_text_content(path: &'static str) -> String {
+    ensure_proc_simple_text_entry(path);
+    let bytes = PROC_SIMPLE_TEXT_FILES
+        .lock()
+        .get(path)
+        .cloned()
+        .unwrap_or_else(|| proc_simple_text_default(path));
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn write_proc_simple_text(path: &'static str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    if !proc_simple_text_is_writable(path) {
+        return Err(EINVAL);
+    }
+    let normalized = if proc_simple_text_is_numeric(path) {
+        let value = parse_proc_sys_usize(data)?;
+        alloc::format!("{}\n", value).into_bytes()
+    } else {
+        let Ok(raw) = core::str::from_utf8(data) else {
+            return Err(EINVAL);
+        };
+        if raw.is_empty() || raw.contains('\0') {
+            return Err(EINVAL);
+        }
+        alloc::format!("{}\n", raw.trim_end_matches(['\n', '\r'])).into_bytes()
+    };
+    ensure_proc_simple_text_entry(path);
+    PROC_SIMPLE_TEXT_FILES
+        .lock()
+        .insert(path, normalized.clone());
+    Ok(normalized)
+}
+
+fn write_pid_max_sysctl(data: &[u8]) -> Result<Vec<u8>, isize> {
+    let value = parse_proc_sys_usize(data)?;
+    let (min, max) = crate::task::pid_max_bounds();
+    if !(min..=max).contains(&value) {
+        return Err(EINVAL);
+    }
+    let applied = crate::task::set_pid_max(value);
+    Ok(alloc::format!("{}\n", applied).into_bytes())
+}
+
+fn write_vm_trigger_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let value = parse_proc_sys_usize(data)?;
+    match path {
+        "/proc/sys/vm/drop_caches" if (1..=7).contains(&value) => {}
+        "/proc/sys/vm/compact_memory" if value == 1 => {}
+        _ => return Err(EINVAL),
+    }
+    Ok(b"0\n".to_vec())
+}
+
+fn managed_proc_sys_file_kind(path: &str) -> Option<ProcFileKind> {
+    match path {
+        "/proc/sys/vm/drop_caches" => Some(ProcFileKind::VmDropCaches),
+        "/proc/sys/vm/compact_memory" => Some(ProcFileKind::VmCompactMemory),
+        "/proc/sys/vm/overcommit_memory" => Some(ProcFileKind::VmOvercommitMemory),
+        "/proc/sys/vm/overcommit_ratio" => Some(ProcFileKind::VmOvercommitRatio),
+        "/proc/sys/fs/pipe-max-size" => Some(ProcFileKind::FsPipeMaxSize),
+        "/proc/sys/fs/mqueue/queues_max" => Some(ProcFileKind::FsMqueueQueuesMax),
+        "/proc/sys/kernel/pid_max" => Some(ProcFileKind::KernelPidMax),
+        "/proc/sys/kernel/msgmax" => Some(ProcFileKind::KernelMsgmax),
+        "/proc/sys/kernel/msgmnb" => Some(ProcFileKind::KernelMsgmnb),
+        "/proc/sys/kernel/msgmni" => Some(ProcFileKind::KernelMsgmni),
+        "/proc/sys/kernel/sem" => Some(ProcFileKind::KernelSem),
+        "/proc/sys/kernel/shmmax" => Some(ProcFileKind::KernelShmmax),
+        "/proc/sys/kernel/shmmni" => Some(ProcFileKind::KernelShmmni),
+        "/proc/sys/kernel/shmall" => Some(ProcFileKind::KernelShmall),
+        _ => proc_simple_text_path(path).map(ProcFileKind::SimpleText),
+    }
 }
 
 fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
@@ -716,7 +862,47 @@ fn proc_pid_task_tid_entries(pid: u32, tid: u32) -> Vec<PseudoDirent> {
         ino: tid as u64,
         dtype: 8,
     });
+    entries.push(PseudoDirent {
+        name: String::from("cwd"),
+        ino: tid as u64,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("fd"),
+        ino: tid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("ns"),
+        ino: tid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("mounts"),
+        ino: tid as u64,
+        dtype: 8,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("cgroup"),
+        ino: tid as u64,
+        dtype: 8,
+    });
     entries
+}
+
+fn proc_pid_exists(pid: u32) -> bool {
+    pid2process(pid as usize).is_some()
+}
+
+fn current_thread_self_target() -> Option<String> {
+    let pid = current_process().getpid() as u32;
+    let task = current_task()?;
+    let tid_index = {
+        let inner = task.borrow_mut();
+        inner.res.as_ref()?.tid
+    };
+    let tid = encode_proc_linux_tid(pid, tid_index);
+    Some(alloc::format!("{pid}/task/{tid}"))
 }
 
 fn proc_dir_entry_path(base: &str, name: &str) -> String {
@@ -804,6 +990,12 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
             PseudoKindTag::Static => None,
         };
     }
+    if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+        return Some(alloc::format!("pipe:[{}]", pipe as *const Pipe as usize));
+    }
+    if let Some(ns) = file.as_any().downcast_ref::<NamespaceFile>() {
+        return Some(alloc::format!("ipc:[{}]", ns.ns_id()));
+    }
     if file.as_any().downcast_ref::<RtcFile>().is_some() {
         return Some(String::from("/dev/misc/rtc"));
     }
@@ -832,7 +1024,39 @@ fn proc_pid_cwd(pid: u32) -> Option<String> {
     Some(inner.cwd.clone())
 }
 
-pub fn proc_readlink(path: &str) -> Option<String> {
+fn proc_pid_fd_file(pid: u32, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
+    let proc = pid2process(pid as usize)?;
+    let files_proc = proc.files_owner_process();
+    let inner = files_proc.try_borrow_mut()?;
+    inner.fd_table.get(fd)?.as_ref().cloned()
+}
+
+fn proc_pid_ipc_ns_target(pid: u32) -> Option<String> {
+    let proc = pid2process(pid as usize)?;
+    let inner = proc.try_borrow_mut()?;
+    Some(alloc::format!("ipc:[{}]", inner.ipc_ns_id))
+}
+
+fn parse_proc_fd_component(fd_name: &str) -> Option<usize> {
+    if fd_name.is_empty() || fd_name.contains('/') || !fd_name.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    fd_name.parse::<usize>().ok()
+}
+
+fn proc_pid_task_rest(rest: &str) -> Option<(u32, &str)> {
+    let task_rest = rest.strip_prefix("task/")?;
+    let mut parts = task_rest.splitn(2, '/');
+    let tid_name = parts.next().unwrap_or("");
+    if tid_name.is_empty() || !tid_name.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let tid = tid_name.parse::<u32>().ok()?;
+    let tail = parts.next().unwrap_or("");
+    Some((tid, tail))
+}
+
+pub fn proc_magic_link_exists(path: &str) -> bool {
     let trimmed = if path.len() > 1 {
         path.trim_end_matches('/')
     } else {
@@ -840,21 +1064,132 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     };
 
     if trimmed == "/proc/self" {
-        return Some(alloc::format!("{}", current_process().getpid()));
+        return true;
+    }
+    if trimmed == "/proc/thread-self" {
+        return current_thread_self_target().is_some();
+    }
+
+    let Some((pid, rest)) = proc_pid_from_path_with_rest(trimmed) else {
+        return false;
+    };
+    if !proc_pid_exists(pid) {
+        return false;
+    }
+    if rest == "cwd" || rest == "ns/ipc" {
+        return true;
+    }
+    if let Some(fd_name) = rest.strip_prefix("fd/") {
+        return parse_proc_fd_component(fd_name)
+            .and_then(|fd| proc_pid_fd_file(pid, fd))
+            .is_some();
+    }
+
+    let Some((tid, tail)) = proc_pid_task_rest(rest) else {
+        return false;
+    };
+    if !proc_pid_task_alive(pid, tid) {
+        return false;
+    }
+    if tail == "cwd" || tail == "ns/ipc" {
+        return true;
+    }
+    tail.strip_prefix("fd/")
+        .and_then(parse_proc_fd_component)
+        .and_then(|fd| proc_pid_fd_file(pid, fd))
+        .is_some()
+}
+
+pub fn proc_fd_link_file(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    let trimmed = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+
+    if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
+        let pid = current_process().getpid();
+        let suffix = &trimmed["/proc/self".len()..];
+        let mapped = alloc::format!("/proc/{pid}{suffix}");
+        return proc_fd_link_file(&mapped);
+    }
+    if trimmed == "/proc/thread-self" || trimmed.starts_with("/proc/thread-self/") {
+        let target = current_thread_self_target()?;
+        let suffix = &trimmed["/proc/thread-self".len()..];
+        let mapped = alloc::format!("/proc/{target}{suffix}");
+        return proc_fd_link_file(&mapped);
+    }
+
+    let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
+    if !proc_pid_exists(pid) {
+        return None;
+    }
+    if let Some(fd_name) = rest.strip_prefix("fd/") {
+        let fd = parse_proc_fd_component(fd_name)?;
+        return proc_pid_fd_file(pid, fd);
+    }
+
+    let (tid, tail) = proc_pid_task_rest(rest)?;
+    if !proc_pid_task_alive(pid, tid) {
+        return None;
+    }
+    let fd_name = tail.strip_prefix("fd/")?;
+    let fd = parse_proc_fd_component(fd_name)?;
+    proc_pid_fd_file(pid, fd)
+}
+
+pub fn proc_readlink(path: &str) -> Option<String> {
+    let trimmed = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+
+    if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
+        let pid = current_process().getpid();
+        if trimmed == "/proc/self" {
+            return Some(alloc::format!("{pid}"));
+        }
+        let suffix = &trimmed["/proc/self".len()..];
+        let mapped = alloc::format!("/proc/{pid}{suffix}");
+        return proc_readlink(&mapped);
+    }
+
+    if trimmed == "/proc/thread-self" || trimmed.starts_with("/proc/thread-self/") {
+        let target = current_thread_self_target()?;
+        if trimmed == "/proc/thread-self" {
+            return Some(target);
+        }
+        let suffix = &trimmed["/proc/thread-self".len()..];
+        let mapped = alloc::format!("/proc/{target}{suffix}");
+        return proc_readlink(&mapped);
     }
 
     let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
     if rest == "cwd" {
         return proc_pid_cwd(pid);
     }
+    if rest == "ns/ipc" {
+        return proc_pid_ipc_ns_target(pid);
+    }
 
-    let Some(fd_name) = rest.strip_prefix("fd/") else {
-        return None;
-    };
-    if fd_name.is_empty() || fd_name.contains('/') || !fd_name.chars().all(|c| c.is_ascii_digit()) {
+    if let Some(fd_name) = rest.strip_prefix("fd/") {
+        let fd = parse_proc_fd_component(fd_name)?;
+        return proc_fd_target(pid, fd);
+    }
+
+    let (tid, tail) = proc_pid_task_rest(rest)?;
+    if !proc_pid_task_alive(pid, tid) {
         return None;
     }
-    let fd = fd_name.parse::<usize>().ok()?;
+    if tail == "cwd" {
+        return proc_pid_cwd(pid);
+    }
+    if tail == "ns/ipc" {
+        return proc_pid_ipc_ns_target(pid);
+    }
+    let fd_name = tail.strip_prefix("fd/")?;
+    let fd = parse_proc_fd_component(fd_name)?;
     proc_fd_target(pid, fd)
 }
 
@@ -886,10 +1221,104 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     if trimmed == "/proc" {
         return Some(Arc::new(PseudoDir::new("/proc", proc_root_entries())));
     }
+    match trimmed {
+        "/proc/sys" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys",
+                proc_dir_entries(&[("kernel", 4), ("fs", 4), ("vm", 4), ("net", 4)]),
+            )));
+        }
+        "/proc/sys/kernel" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/kernel",
+                proc_sys_kernel_entries(),
+            )));
+        }
+        "/proc/sys/kernel/keys" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/kernel/keys",
+                proc_sys_kernel_keys_entries(),
+            )));
+        }
+        "/proc/sys/kernel/random" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/kernel/random",
+                proc_dir_entries(&[("entropy_avail", 8)]),
+            )));
+        }
+        "/proc/sys/kernel/random/entropy_avail" => {
+            return Some(Arc::new(PseudoFile::new_static("256\n")));
+        }
+        "/proc/sys/fs" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/fs",
+                proc_sys_fs_entries(),
+            )));
+        }
+        "/proc/sys/fs/inotify" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/fs/inotify",
+                proc_dir_entries(&[
+                    ("max_queued_events", 8),
+                    ("max_user_instances", 8),
+                    ("max_user_watches", 8),
+                ]),
+            )));
+        }
+        "/proc/sys/fs/mqueue" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/fs/mqueue",
+                proc_dir_entries(&[("queues_max", 8)]),
+            )));
+        }
+        "/proc/sys/vm" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/vm",
+                proc_sys_vm_entries(),
+            )));
+        }
+        "/proc/sys/net" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/net",
+                proc_sys_net_entries(),
+            )));
+        }
+        "/proc/sys/net/ipv4" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/net/ipv4",
+                proc_sys_net_ipv4_entries(),
+            )));
+        }
+        "/proc/sys/net/ipv4/conf" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/net/ipv4/conf",
+                proc_sys_net_ipv4_conf_entries(),
+            )));
+        }
+        "/proc/sys/net/ipv4/conf/lo" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/net/ipv4/conf/lo",
+                proc_sys_net_ipv4_conf_if_entries(),
+            )));
+        }
+        "/proc/sys/net/ipv4/conf/default" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/net/ipv4/conf/default",
+                proc_sys_net_ipv4_conf_if_entries(),
+            )));
+        }
+        _ => {}
+    }
     if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
         let pid = current_process().getpid();
         let suffix = &trimmed["/proc/self".len()..];
         let mapped = alloc::format!("/proc/{pid}{suffix}");
+        return open_proc_pseudo(&mapped);
+    }
+    if trimmed == "/proc/thread-self" || trimmed.starts_with("/proc/thread-self/") {
+        let target = current_thread_self_target()?;
+        let suffix = &trimmed["/proc/thread-self".len()..];
+        let mapped = alloc::format!("/proc/{target}{suffix}");
         return open_proc_pseudo(&mapped);
     }
     if trimmed == "/proc/sysvipc" {
@@ -941,7 +1370,14 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         _ => {}
     }
 
+    if let Some(kind) = managed_proc_sys_file_kind(trimmed) {
+        return Some(ProcPseudoFile::new(kind));
+    }
+
     let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
+    if !proc_pid_exists(pid) {
+        return None;
+    }
     if rest.is_empty() {
         return Some(Arc::new(PseudoDir::new(
             &alloc::format!("/proc/{pid}"),
@@ -966,28 +1402,41 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             proc_pid_ns_entries(pid),
         )));
     }
-    if let Some(task_rest) = rest.strip_prefix("task/") {
-        let mut parts = task_rest.splitn(2, '/');
-        let tid_name = parts.next().unwrap_or("");
-        if tid_name.is_empty() || !tid_name.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        let tid = tid_name.parse::<u32>().ok()?;
+    if let Some((tid, tail)) = proc_pid_task_rest(rest) {
         if !proc_pid_task_alive(pid, tid) {
             return None;
         }
-        let tail = parts.next().unwrap_or("");
         if tail.is_empty() {
             return Some(Arc::new(PseudoDir::new(
                 &alloc::format!("/proc/{pid}/task/{tid}"),
                 proc_pid_task_tid_entries(pid, tid),
             )));
         }
-        if tail == "stat" {
-            return Some(ProcPseudoFile::new(ProcFileKind::PidTaskStat(pid, tid)));
+        match tail {
+            "stat" => return Some(ProcPseudoFile::new(ProcFileKind::PidTaskStat(pid, tid))),
+            "comm" => return Some(ProcPseudoFile::new(ProcFileKind::PidTaskComm(pid, tid))),
+            "fd" => {
+                return Some(Arc::new(PseudoDir::new(
+                    &alloc::format!("/proc/{pid}/task/{tid}/fd"),
+                    proc_pid_fd_entries(pid),
+                )));
+            }
+            "ns" => {
+                return Some(Arc::new(PseudoDir::new(
+                    &alloc::format!("/proc/{pid}/task/{tid}/ns"),
+                    proc_pid_ns_entries(pid),
+                )));
+            }
+            "mounts" => return Some(ProcPseudoFile::new(ProcFileKind::PidMounts)),
+            "cgroup" => return Some(ProcPseudoFile::new(ProcFileKind::PidCgroup(pid))),
+            _ => {}
         }
-        if tail == "comm" {
-            return Some(ProcPseudoFile::new(ProcFileKind::PidTaskComm(pid, tid)));
+        if let Some(ns_name) = tail.strip_prefix("ns/") {
+            if ns_name == "ipc" {
+                let proc = pid2process(pid as usize)?;
+                let ipc_ns_id = proc.borrow_mut().ipc_ns_id;
+                return Some(Arc::new(NamespaceFile::new_ipc(ipc_ns_id)));
+            }
         }
         return None;
     }
@@ -1007,57 +1456,14 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "maps" => Some(ProcPseudoFile::new(ProcFileKind::PidMaps(pid))),
         "pagemap" => Some(ProcPseudoFile::new(ProcFileKind::PidPagemap(pid))),
         "smaps" => Some(ProcPseudoFile::new(ProcFileKind::PidSmaps(pid))),
-        "coredump_filter" => Some(ProcPseudoFile::new(ProcFileKind::PidCoredumpFilter(pid))),
-        "mounts" => Some(ProcPseudoFile::new(ProcFileKind::PidMounts(pid))),
+        "coredump_filter" => Some(ProcPseudoFile::new(ProcFileKind::PidCoredumpFilter)),
+        "mounts" => Some(ProcPseudoFile::new(ProcFileKind::PidMounts)),
         "cgroup" => Some(ProcPseudoFile::new(ProcFileKind::PidCgroup(pid))),
         _ => None,
     }
 }
 
-pub fn build_proc_root_entries(
-    static_entries: Vec<(String, u32, u8)>,
-    pids: Vec<usize>,
-) -> Vec<PseudoDirent> {
-    let mut entries = Vec::new();
-    entries.push(PseudoDirent {
-        name: String::from("."),
-        ino: 1,
-        dtype: 4,
-    });
-    entries.push(PseudoDirent {
-        name: String::from(".."),
-        ino: 1,
-        dtype: 4,
-    });
-    for (name, ino, ftype) in static_entries {
-        if name == "." || name == ".." || name == "self" {
-            continue;
-        }
-        if name.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        entries.push(PseudoDirent {
-            name,
-            ino: ino as u64,
-            dtype: dt_type_from_ext4(ftype),
-        });
-    }
-    entries.push(PseudoDirent {
-        name: String::from("self"),
-        ino: 1,
-        dtype: 10,
-    });
-    for pid in pids {
-        entries.push(PseudoDirent {
-            name: alloc::format!("{}", pid),
-            ino: pid as u64,
-            dtype: 4,
-        });
-    }
-    entries
-}
-
-pub fn collect_pids() -> Vec<usize> {
+fn collect_pids() -> Vec<usize> {
     let mut pids: Vec<usize> = {
         let map = PID2PCB.lock();
         map.keys().copied().filter(|pid| *pid != 0).collect()
@@ -1066,9 +1472,9 @@ pub fn collect_pids() -> Vec<usize> {
     pids
 }
 
-pub fn proc_file_content(kind: &ProcFileKind) -> String {
+fn proc_file_content(kind: &ProcFileKind) -> String {
     match kind {
-        ProcFileKind::Mounts | ProcFileKind::PidMounts(_) => proc_mounts(),
+        ProcFileKind::Mounts | ProcFileKind::PidMounts => proc_mounts(),
         ProcFileKind::Cgroups => crate::fs::cgroup_proc_cgroups_content(),
         ProcFileKind::Meminfo => proc_meminfo(),
         ProcFileKind::Cpuinfo => proc_cpuinfo(),
@@ -1081,6 +1487,48 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::SysvipcMsg => crate::syscall::sysv_ipc::proc_sysvipc_msg(),
         ProcFileKind::SysvipcSem => crate::syscall::sysv_ipc::proc_sysvipc_sem(),
         ProcFileKind::SysvipcShm => crate::syscall::sysv_shm::proc_sysvipc_shm(),
+        ProcFileKind::VmOvercommitMemory => alloc::format!("{}\n", vm_overcommit_memory()),
+        ProcFileKind::VmOvercommitRatio => alloc::format!("{}\n", vm_overcommit_ratio()),
+        ProcFileKind::VmDropCaches => String::from("0\n"),
+        ProcFileKind::VmCompactMemory => String::from("0\n"),
+        ProcFileKind::FsPipeMaxSize => {
+            alloc::format!("{}\n", crate::fs::pipe_max_size_limit_for_procfs())
+        }
+        ProcFileKind::FsMqueueQueuesMax => alloc::format!(
+            "{}\n",
+            crate::syscall::posix_mq::queues_max_limit_for_procfs()
+        ),
+        ProcFileKind::KernelPidMax => alloc::format!("{}\n", crate::task::pid_max()),
+        ProcFileKind::KernelMsgmax => alloc::format!(
+            "{}\n",
+            crate::syscall::sysv_ipc::runtime_msgmax_for_procfs()
+        ),
+        ProcFileKind::KernelMsgmnb => alloc::format!(
+            "{}\n",
+            crate::syscall::sysv_ipc::runtime_msgmnb_for_procfs()
+        ),
+        ProcFileKind::KernelMsgmni => alloc::format!(
+            "{}\n",
+            crate::syscall::sysv_ipc::runtime_msgmni_for_procfs()
+        ),
+        ProcFileKind::KernelSem => {
+            let (semmsl, semmns, semopm, semmni) =
+                crate::syscall::sysv_ipc::runtime_sem_limits_for_procfs();
+            alloc::format!("{}\t{}\t{}\t{}\n", semmsl, semmns, semopm, semmni)
+        }
+        ProcFileKind::KernelShmmax => alloc::format!(
+            "{}\n",
+            crate::syscall::sysv_shm::runtime_shmmax_for_procfs()
+        ),
+        ProcFileKind::KernelShmmni => alloc::format!(
+            "{}\n",
+            crate::syscall::sysv_shm::runtime_shmmni_for_procfs()
+        ),
+        ProcFileKind::KernelShmall => alloc::format!(
+            "{}\n",
+            crate::syscall::sysv_shm::runtime_shmall_for_procfs()
+        ),
+        ProcFileKind::SimpleText(path) => proc_simple_text_content(path),
         ProcFileKind::PidStat(pid) => proc_pid_stat(*pid),
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
         ProcFileKind::PidComm(pid) => proc_pid_comm(*pid),
@@ -1088,109 +1536,10 @@ pub fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::PidMaps(pid) => proc_pid_maps(*pid),
         ProcFileKind::PidPagemap(_) => String::new(),
         ProcFileKind::PidSmaps(pid) => proc_pid_smaps(*pid),
-        ProcFileKind::PidCoredumpFilter(_) => String::from("00000033\n"),
+        ProcFileKind::PidCoredumpFilter => String::from("00000033\n"),
         ProcFileKind::PidCgroup(pid) => crate::fs::cgroup_proc_pid_content(*pid as usize),
         ProcFileKind::PidTaskStat(pid, tid) => proc_pid_task_stat(*pid, *tid),
         ProcFileKind::PidTaskComm(pid, tid) => proc_pid_task_comm(*pid, *tid),
-    }
-}
-
-fn proc_pid_from_path(path: &str) -> Option<usize> {
-    let rest = path.strip_prefix("/proc/")?;
-    let first = rest.split('/').next().unwrap_or("");
-    if first.is_empty() {
-        return None;
-    }
-    if !first.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    first.parse::<usize>().ok()
-}
-
-fn sync_proc_pid(pid: usize) {
-    if crate::debug_config::DEBUG_PROCFS {
-        crate::println!("[procfs] sync pid={} begin", pid);
-    }
-    let _guard = ext4_lock();
-    let proc_inode = match find_path_in_roots("/proc") {
-        Some(v) => v,
-        None => return,
-    };
-    let name = alloc::format!("{}", pid);
-    let pid_dir = match proc_inode.find(&name) {
-        Some(v) => v,
-        None => match proc_inode.create_dir(&name) {
-            Ok(v) => v,
-            Err(_) => return,
-        },
-    };
-    pid_dir.set_mode(0o555);
-
-    let pid_u32 = pid as u32;
-    let _ = ensure_proc_file(&pid_dir, "stat", ProcFileKind::PidStat(pid_u32), 0o444);
-    let _ = ensure_proc_file(
-        &pid_dir,
-        "cmdline",
-        ProcFileKind::PidCmdline(pid_u32),
-        0o444,
-    );
-    let _ = ensure_proc_file(&pid_dir, "status", ProcFileKind::PidStatus(pid_u32), 0o444);
-    let _ = ensure_proc_file(&pid_dir, "maps", ProcFileKind::PidMaps(pid_u32), 0o444);
-    let _ = ensure_proc_file(
-        &pid_dir,
-        "pagemap",
-        ProcFileKind::PidPagemap(pid_u32),
-        0o444,
-    );
-    let _ = ensure_proc_file(&pid_dir, "smaps", ProcFileKind::PidSmaps(pid_u32), 0o444);
-    let _ = ensure_proc_file(
-        &pid_dir,
-        "coredump_filter",
-        ProcFileKind::PidCoredumpFilter(pid_u32),
-        0o644,
-    );
-    let _ = ensure_proc_file(&pid_dir, "mounts", ProcFileKind::PidMounts(pid_u32), 0o444);
-    let _ = ensure_proc_file(&pid_dir, "cgroup", ProcFileKind::PidCgroup(pid_u32), 0o444);
-    if crate::debug_config::DEBUG_PROCFS {
-        crate::println!("[procfs] sync pid={} end", pid);
-    }
-}
-
-fn ensure_dir(parent: &Arc<ext4_fs::Inode>, name: &str, mode: u16) -> Option<Arc<ext4_fs::Inode>> {
-    let inode = match parent.find(name) {
-        Some(v) => v,
-        None => parent.create_dir(name).ok()?,
-    };
-    inode.set_mode(mode);
-    Some(inode)
-}
-
-fn ensure_file(parent: &Arc<ext4_fs::Inode>, name: &str, mode: u16) -> Option<Arc<ext4_fs::Inode>> {
-    let inode = match parent.find(name) {
-        Some(v) => v,
-        None => parent.create_file(name).ok()?,
-    };
-    inode.set_mode(mode);
-    Some(inode)
-}
-
-fn ensure_proc_file(
-    parent: &Arc<ext4_fs::Inode>,
-    name: &str,
-    kind: ProcFileKind,
-    mode: u16,
-) -> Option<Arc<ext4_fs::Inode>> {
-    let inode = ensure_file(parent, name, mode)?;
-    PROC_FILES.lock().insert(inode.inode_num(), kind);
-    Some(inode)
-}
-
-fn dt_type_from_ext4(ftype: u8) -> u8 {
-    match ftype {
-        2 => 4,  // DT_DIR
-        1 => 8,  // DT_REG
-        7 => 10, // DT_LNK
-        _ => 0,  // DT_UNKNOWN
     }
 }
 
@@ -1198,28 +1547,37 @@ fn proc_mounts() -> String {
     crate::syscall::filesystem::proc_mounts_snapshot()
 }
 
-fn read_vm_tunable_usize(name: &str, default: usize) -> usize {
-    let path = alloc::format!("/proc/sys/vm/{}", name);
-    let Some(inode) = find_path_in_roots(&path) else {
-        return default;
+pub(crate) fn parse_proc_sys_usize(data: &[u8]) -> Result<usize, isize> {
+    let Ok(raw) = core::str::from_utf8(data) else {
+        return Err(EINVAL);
     };
-    let mut buf = [0u8; 32];
-    let len = inode.read_at(0, &mut buf);
-    if len == 0 {
-        return default;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(EINVAL);
     }
-    let Ok(raw) = core::str::from_utf8(&buf[..len]) else {
-        return default;
+    trimmed.parse::<usize>().map_err(|_| EINVAL)
+}
+
+fn write_vm_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let (slot, max) = match path {
+        "/proc/sys/vm/overcommit_memory" => (&VM_OVERCOMMIT_MEMORY, VM_OVERCOMMIT_MEMORY_MAX),
+        "/proc/sys/vm/overcommit_ratio" => (&VM_OVERCOMMIT_RATIO, VM_OVERCOMMIT_RATIO_MAX),
+        _ => return Err(EINVAL),
     };
-    raw.trim().parse::<usize>().unwrap_or(default)
+    let value = parse_proc_sys_usize(data)?;
+    if value > max {
+        return Err(EINVAL);
+    }
+    slot.store(value, Ordering::Relaxed);
+    Ok(alloc::format!("{}\n", value).into_bytes())
 }
 
 pub fn vm_overcommit_memory() -> usize {
-    read_vm_tunable_usize("overcommit_memory", 0).min(2)
+    VM_OVERCOMMIT_MEMORY.load(Ordering::Relaxed)
 }
 
-pub fn vm_overcommit_ratio() -> usize {
-    read_vm_tunable_usize("overcommit_ratio", 50)
+fn vm_overcommit_ratio() -> usize {
+    VM_OVERCOMMIT_RATIO.load(Ordering::Relaxed)
 }
 
 pub fn vm_commit_limit_bytes() -> usize {

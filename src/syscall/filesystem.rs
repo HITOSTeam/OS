@@ -12,9 +12,9 @@ use spin::Mutex;
 use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
-        CgroupFile, CgroupMountSpec, EventFdFile, File, NetSocketFile, OSInode, OpenFlags, Pipe,
-        ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile,
-        PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TimerFdFile, TtyFile,
+        CgroupFile, CgroupMountSpec, EventFdFile, File, NamespaceFile, NetSocketFile, OSInode,
+        OpenFlags, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
+        PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TimerFdFile, TtyFile,
         cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount,
         cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots, make_pipe,
         open_cgroup_pseudo, open_file, pseudo_block_is_read_only, pseudo_block_note_sync,
@@ -725,6 +725,13 @@ fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Option<String>
     }
     let os_inode = file.as_any().downcast_ref::<OSInode>()?;
     inode_path_hint(&os_inode.ext4_inode()).map(|path| mount_display_abs(&path))
+}
+
+fn pseudo_abs_for_ext4_dirfd(base: &Arc<ext4_fs::Inode>, path: &str) -> Option<String> {
+    let base_path = inode_path_hint(base)?;
+    let logical_base = mount_display_abs(&base_path);
+    let abs = normalize_path(&logical_base, path);
+    open_pseudo(&abs).map(|_| abs)
 }
 
 fn mount_is_busy(target: &str, writable_only: bool) -> bool {
@@ -1494,11 +1501,54 @@ fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     inner.fd_table[fd].clone()
 }
 
+fn try_write_proc_pseudo_file(
+    file: &Arc<dyn File + Send + Sync>,
+    data: &[u8],
+    offset: usize,
+    advance_offset: bool,
+) -> Option<isize> {
+    let proc_file = file.as_any().downcast_ref::<ProcPseudoFile>()?;
+    if data.is_empty() {
+        return Some(0);
+    }
+    let written = match proc_file.pwrite_bytes(offset, data) {
+        Ok(written) => written,
+        Err(err) => return Some(err),
+    };
+    if advance_offset {
+        proc_file.set_offset(offset.saturating_add(written));
+    }
+    Some(written as isize)
+}
+
+pub(crate) fn fd_is_writable_proc_pseudo(fd: usize) -> bool {
+    let Some(file) = get_fd_file(fd) else {
+        return false;
+    };
+    file.as_any()
+        .downcast_ref::<ProcPseudoFile>()
+        .map(|proc_file| proc_file.writable())
+        .unwrap_or(false)
+}
+
+pub(crate) fn write_proc_pseudo_fd(fd: usize, data: &[u8], offset: Option<usize>) -> Option<isize> {
+    let file = get_fd_file(fd)?;
+    let effective_offset = if let Some(offset) = offset {
+        offset
+    } else {
+        file.as_any().downcast_ref::<ProcPseudoFile>()?.offset()
+    };
+    try_write_proc_pseudo_file(&file, data, effective_offset, offset.is_none())
+}
+
 fn file_is_seekable_for_preadwrite(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> bool {
     if file.as_any().downcast_ref::<OSInode>().is_some() {
         return true;
     }
     if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
+        return true;
+    }
+    if file.as_any().downcast_ref::<ProcPseudoFile>().is_some() {
         return true;
     }
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
@@ -1834,13 +1884,10 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         if !base.is_dir() {
             return Err(ENOTDIR);
         }
-        let rel = normalize_relative_path(path);
-        if !rel.is_empty() && crate::fs::is_proc_root(base.as_ref()) {
-            let abs = alloc::format!("/proc/{}", rel);
-            if crate::fs::is_proc_pseudo_path(&abs) {
-                return Ok(AtPath::PseudoAbs(abs));
-            }
+        if let Some(abs) = pseudo_abs_for_ext4_dirfd(&base, path) {
+            return Ok(AtPath::PseudoAbs(abs));
         }
+        let rel = normalize_relative_path(path);
         return Ok(AtPath::Ext4Rel { base, rel });
     }
 
@@ -1954,6 +2001,44 @@ fn maybe_dispatch_proc_fd_at(
     }
     let fd = parse_proc_fd_for_current_process(abs)?;
     Some(op(fd))
+}
+
+fn proc_path_for_at<'a>(raw_abs: Option<&'a str>, at: &'a AtPath) -> Option<&'a str> {
+    if let Some(abs) = raw_abs {
+        if crate::fs::is_proc_pseudo_path(abs) {
+            return Some(abs);
+        }
+    }
+    match at {
+        AtPath::PseudoAbs(abs) if crate::fs::is_proc_pseudo_path(abs) => Some(abs.as_str()),
+        _ => None,
+    }
+}
+
+fn reopen_proc_link_file(
+    src_file: alloc::sync::Arc<dyn File + Send + Sync>,
+    flags: usize,
+    readable: bool,
+    writable: bool,
+    o_path: bool,
+) -> Result<usize, isize> {
+    let file: alloc::sync::Arc<dyn File + Send + Sync> =
+        if let Some(shm) = src_file.as_any().downcast_ref::<PseudoShmFile>() {
+            alloc::sync::Arc::new(shm.reopen_with_mode(readable, writable))
+        } else {
+            src_file
+        };
+    let fd = install_open_file_fd(file, flags, o_path)?;
+    if !o_path && (flags & O_TRUNC) != 0 {
+        let tr = syscall_ftruncate(fd, 0);
+        if tr != 0 {
+            let process = current_files_process();
+            let mut inner = process.borrow_mut();
+            let _ = inner.clear_fd(fd);
+            return Err(tr);
+        }
+    }
+    Ok(fd)
 }
 
 fn pseudo_path_exists_result(abs: &str) -> isize {
@@ -4005,6 +4090,151 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     ret
 }
 
+fn open_existing_ext4_inode(
+    path: &str,
+    raw_abs: Option<&str>,
+    inode: alloc::sync::Arc<ext4_fs::Inode>,
+    flags: usize,
+    readable: bool,
+    writable: bool,
+    append: bool,
+    o_path: bool,
+) -> Result<usize, isize> {
+    let readonly_fs = raw_abs.map(path_is_rofs).unwrap_or(false);
+    let ext4_guard = ext4_lock();
+
+    if let Some(abs) = raw_abs {
+        note_inode_path_hint(&inode, abs);
+        let mode = inode.mode() & S_IFMT;
+        if path_is_nodev(abs) && matches!(mode, S_IFCHR | S_IFBLK) {
+            return Err(EACCES);
+        }
+    }
+
+    if !o_path && inode.is_dir() && ((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) != 0) {
+        return Err(EISDIR);
+    }
+
+    if (flags & O_NOATIME) != 0 {
+        let (euid, _egid) = current_effective_uid_gid();
+        if euid != 0 && euid != inode.uid() {
+            return Err(EPERM);
+        }
+    }
+
+    let mut mask = 0usize;
+    if readable {
+        mask |= 4;
+    }
+    if writable {
+        mask |= 2;
+    }
+    if !inode_mode_allows(&inode, mask) {
+        return Err(EACCES);
+    }
+
+    if (flags & O_DIRECTORY) != 0 && !inode.is_dir() {
+        return Err(ENOTDIR);
+    }
+
+    let text_write_intent = writable || (flags & O_TRUNC) != 0;
+    let exec_inode_guard = if !o_path && inode.is_file() && text_write_intent {
+        let guard = lock_executing_inodes();
+        let exec_busy =
+            is_inode_currently_executed_locked(&guard, inode.device_id(), inode.inode_num());
+        if exec_busy {
+            return Err(ETXTBSY);
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
+    if !o_path && inode.is_file() {
+        maybe_signal_lease_break(
+            file_lock_key_from_inode(&inode),
+            writable,
+            false,
+            current_process().getpid(),
+        );
+    }
+
+    if !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file() {
+        if let Err(e) = inode.clear() {
+            return Err(ext4_err_to_errno(e));
+        }
+        touch_inode_mtime_ctime_now(&inode);
+    }
+
+    if !o_path && inode.is_fifo() {
+        let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
+        let accmode = flags & O_ACCMODE;
+        if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
+            drop(ext4_guard);
+            return Err(ENXIO);
+        }
+        let Some(file) = state.open_file(accmode) else {
+            drop(ext4_guard);
+            return Err(EINVAL);
+        };
+        drop(ext4_guard);
+        return install_open_file_fd(file, flags, o_path);
+    }
+
+    let inode_num = inode.inode_num();
+    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs_tmp_cleanup(
+        readable,
+        writable,
+        append,
+        inode,
+        readonly_fs,
+        false,
+        None,
+    ));
+    drop(exec_inode_guard);
+    crate::fs::debug_track_iozone_inode(path, inode_num);
+    drop(ext4_guard);
+    install_open_file_fd(os_inode, flags, o_path)
+}
+
+fn open_existing_target_path(
+    abs: &str,
+    flags: usize,
+    readable: bool,
+    writable: bool,
+    append: bool,
+    o_path: bool,
+) -> Result<usize, isize> {
+    let write_intent =
+        writable || (flags & (O_CREAT | O_TRUNC)) != 0 || (flags & O_TMPFILE) == O_TMPFILE;
+    if write_intent && path_is_rofs(abs) {
+        return Err(EROFS);
+    }
+
+    let at = resolve_at_path(AT_FDCWD, abs)?;
+    if let AtPath::PseudoAbs(_) = &at {
+        let Some(file) = open_pseudo(abs) else {
+            return Err(ENOENT);
+        };
+        return install_open_file_fd(file, flags, o_path);
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+    drop(_ext4_guard);
+    open_existing_ext4_inode(
+        abs,
+        Some(abs),
+        inode,
+        flags,
+        readable,
+        writable,
+        append,
+        o_path,
+    )
+}
+
 pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -4059,32 +4289,18 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     if write_intent && readonly_fs {
         return EROFS;
     }
-    // `/proc/self/fd/<n>` reopen path: used by memfd and shell helpers.
-    if let Some(abs) = raw_abs.as_deref() {
-        if let Some(src_fd) = parse_proc_fd_for_current_process(&abs) {
-            let Some(src_file) = get_fd_file(src_fd) else {
-                return ENOENT;
-            };
-            let file: alloc::sync::Arc<dyn File + Send + Sync> =
-                if let Some(shm) = src_file.as_any().downcast_ref::<PseudoShmFile>() {
-                    alloc::sync::Arc::new(shm.reopen_with_mode(readable, writable))
-                } else {
-                    src_file
+    if !nofollow {
+        if let Some(proc_path) = raw_abs
+            .as_deref()
+            .filter(|abs| crate::fs::is_proc_pseudo_path(abs))
+        {
+            if let Some(src_file) = crate::fs::proc_fd_link_file(proc_path) {
+                let fd = match reopen_proc_link_file(src_file, flags, readable, writable, o_path) {
+                    Ok(fd) => fd,
+                    Err(e) => return e,
                 };
-            let fd = match install_open_file_fd(file, flags, o_path) {
-                Ok(fd) => fd,
-                Err(e) => return e,
-            };
-            if !o_path && (flags & O_TRUNC) != 0 {
-                let tr = syscall_ftruncate(fd, 0);
-                if tr != 0 {
-                    let process = current_files_process();
-                    let mut inner = process.borrow_mut();
-                    let _ = inner.clear_fd(fd);
-                    return tr;
-                }
+                return fd as isize;
             }
-            return fd as isize;
         }
     }
     let append = !o_path && (flags & O_APPEND) != 0;
@@ -4118,6 +4334,33 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     if let AtPath::PseudoAbs(abs) = &at {
         if tmpfile_requested {
             return EOPNOTSUPP;
+        }
+        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
+            if crate::fs::proc_magic_link_exists(proc_path) {
+                if nofollow {
+                    return ELOOP;
+                }
+                if let Some(target) = crate::fs::proc_readlink(proc_path) {
+                    if target.starts_with('/') {
+                        let fd = match open_existing_target_path(
+                            &target, flags, readable, writable, append, o_path,
+                        ) {
+                            Ok(fd) => fd,
+                            Err(e) => return e,
+                        };
+                        return fd as isize;
+                    }
+                }
+                let file = match open_pseudo(proc_path) {
+                    Some(f) => f,
+                    None => return ENOENT,
+                };
+                let fd = match install_open_file_fd(file, flags, o_path) {
+                    Ok(fd) => fd,
+                    Err(e) => return e,
+                };
+                return fd as isize;
+            }
         }
         // Minimal `/dev/shm` support for POSIX `shm_open` users (e.g., cyclictest).
         // Must handle `O_CREAT|O_EXCL` even when the object already exists.
@@ -4487,156 +4730,6 @@ fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     }
     if let Some(node) = crate::fs::open_proc_pseudo(path) {
         return Some(node);
-    }
-    if (path.starts_with("/proc/sys/kernel/")
-        || path.starts_with("/proc/sys/fs/")
-        || path.starts_with("/proc/sys/net/")
-        || path.starts_with("/proc/sys/vm/"))
-    {
-        if let Some(inode) = find_path_in_roots(path) {
-            return Some(alloc::sync::Arc::new(OSInode::new_replace_on_write(
-                true, true, inode,
-            )));
-        }
-    }
-    if path == "/proc/sys" || path == "/proc/sys/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("kernel"),
-                ino: 2,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("fs"),
-                ino: 3,
-                dtype: 4
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/proc/sys", entries)));
-    }
-    if path == "/proc/sys/kernel" || path == "/proc/sys/kernel/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("random"),
-                ino: 2,
-                dtype: 4
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/proc/sys/kernel",
-            entries,
-        )));
-    }
-    if path == "/proc/sys/kernel/random" || path == "/proc/sys/kernel/random/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("entropy_avail"),
-                ino: 2,
-                dtype: 8
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/proc/sys/kernel/random",
-            entries,
-        )));
-    }
-    if path == "/proc/sys/kernel/random/entropy_avail" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("256\n")));
-    }
-    if path == "/proc/sys/fs" || path == "/proc/sys/fs/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("inotify"),
-                ino: 2,
-                dtype: 4
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/proc/sys/fs",
-            entries,
-        )));
-    }
-    if path == "/proc/sys/fs/inotify" || path == "/proc/sys/fs/inotify/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("max_queued_events"),
-                ino: 2,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("max_user_instances"),
-                ino: 3,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("max_user_watches"),
-                ino: 4,
-                dtype: 8
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/proc/sys/fs/inotify",
-            entries,
-        )));
-    }
-    if path == "/proc/sys/fs/inotify/max_queued_events" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static_rw("16384\n")));
-    }
-    if path == "/proc/sys/fs/inotify/max_user_instances" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static_rw("128\n")));
-    }
-    if path == "/proc/sys/fs/inotify/max_user_watches" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static_rw("8192\n")));
     }
     if path == "/sys" || path == "/sys/" {
         let entries = alloc::vec![
@@ -5614,12 +5707,23 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
         return len as isize;
     }
 
+    let raw_abs = resolve_abs_path(dirfd, &path);
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
+            if let Some(target) = crate::fs::proc_readlink(proc_path) {
+                let bytes = target.as_bytes();
+                let len = min(bytes.len(), bufsiz);
+                if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
+                    return EFAULT;
+                }
+                return len as isize;
+            }
+        }
         if let Some(target) = crate::fs::proc_readlink(abs) {
             let bytes = target.as_bytes();
             let len = min(bytes.len(), bufsiz);
@@ -6368,6 +6472,31 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             Err(e) => e,
         };
     }
+    if file.as_any().downcast_ref::<ProcPseudoFile>().is_some() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return EFAULT;
+        };
+        let mut data = Vec::with_capacity(len);
+        for slice in user_bufs {
+            data.extend_from_slice(slice);
+        }
+        if let Some(ret) = try_write_proc_pseudo_file(
+            &file,
+            &data,
+            file.as_any()
+                .downcast_ref::<ProcPseudoFile>()
+                .map(ProcPseudoFile::offset)
+                .unwrap_or(0),
+            true,
+        ) {
+            return ret;
+        }
+    }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, os_inode.offset()) {
             return e;
@@ -6662,6 +6791,24 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
         return n;
     }
 
+    if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
+        let old = proc_file.offset();
+        proc_file.set_offset(pos as usize);
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            proc_file.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
+        let n = file.read(buf) as isize;
+        proc_file.set_offset(old);
+        return n;
+    }
+
     // Seekable pseudo files: emulate by temporarily adjusting the per-fd offset.
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         if pf.len().is_none() {
@@ -6754,7 +6901,6 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
                 hit_fsize_limit = true;
             }
         }
-
         let mut total = 0usize;
         let token = get_current_token();
         let mut off = effective_pos;
@@ -6790,6 +6936,24 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             cgroup_charge_file_write(current_process().getpid(), total);
         }
         return total as isize;
+    }
+
+    if file.as_any().downcast_ref::<ProcPseudoFile>().is_some() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return EFAULT;
+        };
+        let mut data = Vec::with_capacity(len);
+        for slice in user_bufs {
+            data.extend_from_slice(slice);
+        }
+        if let Some(ret) = try_write_proc_pseudo_file(&file, &data, pos as usize, false) {
+            return ret;
+        }
     }
 
     if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
@@ -8966,6 +9130,278 @@ fn statx_timestamp(sec: i64, nsec: i64) -> StatxTimestamp {
     }
 }
 
+fn proc_symlink_kstat(link_len: usize) -> KStat {
+    let st_size = link_len as i64;
+    let st_blocks = if st_size <= 0 {
+        0
+    } else {
+        ((st_size as u64 + 511) / 512) as u64
+    };
+    KStat {
+        st_dev: 0,
+        st_ino: 1,
+        st_mode: 0o120777,
+        st_nlink: 1,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        __pad: 0,
+        st_size,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks,
+        st_atime_sec: 0,
+        st_atime_nsec: 0,
+        st_mtime_sec: 0,
+        st_mtime_nsec: 0,
+        st_ctime_sec: 0,
+        st_ctime_nsec: 0,
+        __unused: [0, 0],
+    }
+}
+
+fn kstat_from_file(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> Result<KStat, isize> {
+    if file.as_any().downcast_ref::<PseudoDir>().is_some()
+        || file.as_any().downcast_ref::<PseudoFile>().is_some()
+        || file.as_any().downcast_ref::<ProcPseudoFile>().is_some()
+        || file.as_any().downcast_ref::<CgroupFile>().is_some()
+        || file.as_any().downcast_ref::<PseudoBlock>().is_some()
+        || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
+        || file.as_any().downcast_ref::<RtcFile>().is_some()
+        || file.as_any().downcast_ref::<TtyFile>().is_some()
+        || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
+        || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
+        || file.as_any().downcast_ref::<Pipe>().is_some()
+        || file.as_any().downcast_ref::<NamespaceFile>().is_some()
+    {
+        let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
+            0o040555
+        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.mode()
+        } else if file.as_any().downcast_ref::<Pipe>().is_some() {
+            0o010600
+        } else if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
+            0o060600
+        } else if file.as_any().downcast_ref::<PseudoShmFile>().is_some()
+            || file.as_any().downcast_ref::<RtcFile>().is_some()
+        {
+            0o100666
+        } else if file.as_any().downcast_ref::<TtyFile>().is_some()
+            || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
+            || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
+        {
+            0o020666
+        } else if file.as_any().downcast_ref::<NamespaceFile>().is_some() {
+            0o100444
+        } else if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
+            if proc_file.writable() {
+                0o100644
+            } else {
+                0o100444
+            }
+        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+            match pf.kind_tag() {
+                crate::fs::PseudoKindTag::Null => 0o020666,
+                crate::fs::PseudoKindTag::Zero | crate::fs::PseudoKindTag::Urandom => 0o020444,
+                crate::fs::PseudoKindTag::Static => 0o100444,
+            }
+        } else {
+            0o100444
+        };
+        let st_rdev: u64 = if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
+            EXT4_ST_DEV
+        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+            match pf.kind_tag() {
+                crate::fs::PseudoKindTag::Null => 0x103,
+                crate::fs::PseudoKindTag::Zero => 0x105,
+                crate::fs::PseudoKindTag::Urandom => 0x109,
+                crate::fs::PseudoKindTag::Static => 0,
+            }
+        } else if file.as_any().downcast_ref::<TtyFile>().is_some() {
+            0x500
+        } else if file.as_any().downcast_ref::<PtyMasterFile>().is_some() {
+            0x501
+        } else if file.as_any().downcast_ref::<PtySlaveFile>().is_some() {
+            0x502
+        } else {
+            0
+        };
+        let st_size: i64 = if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+            shm.len() as i64
+        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+            cgroup.len() as i64
+        } else if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
+            proc_file.len().unwrap_or(0) as i64
+        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+            pf.len().unwrap_or(0) as i64
+        } else {
+            0
+        };
+        let st_blocks: u64 = if st_size <= 0 {
+            0
+        } else {
+            ((st_size as u64 + 511) / 512) as u64
+        };
+        let st_ino = if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+            pipe as *const Pipe as u64
+        } else if let Some(ns) = file.as_any().downcast_ref::<NamespaceFile>() {
+            ns.ns_id() as u64
+        } else {
+            1
+        };
+        return Ok(KStat {
+            st_dev: 0,
+            st_ino,
+            st_mode: mode,
+            st_nlink: 1,
+            st_uid: 0,
+            st_gid: 0,
+            st_rdev,
+            __pad: 0,
+            st_size,
+            st_blksize: 4096,
+            __pad2: 0,
+            st_blocks,
+            st_atime_sec: 0,
+            st_atime_nsec: 0,
+            st_mtime_sec: 0,
+            st_mtime_nsec: 0,
+            st_ctime_sec: 0,
+            st_ctime_nsec: 0,
+            __unused: [0, 0],
+        });
+    }
+
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        let perm = match (file.readable(), file.writable()) {
+            (true, true) => 0o666,
+            (true, false) => 0o444,
+            (false, true) => 0o222,
+            (false, false) => 0o000,
+        };
+        return Ok(KStat {
+            st_dev: 0,
+            st_ino: file.as_any() as *const dyn core::any::Any as *const () as u64,
+            st_mode: 0o010000 | perm,
+            st_nlink: 1,
+            st_uid: 0,
+            st_gid: 0,
+            st_rdev: 0,
+            __pad: 0,
+            st_size: 0,
+            st_blksize: 4096,
+            __pad2: 0,
+            st_blocks: 0,
+            st_atime_sec: 0,
+            st_atime_nsec: 0,
+            st_mtime_sec: 0,
+            st_mtime_nsec: 0,
+            st_ctime_sec: 0,
+            st_ctime_nsec: 0,
+            __unused: [0, 0],
+        });
+    };
+    let inode = os_inode.ext4_inode();
+
+    let _ext4_guard = ext4_lock();
+    let mode_raw = inode.mode();
+    let mode = mode_raw as u32;
+    let uid = inode.uid();
+    let gid = inode.gid();
+    let nlink = inode.link_count();
+    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
+    let disk_size = inode.size() as usize;
+    let size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
+    let blocks = (((size as u64) + 511) / 512) as u64;
+    let times = get_inode_times(inode.inode_num() as u64);
+
+    Ok(KStat {
+        st_dev: EXT4_ST_DEV,
+        st_ino: inode.inode_num() as u64,
+        st_mode: mode,
+        st_nlink: nlink,
+        st_uid: uid,
+        st_gid: gid,
+        st_rdev,
+        __pad: 0,
+        st_size: size,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: blocks,
+        st_atime_sec: times.atime_sec,
+        st_atime_nsec: times.atime_nsec,
+        st_mtime_sec: times.mtime_sec,
+        st_mtime_nsec: times.mtime_nsec,
+        st_ctime_sec: times.ctime_sec,
+        st_ctime_nsec: times.ctime_nsec,
+        __unused: [0, 0],
+    })
+}
+
+fn kstat_from_abs_path(abs: &str) -> Result<KStat, isize> {
+    let at = resolve_at_path(AT_FDCWD, abs)?;
+    if let AtPath::PseudoAbs(_) = &at {
+        let Some(file) = open_pseudo(abs) else {
+            return Err(ENOENT);
+        };
+        return kstat_from_file(&file);
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+    let mode_raw = inode.mode();
+    let mode = mode_raw as u32;
+    let uid = inode.uid();
+    let gid = inode.gid();
+    let nlink = inode.link_count();
+    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
+    let size = inode_visible_size(&inode) as i64;
+    let blocks = (((size as u64) + 511) / 512) as u64;
+    let times = get_inode_times(inode.inode_num() as u64);
+
+    Ok(KStat {
+        st_dev: EXT4_ST_DEV,
+        st_ino: inode.inode_num() as u64,
+        st_mode: mode,
+        st_nlink: nlink,
+        st_uid: uid,
+        st_gid: gid,
+        st_rdev,
+        __pad: 0,
+        st_size: size,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: blocks,
+        st_atime_sec: times.atime_sec,
+        st_atime_nsec: times.atime_nsec,
+        st_mtime_sec: times.mtime_sec,
+        st_mtime_nsec: times.mtime_nsec,
+        st_ctime_sec: times.ctime_sec,
+        st_ctime_nsec: times.ctime_nsec,
+        __unused: [0, 0],
+    })
+}
+
+fn proc_magic_link_target_kstat(path: &str) -> Result<Option<KStat>, isize> {
+    if !crate::fs::proc_magic_link_exists(path) {
+        return Ok(None);
+    }
+    if let Some(file) = crate::fs::proc_fd_link_file(path) {
+        return kstat_from_file(&file).map(Some);
+    }
+    if let Some(file) = open_pseudo(path) {
+        return kstat_from_file(&file).map(Some);
+    }
+    let Some(target) = crate::fs::proc_readlink(path) else {
+        return Err(ENOENT);
+    };
+    if !target.starts_with('/') {
+        return Err(ENOENT);
+    }
+    kstat_from_abs_path(&target).map(Some)
+}
+
 fn statx_from_kstat(st: &KStat) -> Statx {
     let stx_rdev_major = linux_dev_major(st.st_rdev);
     let stx_rdev_minor = linux_dev_minor(st.st_rdev);
@@ -9025,145 +9461,11 @@ fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
     let Some(file) = get_fd_file(fd) else {
         return Err(EBADF);
     };
-
-    // Pseudo nodes.
-    if file.as_any().downcast_ref::<PseudoDir>().is_some()
-        || file.as_any().downcast_ref::<PseudoFile>().is_some()
-        || file.as_any().downcast_ref::<CgroupFile>().is_some()
-        || file.as_any().downcast_ref::<PseudoBlock>().is_some()
-        || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
-        || file.as_any().downcast_ref::<RtcFile>().is_some()
-        || file.as_any().downcast_ref::<TtyFile>().is_some()
-        || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
-        || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
-        || file.as_any().downcast_ref::<Pipe>().is_some()
-    {
-        let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
-            0o040555
-        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
-            cgroup.mode()
-        } else if file.as_any().downcast_ref::<Pipe>().is_some() {
-            0o010600
-        } else if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
-            0o060600
-        } else if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
-            0o100666
-        } else if file.as_any().downcast_ref::<RtcFile>().is_some() {
-            0o100666
-        } else if file.as_any().downcast_ref::<TtyFile>().is_some()
-            || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
-            || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
-        {
-            0o020666
-        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
-            match pf.kind_tag() {
-                crate::fs::PseudoKindTag::Null => 0o020666,
-                crate::fs::PseudoKindTag::Zero | crate::fs::PseudoKindTag::Urandom => 0o020444,
-                crate::fs::PseudoKindTag::Static => 0o100444,
-            }
-        } else {
-            0o100444
-        };
-        let st_rdev: u64 = if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
-            EXT4_ST_DEV
-        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
-            match pf.kind_tag() {
-                crate::fs::PseudoKindTag::Null => 0x103,
-                crate::fs::PseudoKindTag::Zero => 0x105,
-                crate::fs::PseudoKindTag::Urandom => 0x109,
-                crate::fs::PseudoKindTag::Static => 0,
-            }
-        } else if file.as_any().downcast_ref::<TtyFile>().is_some() {
-            0x500
-        } else if file.as_any().downcast_ref::<PtyMasterFile>().is_some() {
-            0x501
-        } else if file.as_any().downcast_ref::<PtySlaveFile>().is_some() {
-            0x502
-        } else {
-            0
-        };
-        let st_size: i64 = if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-            shm.len() as i64
-        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
-            cgroup.len() as i64
-        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
-            pf.len().unwrap_or(0) as i64
-        } else {
-            0
-        };
-        let st_blocks: u64 = if st_size <= 0 {
-            0
-        } else {
-            ((st_size as u64 + 511) / 512) as u64
-        };
-        return Ok(KStat {
-            st_dev: 0,
-            st_ino: 1,
-            st_mode: mode,
-            st_nlink: 1,
-            st_uid: 0,
-            st_gid: 0,
-            st_rdev,
-            __pad: 0,
-            st_size,
-            st_blksize: 4096,
-            __pad2: 0,
-            st_blocks,
-            st_atime_sec: 0,
-            st_atime_nsec: 0,
-            st_mtime_sec: 0,
-            st_mtime_nsec: 0,
-            st_ctime_sec: 0,
-            st_ctime_nsec: 0,
-            __unused: [0, 0],
-        });
-    }
-
-    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return Err(EBADF);
-    };
-    let inode = os_inode.ext4_inode();
-
-    let _ext4_guard = ext4_lock();
-    let mode_raw = inode.mode();
-    let mode = mode_raw as u32;
-    let uid = inode.uid();
-    let gid = inode.gid();
-    let nlink = inode.link_count();
-    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
-    let disk_size = inode.size() as usize;
-    let mut size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
-    if let Some(kind) = crate::fs::proc_file_kind(inode.inode_num()) {
-        size = crate::fs::proc_file_len(&kind) as i64;
-    }
-    let blocks = (((size as u64) + 511) / 512) as u64;
-    let times = get_inode_times(inode.inode_num() as u64);
-
-    Ok(KStat {
-        st_dev: EXT4_ST_DEV,
-        st_ino: inode.inode_num() as u64,
-        st_mode: mode,
-        st_nlink: nlink,
-        st_uid: uid,
-        st_gid: gid,
-        st_rdev,
-        __pad: 0,
-        st_size: size,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: blocks,
-        st_atime_sec: times.atime_sec,
-        st_atime_nsec: times.atime_nsec,
-        st_mtime_sec: times.mtime_sec,
-        st_mtime_nsec: times.mtime_nsec,
-        st_ctime_sec: times.ctime_sec,
-        st_ctime_nsec: times.ctime_nsec,
-        __unused: [0, 0],
-    })
+    kstat_from_file(&file)
 }
 
 pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
-    let Some(file) = get_fd_file(fd) else {
+    if get_fd_file(fd).is_none() {
         if crate::debug_config::DEBUG_FS {
             let pid = current_process().getpid();
             crate::println!("[fs] fstat(pid={}) fd={} -> EBADF(nofile)", pid, fd);
@@ -9173,202 +9475,9 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     if st_ptr == 0 {
         return EFAULT;
     }
-
-    // Pseudo nodes: return minimal metadata so libc/busybox can `opendir()` them.
-    if file.as_any().downcast_ref::<PseudoDir>().is_some()
-        || file.as_any().downcast_ref::<PseudoFile>().is_some()
-        || file.as_any().downcast_ref::<CgroupFile>().is_some()
-        || file.as_any().downcast_ref::<PseudoBlock>().is_some()
-        || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
-        || file.as_any().downcast_ref::<RtcFile>().is_some()
-        || file.as_any().downcast_ref::<TtyFile>().is_some()
-        || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
-        || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
-        || file.as_any().downcast_ref::<Pipe>().is_some()
-    {
-        let mode: u32 = if file.as_any().downcast_ref::<PseudoDir>().is_some() {
-            0o040555
-        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
-            cgroup.mode()
-        } else if file.as_any().downcast_ref::<Pipe>().is_some() {
-            0o010600
-        } else if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
-            0o060600
-        } else if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
-            0o100666
-        } else if file.as_any().downcast_ref::<RtcFile>().is_some() {
-            0o100666
-        } else if file.as_any().downcast_ref::<TtyFile>().is_some()
-            || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
-            || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
-        {
-            0o020666
-        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
-            match pf.kind_tag() {
-                // /dev/null, /dev/zero, /dev/{u}random should look like character devices
-                // to satisfy glibc helpers such as `daemon()`.
-                crate::fs::PseudoKindTag::Null => 0o020666,
-                crate::fs::PseudoKindTag::Zero | crate::fs::PseudoKindTag::Urandom => 0o020444,
-                crate::fs::PseudoKindTag::Static => 0o100444,
-            }
-        } else {
-            0o100444
-        };
-        let st_rdev: u64 = if file.as_any().downcast_ref::<PseudoBlock>().is_some() {
-            EXT4_ST_DEV
-        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
-            match pf.kind_tag() {
-                crate::fs::PseudoKindTag::Null => 0x103,
-                crate::fs::PseudoKindTag::Zero => 0x105,
-                crate::fs::PseudoKindTag::Urandom => 0x109,
-                crate::fs::PseudoKindTag::Static => 0,
-            }
-        } else if file.as_any().downcast_ref::<TtyFile>().is_some() {
-            0x500
-        } else if file.as_any().downcast_ref::<PtyMasterFile>().is_some() {
-            0x501
-        } else if file.as_any().downcast_ref::<PtySlaveFile>().is_some() {
-            0x502
-        } else {
-            0
-        };
-        let st_size: i64 = if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-            shm.len() as i64
-        } else if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
-            cgroup.len() as i64
-        } else if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
-            match pf.kind_tag() {
-                crate::fs::PseudoKindTag::Static => pf.len().unwrap_or(0) as i64,
-                _ => 0,
-            }
-        } else {
-            0
-        };
-        let st_blocks: u64 = if st_size <= 0 {
-            0
-        } else {
-            ((st_size as u64 + 511) / 512) as u64
-        };
-        let st_ino = file
-            .as_any()
-            .downcast_ref::<Pipe>()
-            .map(|pipe| pipe as *const Pipe as u64)
-            .unwrap_or(1);
-        let st = KStat {
-            st_dev: 0,
-            st_ino,
-            st_mode: mode,
-            st_nlink: 1,
-            st_uid: 0,
-            st_gid: 0,
-            st_rdev,
-            __pad: 0,
-            st_size,
-            st_blksize: 4096,
-            __pad2: 0,
-            st_blocks,
-            st_atime_sec: 0,
-            st_atime_nsec: 0,
-            st_mtime_sec: 0,
-            st_mtime_nsec: 0,
-            st_ctime_sec: 0,
-            st_ctime_nsec: 0,
-            __unused: [0, 0],
-        };
-        let token = get_current_token();
-        if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-            return EFAULT;
-        }
-        if crate::debug_config::DEBUG_FS {
-            let pid = current_process().getpid();
-            if fd <= 8 {
-                crate::println!("[fs] fstat(pid={}) fd={} pseudo -> ok", pid, fd);
-            }
-        }
-        return 0;
-    }
-
-    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        // Fallback for non-inode descriptors (pipe/socketpair/stdin/stdout...).
-        let perm = match (file.readable(), file.writable()) {
-            (true, true) => 0o666,
-            (true, false) => 0o444,
-            (false, true) => 0o222,
-            (false, false) => 0o000,
-        };
-        let st = KStat {
-            st_dev: 0,
-            st_ino: (file.as_any() as *const dyn core::any::Any as *const () as u64),
-            st_mode: 0o010000 | perm,
-            st_nlink: 1,
-            st_uid: 0,
-            st_gid: 0,
-            st_rdev: 0,
-            __pad: 0,
-            st_size: 0,
-            st_blksize: 4096,
-            __pad2: 0,
-            st_blocks: 0,
-            st_atime_sec: 0,
-            st_atime_nsec: 0,
-            st_mtime_sec: 0,
-            st_mtime_nsec: 0,
-            st_ctime_sec: 0,
-            st_ctime_nsec: 0,
-            __unused: [0, 0],
-        };
-        let token = get_current_token();
-        if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-            return EFAULT;
-        }
-        if crate::debug_config::DEBUG_FS {
-            let pid = current_process().getpid();
-            crate::println!(
-                "[fs] fstat(pid={}) fd={} -> fallback mode={:#o}",
-                pid,
-                fd,
-                st.st_mode
-            );
-        }
-        return 0;
-    };
-    let inode = os_inode.ext4_inode();
-
-    let _ext4_guard = ext4_lock();
-    let mode_raw = inode.mode();
-    let mode = mode_raw as u32;
-    let uid = inode.uid();
-    let gid = inode.gid();
-    let nlink = inode.link_count();
-    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
-    let disk_size = inode.size() as usize;
-    let mut size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
-    if let Some(kind) = crate::fs::proc_file_kind(inode.inode_num()) {
-        size = crate::fs::proc_file_len(&kind) as i64;
-    }
-    let blocks = (((size as u64) + 511) / 512) as u64;
-    let times = get_inode_times(inode.inode_num() as u64);
-
-    let st = KStat {
-        st_dev: EXT4_ST_DEV,
-        st_ino: inode.inode_num() as u64,
-        st_mode: mode,
-        st_nlink: nlink,
-        st_uid: uid,
-        st_gid: gid,
-        st_rdev,
-        __pad: 0,
-        st_size: size,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: blocks,
-        st_atime_sec: times.atime_sec,
-        st_atime_nsec: times.atime_nsec,
-        st_mtime_sec: times.mtime_sec,
-        st_mtime_nsec: times.mtime_nsec,
-        st_ctime_sec: times.ctime_sec,
-        st_ctime_nsec: times.ctime_nsec,
-        __unused: [0, 0],
+    let st = match kstat_from_fd(fd) {
+        Ok(st) => st,
+        Err(e) => return e,
     };
 
     let token = get_current_token();
@@ -9378,7 +9487,12 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
         if pid >= 2 && fd <= 8 {
-            crate::println!("[fs] fstat(pid={}) fd={} -> ok mode={:#o}", pid, fd, mode);
+            crate::println!(
+                "[fs] fstat(pid={}) fd={} -> ok mode={:#o}",
+                pid,
+                fd,
+                st.st_mode
+            );
         }
     }
     0
@@ -9489,6 +9603,7 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
     if file.as_any().downcast_ref::<Pipe>().is_some()
         || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
+        || file.as_any().downcast_ref::<ProcPseudoFile>().is_some()
         || file.as_any().downcast_ref::<CgroupFile>().is_some()
         || file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
@@ -9595,6 +9710,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return ENOENT;
     }
 
+    let raw_abs = resolve_abs_path(dirfd, &path);
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
@@ -9602,115 +9718,33 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     // Pseudo nodes: return minimal metadata.
     if let AtPath::PseudoAbs(abs) = &at {
-        if let Some(target) = crate::fs::proc_readlink(abs) {
-            let st_size = target.len() as i64;
-            let st_blocks = if st_size <= 0 {
-                0
-            } else {
-                ((st_size as u64 + 511) / 512) as u64
-            };
-            let st = KStat {
-                st_dev: 0,
-                st_ino: 1,
-                st_mode: 0o120777,
-                st_nlink: 1,
-                st_uid: 0,
-                st_gid: 0,
-                st_rdev: 0,
-                __pad: 0,
-                st_size,
-                st_blksize: 4096,
-                __pad2: 0,
-                st_blocks,
-                st_atime_sec: 0,
-                st_atime_nsec: 0,
-                st_mtime_sec: 0,
-                st_mtime_nsec: 0,
-                st_ctime_sec: 0,
-                st_ctime_nsec: 0,
-                __unused: [0, 0],
-            };
-            if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-                return EFAULT;
+        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
+            if crate::fs::proc_magic_link_exists(proc_path) {
+                let st = if (_flags & AT_SYMLINK_NOFOLLOW) != 0 {
+                    let link_len = crate::fs::proc_readlink(proc_path)
+                        .map(|target| target.len())
+                        .unwrap_or(0);
+                    proc_symlink_kstat(link_len)
+                } else {
+                    match proc_magic_link_target_kstat(proc_path) {
+                        Ok(Some(st)) => st,
+                        Ok(None) => return ENOENT,
+                        Err(e) => return e,
+                    }
+                };
+                if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
+                    return EFAULT;
+                }
+                return 0;
             }
-            return 0;
         }
-        let Some(node) = open_pseudo(abs) else {
+        let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
+        let Some(node) = open_pseudo(pseudo_path) else {
             return ENOENT;
         };
-        let mode: u32 = if node.as_any().downcast_ref::<PseudoDir>().is_some() {
-            0o040555
-        } else if let Some(cgroup) = node.as_any().downcast_ref::<CgroupFile>() {
-            cgroup.mode()
-        } else if abs == "/dev/root" {
-            0o060600
-        } else if node.as_any().downcast_ref::<PseudoShmFile>().is_some() {
-            0o100666
-        } else if abs == "/dev/null"
-            || abs == "/dev/zero"
-            || abs == "/dev/misc/rtc"
-            || abs == "/dev/ptmx"
-            || abs == "/dev/tty"
-            || abs.starts_with("/dev/pts/")
-        {
-            0o020666
-        } else {
-            0o100444
-        };
-        let st_rdev: u64 = if abs == "/dev/root" {
-            EXT4_ST_DEV
-        } else if abs == "/dev/null" {
-            0x103
-        } else if abs == "/dev/zero" {
-            0x105
-        } else if abs == "/dev/misc/rtc" {
-            0x109
-        } else if abs == "/dev/ptmx" {
-            0x501
-        } else if abs == "/dev/tty" {
-            0x500
-        } else if abs.starts_with("/dev/pts/") {
-            0x502
-        } else {
-            0
-        };
-        let st_size: i64 = if let Some(shm) = node.as_any().downcast_ref::<PseudoShmFile>() {
-            shm.len() as i64
-        } else if let Some(cgroup) = node.as_any().downcast_ref::<CgroupFile>() {
-            cgroup.len() as i64
-        } else if let Some(pf) = node.as_any().downcast_ref::<PseudoFile>() {
-            match pf.kind_tag() {
-                crate::fs::PseudoKindTag::Static => pf.len().unwrap_or(0) as i64,
-                _ => 0,
-            }
-        } else {
-            0
-        };
-        let st_blocks: u64 = if st_size <= 0 {
-            0
-        } else {
-            ((st_size as u64 + 511) / 512) as u64
-        };
-        let st = KStat {
-            st_dev: 0,
-            st_ino: 1,
-            st_mode: mode,
-            st_nlink: 1,
-            st_uid: 0,
-            st_gid: 0,
-            st_rdev,
-            __pad: 0,
-            st_size,
-            st_blksize: 4096,
-            __pad2: 0,
-            st_blocks,
-            st_atime_sec: 0,
-            st_atime_nsec: 0,
-            st_mtime_sec: 0,
-            st_mtime_nsec: 0,
-            st_ctime_sec: 0,
-            st_ctime_nsec: 0,
-            __unused: [0, 0],
+        let st = match kstat_from_file(&node) {
+            Ok(st) => st,
+            Err(e) => return e,
         };
         if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
             return EFAULT;
@@ -9751,10 +9785,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     let gid = inode.gid();
     let nlink = inode.link_count();
     let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
-    let mut size = inode_visible_size(&inode) as i64;
-    if let Some(kind) = crate::fs::proc_file_kind(inode.inode_num()) {
-        size = crate::fs::proc_file_len(&kind) as i64;
-    }
+    let size = inode_visible_size(&inode) as i64;
     let blocks = (((size as u64) + 511) / 512) as u64;
     let times = get_inode_times(inode.inode_num() as u64);
 
@@ -9832,6 +9863,7 @@ pub fn syscall_statx(
         return EBADF;
     }
     let effective_dirfd = dirfd;
+    let raw_abs = resolve_abs_path(effective_dirfd, &path);
     let at = match resolve_at_path(effective_dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
@@ -9839,111 +9871,34 @@ pub fn syscall_statx(
 
     // Pseudo nodes: return minimal metadata.
     if let AtPath::PseudoAbs(abs) = &at {
-        if let Some(target) = crate::fs::proc_readlink(abs) {
-            let st_size = target.len() as i64;
-            let st_blocks: u64 = if st_size <= 0 {
-                0
-            } else {
-                ((st_size as u64 + 511) / 512) as u64
-            };
-            let st = KStat {
-                st_dev: 0,
-                st_ino: 1,
-                st_mode: 0o120777,
-                st_nlink: 1,
-                st_uid: 0,
-                st_gid: 0,
-                st_rdev: 0,
-                __pad: 0,
-                st_size,
-                st_blksize: 4096,
-                __pad2: 0,
-                st_blocks,
-                st_atime_sec: 0,
-                st_atime_nsec: 0,
-                st_mtime_sec: 0,
-                st_mtime_nsec: 0,
-                st_ctime_sec: 0,
-                st_ctime_nsec: 0,
-                __unused: [0, 0],
-            };
-            let stx = statx_from_kstat(&st);
-            if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
-                return EFAULT;
+        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
+            if crate::fs::proc_magic_link_exists(proc_path) {
+                let st = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+                    let link_len = crate::fs::proc_readlink(proc_path)
+                        .map(|target| target.len())
+                        .unwrap_or(0);
+                    proc_symlink_kstat(link_len)
+                } else {
+                    match proc_magic_link_target_kstat(proc_path) {
+                        Ok(Some(st)) => st,
+                        Ok(None) => return ENOENT,
+                        Err(e) => return e,
+                    }
+                };
+                let stx = statx_from_kstat(&st);
+                if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
+                    return EFAULT;
+                }
+                return 0;
             }
-            return 0;
         }
-        let Some(node) = open_pseudo(abs) else {
+        let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
+        let Some(node) = open_pseudo(pseudo_path) else {
             return ENOENT;
         };
-        let mode: u32 = if node.as_any().downcast_ref::<PseudoDir>().is_some() {
-            0o040555
-        } else if let Some(cgroup) = node.as_any().downcast_ref::<CgroupFile>() {
-            cgroup.mode()
-        } else if abs == "/dev/root" {
-            0o060600
-        } else if node.as_any().downcast_ref::<PseudoShmFile>().is_some() {
-            0o100666
-        } else if abs == "/dev/null"
-            || abs == "/dev/zero"
-            || abs == "/dev/misc/rtc"
-            || abs == "/dev/ptmx"
-            || abs == "/dev/tty"
-            || abs.starts_with("/dev/pts/")
-        {
-            0o020666
-        } else {
-            0o100444
-        };
-        let st_rdev: u64 = if abs == "/dev/root" {
-            EXT4_ST_DEV
-        } else if abs == "/dev/null" {
-            0x103
-        } else if abs == "/dev/zero" {
-            0x105
-        } else if abs == "/dev/misc/rtc" {
-            0x109
-        } else if abs == "/dev/ptmx" {
-            0x501
-        } else if abs == "/dev/tty" {
-            0x500
-        } else if abs.starts_with("/dev/pts/") {
-            0x502
-        } else {
-            0
-        };
-        let st_size: i64 = if let Some(shm) = node.as_any().downcast_ref::<PseudoShmFile>() {
-            shm.len() as i64
-        } else if let Some(cgroup) = node.as_any().downcast_ref::<CgroupFile>() {
-            cgroup.len() as i64
-        } else {
-            0
-        };
-        let st_blocks: u64 = if st_size <= 0 {
-            0
-        } else {
-            ((st_size as u64 + 511) / 512) as u64
-        };
-        let st = KStat {
-            st_dev: 0,
-            st_ino: 1,
-            st_mode: mode,
-            st_nlink: 1,
-            st_uid: 0,
-            st_gid: 0,
-            st_rdev,
-            __pad: 0,
-            st_size,
-            st_blksize: 4096,
-            __pad2: 0,
-            st_blocks,
-            st_atime_sec: 0,
-            st_atime_nsec: 0,
-            st_mtime_sec: 0,
-            st_mtime_nsec: 0,
-            st_ctime_sec: 0,
-            st_ctime_nsec: 0,
-            __unused: [0, 0],
+        let st = match kstat_from_file(&node) {
+            Ok(st) => st,
+            Err(e) => return e,
         };
         let stx = statx_from_kstat(&st);
         if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
@@ -9989,10 +9944,7 @@ pub fn syscall_statx(
     let gid = inode.gid();
     let nlink = inode.link_count();
     let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
-    let mut size = inode_visible_size(&inode) as i64;
-    if let Some(kind) = crate::fs::proc_file_kind(inode.inode_num()) {
-        size = crate::fs::proc_file_len(&kind) as i64;
-    }
+    let size = inode_visible_size(&inode) as i64;
     let blocks = (((size as u64) + 511) / 512) as u64;
     let times = get_inode_times(inode.inode_num() as u64);
 
@@ -10088,54 +10040,54 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         return ENOTDIR;
     };
     let inode = os_inode.ext4_inode();
-    if crate::fs::is_proc_root(inode.as_ref()) {
-        let pids = crate::fs::collect_pids();
-        let ext4_guard = ext4_lock();
-        let static_entries = inode.dir_entries();
-        drop(ext4_guard);
+    if let Some(path) = inode_path_hint(&inode).map(|path| mount_display_abs(&path)) {
+        if let Some(node) = open_pseudo(&path) {
+            if let Some(pdir) = node.as_any().downcast_ref::<PseudoDir>() {
+                let entries = pdir.entries();
+                let mut index = os_inode.dir_offset();
+                if index >= entries.len() || len == 0 {
+                    return 0;
+                }
 
-        let entries = crate::fs::build_proc_root_entries(static_entries, pids);
-        let mut index = os_inode.dir_offset();
-        if index >= entries.len() || len == 0 {
-            return 0;
-        }
+                let mut kbuf = alloc::vec![0u8; len];
+                let mut written = 0usize;
+                while index < entries.len() {
+                    let ent = &entries[index];
+                    let name_bytes = ent.name.as_bytes();
+                    let reclen = align_up(19 + name_bytes.len() + 1, 8);
+                    if written + reclen > len {
+                        break;
+                    }
+                    let base = written;
+                    kbuf[base..base + 8].copy_from_slice(&ent.ino.to_le_bytes());
+                    kbuf[base + 8..base + 16].copy_from_slice(&((index + 1) as i64).to_le_bytes());
+                    kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+                    kbuf[base + 18] = ent.dtype;
+                    kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+                    kbuf[base + 19 + name_bytes.len()] = 0;
+                    for b in kbuf[base + 19 + name_bytes.len() + 1..base + reclen].iter_mut() {
+                        *b = 0;
+                    }
 
-        let mut kbuf = alloc::vec![0u8; len];
-        let mut written = 0usize;
-        while index < entries.len() {
-            let ent = &entries[index];
-            let name_bytes = ent.name.as_bytes();
-            let reclen = align_up(19 + name_bytes.len() + 1, 8);
-            if written + reclen > len {
-                break;
+                    written += reclen;
+                    index += 1;
+                }
+
+                let user_bufs =
+                    translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
+                let mut src_off = 0usize;
+                for ub in user_bufs {
+                    let end = src_off + ub.len();
+                    ub.copy_from_slice(&kbuf[src_off..end]);
+                    src_off = end;
+                }
+                os_inode.set_dir_offset(index);
+                if written > 0 {
+                    maybe_update_inode_atime(&inode, true);
+                }
+                return written as isize;
             }
-            let base = written;
-            kbuf[base..base + 8].copy_from_slice(&ent.ino.to_le_bytes());
-            kbuf[base + 8..base + 16].copy_from_slice(&((index + 1) as i64).to_le_bytes());
-            kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            kbuf[base + 18] = ent.dtype;
-            kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
-            kbuf[base + 19 + name_bytes.len()] = 0;
-            for b in kbuf[base + 19 + name_bytes.len() + 1..base + reclen].iter_mut() {
-                *b = 0;
-            }
-
-            written += reclen;
-            index += 1;
         }
-
-        let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
-        let mut src_off = 0usize;
-        for ub in user_bufs {
-            let end = src_off + ub.len();
-            ub.copy_from_slice(&kbuf[src_off..end]);
-            src_off = end;
-        }
-        os_inode.set_dir_offset(index);
-        if written > 0 {
-            maybe_update_inode_atime(&inode, true);
-        }
-        return written as isize;
     }
 
     let ext4_guard = ext4_lock();
@@ -10293,8 +10245,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
 
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
-        let inode_num = inode.inode_num();
-        let (is_dir, is_fifo, mut end) = {
+        let (is_dir, is_fifo, end) = {
             let _ext4_guard = ext4_lock();
             let disk = inode.size() as usize;
             let end = core::cmp::max(disk, os_inode.pending_write_end()) as isize;
@@ -10302,11 +10253,6 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         };
         if is_fifo {
             return ESPIPE;
-        }
-        if !is_dir {
-            if let Some(kind) = crate::fs::proc_file_kind(inode_num) {
-                end = crate::fs::proc_file_len(&kind) as isize;
-            }
         }
 
         if is_dir {

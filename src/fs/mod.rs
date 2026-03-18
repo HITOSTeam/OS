@@ -139,12 +139,15 @@ pub(crate) use inode::{
 pub(crate) use net_socket::notify_net_poll_events;
 pub use net_socket::{NetSocketFile, NetSocketKind};
 pub(crate) use pipe::remove_task_waiters as remove_pipe_waiters_for_task;
-pub use pipe::{Pipe, debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe};
+pub use pipe::{
+    Pipe, debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe,
+    pipe_max_size_limit_for_procfs, write_pipe_sysctl,
+};
+pub(crate) use procfs::parse_proc_sys_usize;
 pub use procfs::{
-    ProcPseudoFile, build_proc_root_entries, collect_pids, init_procfs, is_proc_pseudo_path,
-    is_proc_root, open_proc_pseudo, proc_file_content, proc_file_kind, proc_file_len,
-    proc_readlink, sync_proc_path, vm_commit_limit_bytes, vm_committed_as_bytes,
-    vm_overcommit_memory, vm_overcommit_ratio,
+    ProcPseudoFile, is_proc_pseudo_path, open_proc_pseudo, proc_fd_link_file,
+    proc_magic_link_exists, proc_readlink, vm_commit_limit_bytes, vm_committed_as_bytes,
+    vm_overcommit_memory,
 };
 pub use pseudo::PseudoBlock;
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
