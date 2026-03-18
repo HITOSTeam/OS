@@ -1850,6 +1850,16 @@ impl MemorySet {
         merged
     }
 
+    /// Highest end address among current user VMAs.
+    pub fn max_user_mapped_end(&self) -> usize {
+        self.areas
+            .iter()
+            .filter(|area| area.map_perm.contains(MapPermission::U))
+            .map(|area| area.vpn_range.get_end().0.saturating_mul(PAGE_SIZE))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Whether every page in `[start_va, end_va)` belongs to some user VMA.
     pub fn user_range_fully_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
         let start: usize = start_va.into();

@@ -302,10 +302,35 @@ impl Ord for TimerFdScheduleEntry {
 struct TimerFdScheduleState {
     monotonic: BinaryHeap<TimerFdScheduleEntry>,
     realtime: BinaryHeap<TimerFdScheduleEntry>,
+    monotonic_armed: usize,
+    realtime_armed: usize,
 }
 
 impl TimerFdScheduleState {
+    fn adjust_armed(&mut self, clock_id: usize, was_armed: bool, is_armed: bool) {
+        if was_armed == is_armed {
+            return;
+        }
+        let armed = match clock_id {
+            CLOCK_MONOTONIC => &mut self.monotonic_armed,
+            CLOCK_REALTIME => &mut self.realtime_armed,
+            _ => return,
+        };
+        if is_armed {
+            *armed = armed.saturating_add(1);
+        } else {
+            *armed = armed.saturating_sub(1);
+        }
+    }
+
+    fn has_live_timers(&self) -> bool {
+        self.monotonic_armed != 0 || self.realtime_armed != 0
+    }
+
     fn live_realtime_files(&self) -> Vec<Arc<TimerFdFile>> {
+        if self.realtime_armed == 0 {
+            return Vec::new();
+        }
         let mut live = BTreeMap::new();
         for entry in self.realtime.iter() {
             let Some(file) = entry.file.upgrade() else {
@@ -404,12 +429,20 @@ impl TimerFdFile {
         }
     }
 
-    fn reschedule_locked(&self, inner: &mut TimerFdInner) {
+    fn is_armed_locked(&self, inner: &TimerFdInner) -> bool {
+        matches!(self.clock_id, CLOCK_MONOTONIC | CLOCK_REALTIME)
+            && inner.deadline_ns.is_some()
+            && !inner.canceled
+    }
+
+    fn update_schedule_locked(&self, inner: &mut TimerFdInner, was_armed: bool) {
+        let is_armed = self.is_armed_locked(inner);
         inner.schedule_seq = inner.schedule_seq.wrapping_add(1);
-        let Some(deadline_ns) = inner.deadline_ns.filter(|_| !inner.canceled) else {
+        let mut state = TIMERFD_SCHEDULE.lock();
+        state.adjust_armed(self.clock_id, was_armed, is_armed);
+        let Some(deadline_ns) = inner.deadline_ns.filter(|_| is_armed) else {
             return;
         };
-        let mut state = TIMERFD_SCHEDULE.lock();
         let Some(heap) = Self::schedule_heap_mut(&mut state, self.clock_id) else {
             return;
         };
@@ -445,10 +478,11 @@ impl TimerFdFile {
     }
 
     fn advance_to_ns_locked(&self, inner: &mut TimerFdInner, now_ns: u64) -> bool {
+        let was_armed = self.is_armed_locked(inner);
         let prev_deadline = inner.deadline_ns;
         let became_ready = Self::update_expirations_locked(inner, now_ns);
         if inner.deadline_ns != prev_deadline {
-            self.reschedule_locked(inner);
+            self.update_schedule_locked(inner, was_armed);
         }
         became_ready
     }
@@ -534,12 +568,13 @@ impl TimerFdFile {
             0
         };
         let old_interval_ns = inner.interval_ns;
+        let was_armed = self.is_armed_locked(&inner);
         inner.deadline_ns = deadline_ns;
         inner.interval_ns = interval_ns;
         inner.expirations = 0;
         inner.cancel_on_set = cancel_on_set;
         inner.canceled = false;
-        self.reschedule_locked(&mut inner);
+        self.update_schedule_locked(&mut inner, was_armed);
         let became_ready = self.flush_expirations(&mut inner);
         if became_ready {
             let mut waiters = Self::wake_read_waiters(&mut inner.read_waiters);
@@ -555,15 +590,31 @@ impl TimerFdFile {
         if self.clock_id != CLOCK_REALTIME || !inner.cancel_on_set || inner.canceled {
             return false;
         }
+        let was_armed = self.is_armed_locked(&inner);
         inner.canceled = true;
         inner.deadline_ns = None;
         inner.expirations = 0;
-        self.reschedule_locked(&mut inner);
+        self.update_schedule_locked(&mut inner, was_armed);
         let mut waiters = Self::wake_read_waiters(&mut inner.read_waiters);
         waiters.extend(inner.poll_waiters.take_wakeups());
         drop(inner);
         wake_tasks(waiters);
         true
+    }
+}
+
+impl Drop for TimerFdFile {
+    fn drop(&mut self) {
+        let inner = self.inner.lock();
+        if !matches!(self.clock_id, CLOCK_MONOTONIC | CLOCK_REALTIME)
+            || inner.deadline_ns.is_none()
+            || inner.canceled
+        {
+            return;
+        }
+        TIMERFD_SCHEDULE
+            .lock()
+            .adjust_armed(self.clock_id, true, false);
     }
 }
 
@@ -1032,6 +1083,10 @@ pub(crate) fn process_timerfd_expirations() {
             wake_tasks(waiters);
         }
     }
+}
+
+pub(crate) fn has_pending_timerfds() -> bool {
+    TIMERFD_SCHEDULE.lock().has_live_timers()
 }
 
 pub(crate) fn cancel_realtime_timerfds_on_set() {

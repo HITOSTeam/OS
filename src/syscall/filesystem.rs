@@ -1766,17 +1766,6 @@ fn is_pseudo_path(abs: &str) -> bool {
         || abs.starts_with("/etc/")
 }
 
-fn rewrite_proc_self(abs: &str) -> String {
-    if abs == "/proc/self" || abs.starts_with("/proc/self/") {
-        let pid = current_process().getpid();
-        let suffix = &abs["/proc/self".len()..];
-        let mut out = alloc::format!("/proc/{pid}");
-        out.push_str(suffix);
-        return out;
-    }
-    String::from(abs)
-}
-
 enum AtPath {
     /// An ext4 lookup rooted at `/`.
     Ext4Abs(String),
@@ -1801,7 +1790,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     // Absolute path: ignore dirfd.
     if path.starts_with('/') {
         let jail_abs = normalize_path("/", path);
-        let abs = rewrite_proc_self(&apply_process_root(&jail_abs));
+        let abs = crate::fs::normalize_proc_magic_path(&apply_process_root(&jail_abs)).into_owned();
         if crate::fs::is_proc_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
         }
@@ -1821,7 +1810,7 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     if dirfd == AT_FDCWD {
         let process = current_process();
         let cwd = { process.borrow_mut().cwd.clone() };
-        let abs = rewrite_proc_self(&normalize_path(&cwd, path));
+        let abs = crate::fs::normalize_proc_magic_path(&normalize_path(&cwd, path)).into_owned();
         if crate::fs::is_proc_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
         }
@@ -1863,7 +1852,8 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     };
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
-        let abs = rewrite_proc_self(&normalize_path(pdir.path(), path));
+        let abs =
+            crate::fs::normalize_proc_magic_path(&normalize_path(pdir.path(), path)).into_owned();
         if crate::fs::is_proc_pseudo_path(&abs) {
             return Ok(AtPath::PseudoAbs(abs));
         }
@@ -1902,7 +1892,7 @@ fn resolve_ext4_abs_path(
     depth: &mut usize,
     seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
-    let abs = rewrite_proc_self(path);
+    let abs = crate::fs::normalize_proc_magic_path(path).into_owned();
 
     // Prefer the secondary disk for OSComp test roots when available.
     if (abs == "/musl"
@@ -5533,6 +5523,10 @@ pub fn syscall_lsetxattr(
 /// Linux `fsetxattr(2)` (syscall 7 on riscv64).
 pub fn syscall_fsetxattr(fd: usize, name: usize, value: usize, size: usize, flags: usize) -> isize {
     let token = get_current_token();
+    let inode = match resolve_xattr_fd_inode(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let name = match read_user_xattr_name(token, name) {
         Ok(v) => v,
         Err(e) => return e,
@@ -5541,16 +5535,15 @@ pub fn syscall_fsetxattr(fd: usize, name: usize, value: usize, size: usize, flag
         Ok(v) => v,
         Err(e) => return e,
     };
-    let inode = match resolve_xattr_fd_inode(fd) {
-        Ok(Some(v)) => v,
-        Ok(None) => {
+    let inode = match inode {
+        Some(v) => v,
+        None => {
             return if xattr_is_user_namespace(&name) {
                 EPERM
             } else {
                 EOPNOTSUPP
             };
         }
-        Err(e) => return e,
     };
     do_setxattr(&inode, &name, value.as_slice(), flags)
 }
@@ -5586,14 +5579,17 @@ pub fn syscall_lgetxattr(path: usize, name: usize, value: usize, size: usize) ->
 /// Linux `fgetxattr(2)` (syscall 10 on riscv64).
 pub fn syscall_fgetxattr(fd: usize, name: usize, value: usize, size: usize) -> isize {
     let token = get_current_token();
+    let inode = match resolve_xattr_fd_inode(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let name = match read_user_xattr_name(token, name) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let inode = match resolve_xattr_fd_inode(fd) {
-        Ok(Some(v)) => v,
-        Ok(None) => return ENODATA,
-        Err(e) => return e,
+    let inode = match inode {
+        Some(v) => v,
+        None => return ENODATA,
     };
     do_getxattr(&inode, &name, value, size, token)
 }
@@ -5660,14 +5656,17 @@ pub fn syscall_lremovexattr(path: usize, name: usize) -> isize {
 /// Linux `fremovexattr(2)` (syscall 16 on riscv64).
 pub fn syscall_fremovexattr(fd: usize, name: usize) -> isize {
     let token = get_current_token();
+    let inode = match resolve_xattr_fd_inode(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let name = match read_user_xattr_name(token, name) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let inode = match resolve_xattr_fd_inode(fd) {
-        Ok(Some(v)) => v,
-        Ok(None) => return ENODATA,
-        Err(e) => return e,
+    let inode = match inode {
+        Some(v) => v,
+        None => return ENODATA,
     };
     do_removexattr(&inode, &name)
 }

@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -38,6 +39,7 @@ pub enum ProcFileKind {
     VmOvercommitRatio,
     VmDropCaches,
     VmCompactMemory,
+    FsFileMax,
     FsPipeMaxSize,
     FsMqueueQueuesMax,
     KernelPidMax,
@@ -75,9 +77,12 @@ const VM_OVERCOMMIT_MEMORY_DEFAULT: usize = 0;
 const VM_OVERCOMMIT_MEMORY_MAX: usize = 2;
 const VM_OVERCOMMIT_RATIO_DEFAULT: usize = 50;
 const VM_OVERCOMMIT_RATIO_MAX: usize = 100;
+const FS_FILE_MAX_DEFAULT: usize = 8192;
+const FS_FILE_MAX_MAX: usize = isize::MAX as usize;
 const EINVAL: isize = -22;
 static VM_OVERCOMMIT_MEMORY: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_MEMORY_DEFAULT);
 static VM_OVERCOMMIT_RATIO: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_RATIO_DEFAULT);
+static FS_FILE_MAX: AtomicUsize = AtomicUsize::new(FS_FILE_MAX_DEFAULT);
 
 fn should_report_proc_pid_stat_diag(calls: usize) -> bool {
     calls <= 16 || calls % 2048 == 0
@@ -126,11 +131,13 @@ fn record_proc_pid_stat_diag(pid: u32, state_char: char, elapsed_cycles: usize, 
 }
 
 // gzip-compressed minimal config for LTP kconfig checks.
+// Keep this conservative: only advertise options that this kernel surface
+// actually exposes to user space.
 const PROC_CONFIG_GZ: &[u8] = &[
     31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 115, 246, 247, 115, 243, 116, 143, 119, 10, 118, 137, 15, 8,
     242, 119, 118, 13, 14, 142, 119, 116, 118, 14, 177, 173, 228, 82, 86, 112, 198, 46, 23, 31,
-    102, 172, 144, 89, 172, 144, 151, 95, 162, 80, 156, 90, 194, 5, 0, 236, 87, 124, 248, 66, 0, 0,
-    0,
+    102, 172, 144, 89, 172, 144, 151, 95, 162, 80, 156, 90, 194, 5, 85, 5, 82, 17, 239, 22, 12, 212,
+    8, 21, 8, 142, 12, 118, 14, 241, 1, 242, 1, 240, 171, 117, 110, 99, 0, 0, 0,
 ];
 
 struct ProcPseudoInner {
@@ -159,24 +166,18 @@ impl ProcPseudoFile {
     }
 
     pub fn seek_end(&self) -> isize {
-        match self.kind {
-            ProcFileKind::PidPagemap(_) | ProcFileKind::Kpageflags => isize::MAX,
-            _ => proc_file_len(&self.kind) as isize,
-        }
+        proc_file_len(&self.kind) as isize
     }
 
     pub fn len(&self) -> Option<usize> {
-        match self.kind {
-            ProcFileKind::PidPagemap(_) | ProcFileKind::Kpageflags => None,
-            _ => Some(proc_file_len(&self.kind)),
-        }
+        Some(proc_file_len(&self.kind))
     }
 
     pub fn pwrite_bytes(&self, offset: usize, data: &[u8]) -> Result<usize, isize> {
         if offset != 0 {
             return Err(EINVAL);
         }
-        let normalized = match self.kind {
+        let _normalized = match self.kind {
             ProcFileKind::VmOvercommitMemory => {
                 write_vm_sysctl("/proc/sys/vm/overcommit_memory", data)?
             }
@@ -189,6 +190,7 @@ impl ProcPseudoFile {
             ProcFileKind::VmCompactMemory => {
                 write_vm_trigger_sysctl("/proc/sys/vm/compact_memory", data)?
             }
+            ProcFileKind::FsFileMax => write_fs_file_max_sysctl(data)?,
             ProcFileKind::FsPipeMaxSize => {
                 crate::fs::write_pipe_sysctl("/proc/sys/fs/pipe-max-size", data)?
             }
@@ -221,7 +223,7 @@ impl ProcPseudoFile {
             ProcFileKind::SimpleText(path) => write_proc_simple_text(path, data)?,
             _ => return Err(EINVAL),
         };
-        Ok(normalized.len())
+        Ok(data.len())
     }
 }
 
@@ -236,6 +238,7 @@ impl File for ProcPseudoFile {
             | ProcFileKind::VmOvercommitRatio
             | ProcFileKind::VmDropCaches
             | ProcFileKind::VmCompactMemory
+            | ProcFileKind::FsFileMax
             | ProcFileKind::FsPipeMaxSize
             | ProcFileKind::FsMqueueQueuesMax
             | ProcFileKind::KernelPidMax
@@ -290,7 +293,11 @@ impl File for ProcPseudoFile {
 }
 
 fn proc_file_len(kind: &ProcFileKind) -> usize {
-    proc_file_content(kind).len()
+    match kind {
+        ProcFileKind::Kpageflags => proc_kpageflags_len(),
+        ProcFileKind::PidPagemap(pid) => proc_pid_pagemap_len(*pid),
+        _ => proc_file_content(kind).len(),
+    }
 }
 
 pub fn is_proc_pseudo_path(abs: &str) -> bool {
@@ -410,6 +417,7 @@ fn proc_sys_kernel_keys_entries() -> Vec<PseudoDirent> {
 
 fn proc_sys_fs_entries() -> Vec<PseudoDirent> {
     proc_dir_entries(&[
+        ("file-max", 8),
         ("inotify", 4),
         ("mqueue", 4),
         ("pipe-max-size", 8),
@@ -611,6 +619,7 @@ fn managed_proc_sys_file_kind(path: &str) -> Option<ProcFileKind> {
         "/proc/sys/vm/compact_memory" => Some(ProcFileKind::VmCompactMemory),
         "/proc/sys/vm/overcommit_memory" => Some(ProcFileKind::VmOvercommitMemory),
         "/proc/sys/vm/overcommit_ratio" => Some(ProcFileKind::VmOvercommitRatio),
+        "/proc/sys/fs/file-max" => Some(ProcFileKind::FsFileMax),
         "/proc/sys/fs/pipe-max-size" => Some(ProcFileKind::FsPipeMaxSize),
         "/proc/sys/fs/mqueue/queues_max" => Some(ProcFileKind::FsMqueueQueuesMax),
         "/proc/sys/kernel/pid_max" => Some(ProcFileKind::KernelPidMax),
@@ -905,6 +914,45 @@ fn current_thread_self_target() -> Option<String> {
     Some(alloc::format!("{pid}/task/{tid}"))
 }
 
+fn current_thread_self_abs_target() -> Option<String> {
+    current_thread_self_target().map(|target| alloc::format!("/proc/{target}"))
+}
+
+fn trim_proc_path(path: &str) -> &str {
+    if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    }
+}
+
+fn proc_magic_alias_target_path(trimmed: &str) -> Option<String> {
+    if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
+        let pid = current_process().getpid();
+        let suffix = &trimmed["/proc/self".len()..];
+        let mut mapped = alloc::format!("/proc/{pid}");
+        mapped.push_str(suffix);
+        return Some(mapped);
+    }
+
+    if trimmed == "/proc/thread-self" || trimmed.starts_with("/proc/thread-self/") {
+        let mut mapped = current_thread_self_abs_target()?;
+        let suffix = &trimmed["/proc/thread-self".len()..];
+        mapped.push_str(suffix);
+        return Some(mapped);
+    }
+
+    None
+}
+
+pub fn normalize_proc_magic_path(path: &str) -> Cow<'_, str> {
+    let trimmed = trim_proc_path(path);
+    match proc_magic_alias_target_path(trimmed) {
+        Some(mapped) => Cow::Owned(mapped),
+        None => Cow::Borrowed(trimmed),
+    }
+}
+
 fn proc_dir_entry_path(base: &str, name: &str) -> String {
     if base == "/" {
         alloc::format!("/{name}")
@@ -1057,11 +1105,7 @@ fn proc_pid_task_rest(rest: &str) -> Option<(u32, &str)> {
 }
 
 pub fn proc_magic_link_exists(path: &str) -> bool {
-    let trimmed = if path.len() > 1 {
-        path.trim_end_matches('/')
-    } else {
-        path
-    };
+    let trimmed = trim_proc_path(path);
 
     if trimmed == "/proc/self" {
         return true;
@@ -1069,6 +1113,9 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if trimmed == "/proc/thread-self" {
         return current_thread_self_target().is_some();
     }
+
+    let normalized = normalize_proc_magic_path(trimmed);
+    let trimmed = normalized.as_ref();
 
     let Some((pid, rest)) = proc_pid_from_path_with_rest(trimmed) else {
         return false;
@@ -1101,24 +1148,8 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
 }
 
 pub fn proc_fd_link_file(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
-    let trimmed = if path.len() > 1 {
-        path.trim_end_matches('/')
-    } else {
-        path
-    };
-
-    if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
-        let pid = current_process().getpid();
-        let suffix = &trimmed["/proc/self".len()..];
-        let mapped = alloc::format!("/proc/{pid}{suffix}");
-        return proc_fd_link_file(&mapped);
-    }
-    if trimmed == "/proc/thread-self" || trimmed.starts_with("/proc/thread-self/") {
-        let target = current_thread_self_target()?;
-        let suffix = &trimmed["/proc/thread-self".len()..];
-        let mapped = alloc::format!("/proc/{target}{suffix}");
-        return proc_fd_link_file(&mapped);
-    }
+    let normalized = normalize_proc_magic_path(path);
+    let trimmed = normalized.as_ref();
 
     let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
     if !proc_pid_exists(pid) {
@@ -1139,20 +1170,13 @@ pub fn proc_fd_link_file(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
 }
 
 pub fn proc_readlink(path: &str) -> Option<String> {
-    let trimmed = if path.len() > 1 {
-        path.trim_end_matches('/')
-    } else {
-        path
-    };
+    let trimmed = trim_proc_path(path);
 
     if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
         let pid = current_process().getpid();
         if trimmed == "/proc/self" {
             return Some(alloc::format!("{pid}"));
         }
-        let suffix = &trimmed["/proc/self".len()..];
-        let mapped = alloc::format!("/proc/{pid}{suffix}");
-        return proc_readlink(&mapped);
     }
 
     if trimmed == "/proc/thread-self" || trimmed.starts_with("/proc/thread-self/") {
@@ -1160,10 +1184,10 @@ pub fn proc_readlink(path: &str) -> Option<String> {
         if trimmed == "/proc/thread-self" {
             return Some(target);
         }
-        let suffix = &trimmed["/proc/thread-self".len()..];
-        let mapped = alloc::format!("/proc/{target}{suffix}");
-        return proc_readlink(&mapped);
     }
+
+    let normalized = normalize_proc_magic_path(trimmed);
+    let trimmed = normalized.as_ref();
 
     let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
     if rest == "cwd" {
@@ -1213,11 +1237,8 @@ fn proc_pid_from_path_with_rest(path: &str) -> Option<(u32, &str)> {
 }
 
 pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
-    let trimmed = if path.len() > 1 {
-        path.trim_end_matches('/')
-    } else {
-        path
-    };
+    let normalized = normalize_proc_magic_path(path);
+    let trimmed = normalized.as_ref();
     if trimmed == "/proc" {
         return Some(Arc::new(PseudoDir::new("/proc", proc_root_entries())));
     }
@@ -1308,18 +1329,6 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             )));
         }
         _ => {}
-    }
-    if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
-        let pid = current_process().getpid();
-        let suffix = &trimmed["/proc/self".len()..];
-        let mapped = alloc::format!("/proc/{pid}{suffix}");
-        return open_proc_pseudo(&mapped);
-    }
-    if trimmed == "/proc/thread-self" || trimmed.starts_with("/proc/thread-self/") {
-        let target = current_thread_self_target()?;
-        let suffix = &trimmed["/proc/thread-self".len()..];
-        let mapped = alloc::format!("/proc/{target}{suffix}");
-        return open_proc_pseudo(&mapped);
     }
     if trimmed == "/proc/sysvipc" {
         let entries = alloc::vec![
@@ -1491,6 +1500,7 @@ fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::VmOvercommitRatio => alloc::format!("{}\n", vm_overcommit_ratio()),
         ProcFileKind::VmDropCaches => String::from("0\n"),
         ProcFileKind::VmCompactMemory => String::from("0\n"),
+        ProcFileKind::FsFileMax => alloc::format!("{}\n", fs_file_max()),
         ProcFileKind::FsPipeMaxSize => {
             alloc::format!("{}\n", crate::fs::pipe_max_size_limit_for_procfs())
         }
@@ -1572,12 +1582,25 @@ fn write_vm_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
     Ok(alloc::format!("{}\n", value).into_bytes())
 }
 
+fn write_fs_file_max_sysctl(data: &[u8]) -> Result<Vec<u8>, isize> {
+    let value = parse_proc_sys_usize(data)?;
+    if value > FS_FILE_MAX_MAX {
+        return Err(EINVAL);
+    }
+    FS_FILE_MAX.store(value, Ordering::Relaxed);
+    Ok(alloc::format!("{}\n", value).into_bytes())
+}
+
 pub fn vm_overcommit_memory() -> usize {
     VM_OVERCOMMIT_MEMORY.load(Ordering::Relaxed)
 }
 
 fn vm_overcommit_ratio() -> usize {
     VM_OVERCOMMIT_RATIO.load(Ordering::Relaxed)
+}
+
+fn fs_file_max() -> usize {
+    FS_FILE_MAX.load(Ordering::Relaxed)
 }
 
 pub fn vm_commit_limit_bytes() -> usize {
@@ -2096,11 +2119,33 @@ fn proc_kpageflags_entry(pfn: usize) -> u64 {
     0
 }
 
+fn proc_kpageflags_len() -> usize {
+    let phys_bytes = config::phys_mem_end().saturating_sub(config::phys_mem_start());
+    let page_count = phys_bytes / config::PAGE_SIZE;
+    page_count.saturating_mul(8)
+}
+
+fn proc_pid_pagemap_len(pid: u32) -> usize {
+    let Some(proc) = pid2process(pid as usize) else {
+        return 0;
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        return 0;
+    };
+    let max_end = inner.memory_set.max_user_mapped_end();
+    let page_count = max_end.saturating_add(config::PAGE_SIZE - 1) / config::PAGE_SIZE;
+    page_count.saturating_mul(8)
+}
+
 fn proc_kpageflags_read(offset: &mut usize, buf: &mut UserBuffer) -> usize {
+    let limit = proc_kpageflags_len();
+    if *offset >= limit {
+        return 0;
+    }
     let mut total = 0usize;
     for slice in buf.buffers.iter_mut() {
         let mut i = 0usize;
-        while i < slice.len() {
+        while i < slice.len() && *offset < limit {
             let entry = (*offset) / 8;
             let byte_in_entry = (*offset) % 8;
             let val = proc_kpageflags_entry(entry);
@@ -2114,10 +2159,14 @@ fn proc_kpageflags_read(offset: &mut usize, buf: &mut UserBuffer) -> usize {
 }
 
 fn proc_pid_pagemap_read(pid: u32, offset: &mut usize, buf: &mut UserBuffer) -> usize {
+    let limit = proc_pid_pagemap_len(pid);
+    if *offset >= limit {
+        return 0;
+    }
     let mut total = 0usize;
     for slice in buf.buffers.iter_mut() {
         let mut i = 0usize;
-        while i < slice.len() {
+        while i < slice.len() && *offset < limit {
             let entry = (*offset) / 8;
             let byte_in_entry = (*offset) % 8;
             let val = proc_pid_pagemap_entry(pid, entry);

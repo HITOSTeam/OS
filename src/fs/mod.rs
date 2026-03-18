@@ -129,7 +129,8 @@ pub use dummy::{
     DummyFile, EventFdFile, NamespaceFile, NamespaceKind, PidFdFile, TimerFdFile, UserfaultfdFile,
 };
 pub(crate) use dummy::{
-    cancel_realtime_timerfds_on_set, process_timerfd_expirations, wake_pidfd_poll_waiters,
+    cancel_realtime_timerfds_on_set, has_pending_timerfds, process_timerfd_expirations,
+    wake_pidfd_poll_waiters,
 };
 pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub(crate) use inode::{
@@ -145,9 +146,9 @@ pub use pipe::{
 };
 pub(crate) use procfs::parse_proc_sys_usize;
 pub use procfs::{
-    ProcPseudoFile, is_proc_pseudo_path, open_proc_pseudo, proc_fd_link_file,
-    proc_magic_link_exists, proc_readlink, vm_commit_limit_bytes, vm_committed_as_bytes,
-    vm_overcommit_memory,
+    ProcPseudoFile, is_proc_pseudo_path, normalize_proc_magic_path, open_proc_pseudo,
+    proc_fd_link_file, proc_magic_link_exists, proc_readlink, vm_commit_limit_bytes,
+    vm_committed_as_bytes, vm_overcommit_memory,
 };
 pub use pseudo::PseudoBlock;
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};

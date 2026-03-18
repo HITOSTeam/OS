@@ -942,5 +942,6 @@ pub fn has_pending_timers() -> bool {
     !TIMERS.lock().is_empty()
         || !ALARM_TIMERS.lock().is_empty()
         || posix_pending
+        || crate::fs::has_pending_timerfds()
         || !DELAYED_TID_CLEARS.lock().is_empty()
 }
