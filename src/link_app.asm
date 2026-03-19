@@ -204,9 +204,13 @@ app_50_name:
     .asciz "proc_magic_links_smoke"
 .section .rodata
 .align 3
+app_51_name:
+    .asciz "mount_namespace_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 51
+    .quad 52
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -258,3 +262,4 @@ num_user_apps:
     .quad app_48_name
     .quad app_49_name
     .quad app_50_name
+    .quad app_51_name

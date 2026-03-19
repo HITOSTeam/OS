@@ -2,6 +2,7 @@
 mod cgroupfs;
 mod dummy;
 mod inode;
+mod mountns;
 mod net_socket;
 mod pipe;
 mod procfs;
@@ -136,6 +137,10 @@ pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, 
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, register_deferred_unlink_cleanup,
     root_inode_for_path, secondary_root_inode,
+};
+pub(crate) use mountns::{
+    MountNamespace, MountNamespaceState, MountRecord, clone_mount_namespace,
+    initial_mount_namespace, mount_namespace_id,
 };
 pub(crate) use net_socket::notify_net_poll_events;
 pub use net_socket::{NetSocketFile, NetSocketKind};

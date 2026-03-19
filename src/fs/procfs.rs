@@ -11,8 +11,8 @@ use spin::Mutex;
 
 use crate::config;
 use crate::fs::{
-    File, NamespaceFile, OSInode, Pipe, PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag,
-    PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, root_inode_for_path,
+    File, NamespaceFile, NamespaceKind, OSInode, Pipe, PseudoDir, PseudoDirent, PseudoFile,
+    PseudoKindTag, PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, root_inode_for_path,
     secondary_root_inode,
 };
 use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages};
@@ -59,7 +59,7 @@ pub enum ProcFileKind {
     PidPagemap(u32),
     PidSmaps(u32),
     PidCoredumpFilter,
-    PidMounts,
+    PidMounts(u32),
     PidCgroup(u32),
     PidTaskStat(u32, u32),
     PidTaskComm(u32, u32),
@@ -754,6 +754,11 @@ fn proc_pid_ns_entries(pid: u32) -> Vec<PseudoDirent> {
         ino: pid as u64,
         dtype: 10,
     });
+    entries.push(PseudoDirent {
+        name: String::from("mnt"),
+        ino: pid as u64,
+        dtype: 10,
+    });
     entries
 }
 
@@ -1092,7 +1097,7 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
         return Some(alloc::format!("pipe:[{}]", pipe as *const Pipe as usize));
     }
     if let Some(ns) = file.as_any().downcast_ref::<NamespaceFile>() {
-        return Some(alloc::format!("ipc:[{}]", ns.ns_id()));
+        return Some(ns.target_string());
     }
     if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
         return Some(String::from(link.link_path()));
@@ -1132,16 +1137,25 @@ fn proc_pid_fd_file(pid: u32, fd: usize) -> Option<Arc<dyn File + Send + Sync>> 
     inner.fd_table.get(fd)?.as_ref().cloned()
 }
 
-fn proc_pid_ipc_ns_target(pid: u32) -> Option<String> {
+fn proc_pid_namespace_target(pid: u32, kind: NamespaceKind) -> Option<String> {
     let proc = pid2process(pid as usize)?;
-    let inner = proc.try_borrow_mut()?;
-    Some(alloc::format!("ipc:[{}]", inner.ipc_ns_id))
+    let ns_id = match kind {
+        NamespaceKind::Ipc => proc.try_borrow_mut()?.ipc_ns_id,
+        NamespaceKind::Mount => proc.mount_namespace_id(),
+    };
+    Some(kind.target_string(ns_id))
 }
 
-fn proc_pid_ipc_ns_file(pid: u32) -> Option<Arc<dyn File + Send + Sync>> {
+fn proc_pid_namespace_file(pid: u32, kind: NamespaceKind) -> Option<Arc<dyn File + Send + Sync>> {
     let proc = pid2process(pid as usize)?;
-    let inner = proc.try_borrow_mut()?;
-    Some(Arc::new(NamespaceFile::new_ipc(inner.ipc_ns_id)))
+    let file: Arc<dyn File + Send + Sync> = match kind {
+        NamespaceKind::Ipc => {
+            let inner = proc.try_borrow_mut()?;
+            Arc::new(NamespaceFile::new_ipc(inner.ipc_ns_id))
+        }
+        NamespaceKind::Mount => Arc::new(NamespaceFile::new_mount(proc.mount_namespace())),
+    };
+    Some(file)
 }
 
 fn parse_proc_fd_component(fd_name: &str) -> Option<usize> {
@@ -1190,7 +1204,12 @@ pub fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTa
         return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
     }
     if rest == "ns/ipc" {
-        return proc_pid_ipc_ns_file(pid).map(ProcMagicLinkFollowTarget::File);
+        return proc_pid_namespace_file(pid, NamespaceKind::Ipc)
+            .map(ProcMagicLinkFollowTarget::File);
+    }
+    if rest == "ns/mnt" {
+        return proc_pid_namespace_file(pid, NamespaceKind::Mount)
+            .map(ProcMagicLinkFollowTarget::File);
     }
     if let Some(fd_name) = rest.strip_prefix("fd/") {
         let fd = parse_proc_fd_component(fd_name)?;
@@ -1205,7 +1224,12 @@ pub fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTa
         return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
     }
     if tail == "ns/ipc" {
-        return proc_pid_ipc_ns_file(pid).map(ProcMagicLinkFollowTarget::File);
+        return proc_pid_namespace_file(pid, NamespaceKind::Ipc)
+            .map(ProcMagicLinkFollowTarget::File);
+    }
+    if tail == "ns/mnt" {
+        return proc_pid_namespace_file(pid, NamespaceKind::Mount)
+            .map(ProcMagicLinkFollowTarget::File);
     }
     let fd_name = tail.strip_prefix("fd/")?;
     let fd = parse_proc_fd_component(fd_name)?;
@@ -1231,7 +1255,7 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if !proc_pid_exists(pid) {
         return false;
     }
-    if rest == "cwd" || rest == "ns/ipc" {
+    if rest == "cwd" || rest == "ns/ipc" || rest == "ns/mnt" {
         return true;
     }
     if let Some(fd_name) = rest.strip_prefix("fd/") {
@@ -1246,7 +1270,7 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if !proc_pid_task_alive(pid, tid) {
         return false;
     }
-    if tail == "cwd" || tail == "ns/ipc" {
+    if tail == "cwd" || tail == "ns/ipc" || tail == "ns/mnt" {
         return true;
     }
     tail.strip_prefix("fd/")
@@ -1302,7 +1326,10 @@ pub fn proc_readlink(path: &str) -> Option<String> {
         return proc_pid_cwd(pid);
     }
     if rest == "ns/ipc" {
-        return proc_pid_ipc_ns_target(pid);
+        return proc_pid_namespace_target(pid, NamespaceKind::Ipc);
+    }
+    if rest == "ns/mnt" {
+        return proc_pid_namespace_target(pid, NamespaceKind::Mount);
     }
 
     if let Some(fd_name) = rest.strip_prefix("fd/") {
@@ -1318,7 +1345,10 @@ pub fn proc_readlink(path: &str) -> Option<String> {
         return proc_pid_cwd(pid);
     }
     if tail == "ns/ipc" {
-        return proc_pid_ipc_ns_target(pid);
+        return proc_pid_namespace_target(pid, NamespaceKind::Ipc);
+    }
+    if tail == "ns/mnt" {
+        return proc_pid_namespace_target(pid, NamespaceKind::Mount);
     }
     let fd_name = tail.strip_prefix("fd/")?;
     let fd = parse_proc_fd_component(fd_name)?;
@@ -1544,26 +1574,25 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
                     proc_pid_ns_entries(pid),
                 )));
             }
-            "mounts" => return Some(ProcPseudoFile::new(ProcFileKind::PidMounts)),
+            "mounts" => return Some(ProcPseudoFile::new(ProcFileKind::PidMounts(pid))),
             "cgroup" => return Some(ProcPseudoFile::new(ProcFileKind::PidCgroup(pid))),
             _ => {}
         }
         if let Some(ns_name) = tail.strip_prefix("ns/") {
-            if ns_name == "ipc" {
-                let proc = pid2process(pid as usize)?;
-                let ipc_ns_id = proc.borrow_mut().ipc_ns_id;
-                return Some(Arc::new(NamespaceFile::new_ipc(ipc_ns_id)));
-            }
+            return match ns_name {
+                "ipc" => proc_pid_namespace_file(pid, NamespaceKind::Ipc),
+                "mnt" => proc_pid_namespace_file(pid, NamespaceKind::Mount),
+                _ => None,
+            };
         }
         return None;
     }
     if let Some(ns_name) = rest.strip_prefix("ns/") {
-        if ns_name == "ipc" {
-            let proc = pid2process(pid as usize)?;
-            let ipc_ns_id = proc.borrow_mut().ipc_ns_id;
-            return Some(Arc::new(NamespaceFile::new_ipc(ipc_ns_id)));
-        }
-        return None;
+        return match ns_name {
+            "ipc" => proc_pid_namespace_file(pid, NamespaceKind::Ipc),
+            "mnt" => proc_pid_namespace_file(pid, NamespaceKind::Mount),
+            _ => None,
+        };
     }
     match rest {
         "stat" => Some(ProcPseudoFile::new(ProcFileKind::PidStat(pid))),
@@ -1574,7 +1603,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "pagemap" => Some(ProcPseudoFile::new(ProcFileKind::PidPagemap(pid))),
         "smaps" => Some(ProcPseudoFile::new(ProcFileKind::PidSmaps(pid))),
         "coredump_filter" => Some(ProcPseudoFile::new(ProcFileKind::PidCoredumpFilter)),
-        "mounts" => Some(ProcPseudoFile::new(ProcFileKind::PidMounts)),
+        "mounts" => Some(ProcPseudoFile::new(ProcFileKind::PidMounts(pid))),
         "cgroup" => Some(ProcPseudoFile::new(ProcFileKind::PidCgroup(pid))),
         _ => None,
     }
@@ -1591,7 +1620,8 @@ fn collect_pids() -> Vec<usize> {
 
 fn proc_file_content(kind: &ProcFileKind) -> String {
     match kind {
-        ProcFileKind::Mounts | ProcFileKind::PidMounts => proc_mounts(),
+        ProcFileKind::Mounts => proc_mounts_current(),
+        ProcFileKind::PidMounts(pid) => proc_mounts_for_pid(*pid),
         ProcFileKind::Cgroups => crate::fs::cgroup_proc_cgroups_content(),
         ProcFileKind::Meminfo => proc_meminfo(),
         ProcFileKind::Cpuinfo => proc_cpuinfo(),
@@ -1661,8 +1691,15 @@ fn proc_file_content(kind: &ProcFileKind) -> String {
     }
 }
 
-fn proc_mounts() -> String {
+fn proc_mounts_current() -> String {
     crate::syscall::filesystem::proc_mounts_snapshot()
+}
+
+fn proc_mounts_for_pid(pid: u32) -> String {
+    let Some(process) = pid2process(pid as usize) else {
+        return proc_mounts_current();
+    };
+    crate::syscall::filesystem::proc_mounts_snapshot_for_process(&process)
 }
 
 pub(crate) fn parse_proc_sys_usize(data: &[u8]) -> Result<usize, isize> {

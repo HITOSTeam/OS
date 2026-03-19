@@ -607,11 +607,13 @@ fn parse_shebang(data: &[u8]) -> Option<(String, Option<String>)> {
 
 pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
+    const CLONE_FS: usize = 0x0000_0200;
     const CLONE_FILES: usize = 0x0000_0400;
     const CLONE_VFORK: usize = 0x0000_4000;
     const CLONE_PARENT: usize = 0x0000_8000;
     const CLONE_SIGHAND: usize = 0x0000_0800;
     const CLONE_THREAD: usize = 0x0001_0000;
+    const CLONE_NEWNS: usize = 0x0002_0000;
     const CLONE_SETTLS: usize = 0x0008_0000;
     const CLONE_PARENT_SETTID: usize = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
@@ -646,7 +648,12 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
         return EINVAL;
     }
-    if (flags & (CLONE_NEWUTS | CLONE_NEWCGROUP)) != 0 && current_process().borrow_mut().euid != 0 {
+    if (flags & CLONE_NEWNS) != 0 && (flags & CLONE_FS) != 0 {
+        return EINVAL;
+    }
+    if (flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWCGROUP)) != 0
+        && current_process().borrow_mut().euid != 0
+    {
         return EPERM;
     }
     if stack == 0 {
@@ -797,6 +804,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     }
     if (flags & CLONE_NEWUTS) != 0 {
         child.unshare_uts_namespace();
+    }
+    if (flags & CLONE_NEWNS) != 0 {
+        child.unshare_mount_namespace();
     }
     if (flags & CLONE_NEWCGROUP) != 0 {
         child.set_cgroup_namespace_root(cgroup_current_path(child.getpid()));

@@ -12,15 +12,15 @@ use spin::Mutex;
 use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
-        CgroupFile, CgroupMountSpec, EventFdFile, File, NamespaceFile, NetSocketFile, OSInode,
-        OpenFlags, Pipe, ProcMagicLinkFile, ProcMagicLinkFollowTarget, ProcPseudoFile, PseudoBlock,
-        PseudoDir, PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
-        SocketPairEnd, TimerFdFile, TtyFile, cgroup_charge_file_write,
-        cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
-        cgroup_umount, ext4_lock, find_path_in_roots, make_pipe, open_cgroup_pseudo, open_file,
-        pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_stat_snapshot,
-        register_deferred_unlink_cleanup, secondary_root_inode, shm_create, shm_get, shm_list,
-        shm_remove,
+        CgroupFile, CgroupMountSpec, EventFdFile, File, MountNamespace, MountNamespaceState,
+        MountRecord, NamespaceFile, NetSocketFile, OSInode, OpenFlags, Pipe, ProcMagicLinkFile,
+        ProcMagicLinkFollowTarget, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent,
+        PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd,
+        TimerFdFile, TtyFile, cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir,
+        cgroup_mount, cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots,
+        make_pipe, open_cgroup_pseudo, open_file, pseudo_block_is_read_only,
+        pseudo_block_note_sync, pseudo_block_stat_snapshot, register_deferred_unlink_cleanup,
+        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
@@ -410,8 +410,6 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref FIFO_PIPE_STATES: Mutex<BTreeMap<u64, Arc<FifoPipeState>>> =
         Mutex::new(BTreeMap::new());
-    static ref ROFS_MOUNTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    static ref MOUNT_TABLE: Mutex<Vec<MountRecord>> = Mutex::new(Vec::new());
     static ref DEVICE_MOUNT_SOURCES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
     static ref TMPFS_REATTACH_SOURCES: Mutex<BTreeMap<String, String>> =
         Mutex::new(BTreeMap::new());
@@ -488,17 +486,6 @@ fn inode_is_immutable_or_append(inode: &Arc<ext4_fs::Inode>) -> bool {
     (inode_fs_flags(inode.inode_num() as u64) & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0
 }
 
-#[derive(Clone)]
-struct MountRecord {
-    target: String,
-    source: String,
-    source_display: String,
-    fs_type: String,
-    flags: usize,
-    access_seq: usize,
-    expire_mark_seq: Option<usize>,
-}
-
 fn mount_flags_to_proc_opts(flags: usize) -> String {
     let mut opts = Vec::new();
     opts.push(if (flags & MS_RDONLY) != 0 { "ro" } else { "rw" });
@@ -560,10 +547,13 @@ fn mount_source_join(source: &str, suffix: &str) -> String {
     )
 }
 
-fn mount_lookup_for_abs(abs: &str) -> Option<MountRecord> {
-    let mounts = MOUNT_TABLE.lock();
+fn current_mount_namespace() -> MountNamespace {
+    current_process().mount_namespace()
+}
+
+fn mount_lookup_for_state(state: &MountNamespaceState, abs: &str) -> Option<MountRecord> {
     let mut best: Option<MountRecord> = None;
-    for mount in mounts.iter() {
+    for mount in state.mounts() {
         if !path_under_mount(abs, &mount.target) {
             continue;
         }
@@ -575,12 +565,27 @@ fn mount_lookup_for_abs(abs: &str) -> Option<MountRecord> {
     best
 }
 
+fn mount_lookup_for_namespace(ns: &MountNamespace, abs: &str) -> Option<MountRecord> {
+    let state = ns.lock();
+    mount_lookup_for_state(&state, abs)
+}
+
+fn mount_lookup_for_abs(abs: &str) -> Option<MountRecord> {
+    mount_lookup_for_namespace(&current_mount_namespace(), abs)
+}
+
+fn mount_flags_for_namespace(ns: &MountNamespace, abs: &str) -> usize {
+    mount_lookup_for_namespace(ns, abs)
+        .map(|m| m.flags)
+        .unwrap_or(0)
+}
+
 fn mount_flags_for_abs(abs: &str) -> usize {
     mount_lookup_for_abs(abs).map(|m| m.flags).unwrap_or(0)
 }
 
-fn translate_mount_abs(abs: &str) -> String {
-    let Some(mount) = mount_lookup_for_abs(abs) else {
+fn translate_mount_abs_for_namespace(ns: &MountNamespace, abs: &str) -> String {
+    let Some(mount) = mount_lookup_for_namespace(ns, abs) else {
         return String::from(abs);
     };
     let suffix = if abs == mount.target {
@@ -591,6 +596,46 @@ fn translate_mount_abs(abs: &str) -> String {
     normalize_path("/", &mount_source_join(&mount.source, suffix))
 }
 
+fn translate_mount_abs(abs: &str) -> String {
+    translate_mount_abs_for_namespace(&current_mount_namespace(), abs)
+}
+
+fn with_mount_namespace_mut<R>(
+    ns: &MountNamespace,
+    f: impl FnOnce(&mut MountNamespaceState) -> R,
+) -> R {
+    let mut state = ns.lock();
+    f(&mut state)
+}
+
+fn upsert_mount_record_in(
+    ns: &MountNamespace,
+    target: &str,
+    source: &str,
+    source_display: &str,
+    fs_type: &str,
+    flags: usize,
+) {
+    with_mount_namespace_mut(ns, |state| {
+        let mounts = state.mounts_mut();
+        let snapshot = mounts
+            .iter()
+            .find(|m| m.target == target)
+            .map(|m| (m.access_seq, m.expire_mark_seq))
+            .unwrap_or((0, None));
+        mounts.retain(|m| m.target != target);
+        mounts.push(MountRecord {
+            target: String::from(target),
+            source: String::from(source),
+            source_display: String::from(source_display),
+            fs_type: String::from(fs_type),
+            flags,
+            access_seq: snapshot.0,
+            expire_mark_seq: snapshot.1,
+        });
+    });
+}
+
 fn upsert_mount_record(
     target: &str,
     source: &str,
@@ -598,53 +643,65 @@ fn upsert_mount_record(
     fs_type: &str,
     flags: usize,
 ) {
-    let mut mounts = MOUNT_TABLE.lock();
-    let state = mounts
-        .iter()
-        .find(|m| m.target == target)
-        .map(|m| (m.access_seq, m.expire_mark_seq))
-        .unwrap_or((0, None));
-    mounts.retain(|m| m.target != target);
-    mounts.push(MountRecord {
-        target: String::from(target),
-        source: String::from(source),
-        source_display: String::from(source_display),
-        fs_type: String::from(fs_type),
+    upsert_mount_record_in(
+        &current_mount_namespace(),
+        target,
+        source,
+        source_display,
+        fs_type,
         flags,
-        access_seq: state.0,
-        expire_mark_seq: state.1,
-    });
+    );
+}
+
+fn remove_mount_record_in(ns: &MountNamespace, target: &str) -> bool {
+    with_mount_namespace_mut(ns, |state| {
+        let mounts = state.mounts_mut();
+        let old_len = mounts.len();
+        mounts.retain(|m| m.target != target);
+        mounts.len() != old_len
+    })
 }
 
 fn remove_mount_record(target: &str) -> bool {
-    let mut mounts = MOUNT_TABLE.lock();
-    let old_len = mounts.len();
-    mounts.retain(|m| m.target != target);
-    mounts.len() != old_len
+    remove_mount_record_in(&current_mount_namespace(), target)
+}
+
+fn update_mount_record_flags_in(ns: &MountNamespace, target: &str, flags: usize) -> bool {
+    with_mount_namespace_mut(ns, |state| {
+        let Some(record) = state.mounts_mut().iter_mut().find(|m| m.target == target) else {
+            return false;
+        };
+        record.flags = flags;
+        true
+    })
 }
 
 fn update_mount_record_flags(target: &str, flags: usize) -> bool {
-    let mut mounts = MOUNT_TABLE.lock();
-    let Some(record) = mounts.iter_mut().find(|m| m.target == target) else {
-        return false;
-    };
-    record.flags = flags;
-    true
+    update_mount_record_flags_in(&current_mount_namespace(), target, flags)
+}
+
+fn move_mount_record_target_in(ns: &MountNamespace, old_target: &str, new_target: &str) -> bool {
+    with_mount_namespace_mut(ns, |state| {
+        let Some(record) = state
+            .mounts_mut()
+            .iter_mut()
+            .find(|m| m.target == old_target)
+        else {
+            return false;
+        };
+        record.target = String::from(new_target);
+        true
+    })
 }
 
 fn move_mount_record_target(old_target: &str, new_target: &str) -> bool {
-    let mut mounts = MOUNT_TABLE.lock();
-    let Some(record) = mounts.iter_mut().find(|m| m.target == old_target) else {
-        return false;
-    };
-    record.target = String::from(new_target);
-    true
+    move_mount_record_target_in(&current_mount_namespace(), old_target, new_target)
 }
 
-fn mount_display_abs(abs: &str) -> String {
-    let mounts = MOUNT_TABLE.lock();
+fn mount_display_abs_for_namespace(ns: &MountNamespace, abs: &str) -> String {
+    let state = ns.lock();
     let mut best: Option<&MountRecord> = None;
-    for mount in mounts.iter() {
+    for mount in state.mounts() {
         if !path_under_mount(abs, &mount.source) {
             continue;
         }
@@ -664,12 +721,22 @@ fn mount_display_abs(abs: &str) -> String {
     normalize_path("/", &mount_source_join(&mount.target, suffix))
 }
 
+fn mount_display_abs(abs: &str) -> String {
+    mount_display_abs_for_namespace(&current_mount_namespace(), abs)
+}
+
+fn sync_rofs_mount_flag_in(ns: &MountNamespace, target: &str, flags: usize) {
+    with_mount_namespace_mut(ns, |state| {
+        let mounts = state.rofs_mounts_mut();
+        mounts.retain(|m| m != target);
+        if (flags & MS_RDONLY) != 0 {
+            mounts.push(String::from(target));
+        }
+    });
+}
+
 fn sync_rofs_mount_flag(target: &str, flags: usize) {
-    let mut mounts = ROFS_MOUNTS.lock();
-    mounts.retain(|m| m != target);
-    if (flags & MS_RDONLY) != 0 {
-        mounts.push(String::from(target));
-    }
+    sync_rofs_mount_flag_in(&current_mount_namespace(), target, flags);
 }
 
 fn mount_flag_mask() -> usize {
@@ -684,23 +751,35 @@ fn mount_flag_mask() -> usize {
 }
 
 fn mount_record_for_target(target: &str) -> Option<MountRecord> {
-    let mounts = MOUNT_TABLE.lock();
-    mounts.iter().find(|m| m.target == target).cloned()
+    let state = current_mount_namespace();
+    let state = state.lock();
+    state.mounts().iter().find(|m| m.target == target).cloned()
+}
+
+fn mount_record_for_target_in(ns: &MountNamespace, target: &str) -> Option<MountRecord> {
+    let state = ns.lock();
+    state.mounts().iter().find(|m| m.target == target).cloned()
+}
+
+fn note_mount_access_in(ns: &MountNamespace, abs: &str) {
+    with_mount_namespace_mut(ns, |state| {
+        let mounts = state.mounts_mut();
+        let mut best_idx = None;
+        let mut best_len = 0usize;
+        for (idx, mount) in mounts.iter().enumerate() {
+            if path_under_mount(abs, &mount.target) && mount.target.len() >= best_len {
+                best_idx = Some(idx);
+                best_len = mount.target.len();
+            }
+        }
+        if let Some(idx) = best_idx {
+            mounts[idx].access_seq = mounts[idx].access_seq.saturating_add(1);
+        }
+    });
 }
 
 fn note_mount_access(abs: &str) {
-    let mut mounts = MOUNT_TABLE.lock();
-    let mut best_idx = None;
-    let mut best_len = 0usize;
-    for (idx, mount) in mounts.iter().enumerate() {
-        if path_under_mount(abs, &mount.target) && mount.target.len() >= best_len {
-            best_idx = Some(idx);
-            best_len = mount.target.len();
-        }
-    }
-    if let Some(idx) = best_idx {
-        mounts[idx].access_seq = mounts[idx].access_seq.saturating_add(1);
-    }
+    note_mount_access_in(&current_mount_namespace(), abs);
 }
 
 fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Option<String> {
@@ -739,6 +818,7 @@ fn mount_is_busy(target: &str, writable_only: bool) -> bool {
     let self_bind_root = mount_record_for_target(target)
         .map(|record| record.source == target)
         .unwrap_or(false);
+    let current_ns_id = current_process().mount_namespace_id();
     let processes = {
         let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
@@ -757,6 +837,9 @@ fn mount_is_busy(target: &str, writable_only: bool) -> bool {
             None => continue,
         };
         if is_zombie {
+            continue;
+        }
+        if process.mount_namespace_id() != current_ns_id {
             continue;
         }
         let cwd_busy = path_under_mount(&cwd, target) && !(self_bind_root && cwd == target);
@@ -1144,13 +1227,20 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
     };
 
     if (flags & MNT_EXPIRE) != 0 {
-        let mut mounts = MOUNT_TABLE.lock();
-        let Some(entry) = mounts.iter_mut().find(|m| m.target == abs) else {
-            return EINVAL;
-        };
-        if entry.expire_mark_seq != Some(entry.access_seq) {
-            entry.expire_mark_seq = Some(entry.access_seq);
-            return EAGAIN;
+        let updated = with_mount_namespace_mut(&current_mount_namespace(), |state| {
+            let Some(entry) = state.mounts_mut().iter_mut().find(|m| m.target == abs) else {
+                return None;
+            };
+            if entry.expire_mark_seq != Some(entry.access_seq) {
+                entry.expire_mark_seq = Some(entry.access_seq);
+                return Some(EAGAIN);
+            }
+            Some(0)
+        });
+        match updated {
+            Some(EAGAIN) => return EAGAIN,
+            Some(0) => {}
+            _ => return EINVAL,
         }
     }
 
@@ -1169,18 +1259,14 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
     }
     sync_rofs_mount_flag(&abs, 0);
     let _ = remove_mount_record(&abs);
-    if (record.flags & MS_RDONLY) != 0 {
-        let mut mounts = ROFS_MOUNTS.lock();
-        mounts.retain(|m| m != &abs);
-    }
     0
 }
 
-pub(crate) fn proc_mounts_snapshot() -> String {
+fn proc_mounts_snapshot_for_namespace(ns: &MountNamespace) -> String {
     let mut out = String::from("/dev/root / ext4 rw,relatime 0 0\n");
     let mut mounts = {
-        let mounts = MOUNT_TABLE.lock();
-        mounts.iter().cloned().collect::<Vec<_>>()
+        let state = ns.lock();
+        state.mounts().to_vec()
     };
     mounts.sort_by(|a, b| a.target.cmp(&b.target));
     for mount in mounts {
@@ -1200,21 +1286,33 @@ pub(crate) fn proc_mounts_snapshot() -> String {
     out
 }
 
+pub(crate) fn proc_mounts_snapshot() -> String {
+    proc_mounts_snapshot_for_namespace(&current_mount_namespace())
+}
+
+pub(crate) fn proc_mounts_snapshot_for_process(process: &Arc<ProcessControlBlock>) -> String {
+    proc_mounts_snapshot_for_namespace(&process.mount_namespace())
+}
+
 pub(crate) fn statfs_mount_flags_for_abs(abs: &str) -> i64 {
     mount_flags_to_statfs(mount_flags_for_abs(abs))
 }
 
 pub(crate) fn register_rofs_mount(abs: &str) {
-    let mut mounts = ROFS_MOUNTS.lock();
-    if !mounts.iter().any(|m| m == abs) {
-        mounts.push(String::from(abs));
-    }
+    let ns = current_mount_namespace();
+    with_mount_namespace_mut(&ns, |state| {
+        let mounts = state.rofs_mounts_mut();
+        if !mounts.iter().any(|m| m == abs) {
+            mounts.push(String::from(abs));
+        }
+    });
     let _ = update_mount_record_flags(abs, mount_flags_for_abs(abs) | MS_RDONLY);
 }
 
 pub(crate) fn unregister_rofs_mount(abs: &str) {
-    let mut mounts = ROFS_MOUNTS.lock();
-    mounts.retain(|m| m != abs);
+    with_mount_namespace_mut(&current_mount_namespace(), |state| {
+        state.rofs_mounts_mut().retain(|m| m != abs);
+    });
     if let Some(mut record) = mount_lookup_for_abs(abs) {
         if record.target == abs {
             record.flags &= !MS_RDONLY;
@@ -1227,8 +1325,12 @@ fn path_is_rofs(abs: &str) -> bool {
     if (mount_flags_for_abs(abs) & MS_RDONLY) != 0 {
         return true;
     }
-    let mounts = ROFS_MOUNTS.lock();
-    mounts.iter().any(|mnt| path_under_mount(abs, mnt))
+    let ns = current_mount_namespace();
+    let state = ns.lock();
+    state
+        .rofs_mounts()
+        .iter()
+        .any(|mnt| path_under_mount(abs, mnt))
 }
 
 fn path_is_nodev(abs: &str) -> bool {
@@ -1245,8 +1347,9 @@ fn path_is_nosymfollow(abs: &str) -> bool {
 
 fn inode_is_rofs_mount_root(inode: &Arc<ext4_fs::Inode>) -> bool {
     let mounts: Vec<String> = {
-        let mounts = ROFS_MOUNTS.lock();
-        mounts.iter().cloned().collect()
+        let ns = current_mount_namespace();
+        let state = ns.lock();
+        state.rofs_mounts().to_vec()
     };
     for mount in mounts {
         let Some(mount_inode) = find_path_in_roots(&translate_mount_abs(&mount)) else {
@@ -1262,11 +1365,12 @@ fn inode_is_rofs_mount_root(inode: &Arc<ext4_fs::Inode>) -> bool {
 }
 
 fn path_is_mount_point(abs: &str) -> bool {
-    if MOUNT_TABLE.lock().iter().any(|mnt| mnt.target == abs) {
+    if mount_record_for_target(abs).is_some() {
         return true;
     }
-    let mounts = ROFS_MOUNTS.lock();
-    mounts.iter().any(|mnt| mnt == abs)
+    let ns = current_mount_namespace();
+    let state = ns.lock();
+    state.rofs_mounts().iter().any(|mnt| mnt == abs)
 }
 
 fn path_under_mount(abs: &str, mnt: &str) -> bool {
@@ -1287,9 +1391,10 @@ fn rofs_mount_root_for_abs(abs: &str) -> Option<String> {
     if let Some(mount) = mount_lookup_for_abs(abs) {
         return Some(mount.target);
     }
-    let mounts = ROFS_MOUNTS.lock();
+    let ns = current_mount_namespace();
+    let state = ns.lock();
     let mut best: Option<&str> = None;
-    for mnt in mounts.iter() {
+    for mnt in state.rofs_mounts() {
         if path_under_mount(abs, mnt) {
             match best {
                 Some(cur) if mnt.len() <= cur.len() => {}
@@ -9391,7 +9496,7 @@ fn kstat_from_file(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> Result<KS
         let st_ino = if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
             pipe as *const Pipe as u64
         } else if let Some(ns) = file.as_any().downcast_ref::<NamespaceFile>() {
-            ns.ns_id() as u64
+            ns.inode_number()
         } else {
             1
         };

@@ -712,7 +712,7 @@ pub fn syscall_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5:
 /// Minimal support:
 /// - `CLONE_FILES`: unshare file descriptor table from CLONE_FILES owner.
 /// - `CLONE_FS`: currently a no-op (cwd/umask are already process-local).
-/// - `CLONE_NEWNS`: requires root and is treated as successful no-op namespace split.
+/// - `CLONE_NEWNS`: clone the current mount namespace.
 pub fn syscall_unshare(flags: usize) -> isize {
     const CLONE_FS: usize = 0x0000_0200;
     const CLONE_FILES: usize = 0x0000_0400;
@@ -729,6 +729,9 @@ pub fn syscall_unshare(flags: usize) -> isize {
     if (flags & CLONE_FILES) != 0 {
         process.unshare_files();
     }
+    if (flags & CLONE_NEWNS) != 0 {
+        process.unshare_mount_namespace();
+    }
     if (flags & CLONE_NEWUTS) != 0 {
         process.unshare_uts_namespace();
     }
@@ -739,9 +742,11 @@ pub fn syscall_unshare(flags: usize) -> isize {
 ///
 /// Minimal support:
 /// - IPC namespace fd from `/proc/<pid>/ns/ipc`
-/// - `nstype` of 0 or `CLONE_NEWIPC`
+/// - mount namespace fd from `/proc/<pid>/ns/mnt`
+/// - `nstype` of 0, `CLONE_NEWIPC`, or `CLONE_NEWNS`
 pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
     const EBADF: isize = -9;
+    const CLONE_NEWNS: usize = 0x0002_0000;
     const CLONE_NEWIPC: usize = 0x0800_0000;
 
     if fd < 0 {
@@ -782,6 +787,17 @@ pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
                 return EINVAL;
             }
             inner.ipc_ns_id = ns_file.ns_id();
+            0
+        }
+        NamespaceKind::Mount => {
+            if expected != CLONE_NEWNS {
+                return EINVAL;
+            }
+            drop(inner);
+            let Some(namespace) = ns_file.mount_namespace() else {
+                return EINVAL;
+            };
+            process.set_mount_namespace(namespace);
             0
         }
     }

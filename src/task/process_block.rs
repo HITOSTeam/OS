@@ -9,7 +9,10 @@ use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
-use crate::fs::{File, PollWaitQueue, Stdin, Stdout, cgroup_attach_fork_child};
+use crate::fs::{
+    File, MountNamespace, PollWaitQueue, Stdin, Stdout, cgroup_attach_fork_child,
+    clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
+};
 use crate::mm::{
     ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
 };
@@ -968,6 +971,8 @@ pub struct ProcessControlBlockInner {
     pub ipc_ns_id: usize,
     /// Shared UTS namespace state (hostname/domainname).
     pub uts_ns: Arc<SpinMutex<UtsNamespaceState>>,
+    /// Shared mount namespace state used by mount/umount/path view syscalls.
+    pub mnt_ns: MountNamespace,
     /// cgroup namespace root path. "/" means the initial namespace.
     pub cgroup_ns_root: String,
     /// PID namespace id; 0 is the initial namespace.
@@ -1426,6 +1431,7 @@ impl ProcessControlBlock {
                 mlockall_future: false,
                 ipc_ns_id: 0,
                 uts_ns: Arc::new(SpinMutex::new(UtsNamespaceState::new())),
+                mnt_ns: initial_mount_namespace(),
                 cgroup_ns_root: String::from("/"),
                 pid_ns_id: 0,
                 pid_ns_vpid: pid,
@@ -1933,6 +1939,7 @@ impl ProcessControlBlock {
                 mlockall_future: false,
                 ipc_ns_id: parent.ipc_ns_id,
                 uts_ns: Arc::clone(&parent.uts_ns),
+                mnt_ns: Arc::clone(&parent.mnt_ns),
                 cgroup_ns_root: parent.cgroup_ns_root.clone(),
                 pid_ns_id: parent.pid_ns_id,
                 pid_ns_vpid: pid_value,
@@ -2099,6 +2106,27 @@ impl ProcessControlBlock {
     pub fn uts_namespace(self: &Arc<Self>) -> Arc<SpinMutex<UtsNamespaceState>> {
         let inner = self.borrow_mut();
         Arc::clone(&inner.uts_ns)
+    }
+
+    pub fn mount_namespace(&self) -> MountNamespace {
+        let inner = self.borrow_mut();
+        Arc::clone(&inner.mnt_ns)
+    }
+
+    pub fn mount_namespace_id(&self) -> usize {
+        mount_namespace_id(&self.mount_namespace())
+    }
+
+    pub fn set_mount_namespace(&self, namespace: MountNamespace) {
+        self.borrow_mut().mnt_ns = namespace;
+    }
+
+    pub fn unshare_mount_namespace(&self) {
+        let namespace = {
+            let inner = self.borrow_mut();
+            clone_mount_namespace(&inner.mnt_ns)
+        };
+        self.borrow_mut().mnt_ns = namespace;
     }
 
     pub fn cgroup_namespace_root(&self) -> String {
