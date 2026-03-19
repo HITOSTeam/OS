@@ -2521,7 +2521,7 @@ fn resolve_at_inode(
 }
 
 pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
-    if let Some(abs) = resolve_abs_path(AT_FDCWD, path) {
+    if let Some(abs) = resolve_abs_path(AT_FDCWD, path)? {
         if path_is_noexec(&abs) {
             return Err(EACCES);
         }
@@ -2553,7 +2553,7 @@ pub(crate) fn resolve_exec_inode_at(
         return Err(EINVAL);
     }
     if !path.is_empty() {
-        if let Some(abs) = resolve_abs_path(dirfd, path) {
+        if let Some(abs) = resolve_abs_path(dirfd, path)? {
             if path_is_noexec(&abs) {
                 return Err(EACCES);
             }
@@ -2802,9 +2802,9 @@ fn resolve_parent_and_name(
     }
 }
 
-fn resolve_abs_path(dirfd: isize, path: &str) -> Option<String> {
+fn resolve_abs_path(dirfd: isize, path: &str) -> Result<Option<String>, isize> {
     if path.is_empty() {
-        return None;
+        return Ok(None);
     }
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
@@ -2827,16 +2827,18 @@ fn resolve_abs_path(dirfd: isize, path: &str) -> Option<String> {
                 }
             }
         } else {
-            return None;
+            return Ok(None);
         }
     } else {
-        return None;
+        return Ok(None);
     };
-    Some(resolve_proc_magic_intermediate_abs_path(&abs).unwrap_or(abs))
+    resolve_proc_magic_intermediate_abs_path(&abs).map(Some)
 }
 
 fn rofs_for_path(dirfd: isize, path: &str) -> bool {
     resolve_abs_path(dirfd, path)
+        .ok()
+        .flatten()
         .map(|abs| path_is_rofs(&abs))
         .unwrap_or(false)
 }
@@ -4376,7 +4378,10 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     };
     let tmpfile_requested = (flags & O_TMPFILE) == O_TMPFILE;
     let write_intent = writable || (flags & (O_CREAT | O_TRUNC)) != 0 || tmpfile_requested;
-    let raw_abs = resolve_abs_path(dirfd, &path);
+    let raw_abs = match resolve_abs_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let readonly_fs = raw_abs.as_deref().map(path_is_rofs).unwrap_or(false);
     if write_intent && readonly_fs {
         return EROFS;
@@ -4436,11 +4441,11 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                     if (flags & O_DIRECTORY) != 0 {
                         return ENOTDIR;
                     }
-                    let Some(target) = crate::fs::proc_readlink(proc_path) else {
-                        return ENOENT;
-                    };
-                    let fd = match install_open_file_fd(ProcMagicLinkFile::new(target), flags, true)
-                    {
+                    let fd = match install_open_file_fd(
+                        ProcMagicLinkFile::new(proc_path),
+                        flags,
+                        true,
+                    ) {
                         Ok(fd) => fd,
                         Err(e) => return e,
                     };
@@ -5403,7 +5408,10 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     if !inode_mode_allows_uid_gid(&inode, mode, uid, gid) {
         return EACCES;
     }
-    if let Some(abs) = resolve_abs_path(dirfd, &path) {
+    if let Some(abs) = match resolve_abs_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    } {
         mount_note_path_access(&abs);
     }
     0
@@ -5807,7 +5815,10 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
             return EBADF;
         };
         if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
-            let bytes = link.target().as_bytes();
+            let Some(target) = link.readlink_target() else {
+                return ENOENT;
+            };
+            let bytes = target.as_bytes();
             let len = min(bytes.len(), bufsiz);
             if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
                 return EFAULT;
@@ -5830,7 +5841,10 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
         return len as isize;
     }
 
-    let raw_abs = resolve_abs_path(dirfd, &path);
+    let raw_abs = match resolve_abs_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
@@ -7652,7 +7666,10 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         if final_non_empty_component(&path) == Some("..") {
             return ENOTEMPTY;
         }
-        if let Some(abs) = resolve_abs_path(dirfd, &path) {
+        if let Some(abs) = match resolve_abs_path(dirfd, &path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        } {
             if path_is_mount_point(&abs) {
                 return EBUSY;
             }
@@ -8944,8 +8961,10 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
             if let Err(e) = resolve_at_inode(&at, fsuid, fsgid, true) {
                 return e;
             }
-            let abs =
-                resolve_abs_path(AT_FDCWD, path.as_str()).unwrap_or_else(|| String::from("/"));
+            let abs = resolve_abs_path(AT_FDCWD, path.as_str())
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| String::from("/"));
             fill_statfs(st_ptr, statfs_mount_flags_for_abs(&abs))
         }
     }
@@ -9285,7 +9304,7 @@ fn proc_symlink_kstat(link_len: usize) -> KStat {
 
 fn kstat_from_file(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> Result<KStat, isize> {
     if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
-        return Ok(proc_symlink_kstat(link.target().len()));
+        return Ok(proc_symlink_kstat(link.target_len_hint()));
     }
 
     if file.as_any().downcast_ref::<PseudoDir>().is_some()
@@ -9837,7 +9856,10 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return ENOENT;
     }
 
-    let raw_abs = resolve_abs_path(dirfd, &path);
+    let raw_abs = match resolve_abs_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
@@ -9990,7 +10012,10 @@ pub fn syscall_statx(
         return EBADF;
     }
     let effective_dirfd = dirfd;
-    let raw_abs = resolve_abs_path(effective_dirfd, &path);
+    let raw_abs = match resolve_abs_path(effective_dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let at = match resolve_at_path(effective_dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
@@ -10676,7 +10701,7 @@ fn read_user_path_abs(dirfd: isize, ptr: usize) -> Result<String, isize> {
     if path.is_empty() {
         return Err(ENOENT);
     }
-    resolve_abs_path(dirfd, &path).ok_or(EBADF)
+    resolve_abs_path(dirfd, &path)?.ok_or(EBADF)
 }
 
 fn ensure_mount_target_dir(abs: &str) -> Result<(), isize> {

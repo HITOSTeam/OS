@@ -150,7 +150,8 @@ pub struct ProcPseudoFile {
 }
 
 pub struct ProcMagicLinkFile {
-    target: String,
+    link_path: String,
+    target_len_hint: usize,
 }
 
 impl ProcPseudoFile {
@@ -232,12 +233,25 @@ impl ProcPseudoFile {
 }
 
 impl ProcMagicLinkFile {
-    pub fn new(target: String) -> Arc<Self> {
-        Arc::new(Self { target })
+    pub fn new(path: &str) -> Arc<Self> {
+        let link_path = normalize_proc_magic_path(path).into_owned();
+        let target_len_hint = proc_readlink(&link_path).map_or(0, |target| target.len());
+        Arc::new(Self {
+            link_path,
+            target_len_hint,
+        })
     }
 
-    pub fn target(&self) -> &str {
-        &self.target
+    pub fn link_path(&self) -> &str {
+        &self.link_path
+    }
+
+    pub fn readlink_target(&self) -> Option<String> {
+        proc_readlink(&self.link_path)
+    }
+
+    pub fn target_len_hint(&self) -> usize {
+        self.target_len_hint
     }
 }
 
@@ -1081,7 +1095,7 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
         return Some(alloc::format!("ipc:[{}]", ns.ns_id()));
     }
     if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
-        return Some(String::from(link.target()));
+        return Some(String::from(link.link_path()));
     }
     if file.as_any().downcast_ref::<RtcFile>().is_some() {
         return Some(String::from("/dev/misc/rtc"));
