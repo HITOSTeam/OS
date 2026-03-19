@@ -2560,7 +2560,6 @@ pub(crate) fn resolve_exec_inode_at(
         }
     }
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let inode = if path.is_empty() {
         if (flags & AT_EMPTY_PATH) == 0 {
@@ -2581,12 +2580,17 @@ pub(crate) fn resolve_exec_inode_at(
         if let AtPath::PseudoAbs(_) = &at {
             return Err(ENOENT);
         }
+        // Resolve the lookup path before taking `ext4_lock()`: the AT_FDCWD
+        // relative-path branch may need to reopen the base inode under the
+        // same lock, and holding it here would self-deadlock.
+        let _ext4_guard = ext4_lock();
         let inode = resolve_at_inode(&at, fsuid, fsgid, follow_final)?;
         if !follow_final && inode.is_symlink() {
             return Err(ELOOP);
         }
         inode
     };
+    let _ext4_guard = ext4_lock();
     if !inode.is_file() {
         return Err(EACCES);
     }

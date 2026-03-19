@@ -8,7 +8,7 @@ use spin::{Mutex, MutexGuard};
 
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
-    debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
+    debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL},
     fs::{
         PidFdFile, cgroup_attach_thread, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
         root_inode_for_path, secondary_root_inode,
