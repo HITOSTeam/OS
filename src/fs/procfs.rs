@@ -131,13 +131,14 @@ fn record_proc_pid_stat_diag(pid: u32, state_char: char, elapsed_cycles: usize, 
 }
 
 // gzip-compressed minimal config for LTP kconfig checks.
-// Keep this conservative: only advertise options that this kernel surface
-// actually exposes to user space.
+// Keep this conservative, but include the coarse namespace capability bits
+// once the corresponding mount-namespace surface is intentionally exposed.
 const PROC_CONFIG_GZ: &[u8] = &[
     31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 115, 246, 247, 115, 243, 116, 143, 119, 10, 118, 137, 15, 8,
     242, 119, 118, 13, 14, 142, 119, 116, 118, 14, 177, 173, 228, 82, 86, 112, 198, 46, 23, 31,
-    102, 172, 144, 89, 172, 144, 151, 95, 162, 80, 156, 90, 194, 5, 85, 5, 82, 17, 239, 22, 12,
-    212, 8, 21, 8, 142, 12, 118, 14, 241, 1, 242, 1, 240, 171, 117, 110, 99, 0, 0, 0,
+    102, 172, 144, 89, 172, 144, 151, 95, 162, 80, 156, 90, 194, 5, 85, 229, 231, 232, 235, 26,
+    28, 224, 8, 84, 5, 212, 11, 21, 11, 13, 118, 13, 138, 247, 67, 18, 0, 25, 19, 239, 134, 36,
+    16, 28, 25, 236, 28, 226, 3, 228, 3, 0, 190, 82, 59, 223, 136, 0, 0, 0,
 ];
 
 struct ProcPseudoInner {

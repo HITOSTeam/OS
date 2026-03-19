@@ -139,7 +139,7 @@ pub(crate) use inode::{
     root_inode_for_path, secondary_root_inode,
 };
 pub(crate) use mountns::{
-    MountNamespace, MountNamespaceState, MountRecord, clone_mount_namespace,
+    MountNamespace, MountNamespaceState, MountPropagation, MountRecord, clone_mount_namespace,
     initial_mount_namespace, mount_namespace_id,
 };
 pub(crate) use net_socket::notify_net_poll_events;

@@ -5,6 +5,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MountPropagation {
+    Private,
+    Shared,
+    Slave,
+    Unbindable,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct MountRecord {
     pub(crate) target: String,
@@ -12,6 +20,11 @@ pub(crate) struct MountRecord {
     pub(crate) source_display: String,
     pub(crate) fs_type: String,
     pub(crate) flags: usize,
+    pub(crate) stack_seq: usize,
+    pub(crate) event_id: usize,
+    pub(crate) propagation: MountPropagation,
+    pub(crate) peer_group_id: Option<usize>,
+    pub(crate) master_group_id: Option<usize>,
     pub(crate) access_seq: usize,
     pub(crate) expire_mark_seq: Option<usize>,
 }

@@ -13,14 +13,15 @@ use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
         CgroupFile, CgroupMountSpec, EventFdFile, File, MountNamespace, MountNamespaceState,
-        MountRecord, NamespaceFile, NetSocketFile, OSInode, OpenFlags, Pipe, ProcMagicLinkFile,
-        ProcMagicLinkFollowTarget, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent,
-        PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd,
-        TimerFdFile, TtyFile, cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir,
-        cgroup_mount, cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots,
-        make_pipe, open_cgroup_pseudo, open_file, pseudo_block_is_read_only,
-        pseudo_block_note_sync, pseudo_block_stat_snapshot, register_deferred_unlink_cleanup,
-        secondary_root_inode, shm_create, shm_get, shm_list, shm_remove,
+        MountPropagation, MountRecord, NamespaceFile, NetSocketFile, OSInode, OpenFlags, Pipe,
+        ProcMagicLinkFile, ProcMagicLinkFollowTarget, ProcPseudoFile, PseudoBlock, PseudoDir,
+        PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
+        SocketPairEnd, TimerFdFile, TtyFile, cgroup_charge_file_write,
+        cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
+        cgroup_umount, ext4_lock, find_path_in_roots, make_pipe, open_cgroup_pseudo, open_file,
+        pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_stat_snapshot,
+        register_deferred_unlink_cleanup, secondary_root_inode, shm_create, shm_get, shm_list,
+        shm_remove,
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
@@ -81,7 +82,11 @@ const MS_NOATIME: usize = 0x400;
 const MS_NODIRATIME: usize = 0x800;
 const MS_BIND: usize = 0x1000;
 const MS_MOVE: usize = 0x2000;
+const MS_REC: usize = 0x4000;
+const MS_UNBINDABLE: usize = 1 << 17;
 const MS_PRIVATE: usize = 1 << 18;
+const MS_SLAVE: usize = 1 << 19;
+const MS_SHARED: usize = 1 << 20;
 const MS_STRICTATIME: usize = 1 << 24;
 
 const MNT_FORCE: usize = 0x1;
@@ -202,6 +207,9 @@ const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
 const FALLOC_FL_SUPPORTED_MASK: usize = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
 
 static TMPFILE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static NEXT_MOUNT_STACK_SEQ: AtomicUsize = AtomicUsize::new(1);
+static NEXT_MOUNT_EVENT_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_MOUNT_PEER_GROUP_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Clone, Copy, Default)]
 struct InodeTimes {
@@ -551,6 +559,42 @@ fn current_mount_namespace() -> MountNamespace {
     current_process().mount_namespace()
 }
 
+fn next_mount_stack_seq() -> usize {
+    NEXT_MOUNT_STACK_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_mount_event_id() -> usize {
+    NEXT_MOUNT_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_mount_peer_group_id() -> usize {
+    NEXT_MOUNT_PEER_GROUP_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn mount_target_match_better(candidate: &MountRecord, current: &MountRecord) -> bool {
+    candidate.target.len() > current.target.len()
+        || (candidate.target.len() == current.target.len() && candidate.stack_seq > current.stack_seq)
+}
+
+fn mount_source_match_better(candidate: &MountRecord, current: &MountRecord) -> bool {
+    candidate.source.len() > current.source.len()
+        || (candidate.source.len() == current.source.len() && candidate.stack_seq > current.stack_seq)
+}
+
+fn top_mount_index_for_target_in_state(state: &MountNamespaceState, target: &str) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for (idx, mount) in state.mounts().iter().enumerate() {
+        if mount.target != target {
+            continue;
+        }
+        match best {
+            Some((_, cur_seq)) if mount.stack_seq <= cur_seq => {}
+            _ => best = Some((idx, mount.stack_seq)),
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
+
 fn mount_lookup_for_state(state: &MountNamespaceState, abs: &str) -> Option<MountRecord> {
     let mut best: Option<MountRecord> = None;
     for mount in state.mounts() {
@@ -558,7 +602,7 @@ fn mount_lookup_for_state(state: &MountNamespaceState, abs: &str) -> Option<Moun
             continue;
         }
         match best.as_ref() {
-            Some(cur) if mount.target.len() <= cur.target.len() => {}
+            Some(cur) if !mount_target_match_better(mount, cur) => {}
             _ => best = Some(mount.clone()),
         }
     }
@@ -608,57 +652,103 @@ fn with_mount_namespace_mut<R>(
     f(&mut state)
 }
 
-fn upsert_mount_record_in(
+fn push_mount_record_in(
     ns: &MountNamespace,
     target: &str,
     source: &str,
     source_display: &str,
     fs_type: &str,
     flags: usize,
+    propagation: MountPropagation,
+    peer_group_id: Option<usize>,
+    master_group_id: Option<usize>,
+    event_id: usize,
 ) {
     with_mount_namespace_mut(ns, |state| {
-        let mounts = state.mounts_mut();
-        let snapshot = mounts
-            .iter()
-            .find(|m| m.target == target)
-            .map(|m| (m.access_seq, m.expire_mark_seq))
-            .unwrap_or((0, None));
-        mounts.retain(|m| m.target != target);
-        mounts.push(MountRecord {
+        state.mounts_mut().push(MountRecord {
             target: String::from(target),
             source: String::from(source),
             source_display: String::from(source_display),
             fs_type: String::from(fs_type),
             flags,
-            access_seq: snapshot.0,
-            expire_mark_seq: snapshot.1,
+            stack_seq: next_mount_stack_seq(),
+            event_id,
+            propagation,
+            peer_group_id,
+            master_group_id,
+            access_seq: 0,
+            expire_mark_seq: None,
         });
     });
 }
 
-fn upsert_mount_record(
+fn mount_record_for_target(target: &str) -> Option<MountRecord> {
+    let state = current_mount_namespace();
+    let state = state.lock();
+    let idx = top_mount_index_for_target_in_state(&state, target)?;
+    Some(state.mounts()[idx].clone())
+}
+
+fn mount_record_for_target_in(ns: &MountNamespace, target: &str) -> Option<MountRecord> {
+    let state = ns.lock();
+    let idx = top_mount_index_for_target_in_state(&state, target)?;
+    Some(state.mounts()[idx].clone())
+}
+
+fn sync_rofs_mount_flag_in(ns: &MountNamespace, target: &str, flags: usize) {
+    with_mount_namespace_mut(ns, |state| {
+        let mounts = state.rofs_mounts_mut();
+        mounts.retain(|m| m != target);
+        if (flags & MS_RDONLY) != 0 {
+            mounts.push(String::from(target));
+        }
+    });
+}
+
+fn sync_rofs_mount_flag(target: &str, flags: usize) {
+    sync_rofs_mount_flag_in(&current_mount_namespace(), target, flags);
+}
+
+fn sync_mount_record_rofs_in(ns: &MountNamespace, target: &str) {
+    if let Some(record) = mount_record_for_target_in(ns, target) {
+        sync_rofs_mount_flag_in(ns, target, record.flags);
+    } else {
+        sync_rofs_mount_flag_in(ns, target, 0);
+    }
+}
+
+fn push_mount_record(
     target: &str,
     source: &str,
     source_display: &str,
     fs_type: &str,
     flags: usize,
+    propagation: MountPropagation,
+    peer_group_id: Option<usize>,
+    master_group_id: Option<usize>,
+    event_id: usize,
 ) {
-    upsert_mount_record_in(
+    push_mount_record_in(
         &current_mount_namespace(),
         target,
         source,
         source_display,
         fs_type,
         flags,
+        propagation,
+        peer_group_id,
+        master_group_id,
+        event_id,
     );
 }
 
 fn remove_mount_record_in(ns: &MountNamespace, target: &str) -> bool {
     with_mount_namespace_mut(ns, |state| {
-        let mounts = state.mounts_mut();
-        let old_len = mounts.len();
-        mounts.retain(|m| m.target != target);
-        mounts.len() != old_len
+        let Some(idx) = top_mount_index_for_target_in_state(state, target) else {
+            return false;
+        };
+        state.mounts_mut().remove(idx);
+        true
     })
 }
 
@@ -668,10 +758,10 @@ fn remove_mount_record(target: &str) -> bool {
 
 fn update_mount_record_flags_in(ns: &MountNamespace, target: &str, flags: usize) -> bool {
     with_mount_namespace_mut(ns, |state| {
-        let Some(record) = state.mounts_mut().iter_mut().find(|m| m.target == target) else {
+        let Some(idx) = top_mount_index_for_target_in_state(state, target) else {
             return false;
         };
-        record.flags = flags;
+        state.mounts_mut()[idx].flags = flags;
         true
     })
 }
@@ -682,14 +772,10 @@ fn update_mount_record_flags(target: &str, flags: usize) -> bool {
 
 fn move_mount_record_target_in(ns: &MountNamespace, old_target: &str, new_target: &str) -> bool {
     with_mount_namespace_mut(ns, |state| {
-        let Some(record) = state
-            .mounts_mut()
-            .iter_mut()
-            .find(|m| m.target == old_target)
-        else {
+        let Some(idx) = top_mount_index_for_target_in_state(state, old_target) else {
             return false;
         };
-        record.target = String::from(new_target);
+        state.mounts_mut()[idx].target = String::from(new_target);
         true
     })
 }
@@ -706,7 +792,7 @@ fn mount_display_abs_for_namespace(ns: &MountNamespace, abs: &str) -> String {
             continue;
         }
         match best {
-            Some(cur) if mount.source.len() <= cur.source.len() => {}
+            Some(cur) if !mount_source_match_better(mount, cur) => {}
             _ => best = Some(mount),
         }
     }
@@ -725,20 +811,6 @@ fn mount_display_abs(abs: &str) -> String {
     mount_display_abs_for_namespace(&current_mount_namespace(), abs)
 }
 
-fn sync_rofs_mount_flag_in(ns: &MountNamespace, target: &str, flags: usize) {
-    with_mount_namespace_mut(ns, |state| {
-        let mounts = state.rofs_mounts_mut();
-        mounts.retain(|m| m != target);
-        if (flags & MS_RDONLY) != 0 {
-            mounts.push(String::from(target));
-        }
-    });
-}
-
-fn sync_rofs_mount_flag(target: &str, flags: usize) {
-    sync_rofs_mount_flag_in(&current_mount_namespace(), target, flags);
-}
-
 fn mount_flag_mask() -> usize {
     MS_RDONLY
         | MS_NOSUID
@@ -750,29 +822,22 @@ fn mount_flag_mask() -> usize {
         | MS_STRICTATIME
 }
 
-fn mount_record_for_target(target: &str) -> Option<MountRecord> {
-    let state = current_mount_namespace();
-    let state = state.lock();
-    state.mounts().iter().find(|m| m.target == target).cloned()
-}
-
-fn mount_record_for_target_in(ns: &MountNamespace, target: &str) -> Option<MountRecord> {
-    let state = ns.lock();
-    state.mounts().iter().find(|m| m.target == target).cloned()
-}
-
 fn note_mount_access_in(ns: &MountNamespace, abs: &str) {
     with_mount_namespace_mut(ns, |state| {
         let mounts = state.mounts_mut();
-        let mut best_idx = None;
-        let mut best_len = 0usize;
+        let mut best: Option<(usize, usize, usize)> = None;
         for (idx, mount) in mounts.iter().enumerate() {
-            if path_under_mount(abs, &mount.target) && mount.target.len() >= best_len {
-                best_idx = Some(idx);
-                best_len = mount.target.len();
+            if !path_under_mount(abs, &mount.target) {
+                continue;
+            }
+            match best {
+                Some((_, cur_len, cur_seq))
+                    if mount.target.len() < cur_len
+                        || (mount.target.len() == cur_len && mount.stack_seq <= cur_seq) => {}
+                _ => best = Some((idx, mount.target.len(), mount.stack_seq)),
             }
         }
-        if let Some(idx) = best_idx {
+        if let Some((idx, _, _)) = best {
             mounts[idx].access_seq = mounts[idx].access_seq.saturating_add(1);
         }
     });
@@ -930,6 +995,240 @@ fn target_dir_exists(abs: &str) -> Result<(), isize> {
     Ok(())
 }
 
+fn collect_live_mount_namespaces() -> Vec<MountNamespace> {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for process in processes {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        if inner.is_zombie {
+            continue;
+        }
+        let ns = Arc::clone(&inner.mnt_ns);
+        let ns_id = inner.mnt_ns.lock().id();
+        drop(inner);
+        if seen.insert(ns_id) {
+            out.push(ns);
+        }
+    }
+    out
+}
+
+fn inherited_mount_propagation(
+    target: &str,
+) -> (MountPropagation, Option<usize>, Option<usize>) {
+    let Some(base) = mount_record_for_target(target) else {
+        return (MountPropagation::Private, None, None);
+    };
+    match base.propagation {
+        MountPropagation::Private => (MountPropagation::Private, None, None),
+        MountPropagation::Shared => (MountPropagation::Shared, base.peer_group_id, None),
+        MountPropagation::Slave => (MountPropagation::Slave, None, base.master_group_id),
+        MountPropagation::Unbindable => (MountPropagation::Unbindable, None, None),
+    }
+}
+
+fn create_mount_record_with_propagation(
+    target: &str,
+    source: &str,
+    source_display: &str,
+    fs_type: &str,
+    flags: usize,
+) {
+    let Some(base) = mount_record_for_target(target) else {
+        push_mount_record(
+            target,
+            source,
+            source_display,
+            fs_type,
+            flags,
+            MountPropagation::Private,
+            None,
+            None,
+            next_mount_event_id(),
+        );
+        sync_mount_record_rofs(target);
+        return;
+    };
+
+    if base.propagation != MountPropagation::Shared {
+        let (propagation, peer_group_id, master_group_id) = inherited_mount_propagation(target);
+        push_mount_record(
+            target,
+            source,
+            source_display,
+            fs_type,
+            flags,
+            propagation,
+            peer_group_id,
+            master_group_id,
+            next_mount_event_id(),
+        );
+        sync_mount_record_rofs(target);
+        return;
+    }
+
+    let Some(source_peer_group) = base.peer_group_id else {
+        push_mount_record(
+            target,
+            source,
+            source_display,
+            fs_type,
+            flags,
+            MountPropagation::Private,
+            None,
+            None,
+            next_mount_event_id(),
+        );
+        sync_mount_record_rofs(target);
+        return;
+    };
+
+    let event_id = next_mount_event_id();
+    let new_peer_group = next_mount_peer_group_id();
+    let namespaces = collect_live_mount_namespaces();
+    let mut created_any = false;
+
+    for ns in namespaces {
+        let Some(top) = mount_record_for_target_in(&ns, target) else {
+            continue;
+        };
+        if top.propagation == MountPropagation::Shared
+            && top.peer_group_id == Some(source_peer_group)
+        {
+            push_mount_record_in(
+                &ns,
+                target,
+                source,
+                source_display,
+                fs_type,
+                flags,
+                MountPropagation::Shared,
+                Some(new_peer_group),
+                None,
+                event_id,
+            );
+            sync_mount_record_rofs_in(&ns, target);
+            created_any = true;
+        } else if top.propagation == MountPropagation::Slave
+            && top.master_group_id == Some(source_peer_group)
+        {
+            push_mount_record_in(
+                &ns,
+                target,
+                source,
+                source_display,
+                fs_type,
+                flags,
+                MountPropagation::Slave,
+                None,
+                Some(new_peer_group),
+                event_id,
+            );
+            sync_mount_record_rofs_in(&ns, target);
+            created_any = true;
+        }
+    }
+
+    if !created_any {
+        push_mount_record(
+            target,
+            source,
+            source_display,
+            fs_type,
+            flags,
+            MountPropagation::Shared,
+            Some(new_peer_group),
+            None,
+            event_id,
+        );
+        sync_mount_record_rofs(target);
+    }
+}
+
+fn remove_mount_records_by_event(target: &str, event_id: usize) -> usize {
+    let namespaces = collect_live_mount_namespaces();
+    let mut removed = 0usize;
+    for ns in namespaces {
+        let should_remove = mount_record_for_target_in(&ns, target)
+            .map(|record| record.event_id == event_id)
+            .unwrap_or(false);
+        if !should_remove {
+            continue;
+        }
+        if remove_mount_record_in(&ns, target) {
+            sync_mount_record_rofs_in(&ns, target);
+            removed = removed.saturating_add(1);
+        }
+    }
+    removed
+}
+
+fn apply_mount_propagation_change(target: &str, flags: usize) -> Result<(), isize> {
+    let propagation = match (
+        (flags & MS_SHARED) != 0,
+        (flags & MS_PRIVATE) != 0,
+        (flags & MS_SLAVE) != 0,
+        (flags & MS_UNBINDABLE) != 0,
+    ) {
+        (true, false, false, false) => MountPropagation::Shared,
+        (false, true, false, false) => MountPropagation::Private,
+        (false, false, true, false) => MountPropagation::Slave,
+        (false, false, false, true) => MountPropagation::Unbindable,
+        _ => return Err(EINVAL),
+    };
+    let recursive = (flags & MS_REC) != 0;
+    let mut changed = false;
+    with_mount_namespace_mut(&current_mount_namespace(), |state| {
+        for record in state.mounts_mut().iter_mut() {
+            let applies = if recursive {
+                path_under_mount(&record.target, target)
+            } else {
+                record.target == target
+            };
+            if !applies {
+                continue;
+            }
+            match propagation {
+                MountPropagation::Shared => {
+                    let peer_group = record
+                        .peer_group_id
+                        .unwrap_or_else(next_mount_peer_group_id);
+                    record.propagation = MountPropagation::Shared;
+                    record.peer_group_id = Some(peer_group);
+                    record.master_group_id = None;
+                }
+                MountPropagation::Private => {
+                    record.propagation = MountPropagation::Private;
+                    record.peer_group_id = None;
+                    record.master_group_id = None;
+                }
+                MountPropagation::Slave => {
+                    let master_group = record.peer_group_id.or(record.master_group_id);
+                    record.propagation = MountPropagation::Slave;
+                    record.peer_group_id = None;
+                    record.master_group_id = master_group;
+                }
+                MountPropagation::Unbindable => {
+                    record.propagation = MountPropagation::Unbindable;
+                    record.peer_group_id = None;
+                    record.master_group_id = None;
+                }
+            }
+            changed = true;
+        }
+    });
+    if !changed {
+        target_dir_exists(target)?;
+    }
+    Ok(())
+}
+
 fn sync_mount_record_rofs(target: &str) {
     if let Some(record) = mount_record_for_target(target) {
         sync_rofs_mount_flag(target, record.flags);
@@ -997,8 +1296,9 @@ pub(crate) fn syscall_mount_impl(
     let cwd = { process.borrow_mut().cwd.clone() };
     let target = normalize_path(&cwd, &dir);
 
-    if (flags & MS_PRIVATE) != 0 {
-        return match target_dir_exists(&target) {
+    let propagation_flags = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
+    if (flags & propagation_flags) != 0 {
+        return match apply_mount_propagation_change(&target, flags) {
             Ok(()) => 0,
             Err(e) => e,
         };
@@ -1080,10 +1380,6 @@ pub(crate) fn syscall_mount_impl(
         return 0;
     }
 
-    if mount_record_for_target(&target).is_some() {
-        return EBUSY;
-    }
-
     if (flags & MS_BIND) != 0 {
         let Some(source_display) = special.as_deref() else {
             return EINVAL;
@@ -1092,6 +1388,12 @@ pub(crate) fn syscall_mount_impl(
             return EINVAL;
         }
         let source_abs = normalize_path(&cwd, source_display);
+        if mount_lookup_for_abs(&source_abs)
+            .map(|record| record.propagation == MountPropagation::Unbindable)
+            .unwrap_or(false)
+        {
+            return EINVAL;
+        }
         let source = translate_mount_abs(&source_abs);
         let _ext4_guard = ext4_lock();
         if find_path_in_roots(&source).is_none() {
@@ -1102,8 +1404,7 @@ pub(crate) fn syscall_mount_impl(
             .map(|m| m.flags)
             .unwrap_or(0);
         let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
-        upsert_mount_record(&target, &source, &source_abs, fsname, bind_flags);
-        sync_mount_record_rofs(&target);
+        create_mount_record_with_propagation(&target, &source, &source_abs, fsname, bind_flags);
         return 0;
     }
 
@@ -1122,14 +1423,13 @@ pub(crate) fn syscall_mount_impl(
         if rc != 0 {
             return rc;
         }
-        upsert_mount_record(
+        create_mount_record_with_propagation(
             &target,
             &target,
             "cgroup2",
             "cgroup2",
             flags & mount_flag_mask(),
         );
-        sync_mount_record_rofs(&target);
         return 0;
     }
     if fsname == "cgroup" {
@@ -1142,14 +1442,13 @@ pub(crate) fn syscall_mount_impl(
         if rc != 0 {
             return rc;
         }
-        upsert_mount_record(
+        create_mount_record_with_propagation(
             &target,
             &target,
             spec.source_label(),
             "cgroup",
             flags & mount_flag_mask(),
         );
-        sync_mount_record_rofs(&target);
         return 0;
     }
     if source_display == "/dev/root" && (flags & MS_RDONLY) == 0 && pseudo_block_is_read_only() {
@@ -1169,14 +1468,13 @@ pub(crate) fn syscall_mount_impl(
         Ok(v) => v,
         Err(e) => return e,
     };
-    upsert_mount_record(
+    create_mount_record_with_propagation(
         &target,
         &source,
         source_display,
         fsname,
         flags & mount_flag_mask(),
     );
-    sync_mount_record_rofs(&target);
     0
 }
 
@@ -1228,9 +1526,10 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
 
     if (flags & MNT_EXPIRE) != 0 {
         let updated = with_mount_namespace_mut(&current_mount_namespace(), |state| {
-            let Some(entry) = state.mounts_mut().iter_mut().find(|m| m.target == abs) else {
+            let Some(idx) = top_mount_index_for_target_in_state(state, &abs) else {
                 return None;
             };
+            let entry = &mut state.mounts_mut()[idx];
             if entry.expire_mark_seq != Some(entry.access_seq) {
                 entry.expire_mark_seq = Some(entry.access_seq);
                 return Some(EAGAIN);
@@ -1257,8 +1556,7 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
     if record.fs_type == "cgroup2" || record.fs_type == "cgroup" {
         let _ = cgroup_umount(&abs);
     }
-    sync_rofs_mount_flag(&abs, 0);
-    let _ = remove_mount_record(&abs);
+    let _ = remove_mount_records_by_event(&abs, record.event_id);
     0
 }
 
@@ -7430,8 +7728,9 @@ pub fn syscall_chroot(pathname: usize) -> isize {
     }
 
     let mut inner = process.borrow_mut();
-    inner.root = final_root.clone();
-    inner.cwd = final_root;
+    // Linux chroot() updates "/" for this process but does not implicitly
+    // retarget "."; callers that want both semantics must chdir("/") too.
+    inner.root = final_root;
     0
 }
 
@@ -11118,14 +11417,13 @@ pub fn syscall_move_mount(
         return ENOENT;
     }
     let state = handle.state.lock();
-    upsert_mount_record(
+    create_mount_record_with_propagation(
         &to_abs,
         &state.source,
         &state.source_display,
         &state.fs_type,
         state.flags,
     );
-    sync_rofs_state(&to_abs, state.flags);
     0
 }
 
