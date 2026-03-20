@@ -19,6 +19,7 @@ use crate::{
         SocketPairEnd, TimerFdFile, TtyFile, cgroup_charge_file_write,
         cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
         cgroup_umount, ext4_lock, find_path_in_roots, make_pipe, open_cgroup_pseudo, open_file,
+        mount_namespace_id,
         pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_stat_snapshot,
         register_deferred_unlink_cleanup, secondary_root_inode, shm_create, shm_get, shm_list,
         shm_remove,
@@ -987,8 +988,9 @@ fn target_dir_exists(abs: &str) -> Result<(), isize> {
         }
         return Err(ENOTDIR);
     }
+    let translated = translate_mount_abs(abs);
     let _ext4_guard = ext4_lock();
-    let inode = find_path_in_roots(abs).ok_or(ENOENT)?;
+    let inode = find_path_in_roots(&translated).ok_or(ENOENT)?;
     if !inode.is_dir() {
         return Err(ENOTDIR);
     }
@@ -1019,10 +1021,15 @@ fn collect_live_mount_namespaces() -> Vec<MountNamespace> {
     out
 }
 
-fn inherited_mount_propagation(
-    target: &str,
-) -> (MountPropagation, Option<usize>, Option<usize>) {
-    let Some(base) = mount_record_for_target(target) else {
+#[derive(Clone)]
+struct MountPropagationDestination {
+    ns: MountNamespace,
+    target: String,
+    propagation: MountPropagation,
+}
+
+fn inherited_mount_propagation(target: &str) -> (MountPropagation, Option<usize>, Option<usize>) {
+    let Some(base) = mount_lookup_for_abs(target) else {
         return (MountPropagation::Private, None, None);
     };
     match base.propagation {
@@ -1033,6 +1040,123 @@ fn inherited_mount_propagation(
     }
 }
 
+fn top_mounts_for_namespace(ns: &MountNamespace) -> Vec<MountRecord> {
+    let state = ns.lock();
+    let mut tops: BTreeMap<String, MountRecord> = BTreeMap::new();
+    for mount in state.mounts() {
+        match tops.get(mount.target.as_str()) {
+            Some(cur) if !mount_target_match_better(mount, cur) => {}
+            _ => {
+                tops.insert(mount.target.clone(), mount.clone());
+            }
+        }
+    }
+    tops.into_values().collect()
+}
+
+fn mount_target_suffix(base_target: &str, target: &str) -> String {
+    if target == base_target {
+        return String::new();
+    }
+    String::from(target[base_target.len()..].trim_start_matches('/'))
+}
+
+fn shared_group_destinations(base: &MountRecord, target: &str) -> Vec<MountPropagationDestination> {
+    let Some(peer_group) = base.peer_group_id else {
+        return Vec::new();
+    };
+    let suffix = mount_target_suffix(&base.target, target);
+    let namespaces = collect_live_mount_namespaces();
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+
+    for ns in namespaces {
+        let ns_id = mount_namespace_id(&ns);
+        for top in top_mounts_for_namespace(&ns) {
+            let propagation = if top.propagation == MountPropagation::Shared
+                && top.peer_group_id == Some(peer_group)
+            {
+                MountPropagation::Shared
+            } else if top.propagation == MountPropagation::Slave
+                && top.master_group_id == Some(peer_group)
+            {
+                MountPropagation::Slave
+            } else {
+                continue;
+            };
+            let dest_target = if suffix.is_empty() {
+                top.target.clone()
+            } else {
+                normalize_path(&top.target, &suffix)
+            };
+            let key = (
+                ns_id,
+                dest_target.clone(),
+                match propagation {
+                    MountPropagation::Shared => 0u8,
+                    MountPropagation::Slave => 1u8,
+                    MountPropagation::Private => 2u8,
+                    MountPropagation::Unbindable => 3u8,
+                },
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            out.push(MountPropagationDestination {
+                ns: Arc::clone(&ns),
+                target: dest_target,
+                propagation,
+            });
+        }
+    }
+
+    out
+}
+
+fn push_mount_to_destination(
+    dest: &MountPropagationDestination,
+    source: &str,
+    source_display: &str,
+    fs_type: &str,
+    flags: usize,
+    event_id: usize,
+    shared_peer_group: Option<usize>,
+    slave_master_group: Option<usize>,
+) {
+    match dest.propagation {
+        MountPropagation::Shared => {
+            push_mount_record_in(
+                &dest.ns,
+                &dest.target,
+                source,
+                source_display,
+                fs_type,
+                flags,
+                MountPropagation::Shared,
+                shared_peer_group,
+                None,
+                event_id,
+            );
+        }
+        MountPropagation::Slave => {
+            push_mount_record_in(
+                &dest.ns,
+                &dest.target,
+                source,
+                source_display,
+                fs_type,
+                flags,
+                MountPropagation::Slave,
+                None,
+                slave_master_group,
+                event_id,
+            );
+        }
+        MountPropagation::Private | MountPropagation::Unbindable => {}
+    }
+    sync_mount_record_rofs_in(&dest.ns, &dest.target);
+}
+
 fn create_mount_record_with_propagation(
     target: &str,
     source: &str,
@@ -1040,7 +1164,7 @@ fn create_mount_record_with_propagation(
     fs_type: &str,
     flags: usize,
 ) {
-    let Some(base) = mount_record_for_target(target) else {
+    let Some(base) = mount_lookup_for_abs(target) else {
         push_mount_record(
             target,
             source,
@@ -1056,53 +1180,38 @@ fn create_mount_record_with_propagation(
         return;
     };
 
-    if base.propagation != MountPropagation::Shared {
-        let (propagation, peer_group_id, master_group_id) = inherited_mount_propagation(target);
-        push_mount_record(
-            target,
-            source,
-            source_display,
-            fs_type,
-            flags,
-            propagation,
-            peer_group_id,
-            master_group_id,
-            next_mount_event_id(),
-        );
-        sync_mount_record_rofs(target);
-        return;
-    }
-
-    let Some(source_peer_group) = base.peer_group_id else {
-        push_mount_record(
-            target,
-            source,
-            source_display,
-            fs_type,
-            flags,
-            MountPropagation::Private,
-            None,
-            None,
-            next_mount_event_id(),
-        );
-        sync_mount_record_rofs(target);
-        return;
-    };
-
-    let event_id = next_mount_event_id();
-    let new_peer_group = next_mount_peer_group_id();
-    let namespaces = collect_live_mount_namespaces();
-    let mut created_any = false;
-
-    for ns in namespaces {
-        let Some(top) = mount_record_for_target_in(&ns, target) else {
-            continue;
-        };
-        if top.propagation == MountPropagation::Shared
-            && top.peer_group_id == Some(source_peer_group)
-        {
-            push_mount_record_in(
-                &ns,
+    if base.propagation == MountPropagation::Shared {
+        let event_id = next_mount_event_id();
+        let new_peer_group = next_mount_peer_group_id();
+        let mut created_any = false;
+        for dest in shared_group_destinations(&base, target) {
+            created_any = true;
+            match dest.propagation {
+                MountPropagation::Shared => push_mount_to_destination(
+                    &dest,
+                    source,
+                    source_display,
+                    fs_type,
+                    flags,
+                    event_id,
+                    Some(new_peer_group),
+                    None,
+                ),
+                MountPropagation::Slave => push_mount_to_destination(
+                    &dest,
+                    source,
+                    source_display,
+                    fs_type,
+                    flags,
+                    event_id,
+                    None,
+                    Some(new_peer_group),
+                ),
+                MountPropagation::Private | MountPropagation::Unbindable => {}
+            }
+        }
+        if !created_any {
+            push_mount_record(
                 target,
                 source,
                 source_display,
@@ -1113,58 +1222,189 @@ fn create_mount_record_with_propagation(
                 None,
                 event_id,
             );
-            sync_mount_record_rofs_in(&ns, target);
-            created_any = true;
-        } else if top.propagation == MountPropagation::Slave
-            && top.master_group_id == Some(source_peer_group)
-        {
-            push_mount_record_in(
-                &ns,
+            sync_mount_record_rofs(target);
+        }
+        return;
+    }
+
+    let (propagation, peer_group_id, master_group_id) = inherited_mount_propagation(target);
+    push_mount_record(
+        target,
+        source,
+        source_display,
+        fs_type,
+        flags,
+        propagation,
+        peer_group_id,
+        master_group_id,
+        next_mount_event_id(),
+    );
+    sync_mount_record_rofs(target);
+}
+
+fn create_bind_mount_record_with_propagation(
+    target: &str,
+    source: &str,
+    source_display: &str,
+    fs_type: &str,
+    flags: usize,
+) {
+    if let Some(source_mount) = mount_record_for_target(source_display) {
+        if source_mount.propagation == MountPropagation::Shared {
+            let source_peer_group = source_mount
+                .peer_group_id
+                .unwrap_or_else(next_mount_peer_group_id);
+            let event_id = next_mount_event_id();
+
+            if let Some(base) = mount_lookup_for_abs(target) {
+                if base.propagation == MountPropagation::Shared {
+                    let mut created_any = false;
+                    for dest in shared_group_destinations(&base, target) {
+                        created_any = true;
+                        match dest.propagation {
+                            MountPropagation::Shared => push_mount_to_destination(
+                                &dest,
+                                source,
+                                source_display,
+                                fs_type,
+                                flags,
+                                event_id,
+                                Some(source_peer_group),
+                                None,
+                            ),
+                            MountPropagation::Slave => push_mount_to_destination(
+                                &dest,
+                                source,
+                                source_display,
+                                fs_type,
+                                flags,
+                                event_id,
+                                None,
+                                Some(source_peer_group),
+                            ),
+                            MountPropagation::Private | MountPropagation::Unbindable => {}
+                        }
+                    }
+                    if !created_any {
+                        push_mount_record(
+                            target,
+                            source,
+                            source_display,
+                            fs_type,
+                            flags,
+                            MountPropagation::Shared,
+                            Some(source_peer_group),
+                            None,
+                            event_id,
+                        );
+                        sync_mount_record_rofs(target);
+                    }
+                    return;
+                }
+            }
+
+            push_mount_record(
                 target,
                 source,
                 source_display,
                 fs_type,
                 flags,
-                MountPropagation::Slave,
+                MountPropagation::Shared,
+                Some(source_peer_group),
                 None,
-                Some(new_peer_group),
                 event_id,
             );
-            sync_mount_record_rofs_in(&ns, target);
-            created_any = true;
+            sync_mount_record_rofs(target);
+            return;
         }
     }
 
-    if !created_any {
-        push_mount_record(
-            target,
-            source,
-            source_display,
-            fs_type,
-            flags,
-            MountPropagation::Shared,
-            Some(new_peer_group),
-            None,
-            event_id,
-        );
-        sync_mount_record_rofs(target);
+    if let Some(base) = mount_lookup_for_abs(target) {
+        if base.propagation == MountPropagation::Shared {
+            let event_id = next_mount_event_id();
+            let new_peer_group = next_mount_peer_group_id();
+            let mut created_any = false;
+            for dest in shared_group_destinations(&base, target) {
+                created_any = true;
+                match dest.propagation {
+                    MountPropagation::Shared => push_mount_to_destination(
+                        &dest,
+                        source,
+                        source_display,
+                        fs_type,
+                        flags,
+                        event_id,
+                        Some(new_peer_group),
+                        None,
+                    ),
+                    MountPropagation::Slave => push_mount_to_destination(
+                        &dest,
+                        source,
+                        source_display,
+                        fs_type,
+                        flags,
+                        event_id,
+                        None,
+                        Some(new_peer_group),
+                    ),
+                    MountPropagation::Private | MountPropagation::Unbindable => {}
+                }
+            }
+            if !created_any {
+                push_mount_record(
+                    target,
+                    source,
+                    source_display,
+                    fs_type,
+                    flags,
+                    MountPropagation::Shared,
+                    Some(new_peer_group),
+                    None,
+                    event_id,
+                );
+                sync_mount_record_rofs(target);
+            }
+            return;
+        }
     }
+
+    push_mount_record(
+        target,
+        source,
+        source_display,
+        fs_type,
+        flags,
+        MountPropagation::Private,
+        None,
+        None,
+        next_mount_event_id(),
+    );
+    sync_mount_record_rofs(target);
 }
 
-fn remove_mount_records_by_event(target: &str, event_id: usize) -> usize {
+fn remove_mount_records_by_event(event_id: usize) -> usize {
     let namespaces = collect_live_mount_namespaces();
     let mut removed = 0usize;
     for ns in namespaces {
-        let should_remove = mount_record_for_target_in(&ns, target)
-            .map(|record| record.event_id == event_id)
-            .unwrap_or(false);
-        if !should_remove {
+        let mut affected_targets = BTreeSet::new();
+        let removed_in_ns = with_mount_namespace_mut(&ns, |state| {
+            let before = state.mounts().len();
+            state.mounts_mut().retain(|record| {
+                if record.event_id == event_id {
+                    affected_targets.insert(record.target.clone());
+                    return false;
+                }
+                true
+            });
+            before.saturating_sub(state.mounts().len())
+        });
+        if removed_in_ns == 0 {
             continue;
         }
-        if remove_mount_record_in(&ns, target) {
-            sync_mount_record_rofs_in(&ns, target);
-            removed = removed.saturating_add(1);
+        for target in affected_targets {
+            sync_mount_record_rofs_in(&ns, &target);
         }
+        removed = removed.saturating_add(removed_in_ns);
     }
     removed
 }
@@ -1404,7 +1644,13 @@ pub(crate) fn syscall_mount_impl(
             .map(|m| m.flags)
             .unwrap_or(0);
         let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
-        create_mount_record_with_propagation(&target, &source, &source_abs, fsname, bind_flags);
+        create_bind_mount_record_with_propagation(
+            &target,
+            &source,
+            &source_abs,
+            fsname,
+            bind_flags,
+        );
         return 0;
     }
 
@@ -1556,7 +1802,7 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
     if record.fs_type == "cgroup2" || record.fs_type == "cgroup" {
         let _ = cgroup_umount(&abs);
     }
-    let _ = remove_mount_records_by_event(&abs, record.event_id);
+    let _ = remove_mount_records_by_event(record.event_id);
     0
 }
 

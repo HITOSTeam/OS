@@ -208,9 +208,13 @@ app_51_name:
     .asciz "mount_namespace_smoke"
 .section .rodata
 .align 3
+app_52_name:
+    .asciz "umount_once"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 52
+    .quad 53
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -263,3 +267,4 @@ num_user_apps:
     .quad app_49_name
     .quad app_50_name
     .quad app_51_name
+    .quad app_52_name
