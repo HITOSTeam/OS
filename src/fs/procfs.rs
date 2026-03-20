@@ -12,8 +12,8 @@ use spin::Mutex;
 use crate::config;
 use crate::fs::{
     File, NamespaceFile, NamespaceKind, OSInode, Pipe, PseudoDir, PseudoDirent, PseudoFile,
-    PseudoKindTag, PseudoShmFile, RtcFile, ext4_lock, find_path_in_roots, root_inode_for_path,
-    secondary_root_inode,
+    PseudoKindTag, PseudoShmFile, RtcFile, ext4_lock, inode_path_hint, inode_path_in_roots,
+    path_resolves_to_inode,
 };
 use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages};
 use crate::task::manager::{PID2PCB, pid2process};
@@ -79,7 +79,11 @@ const VM_OVERCOMMIT_RATIO_DEFAULT: usize = 50;
 const VM_OVERCOMMIT_RATIO_MAX: usize = 100;
 const FS_FILE_MAX_DEFAULT: usize = 8192;
 const FS_FILE_MAX_MAX: usize = isize::MAX as usize;
+const MAX_PROC_MAGIC_SYMLINKS: usize = 40;
+const ELOOP: isize = -40;
+const ENOENT: isize = -2;
 const EINVAL: isize = -22;
+const ENOTDIR: isize = -20;
 static VM_OVERCOMMIT_MEMORY: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_MEMORY_DEFAULT);
 static VM_OVERCOMMIT_RATIO: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_RATIO_DEFAULT);
 static FS_FILE_MAX: AtomicUsize = AtomicUsize::new(FS_FILE_MAX_DEFAULT);
@@ -982,6 +986,161 @@ fn trim_proc_path(path: &str) -> &str {
     }
 }
 
+fn normalize_abs_path(cwd: &str, path: &str) -> String {
+    let mut parts = Vec::new();
+    let absolute = path.starts_with('/');
+    if !absolute {
+        for seg in cwd.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                parts.pop();
+                continue;
+            }
+            parts.push(seg);
+        }
+    }
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            parts.pop();
+            continue;
+        }
+        parts.push(seg);
+    }
+    let mut out = String::from("/");
+    out.push_str(&parts.join("/"));
+    if out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rfind('/') {
+        Some(pos) => {
+            let (parent, name) = trimmed.split_at(pos);
+            Some((parent, &name[1..]))
+        }
+        None => Some(("", trimmed)),
+    }
+}
+
+fn proc_magic_link_parent_path(link_path: &str) -> &str {
+    split_parent_and_name(link_path)
+        .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+        .unwrap_or("/")
+}
+
+fn proc_magic_link_target_path(link_path: &str, target: &str, remainder: &str) -> String {
+    let base = if target.starts_with('/') {
+        String::from(target)
+    } else {
+        normalize_abs_path(proc_magic_link_parent_path(link_path), target)
+    };
+    if remainder.is_empty() {
+        base
+    } else {
+        normalize_abs_path(&base, remainder)
+    }
+}
+
+fn current_mount_display_abs(abs: &str) -> String {
+    let ns = current_process().mount_namespace();
+    let state = ns.lock();
+    state.display_mount_abs(abs)
+}
+
+fn proc_magic_link_dir_target_path(
+    link_path: &str,
+    file: &Arc<dyn File + Send + Sync>,
+) -> Result<String, isize> {
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        return Ok(String::from(pdir.path()));
+    }
+
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return Err(ENOTDIR);
+    };
+    let inode = os_inode.ext4_inode();
+    let is_dir = {
+        let _ext4_guard = ext4_lock();
+        inode.is_dir()
+    };
+    if !is_dir {
+        return Err(ENOTDIR);
+    }
+    if let Some(path) = proc_readlink(link_path).filter(|path| path.starts_with('/')) {
+        return Ok(path);
+    }
+    inode_path_hint(&inode)
+        .map(|path| current_mount_display_abs(&path))
+        .ok_or(ENOENT)
+}
+
+fn follow_proc_magic_link_target(
+    link_path: &str,
+    target: ProcMagicLinkFollowTarget,
+    remainder: &str,
+) -> Result<String, isize> {
+    match target {
+        ProcMagicLinkFollowTarget::Path(target) => {
+            Ok(proc_magic_link_target_path(link_path, &target, remainder))
+        }
+        ProcMagicLinkFollowTarget::File(file) => {
+            let base = proc_magic_link_dir_target_path(link_path, &file)?;
+            Ok(if remainder.is_empty() {
+                base
+            } else {
+                normalize_abs_path(&base, remainder)
+            })
+        }
+    }
+}
+
+fn resolve_next_proc_magic_intermediate_component(abs: &str) -> Result<Option<String>, isize> {
+    if !is_proc_pseudo_path(abs) {
+        return Ok(None);
+    }
+
+    let components: Vec<&str> = abs
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    if components.len() < 2 || components[0] != "proc" {
+        return Ok(None);
+    }
+
+    let mut prefix = String::new();
+    for idx in 0..components.len() - 1 {
+        prefix.push('/');
+        prefix.push_str(components[idx]);
+        if let Some(target) = proc_magic_link_follow_target(&prefix) {
+            let remainder = components[idx + 1..].join("/");
+            return follow_proc_magic_link_target(&prefix, target, &remainder).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn resolve_proc_magic_intermediate_abs_path(abs: &str) -> Result<String, isize> {
+    let mut current = String::from(abs);
+    for _ in 0..MAX_PROC_MAGIC_SYMLINKS {
+        let Some(next) = resolve_next_proc_magic_intermediate_component(&current)? else {
+            return Ok(current);
+        };
+        current = next;
+    }
+    Err(ELOOP)
+}
+
 fn proc_magic_alias_target_path(trimmed: &str) -> Option<String> {
     if trimmed == "/proc/self" || trimmed.starts_with("/proc/self/") {
         let pid = current_process().getpid();
@@ -1007,69 +1166,6 @@ pub fn normalize_proc_magic_path(path: &str) -> Cow<'_, str> {
         Some(mapped) => Cow::Owned(mapped),
         None => Cow::Borrowed(trimmed),
     }
-}
-
-fn proc_dir_entry_path(base: &str, name: &str) -> String {
-    if base == "/" {
-        alloc::format!("/{name}")
-    } else {
-        alloc::format!("{base}/{name}")
-    }
-}
-
-fn find_inode_path_in_subtree(
-    dir: &Arc<ext4_fs::Inode>,
-    base: &str,
-    target_dev: usize,
-    target_ino: u32,
-    depth: usize,
-) -> Option<String> {
-    if depth == 0 {
-        return None;
-    }
-    for (name, _ino, _ftype) in dir.dir_entries() {
-        if name == "." || name == ".." {
-            continue;
-        }
-        if base == "/" && name == "proc" {
-            continue;
-        }
-        let Some(child) = dir.find(&name) else {
-            continue;
-        };
-        let path = proc_dir_entry_path(base, &name);
-        if child.device_id() == target_dev && child.inode_num() == target_ino {
-            return Some(path);
-        }
-        if child.is_dir() {
-            if let Some(found) =
-                find_inode_path_in_subtree(&child, &path, target_dev, target_ino, depth - 1)
-            {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn find_inode_path_in_roots(target: &Arc<ext4_fs::Inode>) -> Option<String> {
-    let target_dev = target.device_id();
-    let target_ino = target.inode_num();
-    let _guard = ext4_lock();
-
-    let primary = root_inode_for_path("/");
-    if primary.device_id() == target_dev && primary.inode_num() == target_ino {
-        return Some(String::from("/"));
-    }
-    if let Some(found) = find_inode_path_in_subtree(&primary, "/", target_dev, target_ino, 64) {
-        return Some(found);
-    }
-
-    let secondary = secondary_root_inode()?;
-    if secondary.device_id() == target_dev && secondary.inode_num() == target_ino {
-        return Some(String::from("/"));
-    }
-    find_inode_path_in_subtree(&secondary, "/", target_dev, target_ino, 64)
 }
 
 fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
@@ -1111,16 +1207,10 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     }
     if let Some(oinode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = oinode.ext4_inode();
-        if inode.is_dir() {
-            if let Some(cwd_inode) = find_path_in_roots(&cwd) {
-                if cwd_inode.device_id() == inode.device_id()
-                    && cwd_inode.inode_num() == inode.inode_num()
-                {
-                    return Some(cwd);
-                }
-            }
+        if inode.is_dir() && path_resolves_to_inode(&cwd, &inode) {
+            return Some(cwd);
         }
-        return find_inode_path_in_roots(&inode);
+        return inode_path_hint(&inode).or_else(|| inode_path_in_roots(&inode));
     }
     None
 }
@@ -1178,12 +1268,12 @@ fn proc_pid_task_rest(rest: &str) -> Option<(u32, &str)> {
     Some((tid, tail))
 }
 
-pub enum ProcMagicLinkFollowTarget {
+enum ProcMagicLinkFollowTarget {
     Path(String),
     File(Arc<dyn File + Send + Sync>),
 }
 
-pub fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget> {
+fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget> {
     let trimmed = trim_proc_path(path);
 
     if trimmed == "/proc/self" {

@@ -61,6 +61,7 @@ lazy_static! {
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref DEFERRED_UNLINK_CLEANUP: Mutex<BTreeMap<(usize, u32), TmpfileCleanup>> =
         Mutex::new(BTreeMap::new());
+    static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> = Mutex::new(BTreeMap::new());
 }
 
 pub(crate) fn ext4_lock() -> Ext4Guard {
@@ -82,6 +83,176 @@ pub(crate) fn debug_track_iozone_inode(path: &str, inode_num: u32) {
     }
     tracked.push(inode_num);
     println!("[iozone-debug] track inode={} path='{}'", inode_num, path);
+}
+
+pub(crate) fn note_inode_path_hint(inode: &Arc<Inode>, path: &str) {
+    INODE_PATH_HINTS
+        .lock()
+        .insert((inode.device_id(), inode.inode_num()), String::from(path));
+}
+
+pub(crate) fn inode_path_hint(inode: &Arc<Inode>) -> Option<String> {
+    INODE_PATH_HINTS
+        .lock()
+        .get(&(inode.device_id(), inode.inode_num()))
+        .cloned()
+}
+
+fn normalize_inode_abs_path(cwd: &str, path: &str) -> String {
+    let mut parts = Vec::new();
+    let absolute = path.starts_with('/');
+    if !absolute {
+        for seg in cwd.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                parts.pop();
+                continue;
+            }
+            parts.push(seg);
+        }
+    }
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            parts.pop();
+            continue;
+        }
+        parts.push(seg);
+    }
+    let mut out = String::from("/");
+    out.push_str(&parts.join("/"));
+    if out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+fn split_inode_parent_and_name(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rfind('/') {
+        Some(pos) => {
+            let (parent, name) = trimmed.split_at(pos);
+            Some((parent, &name[1..]))
+        }
+        None => Some(("", trimmed)),
+    }
+}
+
+fn join_inode_path(base: &str, name: &str) -> String {
+    if base == "/" {
+        alloc::format!("/{name}")
+    } else {
+        alloc::format!("{base}/{name}")
+    }
+}
+
+fn find_inode_path_in_subtree(
+    dir: &Arc<Inode>,
+    base: &str,
+    target_dev: usize,
+    target_ino: u32,
+    depth: usize,
+) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    for (name, _ino, _ftype) in dir.dir_entries() {
+        if name == "." || name == ".." {
+            continue;
+        }
+        // `/proc` is pseudo-fs state; don't leak an ext4 placeholder entry here.
+        if base == "/" && name == "proc" {
+            continue;
+        }
+        let Some(child) = dir.find(&name) else {
+            continue;
+        };
+        let path = join_inode_path(base, &name);
+        if child.device_id() == target_dev && child.inode_num() == target_ino {
+            return Some(path);
+        }
+        if child.is_dir() {
+            if let Some(found) =
+                find_inode_path_in_subtree(&child, &path, target_dev, target_ino, depth - 1)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
+    let target_dev = target.device_id();
+    let target_ino = target.inode_num();
+    let _guard = ext4_lock();
+
+    let primary = root_inode_for_path("/");
+    if primary.device_id() == target_dev && primary.inode_num() == target_ino {
+        return Some(String::from("/"));
+    }
+    if let Some(found) = find_inode_path_in_subtree(&primary, "/", target_dev, target_ino, 64) {
+        return Some(found);
+    }
+
+    let secondary = secondary_root_inode()?;
+    if secondary.device_id() == target_dev && secondary.inode_num() == target_ino {
+        return Some(String::from("/"));
+    }
+    find_inode_path_in_subtree(&secondary, "/", target_dev, target_ino, 64)
+}
+
+pub(crate) fn path_resolves_to_inode(path: &str, target: &Arc<Inode>) -> bool {
+    let _guard = ext4_lock();
+    let Some(found) = find_path_in_roots(path) else {
+        return false;
+    };
+    found.device_id() == target.device_id() && found.inode_num() == target.inode_num()
+}
+
+/// Caller must already hold `ext4_lock()`.
+pub(crate) fn resolve_final_symlink_abs_path_locked(abs: &str) -> String {
+    let mut current = String::from(abs);
+    for _ in 0..40 {
+        if current == "/" {
+            break;
+        }
+        let Some((parent, name)) = split_inode_parent_and_name(&current) else {
+            break;
+        };
+        let parent_abs = if parent.is_empty() { "/" } else { parent };
+        let Some(parent_inode) = find_path_in_roots(parent_abs) else {
+            break;
+        };
+        let Some(child) = parent_inode.find(name) else {
+            break;
+        };
+        if !child.is_symlink() {
+            break;
+        }
+        let target = String::from_utf8_lossy(&child.read_all()).into_owned();
+        if target.is_empty() {
+            break;
+        }
+        current = if target.starts_with('/') {
+            normalize_inode_abs_path("/", &target)
+        } else {
+            normalize_inode_abs_path(parent_abs, &target)
+        };
+    }
+    current
+}
+
+pub(crate) fn resolve_final_symlink_abs_path(abs: &str) -> String {
+    let _guard = ext4_lock();
+    resolve_final_symlink_abs_path_locked(abs)
 }
 
 fn debug_iozone_tracked(inode_num: u32) -> bool {

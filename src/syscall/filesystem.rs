@@ -12,21 +12,22 @@ use spin::Mutex;
 use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
-        CgroupFile, CgroupMountSpec, EventFdFile, File, MountNamespace, MountNamespaceState,
-        MountPropagation, MountRecord, NamespaceFile, NetSocketFile, OSInode, OpenFlags, Pipe,
-        ProcMagicLinkFile, ProcMagicLinkFollowTarget, ProcPseudoFile, PseudoBlock, PseudoDir,
+        CgroupFile, CgroupMountSpec, ClassifiedAbsPath, EventFdFile, File, MountNamespace,
+        MountNamespaceState, MountPropagation, MountRecord, NamespaceFile, NetSocketFile, OSInode,
+        OpenFlags, Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir,
         PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
         SocketPairEnd, TimerFdFile, TtyFile, cgroup_charge_file_write,
         cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
-        cgroup_umount, ext4_lock, find_path_in_roots, make_pipe, open_cgroup_pseudo, open_file,
-        mount_namespace_id,
+        cgroup_umount, ext4_lock, find_path_in_roots, inode_path_hint, make_pipe,
+        note_inode_path_hint, open_file, open_pseudo, shm_get, shm_object_name,
+        mount_namespace_id, resolve_final_symlink_abs_path,
+        resolve_final_symlink_abs_path_locked, resolve_proc_magic_intermediate_abs_path,
         pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_stat_snapshot,
-        register_deferred_unlink_cleanup, secondary_root_inode, shm_create, shm_get, shm_list,
-        shm_remove,
+        register_deferred_unlink_cleanup, secondary_root_inode, shm_create, shm_remove,
     },
     mm::{
         MapPermission, UserBuffer, copy_from_user, copy_to_user, read_user_value,
-        translated_byte_buffer, translated_mutref, translated_str, try_copy_from_user,
+        translated_byte_buffer, translated_mutref, try_copy_from_user,
         try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
         try_translated_byte_buffer, try_write_user_value, write_user_value,
     },
@@ -415,8 +416,6 @@ lazy_static! {
     static ref INODE_XATTRS: Mutex<BTreeMap<u64, BTreeMap<String, Vec<u8>>>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_FSFLAGS: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
-    static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> =
-        Mutex::new(BTreeMap::new());
     static ref FIFO_PIPE_STATES: Mutex<BTreeMap<u64, Arc<FifoPipeState>>> =
         Mutex::new(BTreeMap::new());
     static ref DEVICE_MOUNT_SOURCES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
@@ -478,19 +477,6 @@ pub(crate) fn set_inode_fs_flags(ino: u64, flags: u32) {
     }
 }
 
-fn note_inode_path_hint(inode: &Arc<ext4_fs::Inode>, path: &str) {
-    INODE_PATH_HINTS
-        .lock()
-        .insert((inode.device_id(), inode.inode_num()), String::from(path));
-}
-
-fn inode_path_hint(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
-    INODE_PATH_HINTS
-        .lock()
-        .get(&(inode.device_id(), inode.inode_num()))
-        .cloned()
-}
-
 fn inode_is_immutable_or_append(inode: &Arc<ext4_fs::Inode>) -> bool {
     (inode_fs_flags(inode.inode_num() as u64) & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0
 }
@@ -542,20 +528,6 @@ fn mount_flags_to_statfs(flags: usize) -> i64 {
     out as i64
 }
 
-fn mount_source_join(source: &str, suffix: &str) -> String {
-    if suffix.is_empty() {
-        return String::from(source);
-    }
-    if source == "/" {
-        return alloc::format!("/{}", suffix.trim_start_matches('/'));
-    }
-    alloc::format!(
-        "{}/{}",
-        source.trim_end_matches('/'),
-        suffix.trim_start_matches('/')
-    )
-}
-
 fn current_mount_namespace() -> MountNamespace {
     current_process().mount_namespace()
 }
@@ -572,77 +544,22 @@ fn next_mount_peer_group_id() -> usize {
     NEXT_MOUNT_PEER_GROUP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn mount_target_match_better(candidate: &MountRecord, current: &MountRecord) -> bool {
-    candidate.target.len() > current.target.len()
-        || (candidate.target.len() == current.target.len() && candidate.stack_seq > current.stack_seq)
-}
-
-fn mount_source_match_better(candidate: &MountRecord, current: &MountRecord) -> bool {
-    candidate.source.len() > current.source.len()
-        || (candidate.source.len() == current.source.len() && candidate.stack_seq > current.stack_seq)
-}
-
-fn top_mount_index_for_target_in_state(state: &MountNamespaceState, target: &str) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None;
-    for (idx, mount) in state.mounts().iter().enumerate() {
-        if mount.target != target {
-            continue;
-        }
-        match best {
-            Some((_, cur_seq)) if mount.stack_seq <= cur_seq => {}
-            _ => best = Some((idx, mount.stack_seq)),
-        }
-    }
-    best.map(|(idx, _)| idx)
-}
-
-fn mount_lookup_for_state(state: &MountNamespaceState, abs: &str) -> Option<MountRecord> {
-    let mut best: Option<MountRecord> = None;
-    for mount in state.mounts() {
-        if !path_under_mount(abs, &mount.target) {
-            continue;
-        }
-        match best.as_ref() {
-            Some(cur) if !mount_target_match_better(mount, cur) => {}
-            _ => best = Some(mount.clone()),
-        }
-    }
-    best
-}
-
-fn mount_lookup_for_namespace(ns: &MountNamespace, abs: &str) -> Option<MountRecord> {
-    let state = ns.lock();
-    mount_lookup_for_state(&state, abs)
-}
-
 fn mount_lookup_for_abs(abs: &str) -> Option<MountRecord> {
-    mount_lookup_for_namespace(&current_mount_namespace(), abs)
-}
-
-fn mount_flags_for_namespace(ns: &MountNamespace, abs: &str) -> usize {
-    mount_lookup_for_namespace(ns, abs)
-        .map(|m| m.flags)
-        .unwrap_or(0)
+    let state = current_mount_namespace();
+    let state = state.lock();
+    state.mount_record_for_path(abs)
 }
 
 fn mount_flags_for_abs(abs: &str) -> usize {
-    mount_lookup_for_abs(abs).map(|m| m.flags).unwrap_or(0)
-}
-
-fn translate_mount_abs_for_namespace(ns: &MountNamespace, abs: &str) -> String {
-    let Some(mount) = mount_lookup_for_namespace(ns, abs) else {
-        return String::from(abs);
-    };
-    let suffix = if abs == mount.target {
-        ""
-    } else {
-        &abs[mount.target.len()..]
-    };
-    normalize_path("/", &mount_source_join(&mount.source, suffix))
+    let state = current_mount_namespace();
+    let state = state.lock();
+    state.mount_flags_for_path(abs)
 }
 
 fn translate_mount_abs(abs: &str) -> String {
-    translate_mount_abs_for_namespace(&current_mount_namespace(), abs)
+    let state = current_mount_namespace();
+    let state = state.lock();
+    state.translate_mount_abs(abs)
 }
 
 fn with_mount_namespace_mut<R>(
@@ -666,7 +583,7 @@ fn push_mount_record_in(
     event_id: usize,
 ) {
     with_mount_namespace_mut(ns, |state| {
-        state.mounts_mut().push(MountRecord {
+        state.push_record(MountRecord {
             target: String::from(target),
             source: String::from(source),
             source_display: String::from(source_display),
@@ -686,23 +603,17 @@ fn push_mount_record_in(
 fn mount_record_for_target(target: &str) -> Option<MountRecord> {
     let state = current_mount_namespace();
     let state = state.lock();
-    let idx = top_mount_index_for_target_in_state(&state, target)?;
-    Some(state.mounts()[idx].clone())
+    state.mount_record_for_target(target)
 }
 
 fn mount_record_for_target_in(ns: &MountNamespace, target: &str) -> Option<MountRecord> {
     let state = ns.lock();
-    let idx = top_mount_index_for_target_in_state(&state, target)?;
-    Some(state.mounts()[idx].clone())
+    state.mount_record_for_target(target)
 }
 
 fn sync_rofs_mount_flag_in(ns: &MountNamespace, target: &str, flags: usize) {
     with_mount_namespace_mut(ns, |state| {
-        let mounts = state.rofs_mounts_mut();
-        mounts.retain(|m| m != target);
-        if (flags & MS_RDONLY) != 0 {
-            mounts.push(String::from(target));
-        }
+        state.sync_rofs_mount_flag(target, flags & MS_RDONLY);
     });
 }
 
@@ -743,28 +654,8 @@ fn push_mount_record(
     );
 }
 
-fn remove_mount_record_in(ns: &MountNamespace, target: &str) -> bool {
-    with_mount_namespace_mut(ns, |state| {
-        let Some(idx) = top_mount_index_for_target_in_state(state, target) else {
-            return false;
-        };
-        state.mounts_mut().remove(idx);
-        true
-    })
-}
-
-fn remove_mount_record(target: &str) -> bool {
-    remove_mount_record_in(&current_mount_namespace(), target)
-}
-
 fn update_mount_record_flags_in(ns: &MountNamespace, target: &str, flags: usize) -> bool {
-    with_mount_namespace_mut(ns, |state| {
-        let Some(idx) = top_mount_index_for_target_in_state(state, target) else {
-            return false;
-        };
-        state.mounts_mut()[idx].flags = flags;
-        true
-    })
+    with_mount_namespace_mut(ns, |state| state.update_top_mount_flags(target, flags))
 }
 
 fn update_mount_record_flags(target: &str, flags: usize) -> bool {
@@ -772,44 +663,17 @@ fn update_mount_record_flags(target: &str, flags: usize) -> bool {
 }
 
 fn move_mount_record_target_in(ns: &MountNamespace, old_target: &str, new_target: &str) -> bool {
-    with_mount_namespace_mut(ns, |state| {
-        let Some(idx) = top_mount_index_for_target_in_state(state, old_target) else {
-            return false;
-        };
-        state.mounts_mut()[idx].target = String::from(new_target);
-        true
-    })
+    with_mount_namespace_mut(ns, |state| state.move_top_mount_target(old_target, new_target))
 }
 
 fn move_mount_record_target(old_target: &str, new_target: &str) -> bool {
     move_mount_record_target_in(&current_mount_namespace(), old_target, new_target)
 }
 
-fn mount_display_abs_for_namespace(ns: &MountNamespace, abs: &str) -> String {
-    let state = ns.lock();
-    let mut best: Option<&MountRecord> = None;
-    for mount in state.mounts() {
-        if !path_under_mount(abs, &mount.source) {
-            continue;
-        }
-        match best {
-            Some(cur) if !mount_source_match_better(mount, cur) => {}
-            _ => best = Some(mount),
-        }
-    }
-    let Some(mount) = best else {
-        return String::from(abs);
-    };
-    let suffix = if abs == mount.source {
-        ""
-    } else {
-        &abs[mount.source.len()..]
-    };
-    normalize_path("/", &mount_source_join(&mount.target, suffix))
-}
-
 fn mount_display_abs(abs: &str) -> String {
-    mount_display_abs_for_namespace(&current_mount_namespace(), abs)
+    let state = current_mount_namespace();
+    let state = state.lock();
+    state.display_mount_abs(abs)
 }
 
 fn mount_flag_mask() -> usize {
@@ -823,29 +687,19 @@ fn mount_flag_mask() -> usize {
         | MS_STRICTATIME
 }
 
-fn note_mount_access_in(ns: &MountNamespace, abs: &str) {
-    with_mount_namespace_mut(ns, |state| {
-        let mounts = state.mounts_mut();
-        let mut best: Option<(usize, usize, usize)> = None;
-        for (idx, mount) in mounts.iter().enumerate() {
-            if !path_under_mount(abs, &mount.target) {
-                continue;
-            }
-            match best {
-                Some((_, cur_len, cur_seq))
-                    if mount.target.len() < cur_len
-                        || (mount.target.len() == cur_len && mount.stack_seq <= cur_seq) => {}
-                _ => best = Some((idx, mount.target.len(), mount.stack_seq)),
-            }
-        }
-        if let Some((idx, _, _)) = best {
-            mounts[idx].access_seq = mounts[idx].access_seq.saturating_add(1);
-        }
+fn note_mount_access(abs: &str) {
+    with_mount_namespace_mut(&current_mount_namespace(), |state| {
+        state.note_mount_access(abs);
     });
 }
 
-fn note_mount_access(abs: &str) {
-    note_mount_access_in(&current_mount_namespace(), abs);
+fn current_cwd_path() -> String {
+    let process = current_process();
+    process.borrow_mut().cwd.clone()
+}
+
+fn logical_path_for_inode(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
+    inode_path_hint(inode).map(|path| mount_display_abs(&path))
 }
 
 fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Option<String> {
@@ -870,12 +724,11 @@ fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Option<String>
         return Some(String::from("/dev/shm"));
     }
     let os_inode = file.as_any().downcast_ref::<OSInode>()?;
-    inode_path_hint(&os_inode.ext4_inode()).map(|path| mount_display_abs(&path))
+    logical_path_for_inode(&os_inode.ext4_inode())
 }
 
 fn pseudo_abs_for_ext4_dirfd(base: &Arc<ext4_fs::Inode>, path: &str) -> Option<String> {
-    let base_path = inode_path_hint(base)?;
-    let logical_base = mount_display_abs(&base_path);
+    let logical_base = logical_path_for_inode(base)?;
     let abs = normalize_path(&logical_base, path);
     open_pseudo(&abs).map(|_| abs)
 }
@@ -1042,16 +895,7 @@ fn inherited_mount_propagation(target: &str) -> (MountPropagation, Option<usize>
 
 fn top_mounts_for_namespace(ns: &MountNamespace) -> Vec<MountRecord> {
     let state = ns.lock();
-    let mut tops: BTreeMap<String, MountRecord> = BTreeMap::new();
-    for mount in state.mounts() {
-        match tops.get(mount.target.as_str()) {
-            Some(cur) if !mount_target_match_better(mount, cur) => {}
-            _ => {
-                tops.insert(mount.target.clone(), mount.clone());
-            }
-        }
-    }
-    tops.into_values().collect()
+    state.top_mounts()
 }
 
 fn mount_target_suffix(base_target: &str, target: &str) -> String {
@@ -1772,7 +1616,7 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
 
     if (flags & MNT_EXPIRE) != 0 {
         let updated = with_mount_namespace_mut(&current_mount_namespace(), |state| {
-            let Some(idx) = top_mount_index_for_target_in_state(state, &abs) else {
+            let Some(idx) = state.top_mount_index_for_target(&abs) else {
                 return None;
             };
             let entry = &mut state.mounts_mut()[idx];
@@ -1871,10 +1715,7 @@ fn path_is_rofs(abs: &str) -> bool {
     }
     let ns = current_mount_namespace();
     let state = ns.lock();
-    state
-        .rofs_mounts()
-        .iter()
-        .any(|mnt| path_under_mount(abs, mnt))
+    state.rofs_mount_covers(abs)
 }
 
 fn path_is_nodev(abs: &str) -> bool {
@@ -1914,7 +1755,7 @@ fn path_is_mount_point(abs: &str) -> bool {
     }
     let ns = current_mount_namespace();
     let state = ns.lock();
-    state.rofs_mounts().iter().any(|mnt| mnt == abs)
+    state.rofs_mount_contains(abs)
 }
 
 fn path_under_mount(abs: &str, mnt: &str) -> bool {
@@ -1937,16 +1778,7 @@ fn rofs_mount_root_for_abs(abs: &str) -> Option<String> {
     }
     let ns = current_mount_namespace();
     let state = ns.lock();
-    let mut best: Option<&str> = None;
-    for mnt in state.rofs_mounts() {
-        if path_under_mount(abs, mnt) {
-            match best {
-                Some(cur) if mnt.len() <= cur.len() => {}
-                _ => best = Some(mnt.as_str()),
-            }
-        }
-    }
-    best.map(String::from)
+    state.rofs_mount_root_for_path(abs)
 }
 
 fn hardlink_cross_mount(old_abs: &str, new_abs: &str) -> bool {
@@ -2086,16 +1918,6 @@ fn should_try_busybox_applet_path(path: &str, allow_relative: bool) -> bool {
         || path.starts_with("/usr/sbin/")
 }
 
-fn shm_object_name(abs: &str) -> Option<&str> {
-    // Only accept `/dev/shm/<name>` (single path component).
-    let rest = abs.strip_prefix("/dev/shm/")?;
-    let name = rest.trim_start_matches('/');
-    if name.is_empty() || name.contains('/') {
-        return None;
-    }
-    Some(name)
-}
-
 fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -2108,140 +1930,6 @@ fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
         }
         None => Some(("", trimmed)),
     }
-}
-
-fn proc_magic_link_parent_path(link_path: &str) -> &str {
-    split_parent_and_name(link_path)
-        .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
-        .unwrap_or("/")
-}
-
-fn proc_magic_link_target_path(link_path: &str, target: &str, remainder: &str) -> String {
-    let base = if target.starts_with('/') {
-        String::from(target)
-    } else {
-        normalize_path(proc_magic_link_parent_path(link_path), target)
-    };
-    if remainder.is_empty() {
-        base
-    } else {
-        normalize_path(&base, remainder)
-    }
-}
-
-fn proc_magic_link_dir_target_path(
-    link_path: &str,
-    file: &Arc<dyn File + Send + Sync>,
-) -> Result<String, isize> {
-    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
-        return Ok(String::from(pdir.path()));
-    }
-
-    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return Err(ENOTDIR);
-    };
-    let inode = os_inode.ext4_inode();
-    let is_dir = {
-        let _ext4_guard = ext4_lock();
-        inode.is_dir()
-    };
-    if !is_dir {
-        return Err(ENOTDIR);
-    }
-    if let Some(path) = crate::fs::proc_readlink(link_path).filter(|path| path.starts_with('/')) {
-        return Ok(path);
-    }
-    inode_path_hint(&inode)
-        .map(|path| mount_display_abs(&path))
-        .ok_or(ENOENT)
-}
-
-fn follow_proc_magic_link_target(
-    link_path: &str,
-    target: ProcMagicLinkFollowTarget,
-    remainder: &str,
-) -> Result<String, isize> {
-    match target {
-        ProcMagicLinkFollowTarget::Path(target) => {
-            Ok(proc_magic_link_target_path(link_path, &target, remainder))
-        }
-        ProcMagicLinkFollowTarget::File(file) => {
-            let base = proc_magic_link_dir_target_path(link_path, &file)?;
-            Ok(if remainder.is_empty() {
-                base
-            } else {
-                normalize_path(&base, remainder)
-            })
-        }
-    }
-}
-
-fn resolve_next_proc_magic_intermediate_component(abs: &str) -> Result<Option<String>, isize> {
-    if !crate::fs::is_proc_pseudo_path(abs) {
-        return Ok(None);
-    }
-
-    let components: Vec<&str> = abs
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .collect();
-    if components.len() < 2 || components[0] != "proc" {
-        return Ok(None);
-    }
-
-    let mut prefix = String::new();
-    for idx in 0..components.len() - 1 {
-        prefix.push('/');
-        prefix.push_str(components[idx]);
-        if let Some(target) = crate::fs::proc_magic_link_follow_target(&prefix) {
-            let remainder = components[idx + 1..].join("/");
-            return follow_proc_magic_link_target(&prefix, target, &remainder).map(Some);
-        }
-    }
-    Ok(None)
-}
-
-fn resolve_proc_magic_intermediate_abs_path(abs: &str) -> Result<String, isize> {
-    let mut current = String::from(abs);
-    for _ in 0..MAX_SYMLINKS {
-        let Some(next) = resolve_next_proc_magic_intermediate_component(&current)? else {
-            return Ok(current);
-        };
-        current = next;
-    }
-    Err(ELOOP)
-}
-
-fn resolve_final_symlink_abs_path(abs: &str) -> String {
-    let mut current = String::from(abs);
-    for _ in 0..MAX_SYMLINKS {
-        if current == "/" {
-            break;
-        }
-        let Some((parent, name)) = split_parent_and_name(&current) else {
-            break;
-        };
-        let parent_abs = if parent.is_empty() { "/" } else { parent };
-        let Some(parent_inode) = find_path_in_roots(parent_abs) else {
-            break;
-        };
-        let Some(child) = parent_inode.find(name) else {
-            break;
-        };
-        if !child.is_symlink() {
-            break;
-        }
-        let target = String::from_utf8_lossy(&child.read_all()).into_owned();
-        if target.is_empty() {
-            break;
-        }
-        current = if target.starts_with('/') {
-            normalize_path("/", &target)
-        } else {
-            normalize_path(parent_abs, &target)
-        };
-    }
-    current
 }
 
 fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
@@ -2506,16 +2194,12 @@ fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
         .map(|o| o.ext4_inode())
 }
 
-fn is_pseudo_path(abs: &str) -> bool {
-    crate::fs::is_cgroup_pseudo_path(abs)
-        || abs == "/sys"
-        || abs.starts_with("/sys/")
-        || abs == "/dev"
-        || abs.starts_with("/dev/")
-        || abs == "/proc/sys"
-        || abs.starts_with("/proc/sys/")
-        || abs == "/etc"
-        || abs.starts_with("/etc/")
+enum RelativeAtPathBase {
+    LogicalAbs(String),
+    Ext4Dir {
+        base: alloc::sync::Arc<ext4_fs::Inode>,
+        logical_base: Option<String>,
+    },
 }
 
 enum AtPath {
@@ -2530,20 +2214,96 @@ enum AtPath {
     PseudoAbs(String),
 }
 
+fn classify_current_abs_path(abs: &str) -> ClassifiedAbsPath {
+    let state = current_mount_namespace();
+    let state = state.lock();
+    state.classify_logical_abs_path(abs)
+}
+
 fn classify_abs_at_path(abs: String) -> AtPath {
-    if crate::fs::is_proc_pseudo_path(&abs) {
-        return AtPath::PseudoAbs(abs);
+    match classify_current_abs_path(&abs) {
+        ClassifiedAbsPath::Ext4(translated) => AtPath::Ext4Abs(translated),
+        ClassifiedAbsPath::Pseudo(path) => AtPath::PseudoAbs(path),
     }
-    if let Some(mount) = mount_lookup_for_abs(&abs) {
-        if mount.fs_type == "cgroup2" || mount.fs_type == "cgroup" {
-            return AtPath::PseudoAbs(abs);
+}
+
+fn resolve_relative_at_path_base(dirfd: isize) -> Result<RelativeAtPathBase, isize> {
+    if dirfd == AT_FDCWD {
+        return Ok(RelativeAtPathBase::LogicalAbs(current_cwd_path()));
+    }
+    if dirfd < 0 {
+        return Err(EBADF);
+    }
+    let Some(file) = get_fd_file(dirfd as usize) else {
+        return Err(EBADF);
+    };
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        return Ok(RelativeAtPathBase::LogicalAbs(String::from(pdir.path())));
+    }
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return Err(ENOTDIR);
+    };
+    let base = os_inode.ext4_inode();
+    if !base.is_dir() {
+        return Err(ENOTDIR);
+    }
+    Ok(RelativeAtPathBase::Ext4Dir {
+        logical_base: logical_path_for_inode(&base),
+        base,
+    })
+}
+
+fn resolve_relative_at_path_from_logical_base(base_path: &str, path: &str) -> Result<AtPath, isize> {
+    let logical_abs = normalize_path(base_path, path);
+    let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
+    let classified_abs = classify_current_abs_path(&abs);
+    if matches!(classified_abs, ClassifiedAbsPath::Pseudo(_)) {
+        return Ok(AtPath::PseudoAbs(abs));
+    }
+    if abs != logical_abs {
+        let ClassifiedAbsPath::Ext4(translated) = classified_abs else {
+            unreachable!();
+        };
+        return Ok(AtPath::Ext4Abs(translated));
+    }
+    let rel = if let Some(mount) = mount_lookup_for_abs(&abs) {
+        let suffix = if abs == mount.target {
+            String::new()
+        } else {
+            String::from(abs[mount.target.len()..].trim_start_matches('/'))
+        };
+        let _ext4_guard = ext4_lock();
+        let Some(base) = find_path_in_roots(&mount.source) else {
+            return Err(ENOENT);
+        };
+        return Ok(AtPath::Ext4Rel { base, rel: suffix });
+    } else {
+        normalize_relative_path(path)
+    };
+    let _ext4_guard = ext4_lock();
+    let Some(base) = find_path_in_roots(&translate_mount_abs(base_path)) else {
+        return Err(ENOENT);
+    };
+    Ok(AtPath::Ext4Rel { base, rel })
+}
+
+fn resolve_relative_at_path_from_ext4_base(
+    base: alloc::sync::Arc<ext4_fs::Inode>,
+    logical_base: Option<String>,
+    path: &str,
+) -> Result<AtPath, isize> {
+    if let Some(logical_base) = logical_base {
+        let logical_abs = normalize_path(&logical_base, path);
+        let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
+        if abs != logical_abs {
+            return Ok(classify_abs_at_path(abs));
         }
     }
-    if is_pseudo_path(&abs) {
-        AtPath::PseudoAbs(abs)
-    } else {
-        AtPath::Ext4Abs(translate_mount_abs(&abs))
+    if let Some(abs) = pseudo_abs_for_ext4_dirfd(&base, path) {
+        return Ok(AtPath::PseudoAbs(abs));
     }
+    let rel = normalize_relative_path(path);
+    Ok(AtPath::Ext4Rel { base, rel })
 }
 
 fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
@@ -2562,73 +2322,14 @@ fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
         return Ok(classify_abs_at_path(abs));
     }
 
-    // Relative path.
-    if dirfd == AT_FDCWD {
-        let process = current_process();
-        let cwd = { process.borrow_mut().cwd.clone() };
-        let logical_abs = normalize_path(&cwd, path);
-        let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
-        if let AtPath::PseudoAbs(_) = classify_abs_at_path(abs.clone()) {
-            return Ok(AtPath::PseudoAbs(abs));
+    match resolve_relative_at_path_base(dirfd)? {
+        RelativeAtPathBase::LogicalAbs(base_path) => {
+            resolve_relative_at_path_from_logical_base(&base_path, path)
         }
-        if abs != logical_abs {
-            return Ok(AtPath::Ext4Abs(translate_mount_abs(&abs)));
+        RelativeAtPathBase::Ext4Dir { base, logical_base } => {
+            resolve_relative_at_path_from_ext4_base(base, logical_base, path)
         }
-        let rel = if let Some(mount) = mount_lookup_for_abs(&abs) {
-            let suffix = if abs == mount.target {
-                String::new()
-            } else {
-                String::from(abs[mount.target.len()..].trim_start_matches('/'))
-            };
-            let _ext4_guard = ext4_lock();
-            let Some(base) = find_path_in_roots(&mount.source) else {
-                return Err(ENOENT);
-            };
-            return Ok(AtPath::Ext4Rel { base, rel: suffix });
-        } else {
-            normalize_relative_path(path)
-        };
-        let _ext4_guard = ext4_lock();
-        let Some(base) = find_path_in_roots(&translate_mount_abs(&cwd)) else {
-            return Err(ENOENT);
-        };
-        return Ok(AtPath::Ext4Rel { base, rel });
     }
-
-    if dirfd < 0 {
-        return Err(EBADF);
-    }
-
-    let Some(file) = get_fd_file(dirfd as usize) else {
-        return Err(EBADF);
-    };
-
-    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
-        let abs = resolve_proc_magic_intermediate_abs_path(&normalize_path(pdir.path(), path))?;
-        return Ok(classify_abs_at_path(abs));
-    }
-
-    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-        let base = os_inode.ext4_inode();
-        if !base.is_dir() {
-            return Err(ENOTDIR);
-        }
-        if let Some(base_path) = inode_path_hint(&base) {
-            let logical_base = mount_display_abs(&base_path);
-            let logical_abs = normalize_path(&logical_base, path);
-            let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
-            if abs != logical_abs {
-                return Ok(classify_abs_at_path(abs));
-            }
-        }
-        if let Some(abs) = pseudo_abs_for_ext4_dirfd(&base, path) {
-            return Ok(AtPath::PseudoAbs(abs));
-        }
-        let rel = normalize_relative_path(path);
-        return Ok(AtPath::Ext4Rel { base, rel });
-    }
-
-    Err(ENOTDIR)
 }
 
 fn resolve_ext4_abs_path(
@@ -3279,7 +2980,10 @@ pub fn syscall_acct(pathname: usize) -> isize {
         return 0;
     }
     let token = get_current_token();
-    let path = translated_str(token, pathname as *const u8);
+    let path = match read_user_cstring(token, pathname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if path.is_empty() {
         return ENOENT;
     }
@@ -3455,31 +3159,28 @@ fn resolve_abs_path(dirfd: isize, path: &str) -> Result<Option<String>, isize> {
     if path.is_empty() {
         return Ok(None);
     }
-    let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
     let abs = if path.starts_with('/') {
         normalize_path("/", path)
-    } else if dirfd == AT_FDCWD {
-        normalize_path(&cwd, path)
-    } else if dirfd >= 0 {
-        // If dirfd refers to a pseudo directory, resolve relative to it.
-        // For ext4 dirfds, prefer procfs fd symlink target to preserve mount context.
-        if let Some(file) = get_fd_file(dirfd as usize) {
+    } else {
+        let cwd = current_cwd_path();
+        if dirfd == AT_FDCWD {
+            normalize_path(&cwd, path)
+        } else if dirfd >= 0 {
+            // If dirfd refers to a pseudo directory, resolve relative to it.
+            // For ext4 dirfds, prefer procfs fd symlink target to preserve mount context.
+            let Some(file) = get_fd_file(dirfd as usize) else {
+                return Ok(None);
+            };
             if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
                 normalize_path(pdir.path(), path)
             } else {
                 let fd_path = alloc::format!("/proc/self/fd/{}", dirfd);
-                if let Some(base) = crate::fs::proc_readlink(&fd_path) {
-                    normalize_path(&base, path)
-                } else {
-                    normalize_path(&cwd, path)
-                }
+                let base = crate::fs::proc_readlink(&fd_path).unwrap_or(cwd);
+                normalize_path(&base, path)
             }
         } else {
             return Ok(None);
         }
-    } else {
-        return Ok(None);
     };
     resolve_proc_magic_intermediate_abs_path(&abs).map(Some)
 }
@@ -5484,511 +5185,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     fd as isize
 }
 
-fn open_pseudo(path: &str) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
-    if let Some(node) = open_cgroup_pseudo(path) {
-        return Some(node);
-    }
-    if let Some(node) = crate::fs::open_proc_pseudo(path) {
-        return Some(node);
-    }
-    if path == "/sys" || path == "/sys/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("devices"),
-                ino: 2,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("block"),
-                ino: 3,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("dev"),
-                ino: 4,
-                dtype: 4
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/sys", entries)));
-    }
-    if path == "/dev" || path == "/dev/" {
-        let mut entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("root"),
-                ino: 6,
-                dtype: 6
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("ptmx"),
-                ino: 9,
-                dtype: 2
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("tty"),
-                ino: 10,
-                dtype: 2
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("pts"),
-                ino: 11,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("shm"),
-                ino: 8,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("cgroup"),
-                ino: 12,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("null"),
-                ino: 2,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("zero"),
-                ino: 3,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("urandom"),
-                ino: 4,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("random"),
-                ino: 5,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("misc"),
-                ino: 7,
-                dtype: 4
-            },
-        ];
-        entries.extend(crate::fs::pseudo_dev_dir_entries());
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev", entries)));
-    }
-    if path == "/dev/cgroup" || path == "/dev/cgroup/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 12,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/dev/cgroup",
-            entries,
-        )));
-    }
-    if path == "/dev/pts" || path == "/dev/pts/" {
-        let mut entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-        ];
-        for idx in crate::fs::list_dev_pts() {
-            entries.push(PseudoDirent {
-                name: alloc::format!("{}", idx),
-                ino: 2000 + idx as u64,
-                dtype: 2,
-            });
-        }
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/pts", entries)));
-    }
-    if let Some(rest) = path.strip_prefix("/dev/pts/") {
-        if !rest.is_empty() && !rest.contains('/') && rest.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(idx) = rest.parse::<u32>() {
-                if let Some(node) = crate::fs::open_dev_pts(idx) {
-                    return Some(node);
-                }
-            }
-        }
-    }
-    if path == "/dev/shm" || path == "/dev/shm/" {
-        let mut entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-        ];
-        for (idx, name) in shm_list().into_iter().enumerate() {
-            entries.push(PseudoDirent {
-                name,
-                ino: (1000 + idx) as u64,
-                dtype: 8,
-            });
-        }
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/shm", entries)));
-    }
-    if path == "/dev/misc" || path == "/dev/misc/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("rtc"),
-                ino: 2,
-                dtype: 8
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/dev/misc", entries)));
-    }
-    if path == "/etc" || path == "/etc/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("passwd"),
-                ino: 2,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("group"),
-                ino: 3,
-                dtype: 8
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/etc", entries)));
-    }
-    if path == "/etc/passwd" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
-            "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:\n",
-        )));
-    }
-    if path == "/etc/group" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
-            "root:x:0:\ndaemon:x:1:\nusers:x:100:\nnobody:x:65534:\nnogroup:x:65534:\n",
-        )));
-    }
-
-    // Minimal block topology nodes expected by LTP device helpers.
-    if path == "/sys/block" || path == "/sys/block/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("root"),
-                ino: 2,
-                dtype: 4
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/sys/block", entries)));
-    }
-    if path == "/sys/block/root" || path == "/sys/block/root/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("queue"),
-                ino: 2,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("size"),
-                ino: 3,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("stat"),
-                ino: 4,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("dev"),
-                ino: 5,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("removable"),
-                ino: 6,
-                dtype: 8
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/sys/block/root",
-            entries,
-        )));
-    }
-    if path == "/sys/block/root/queue" || path == "/sys/block/root/queue/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("logical_block_size"),
-                ino: 2,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("physical_block_size"),
-                ino: 3,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("minimum_io_size"),
-                ino: 4,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("optimal_io_size"),
-                ino: 5,
-                dtype: 8
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("dma_alignment"),
-                ino: 6,
-                dtype: 8
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/sys/block/root/queue",
-            entries,
-        )));
-    }
-    if path == "/sys/block/root/size" {
-        // 1GiB pseudo block device in 512-byte sectors.
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("2097152\n")));
-    }
-    if path == "/sys/block/root/stat" {
-        let stat = pseudo_block_stat_snapshot();
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(&stat)));
-    }
-    if path == "/sys/block/root/dev" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("1:0\n")));
-    }
-    if path == "/sys/block/root/removable" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
-    }
-    if path == "/sys/block/root/queue/logical_block_size" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("512\n")));
-    }
-    if path == "/sys/block/root/queue/physical_block_size" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("4096\n")));
-    }
-    if path == "/sys/block/root/queue/minimum_io_size" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("512\n")));
-    }
-    if path == "/sys/block/root/queue/optimal_io_size" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
-    }
-    if path == "/sys/block/root/queue/dma_alignment" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
-    }
-    if path == "/sys/dev" || path == "/sys/dev/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("block"),
-                ino: 2,
-                dtype: 4
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new("/sys/dev", entries)));
-    }
-    if path == "/sys/dev/block" || path == "/sys/dev/block/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("1:0"),
-                ino: 2,
-                dtype: 4
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/sys/dev/block",
-            entries,
-        )));
-    }
-    if path == "/sys/dev/block/1:0" || path == "/sys/dev/block/1:0/" {
-        let entries = alloc::vec![
-            PseudoDirent {
-                name: alloc::string::String::from("."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from(".."),
-                ino: 1,
-                dtype: 4
-            },
-            PseudoDirent {
-                name: alloc::string::String::from("uevent"),
-                ino: 2,
-                dtype: 8
-            },
-        ];
-        return Some(alloc::sync::Arc::new(PseudoDir::new(
-            "/sys/dev/block/1:0",
-            entries,
-        )));
-    }
-    if path == "/sys/dev/block/1:0/uevent" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(
-            "MAJOR=1\nMINOR=0\nDEVNAME=root\nDEVTYPE=disk\n",
-        )));
-    }
-
-    // /sys/devices/system/cpu/*
-    if path == "/sys/devices/system/cpu/possible"
-        || path == "/sys/devices/system/cpu/present"
-        || path == "/sys/devices/system/cpu/online"
-    {
-        let n = crate::config::MAX_HARTS;
-        let s = if n == 0 {
-            String::from("\n")
-        } else if n == 1 {
-            String::from("0\n")
-        } else {
-            alloc::format!("0-{}\n", n - 1)
-        };
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
-    }
-    if path == "/sys/devices/system/cpu/kernel_max" {
-        let n = crate::config::MAX_HARTS;
-        let s = if n == 0 {
-            String::from("0\n")
-        } else {
-            alloc::format!("{}\n", n - 1)
-        };
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static(&s)));
-    }
-    // /sys/devices/system/node/*
-    if path == "/sys/devices/system/node/online" || path == "/sys/devices/system/node/possible" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_static("0\n")));
-    }
-    // /dev/*
-    if path == "/dev/ptmx" {
-        return Some(crate::fs::open_dev_ptmx());
-    }
-    if path == "/dev/tty" {
-        return Some(crate::fs::open_dev_tty());
-    }
-    if path == "/dev/root" {
-        return Some(alloc::sync::Arc::new(PseudoBlock::new()));
-    }
-    if let Some(name) = shm_object_name(path) {
-        let data = shm_get(name)?;
-        return Some(alloc::sync::Arc::new(PseudoShmFile::new(data)));
-    }
-    if path == "/dev/null" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_null()));
-    }
-    if path == "/dev/zero" {
-        return Some(alloc::sync::Arc::new(PseudoFile::new_zero()));
-    }
-    if path == "/dev/urandom" || path == "/dev/random" {
-        let seed =
-            (crate::time::get_time() as u64) ^ ((crate::task::processor::hart_id() as u64) << 32);
-        return Some(alloc::sync::Arc::new(PseudoFile::new_urandom(seed)));
-    }
-    if path == "/dev/misc/rtc" {
-        return Some(alloc::sync::Arc::new(RtcFile::new()));
-    }
-    if let Some(node) = crate::fs::open_pseudo_dev_dir(path) {
-        return Some(node);
-    }
-    None
-}
-
 /// Linux `faccessat(2)` (syscall 48 on riscv64).
 ///
 /// Used by busybox `which` and shells to locate executables.
@@ -7960,7 +7156,7 @@ pub fn syscall_chroot(pathname: usize) -> isize {
         if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
             return EACCES;
         }
-        resolve_final_symlink_abs_path(&candidate_abs)
+        resolve_final_symlink_abs_path_locked(&candidate_abs)
     };
 
     // Capability check after pathname validation so permission errors surface
@@ -8094,7 +7290,7 @@ pub fn syscall_fchdir(fd: usize) -> isize {
         process.borrow_mut().cwd.clone()
     };
     let target_path = crate::fs::proc_readlink(&proc_fd_path).unwrap_or(fallback_cwd);
-    let final_cwd = if crate::fs::is_proc_pseudo_path(&target_path) || is_pseudo_path(&target_path)
+    let final_cwd = if matches!(classify_current_abs_path(&target_path), ClassifiedAbsPath::Pseudo(_))
     {
         target_path
     } else {
@@ -9704,7 +8900,10 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         return 0;
     }
     let token = get_current_token();
-    let path = translated_str(token, pathname as *const u8);
+    let path = match read_user_cstring(token, pathname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if path.is_empty() {
         return ENOENT;
     }
