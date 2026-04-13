@@ -22,9 +22,9 @@ use crate::{
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     const ENOMEM: isize = -12;
-    let task = current_task().unwrap();
-    let process = task.process.upgrade().unwrap();
-    let ustack_base = task.borrow_mut().res.as_ref().unwrap().ustack_base;
+    let task = current_task().expect("sys_thread_create: no current task");
+    let Some(process) = task.process.upgrade() else { return -1 };
+    let Some(ustack_base) = task.borrow_mut().res.as_ref().map(|r| r.ustack_base) else { return -1 };
     // create a new thread
     let Some(new_task) =
         TaskControlBlock::try_new(Arc::clone(&process), ustack_base, true).map(Arc::new)
@@ -38,7 +38,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     // Otherwise, another hart might schedule it and jump to user with an uninitialized TrapContext.
     let new_task_tid = {
         let mut new_task_inner = new_task.borrow_mut();
-        let new_task_res = new_task_inner.res.as_ref().unwrap();
+        let Some(new_task_res) = new_task_inner.res.as_ref() else { return -1 };
         let new_task_tid = new_task_res.tid;
 
         // add new thread to current process
@@ -69,26 +69,24 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
 }
 
 pub fn sys_gettid() -> isize {
-    current_task()
-        .unwrap()
-        .borrow_mut()
-        .res
-        .as_ref()
-        .unwrap()
-        .tid as isize
+    let task = current_task().expect("sys_gettid: no current task");
+    let inner = task.borrow_mut();
+    let Some(res) = inner.res.as_ref() else { return -1 };
+    res.tid as isize
 }
 
 /// thread does not exist, return -1
 /// thread has not exited yet, return -2
 /// otherwise, return thread's exit code
 pub fn sys_waittid(tid: usize) -> i32 {
-    let task = current_task().unwrap();
-    let process = task.process.upgrade().unwrap();
+    let task = current_task().expect("sys_waittid: no current task");
+    let Some(process) = task.process.upgrade() else { return -1 };
 
     // Get current tid without holding locks across other borrows.
     let self_tid = {
         let task_inner = task.borrow_mut();
-        task_inner.res.as_ref().unwrap().tid
+        let Some(res) = task_inner.res.as_ref() else { return -1 };
+        res.tid
     };
     // a thread cannot wait for itself
     if self_tid == tid {
@@ -145,7 +143,7 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     if time_ms == 0 {
         return 0;
     }
-    let task = current_task().unwrap();
+    let task = current_task().expect("sys_sleep: no current task");
     let tid = if DEBUG_TIMER || DEBUG_CYCLICTEST {
         task.borrow_mut()
             .res

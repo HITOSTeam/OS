@@ -20,6 +20,15 @@ use super::{
     try_write_user_value, wake_record_lock_waiters,
 };
 
+macro_rules! fd_file {
+    ($inner:expr, $fd:expr) => {
+        match $inner.fd_table.get($fd).and_then(|slot| slot.as_ref()) {
+            Some(f) => f.clone(),
+            None => return err(SyscallError::EBADF),
+        }
+    };
+}
+
 pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     // Minimal `fcntl(2)` support for busybox/ash/glibc startup.
     const F_DUPFD: usize = 0;
@@ -90,7 +99,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             inner.ensure_fd_flags_len();
             let mut cur = inner.fd_flags[fd];
             if (arg & O_NONBLOCK) != 0 {
@@ -115,7 +124,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             inner.ensure_fd_flags_len();
             let cur_flags = inner.fd_flags[fd];
             let mut flags = match (file.readable(), file.writable()) {
@@ -149,7 +158,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
@@ -187,7 +196,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
@@ -205,7 +214,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let token = get_current_token();
             let own = match try_read_user_value::<FcntlOwnerEx>(token, arg as *const FcntlOwnerEx) {
@@ -247,7 +256,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
@@ -269,7 +278,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
@@ -286,7 +295,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
@@ -299,7 +308,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(key) = file_lock_key(&file) else {
                 return err(SyscallError::EINVAL);
@@ -313,7 +322,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(key) = file_lock_key(&file) else {
                 return err(SyscallError::EINVAL);
@@ -327,7 +336,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
 
             let token = get_current_token();
@@ -512,7 +521,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
@@ -528,7 +537,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
@@ -541,7 +550,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             drop(inner);
             let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
                 return err(SyscallError::EINVAL);
@@ -557,7 +566,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             let has_writable_shared_map =
                 if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
                     let id = shm.memfd_id();
@@ -595,7 +604,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !inner.is_fd_open(fd) {
                 return err(SyscallError::EBADF);
             }
-            let file = inner.fd_table[fd].as_ref().unwrap().clone();
+            let file = fd_file!(inner, fd);
             inner.ensure_fd_flags_len();
             let old_flags = inner.fd_flags[fd];
             let minfd = arg;
