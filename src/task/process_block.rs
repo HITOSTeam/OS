@@ -33,7 +33,7 @@ use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
 use lazy_static::lazy_static;
-use spin::{Mutex as SpinMutex, MutexGuard};
+use spin::{Mutex as SpinMutex, MutexGuard, RwLock};
 
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
@@ -55,7 +55,7 @@ pub fn register_pid_namespace(parent_ns_id: usize, child_ns_id: usize) {
         return;
     }
     PID_NAMESPACE_PARENTS
-        .lock()
+        .write()
         .insert(child_ns_id, parent_ns_id);
 }
 
@@ -66,7 +66,7 @@ pub fn pid_namespace_descends_from(ns_id: usize, ancestor_ns_id: usize) -> bool 
     if ns_id == ancestor_ns_id {
         return true;
     }
-    let parents = PID_NAMESPACE_PARENTS.lock();
+    let parents = PID_NAMESPACE_PARENTS.read();
     let mut current = ns_id;
     while current != 0 {
         let Some(parent) = parents.get(&current).copied() else {
@@ -261,8 +261,8 @@ lazy_static! {
     static ref SHARED_FILES_SHARERS: SpinMutex<BTreeMap<usize, Vec<Weak<ProcessControlBlock>>>> =
         SpinMutex::new(BTreeMap::new());
     /// child pid namespace id -> parent pid namespace id.
-    static ref PID_NAMESPACE_PARENTS: SpinMutex<BTreeMap<usize, usize>> =
-        SpinMutex::new(BTreeMap::new());
+    static ref PID_NAMESPACE_PARENTS: RwLock<BTreeMap<usize, usize>> =
+        RwLock::new(BTreeMap::new());
 }
 
 fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
