@@ -9,6 +9,7 @@ use super::{
     err, ext4_lock, fd_has_o_path, file_lock_key_from_inode, fill_statfs,
     find_path_in_roots, flush_open_inode_views, fsize_limit_allows,
     get_current_token, get_fd_file, get_inode_times, inode_mode_allows_uid_gid,
+    require_fd_file,
     inode_rdev_for_mode, inode_visible_size, kstat_from_fd, kstat_from_file,
     maybe_signal_lease_break, open_pseudo, proc_magic_link_target_kstat,
     proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync,
@@ -35,9 +36,7 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
     if (mode & FALLOC_FL_PUNCH_HOLE) != 0 && (mode & FALLOC_FL_KEEP_SIZE) == 0 {
         return err(SyscallError::EINVAL);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if !file.writable() {
         return err(SyscallError::EBADF);
     }
@@ -143,9 +142,7 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if !file.writable() {
         // Linux reports err(SyscallError::EINVAL) when the descriptor does not permit writing.
         return err(SyscallError::EINVAL);
@@ -301,9 +298,7 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         if dirfd < 0 {
             return err(SyscallError::EBADF);
         }
-        let Some(file) = get_fd_file(dirfd as usize) else {
-            return err(SyscallError::EBADF);
-        };
+        let file = require_fd_file!(dirfd);
         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
             if os_inode.readonly_fs() {
                 return err(SyscallError::EROFS);
@@ -495,9 +490,7 @@ pub fn syscall_fsync(fd: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
         {
@@ -562,9 +555,7 @@ pub fn syscall_syncfs(fd: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if file.as_any().downcast_ref::<OSInode>().is_none() {
         return err(SyscallError::EINVAL);
     }
@@ -578,9 +569,7 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if file.as_any().downcast_ref::<Pipe>().is_some()
         || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
@@ -644,9 +633,7 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
 
     if file.as_any().downcast_ref::<Pipe>().is_some()
         || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()

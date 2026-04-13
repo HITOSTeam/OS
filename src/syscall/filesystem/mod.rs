@@ -49,6 +49,8 @@ pub(crate) use crate::syscall::error::{SyscallError, err};
 
 mod ctl;
 pub use ctl::*;
+mod fcntl;
+pub use fcntl::*;
 mod open_close;
 pub use open_close::*;
 mod xattr;

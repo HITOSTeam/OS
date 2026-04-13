@@ -342,14 +342,18 @@ const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
 const SYSCALL_CONDVAR_WAIT: usize = 1032;
 const SYSCALL_GET_HARTID: usize = 998;
 
-pub fn syscall(id: usize, args: [usize; 6]) -> isize {
-    LAST_SYSCALL_ID.store(id, Ordering::Relaxed);
-    LAST_SYSCALL_A0.store(args[0], Ordering::Relaxed);
-    LAST_SYSCALL_A1.store(args[1], Ordering::Relaxed);
-    LAST_SYSCALL_A2.store(args[2], Ordering::Relaxed);
-    LAST_SYSCALL_A3.store(args[3], Ordering::Relaxed);
-    LAST_SYSCALL_A4.store(args[4], Ordering::Relaxed);
-    LAST_SYSCALL_A5.store(args[5], Ordering::Relaxed);
+/// Consolidated debug tracing for syscall entry.
+/// All conditional debug logging is centralized here to keep `syscall()` clean.
+#[inline(always)]
+fn trace_syscall_entry(id: usize, args: &[usize; 6]) {
+    if !(crate::debug_config::DEBUG_CYCLICTEST
+        || crate::debug_config::DEBUG_SIGNAL
+        || crate::debug_config::DEBUG_SYSCALL)
+    {
+        return;
+    }
+
+    // -- cyclictest: log all syscalls for "cyclictest" processes (with countdown) --
     if crate::debug_config::DEBUG_CYCLICTEST {
         let proc = crate::task::processor::current_process();
         let is_cyclic = {
@@ -380,6 +384,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             }
         }
     }
+
+    // -- cyclictest: log scheduler-related syscalls --
     if crate::debug_config::DEBUG_CYCLICTEST {
         match id {
             118 | 119 | 120 | 121 | 122 | 123 | 124 | 125 | 126 | 127 | 142 | 143 | 144 | 145
@@ -398,6 +404,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             _ => {}
         }
     }
+
+    // -- signal: log all syscalls for "sleep" processes --
     if crate::debug_config::DEBUG_SIGNAL {
         let is_sleep = {
             let proc = crate::task::processor::current_process();
@@ -425,6 +433,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             );
         }
     }
+
+    // -- signal: log time-related syscalls --
     if crate::debug_config::DEBUG_SIGNAL {
         let pid = crate::task::processor::current_process().getpid();
         match id {
@@ -449,12 +459,11 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             _ => {}
         }
     }
-    // Lightweight syscall trace for debugging glibc/busybox startup.
-    // Keep disabled for normal runs.
+
+    // -- general syscall trace (with countdown) --
     static TRACE_LEFT: AtomicUsize = AtomicUsize::new(256);
     if crate::debug_config::DEBUG_SYSCALL {
         let pid = crate::task::processor::current_process().getpid();
-        // Skip the interactive shell itself (pid=1) to avoid logging every keystroke.
         if pid >= 2 {
             let left = TRACE_LEFT.fetch_sub(1, Ordering::Relaxed);
             if left > 0 {
@@ -472,10 +481,17 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             }
         }
     }
-    // println!(
-    //     "syscall id: {}, args: {},{},{}",
-    //     id, args[0], args[1], args[2]
-    // );
+}
+
+pub fn syscall(id: usize, args: [usize; 6]) -> isize {
+    LAST_SYSCALL_ID.store(id, Ordering::Relaxed);
+    LAST_SYSCALL_A0.store(args[0], Ordering::Relaxed);
+    LAST_SYSCALL_A1.store(args[1], Ordering::Relaxed);
+    LAST_SYSCALL_A2.store(args[2], Ordering::Relaxed);
+    LAST_SYSCALL_A3.store(args[3], Ordering::Relaxed);
+    LAST_SYSCALL_A4.store(args[4], Ordering::Relaxed);
+    LAST_SYSCALL_A5.store(args[5], Ordering::Relaxed);
+    trace_syscall_entry(id, &args);
     let ret = match id {
         SYSCALL_GETCWD => filesystem::syscall_getcwd(args[0], args[1]),
         SYSCALL_FCNTL => filesystem::syscall_fcntl(args[0], args[1], args[2]),

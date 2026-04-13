@@ -5,7 +5,7 @@ use super::{
     SocketPairEnd, SyscallError, TimerFdFile, UserBuffer, Vec,
     cgroup_charge_file_write, current_process, err, ext4_err_to_errno, ext4_lock,
     fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe,
-    file_is_seekable_for_preadwrite, get_current_token, get_fd_file,
+    file_is_seekable_for_preadwrite, get_current_token, get_fd_file, require_fd_file,
     maybe_update_inode_atime, mirror_inode_write_to_current_mmaps,
     pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal,
     read_optional_offset, read_vm_iovec, socketpair_write_from_kernel,
@@ -19,9 +19,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if !file.readable() {
         return err(SyscallError::EBADF);
     }
@@ -115,9 +113,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if file.as_any().downcast_ref::<TimerFdFile>().is_some() {
         return err(SyscallError::EINVAL);
     }
@@ -317,9 +313,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if !file_is_seekable_for_preadwrite(&file) {
         return err(SyscallError::ESPIPE);
     }
@@ -441,9 +435,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     if !file_is_seekable_for_preadwrite(&file) {
         return err(SyscallError::ESPIPE);
     }
@@ -630,12 +622,8 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
     if fd_has_o_path(in_fd) || fd_has_o_path(out_fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(in_file) = get_fd_file(in_fd) else {
-        return err(SyscallError::EBADF);
-    };
-    let Some(out_file) = get_fd_file(out_fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let in_file = require_fd_file!(in_fd);
+    let out_file = require_fd_file!(out_fd);
     if !in_file.readable() || !out_file.writable() {
         return err(SyscallError::EBADF);
     }
@@ -740,12 +728,8 @@ pub fn syscall_splice(
     if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
         return err(SyscallError::EBADF);
     }
-    let Some(in_file) = get_fd_file(fd_in) else {
-        return err(SyscallError::EBADF);
-    };
-    let Some(out_file) = get_fd_file(fd_out) else {
-        return err(SyscallError::EBADF);
-    };
+    let in_file = require_fd_file!(fd_in);
+    let out_file = require_fd_file!(fd_out);
     if !in_file.readable() || !out_file.writable() {
         return err(SyscallError::EBADF);
     }
@@ -933,12 +917,8 @@ pub fn syscall_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isi
     if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
         return err(SyscallError::EBADF);
     }
-    let Some(in_file) = get_fd_file(fd_in) else {
-        return err(SyscallError::EBADF);
-    };
-    let Some(out_file) = get_fd_file(fd_out) else {
-        return err(SyscallError::EBADF);
-    };
+    let in_file = require_fd_file!(fd_in);
+    let out_file = require_fd_file!(fd_out);
     if !in_file.readable() || !out_file.writable() {
         return err(SyscallError::EBADF);
     }
@@ -995,9 +975,7 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
     }
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
     let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
         return err(SyscallError::EBADF);
     };
@@ -1094,12 +1072,8 @@ pub fn syscall_copy_file_range(
     if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
         return err(SyscallError::EBADF);
     }
-    let Some(in_file) = get_fd_file(fd_in) else {
-        return err(SyscallError::EBADF);
-    };
-    let Some(out_file) = get_fd_file(fd_out) else {
-        return err(SyscallError::EBADF);
-    };
+    let in_file = require_fd_file!(fd_in);
+    let out_file = require_fd_file!(fd_out);
     if !in_file.readable() {
         return err(SyscallError::EBADF);
     }
@@ -1227,9 +1201,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     const SEEK_END: usize = 2;
     const PSEUDO_ROOT_DEV_BYTES: usize = 1024 * 1024 * 1024;
 
-    let Some(file) = get_fd_file(fd) else {
-        return err(SyscallError::EBADF);
-    };
+    let file = require_fd_file!(fd);
 
     // Directories: map seek position to our per-fd `dir_offset`.
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {

@@ -130,6 +130,17 @@ pub(crate) fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send 
     inner.fd_table[fd].clone()
 }
 
+/// Get the file for `fd`, returning `-EBADF` if the descriptor is not open.
+macro_rules! require_fd_file {
+    ($fd:expr) => {
+        match $crate::syscall::filesystem::get_fd_file($fd as usize) {
+            Some(f) => f,
+            None => return $crate::syscall::error::err($crate::syscall::error::SyscallError::EBADF),
+        }
+    };
+}
+pub(crate) use require_fd_file;
+
 pub(crate) fn try_write_proc_pseudo_file(
     file: &Arc<dyn File + Send + Sync>,
     data: &[u8],

@@ -16,32 +16,46 @@ use ext4_fs::{Ext4FileSystem, Inode};
 use lazy_static::*;
 use spin::Mutex;
 
+/// Yield-aware spinlock for serializing ext4 filesystem operations.
+///
+/// Unlike a pure spinlock, this lock cooperatively yields the current task
+/// (via `suspend_current_and_run_next`) when contended and a task context
+/// is available. During early boot (before the task system is initialized),
+/// it falls back to a spin-loop hint. This avoids wasting CPU on busy-wait
+/// while still working correctly outside of a multitasking context.
 struct Ext4Lock {
-    locked: AtomicBool,
+    held: AtomicBool,
 }
 
 impl Ext4Lock {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            held: AtomicBool::new(false),
         }
     }
 
     fn lock(&self) {
         loop {
-            if !self.locked.swap(true, Ordering::Acquire) {
+            // Attempt to acquire: CAS is more efficient than swap on
+            // weakly-ordered architectures (RISC-V, LoongArch) because it
+            // avoids writing when the lock is already held.
+            if self
+                .held
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 return;
             }
+            // Hint the CPU we are in a spin-wait before deciding to yield.
+            spin_loop();
             if crate::task::processor::current_task().is_some() {
                 crate::task::processor::suspend_current_and_run_next();
-            } else {
-                spin_loop();
             }
         }
     }
 
     fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
+        self.held.store(false, Ordering::Release);
     }
 }
 
