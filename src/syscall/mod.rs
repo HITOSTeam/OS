@@ -1,4 +1,5 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
+pub mod error;
 pub(crate) mod filesystem;
 
 mod condvar;

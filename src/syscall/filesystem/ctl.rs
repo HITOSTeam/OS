@@ -2,7 +2,7 @@ use super::*;
 
 pub fn syscall_acct(pathname: usize) -> isize {
     if current_effective_uid_gid().0 != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if pathname == 0 {
         *ACCT_STATE.lock() = None;
@@ -14,18 +14,18 @@ pub fn syscall_acct(pathname: usize) -> isize {
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     let trailing_slash = path.len() > 1 && path.ends_with('/');
     if rofs_for_path(AT_FDCWD, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     let at = match resolve_at_path(AT_FDCWD, &path) {
         Ok(v) => v,
         Err(e) => return e,
     };
     if let AtPath::PseudoAbs(_) = &at {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
@@ -34,16 +34,16 @@ pub fn syscall_acct(pathname: usize) -> isize {
         Err(e) => return e,
     };
     if inode.is_dir() {
-        return EISDIR;
+        return err(SyscallError::EISDIR);
     }
     if trailing_slash {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
     if !inode.is_file() {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     *ACCT_STATE.lock() = Some(AcctState {
         inode: Arc::clone(&inode),
@@ -173,7 +173,6 @@ pub fn release_all_file_leases_for_owner(owner_pid: usize) {
 
 pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     // Minimal `fcntl(2)` support for busybox/ash/glibc startup.
-    const ESRCH: isize = -3;
     const F_DUPFD: usize = 0;
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
@@ -211,7 +210,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             inner.ensure_fd_flags_len();
             if (inner.fd_flags[fd] & FD_CLOEXEC) != 0 {
@@ -224,7 +223,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             inner.ensure_fd_flags_len();
             let mut cur = inner.fd_flags[fd];
@@ -240,7 +239,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             inner.ensure_fd_flags_len();
@@ -265,7 +264,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             inner.ensure_fd_flags_len();
@@ -299,17 +298,17 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let owner = arg as i32;
             let (owner_type, owner_pid) = if owner < 0 {
                 let Some(pid) = owner.checked_neg() else {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 };
                 (F_OWNER_PGRP, pid)
             } else {
@@ -321,7 +320,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 {
                     process.getpid() as i32
                 } else {
-                    return ESRCH;
+                    return err(SyscallError::ESRCH);
                 };
                 (F_OWNER_PID, owner_pid)
             };
@@ -337,12 +336,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let (owner_type, owner_pid) = pipe.get_async_owner();
             if owner_type == F_OWNER_PGRP {
@@ -355,20 +354,20 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let token = get_current_token();
             let own = match try_read_user_value::<FcntlOwnerEx>(token, arg as *const FcntlOwnerEx) {
                 Some(v) => v,
-                None => return EFAULT,
+                None => return err(SyscallError::EFAULT),
             };
             if !matches!(own.type_, F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP) {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let (owner_type, owner_pid) = if matches!(own.type_, F_OWNER_TID | F_OWNER_PID) {
                 let current_ns_id = current_process().pid_namespace_id();
@@ -379,7 +378,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 {
                     process.getpid() as i32
                 } else {
-                    return ESRCH;
+                    return err(SyscallError::ESRCH);
                 };
                 (own.type_, owner_pid)
             } else {
@@ -397,12 +396,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let (owner_type, owner_pid) = pipe.get_async_owner();
             let own = FcntlOwnerEx {
@@ -411,7 +410,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             };
             let token = get_current_token();
             if try_write_user_value(token, arg as *mut FcntlOwnerEx, &own).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             0
         }
@@ -419,12 +418,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let sig = arg as i32;
             match pipe.set_async_signal(sig) {
@@ -436,12 +435,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             pipe.get_async_signal() as isize
         }
@@ -449,12 +448,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(key) = file_lock_key(&file) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let owner_pid = current_process().getpid();
             set_file_lease(key, owner_pid, arg as i16, &file)
@@ -463,12 +462,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(key) = file_lock_key(&file) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let owner_pid = current_process().getpid();
             get_file_lease_type(key, owner_pid) as isize
@@ -477,7 +476,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
@@ -485,14 +484,14 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let token = get_current_token();
             let flock = match try_read_user_value::<FcntlFlock>(token, arg as *const FcntlFlock) {
                 Some(v) => v,
-                None => return EFAULT,
+                None => return err(SyscallError::EFAULT),
             };
             let is_ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
             if is_ofd && flock.l_pid != 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let Some(key) = file_lock_key(&file) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let owner_pid = current_process().getpid();
             let owner = if is_ofd {
@@ -509,16 +508,16 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             match flock.l_type {
                 F_RDLCK => {
                     if !file.readable() {
-                        return EBADF;
+                        return err(SyscallError::EBADF);
                     }
                 }
                 F_WRLCK => {
                     if !file.writable() {
-                        return EBADF;
+                        return err(SyscallError::EBADF);
                     }
                 }
                 F_UNLCK => {}
-                _ => return EINVAL,
+                _ => return err(SyscallError::EINVAL),
             }
 
             if matches!(cmd, F_GETLK | F_OFD_GETLK) {
@@ -546,7 +545,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                     out.l_pid = 0;
                 }
                 if try_write_user_value(token, arg as *mut FcntlFlock, &out).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 0
             } else {
@@ -595,13 +594,13 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                         break 0;
                     }
                     if !blocking {
-                        break EAGAIN;
+                        break err(SyscallError::EAGAIN);
                     }
                     if !is_ofd && detect_record_lock_deadlock(owner_pid, &conflict_owners) {
-                        break EDEADLK;
+                        break err(SyscallError::EDEADLK);
                     }
                     let Some(task) = waiter_task.as_ref() else {
-                        break EACCES;
+                        break err(SyscallError::EACCES);
                     };
                     if !is_ofd {
                         set_record_lock_waiting(
@@ -638,7 +637,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                         if !is_ofd {
                             clear_record_lock_waiting(owner_pid);
                         }
-                        break EINTR;
+                        break err(SyscallError::EINTR);
                     }
                     block_current_and_run_next();
                     if has_pending_unmasked_signal() {
@@ -646,7 +645,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                         if !is_ofd {
                             clear_record_lock_waiting(owner_pid);
                         }
-                        break EINTR;
+                        break err(SyscallError::EINTR);
                     }
                 };
                 if let Some(task) = waiter_task.as_ref() {
@@ -662,12 +661,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             match pipe.set_pipe_size(arg) {
                 Ok(sz) => sz as isize,
@@ -678,12 +677,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             pipe.pipe_size() as isize
         }
@@ -691,15 +690,15 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             drop(inner);
             let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let Some(seals) = shm.memfd_seals() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             seals as isize
         }
@@ -707,7 +706,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             let has_writable_shared_map =
@@ -721,20 +720,20 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 };
             drop(inner);
             if !file.writable() {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let add = arg as u32;
             if (add & !PseudoShmFile::F_SEAL_ALL) != 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             if (add & PseudoShmFile::F_SEAL_WRITE) != 0
                 && !shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE)
                 && has_writable_shared_map
             {
-                return EBUSY;
+                return err(SyscallError::EBUSY);
             }
             match shm.add_memfd_seals(add) {
                 Ok(_) => 0,
@@ -745,7 +744,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let process = current_files_process();
             let mut inner = process.borrow_mut();
             if !inner.is_fd_open(fd) {
-                return EBADF;
+                return err(SyscallError::EBADF);
             }
             let file = inner.fd_table[fd].as_ref().unwrap().clone();
             inner.ensure_fd_flags_len();
@@ -753,14 +752,14 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let minfd = arg;
             let limit = inner.rlimit_nofile_cur as usize;
             if minfd >= limit {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let mut newfd = minfd;
             while newfd < inner.fd_table.len() && inner.fd_table[newfd].is_some() {
                 newfd += 1;
             }
             if newfd >= limit {
-                return EMFILE;
+                return err(SyscallError::EMFILE);
             }
             if newfd >= inner.fd_table.len() {
                 // Extend fd table to fit the selected target descriptor.
@@ -777,7 +776,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             inner.fd_flags[newfd] = new_flags;
             newfd as isize
         }
-        _ => EINVAL,
+        _ => err(SyscallError::EINVAL),
     };
 
     if crate::debug_config::DEBUG_FS {
@@ -798,7 +797,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
 
 pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usize) -> isize {
     if mode & !0x7 != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -806,7 +805,7 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     if busybox_exists() && should_try_busybox_applet_path(&path, false) {
         return 0;
@@ -825,7 +824,7 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
         return if open_pseudo(abs).is_some() {
             0
         } else {
-            ENOENT
+            err(SyscallError::ENOENT)
         };
     }
 
@@ -833,7 +832,7 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, uid, gid, true) {
         Ok(v) => v,
-        Err(ENOENT) if matches!(path.as_str(), "busybox" | "./busybox") => {
+        Err(e) if e == err(SyscallError::ENOENT) && matches!(path.as_str(), "busybox" | "./busybox") => {
             let candidates = [
                 "/musl/busybox",
                 "/glibc/busybox",
@@ -849,17 +848,17 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
             }
             match found {
                 Some(v) => v,
-                None => return ENOENT,
+                None => return err(SyscallError::ENOENT),
             }
         }
         Err(e) => return e,
     };
 
     if (mode & 2) != 0 && rofs_for_path(dirfd, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     if !inode_mode_allows_uid_gid(&inode, mode, uid, gid) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if let Some(abs) = match resolve_abs_path(dirfd, &path) {
         Ok(v) => v,
@@ -872,20 +871,20 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
 
 pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return EROFS;
+            return err(SyscallError::EROFS);
         }
         let inode = os_inode.ext4_inode();
         let _ext4_guard = ext4_lock();
         let (uid, _gid) = current_effective_uid_gid();
         if uid != 0 && inode.uid() != uid {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         let mut new_mode = (mode as u16) & 0o7777;
         // Linux clears S_ISGID when an unprivileged caller is outside file group.
@@ -907,14 +906,14 @@ pub fn syscall_fchmodat2(dirfd: isize, pathname: usize, mode: usize, flags: usiz
 
 pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return EROFS;
+            return err(SyscallError::EROFS);
         }
         let inode = os_inode.ext4_inode();
         let _ext4_guard = ext4_lock();
@@ -935,7 +934,7 @@ pub fn syscall_fchownat(
 ) -> isize {
     let valid_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -972,7 +971,7 @@ pub fn syscall_fchownat(
         Err(e) => return e,
     };
     if rofs_for_path(dirfd, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     let ret = apply_chown_to_inode(&inode, uid, gid);
     if ret != 0 {
@@ -988,7 +987,7 @@ pub fn syscall_chroot(pathname: usize) -> isize {
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     let at = match resolve_at_path(AT_FDCWD, &path) {
@@ -996,7 +995,7 @@ pub fn syscall_chroot(pathname: usize) -> isize {
         Err(e) => return e,
     };
     if matches!(at, AtPath::PseudoAbs(_)) {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
 
     let process = current_process();
@@ -1015,10 +1014,10 @@ pub fn syscall_chroot(pathname: usize) -> isize {
             Err(e) => return e,
         };
         if !inode.is_dir() {
-            return ENOTDIR;
+            return err(SyscallError::ENOTDIR);
         }
         if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         resolve_final_symlink_abs_path_locked(&candidate_abs)
     };
@@ -1030,7 +1029,7 @@ pub fn syscall_chroot(pathname: usize) -> isize {
         inner.euid == 0
     };
     if !has_priv {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
 
     let mut inner = process.borrow_mut();
@@ -1047,7 +1046,7 @@ pub fn syscall_chdir(pathname: usize) -> isize {
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     let at = match resolve_at_path(AT_FDCWD, &path) {
         Ok(v) => v,
@@ -1102,19 +1101,19 @@ pub fn syscall_chdir(pathname: usize) -> isize {
             );
         }
         if !inode.is_dir() {
-            return ENOTDIR;
+            return err(SyscallError::ENOTDIR);
         }
         if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         resolve_final_symlink_abs_path(&new_cwd)
     } else if let Some(node) = open_pseudo(&new_cwd) {
         if node.as_any().downcast_ref::<PseudoDir>().is_none() {
-            return ENOTDIR;
+            return err(SyscallError::ENOTDIR);
         }
         new_cwd
     } else {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     };
 
     process.borrow_mut().cwd = final_cwd;
@@ -1123,7 +1122,7 @@ pub fn syscall_chdir(pathname: usize) -> isize {
 
 pub fn syscall_fchdir(fd: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
@@ -1133,17 +1132,17 @@ pub fn syscall_fchdir(fd: usize) -> isize {
     }
 
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     };
     let inode = os_inode.ext4_inode();
     let (fsuid, fsgid) = current_fsuid_gid();
     {
         let _ext4_guard = ext4_lock();
         if !inode.is_dir() {
-            return ENOTDIR;
+            return err(SyscallError::ENOTDIR);
         }
         if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
     }
 

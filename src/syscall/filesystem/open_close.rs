@@ -7,7 +7,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     let debug_close = crate::debug_config::DEBUG_FS && path.contains("test_close");
     if debug_close {
@@ -55,7 +55,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     };
     let readonly_fs = raw_abs.as_deref().map(path_is_rofs).unwrap_or(false);
     if write_intent && readonly_fs {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     if !nofollow {
         if let Some(proc_path) = raw_abs
@@ -92,7 +92,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         if path_is_nosymfollow(abs) {
             if let Ok(inode) = resolve_at_inode(&at, fsuid, fsgid, false) {
                 if inode.is_symlink() {
-                    return ELOOP;
+                    return err(SyscallError::ELOOP);
                 }
             }
         }
@@ -101,16 +101,16 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     // Pseudo fs: `/sys`, `/dev`.
     if let AtPath::PseudoAbs(abs) = &at {
         if tmpfile_requested {
-            return EOPNOTSUPP;
+            return err(SyscallError::EOPNOTSUPP);
         }
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
             if crate::fs::proc_magic_link_exists(proc_path) {
                 if nofollow {
                     if !o_path {
-                        return ELOOP;
+                        return err(SyscallError::ELOOP);
                     }
                     if (flags & O_DIRECTORY) != 0 {
-                        return ENOTDIR;
+                        return err(SyscallError::ENOTDIR);
                     }
                     let fd = match install_open_file_fd(
                         ProcMagicLinkFile::new(proc_path),
@@ -135,7 +135,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                 }
                 let file = match open_pseudo(proc_path) {
                     Some(f) => f,
-                    None => return ENOENT,
+                    None => return err(SyscallError::ENOENT),
                 };
                 let fd = match install_open_file_fd(file, flags, o_path) {
                     Ok(fd) => fd,
@@ -150,20 +150,20 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             if let Some(name) = shm_object_name(abs) {
                 if (flags & O_CREAT) != 0 {
                     if (flags & O_EXCL) != 0 && shm_get(name).is_some() {
-                        return EEXIST;
+                        return err(SyscallError::EEXIST);
                     }
                     let data = shm_create(name);
                     alloc::sync::Arc::new(PseudoShmFile::new_with_mode(data, readable, writable))
                 } else {
                     let Some(data) = shm_get(name) else {
-                        return ENOENT;
+                        return err(SyscallError::ENOENT);
                     };
                     alloc::sync::Arc::new(PseudoShmFile::new_with_mode(data, readable, writable))
                 }
             } else if let Some(f) = open_pseudo(abs) {
                 f
             } else {
-                return ENOENT;
+                return err(SyscallError::ENOENT);
             };
         let fd = match install_open_file_fd(file, flags, o_path) {
             Ok(fd) => fd,
@@ -182,7 +182,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     if let AtPath::Ext4Abs(abs) = &at {
         if abs == "/" && secondary_root_inode().is_some() {
             if write_intent && !o_path {
-                return EISDIR;
+                return err(SyscallError::EISDIR);
             }
             let _ext4_guard = ext4_lock();
             let entries = union_root_dir_entries();
@@ -202,7 +202,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     // ext4 lookup with search permission checks and symlink resolution.
     let mut inode = match resolve_at_inode(&at, fsuid, fsgid, !nofollow) {
         Ok(v) => Some(v),
-        Err(ENOENT) => None,
+        Err(e) if e == err(SyscallError::ENOENT) => None,
         Err(e) => {
             if debug_close {
                 crate::println!("[fs] openat close-test resolve_at_inode err={}", e);
@@ -214,26 +214,26 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     if !o_path && nofollow {
         if let Some(inode_ref) = inode.as_ref() {
             if inode_ref.is_symlink() {
-                return ELOOP;
+                return err(SyscallError::ELOOP);
             }
         }
     }
 
     // Existing path + O_CREAT|O_EXCL must fail.
     if !tmpfile_requested && inode.is_some() && (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
-        return EEXIST;
+        return err(SyscallError::EEXIST);
     }
 
     if tmpfile_requested {
         let dir_inode = match inode {
             Some(ref i) => alloc::sync::Arc::clone(i),
-            None => return ENOENT,
+            None => return err(SyscallError::ENOENT),
         };
         if !dir_inode.is_dir() {
-            return ENOTDIR;
+            return err(SyscallError::ENOTDIR);
         }
         if !inode_mode_allows_uid_gid(&dir_inode, 3, fsuid, fsgid) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         // Emulate anonymous tmpfile semantics using a hidden per-filesystem pool.
         // Use the known root inode for the same block device to avoid relying on
@@ -254,7 +254,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         let pool_name = ".ltp_tmpfile_pool";
         let pool_dir = if let Some(existing) = fs_root.find(pool_name) {
             if !existing.is_dir() {
-                return ENOTDIR;
+                return err(SyscallError::ENOTDIR);
             }
             existing
         } else {
@@ -287,7 +287,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             }
         }
         let Some(tmp_inode) = tmp_created else {
-            return ENOSPC;
+            return err(SyscallError::ENOSPC);
         };
         // Use target directory for mode/gid inheritance semantics.
         created_parent = Some(dir_inode);
@@ -307,13 +307,13 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                     if debug_close {
                         crate::println!("[fs] openat close-test parent not dir");
                     }
-                    return ENOTDIR;
+                    return err(SyscallError::ENOTDIR);
                 }
                 if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
                     if debug_close {
                         crate::println!("[fs] openat close-test parent no search perm");
                     }
-                    return EACCES;
+                    return err(SyscallError::EACCES);
                 }
                 inode = match parent.create_file(&name) {
                     Ok(i) => {
@@ -335,7 +335,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 
     let inode = match inode {
         Some(i) => i,
-        None => return ENOENT,
+        None => return err(SyscallError::ENOENT),
     };
 
     if !tmpfile_requested {
@@ -347,7 +347,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     if let Some(abs) = raw_abs.as_deref() {
         let mode = inode.mode() & S_IFMT;
         if path_is_nodev(abs) && matches!(mode, S_IFCHR | S_IFBLK) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
     }
 
@@ -370,23 +370,23 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     // Linux: opening a directory for write is not allowed. Also, O_CREAT on
-    // an existing directory returns EISDIR (including symlink-to-directory).
+    // an existing directory returns err(SyscallError::EISDIR) (including symlink-to-directory).
     if !o_path && inode.is_dir() && ((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) != 0) {
         if debug_close {
             crate::println!(
-                "[fs] openat close-test EISDIR inode={} mode=0o{:o}",
+                "[fs] openat close-test err(SyscallError::EISDIR) inode={} mode=0o{:o}",
                 inode.inode_num(),
                 inode.mode()
             );
         }
-        return EISDIR;
+        return err(SyscallError::EISDIR);
     }
 
-    // Linux `O_NOATIME`: non-owner/non-privileged callers get EPERM.
+    // Linux `O_NOATIME`: non-owner/non-privileged callers get err(SyscallError::EPERM).
     if (flags & O_NOATIME) != 0 {
         let (euid, _egid) = current_effective_uid_gid();
         if euid != 0 && euid != inode.uid() {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
     }
 
@@ -401,24 +401,24 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     if !inode_mode_allows(&inode, mask) {
         if debug_close {
             crate::println!(
-                "[fs] openat close-test EACCES inode={} mode=0o{:o} mask=0o{:o}",
+                "[fs] openat close-test err(SyscallError::EACCES) inode={} mode=0o{:o} mask=0o{:o}",
                 inode.inode_num(),
                 inode.mode(),
                 mask
             );
         }
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
 
     if (flags & O_DIRECTORY) != 0 && !tmpfile_requested && !inode.is_dir() {
         if debug_close {
             crate::println!(
-                "[fs] openat close-test ENOTDIR inode={} mode=0o{:o}",
+                "[fs] openat close-test err(SyscallError::ENOTDIR) inode={} mode=0o{:o}",
                 inode.inode_num(),
                 inode.mode()
             );
         }
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
 
     let text_write_intent = writable || (flags & O_TRUNC) != 0;
@@ -427,7 +427,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         let exec_busy =
             is_inode_currently_executed_locked(&guard, inode.device_id(), inode.inode_num());
         if exec_busy {
-            return ETXTBSY;
+            return err(SyscallError::ETXTBSY);
         }
         Some(guard)
     } else {
@@ -455,11 +455,11 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         let accmode = flags & O_ACCMODE;
         if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
             drop(ext4_guard);
-            return ENXIO;
+            return err(SyscallError::ENXIO);
         }
         let Some(file) = state.open_file(accmode) else {
             drop(ext4_guard);
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         drop(ext4_guard);
         let fd = match install_open_file_fd(file, flags, o_path) {
@@ -510,7 +510,7 @@ pub fn syscall_close(fd: usize) -> isize {
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let lock_key = inner.fd_table[fd].as_ref().and_then(file_lock_key);
     let _ = inner.clear_fd(fd);
@@ -533,7 +533,7 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
     const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
     let valid = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC;
     if first > last || (flags & !valid) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let set_cloexec = (flags & CLOSE_RANGE_CLOEXEC) != 0;
@@ -585,12 +585,12 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
 
     let mut inner = process.borrow_mut();
     let Some(read_fd) = inner.alloc_fd() else {
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[read_fd] = Some(pipe_read);
     let Some(write_fd) = inner.alloc_fd() else {
         let _ = inner.clear_fd(read_fd);
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[write_fd] = Some(pipe_write);
     let mut fd_flags = 0u32;
@@ -618,7 +618,7 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
         let mut inner = process.borrow_mut();
         let _ = inner.clear_fd(read_fd);
         let _ = inner.clear_fd(write_fd);
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -627,13 +627,13 @@ pub fn syscall_dup(oldfd: usize) -> isize {
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     if !inner.is_fd_open(oldfd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let file = inner.fd_table[oldfd].as_ref().unwrap().clone();
     inner.ensure_fd_flags_len();
     let old_flags = inner.fd_flags[oldfd];
     let Some(newfd) = inner.alloc_fd() else {
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[newfd] = Some(file);
     inner.fd_flags[newfd] = old_flags & !FD_CLOEXEC;
@@ -642,18 +642,18 @@ pub fn syscall_dup(oldfd: usize) -> isize {
 
 pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     if (flags & !O_CLOEXEC) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if oldfd == newfd {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     if newfd >= inner.rlimit_nofile_cur as usize {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if !inner.is_fd_open(oldfd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let owner_pid = current_process().getpid();
     let mut replaced_lock_key = None;

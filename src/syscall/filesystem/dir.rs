@@ -7,38 +7,38 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
         Err(e) => return e,
     };
     if bufsiz == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if path.is_empty() {
         if dirfd < 0 {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         }
         let Some(file) = get_fd_file(dirfd as usize) else {
-            return EBADF;
+            return err(SyscallError::EBADF);
         };
         if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
             let Some(target) = link.readlink_target() else {
-                return ENOENT;
+                return err(SyscallError::ENOENT);
             };
             let bytes = target.as_bytes();
             let len = min(bytes.len(), bufsiz);
             if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             return len as isize;
         }
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         let _ext4_guard = ext4_lock();
         let inode = os_inode.ext4_inode();
         if !inode.is_symlink() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let target = inode.read_all();
         let len = min(target.len(), bufsiz);
         if try_copy_to_user(token, buf as *mut u8, &target[..len]).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return len as isize;
     }
@@ -58,7 +58,7 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
                 let bytes = target.as_bytes();
                 let len = min(bytes.len(), bufsiz);
                 if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return len as isize;
             }
@@ -67,14 +67,14 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
             let bytes = target.as_bytes();
             let len = min(bytes.len(), bufsiz);
             if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             return len as isize;
         }
         return if open_pseudo(abs).is_some() {
-            EINVAL
+            err(SyscallError::EINVAL)
         } else {
-            ENOENT
+            err(SyscallError::ENOENT)
         };
     }
 
@@ -85,12 +85,12 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
         Err(e) => return e,
     };
     if !inode.is_symlink() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let target = inode.read_all();
     let len = min(target.len(), bufsiz);
     if try_copy_to_user(token, buf as *mut u8, &target[..len]).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     len as isize
 }
@@ -106,7 +106,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     let at = match resolve_at_path(newdirfd, &path) {
@@ -114,7 +114,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
         Err(e) => return e,
     };
     if let AtPath::PseudoAbs(_) = &at {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -124,13 +124,13 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
         Err(e) => return e,
     };
     if !parent.is_dir() {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if rofs_for_path(newdirfd, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
 
     match parent.create_symlink(&name, &target_path) {
@@ -153,7 +153,7 @@ pub fn syscall_linkat(
 ) -> isize {
     let valid_flags = AT_SYMLINK_FOLLOW | AT_EMPTY_PATH;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let token = get_current_token();
@@ -166,12 +166,12 @@ pub fn syscall_linkat(
         Err(e) => return e,
     };
     if new_s.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     let old_at = if old_s.is_empty() {
         if (flags & AT_EMPTY_PATH) == 0 {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         }
         None
     } else {
@@ -186,21 +186,21 @@ pub fn syscall_linkat(
         Err(e) => return e,
     };
     if matches!(new_at, AtPath::PseudoAbs(_)) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     if let Some(AtPath::PseudoAbs(abs)) = &old_at {
         if parse_proc_fd_for_current_process(abs).is_none() {
-            return EXDEV;
+            return err(SyscallError::EXDEV);
         }
     }
     if let (Some(AtPath::Ext4Abs(old_abs)), AtPath::Ext4Abs(new_abs)) = (&old_at, &new_at) {
         if hardlink_cross_mount(old_abs, new_abs) {
-            return EXDEV;
+            return err(SyscallError::EXDEV);
         }
     }
 
     if rofs_for_path(newdirfd, &new_s) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -212,13 +212,13 @@ pub fn syscall_linkat(
             AtPath::PseudoAbs(abs) => {
                 let fd = match parse_proc_fd_for_current_process(&abs) {
                     Some(v) => v,
-                    None => return EXDEV,
+                    None => return err(SyscallError::EXDEV),
                 };
                 let Some(file) = get_fd_file(fd) else {
-                    return EBADF;
+                    return err(SyscallError::EBADF);
                 };
                 let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-                    return EPERM;
+                    return err(SyscallError::EPERM);
                 };
                 os_inode.ext4_inode()
             }
@@ -229,18 +229,18 @@ pub fn syscall_linkat(
         }
     } else {
         if olddirfd < 0 {
-            return EBADF;
+            return err(SyscallError::EBADF);
         }
         let Some(file) = get_fd_file(olddirfd as usize) else {
-            return EBADF;
+            return err(SyscallError::EBADF);
         };
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-            return EPERM;
+            return err(SyscallError::EPERM);
         };
         os_inode.ext4_inode()
     };
     if source.is_dir() {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
 
     let (parent, name) = match resolve_parent_and_name(&new_at, fsuid, fsgid) {
@@ -248,24 +248,24 @@ pub fn syscall_linkat(
         Err(e) => return e,
     };
     if !parent.is_dir() {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if parent.find(&name).is_some() {
-        return EEXIST;
+        return err(SyscallError::EEXIST);
     }
     if parent.device_id() != source.device_id() {
-        return EXDEV;
+        return err(SyscallError::EXDEV);
     }
     if rofs_for_path(newdirfd, &new_s) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
 
     match parent.link_inode(&name, &source) {
         Ok(_) => 0,
-        Err(ext4_fs::Ext4Error::Unsupported) => EPERM,
+        Err(ext4_fs::Ext4Error::Unsupported) => err(SyscallError::EPERM),
         Err(e) => ext4_err_to_errno(e),
     }
 }
@@ -281,7 +281,7 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
         Err(e) => return e,
     };
     if old_s.is_empty() || new_s.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     do_renameat(olddirfd, &old_s, newdirfd, &new_s, false)
 }
@@ -298,13 +298,13 @@ pub fn syscall_renameat2(
     const RENAME_WHITEOUT: usize = 4;
 
     if (flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & RENAME_EXCHANGE) != 0 && (flags & (RENAME_NOREPLACE | RENAME_WHITEOUT)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & RENAME_WHITEOUT) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let token = get_current_token();
@@ -317,7 +317,7 @@ pub fn syscall_renameat2(
         Err(e) => return e,
     };
     if old_s.is_empty() || new_s.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     if flags == 0 {
@@ -329,7 +329,7 @@ pub fn syscall_renameat2(
     if flags == RENAME_EXCHANGE {
         return do_renameat_exchange(olddirfd, &old_s, newdirfd, &new_s);
     }
-    EINVAL
+    err(SyscallError::EINVAL)
 }
 
 pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -> isize {
@@ -339,7 +339,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -347,7 +347,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
         Err(e) => return e,
     };
     if let AtPath::PseudoAbs(_) = &at {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     let (fsuid, fsgid) = current_fsuid_gid();
 
@@ -361,16 +361,16 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
         Err(e) => return e,
     };
     if dirfd_rofs || rofs_for_path(dirfd, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     if !parent.is_dir() {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if parent.find(&name).is_some() {
-        return EEXIST;
+        return err(SyscallError::EEXIST);
     }
 
     let mut file_type = (mode as u16) & S_IFMT;
@@ -379,7 +379,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     }
     let valid_type = matches!(file_type, S_IFREG | S_IFIFO | S_IFCHR | S_IFBLK | S_IFSOCK);
     if !valid_type {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let gid = gid_for_created_inode(Some(&parent), fsgid);
@@ -389,7 +389,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     if matches!(file_type, S_IFCHR | S_IFBLK) {
         let (euid, _) = current_effective_uid_gid();
         if euid != 0 {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
     }
 
@@ -417,7 +417,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     if crate::debug_config::DEBUG_SYSCALL {
         let pid = current_process().getpid();
@@ -454,40 +454,40 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
 
     if let AtPath::PseudoAbs(abs) = &at {
         if open_pseudo(abs).is_some() || crate::fs::proc_readlink(abs).is_some() {
-            return EEXIST;
+            return err(SyscallError::EEXIST);
         }
         if crate::fs::is_cgroup_pseudo_path(abs) {
             return cgroup_mkdir(abs);
         }
         let rc = crate::fs::pseudo_dev_dir_mkdir(abs);
-        if rc != EROFS {
+        if rc != err(SyscallError::EROFS) {
             return rc;
         }
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
 
     let _ext4_guard = ext4_lock();
     if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
-        return EEXIST;
+        return err(SyscallError::EEXIST);
     }
     if matches!(at, AtPath::Ext4Rel { ref rel, .. } if rel.is_empty()) {
-        return EEXIST;
+        return err(SyscallError::EEXIST);
     }
     let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
     };
     if !parent.is_dir() {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if parent.find(&name).is_some() {
-        return EEXIST;
+        return err(SyscallError::EEXIST);
     }
     if rofs_for_path(dirfd, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     match parent.create_dir(&name) {
         Ok(dir) => {
@@ -524,7 +524,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
 pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     const AT_REMOVEDIR: usize = 0x200;
     if (flags & !AT_REMOVEDIR) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let token = get_current_token();
@@ -533,23 +533,23 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     let remove_dir = (flags & AT_REMOVEDIR) != 0;
 
     if remove_dir {
         if final_non_empty_component(&path) == Some(".") {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         if final_non_empty_component(&path) == Some("..") {
-            return ENOTEMPTY;
+            return err(SyscallError::ENOTEMPTY);
         }
         if let Some(abs) = match resolve_abs_path(dirfd, &path) {
             Ok(v) => v,
             Err(e) => return e,
         } {
             if path_is_mount_point(&abs) {
-                return EBUSY;
+                return err(SyscallError::EBUSY);
             }
         }
     }
@@ -562,40 +562,40 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     if let AtPath::PseudoAbs(abs) = &at {
         // Minimal `/dev/shm` support for POSIX `shm_unlink`.
         if abs == "/dev/shm" || abs == "/dev/shm/" {
-            return if remove_dir { EROFS } else { EISDIR };
+            return if remove_dir { err(SyscallError::EROFS) } else { err(SyscallError::EISDIR) };
         }
         if crate::fs::is_cgroup_pseudo_path(abs) {
             return if remove_dir {
                 cgroup_rmdir(abs)
             } else if open_pseudo(abs).is_some() {
-                EISDIR
+                err(SyscallError::EISDIR)
             } else {
-                ENOENT
+                err(SyscallError::ENOENT)
             };
         }
         if let Some(name) = shm_object_name(abs) {
             if remove_dir {
-                return ENOTDIR;
+                return err(SyscallError::ENOTDIR);
             }
-            return if shm_remove(name) { 0 } else { ENOENT };
+            return if shm_remove(name) { 0 } else { err(SyscallError::ENOENT) };
         }
         if crate::fs::pseudo_dev_dir_exists(abs) {
             return if remove_dir {
                 crate::fs::pseudo_dev_dir_rmdir(abs)
             } else {
-                EISDIR
+                err(SyscallError::EISDIR)
             };
         }
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
     if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
-        return EISDIR;
+        return err(SyscallError::EISDIR);
     }
     if matches!(at, AtPath::Ext4Rel { ref rel, .. } if rel.is_empty()) {
-        return EISDIR;
+        return err(SyscallError::EISDIR);
     }
     let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
         Ok(v) => v,
@@ -603,45 +603,45 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     };
 
     if !parent.is_dir() {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if remove_dir && name == "." {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if remove_dir && name == ".." {
-        return ENOTEMPTY;
+        return err(SyscallError::ENOTEMPTY);
     }
 
     // Validate target type: unlink vs rmdir semantics.
     let Some(child) = parent.find(&name) else {
         if rofs_for_path(dirfd, &path) {
-            return EROFS;
+            return err(SyscallError::EROFS);
         }
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     };
     if remove_dir {
         if !child.is_dir() {
-            return ENOTDIR;
+            return err(SyscallError::ENOTDIR);
         }
         if !child.ls().is_empty() {
-            return ENOTEMPTY;
+            return err(SyscallError::ENOTEMPTY);
         }
     } else {
         if child.is_dir() {
-            return EISDIR;
+            return err(SyscallError::EISDIR);
         }
     }
     if !sticky_rename_allowed(&parent, &child, fsuid) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if inode_is_immutable_or_append(&child) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if rofs_for_path(dirfd, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
 
     if !remove_dir {
@@ -654,7 +654,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
 
     match parent.unlink(&name) {
         Ok(_) => 0,
-        Err(ext4_fs::Ext4Error::Unsupported) => ENOTEMPTY,
+        Err(ext4_fs::Ext4Error::Unsupported) => err(SyscallError::ENOTEMPTY),
         Err(e) => ext4_err_to_errno(e),
     }
 }
@@ -665,10 +665,10 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     const MAX_DIRENT_BUF: usize = 256 * 1024;
     let len = len.min(MAX_DIRENT_BUF);
     if len > 0 && len < 24 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let token = get_current_token();
 
@@ -720,7 +720,7 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     }
 
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     };
     let inode = os_inode.ext4_inode();
     if let Some(path) = inode_logical_path(&inode) {
@@ -775,10 +775,10 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
 
     let ext4_guard = ext4_lock();
     if !inode.is_dir() {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     };
     if inode.link_count() == 0 {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     if len == 0 {

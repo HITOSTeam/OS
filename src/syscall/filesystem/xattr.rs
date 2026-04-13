@@ -64,9 +64,9 @@ pub fn syscall_fsetxattr(fd: usize, name: usize, value: usize, size: usize, flag
         Some(v) => v,
         None => {
             return if xattr_is_user_namespace(&name) {
-                EPERM
+                err(SyscallError::EPERM)
             } else {
-                EOPNOTSUPP
+                err(SyscallError::EOPNOTSUPP)
             };
         }
     };
@@ -111,7 +111,7 @@ pub fn syscall_fgetxattr(fd: usize, name: usize, value: usize, size: usize) -> i
     };
     let inode = match inode {
         Some(v) => v,
-        None => return ENODATA,
+        None => return err(SyscallError::ENODATA),
     };
     do_getxattr(&inode, &name, value, size, token)
 }
@@ -182,7 +182,7 @@ pub fn syscall_fremovexattr(fd: usize, name: usize) -> isize {
     };
     let inode = match inode {
         Some(v) => v,
-        None => return ENODATA,
+        None => return err(SyscallError::ENODATA),
     };
     do_removexattr(&inode, &name)
 }

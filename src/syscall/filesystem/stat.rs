@@ -2,50 +2,50 @@ use super::*;
 
 pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if (offset as i64) < 0 || (len as i64) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (mode & !FALLOC_FL_SUPPORTED_MASK) != 0 {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     if (mode & FALLOC_FL_PUNCH_HOLE) != 0 && (mode & FALLOC_FL_KEEP_SIZE) == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !file.writable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(end) = offset.checked_add(len) else {
-        return EFBIG;
+        return err(SyscallError::EFBIG);
     };
     if end > (i64::MAX as usize) {
-        return EFBIG;
+        return err(SyscallError::EFBIG);
     }
     // Current backend does not model tmpfs-like huge preallocation reliably.
     // Keep this explicit so large/stress-only cases return TCONF instead of
     // polluting later tests by filling the shared root image.
     if mode == 0 && offset == 0 && len >= (1 << 20) {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     // Misaligned mode=0 fallocate requires filesystem support we don't expose
     // yet; report unsupported to keep semantics explicit.
     if mode == 0 && (offset & 0xfff) != 0 {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     if fsize_limit_allows(end).is_err() {
-        return EFBIG;
+        return err(SyscallError::EFBIG);
     }
     if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
         if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
             if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             shm.punch_hole_keep_size(offset, len);
             return 0;
@@ -57,7 +57,7 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
             end
         };
         if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && alloc_end > old_size {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         if alloc_end > old_size {
             shm.truncate(alloc_end);
@@ -66,22 +66,22 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
     }
     if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
         // Keep semantics explicit until sparse extent metadata is implemented.
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if os_inode.readonly_fs() {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     let inode = os_inode.ext4_inode();
     {
         let _ext4_guard = ext4_lock();
         if inode.is_dir() {
-            return EISDIR;
+            return err(SyscallError::EISDIR);
         }
         if !inode.is_file() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
     }
     maybe_signal_lease_break(
@@ -119,39 +119,39 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
 
 pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
     if (length as i64) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !file.writable() {
-        // Linux reports EINVAL when the descriptor does not permit writing.
-        return EINVAL;
+        // Linux reports err(SyscallError::EINVAL) when the descriptor does not permit writing.
+        return err(SyscallError::EINVAL);
     }
     if fsize_limit_allows(length).is_err() {
-        return EFBIG;
+        return err(SyscallError::EFBIG);
     }
 
     if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
         let old_size = shm.len();
         if length < old_size && shm.has_memfd_seal(PseudoShmFile::F_SEAL_SHRINK) {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         if length > old_size && shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         shm.truncate(length);
         return 0;
     }
     if file.as_any().downcast_ref::<NetSocketFile>().is_some() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
-            return EROFS;
+            return err(SyscallError::EROFS);
         }
         let _ = os_inode.flush();
         let inode = os_inode.ext4_inode();
@@ -167,15 +167,15 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
         }
         return ret;
     }
-    EINVAL
+    err(SyscallError::EINVAL)
 }
 
 pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
     if (length as i64) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if fsize_limit_allows(length).is_err() {
-        return EFBIG;
+        return err(SyscallError::EFBIG);
     }
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -183,18 +183,18 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     let trailing_slash = path.len() > 1 && path.ends_with('/');
     if rofs_for_path(AT_FDCWD, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     let at = match resolve_at_path(AT_FDCWD, &path) {
         Ok(v) => v,
         Err(e) => return e,
     };
     if let AtPath::PseudoAbs(_) = &at {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
@@ -203,16 +203,16 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
         Err(e) => return e,
     };
     if trailing_slash && !inode.is_dir() {
-        return ENOTDIR;
+        return err(SyscallError::ENOTDIR);
     }
     if !inode.is_file() {
         if inode.is_dir() {
-            return EISDIR;
+            return err(SyscallError::EISDIR);
         }
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     maybe_signal_lease_break(
         file_lock_key_from_inode(&inode),
@@ -231,7 +231,7 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
 
 pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
     if get_fd_file(fd).is_none() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let _ext4_guard = ext4_lock();
     fill_statfs(st_ptr, 0)
@@ -244,7 +244,7 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     let at = match resolve_at_path(AT_FDCWD, path.as_str()) {
         Ok(v) => v,
@@ -254,7 +254,7 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
     match at {
         AtPath::PseudoAbs(abs) => {
             if open_pseudo(&abs).is_none() {
-                return ENOENT;
+                return err(SyscallError::ENOENT);
             }
             fill_statfs(st_ptr, statfs_mount_flags_for_abs(&abs))
         }
@@ -277,17 +277,17 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
     // `futimens` passes a null pathname and uses dirfd as the target fd.
     if pathname == 0 {
         if dirfd == AT_FDCWD {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         if dirfd < 0 {
-            return EBADF;
+            return err(SyscallError::EBADF);
         }
         let Some(file) = get_fd_file(dirfd as usize) else {
-            return EBADF;
+            return err(SyscallError::EBADF);
         };
         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
             if os_inode.readonly_fs() {
-                return EROFS;
+                return err(SyscallError::EROFS);
             }
             let inode = os_inode.ext4_inode();
             let ino = inode.inode_num() as u64;
@@ -334,7 +334,7 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         Err(e) => return e,
     };
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -344,9 +344,9 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
 
     if let AtPath::PseudoAbs(abs) = &at {
         if open_pseudo(abs).is_some() {
-            return EROFS;
+            return err(SyscallError::EROFS);
         }
-        // If any prefix is a pseudo file, report ENOTDIR for deeper paths.
+        // If any prefix is a pseudo file, report err(SyscallError::ENOTDIR) for deeper paths.
         let mut prefix = alloc::string::String::from("/");
         for (idx, comp) in abs.split('/').filter(|s| !s.is_empty()).enumerate() {
             if idx > 0 {
@@ -358,11 +358,11 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
             }
             if let Some(node) = open_pseudo(&prefix) {
                 if node.as_any().downcast_ref::<PseudoDir>().is_none() {
-                    return ENOTDIR;
+                    return err(SyscallError::ENOTDIR);
                 }
             }
         }
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -373,14 +373,14 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         Err(e) => return e,
     };
     if rofs_for_path(dirfd, &path) {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     if _times == 0 {
         if euid != 0 && euid != inode.uid() && !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
     } else if euid != 0 && euid != inode.uid() {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let ino = inode.inode_num() as u64;
     let now = current_timespec();
@@ -424,16 +424,16 @@ pub fn syscall_getcwd(buf: usize, size: usize) -> isize {
     let cwd = { process.borrow_mut().cwd.clone() };
     let need = cwd.len().saturating_add(1);
     if size < need {
-        return ERANGE;
+        return err(SyscallError::ERANGE);
     }
     if buf == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let mut bytes = cwd.into_bytes();
     bytes.push(0);
     let token = get_current_token();
     if try_copy_to_user(token, buf as *mut u8, &bytes).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     need as isize
 }
@@ -442,12 +442,12 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     if get_fd_file(fd).is_none() {
         if crate::debug_config::DEBUG_FS {
             let pid = current_process().getpid();
-            crate::println!("[fs] fstat(pid={}) fd={} -> EBADF(nofile)", pid, fd);
+            crate::println!("[fs] fstat(pid={}) fd={} -> err(SyscallError::EBADF)(nofile)", pid, fd);
         }
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if st_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let st = match kstat_from_fd(fd) {
         Ok(st) => st,
@@ -456,7 +456,7 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
 
     let token = get_current_token();
     if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
@@ -474,17 +474,17 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
 
 pub fn syscall_fsync(fd: usize) -> isize {
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
         {
             let _ext4_guard = ext4_lock();
             if !(inode.is_file() || inode.is_dir()) {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
         }
         if os_inode.readonly_fs() {
@@ -496,7 +496,7 @@ pub fn syscall_fsync(fd: usize) -> isize {
         pseudo_block_note_sync();
         return 0;
     }
-    EINVAL
+    err(SyscallError::EINVAL)
 }
 
 pub fn syscall_sync() -> isize {
@@ -541,13 +541,13 @@ pub fn syscall_sync() -> isize {
 
 pub fn syscall_syncfs(fd: usize) -> isize {
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if file.as_any().downcast_ref::<OSInode>().is_none() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     syscall_sync()
 }
@@ -557,10 +557,10 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
     const SYNC_FILE_RANGE_WRITE: usize = 2;
     const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if file.as_any().downcast_ref::<Pipe>().is_some()
         || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
@@ -572,24 +572,24 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
         || file.as_any().downcast_ref::<RtcFile>().is_some()
         || file.as_any().downcast_ref::<NetSocketFile>().is_some()
     {
-        return ESPIPE;
+        return err(SyscallError::ESPIPE);
     }
     let valid_flags =
         SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (offset as i64) < 0 || (nbytes as i64) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let inode = os_inode.ext4_inode();
     {
         let _ext4_guard = ext4_lock();
         if !inode.is_file() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
     }
     if os_inode.readonly_fs() {
@@ -609,7 +609,7 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
     const POSIX_FADV_NOREUSE: usize = 5;
 
     if (offset as i64) < 0 || (len as i64) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if !matches!(
         advice,
@@ -620,29 +620,29 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
             | POSIX_FADV_DONTNEED
             | POSIX_FADV_NOREUSE
     ) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
 
     if file.as_any().downcast_ref::<Pipe>().is_some()
         || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
     {
-        return ESPIPE;
+        return err(SyscallError::ESPIPE);
     }
 
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let inode = os_inode.ext4_inode();
     {
         let _ext4_guard = ext4_lock();
         if !inode.is_file() {
-            return ESPIPE;
+            return err(SyscallError::ESPIPE);
         }
     }
     0
@@ -650,12 +650,12 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
 
 pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: usize) -> isize {
     if st_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     const AT_EMPTY_PATH: usize = 0x1000;
     let valid_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
     if (_flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -668,7 +668,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         if (_flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
             return syscall_fstat(dirfd as usize, st_ptr);
         }
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     let raw_abs = match resolve_abs_path(dirfd, &path) {
@@ -692,26 +692,26 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
                 } else {
                     match proc_magic_link_target_kstat(proc_path) {
                         Ok(Some(st)) => st,
-                        Ok(None) => return ENOENT,
+                        Ok(None) => return err(SyscallError::ENOENT),
                         Err(e) => return e,
                     }
                 };
                 if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
         }
         let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
         let Some(node) = open_pseudo(pseudo_path) else {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         };
         let st = match kstat_from_file(&node) {
             Ok(st) => st,
             Err(e) => return e,
         };
         if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return 0;
     }
@@ -721,7 +721,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
         Ok(v) => v,
-        Err(ENOENT) if matches!(path.as_str(), "busybox" | "./busybox") => {
+        Err(e) if e == err(SyscallError::ENOENT) && matches!(path.as_str(), "busybox" | "./busybox") => {
             let candidates = [
                 "/musl/busybox",
                 "/glibc/busybox",
@@ -737,7 +737,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
             }
             match found {
                 Some(v) => v,
-                None => return ENOENT,
+                None => return err(SyscallError::ENOENT),
             }
         }
         Err(e) => return e,
@@ -776,7 +776,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     };
 
     if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -789,15 +789,15 @@ pub fn syscall_statx(
     stx_ptr: usize,
 ) -> isize {
     if stx_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let valid_flags = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     const STATX_VALID_MASK: usize = 0x0001_FFFF;
     if (_mask & !STATX_VALID_MASK) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -806,7 +806,7 @@ pub fn syscall_statx(
     };
     if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
         if dirfd < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let st = match kstat_from_fd(dirfd as usize) {
             Ok(v) => v,
@@ -814,16 +814,16 @@ pub fn syscall_statx(
         };
         let stx = statx_from_kstat(&st);
         if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return 0;
     }
     if path.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
 
     if dirfd < 0 && dirfd != AT_FDCWD {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let effective_dirfd = dirfd;
     let raw_abs = match resolve_abs_path(effective_dirfd, &path) {
@@ -847,20 +847,20 @@ pub fn syscall_statx(
                 } else {
                     match proc_magic_link_target_kstat(proc_path) {
                         Ok(Some(st)) => st,
-                        Ok(None) => return ENOENT,
+                        Ok(None) => return err(SyscallError::ENOENT),
                         Err(e) => return e,
                     }
                 };
                 let stx = statx_from_kstat(&st);
                 if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
         }
         let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
         let Some(node) = open_pseudo(pseudo_path) else {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         };
         let st = match kstat_from_file(&node) {
             Ok(st) => st,
@@ -868,7 +868,7 @@ pub fn syscall_statx(
         };
         let stx = statx_from_kstat(&st);
         if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return 0;
     }
@@ -901,7 +901,7 @@ pub fn syscall_statx(
     }
 
     let Some(inode) = inode else {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     };
 
     let mode_raw = inode.mode();
@@ -937,7 +937,7 @@ pub fn syscall_statx(
     };
     let stx = statx_from_kstat(&st);
     if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }

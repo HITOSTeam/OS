@@ -1,18 +1,24 @@
 //! File system in os
 mod cgroupfs;
 mod dummy;
+mod eventfd;
 mod inode;
 mod mountns;
+mod namespace_file;
 mod net_socket;
+mod pidfd;
 mod pipe;
 mod procfs;
 mod pseudo;
 mod socketpair;
 mod stdio;
+mod timerfd;
 mod tty;
+mod userfaultfd;
 use crate::mm::UserBuffer;
 use crate::task::{
     manager::wakeup_task,
+    processor::current_process,
     task_block::{TaskControlBlock, TaskStatus},
 };
 use alloc::{
@@ -138,6 +144,16 @@ pub(crate) fn is_builtin_pseudo_path(abs: &str) -> bool {
         || abs.starts_with("/proc/sys/")
         || abs == "/etc"
         || abs.starts_with("/etc/")
+}
+
+pub(crate) fn current_mount_display_abs(abs: &str) -> String {
+    let ns = current_process().mount_namespace();
+    let state = ns.lock();
+    state.display_mount_abs(abs)
+}
+
+pub(crate) fn inode_logical_path(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
+    inode::inode_path_hint(inode).map(|path| current_mount_display_abs(&path))
 }
 
 pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
@@ -633,13 +649,16 @@ pub use cgroupfs::{
     cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
     legacy_cpu_fair_group, open_cgroup_pseudo,
 };
-pub use dummy::{
-    DummyFile, EventFdFile, NamespaceFile, NamespaceKind, PidFdFile, TimerFdFile, UserfaultfdFile,
-};
-pub(crate) use dummy::{
+pub use dummy::DummyFile;
+pub use eventfd::EventFdFile;
+pub use namespace_file::{NamespaceFile, NamespaceKind};
+pub use pidfd::PidFdFile;
+pub use timerfd::TimerFdFile;
+pub use userfaultfd::UserfaultfdFile;
+pub(crate) use timerfd::{
     cancel_realtime_timerfds_on_set, has_pending_timerfds, process_timerfd_expirations,
-    wake_pidfd_poll_waiters,
 };
+pub(crate) use pidfd::wake_pidfd_poll_waiters;
 pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, inode_path_hint,

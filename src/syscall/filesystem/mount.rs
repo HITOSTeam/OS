@@ -2,7 +2,7 @@ use super::*;
 
 pub fn syscall_fsopen(fsname: usize, flags: usize) -> isize {
     if (flags & !FSOPEN_CLOEXEC) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let fsname = match read_user_cstring(token, fsname) {
@@ -10,10 +10,10 @@ pub fn syscall_fsopen(fsname: usize, flags: usize) -> isize {
         Err(e) => return e,
     };
     if fsname.is_empty() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if fsname == "invalid" || fsname == "error" {
-        return ENODEV;
+        return err(SyscallError::ENODEV);
     }
     let mut fd_flags = 0u32;
     if (flags & FSOPEN_CLOEXEC) != 0 {
@@ -24,10 +24,10 @@ pub fn syscall_fsopen(fsname: usize, flags: usize) -> isize {
 
 pub fn syscall_fsconfig(fd: usize, cmd: usize, key: usize, value: usize, aux: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(ctx_file) = file.as_any().downcast_ref::<FsContextFile>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let token = get_current_token();
     let key_s = if key == 0 {
@@ -50,27 +50,27 @@ pub fn syscall_fsconfig(fd: usize, cmd: usize, key: usize, value: usize, aux: us
     match cmd {
         FSCONFIG_SET_FLAG => {
             let Some(key_s) = key_s.as_deref() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             if value_s.is_some() || aux != 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             match key_s {
                 "rw" => state.pending_flags &= !MS_RDONLY,
                 "ro" => state.pending_flags |= MS_RDONLY,
-                _ => return EINVAL,
+                _ => return err(SyscallError::EINVAL),
             }
             0
         }
         FSCONFIG_SET_STRING => {
             let Some(key_s) = key_s.as_deref() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let Some(value_s) = value_s.as_deref() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             if aux != 0 || key_s.is_empty() || value_s.is_empty() {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             match key_s {
                 "source" => {
@@ -79,75 +79,75 @@ pub fn syscall_fsconfig(fd: usize, cmd: usize, key: usize, value: usize, aux: us
                     0
                 }
                 "sync" => 0,
-                _ => EINVAL,
+                _ => err(SyscallError::EINVAL),
             }
         }
-        FSCONFIG_SET_BINARY => EINVAL,
+        FSCONFIG_SET_BINARY => err(SyscallError::EINVAL),
         FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY | FSCONFIG_SET_FD => {
             if key_s.as_deref().unwrap_or("").is_empty() {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             match cmd {
                 FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY => {
                     if value_s.is_none() || aux == usize::MAX {
-                        return EINVAL;
+                        return err(SyscallError::EINVAL);
                     }
                 }
                 FSCONFIG_SET_FD => {
                     if value_s.is_some() || aux == usize::MAX {
-                        return EINVAL;
+                        return err(SyscallError::EINVAL);
                     }
                 }
                 _ => {}
             }
-            EOPNOTSUPP
+            err(SyscallError::EOPNOTSUPP)
         }
         FSCONFIG_CMD_CREATE => {
             if key_s.is_some() || value_s.is_some() || aux != 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             if state.mode != FsContextMode::Create || state.source_abs.is_none() {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             state.created = true;
             0
         }
         FSCONFIG_CMD_RECONFIGURE => {
             if key_s.is_some() || value_s.is_some() || aux != 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             if state.mode != FsContextMode::Reconfigure {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let Some(target_abs) = state.target_abs.clone() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             if !update_mount_record_flags(&target_abs, state.pending_flags) {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             sync_rofs_state(&target_abs, state.pending_flags);
             0
         }
-        _ => EOPNOTSUPP,
+        _ => err(SyscallError::EOPNOTSUPP),
     }
 }
 
 pub fn syscall_fsmount(fd: usize, flags: usize, mount_attrs: usize) -> isize {
     if (flags & !FSMOUNT_CLOEXEC) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (mount_attrs & !FSMOUNT_SUPPORTED_ATTRS) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(ctx_file) = file.as_any().downcast_ref::<FsContextFile>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let state = ctx_file.state.lock();
     if state.mode != FsContextMode::Create || !state.created {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let source = state
         .source_abs
@@ -174,10 +174,10 @@ pub fn syscall_fspick(dirfd: isize, path: usize, flags: usize) -> isize {
     let valid_flags =
         FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let abs = if path == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     } else {
         match read_user_path_abs(dirfd, path) {
             Ok(v) => v,
@@ -211,10 +211,10 @@ pub fn syscall_open_tree(dirfd: isize, path: usize, flags: usize) -> isize {
     let valid_flags =
         OPEN_TREE_CLONE | O_CLOEXEC | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let abs = if path == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     } else {
         match read_user_path_abs(dirfd, path) {
             Ok(v) => v,
@@ -253,10 +253,10 @@ pub fn syscall_move_mount(
     flags: usize,
 ) -> isize {
     if (flags & !MOVE_MOUNT__MASK) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let from_path_s = if from_path == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     } else {
         match read_user_cstring(get_current_token(), from_path) {
             Ok(v) => v,
@@ -271,19 +271,19 @@ pub fn syscall_move_mount(
         return e;
     }
     if from_dirfd < 0 {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(from_dirfd as usize) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(handle) = file.as_any().downcast_ref::<MountHandleFile>() else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !from_path_s.is_empty() {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     if (flags & MOVE_MOUNT_F_EMPTY_PATH) == 0 {
-        return ENOENT;
+        return err(SyscallError::ENOENT);
     }
     let state = handle.state.lock();
     create_mount_record_with_propagation(
@@ -304,13 +304,13 @@ pub fn syscall_mount_setattr(
     size: usize,
 ) -> isize {
     if dirfd < 0 {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if attr == 0 || size < core::mem::size_of::<KMountAttr>() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let path_s = if path == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     } else {
         match read_user_cstring(get_current_token(), path) {
             Ok(v) => v,
@@ -318,22 +318,22 @@ pub fn syscall_mount_setattr(
         }
     };
     if (flags & AT_EMPTY_PATH) == 0 || !path_s.is_empty() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(file) = get_fd_file(dirfd as usize) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(handle) = file.as_any().downcast_ref::<MountHandleFile>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let mount_attr = match try_read_user_value(get_current_token(), attr as *const KMountAttr) {
         Some(v) => v,
-        None => return EFAULT,
+        None => return err(SyscallError::EFAULT),
     };
     let attr_set = mount_attr.attr_set as usize;
     let attr_clr = mount_attr.attr_clr as usize;
     if (attr_set & !FSMOUNT_SUPPORTED_ATTRS) != 0 || (attr_clr & !FSMOUNT_SUPPORTED_ATTRS) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut state = handle.state.lock();
     state.flags |= mount_attr_bits_to_legacy_flags(attr_set);

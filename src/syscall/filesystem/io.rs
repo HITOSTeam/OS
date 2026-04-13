@@ -2,13 +2,13 @@ use super::*;
 
 pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !file.readable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if len == 0 {
         return 0;
@@ -25,55 +25,55 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             inode.is_dir()
         };
         if is_dir {
-            return EISDIR;
+            return err(SyscallError::EISDIR);
         }
     }
     if fd_has_nonblock(fd) {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
             if !pipe.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
         } else if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
             if !sock.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
         } else if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
             if !duplex.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
         } else if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
             if !eventfd.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
         } else if let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() {
             if !timerfd.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
         }
     }
     if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
         if len < core::mem::size_of::<u64>() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let value = match eventfd.read_counter(fd_has_nonblock(fd)) {
             Ok(value) => value,
             Err(e) => return e,
         };
         if try_write_user_value(get_current_token(), buffer as *mut u64, &value).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return core::mem::size_of::<u64>() as isize;
     }
     if let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() {
         if len < core::mem::size_of::<u64>() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let value = match timerfd.read_counter(fd_has_nonblock(fd)) {
             Ok(value) => value,
             Err(e) => return e,
         };
         if try_write_user_value(get_current_token(), buffer as *mut u64, &value).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return core::mem::size_of::<u64>() as isize;
     }
@@ -83,7 +83,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         len,
         MapPermission::W,
     ) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let buf = UserBuffer::new(user_bufs);
     let read_len = file.read(buf) as isize;
@@ -98,16 +98,16 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
 
 pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if file.as_any().downcast_ref::<TimerFdFile>().is_some() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if !file.writable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if len == 0 {
         return 0;
@@ -119,7 +119,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             len,
             MapPermission::R,
         ) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let mut data = Vec::with_capacity(len);
         for slice in user_bufs {
@@ -137,7 +137,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             len,
             MapPermission::R,
         ) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let mut data = Vec::with_capacity(len);
         for slice in user_bufs {
@@ -168,50 +168,50 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if fd_has_nonblock(fd) {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
             if pipe.all_read_ends_closed() {
-                return EPIPE;
+                return err(SyscallError::EPIPE);
             }
             let avail = pipe.available_write();
             if avail == 0 {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
             if write_len <= PIPE_BUF {
                 if avail < write_len {
-                    return EAGAIN;
+                    return err(SyscallError::EAGAIN);
                 }
             } else {
                 write_len = write_len.min(avail);
             }
         } else if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
             if !sock.poll_writable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
         } else if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
             if duplex.write_end_closed() {
-                return EPIPE;
+                return err(SyscallError::EPIPE);
             }
             let avail = duplex.available_write();
             if avail == 0 {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
             if write_len <= PIPE_BUF {
                 if avail < write_len {
-                    return EAGAIN;
+                    return err(SyscallError::EAGAIN);
                 }
             } else {
                 write_len = write_len.min(avail);
             }
         } else if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
             if !eventfd.poll_writable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
         }
     }
     if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
         if len < core::mem::size_of::<u64>() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let Some(value) = try_read_user_value(get_current_token(), buffer as *const u64) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         match eventfd.write_counter(value, fd_has_nonblock(fd)) {
             Ok(()) => return core::mem::size_of::<u64>() as isize,
@@ -230,7 +230,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             if start >= fsize_limit && len > 0 {
                 let pid = current_process().getpid();
                 queue_process_signal(pid, SIGXFSZ_NUM);
-                return EFBIG;
+                return err(SyscallError::EFBIG);
             }
             let remain = (fsize_limit.saturating_sub(start)).min(usize::MAX as u64) as usize;
             if write_len > remain {
@@ -241,12 +241,12 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
         if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         let start = shm.offset();
         let end = start.saturating_add(write_len);
         if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && end > shm.len() {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
     }
     let Ok(user_bufs) = try_translated_byte_buffer(
@@ -255,19 +255,19 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         write_len,
         MapPermission::R,
     ) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let buf = UserBuffer::new(user_bufs);
     let written = file.write(buf) as isize;
     if written == 0 && write_len > 0 {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
             if pipe.all_read_ends_closed() {
-                return EPIPE;
+                return err(SyscallError::EPIPE);
             }
         }
         if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
             if duplex.write_end_closed() {
-                return EPIPE;
+                return err(SyscallError::EPIPE);
             }
         }
     }
@@ -294,22 +294,22 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
 
 pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isize {
     if pos < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !file_is_seekable_for_preadwrite(&file) {
-        return ESPIPE;
+        return err(SyscallError::ESPIPE);
     }
     if !file.readable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, pos as usize) {
         return e;
@@ -323,7 +323,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
             inode.is_dir()
         };
         if is_dir {
-            return EISDIR;
+            return err(SyscallError::EISDIR);
         }
 
         let mut total = 0usize;
@@ -340,7 +340,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
                 break;
             }
             if try_copy_to_user(token, user_ptr as *mut u8, &kbuf[..n]).is_err() {
-                return if total > 0 { total as isize } else { EFAULT };
+                return if total > 0 { total as isize } else { err(SyscallError::EFAULT) };
             }
             total += n;
             off += n;
@@ -365,7 +365,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
             MapPermission::W,
         ) else {
             shm.set_offset(old);
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let buf = UserBuffer::new(user_bufs);
         let n = file.read(buf) as isize;
@@ -383,7 +383,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
             MapPermission::W,
         ) else {
             proc_file.set_offset(old);
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let buf = UserBuffer::new(user_bufs);
         let n = file.read(buf) as isize;
@@ -394,7 +394,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     // Seekable pseudo files: emulate by temporarily adjusting the per-fd offset.
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         if pf.len().is_none() {
-            return ESPIPE;
+            return err(SyscallError::ESPIPE);
         }
         let old = pf.offset();
         pf.set_offset(pos as usize);
@@ -405,7 +405,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
             MapPermission::W,
         ) else {
             pf.set_offset(old);
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let buf = UserBuffer::new(user_bufs);
         let n = file.read(buf) as isize;
@@ -413,27 +413,27 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
         return n;
     }
 
-    ESPIPE
+    err(SyscallError::ESPIPE)
 }
 
 pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isize {
     if pos < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !file_is_seekable_for_preadwrite(&file) {
-        return ESPIPE;
+        return err(SyscallError::ESPIPE);
     }
     if !file.writable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, pos as usize) {
         return e;
@@ -447,7 +447,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             inode.is_dir()
         };
         if is_dir {
-            return EISDIR;
+            return err(SyscallError::EISDIR);
         }
 
         let effective_pos = if os_inode.append() {
@@ -472,7 +472,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             if start >= fsize_limit && len > 0 {
                 let pid = current_process().getpid();
                 queue_process_signal(pid, SIGXFSZ_NUM);
-                return EFBIG;
+                return err(SyscallError::EFBIG);
             }
             let remain = (fsize_limit.saturating_sub(start)).min(usize::MAX as u64) as usize;
             if write_len > remain {
@@ -490,7 +490,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         while total < write_len {
             let want = core::cmp::min(write_len - total, buf_cap);
             if try_copy_from_user(token, user_ptr as *const u8, &mut kbuf[..want]).is_err() {
-                return if total > 0 { total as isize } else { EFAULT };
+                return if total > 0 { total as isize } else { err(SyscallError::EFAULT) };
             }
             match os_inode.pwrite_at(off, &kbuf[..want]) {
                 Ok(n) => {
@@ -503,7 +503,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
                 }
                 Err(_) => {
                     crate::println!("[ext4] Warning: pwrite failed");
-                    return if total > 0 { total as isize } else { EIO };
+                    return if total > 0 { total as isize } else { err(SyscallError::EIO) };
                 }
             }
         }
@@ -524,7 +524,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             len,
             MapPermission::R,
         ) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let mut data = Vec::with_capacity(len);
         for slice in user_bufs {
@@ -537,12 +537,12 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
 
     if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
         if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         let start = pos as usize;
         let end = start.saturating_add(len);
         if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && end > shm.len() {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         let old = shm.offset();
         shm.set_offset(start);
@@ -553,7 +553,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             MapPermission::R,
         ) else {
             shm.set_offset(old);
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let buf = UserBuffer::new(user_bufs);
         let n = file.write(buf) as isize;
@@ -564,7 +564,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     // Seekable pseudo files: emulate by temporarily adjusting the per-fd offset.
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         if pf.len().is_none() {
-            return ESPIPE;
+            return err(SyscallError::ESPIPE);
         }
         let old = pf.offset();
         pf.set_offset(pos as usize);
@@ -575,7 +575,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             MapPermission::R,
         ) else {
             pf.set_offset(old);
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let buf = UserBuffer::new(user_bufs);
         let n = file.write(buf) as isize;
@@ -585,7 +585,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
 
     if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
         if pos != 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let Ok(user_bufs) = try_translated_byte_buffer(
             get_current_token(),
@@ -593,7 +593,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             len,
             MapPermission::R,
         ) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let mut data = Vec::with_capacity(len);
         for slice in user_bufs {
@@ -605,7 +605,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         };
     }
 
-    ESPIPE
+    err(SyscallError::ESPIPE)
 }
 
 pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize) -> isize {
@@ -613,20 +613,20 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
         return 0;
     }
     if fd_has_o_path(in_fd) || fd_has_o_path(out_fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(in_file) = get_fd_file(in_fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(out_file) = get_fd_file(out_fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !in_file.readable() || !out_file.writable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
 
     let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let raw_in_pos = match read_optional_offset(offset) {
         Ok(Some(v)) => v,
@@ -638,10 +638,10 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
     let nonblock = fd_has_nonblock(out_fd);
     if nonblock && out_is_socketpair {
         let Some(sock) = out_file.as_any().downcast_ref::<SocketPairEnd>() else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         if !sock.poll_writable() {
-            return EAGAIN;
+            return err(SyscallError::EAGAIN);
         }
     }
 
@@ -652,7 +652,7 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
     let mut out_inode_opt = out_file.as_any().downcast_ref::<OSInode>();
     if let Some(out_inode) = out_inode_opt {
         if out_inode.readonly_fs() {
-            return EROFS;
+            return err(SyscallError::EROFS);
         }
         out_pos = out_inode.offset();
     }
@@ -666,7 +666,7 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
         let wrote = if let Some(out_inode) = out_inode_opt {
             match out_inode.pwrite_at(out_pos, &buf[..read]) {
                 Ok(n) => n,
-                Err(_) => return if total > 0 { total as isize } else { EIO },
+                Err(_) => return if total > 0 { total as isize } else { err(SyscallError::EIO) },
             }
         } else if out_is_socketpair {
             match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
@@ -674,7 +674,7 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
                 Err(e) => return if total > 0 { total as isize } else { e },
             }
         } else {
-            return if total > 0 { total as isize } else { EINVAL };
+            return if total > 0 { total as isize } else { err(SyscallError::EINVAL) };
         };
         if wrote == 0 {
             break;
@@ -702,7 +702,7 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
         return e;
     }
     if flush_failed {
-        return EIO;
+        return err(SyscallError::EIO);
     }
     total as isize
 }
@@ -717,33 +717,33 @@ pub fn syscall_splice(
 ) -> isize {
     let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(in_file) = get_fd_file(fd_in) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(out_file) = get_fd_file(fd_out) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !in_file.readable() || !out_file.writable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let in_is_pipe = file_is_pipe(&in_file);
     let out_is_pipe = file_is_pipe(&out_file);
     if !in_is_pipe && !out_is_pipe {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if in_is_pipe && off_in != 0 {
-        return ESPIPE;
+        return err(SyscallError::ESPIPE);
     }
     if out_is_pipe && off_out != 0 {
-        return ESPIPE;
+        return err(SyscallError::ESPIPE);
     }
     if !out_is_pipe
         && (fd_has_append(fd_out)
@@ -753,16 +753,16 @@ pub fn syscall_splice(
                 .map(|f| f.append())
                 .unwrap_or(false))
     {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let out_is_inode = out_file.as_any().downcast_ref::<OSInode>().is_some();
     let out_is_socketpair = out_file.as_any().downcast_ref::<SocketPairEnd>().is_some();
     if !out_is_pipe && !out_is_inode && !out_is_socketpair {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let in_is_inode = in_file.as_any().downcast_ref::<OSInode>().is_some();
     if !in_is_pipe && !in_is_inode {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let nonblock =
@@ -774,7 +774,7 @@ pub fn syscall_splice(
             Ok(Some(v)) => v,
             Ok(None) => {
                 let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 };
                 in_inode.offset()
             }
@@ -805,11 +805,11 @@ pub fn syscall_splice(
             if nonblock {
                 if let Some(pipe) = out_file.as_any().downcast_ref::<Pipe>() {
                     if !pipe.poll_writable() {
-                        return if moved > 0 { moved as isize } else { EAGAIN };
+                        return if moved > 0 { moved as isize } else { err(SyscallError::EAGAIN) };
                     }
                 } else if let Some(sock) = out_file.as_any().downcast_ref::<SocketPairEnd>() {
                     if !sock.poll_writable() {
-                        return if moved > 0 { moved as isize } else { EAGAIN };
+                        return if moved > 0 { moved as isize } else { err(SyscallError::EAGAIN) };
                     }
                 }
             }
@@ -819,7 +819,7 @@ pub fn syscall_splice(
             }
         } else {
             let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
-                return if moved > 0 { moved as isize } else { EINVAL };
+                return if moved > 0 { moved as isize } else { err(SyscallError::EINVAL) };
             };
             let is_file = {
                 let inode = in_inode.ext4_inode();
@@ -827,7 +827,7 @@ pub fn syscall_splice(
                 inode.is_file()
             };
             if !is_file {
-                return if moved > 0 { moved as isize } else { EINVAL };
+                return if moved > 0 { moved as isize } else { err(SyscallError::EINVAL) };
             }
             let n = in_inode.pread_at(in_pos, &mut buf[..want]);
             if n == 0 {
@@ -851,14 +851,14 @@ pub fn syscall_splice(
                 inode.is_file()
             };
             if !is_file {
-                return if moved > 0 { moved as isize } else { EINVAL };
+                return if moved > 0 { moved as isize } else { err(SyscallError::EINVAL) };
             }
             if out_inode.readonly_fs() {
-                return if moved > 0 { moved as isize } else { EROFS };
+                return if moved > 0 { moved as isize } else { err(SyscallError::EROFS) };
             }
             match out_inode.pwrite_at(out_pos, &buf[..read]) {
                 Ok(n) => n,
-                Err(_) => return if moved > 0 { moved as isize } else { EIO },
+                Err(_) => return if moved > 0 { moved as isize } else { err(SyscallError::EIO) },
             }
         } else if out_file.as_any().downcast_ref::<SocketPairEnd>().is_some() {
             match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
@@ -866,7 +866,7 @@ pub fn syscall_splice(
                 Err(e) => return if moved > 0 { moved as isize } else { e },
             }
         } else {
-            return if moved > 0 { moved as isize } else { EINVAL };
+            return if moved > 0 { moved as isize } else { err(SyscallError::EINVAL) };
         };
         if wrote == 0 {
             break;
@@ -895,7 +895,7 @@ pub fn syscall_splice(
     if !out_is_pipe {
         if let Some(out_inode) = out_file.as_any().downcast_ref::<OSInode>() {
             if moved > 0 && out_inode.flush().is_err() {
-                return EIO;
+                return err(SyscallError::EIO);
             }
             if off_out == 0 {
                 out_inode.set_offset(out_pos);
@@ -910,31 +910,31 @@ pub fn syscall_splice(
 pub fn syscall_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isize {
     let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(in_file) = get_fd_file(fd_in) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(out_file) = get_fd_file(fd_out) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !in_file.readable() || !out_file.writable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(in_pipe) = in_file.as_any().downcast_ref::<Pipe>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(out_pipe) = out_file.as_any().downcast_ref::<Pipe>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if in_pipe.same_buffer(out_pipe) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let nonblock =
         (flags & SPLICE_F_NONBLOCK) != 0 || fd_has_nonblock(fd_in) || fd_has_nonblock(fd_out);
@@ -975,19 +975,19 @@ pub fn syscall_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isi
 pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize) -> isize {
     let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
     if (flags & !valid_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if fd_has_o_path(fd) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if nr_segs > IOV_MAX {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if nr_segs == 0 {
         return 0;
@@ -1010,7 +1010,7 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
                 let want = core::cmp::min(iv.iov_len - seg_off, scratch.len());
                 let src_ptr = (iv.iov_base + seg_off) as *const u8;
                 if try_copy_from_user(token, src_ptr, &mut scratch[..want]).is_err() {
-                    return if total > 0 { total as isize } else { EFAULT };
+                    return if total > 0 { total as isize } else { err(SyscallError::EFAULT) };
                 }
                 // Linux may return a short vmsplice() once some bytes are moved.
                 // Avoid blocking indefinitely trying to drain very large iovecs.
@@ -1020,7 +1020,7 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
                     Err(e) => return if total > 0 { total as isize } else { e },
                 };
                 if wrote == 0 {
-                    return if total > 0 { total as isize } else { EPIPE };
+                    return if total > 0 { total as isize } else { err(SyscallError::EPIPE) };
                 }
                 total += wrote;
                 seg_off += wrote;
@@ -1041,7 +1041,7 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
                 }
                 let dst_ptr = (iv.iov_base + seg_off) as *mut u8;
                 if try_copy_to_user(token, dst_ptr, &scratch[..read]).is_err() {
-                    return if total > 0 { total as isize } else { EFAULT };
+                    return if total > 0 { total as isize } else { err(SyscallError::EFAULT) };
                 }
                 total += read;
                 seg_off += read;
@@ -1050,7 +1050,7 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
                 }
             }
         } else {
-            return if total > 0 { total as isize } else { EBADF };
+            return if total > 0 { total as isize } else { err(SyscallError::EBADF) };
         }
     }
     total as isize
@@ -1064,55 +1064,55 @@ pub fn syscall_copy_file_range(
     len: usize,
     flags: usize,
 ) -> isize {
-    // Keep an explicit max file-size guard so oversized ranges still report EFBIG
+    // Keep an explicit max file-size guard so oversized ranges still report err(SyscallError::EFBIG)
     // (used by LTP copy_file_range02), but do not cap normal file copies too low.
     const COPY_FILE_RANGE_MAX_FILE_SIZE: u64 = 1u64 << 40; // 1 TiB
     if flags != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     if len > i64::MAX as usize {
-        return EOVERFLOW;
+        return err(SyscallError::EOVERFLOW);
     }
     if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(in_file) = get_fd_file(fd_in) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(out_file) = get_fd_file(fd_out) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !in_file.readable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let Some(in_os_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(out_os_inode) = out_file.as_any().downcast_ref::<OSInode>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let in_inode = in_os_inode.ext4_inode();
     let out_inode = out_os_inode.ext4_inode();
     if out_inode.is_dir() {
-        return EISDIR;
+        return err(SyscallError::EISDIR);
     }
     if !out_file.writable() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if out_os_inode.append() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if out_os_inode.readonly_fs() {
-        return EROFS;
+        return err(SyscallError::EROFS);
     }
     if in_inode.device_id() != out_inode.device_id() {
-        return EXDEV;
+        return err(SyscallError::EXDEV);
     }
     if !in_inode.is_file() || !out_inode.is_file() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let token = get_current_token();
@@ -1120,10 +1120,10 @@ pub fn syscall_copy_file_range(
         in_os_inode.offset()
     } else {
         let Some(v) = try_read_user_value(token, off_in as *const i64) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         if v < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         v as usize
     };
@@ -1131,22 +1131,22 @@ pub fn syscall_copy_file_range(
         out_os_inode.offset()
     } else {
         let Some(v) = try_read_user_value(token, off_out as *const i64) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         if v < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         v as usize
     };
 
     if len > 0 && (out_pos as u64) >= COPY_FILE_RANGE_MAX_FILE_SIZE {
-        return EFBIG;
+        return err(SyscallError::EFBIG);
     }
     if in_inode.inode_num() == out_inode.inode_num() {
         let in_end = in_pos.saturating_add(len);
         let out_end = out_pos.saturating_add(len);
         if in_pos < out_end && out_pos < in_end {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
     }
 
@@ -1157,7 +1157,7 @@ pub fn syscall_copy_file_range(
         let room = COPY_FILE_RANGE_MAX_FILE_SIZE.saturating_sub(out_pos as u64) as usize;
         if room == 0 {
             if copied == 0 {
-                return EFBIG;
+                return err(SyscallError::EFBIG);
             }
             break;
         }
@@ -1168,7 +1168,7 @@ pub fn syscall_copy_file_range(
         }
         let written = match out_os_inode.pwrite_at(out_pos, &buf[..read]) {
             Ok(v) => v,
-            Err(_) => return EIO,
+            Err(_) => return err(SyscallError::EIO),
         };
         if written == 0 {
             break;
@@ -1191,7 +1191,7 @@ pub fn syscall_copy_file_range(
     } else {
         let next = in_pos as i64;
         if try_write_user_value(token, off_in as *mut i64, &next).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     if off_out == 0 {
@@ -1199,7 +1199,7 @@ pub fn syscall_copy_file_range(
     } else {
         let next = out_pos as i64;
         if try_write_user_value(token, off_out as *mut i64, &next).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
 
@@ -1213,7 +1213,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     const PSEUDO_ROOT_DEV_BYTES: usize = 1024 * 1024 * 1024;
 
     let Some(file) = get_fd_file(fd) else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
 
     // Directories: map seek position to our per-fd `dir_offset`.
@@ -1224,10 +1224,10 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             SEEK_SET => offset,
             SEEK_CUR => cur.saturating_add(offset),
             SEEK_END => end.saturating_add(offset),
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if new < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         pdir.set_index(new as usize);
         return new;
@@ -1242,7 +1242,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             (inode.is_dir(), inode.is_fifo(), end)
         };
         if is_fifo {
-            return ESPIPE;
+            return err(SyscallError::ESPIPE);
         }
 
         if is_dir {
@@ -1251,10 +1251,10 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
                 SEEK_SET => offset,
                 SEEK_CUR => cur.saturating_add(offset),
                 SEEK_END => end.saturating_add(offset),
-                _ => return EINVAL,
+                _ => return err(SyscallError::EINVAL),
             };
             if new < 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             os_inode.set_dir_offset(new as usize);
             return new;
@@ -1266,10 +1266,10 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             SEEK_SET => offset,
             SEEK_CUR => cur.saturating_add(offset),
             SEEK_END => end.saturating_add(offset),
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if new < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         os_inode.set_offset(new as usize);
         return new;
@@ -1282,10 +1282,10 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             SEEK_SET => offset,
             SEEK_CUR => cur.saturating_add(offset),
             SEEK_END => end.saturating_add(offset),
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if new < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         pblk.set_offset(new as usize);
         return new;
@@ -1295,17 +1295,17 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     // which libc helpers (busybox `df`) may `rewind()` via lseek.
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         let Some(end) = pf.len().map(|n| n as isize) else {
-            return ESPIPE;
+            return err(SyscallError::ESPIPE);
         };
         let cur = pf.offset() as isize;
         let new = match whence {
             SEEK_SET => offset,
             SEEK_CUR => cur.saturating_add(offset),
             SEEK_END => end.saturating_add(offset),
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if new < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         pf.set_offset(new as usize);
         return new;
@@ -1318,10 +1318,10 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             SEEK_SET => offset,
             SEEK_CUR => cur.saturating_add(offset),
             SEEK_END => end.saturating_add(offset),
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if new < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         shm.set_offset(new as usize);
         return new;
@@ -1333,10 +1333,10 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             SEEK_SET => offset,
             SEEK_CUR => cur.saturating_add(offset),
             SEEK_END => proc_file.seek_end().saturating_add(offset),
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if new < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         proc_file.set_offset(new as usize);
         return new;
@@ -1349,15 +1349,15 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
             SEEK_SET => offset,
             SEEK_CUR => cur.saturating_add(offset),
             SEEK_END => end.saturating_add(offset),
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if new < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         cgroup.set_offset(new as usize);
         return new;
     }
 
-    ESPIPE
+    err(SyscallError::ESPIPE)
 }
 
