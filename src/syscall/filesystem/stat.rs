@@ -9,6 +9,7 @@ use super::{
     err, ext4_lock, fd_has_o_path, file_lock_key_from_inode, fill_statfs,
     find_path_in_roots, flush_open_inode_views, fsize_limit_allows,
     get_current_token, get_fd_file, get_inode_times, inode_mode_allows_uid_gid,
+    is_privileged_or_owner,
     require_fd_file,
     inode_rdev_for_mode, inode_visible_size, kstat_from_fd, kstat_from_file,
     maybe_signal_lease_break, open_pseudo, proc_magic_link_target_kstat,
@@ -390,10 +391,10 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         return err(SyscallError::EROFS);
     }
     if _times == 0 {
-        if euid != 0 && euid != inode.uid() && !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+        if !is_privileged_or_owner(euid, &inode) && !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
             return err(SyscallError::EACCES);
         }
-    } else if euid != 0 && euid != inode.uid() {
+    } else if !is_privileged_or_owner(euid, &inode) {
         return err(SyscallError::EPERM);
     }
     let ino = inode.inode_num() as u64;

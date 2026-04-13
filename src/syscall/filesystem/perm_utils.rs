@@ -87,6 +87,11 @@ pub(crate) fn apply_chown_to_inode(inode: &ext4_fs::Inode, uid: usize, gid: usiz
     0
 }
 
+/// Returns `true` when `euid` is root (0) or matches the inode owner.
+pub(crate) fn is_privileged_or_owner(euid: u32, inode: &ext4_fs::Inode) -> bool {
+    euid == 0 || euid == inode.uid()
+}
+
 pub(crate) fn inode_mode_allows_uid_gid(inode: &ext4_fs::Inode, mask: usize, uid: u32, gid: u32) -> bool {
     if mask == 0 {
         return true;

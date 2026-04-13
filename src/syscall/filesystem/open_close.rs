@@ -9,6 +9,7 @@ use super::{
     current_process, err, ext4_err_to_errno, ext4_lock, fifo_pipe_state_for_inode,
     file_lock_key, file_lock_key_from_inode, get_current_token,
     gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid,
+    is_privileged_or_owner,
     install_open_file_fd, is_inode_currently_executed_locked, lock_executing_inodes,
     make_pipe, maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint,
     open_existing_target_path, open_pseudo, path_is_nodev, path_is_nosymfollow, path_is_rofs,
@@ -404,7 +405,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     // Linux `O_NOATIME`: non-owner/non-privileged callers get err(SyscallError::EPERM).
     if (flags & O_NOATIME) != 0 {
         let (euid, _egid) = current_effective_uid_gid();
-        if euid != 0 && euid != inode.uid() {
+        if !is_privileged_or_owner(euid, &inode) {
             return err(SyscallError::EPERM);
         }
     }

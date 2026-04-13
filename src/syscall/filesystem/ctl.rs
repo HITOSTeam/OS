@@ -14,7 +14,8 @@ use super::{
     empty_path_fd_for_at_op, err, ext4_lock,
     fd_has_o_path, find_path_in_roots,
     get_current_token, get_fd_file, get_time_ms,
-    inode_mode_allows_uid_gid,
+    inode_mode_allows, inode_mode_allows_uid_gid,
+    is_privileged_or_owner,
     logical_path_for_open_fd, maybe_dispatch_proc_fd_at,
     mount_note_path_access, normalize_path, open_pseudo,
     pseudo_path_exists_result, read_user_cstring,
@@ -284,7 +285,7 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
         let inode = os_inode.ext4_inode();
         let _ext4_guard = ext4_lock();
         let (uid, _gid) = current_effective_uid_gid();
-        if uid != 0 && inode.uid() != uid {
+        if !is_privileged_or_owner(uid, &inode) {
             return err(SyscallError::EPERM);
         }
         let mut new_mode = (mode as u16) & 0o7777;
@@ -536,13 +537,12 @@ pub fn syscall_fchdir(fd: usize) -> isize {
         return err(SyscallError::ENOTDIR);
     };
     let inode = os_inode.ext4_inode();
-    let (fsuid, fsgid) = current_fsuid_gid();
     {
         let _ext4_guard = ext4_lock();
         if !inode.is_dir() {
             return err(SyscallError::ENOTDIR);
         }
-        if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
+        if !inode_mode_allows(&inode, 1) {
             return err(SyscallError::EACCES);
         }
     }
