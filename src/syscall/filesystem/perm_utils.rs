@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    OSInode, PID2PCB, ProcessControlBlock,
+    S_IFBLK, S_IFCHR, S_IFMT,
+    SyscallError, Vec,
+    current_process, err,
+};
 
 pub(crate) fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
     match e {

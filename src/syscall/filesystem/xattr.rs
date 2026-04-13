@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    SyscallError, err,
+    get_current_token,
+    do_getxattr, do_listxattr, do_removexattr, do_setxattr,
+    read_user_xattr_name, read_user_xattr_value,
+    resolve_xattr_fd_inode, resolve_xattr_path_inode,
+    xattr_is_user_namespace,
+};
 
 pub fn syscall_setxattr(
     path: usize,
