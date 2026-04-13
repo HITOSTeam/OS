@@ -668,7 +668,7 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     }
     let process = current_files_process();
     let mut inner = process.borrow_mut();
-    if newfd >= inner.rlimit_nofile_cur as usize {
+    if newfd >= inner.rlimits.rlimit_nofile_cur as usize {
         return err(SyscallError::EBADF);
     }
     if !inner.is_fd_open(oldfd) {

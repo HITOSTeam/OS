@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
+use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     config::clock_freq,
@@ -24,11 +25,6 @@ use crate::{
     trap::get_current_token,
 };
 
-const ENOSYS: isize = -38;
-const EINVAL: isize = -22;
-const EAGAIN: isize = -11;
-const EINTR: isize = -4;
-const ETIMEDOUT: isize = -110;
 
 const FUTEX_WAIT: usize = 0;
 const FUTEX_WAKE: usize = 1;
@@ -189,10 +185,10 @@ pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
 
 fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask: u32) -> isize {
     if uaddr == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if bitset_mask == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if DEBUG_FUTEX {
         log::debug!(
@@ -274,7 +270,7 @@ pub fn syscall_futex(
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             if uaddr == 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let task = current_task().unwrap();
             let pid = current_process().getpid();
@@ -288,7 +284,7 @@ pub fn syscall_futex(
             let bitset = if cmd == FUTEX_WAIT_BITSET {
                 let bitset = _val3 as u32;
                 if bitset == 0 {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 bitset
             } else {
@@ -307,9 +303,9 @@ pub fn syscall_futex(
                     );
                 }
                 return if pending_unmasked_signal() {
-                    EINTR
+                    err(SyscallError::EINTR)
                 } else {
-                    EAGAIN
+                    err(SyscallError::EAGAIN)
                 };
             }
             // Read first, then derive key. This forces lazy mappings to be
@@ -338,7 +334,7 @@ pub fn syscall_futex(
                 );
             }
             if pending_unmasked_signal() {
-                return EINTR;
+                return err(SyscallError::EINTR);
             }
             if DEBUG_FUTEX {
                 log::debug!(
@@ -356,7 +352,7 @@ pub fn syscall_futex(
                 let ts = read_user_value(token, _timeout as *const TimeSpec);
                 let timeout_ns = match timespec_to_ns(ts) {
                     Some(ns) => ns,
-                    None => return EINVAL,
+                    None => return err(SyscallError::EINVAL),
                 };
                 let now_ns = futex_wait_now_ns(cmd, clock_realtime);
                 let deadline_ns = if cmd == FUTEX_WAIT_BITSET {
@@ -365,7 +361,7 @@ pub fn syscall_futex(
                     now_ns.saturating_add(timeout_ns)
                 };
                 if deadline_ns <= now_ns {
-                    return ETIMEDOUT;
+                    return err(SyscallError::ETIMEDOUT);
                 }
                 Some(deadline_ns)
             };
@@ -419,7 +415,7 @@ pub fn syscall_futex(
                 let now_ns = futex_wait_now_ns(cmd, clock_realtime);
                 if now_ns >= deadline_ns {
                     let _ = remove_waiter(&in_queue);
-                    return ETIMEDOUT;
+                    return err(SyscallError::ETIMEDOUT);
                 }
                 let wait_ms = ns_to_ms_ceil(deadline_ns.saturating_sub(now_ns)).max(1);
                 add_timer(Arc::clone(&task), wait_ms);
@@ -462,12 +458,12 @@ pub fn syscall_futex(
                                 );
                             }
                         }
-                        return EINTR;
+                        return err(SyscallError::EINTR);
                     }
                     if !in_queue.load(Ordering::Acquire) {
                         return 0;
                     }
-                    return EINTR;
+                    return err(SyscallError::EINTR);
                 }
                 if let Some(deadline_ns) = deadline_ns {
                     let now_ns = futex_wait_now_ns(cmd, clock_realtime);
@@ -490,12 +486,12 @@ pub fn syscall_futex(
                                     );
                                 }
                             }
-                            return ETIMEDOUT;
+                            return err(SyscallError::ETIMEDOUT);
                         }
                         if !in_queue.load(Ordering::Acquire) {
                             return 0;
                         }
-                        return ETIMEDOUT;
+                        return err(SyscallError::ETIMEDOUT);
                     }
                     // Our timer wheel is millisecond-granularity and may wake
                     // slightly early; re-arm until the absolute deadline.
@@ -509,12 +505,12 @@ pub fn syscall_futex(
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let nr_wake = val as isize;
             if nr_wake < 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let bitset_mask = if cmd == FUTEX_WAKE_BITSET {
                 let bitset = _val3 as u32;
                 if bitset == 0 {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 bitset
             } else {
@@ -529,12 +525,12 @@ pub fn syscall_futex(
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if uaddr == 0 || _uaddr2 == 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let nr_wake = val as isize;
             let nr_requeue = _timeout as isize;
             if nr_wake < 0 || nr_requeue < 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let pid = current_process().getpid();
             let token = get_current_token();
@@ -573,12 +569,12 @@ pub fn syscall_futex(
                 if cur != _val3 as i32 {
                     if DEBUG_FUTEX {
                         log::warn!(
-                            "[futex_cmp_requeue_cmp] cmp mismatch -> EAGAIN pid={} uaddr={:#x}",
+                            "[futex_cmp_requeue_cmp] cmp mismatch -> err(SyscallError::EAGAIN) pid={} uaddr={:#x}",
                             pid,
                             uaddr
                         );
                     }
-                    return EAGAIN;
+                    return err(SyscallError::EAGAIN);
                 }
             }
             let val2 = nr_requeue as usize;
@@ -650,6 +646,6 @@ pub fn syscall_futex(
             }
             woke.saturating_add(moved) as isize
         }
-        _ => ENOSYS,
+        _ => err(SyscallError::ENOSYS),
     }
 }

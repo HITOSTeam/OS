@@ -289,7 +289,7 @@ fn process_dumped_core(process: &Arc<ProcessControlBlock>, exit_code: i32) -> bo
     }
     let signum = (-exit_code) as usize;
     let inner = process.borrow_mut();
-    inner.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
+    inner.rlimits.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
 }
 
 fn cleanup_process_threads_for_group_exit(
@@ -552,7 +552,7 @@ pub fn should_preempt_current_on_tick() -> bool {
     };
     let (policy, rt_prio) = {
         let inner = process.borrow_mut();
-        (inner.sched_policy, inner.sched_priority)
+        (inner.scheduling.sched_policy, inner.scheduling.sched_priority)
     };
     match sched_class(policy) {
         Some(SchedClass::Fair) | None => {

@@ -238,7 +238,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         let fsize_limit = {
             let process = current_process();
             let inner = process.borrow_mut();
-            inner.rlimit_fsize_cur
+            inner.rlimits.rlimit_fsize_cur
         };
         if fsize_limit != u64::MAX {
             let start = os_inode.offset() as u64;
@@ -480,7 +480,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         let fsize_limit = {
             let process = current_process();
             let inner = process.borrow_mut();
-            inner.rlimit_fsize_cur
+            inner.rlimits.rlimit_fsize_cur
         };
         if fsize_limit != u64::MAX {
             let start = effective_pos as u64;

@@ -6,6 +6,7 @@ use alloc::{
 use core::any::Any;
 use core::mem::size_of;
 use spin::Mutex;
+use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     config::clock_freq,
@@ -39,15 +40,6 @@ const EPOLL_CLOEXEC: usize = 0x80000;
 const FD_CLOEXEC: u32 = 1;
 const MAX_EPOLL_NESTING: usize = 5;
 
-const EINTR: isize = -4;
-const EBADF: isize = -9;
-const EFAULT: isize = -14;
-const EEXIST: isize = -17;
-const EINVAL: isize = -22;
-const EMFILE: isize = -24;
-const ENOENT: isize = -2;
-const EPERM: isize = -1;
-const ELOOP: isize = -40;
 const EPOLL_IDLE_SLEEP_MS: usize = 10;
 
 type FileArc = Arc<dyn File + Send + Sync>;
@@ -144,7 +136,7 @@ impl EpollFile {
         let mut interests = self.interests.lock();
         Self::prune_stale_locked(&mut interests);
         if interests.contains_key(&fd) {
-            return Err(EEXIST);
+            return Err(err(SyscallError::EEXIST));
         }
         interests.insert(
             fd,
@@ -163,7 +155,7 @@ impl EpollFile {
         let mut interests = self.interests.lock();
         Self::prune_stale_locked(&mut interests);
         let Some(entry) = interests.get_mut(&fd) else {
-            return Err(ENOENT);
+            return Err(err(SyscallError::ENOENT));
         };
         entry.events = events;
         entry.data = data;
@@ -177,7 +169,7 @@ impl EpollFile {
         let mut interests = self.interests.lock();
         Self::prune_stale_locked(&mut interests);
         if interests.remove(&fd).is_none() {
-            return Err(ENOENT);
+            return Err(err(SyscallError::ENOENT));
         }
         Ok(())
     }
@@ -408,15 +400,15 @@ fn get_fd_file(fd: usize) -> Result<FileArc, isize> {
     let process = current_files_process();
     let inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
-        return Err(EBADF);
+        return Err(err(SyscallError::EBADF));
     }
-    inner.fd_table[fd].clone().ok_or(EBADF)
+    inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
 }
 
 fn get_epoll_file(fd: usize) -> Result<FileArc, isize> {
     let file = get_fd_file(fd)?;
     if file.as_any().downcast_ref::<EpollFile>().is_none() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     Ok(file)
 }
@@ -429,9 +421,9 @@ fn fd_to_epoll_ref(file: &FileArc) -> &EpollFile {
 
 fn parse_user_event(token: usize, event_ptr: usize) -> Result<UserEpollEvent, isize> {
     if event_ptr == 0 {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     }
-    try_read_user_value::<UserEpollEvent>(token, event_ptr as *const UserEpollEvent).ok_or(EFAULT)
+    try_read_user_value::<UserEpollEvent>(token, event_ptr as *const UserEpollEvent).ok_or(err(SyscallError::EFAULT))
 }
 
 fn write_ready_events(
@@ -441,10 +433,10 @@ fn write_ready_events(
 ) -> Result<(), isize> {
     for (i, ev) in events.iter().enumerate() {
         let Some(ptr) = events_ptr.checked_add(i * size_of::<UserEpollEvent>()) else {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         };
         if try_write_user_value(token, ptr as *mut UserEpollEvent, ev).is_err() {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         }
     }
     Ok(())
@@ -484,7 +476,7 @@ fn now_ns() -> u64 {
 
 fn timespec_to_deadline_ns(ts: EpollTimeSpec) -> Result<u64, isize> {
     if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1_000_000_000 {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let delta_ns = (ts.sec as u64)
         .saturating_mul(1_000_000_000)
@@ -502,10 +494,10 @@ fn install_sigmask(
         return Ok(None);
     }
     if sigsetsize < size_of::<u64>() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let Some(mut new_mask) = try_read_user_value::<u64>(token, sigmask as *const u64) else {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     };
     let sigkill_bit = signal_bit(SIGKILL_NUM).unwrap_or(0);
     let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
@@ -536,7 +528,7 @@ fn epoll_wait_common(
 ) -> isize {
     let maxevents = maxevents as isize;
     if maxevents <= 0 || maxevents > i32::MAX as isize {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let token = get_current_token();
@@ -552,7 +544,7 @@ fn epoll_wait_common(
             (inner.pending_signals, inner.signal_mask)
         };
         if has_unmasked_pending(pending, mask, true) {
-            break EINTR;
+            break err(SyscallError::EINTR);
         }
 
         match should_block(&epoll_file, maxevents as usize, token, events_ptr) {
@@ -584,13 +576,13 @@ fn epoll_wait_common(
                 sleep_ms = 1;
             }
             let r = crate::syscall::thread::sys_sleep(sleep_ms);
-            if r == EINTR {
+            if r == err(SyscallError::EINTR) {
                 let (pending, mask) = {
                     let inner = task.borrow_mut();
                     (inner.pending_signals, inner.signal_mask)
                 };
                 if has_unmasked_pending(pending, mask, true) {
-                    break EINTR;
+                    break err(SyscallError::EINTR);
                 }
             }
         } else if waiter_armed {
@@ -600,13 +592,13 @@ fn epoll_wait_common(
             // so keep the task in a stable sleeping state long enough for
             // signal/peer-driven wakeup tests to observe it as blocked.
             let r = crate::syscall::thread::sys_sleep(EPOLL_IDLE_SLEEP_MS);
-            if r == EINTR {
+            if r == err(SyscallError::EINTR) {
                 let (pending, mask) = {
                     let inner = task.borrow_mut();
                     (inner.pending_signals, inner.signal_mask)
                 };
                 if has_unmasked_pending(pending, mask, true) {
-                    break EINTR;
+                    break err(SyscallError::EINTR);
                 }
             }
         }
@@ -618,12 +610,12 @@ fn epoll_wait_common(
 
 pub fn syscall_epoll_create1(flags: usize) -> isize {
     if (flags & !EPOLL_CLOEXEC) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     let Some(fd) = inner.alloc_fd() else {
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[fd] = Some(Arc::new(EpollFile::new()));
     let mut fd_flags = 0u32;
@@ -643,7 +635,7 @@ pub fn syscall_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) ->
 
     let op = op as isize;
     if op != EPOLL_CTL_ADD && op != EPOLL_CTL_DEL && op != EPOLL_CTL_MOD {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let target_file = match get_fd_file(fd) {
@@ -652,7 +644,7 @@ pub fn syscall_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) ->
     };
 
     if fd == epfd {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let token = get_current_token();
@@ -667,18 +659,18 @@ pub fn syscall_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) ->
 
     if op == EPOLL_CTL_ADD {
         if !target_supports_epoll(&target_file) {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         if let Some(child) = target_file.as_any().downcast_ref::<EpollFile>() {
             if child.id() == ep.id() {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             if ep.would_create_cycle(child) {
-                return ELOOP;
+                return err(SyscallError::ELOOP);
             }
             let mut visited = BTreeSet::new();
             if child.max_depth_recursive(&mut visited) >= MAX_EPOLL_NESTING {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
         }
     }
@@ -702,7 +694,7 @@ pub fn syscall_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) ->
             Ok(()) => 0,
             Err(e) => e,
         },
-        _ => EINVAL,
+        _ => err(SyscallError::EINVAL),
     };
     if ret == 0 {
         ep.notify_poll_waiters();
@@ -724,7 +716,7 @@ pub fn syscall_epoll_pwait(
     };
     let timeout = timeout as isize;
     let deadline_ns = if timeout < -1 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     } else if timeout < 0 {
         None
     } else {
@@ -759,7 +751,7 @@ pub fn syscall_epoll_pwait2(
         let Some(ts) =
             try_read_user_value::<EpollTimeSpec>(token, timeout_ptr as *const EpollTimeSpec)
         else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         match timespec_to_deadline_ns(ts) {
             Ok(deadline) => Some(deadline),

@@ -5,6 +5,7 @@ use core::{
 };
 use lazy_static::lazy_static;
 use spin::{Mutex, MutexGuard};
+use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
@@ -51,16 +52,6 @@ lazy_static! {
 
 pub(crate) type ExecutingInodesGuard = MutexGuard<'static, BTreeMap<(usize, u32), usize>>;
 
-const EPERM: isize = -1;
-const ENOENT: isize = -2;
-const ESRCH: isize = -3;
-const EIO: isize = -5;
-const EACCES: isize = -13;
-const EFAULT: isize = -14;
-const EINVAL: isize = -22;
-const ENAMETOOLONG: isize = -36;
-const E2BIG: isize = -7;
-const ETXTBSY: isize = -26;
 
 const PTRACE_TRACEME: usize = 0;
 const PTRACE_CONT: usize = 7;
@@ -214,20 +205,20 @@ fn record_fork_diag(parent_pid: usize, child_pid: usize, flags: usize, fork_elap
 }
 
 fn try_read_usize_user(token: usize, ptr: usize) -> Result<usize, isize> {
-    try_read_user_value(token, ptr as *const usize).ok_or(EFAULT)
+    try_read_user_value(token, ptr as *const usize).ok_or(err(SyscallError::EFAULT))
 }
 
 fn try_read_user_cstr(token: usize, ptr: usize) -> Result<String, isize> {
     const MAX_USER_CSTR: usize = 256 * 1024;
     let mut s = String::new();
     for i in 0..MAX_USER_CSTR {
-        let ch = try_read_user_value(token, (ptr + i) as *const u8).ok_or(EFAULT)?;
+        let ch = try_read_user_value(token, (ptr + i) as *const u8).ok_or(err(SyscallError::EFAULT))?;
         if ch == 0 {
             return Ok(s);
         }
         s.push(ch as char);
     }
-    Err(ENAMETOOLONG)
+    Err(err(SyscallError::ENAMETOOLONG))
 }
 
 fn read_user_str_array(token: usize, vec_ptr: usize) -> Result<Vec<String>, isize> {
@@ -242,7 +233,7 @@ fn read_user_str_array(token: usize, vec_ptr: usize) -> Result<Vec<String>, isiz
         }
         out.push(try_read_user_cstr(token, p)?);
     }
-    Err(E2BIG)
+    Err(err(SyscallError::E2BIG))
 }
 
 pub(crate) fn is_inode_currently_executed(device_id: usize, inode_num: u32) -> bool {
@@ -334,7 +325,7 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
             let _ext4_guard = ext4_lock();
             return Ok(inode.read_all());
         }
-        Err(e) if e != ENOENT => return Err(e),
+        Err(e) if e != err(SyscallError::ENOENT) => return Err(e),
         Err(_) => {}
     }
     if path == "busybox" || path == "./busybox" {
@@ -350,7 +341,7 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
                     let _ext4_guard = ext4_lock();
                     return Ok(inode.read_all());
                 }
-                Err(ENOENT) => {}
+                Err(e) if e == err(SyscallError::ENOENT) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -366,7 +357,7 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
             Err(e) => Err(e),
         };
     }
-    Err(ENOENT)
+    Err(err(SyscallError::ENOENT))
 }
 
 fn load_file_readonly(path: &str) -> Result<Vec<u8>, isize> {
@@ -382,7 +373,7 @@ fn load_file_readonly(path: &str) -> Result<Vec<u8>, isize> {
 fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, isize> {
     match resolve_exec_inode(path) {
         Ok(inode) => return Ok(inode),
-        Err(e) if e != ENOENT => return Err(e),
+        Err(e) if e != err(SyscallError::ENOENT) => return Err(e),
         Err(_) => {}
     }
     if path == "busybox" || path == "./busybox" {
@@ -395,7 +386,7 @@ fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, i
         for cand in fallbacks {
             match resolve_exec_inode(cand) {
                 Ok(inode) => return Ok(inode),
-                Err(ENOENT) => {}
+                Err(e) if e == err(SyscallError::ENOENT) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -405,7 +396,7 @@ fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, i
         with_bin.push_str(".bin");
         return resolve_exec_inode(&with_bin);
     }
-    Err(ENOENT)
+    Err(err(SyscallError::ENOENT))
 }
 
 fn find_shell_interpreter() -> Result<Option<(String, Vec<u8>, bool)>, isize> {
@@ -426,7 +417,7 @@ fn find_shell_interpreter() -> Result<Option<(String, Vec<u8>, bool)>, isize> {
             Ok(data) => {
                 return Ok(Some((String::from(candidate), data, needs_sh_arg)));
             }
-            Err(ENOENT) => {}
+            Err(e) if e == err(SyscallError::ENOENT) => {}
             Err(e) => return Err(e),
         }
     }
@@ -456,7 +447,7 @@ fn find_busybox_shell() -> Result<Option<(String, Vec<u8>)>, isize> {
     for cand in candidates {
         match load_file_from_path(cand) {
             Ok(data) => return Ok(Some((String::from(cand), data))),
-            Err(ENOENT) => {}
+            Err(e) if e == err(SyscallError::ENOENT) => {}
             Err(e) => return Err(e),
         }
     }
@@ -503,12 +494,12 @@ fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) 
 fn load_interp_data(interp: &str) -> Result<Vec<u8>, isize> {
     match load_file_from_path(interp) {
         Ok(data) => return Ok(data),
-        Err(EACCES) => {
+        Err(e) if e == err(SyscallError::EACCES) => {
             if let Ok(data) = load_file_readonly(interp) {
                 return Ok(data);
             }
         }
-        Err(ENOENT) => {}
+        Err(e) if e == err(SyscallError::ENOENT) => {}
         Err(e) => return Err(e),
     }
 
@@ -547,17 +538,17 @@ fn load_interp_data(interp: &str) -> Result<Vec<u8>, isize> {
     for cand in candidates {
         match load_file_from_path(cand) {
             Ok(data) => return Ok(data),
-            Err(EACCES) => {
+            Err(e) if e == err(SyscallError::EACCES) => {
                 if let Ok(data) = load_file_readonly(cand) {
                     return Ok(data);
                 }
             }
-            Err(ENOENT) => {}
+            Err(e) if e == err(SyscallError::ENOENT) => {}
             Err(e) => return Err(e),
         }
     }
 
-    Err(ENOENT)
+    Err(err(SyscallError::ENOENT))
 }
 
 fn is_elf(data: &[u8]) -> bool {
@@ -623,8 +614,6 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
     const CLONE_NEWPID: usize = 0x2000_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
-    const EINVAL: isize = -22;
-    const EFAULT: isize = -14;
 
     // LoongArch syscall ABI uses a different argument order:
     // clone(flags, stack, ptid, ctid, tls). Swap tls/ctid here.
@@ -633,28 +622,28 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
 
     // Network namespace is not implemented yet.
     if (flags & CLONE_NEWNET) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     // Linux flag constraints:
     // - CLONE_SIGHAND requires CLONE_VM.
     // - CLONE_THREAD requires CLONE_SIGHAND (and therefore CLONE_VM).
     if (flags & CLONE_SIGHAND) != 0 && (flags & CLONE_VM) == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & CLONE_THREAD) != 0 && (flags & CLONE_SIGHAND) == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & CLONE_NEWNS) != 0 && (flags & CLONE_FS) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWCGROUP)) != 0
         && current_process().borrow_mut().euid != 0
     {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if stack == 0 {
         // Linux permits fork-like clone(SIGCHLD, NULL, ...) but rejects NULL
@@ -663,7 +652,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let requires_child_stack =
             (flags & (CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS)) != 0;
         if exit_signal == 0 || requires_child_stack {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
     }
 
@@ -671,7 +660,6 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     // CLONE_THREAD still creates a child process that wait()/getppid() must see.
     let is_thread_like = (flags & CLONE_THREAD) != 0 && (flags & CLONE_VM) != 0;
     if is_thread_like {
-        const ENOMEM: isize = -12;
         let task = current_task().unwrap();
         let parent_mask = {
             let inner = task.borrow_mut();
@@ -692,7 +680,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let Some(new_task) =
             TaskControlBlock::try_new_linux_thread(Arc::clone(&process)).map(Arc::new)
         else {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         };
         new_task.set_cpu_id(select_hart_for_new_task());
 
@@ -749,12 +737,12 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         let token = get_current_token();
         if (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
             if try_write_user_value(token, _ptid as *mut i32, &(linux_tid as i32)).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
         }
         if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
             if try_write_user_value(token, _ctid as *mut i32, &(linux_tid as i32)).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
         }
 
@@ -788,7 +776,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         return e;
     }
     let Some((child, task)) = process.fork_with_task(share_files, share_vm) else {
-        return -12;
+        return err(SyscallError::ENOMEM);
     };
     if (flags & CLONE_NEWIPC) != 0 {
         let (parent_ipc_ns_id, inherited_attaches) = {
@@ -883,7 +871,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
             inner.memory_set.token()
         };
         if try_write_user_value(child_token, _ctid as *mut i32, &(child_pid as i32)).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     if crate::debug_config::DEBUG_TASK_LIFECYCLE
@@ -900,8 +888,8 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     record_fork_diag(process.getpid(), child_pid, flags, fork_elapsed_us);
 
     if !is_thread_like && (flags & CLONE_VFORK) == 0 {
-        let parent_fair = sched_class(process.borrow_mut().sched_policy) == Some(SchedClass::Fair);
-        let child_fair = sched_class(child.borrow_mut().sched_policy) == Some(SchedClass::Fair);
+        let parent_fair = sched_class(process.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
+        let child_fair = sched_class(child.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
         if parent_fair && child_fair && child_same_hart {
             // Let a freshly forked fair child run promptly so it can finish
             // exec/signal setup before the parent races ahead in user space.
@@ -962,8 +950,8 @@ pub fn syscall_vfork() -> isize {
                 process.getpid(),
                 child.getpid()
             );
-            if sched_class(process.borrow_mut().sched_policy) == Some(SchedClass::Fair)
-                && sched_class(child.borrow_mut().sched_policy) == Some(SchedClass::Fair)
+            if sched_class(process.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair)
+                && sched_class(child.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair)
             {
                 suspend_current_and_run_next();
             }
@@ -1283,14 +1271,12 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
     const WUNTRACED: usize = 0x00000002;
     const WCONTINUED: usize = 0x00000008;
     const ECHILD: isize = -10;
-    const EINVAL: isize = -22;
-    const ESRCH: isize = -3;
     let allowed = WNOHANG | WUNTRACED | WCONTINUED;
     if (options & !allowed) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if pid == isize::MIN || pid == (i32::MIN as isize) {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     }
     let token = get_current_token();
     let mut temp_exit_code: i32 = 0;
@@ -1552,24 +1538,22 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     const CLD_STOPPED: i32 = 5;
     const CLD_CONTINUED: i32 = 6;
     const ECHILD: isize = -10;
-    const EINVAL: isize = -22;
-    const EFAULT: isize = -14;
     const EBADF: isize = -9;
     const EAGAIN: isize = -11;
     const O_NONBLOCK: u32 = 0x800;
 
     let allowed = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT;
     if (options & !allowed) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if infop == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if matches!(idtype, P_PID) && id == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut pidfd_target_pid = 0usize;
     let mut pidfd_nonblock = false;
@@ -1622,7 +1606,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
                     child_inner.pgid == target
                 }
                 P_PIDFD => child.pid.0 == pidfd_target_pid,
-                _ => return EINVAL,
+                _ => return err(SyscallError::EINVAL),
             };
             if !matches {
                 continue;
@@ -1873,7 +1857,7 @@ fn execve_with_inode(
                 return exec_interpreter(interp_data, new_args, envs_vec);
             }
             Ok(_) => {}
-            Err(ENOENT) => {}
+            Err(e) if e == err(SyscallError::ENOENT) => {}
             Err(e) => return e,
         }
         if wants_shell && is_system_shell_path(&interp) {
@@ -1931,7 +1915,7 @@ fn execve_with_inode(
                     return ENOEXEC;
                 }
             }
-            Err(ENOENT) if wants_shell => {
+            Err(e) if e == err(SyscallError::ENOENT) && wants_shell => {
                 // handled below
             }
             Err(e) => return e,
@@ -1943,7 +1927,7 @@ fn execve_with_inode(
                 Err(e) => return e,
             };
             let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
-                return ENOENT;
+                return err(SyscallError::ENOENT);
             };
             if !is_elf(&interp_data) {
                 return ENOEXEC;
@@ -1985,7 +1969,7 @@ fn execve_with_inode(
             Err(e) => return e,
         };
         let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         };
         if !is_elf(&interp_data) {
             return ENOEXEC;
@@ -2020,7 +2004,7 @@ fn execve_with_inode(
 pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let token = get_current_token();
     if path_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let path = match try_read_user_cstr(token, path_ptr) {
         Ok(p) => p,
@@ -2032,7 +2016,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         let mut i = 0usize;
         loop {
             if i >= 4096 {
-                return E2BIG;
+                return err(SyscallError::E2BIG);
             }
             let arg_ptr = match try_read_usize_user(token, argv_ptr + i * size_of::<usize>()) {
                 Ok(v) => v,
@@ -2066,7 +2050,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         let mut i = 0usize;
         loop {
             if i >= 4096 {
-                return E2BIG;
+                return err(SyscallError::E2BIG);
             }
             let env_ptr = match try_read_usize_user(token, envp_ptr + i * size_of::<usize>()) {
                 Ok(v) => v,
@@ -2097,7 +2081,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     let inode = match resolve_exec_inode_with_fallback(&path) {
         Ok(inode) => inode,
         Err(e) => {
-            if e == ENOENT {
+            if e == err(SyscallError::ENOENT) {
                 if let Some(ret) = try_exec_busybox_applet(&path, &args_vec, &envs_vec) {
                     return ret;
                 }
@@ -2126,7 +2110,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         }
     };
     if is_inode_open_for_write(inode.inode_num()) {
-        return ETXTBSY;
+        return err(SyscallError::ETXTBSY);
     }
 
     execve_with_inode(path, args_vec, envs_vec, inode)
@@ -2141,7 +2125,7 @@ pub fn syscall_execveat(
 ) -> isize {
     let token = get_current_token();
     if path_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let path = match try_read_user_cstr(token, path_ptr) {
         Ok(p) => p,
@@ -2164,7 +2148,7 @@ pub fn syscall_execveat(
         Err(e) => return e,
     };
     if is_inode_open_for_write(inode.inode_num()) {
-        return ETXTBSY;
+        return err(SyscallError::ETXTBSY);
     }
     execve_with_inode(path, args_vec, envs_vec, inode)
 }
@@ -2180,21 +2164,21 @@ pub fn syscall_getpid() -> isize {
 
 fn ptrace_target_for_current(pid: usize) -> Result<Arc<ProcessControlBlock>, isize> {
     if pid == 0 {
-        return Err(ESRCH);
+        return Err(err(SyscallError::ESRCH));
     }
     let Some(target) = pid2process(pid) else {
-        return Err(ESRCH);
+        return Err(err(SyscallError::ESRCH));
     };
     let tracer_pid = current_process().getpid();
     let traced_by_current = {
         let inner = target.borrow_mut();
         if inner.is_zombie {
-            return Err(ESRCH);
+            return Err(err(SyscallError::ESRCH));
         }
         inner.ptrace_tracer_pid == Some(tracer_pid)
     };
     if !traced_by_current {
-        return Err(EPERM);
+        return Err(err(SyscallError::EPERM));
     }
     Ok(target)
 }
@@ -2205,7 +2189,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
             let process = current_process();
             let mut inner = process.borrow_mut();
             if inner.ptrace_tracer_pid.is_some() {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let Some(parent_pid) = inner
                 .parent
@@ -2213,7 +2197,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                 .and_then(|w| w.upgrade())
                 .map(|p| p.getpid())
             else {
-                return EPERM;
+                return err(SyscallError::EPERM);
             };
             inner.ptrace_tracer_pid = Some(parent_pid);
             0
@@ -2221,21 +2205,21 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
         PTRACE_ATTACH => {
             let tracer_pid = current_process().getpid();
             if pid == tracer_pid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let Some(target) = pid2process(pid) else {
-                return ESRCH;
+                return err(SyscallError::ESRCH);
             };
             if !crate::task::signal::can_signal_process(&target, SIGSTOP_NUM as i32) {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let tasks = {
                 let mut inner = target.borrow_mut();
                 if inner.is_zombie {
-                    return ESRCH;
+                    return err(SyscallError::ESRCH);
                 }
                 if inner.ptrace_tracer_pid.is_some() {
-                    return EPERM;
+                    return err(SyscallError::EPERM);
                 }
                 inner.ptrace_tracer_pid = Some(tracer_pid);
                 inner.stopped = true;
@@ -2261,7 +2245,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
         PTRACE_DETACH => {
             let sig = data as isize;
             if sig < 0 || sig as usize > RT_SIG_MAX {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let target = match ptrace_target_for_current(pid) {
                 Ok(t) => t,
@@ -2298,7 +2282,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
         PTRACE_CONT => {
             let sig = data as isize;
             if sig < 0 || sig as usize > RT_SIG_MAX {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let target = match ptrace_target_for_current(pid) {
                 Ok(t) => t,
@@ -2362,11 +2346,11 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
         }
         _ => {
             // Keep invalid memory/register ptrace operations Linux-like for LTP:
-            // return EIO (tests also accept EFAULT).
+            // return err(SyscallError::EIO) (tests also accept err(SyscallError::EFAULT)).
             if let Err(e) = ptrace_target_for_current(pid) {
                 return e;
             }
-            EIO
+            err(SyscallError::EIO)
         }
     }
 }

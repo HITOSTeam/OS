@@ -14,6 +14,7 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::cmp::min;
+use crate::syscall::error::{SyscallError, err};
 
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
@@ -33,15 +34,6 @@ const MAP_TYPE_MASK: usize = 0x0f;
 
 const LARGE_ANON_MMAP: usize = 1 * 1024 * 1024;
 
-const EACCES: isize = -13;
-const EBADF: isize = -9;
-const EFAULT: isize = -14;
-const EINVAL: isize = -22;
-const ENOMEM: isize = -12;
-const EEXIST: isize = -17;
-const EIO: isize = -5;
-const EOPNOTSUPP: isize = -95;
-const EPERM: isize = -1;
 
 const MCL_CURRENT: usize = 0x01;
 const MCL_FUTURE: usize = 0x02;
@@ -499,37 +491,37 @@ pub fn syscall_mmap(
         | MAP_FIXED_NOREPLACE;
     let map_type = flags & MAP_TYPE_MASK;
     if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if map_type == MAP_SHARED_VALIDATE && (flags & !MAP_KNOWN_MASK) != 0 {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     let is_shared = map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE;
     let is_anon = (flags & MAP_ANONYMOUS) != 0;
     if !is_anon && fd < 0 {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     if len == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if fd >= 0 && (off % PAGE_SIZE) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let file = if !is_anon {
         let Some(file) = get_fd_file(fd as usize) else {
-            return EBADF;
+            return err(SyscallError::EBADF);
         };
         if !file.readable() {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         if is_shared && (prot & PROT_WRITE) != 0 {
             if !file.writable() {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
                 if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
-                    return EPERM;
+                    return err(SyscallError::EPERM);
                 }
             }
         }
@@ -554,7 +546,7 @@ pub fn syscall_mmap(
     let map_len = align_up(len, PAGE_SIZE);
     let commit_charge = anon_private_commit_charge(map_len, prot, is_anon, is_shared);
     if exceeds_overcommit_limit(commit_charge) {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
 
     let process = current_process();
@@ -567,7 +559,7 @@ pub fn syscall_mmap(
     let is_fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     let start = if is_fixed {
         if addr == 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         align_down(addr, PAGE_SIZE)
     } else {
@@ -613,10 +605,10 @@ pub fn syscall_mmap(
         }
     };
     let Some(end) = start.checked_add(map_len) else {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     };
     if !user_range_valid(start, end) {
-        return if is_fixed { EINVAL } else { ENOMEM };
+        return if is_fixed { err(SyscallError::EINVAL) } else { err(SyscallError::ENOMEM) };
     }
     let map_start = start;
     let map_end = end;
@@ -653,7 +645,7 @@ pub fn syscall_mmap(
             .memory_set
             .range_overlaps(map_start.into(), map_end.into())
         {
-            return EEXIST;
+            return err(SyscallError::EEXIST);
         }
     }
 
@@ -689,7 +681,7 @@ pub fn syscall_mmap(
             let vpn = crate::mm::VirtAddr::from(cur).floor();
             if let Some(pte) = inner.memory_set.translate(vpn) {
                 if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
-                    return ENOMEM;
+                    return err(SyscallError::ENOMEM);
                 }
             }
             cur += PAGE_SIZE;
@@ -707,7 +699,7 @@ pub fn syscall_mmap(
         let frames = if let Some(file) = &file {
             if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
                 let Some(frames) = shm.shared_frames(off, map_len) else {
-                    return ENOMEM;
+                    return err(SyscallError::ENOMEM);
                 };
                 frames
             } else {
@@ -716,7 +708,7 @@ pub fn syscall_mmap(
                 let mut frames = alloc::vec::Vec::with_capacity(pages);
                 for _ in 0..pages {
                     let Some(frame) = frame_alloc() else {
-                        return ENOMEM;
+                        return err(SyscallError::ENOMEM);
                     };
                     frames.push(frame);
                 }
@@ -727,7 +719,7 @@ pub fn syscall_mmap(
             let mut frames = alloc::vec::Vec::with_capacity(pages);
             for _ in 0..pages {
                 let Some(frame) = frame_alloc() else {
-                    return ENOMEM;
+                    return err(SyscallError::ENOMEM);
                 };
                 frames.push(frame);
             }
@@ -751,7 +743,7 @@ pub fn syscall_mmap(
             inner
                 .memory_set
                 .unmap_user_range(map_start.into(), map_end.into());
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         }
     } else {
         let map_ok = if is_anon {
@@ -780,7 +772,7 @@ pub fn syscall_mmap(
             inner
                 .memory_set
                 .unmap_user_range(map_start.into(), map_end.into());
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         }
     }
     if !is_fixed && end > inner.mmap_next {
@@ -861,7 +853,7 @@ pub fn syscall_mmap(
                     if try_copy_to_user_unchecked(token, (start + pos) as *mut u8, &tmp[..read])
                         .is_err()
                     {
-                        return ENOMEM;
+                        return err(SyscallError::ENOMEM);
                     }
                     pos += read;
                 }
@@ -881,22 +873,22 @@ pub fn syscall_mremap(
 ) -> isize {
     let supported_flags = MREMAP_MAYMOVE | MREMAP_FIXED;
     if (flags & !supported_flags) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & MREMAP_FIXED) != 0 && (flags & MREMAP_MAYMOVE) == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if old_size == 0 || new_size == 0 || old_addr % PAGE_SIZE != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let old_len = align_up(old_size, PAGE_SIZE);
     let new_len = align_up(new_size, PAGE_SIZE);
     let Some(old_end) = old_addr.checked_add(old_len) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     if !user_range_valid(old_addr, old_end) {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
 
     let process = current_process();
@@ -905,7 +897,7 @@ pub fn syscall_mremap(
         .memory_set
         .user_range_fully_mapped(old_addr.into(), old_end.into())
     {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
 
     let Some(src_idx) = inner
@@ -914,35 +906,35 @@ pub fn syscall_mremap(
         .position(|region| old_addr >= region.start && old_end <= region.end())
     else {
         return if (flags & MREMAP_MAYMOVE) == 0 && new_len > old_len {
-            ENOMEM
+            err(SyscallError::ENOMEM)
         } else {
-            EFAULT
+            err(SyscallError::EFAULT)
         };
     };
     let src_region = inner.mmap_areas[src_idx];
 
     if (flags & MREMAP_FIXED) != 0 {
         if new_addr % PAGE_SIZE != 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let Some(new_end) = new_addr.checked_add(new_len) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         if !user_range_valid(new_addr, new_end) {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         if new_len != old_len {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         if !(new_end <= old_addr || new_addr >= old_end) {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let mut cur = new_addr;
         while cur < new_end {
             let vpn = crate::mm::VirtAddr::from(cur).floor();
             if let Some(pte) = inner.memory_set.translate(vpn) {
                 if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
-                    return ENOMEM;
+                    return err(SyscallError::ENOMEM);
                 }
             }
             cur += PAGE_SIZE;
@@ -956,7 +948,7 @@ pub fn syscall_mremap(
             .memory_set
             .move_user_range(old_addr.into(), old_end.into(), new_addr.into())
         {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         }
         let mut next = Vec::new();
         for region in inner.mmap_areas.drain(..) {
@@ -1000,17 +992,17 @@ pub fn syscall_mremap(
     let mut target_old_end = old_end;
     let mut target_new_end = match old_addr.checked_add(new_len) {
         Some(v) => v,
-        None => return ENOMEM,
+        None => return err(SyscallError::ENOMEM),
     };
     if !user_range_valid(target_start, target_new_end) {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
     if inner
         .memory_set
         .range_overlaps((old_addr + old_len).into(), target_new_end.into())
     {
         if (flags & MREMAP_MAYMOVE) == 0 {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         }
         let preferred = align_up(inner.mmap_next, PAGE_SIZE);
         let fallback = align_up(inner.brk.saturating_add(USER_HEAP_GAP), PAGE_SIZE);
@@ -1019,19 +1011,19 @@ pub fn syscall_mremap(
         let Some(free_start) = find_free_user_range(mapped.as_slice(), preferred, new_len)
             .or_else(|| find_free_user_range(mapped.as_slice(), fallback, new_len))
         else {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         };
         let Some(free_old_end) = free_start.checked_add(old_len) else {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         };
         let Some(free_new_end) = free_start.checked_add(new_len) else {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         };
         if !inner
             .memory_set
             .move_user_range(old_addr.into(), old_end.into(), free_start.into())
         {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         }
         let mut next = Vec::new();
         for region in inner.mmap_areas.drain(..) {
@@ -1092,16 +1084,16 @@ pub fn syscall_mremap(
                 .or_else(|| find_open_inode_file(src_region.file_dev, src_region.file_ino))
             })
         else {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         };
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         };
         if !inner
             .memory_set
             .try_insert_framed_area(grow_start.into(), target_new_end.into(), perm)
         {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         }
         let token = inner.memory_set.token();
         let mut pos = 0usize;
@@ -1116,7 +1108,7 @@ pub fn syscall_mremap(
             if try_copy_to_user_unchecked(token, (grow_start + pos) as *mut u8, &tmp[..read])
                 .is_err()
             {
-                return ENOMEM;
+                return err(SyscallError::ENOMEM);
             }
             pos += read;
         }
@@ -1127,7 +1119,7 @@ pub fn syscall_mremap(
             .try_insert_framed_area(grow_start.into(), target_new_end.into(), perm)
     };
     if !grow_ok {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
 
     if let Some(region) = inner
@@ -1145,20 +1137,20 @@ pub fn syscall_mremap(
 
 pub fn syscall_munmap(addr: usize, len: usize) -> isize {
     if len == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if addr % PAGE_SIZE != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let process = current_process();
     let mut inner = process.borrow_mut();
     let start = addr;
     let Some(end) = start.checked_add(len) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let end = align_up(end, PAGE_SIZE);
     if !user_range_valid(start, end) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let overlaps = inner
@@ -1205,7 +1197,7 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
                             )
                             .is_err()
                         {
-                            return EIO;
+                            return err(SyscallError::EIO);
                         }
                     }
                 }
@@ -1213,7 +1205,7 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
             cur = cur.saturating_add(PAGE_SIZE);
         }
         if os_inode.flush().is_err() {
-            return EIO;
+            return err(SyscallError::EIO);
         }
     }
     inner.memory_set.unmap_user_range(start.into(), end.into());
@@ -1231,23 +1223,23 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
     const MS_SYNC: usize = 4;
 
     if (flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & MS_ASYNC) != 0 && (flags & MS_SYNC) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     if addr % PAGE_SIZE != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(end_raw) = addr.checked_add(len) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let end = align_up(end_raw, PAGE_SIZE);
     if !user_range_valid(addr, end) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -1255,10 +1247,10 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
         .memory_set
         .user_range_fully_mapped(addr.into(), end.into())
     {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
     if (flags & MS_INVALIDATE) != 0 && ranges_overlap(&inner.mlocked_ranges, addr, end) {
-        return -16;
+        return err(SyscallError::EBUSY);
     }
     let overlaps = inner
         .mmap_areas
@@ -1305,7 +1297,7 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
                             )
                             .is_err()
                         {
-                            return EIO;
+                            return err(SyscallError::EIO);
                         }
                     }
                 }
@@ -1313,7 +1305,7 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
             cur = cur.saturating_add(PAGE_SIZE);
         }
         if os_inode.flush().is_err() {
-            return EIO;
+            return err(SyscallError::EIO);
         }
         let mut cur = align_down(seg_start, PAGE_SIZE);
         while cur < seg_end {
@@ -1352,14 +1344,14 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         return 0;
     }
     if addr % PAGE_SIZE != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(end) = addr.checked_add(len) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let end = align_up(end, PAGE_SIZE);
     if !user_range_valid(addr, end) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let mut perm = MapPermission::U;
@@ -1377,13 +1369,13 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     let mut inner = process.borrow_mut();
     let mut next_regions = inner.mmap_areas.clone();
     if apply_mprotect_to_mmap_regions(&mut next_regions, addr, end, prot).is_err() {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if !inner
         .memory_set
         .mprotect_user_range(addr.into(), end.into(), perm)
     {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
     inner.mmap_areas = next_regions;
     // Ensure permission changes take effect immediately.
@@ -1403,17 +1395,17 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 /// This keeps a Linux-like errno matrix for LTP coverage.
 pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
     if addr % PAGE_SIZE != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     let Some(end) = addr.checked_add(len) else {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     };
     let end = align_up(end, PAGE_SIZE);
     if !user_range_valid(addr, end) {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
 
     const MADV_NORMAL: usize = 0;
@@ -1433,7 +1425,7 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                 .memory_set
                 .user_range_fully_mapped(addr.into(), end.into())
             {
-                return ENOMEM;
+                return err(SyscallError::ENOMEM);
             }
             if advice == MADV_WILLNEED || advice == MADV_NORMAL {
                 return 0;
@@ -1449,7 +1441,7 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                     .iter()
                     .any(|region| end > region.start && addr < region.end() && region.shared);
                 if shared_overlap || ranges_overlap(&inner.mlocked_ranges, addr, end) {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
             }
             if advice == MADV_FREE {
@@ -1458,7 +1450,7 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                     .iter()
                     .any(|region| end > region.start && addr < region.end() && region.shared);
                 if shared_overlap {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
             }
             inner
@@ -1466,7 +1458,7 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                 .discard_lazy_user_range(addr.into(), end.into());
             0
         }
-        _ => EINVAL,
+        _ => err(SyscallError::EINVAL),
     }
 }
 
@@ -1477,11 +1469,11 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
     }
     let start = align_down(addr, PAGE_SIZE);
     let Some(end) = addr.checked_add(len) else {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     };
     let end = align_up(end, PAGE_SIZE);
     if !user_range_valid(start, end) {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -1489,7 +1481,7 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
         .memory_set
         .user_range_fully_mapped(start.into(), end.into())
     {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
     let mut cur = start;
     while cur < end {
@@ -1502,8 +1494,8 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
         if !present {
             match inner.memory_set.resolve_lazy_fault(cur, MapPermission::R) {
                 crate::mm::LazyFaultResult::Resolved => {}
-                crate::mm::LazyFaultResult::Oom => return ENOMEM,
-                crate::mm::LazyFaultResult::Invalid => return ENOMEM,
+                crate::mm::LazyFaultResult::Oom => return err(SyscallError::ENOMEM),
+                crate::mm::LazyFaultResult::Invalid => return err(SyscallError::ENOMEM),
             }
         }
         cur += PAGE_SIZE;
@@ -1512,12 +1504,12 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
     next.push((start, end));
     normalize_ranges(&mut next);
     if inner.euid != 0 {
-        let limit = inner.rlimit_memlock_cur as usize;
+        let limit = inner.rlimits.rlimit_memlock_cur as usize;
         if limit == 0 {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         if ranges_total_len(&next) > limit {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         }
     }
     inner.mlocked_ranges = next;
@@ -1531,11 +1523,11 @@ pub fn syscall_munlock(addr: usize, len: usize) -> isize {
     }
     let start = align_down(addr, PAGE_SIZE);
     let Some(end) = addr.checked_add(len) else {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     };
     let end = align_up(end, PAGE_SIZE);
     if !user_range_valid(start, end) {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -1543,7 +1535,7 @@ pub fn syscall_munlock(addr: usize, len: usize) -> isize {
         .memory_set
         .user_range_fully_mapped(start.into(), end.into())
     {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
     trim_ranges(&mut inner.mlocked_ranges, start, end);
     0
@@ -1552,13 +1544,13 @@ pub fn syscall_munlock(addr: usize, len: usize) -> isize {
 /// Linux `mlockall` (syscall 230).
 pub fn syscall_mlockall(flags: usize) -> isize {
     if (flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & (MCL_CURRENT | MCL_FUTURE)) == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & MCL_ONFAULT) != 0 && (flags & (MCL_CURRENT | MCL_FUTURE)) == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -1573,12 +1565,12 @@ pub fn syscall_mlockall(flags: usize) -> isize {
     }
     normalize_ranges(&mut next);
     if inner.euid != 0 {
-        let limit = inner.rlimit_memlock_cur as usize;
+        let limit = inner.rlimits.rlimit_memlock_cur as usize;
         if limit == 0 {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         if ranges_total_len(&next) > limit {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         }
     }
     inner.mlocked_ranges = next;
@@ -1598,17 +1590,17 @@ pub fn syscall_munlockall() -> isize {
 /// Linux `mincore(2)` (syscall 232).
 pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
     if addr % PAGE_SIZE != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     let Some(end_raw) = addr.checked_add(len) else {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     };
     let end = align_up(end_raw, PAGE_SIZE);
     if !user_range_valid(addr, end) {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
 
     let process = current_process();
@@ -1617,7 +1609,7 @@ pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
         .memory_set
         .user_range_fully_mapped(addr.into(), end.into())
     {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
 
     let pages = (end - addr) / PAGE_SIZE;
@@ -1636,7 +1628,7 @@ pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
     drop(inner);
 
     if try_copy_to_user(get_current_token(), vec as *mut u8, &residency).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }

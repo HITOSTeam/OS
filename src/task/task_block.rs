@@ -549,7 +549,7 @@ impl TaskControlBlock {
         let kstack_top = kstack.get_top();
         let process_nice = {
             let inner = process.borrow_mut();
-            inner.nice
+            inner.scheduling.nice
         };
         Some(Self {
             process: Arc::downgrade(&process),
@@ -628,7 +628,7 @@ impl TaskControlBlock {
         let kstack_top = kstack.get_top();
         let process_nice = {
             let inner = process.borrow_mut();
-            inner.nice
+            inner.scheduling.nice
         };
         Some(Self {
             process: Arc::downgrade(&process),

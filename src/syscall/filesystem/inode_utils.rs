@@ -749,7 +749,7 @@ pub(crate) fn fsize_limit_allows(new_len: usize) -> Result<(), isize> {
     let limit = {
         let process = current_process();
         let inner = process.borrow_mut();
-        inner.rlimit_fsize_cur
+        inner.rlimits.rlimit_fsize_cur
     };
     if limit != u64::MAX && (new_len as u64) > limit {
         let pid = current_process().getpid();

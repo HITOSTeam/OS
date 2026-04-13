@@ -454,7 +454,7 @@ pub(crate) fn proc_pid_fd_entries(pid: u32) -> Vec<PseudoDirent> {
     };
     let mut has_predicted = false;
     let predicted_fd = if pid as usize == current_process().getpid() {
-        let limit = inner.rlimit_nofile_cur as usize;
+        let limit = inner.rlimits.rlimit_nofile_cur as usize;
         let fd =
             if let Some(fd) = (0..inner.fd_table.len()).find(|fd| inner.fd_table[*fd].is_none()) {
                 (fd < limit).then_some(fd)

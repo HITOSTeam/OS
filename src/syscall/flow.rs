@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     mm::{try_copy_from_user, try_read_user_value},
@@ -16,19 +17,16 @@ struct IoVec {
     len: usize,
 }
 
-const EFAULT: isize = -14;
-const EINVAL: isize = -22;
-const EOPNOTSUPP: isize = -95;
 const IOV_MAX: usize = 1024;
 
 fn validate_iovcnt(iovcnt_raw: usize) -> Result<usize, isize> {
     let iovcnt = iovcnt_raw as isize;
     if iovcnt < 0 {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let iovcnt = iovcnt as usize;
     if iovcnt > IOV_MAX {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     Ok(iovcnt)
 }
@@ -39,9 +37,9 @@ fn read_iovec(token: usize, iov_ptr: usize, index: usize) -> Result<IoVec, isize
         .checked_mul(iov_size)
         .and_then(|v| iov_ptr.checked_add(v))
     else {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     };
-    try_read_user_value(token, iov_off as *const IoVec).ok_or(EFAULT)
+    try_read_user_value(token, iov_off as *const IoVec).ok_or(err(SyscallError::EFAULT))
 }
 
 fn do_iov<F>(iov_ptr: usize, iovcnt_raw: usize, mut io_once: F) -> isize
@@ -49,7 +47,7 @@ where
     F: FnMut(usize, usize) -> isize,
 {
     let Ok(iovcnt) = validate_iovcnt(iovcnt_raw) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if iovcnt == 0 {
         return 0;
@@ -64,11 +62,11 @@ where
             Err(err) => return if total > 0 { total } else { err },
         };
         if iv.len > isize::MAX as usize {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         total_len = match total_len.checked_add(iv.len) {
             Some(v) if v <= isize::MAX as usize => v,
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if iv.len == 0 {
             continue;
@@ -96,10 +94,10 @@ where
     F: FnMut(usize, usize, isize) -> isize,
 {
     if offset < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Ok(iovcnt) = validate_iovcnt(iovcnt_raw) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if iovcnt == 0 {
         return 0;
@@ -114,11 +112,11 @@ where
             Err(err) => return if total > 0 { total } else { err },
         };
         if iv.len > isize::MAX as usize {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         total_len = match total_len.checked_add(iv.len) {
             Some(v) if v <= isize::MAX as usize => v,
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         if iv.len == 0 {
             continue;
@@ -134,7 +132,7 @@ where
         }
         offset = match offset.checked_add(n) {
             Some(v) => v,
-            None => return if total > 0 { total } else { EINVAL },
+            None => return if total > 0 { total } else { err(SyscallError::EINVAL) },
         };
     }
     total
@@ -152,11 +150,11 @@ fn copy_iov_bytes(iov_ptr: usize, iovcnt_raw: usize) -> Result<Vec<u8>, isize> {
     for index in 0..iovcnt {
         let iv = read_iovec(token, iov_ptr, index)?;
         if iv.len > isize::MAX as usize {
-            return Err(EINVAL);
+            return Err(err(SyscallError::EINVAL));
         }
         total_len = match total_len.checked_add(iv.len) {
             Some(value) if value <= isize::MAX as usize => value,
-            _ => return Err(EINVAL),
+            _ => return Err(err(SyscallError::EINVAL)),
         };
         iovecs.push(iv);
     }
@@ -169,7 +167,7 @@ fn copy_iov_bytes(iov_ptr: usize, iovcnt_raw: usize) -> Result<Vec<u8>, isize> {
         let start = data.len();
         data.resize(start + iv.len, 0);
         if try_copy_from_user(token, iv.base as *const u8, &mut data[start..]).is_err() {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         }
     }
     Ok(data)
@@ -211,7 +209,7 @@ pub fn syscall_preadv(fd: usize, iov_ptr: usize, iovcnt: usize, offset: isize) -
 
 pub fn syscall_pwritev(fd: usize, iov_ptr: usize, iovcnt: usize, offset: isize) -> isize {
     if offset < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if super::filesystem::fd_is_writable_proc_pseudo(fd) {
         let data = match copy_iov_bytes(iov_ptr, iovcnt) {
@@ -242,7 +240,7 @@ pub fn syscall_preadv2(
     flags: usize,
 ) -> isize {
     if flags != 0 {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     let offset = split_offset_to_isize(offset_lo, offset_hi);
     if offset == -1 {
@@ -261,7 +259,7 @@ pub fn syscall_pwritev2(
     flags: usize,
 ) -> isize {
     if flags != 0 {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     let offset = split_offset_to_isize(offset_lo, offset_hi);
     if offset == -1 {

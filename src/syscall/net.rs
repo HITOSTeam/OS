@@ -20,6 +20,7 @@ use crate::task::processor::{
 };
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::trap::get_current_token;
+use crate::syscall::error::{SyscallError, err};
 use crate::{
     bpf::get_prog_clone,
     fs::{
@@ -57,25 +58,6 @@ const SO_ATTACH_BPF: usize = 50;
 const MCAST_JOIN_GROUP: usize = 42;
 const MCAST_LEAVE_GROUP: usize = 45;
 
-const EINVAL: isize = -22;
-const EBADF: isize = -9;
-const EAGAIN: isize = -11;
-const EFAULT: isize = -14;
-const EACCES: isize = -13;
-const ENOTDIR: isize = -20;
-const EAFNOSUPPORT: isize = -97;
-const EMSGSIZE: isize = -90;
-const ENOPROTOOPT: isize = -92;
-const EPROTONOSUPPORT: isize = -93;
-const ENOTSOCK: isize = -88;
-const EOPNOTSUPP: isize = -95;
-const EISCONN: isize = -106;
-const ENOTCONN: isize = -107;
-const EMFILE: isize = -24;
-const EADDRINUSE: isize = -98;
-const EADDRNOTAVAIL: isize = -99;
-const ECONNREFUSED: isize = -111;
-const ENOENT: isize = -2;
 
 const MSG_OOB: usize = 0x1;
 const MSG_PEEK: usize = 0x2;
@@ -253,11 +235,11 @@ impl UnixSocketFile {
 
     fn set_listening(&self, backlog: usize) -> isize {
         if !self.is_stream_like() {
-            return EOPNOTSUPP;
+            return err(SyscallError::EOPNOTSUPP);
         }
         let mut st = self.state.lock();
         if st.bound.is_none() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         st.listening = true;
         st.backlog = backlog.max(1).min(32);
@@ -268,12 +250,12 @@ impl UnixSocketFile {
 
     fn accept_stream(&self) -> Result<Arc<UnixSocketFile>, isize> {
         if !self.is_stream_like() {
-            return Err(EOPNOTSUPP);
+            return Err(err(SyscallError::EOPNOTSUPP));
         }
         loop {
             let mut st = self.state.lock();
             if !st.listening {
-                return Err(EINVAL);
+                return Err(err(SyscallError::EINVAL));
             }
             if let Some(conn) = st.pending_accept.pop_front() {
                 return Ok(conn);
@@ -288,7 +270,7 @@ impl UnixSocketFile {
             {
                 let st = self.state.lock();
                 if st.stream_end.is_some() {
-                    return EISCONN;
+                    return err(SyscallError::EISCONN);
                 }
             }
             let peer_file = match lookup_unix_bound_socket(&addr) {
@@ -296,10 +278,10 @@ impl UnixSocketFile {
                 Err(e) => return e,
             };
             let Some(peer) = peer_file.as_any().downcast_ref::<UnixSocketFile>() else {
-                return ECONNREFUSED;
+                return err(SyscallError::ECONNREFUSED);
             };
             if !peer.is_stream_like() {
-                return EPROTONOSUPPORT;
+                return err(SyscallError::EPROTONOSUPPORT);
             }
             let (client_end, server_end) = make_socketpair();
             let client_bound = self.bound_addr();
@@ -307,10 +289,10 @@ impl UnixSocketFile {
             {
                 let mut peer_st = peer.state.lock();
                 if !peer_st.listening {
-                    return ECONNREFUSED;
+                    return err(SyscallError::ECONNREFUSED);
                 }
                 if peer_st.pending_accept.len() >= peer_st.backlog {
-                    return ECONNREFUSED;
+                    return err(SyscallError::ECONNREFUSED);
                 }
                 let accepted = Arc::new(UnixSocketFile::new_connected_stream(
                     self.sock_type,
@@ -325,7 +307,7 @@ impl UnixSocketFile {
             }
             let mut st = self.state.lock();
             if st.stream_end.is_some() {
-                return EISCONN;
+                return err(SyscallError::EISCONN);
             }
             st.stream_end = Some(client_end);
             st.peer_addr = Some(addr);
@@ -334,17 +316,17 @@ impl UnixSocketFile {
             return 0;
         }
         if !self.is_dgram() {
-            return EPROTONOSUPPORT;
+            return err(SyscallError::EPROTONOSUPPORT);
         }
         let peer_file = match lookup_unix_bound_socket(&addr) {
             Ok(f) => f,
             Err(e) => return e,
         };
         let Some(peer) = peer_file.as_any().downcast_ref::<UnixSocketFile>() else {
-            return ECONNREFUSED;
+            return err(SyscallError::ECONNREFUSED);
         };
         if !peer.is_dgram() {
-            return EPROTONOSUPPORT;
+            return err(SyscallError::EPROTONOSUPPORT);
         }
         let mut st = self.state.lock();
         st.dgram_peer = Some(addr.clone());
@@ -354,12 +336,12 @@ impl UnixSocketFile {
 
     fn send_dgram(&self, payload: Vec<u8>, target: Option<UnixBoundAddr>) -> isize {
         if !self.is_dgram() {
-            return EOPNOTSUPP;
+            return err(SyscallError::EOPNOTSUPP);
         }
         let (to, from) = {
             let st = self.state.lock();
             let Some(to) = target.or_else(|| st.dgram_peer.clone()) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             (to, st.bound.clone())
         };
@@ -368,10 +350,10 @@ impl UnixSocketFile {
             Err(e) => return e,
         };
         let Some(peer) = peer_file.as_any().downcast_ref::<UnixSocketFile>() else {
-            return ECONNREFUSED;
+            return err(SyscallError::ECONNREFUSED);
         };
         if !peer.is_dgram() {
-            return EPROTONOSUPPORT;
+            return err(SyscallError::EPROTONOSUPPORT);
         }
         let n = payload.len();
         let wake = {
@@ -619,11 +601,11 @@ impl NetlinkSocketFile {
 
     fn bind_local(&self, addr: SockAddrNl) -> isize {
         if addr.nl_family != AF_NETLINK {
-            return EAFNOSUPPORT;
+            return err(SyscallError::EAFNOSUPPORT);
         }
         let mut st = self.state.lock();
         if st.bound.is_some() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         st.bound = Some(SockAddrNl {
             nl_family: AF_NETLINK,
@@ -687,10 +669,10 @@ impl NetlinkSocketFile {
                 return Ok(msg);
             }
             if nonblock {
-                return Err(EAGAIN);
+                return Err(err(SyscallError::EAGAIN));
             }
             let Some(task) = current_task() else {
-                return Err(EAGAIN);
+                return Err(err(SyscallError::EAGAIN));
             };
             Self::add_waiter_once(&mut st.recv_waiters, &task);
             drop(st);
@@ -786,23 +768,23 @@ fn get_file(fd: usize) -> Result<FileArc, isize> {
     let process = current_files_process();
     let inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
-        return Err(EBADF);
+        return Err(err(SyscallError::EBADF));
     }
     if fd < inner.fd_flags.len() && (inner.fd_flags[fd] & O_PATH) != 0 {
-        return Err(EBADF);
+        return Err(err(SyscallError::EBADF));
     }
-    inner.fd_table[fd].clone().ok_or(EBADF)
+    inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
 }
 
 fn get_file_from_process(pid: usize, fd: usize) -> Result<FileArc, isize> {
     let Some(process) = pid2process(pid) else {
-        return Err(EBADF);
+        return Err(err(SyscallError::EBADF));
     };
     let inner = process.borrow_mut();
     if fd >= inner.fd_table.len() {
-        return Err(EBADF);
+        return Err(err(SyscallError::EBADF));
     }
-    inner.fd_table[fd].clone().ok_or(EBADF)
+    inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
 }
 
 pub(crate) fn mq_notify_validate_thread_sockfd(pid: usize, sockfd: usize) -> isize {
@@ -811,7 +793,7 @@ pub(crate) fn mq_notify_validate_thread_sockfd(pid: usize, sockfd: usize) -> isi
         Err(e) => return e,
     };
     if file.as_any().downcast_ref::<NetlinkSocketFile>().is_none() {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     0
 }
@@ -827,7 +809,7 @@ pub(crate) fn mq_notify_send_thread_event(
         Err(e) => return e,
     };
     let Some(sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     sock.enqueue_mq_notify(cookie, notify_kind);
     0
@@ -923,18 +905,18 @@ fn parse_sockaddr_in(
     len: usize,
 ) -> Result<(smoltcp::wire::Ipv4Address, u16), isize> {
     if user_ptr == 0 || len < size_of::<SockAddrIn>() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     if len > i32::MAX as usize {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let token = get_current_token();
     let Some(sa) = try_read_user_value(token, user_ptr as *const SockAddrIn) else {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     };
     if sa.sin_family != AF_INET {
         if sa.sin_family != 0 {
-            return Err(EAFNOSUPPORT);
+            return Err(err(SyscallError::EAFNOSUPPORT));
         }
     }
     let port = u16::from_be(sa.sin_port);
@@ -945,18 +927,18 @@ fn parse_sockaddr_in(
 
 fn parse_sockaddr_nl(user_ptr: usize, len: usize) -> Result<SockAddrNl, isize> {
     if user_ptr == 0 || len < size_of::<SockAddrNl>() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     if len > i32::MAX as usize {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let token = get_current_token();
     let Some(sa) = try_read_user_value(token, user_ptr as *const SockAddrNl) else {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     };
     if sa.nl_family != AF_NETLINK {
         if sa.nl_family != 0 {
-            return Err(EAFNOSUPPORT);
+            return Err(err(SyscallError::EAFNOSUPPORT));
         }
     }
     Ok(sa)
@@ -964,24 +946,24 @@ fn parse_sockaddr_nl(user_ptr: usize, len: usize) -> Result<SockAddrNl, isize> {
 
 fn parse_sockaddr_un(user_ptr: usize, len: usize) -> Result<(bool, Vec<u8>), isize> {
     if user_ptr == 0 || len < size_of::<u16>() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     if len > i32::MAX as usize {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let to_copy = len.min(size_of::<SockAddrUn>());
     let token = get_current_token();
     let mut raw = vec![0u8; to_copy];
     if try_copy_from_user(token, user_ptr as *const u8, raw.as_mut_slice()).is_err() {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     }
     let family = u16::from_ne_bytes([raw[0], raw[1]]);
     if family != AF_UNIX {
-        return Err(EAFNOSUPPORT);
+        return Err(err(SyscallError::EAFNOSUPPORT));
     }
     let path = &raw[size_of::<u16>()..];
     if path.is_empty() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     if path[0] == 0 {
         let mut name = path[1..].to_vec();
@@ -989,13 +971,13 @@ fn parse_sockaddr_un(user_ptr: usize, len: usize) -> Result<(bool, Vec<u8>), isi
             name.pop();
         }
         if name.is_empty() {
-            return Err(EINVAL);
+            return Err(err(SyscallError::EINVAL));
         }
         return Ok((true, name));
     }
     let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
     if end == 0 {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     Ok((false, path[..end].to_vec()))
 }
@@ -1006,7 +988,7 @@ fn parse_unix_bound_addr(addr: usize, addrlen: usize) -> Result<UnixBoundAddr, i
         return Ok(UnixBoundAddr::Abstract(raw_name));
     }
     let Ok(path_part) = core::str::from_utf8(&raw_name) else {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     };
     let cwd = { current_process().borrow_mut().cwd.clone() };
     let abs = normalize_path(&cwd, path_part);
@@ -1018,24 +1000,24 @@ fn lookup_unix_bound_socket(addr: &UnixBoundAddr) -> Result<FileArc, isize> {
         UnixBoundAddr::Path(path) => {
             let mut reg = UNIX_BOUND_PATHS.lock();
             let Some(weak) = reg.get(path) else {
-                return Err(ENOENT);
+                return Err(err(SyscallError::ENOENT));
             };
             if let Some(file) = weak.upgrade() {
                 return Ok(file);
             }
             reg.remove(path);
-            Err(ENOENT)
+            Err(err(SyscallError::ENOENT))
         }
         UnixBoundAddr::Abstract(name) => {
             let mut reg = UNIX_BOUND_ABSTRACT.lock();
             let Some(weak) = reg.get(name) else {
-                return Err(ENOENT);
+                return Err(err(SyscallError::ENOENT));
             };
             if let Some(file) = weak.upgrade() {
                 return Ok(file);
             }
             reg.remove(name);
-            Err(ENOENT)
+            Err(err(SyscallError::ENOENT))
         }
     }
 }
@@ -1046,7 +1028,7 @@ fn register_unix_bound_socket(addr: &UnixBoundAddr, file: &FileArc) -> isize {
             let mut reg = UNIX_BOUND_PATHS.lock();
             if let Some(existing) = reg.get(path) {
                 if existing.upgrade().is_some() {
-                    return EADDRINUSE;
+                    return err(SyscallError::EADDRINUSE);
                 }
                 reg.remove(path);
             }
@@ -1056,7 +1038,7 @@ fn register_unix_bound_socket(addr: &UnixBoundAddr, file: &FileArc) -> isize {
             let mut reg = UNIX_BOUND_ABSTRACT.lock();
             if let Some(existing) = reg.get(name) {
                 if existing.upgrade().is_some() {
-                    return EADDRINUSE;
+                    return err(SyscallError::EADDRINUSE);
                 }
                 reg.remove(name);
             }
@@ -1068,7 +1050,7 @@ fn register_unix_bound_socket(addr: &UnixBoundAddr, file: &FileArc) -> isize {
 
 fn bind_unix_socket(file: &FileArc, sock: &UnixSocketFile, addr: usize, addrlen: usize) -> isize {
     if sock.bound_addr().is_some() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let bound = match parse_unix_bound_addr(addr, addrlen) {
         Ok(v) => v,
@@ -1076,23 +1058,23 @@ fn bind_unix_socket(file: &FileArc, sock: &UnixSocketFile, addr: usize, addrlen:
     };
     if let UnixBoundAddr::Path(abs) = &bound {
         let Some((parent_path, name)) = split_parent_and_name(abs) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         let _fs_guard = ext4_lock();
         let Some(parent) = find_path_in_roots(parent_path) else {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         };
         if !parent.is_dir() {
-            return ENOTDIR;
+            return err(SyscallError::ENOTDIR);
         }
         if parent.find(name).is_some() {
-            return EADDRINUSE;
+            return err(SyscallError::EADDRINUSE);
         }
         if parent.create_file(name).is_err() {
             if parent.find(name).is_some() {
-                return EADDRINUSE;
+                return err(SyscallError::EADDRINUSE);
             }
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let reg_result = register_unix_bound_socket(&bound, file);
         if reg_result != 0 {
@@ -1116,15 +1098,15 @@ fn write_sockaddr_in(
     port: u16,
 ) -> isize {
     if user_ptr == 0 || user_len_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(len_u32) = try_read_user_value::<u32>(token, user_len_ptr as *const u32) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let len = len_u32 as usize;
     if len > i32::MAX as usize {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let sa = SockAddrIn {
         sin_family: AF_INET,
@@ -1142,26 +1124,26 @@ fn write_sockaddr_in(
             core::slice::from_raw_parts((&sa as *const SockAddrIn) as *const u8, copy_len)
         };
         if try_copy_to_user(token, user_ptr as *mut u8, bytes).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     if try_write_user_value(token, user_len_ptr as *mut u32, &(required as u32)).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 fn write_sockaddr_nl(user_ptr: usize, user_len_ptr: usize, sa: &SockAddrNl) -> isize {
     if user_ptr == 0 || user_len_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(len_u32) = try_read_user_value::<u32>(token, user_len_ptr as *const u32) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let len = len_u32 as usize;
     if len > i32::MAX as usize {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let required = size_of::<SockAddrNl>();
     let copy_len = core::cmp::min(len, required);
@@ -1170,26 +1152,26 @@ fn write_sockaddr_nl(user_ptr: usize, user_len_ptr: usize, sa: &SockAddrNl) -> i
             core::slice::from_raw_parts((&*sa as *const SockAddrNl) as *const u8, copy_len)
         };
         if try_copy_to_user(token, user_ptr as *mut u8, bytes).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     if try_write_user_value(token, user_len_ptr as *mut u32, &(required as u32)).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 fn write_sockaddr_un(user_ptr: usize, user_len_ptr: usize, addr: Option<&UnixBoundAddr>) -> isize {
     if user_ptr == 0 || user_len_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(len_u32) = try_read_user_value::<u32>(token, user_len_ptr as *const u32) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let len = len_u32 as usize;
     if len > i32::MAX as usize {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut sa = SockAddrUn {
         sun_family: AF_UNIX,
@@ -1216,11 +1198,11 @@ fn write_sockaddr_un(user_ptr: usize, user_len_ptr: usize, addr: Option<&UnixBou
             core::slice::from_raw_parts((&sa as *const SockAddrUn) as *const u8, copy_len)
         };
         if try_copy_to_user(token, user_ptr as *mut u8, bytes).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     if try_write_user_value(token, user_len_ptr as *mut u32, &(required as u32)).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -1230,17 +1212,17 @@ fn read_iovecs(iov_ptr: usize, iovcnt: usize) -> Result<Vec<IoVec>, isize> {
         return Ok(Vec::new());
     }
     if iovcnt > UIO_MAXIOV {
-        return Err(EMSGSIZE);
+        return Err(err(SyscallError::EMSGSIZE));
     }
     if iov_ptr == 0 {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     }
     let token = get_current_token();
     let mut iovs = Vec::with_capacity(iovcnt);
     for i in 0..iovcnt {
         let ptr = (iov_ptr + i * size_of::<IoVec>()) as *const IoVec;
         let Some(iv) = try_read_user_value::<IoVec>(token, ptr) else {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         };
         iovs.push(iv);
     }
@@ -1258,7 +1240,7 @@ fn gather_iovecs_data(iovs: &[IoVec]) -> Result<Vec<u8>, isize> {
         }
         let end = off + iv.len;
         if try_copy_from_user(token, iv.base as *const u8, &mut out[off..end]).is_err() {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         }
         off = end;
     }
@@ -1268,7 +1250,7 @@ fn gather_iovecs_data(iovs: &[IoVec]) -> Result<Vec<u8>, isize> {
 fn iovecs_total_len(iovs: &[IoVec]) -> Result<usize, isize> {
     iovs.iter()
         .try_fold(0usize, |acc, iv| acc.checked_add(iv.len))
-        .ok_or(EINVAL)
+        .ok_or(err(SyscallError::EINVAL))
 }
 
 fn scatter_iovecs_data(iovs: &[IoVec], data: &[u8]) -> Result<usize, isize> {
@@ -1283,7 +1265,7 @@ fn scatter_iovecs_data(iovs: &[IoVec], data: &[u8]) -> Result<usize, isize> {
         }
         let n = core::cmp::min(iv.len, data.len() - off);
         if try_copy_to_user(token, iv.base as *mut u8, &data[off..off + n]).is_err() {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         }
         off += n;
     }
@@ -1297,13 +1279,13 @@ fn write_msg_name_bytes(msg: &mut MsgHdr, value: &[u8]) -> isize {
     }
     let user_len = msg.msg_namelen as usize;
     if user_len > i32::MAX as usize {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let copy_len = core::cmp::min(user_len, value.len());
     if copy_len > 0 {
         let token = get_current_token();
         if try_copy_to_user(token, msg.msg_name as *mut u8, &value[..copy_len]).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     msg.msg_namelen = value.len() as u32;
@@ -1360,20 +1342,20 @@ fn write_msg_name_un(msg: &mut MsgHdr, addr: Option<&UnixBoundAddr>) -> isize {
 fn validate_send_flags(flags: usize) -> isize {
     let known = MSG_OOB | MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE;
     if (flags & !known) != 0 {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     if (flags & MSG_OOB) != 0 {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     0
 }
 
 fn validate_recv_flags(flags: usize) -> isize {
     if (flags & MSG_OOB) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & MSG_ERRQUEUE) != 0 {
-        return EAGAIN;
+        return err(SyscallError::EAGAIN);
     }
     let known = MSG_DONTWAIT
         | MSG_PEEK
@@ -1383,17 +1365,17 @@ fn validate_recv_flags(flags: usize) -> isize {
         | MSG_WAITALL
         | MSG_NOSIGNAL;
     if (flags & !known) != 0 {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     0
 }
 
 fn read_msghdr(user_ptr: usize) -> Result<MsgHdr, isize> {
     if user_ptr == 0 {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     }
     let token = get_current_token();
-    try_read_user_value::<MsgHdr>(token, user_ptr as *const MsgHdr).ok_or(EFAULT)
+    try_read_user_value::<MsgHdr>(token, user_ptr as *const MsgHdr).ok_or(err(SyscallError::EFAULT))
 }
 
 fn write_mmsghdr_msg_len(user_ptr: usize, idx: usize, msg_len: u32) -> isize {
@@ -1401,7 +1383,7 @@ fn write_mmsghdr_msg_len(user_ptr: usize, idx: usize, msg_len: u32) -> isize {
     let base = user_ptr + idx * size_of::<MMsgHdr>();
     let ptr = (base + size_of::<MsgHdr>()) as *mut u32;
     if try_write_user_value(token, ptr, &msg_len).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -1410,14 +1392,14 @@ fn write_mmsghdr(user_ptr: usize, idx: usize, mmsg: &MMsgHdr) -> isize {
     let token = get_current_token();
     let ptr = (user_ptr + idx * size_of::<MMsgHdr>()) as *mut MMsgHdr;
     if try_write_user_value(token, ptr, mmsg).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
     if msg.msg_iovlen > UIO_MAXIOV {
-        return EMSGSIZE;
+        return err(SyscallError::EMSGSIZE);
     }
     let iovs = match read_iovecs(msg.msg_iov, msg.msg_iovlen) {
         Ok(v) => v,
@@ -1425,12 +1407,12 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
     };
     if msg.msg_controllen > 0 {
         if msg.msg_control == 0 {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         let token = get_current_token();
         let mut probe = [0u8; 1];
         if try_copy_from_user(token, msg.msg_control as *const u8, &mut probe).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     let file = match get_file(fd) {
@@ -1465,13 +1447,13 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
                 }
                 total = match total.checked_add(n) {
                     Some(v) => v,
-                    None => return EINVAL,
+                    None => return err(SyscallError::EINVAL),
                 };
             }
             return total;
         }
         if !unix_sock.is_dgram() {
-            return EOPNOTSUPP;
+            return err(SyscallError::EOPNOTSUPP);
         }
         let mut kbuf = match gather_iovecs_data(&iovs) {
             Ok(v) => v,
@@ -1520,7 +1502,7 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     let send_flag_check = validate_send_flags(flags);
     if send_flag_check != 0 {
@@ -1549,7 +1531,7 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
         }
         crate::fs::NetSocketKind::Udp => {
             if kbuf.len() > 65507 {
-                return EMSGSIZE;
+                return err(SyscallError::EMSGSIZE);
             }
             let target = if msg.msg_name == 0 || msg.msg_namelen == 0 {
                 None
@@ -1577,7 +1559,7 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
                 }
             }
         }
-        crate::fs::NetSocketKind::TcpListener => EOPNOTSUPP,
+        crate::fs::NetSocketKind::TcpListener => err(SyscallError::EOPNOTSUPP),
     }
 }
 
@@ -1587,14 +1569,14 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
         return recv_flag_check;
     }
     if msg.msg_iovlen > UIO_MAXIOV {
-        return EMSGSIZE;
+        return err(SyscallError::EMSGSIZE);
     }
     let iovs = match read_iovecs(msg.msg_iov, msg.msg_iovlen) {
         Ok(v) => v,
         Err(e) => return e,
     };
     if msg.msg_controllen > 0 && msg.msg_control == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let total_len = match iovecs_total_len(&iovs) {
         Ok(v) => v,
@@ -1617,7 +1599,7 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
     if let Some(unix_sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
         if unix_sock.is_stream_like() {
             if (flags & MSG_DONTWAIT) != 0 && !unix_sock.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
             let mut total = 0usize;
             for iv in iovs.iter() {
@@ -1634,7 +1616,7 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
                 let n = n as usize;
                 total = match total.checked_add(n) {
                     Some(v) => v,
-                    None => return EINVAL,
+                    None => return err(SyscallError::EINVAL),
                 };
                 if n < iv.len {
                     break;
@@ -1648,10 +1630,10 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
             return total as isize;
         }
         if !unix_sock.is_dgram() {
-            return EOPNOTSUPP;
+            return err(SyscallError::EOPNOTSUPP);
         }
         if (flags & MSG_DONTWAIT) != 0 && unix_sock.state.lock().dgram_queue.is_empty() {
-            return EAGAIN;
+            return err(SyscallError::EAGAIN);
         }
         let dgram = unix_sock.recv_dgram();
         let copied = match scatter_iovecs_data(&iovs, &dgram.payload) {
@@ -1694,12 +1676,12 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     match sock.kind() {
         crate::fs::NetSocketKind::TcpStream => {
             if (flags & MSG_DONTWAIT) != 0 && !sock.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
             let mut total = 0usize;
             for iv in iovs.iter() {
@@ -1717,12 +1699,12 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
                 if n > 0 {
                     let token = get_current_token();
                     if try_copy_to_user(token, iv.base as *mut u8, &kbuf[..n]).is_err() {
-                        return EFAULT;
+                        return err(SyscallError::EFAULT);
                     }
                 }
                 total = match total.checked_add(n) {
                     Some(v) => v,
-                    None => return EINVAL,
+                    None => return err(SyscallError::EINVAL),
                 };
                 if n < iv.len {
                     break;
@@ -1740,7 +1722,7 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
         }
         crate::fs::NetSocketKind::Udp => {
             if (flags & MSG_DONTWAIT) != 0 && !sock.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
             let mut kbuf = vec![0u8; total_len];
             let (n, ip, port) = match sock.udp_recv_from(&mut kbuf) {
@@ -1757,7 +1739,7 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
             }
             copied as isize
         }
-        crate::fs::NetSocketKind::TcpListener => EOPNOTSUPP,
+        crate::fs::NetSocketKind::TcpListener => err(SyscallError::EOPNOTSUPP),
     }
 }
 
@@ -1780,7 +1762,7 @@ pub fn syscall_recvmsg(fd: usize, msg: usize, flags: usize) -> isize {
     }
     let token = get_current_token();
     if try_write_user_value(token, msg as *mut MsgHdr, &msghdr).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     ret
 }
@@ -1790,14 +1772,14 @@ pub fn syscall_sendmmsg(fd: usize, msgvec: usize, vlen: usize, flags: usize) -> 
         return 0;
     }
     if msgvec == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let mut sent = 0usize;
     for i in 0..vlen {
         let token = get_current_token();
         let ptr = (msgvec + i * size_of::<MMsgHdr>()) as *const MMsgHdr;
         let Some(mmsg) = try_read_user_value::<MMsgHdr>(token, ptr) else {
-            return if sent > 0 { sent as isize } else { EFAULT };
+            return if sent > 0 { sent as isize } else { err(SyscallError::EFAULT) };
         };
         let ret = sendmsg_inner(fd, &mmsg.msg_hdr, flags);
         if ret < 0 {
@@ -1823,16 +1805,16 @@ pub fn syscall_recvmmsg(
         return 0;
     }
     if msgvec == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if timeout != 0 {
         let token = get_current_token();
         let Some(ts) = try_read_user_value::<UserTimespec>(token, timeout as *const UserTimespec)
         else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
     }
     let mut recvd = 0usize;
@@ -1840,7 +1822,7 @@ pub fn syscall_recvmmsg(
         let token = get_current_token();
         let ptr = (msgvec + i * size_of::<MMsgHdr>()) as *const MMsgHdr;
         let Some(mut mmsg) = try_read_user_value::<MMsgHdr>(token, ptr) else {
-            return if recvd > 0 { recvd as isize } else { EFAULT };
+            return if recvd > 0 { recvd as isize } else { err(SyscallError::EFAULT) };
         };
         let mut recv_flags = flags;
         if recvd > 0 && (flags & MSG_WAITFORONE) != 0 {
@@ -1868,51 +1850,51 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
     let cloexec = (socket_type & SOCK_CLOEXEC) != 0;
     let nonblock = (socket_type & SOCK_NONBLOCK) != 0;
     if !matches!(st, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW | SOCK_SEQPACKET) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let file: FileArc = match domain as u16 {
         AF_INET => match st {
             SOCK_STREAM => {
                 if protocol != 0 && protocol != 6 {
-                    return EPROTONOSUPPORT;
+                    return err(SyscallError::EPROTONOSUPPORT);
                 }
                 NetSocketFile::new_tcp()
             }
             SOCK_DGRAM => {
                 if protocol != 0 && protocol != 17 {
-                    return EPROTONOSUPPORT;
+                    return err(SyscallError::EPROTONOSUPPORT);
                 }
                 NetSocketFile::new_udp()
             }
-            SOCK_RAW | SOCK_SEQPACKET => return EPROTONOSUPPORT,
-            _ => return EINVAL,
+            SOCK_RAW | SOCK_SEQPACKET => return err(SyscallError::EPROTONOSUPPORT),
+            _ => return err(SyscallError::EINVAL),
         },
         AF_UNIX => {
             if protocol != 0 {
-                return EPROTONOSUPPORT;
+                return err(SyscallError::EPROTONOSUPPORT);
             }
             if !matches!(st, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             Arc::new(UnixSocketFile::new(st))
         }
         AF_NETLINK => {
             if !matches!(st, SOCK_RAW | SOCK_DGRAM) {
-                return EPROTONOSUPPORT;
+                return err(SyscallError::EPROTONOSUPPORT);
             }
             if protocol != 0 {
-                return EPROTONOSUPPORT;
+                return err(SyscallError::EPROTONOSUPPORT);
             }
             Arc::new(NetlinkSocketFile::new())
         }
         _ => {
-            return EAFNOSUPPORT;
+            return err(SyscallError::EAFNOSUPPORT);
         }
     };
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     let Some(fd) = inner.alloc_fd() else {
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[fd] = Some(file);
     let mut fd_flags = 0u32;
@@ -1951,7 +1933,7 @@ pub fn syscall_bind(fd: usize, addr: usize, addrlen: usize) -> isize {
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     let (ip, port) = match parse_sockaddr_in(addr, addrlen) {
         Ok(v) => v,
@@ -1960,12 +1942,12 @@ pub fn syscall_bind(fd: usize, addr: usize, addrlen: usize) -> isize {
     if ip != smoltcp::wire::Ipv4Address::UNSPECIFIED
         && ip != smoltcp::wire::Ipv4Address::new(127, 0, 0, 1)
     {
-        return EADDRNOTAVAIL;
+        return err(SyscallError::EADDRNOTAVAIL);
     }
     if port < 1024 {
         let euid = current_process().borrow_mut().euid;
         if euid != 0 {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
     }
     // 0.0.0.0 means "any"; in loopback-only setup treat as 127.0.0.1.
@@ -2001,7 +1983,7 @@ pub fn syscall_listen(fd: usize, backlog: usize) -> isize {
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     if crate::debug_config::DEBUG_NET {
         crate::println!(
@@ -2035,17 +2017,17 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
     if let Some(unix_sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
         if addr != 0 {
             if addrlen == 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let token = get_current_token();
             let Some(len) = try_read_user_value::<u32>(token, addrlen as *const u32) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             if (len as usize) < size_of::<SockAddrUn>() {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             if try_copy_to_user(token, addr as *mut u8, &[0u8]).is_err() {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
         }
         let new_sock = match unix_sock.accept_stream() {
@@ -2062,7 +2044,7 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
         let mut inherited_flags = inner.fd_flags.get(fd).copied().unwrap_or(0);
         inherited_flags &= !FD_CLOEXEC;
         let Some(newfd) = inner.alloc_fd() else {
-            return EMFILE;
+            return err(SyscallError::EMFILE);
         };
         let new_file: FileArc = new_sock;
         inner.fd_table[newfd] = Some(new_file);
@@ -2078,27 +2060,27 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     // Validate user-provided address buffer (when present) before blocking in accept().
     if addr != 0 {
         if addrlen == 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let token = get_current_token();
         let Some(len) = try_read_user_value::<u32>(token, addrlen as *const u32) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         if (len as usize) < size_of::<SockAddrIn>() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         if try_copy_to_user(token, addr as *mut u8, &[0u8]).is_err() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
     }
     match sock.kind() {
-        crate::fs::NetSocketKind::TcpStream => return EINVAL,
-        crate::fs::NetSocketKind::Udp => return EOPNOTSUPP,
+        crate::fs::NetSocketKind::TcpStream => return err(SyscallError::EINVAL),
+        crate::fs::NetSocketKind::Udp => return err(SyscallError::EOPNOTSUPP),
         crate::fs::NetSocketKind::TcpListener => {}
     }
     let new_sock = match sock.accept() {
@@ -2126,7 +2108,7 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
     let mut inherited_flags = inner.fd_flags.get(fd).copied().unwrap_or(0);
     inherited_flags &= !FD_CLOEXEC;
     let Some(newfd) = inner.alloc_fd() else {
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[newfd] = Some(new_sock);
     inner.fd_flags[newfd] = inherited_flags;
@@ -2144,7 +2126,7 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
 
 pub fn syscall_accept4(fd: usize, addr: usize, addrlen: usize, flags: usize) -> isize {
     if (flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let newfd = syscall_accept(fd, addr, addrlen);
     if newfd < 0 {
@@ -2193,7 +2175,7 @@ pub fn syscall_connect(fd: usize, addr: usize, addrlen: usize) -> isize {
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     let (ip, port) = match parse_sockaddr_in(addr, addrlen) {
         Ok(v) => v,
@@ -2243,12 +2225,12 @@ pub fn syscall_sendto(
             return crate::syscall::filesystem::syscall_write(fd, buf_ptr, len);
         }
         if !unix_sock.is_dgram() {
-            return EOPNOTSUPP;
+            return err(SyscallError::EOPNOTSUPP);
         }
         let token = get_current_token();
         let mut kbuf = alloc::vec![0u8; len];
         if try_copy_from_user(token, buf_ptr as *const u8, kbuf.as_mut_slice()).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         let target = if addr == 0 || addrlen == 0 {
             None
@@ -2280,7 +2262,7 @@ pub fn syscall_sendto(
         let token = get_current_token();
         let mut probe = [0u8; 1];
         if try_copy_from_user(token, buf_ptr as *const u8, &mut probe).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         if addr != 0 && addrlen != 0 {
             let _ = match parse_sockaddr_nl(addr, addrlen) {
@@ -2292,7 +2274,7 @@ pub fn syscall_sendto(
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     let send_flag_check = validate_send_flags(flags);
     if send_flag_check != 0 {
@@ -2304,7 +2286,7 @@ pub fn syscall_sendto(
     let token = get_current_token();
     let mut kbuf = alloc::vec![0u8; len];
     if try_copy_from_user(token, buf_ptr as *const u8, kbuf.as_mut_slice()).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let key = file_key(&file);
     match sock.kind() {
@@ -2323,7 +2305,7 @@ pub fn syscall_sendto(
         crate::fs::NetSocketKind::Udp => {
             let user_len = kbuf.len();
             if kbuf.len() > 65507 {
-                return EMSGSIZE;
+                return err(SyscallError::EMSGSIZE);
             }
             let target = if addr == 0 || addrlen == 0 {
                 None
@@ -2352,7 +2334,7 @@ pub fn syscall_sendto(
                 }
             }
         }
-        crate::fs::NetSocketKind::TcpListener => EOPNOTSUPP,
+        crate::fs::NetSocketKind::TcpListener => err(SyscallError::EOPNOTSUPP),
     }
 }
 
@@ -2388,16 +2370,16 @@ pub fn syscall_recvfrom(
             return n;
         }
         if !unix_sock.is_dgram() {
-            return EOPNOTSUPP;
+            return err(SyscallError::EOPNOTSUPP);
         }
         if (flags & MSG_DONTWAIT) != 0 && unix_sock.state.lock().dgram_queue.is_empty() {
-            return EAGAIN;
+            return err(SyscallError::EAGAIN);
         }
         let msg = unix_sock.recv_dgram();
         let n = len.min(msg.payload.len());
         let token = get_current_token();
         if try_copy_to_user(token, buf_ptr as *mut u8, &msg.payload[..n]).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         if addr != 0 && addrlen != 0 {
             let r = write_sockaddr_un(addr, addrlen, msg.from.as_ref());
@@ -2418,7 +2400,7 @@ pub fn syscall_recvfrom(
         let copied = core::cmp::min(len, packet.len());
         let token = get_current_token();
         if try_copy_to_user(token, buf_ptr as *mut u8, &packet[..copied]).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         if addr != 0 && addrlen != 0 {
             let sa = netlink_sock.local_addr();
@@ -2431,7 +2413,7 @@ pub fn syscall_recvfrom(
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     if len == 0 {
         return 0;
@@ -2440,19 +2422,19 @@ pub fn syscall_recvfrom(
         crate::fs::NetSocketKind::TcpStream => {
             if addr != 0 || addrlen != 0 {
                 if addr == 0 || addrlen == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let token = get_current_token();
                 let Some(name_len) = try_read_user_value::<u32>(token, addrlen as *const u32)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 if (name_len as usize) > i32::MAX as usize {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
             }
             if (flags & MSG_DONTWAIT) != 0 && !sock.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
             let mut kbuf = alloc::vec![0u8; len];
             let n = match sock.tcp_recv(&mut kbuf) {
@@ -2461,13 +2443,13 @@ pub fn syscall_recvfrom(
             };
             let token = get_current_token();
             if try_copy_to_user(token, buf_ptr as *mut u8, &kbuf[..n]).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             n as isize
         }
         crate::fs::NetSocketKind::Udp => {
             if (flags & MSG_DONTWAIT) != 0 && !sock.poll_readable() {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
             let mut kbuf = alloc::vec![0u8; len];
             let (n, ip, port) = match sock.udp_recv_from(&mut kbuf) {
@@ -2476,7 +2458,7 @@ pub fn syscall_recvfrom(
             };
             let token = get_current_token();
             if try_copy_to_user(token, buf_ptr as *mut u8, &kbuf[..n]).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             if addr != 0 && addrlen != 0 {
                 let r = write_sockaddr_in(addr, addrlen, ip, port);
@@ -2486,13 +2468,13 @@ pub fn syscall_recvfrom(
             }
             n as isize
         }
-        crate::fs::NetSocketKind::TcpListener => EOPNOTSUPP,
+        crate::fs::NetSocketKind::TcpListener => err(SyscallError::EOPNOTSUPP),
     }
 }
 
 pub fn syscall_getsockname(fd: usize, addr: usize, addrlen: usize) -> isize {
     if addr == 0 || addrlen == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let file = match get_file(fd) {
         Ok(f) => f,
@@ -2511,7 +2493,7 @@ pub fn syscall_getsockname(fd: usize, addr: usize, addrlen: usize) -> isize {
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     if let Some((lip, lport, _rip, _rport)) = sock.tcp_endpoints_v4() {
         return write_sockaddr_in(addr, addrlen, lip, lport);
@@ -2522,12 +2504,12 @@ pub fn syscall_getsockname(fd: usize, addr: usize, addrlen: usize) -> isize {
     if let Some((ip, port)) = sock.udp_endpoint_v4() {
         return write_sockaddr_in(addr, addrlen, ip, port);
     }
-    ENOTCONN
+    err(SyscallError::ENOTCONN)
 }
 
 pub fn syscall_getpeername(fd: usize, addr: usize, addrlen: usize) -> isize {
     if addr == 0 || addrlen == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let file = match get_file(fd) {
         Ok(f) => f,
@@ -2536,7 +2518,7 @@ pub fn syscall_getpeername(fd: usize, addr: usize, addrlen: usize) -> isize {
     if let Some(unix_sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
         let peer = unix_sock.peer_addr();
         let Some(peer) = peer else {
-            return ENOTCONN;
+            return err(SyscallError::ENOTCONN);
         };
         return write_sockaddr_un(addr, addrlen, Some(&peer));
     }
@@ -2544,11 +2526,11 @@ pub fn syscall_getpeername(fd: usize, addr: usize, addrlen: usize) -> isize {
         return write_sockaddr_un(addr, addrlen, None);
     }
     if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
-        return ENOTCONN;
+        return err(SyscallError::ENOTCONN);
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     if let Some((_lip, _lport, rip, rport)) = sock.tcp_endpoints_v4() {
         return write_sockaddr_in(addr, addrlen, rip, rport);
@@ -2556,7 +2538,7 @@ pub fn syscall_getpeername(fd: usize, addr: usize, addrlen: usize) -> isize {
     if let Some((rip, rport)) = sock.udp_peer_v4() {
         return write_sockaddr_in(addr, addrlen, rip, rport);
     }
-    ENOTCONN
+    err(SyscallError::ENOTCONN)
 }
 
 pub fn syscall_setsockopt(
@@ -2572,20 +2554,20 @@ pub fn syscall_setsockopt(
     };
     if level == SOL_SOCKET && optname == SO_ATTACH_BPF {
         if optlen < size_of::<i32>() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         if optval == 0 {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         let token = get_current_token();
         let Some(prog_fd) = try_read_user_value::<i32>(token, optval as *const i32) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         if prog_fd < 0 {
-            return EBADF;
+            return err(SyscallError::EBADF);
         }
         let Some(prog) = get_prog_clone(prog_fd as usize) else {
-            return EBADF;
+            return err(SyscallError::EBADF);
         };
         if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
             sock.attach_bpf(prog);
@@ -2596,7 +2578,7 @@ pub fn syscall_setsockopt(
                 end.attach_bpf(prog);
                 return 0;
             }
-            return ENOTSOCK;
+            return err(SyscallError::ENOTSOCK);
         }
     }
     if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
@@ -2604,18 +2586,18 @@ pub fn syscall_setsockopt(
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     if level == SOL_SOCKET {
         if optlen < size_of::<i32>() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         if optval == 0 {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         let token = get_current_token();
         let Some(v_i32) = try_read_user_value::<i32>(token, optval as *const i32) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let v = if v_i32 <= 0 { 0 } else { v_i32 as u32 };
         if crate::debug_config::DEBUG_NET && (optname == SO_SNDBUF || optname == SO_RCVBUF) {
@@ -2632,7 +2614,7 @@ pub fn syscall_setsockopt(
             SO_SNDBUF | SO_SNDBUFFORCE => sock.set_sockbuf(Some(v), None),
             SO_RCVBUF | SO_RCVBUFFORCE => sock.set_sockbuf(None, Some(v)),
             SO_OOBINLINE => {}
-            _ => return ENOPROTOOPT,
+            _ => return err(SyscallError::ENOPROTOOPT),
         }
         return 0;
     }
@@ -2647,25 +2629,25 @@ pub fn syscall_setsockopt(
                     sock.set_multicast_joined(false);
                     return 0;
                 }
-                return EADDRNOTAVAIL;
+                return err(SyscallError::EADDRNOTAVAIL);
             }
-            _ => return ENOPROTOOPT,
+            _ => return err(SyscallError::ENOPROTOOPT),
         }
     }
     if level == SOL_TCP || level == SOL_UDP {
-        return ENOPROTOOPT;
+        return err(SyscallError::ENOPROTOOPT);
     }
-    ENOPROTOOPT
+    err(SyscallError::ENOPROTOOPT)
 }
 
 fn write_sockopt_bytes(optval: usize, optlen: usize, user_len: usize, value: &[u8]) -> isize {
     let token = get_current_token();
     let copy_len = core::cmp::min(user_len, value.len());
     if copy_len > 0 && try_copy_to_user(token, optval as *mut u8, &value[..copy_len]).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if try_write_user_value(token, optlen as *mut u32, &(value.len() as u32)).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -2678,18 +2660,18 @@ pub fn syscall_getsockopt(
     optlen: usize,
 ) -> isize {
     if optval == 0 || optlen == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(user_len_u32) = try_read_user_value::<u32>(token, optlen as *const u32) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let user_len = user_len_u32 as usize;
     if user_len > i32::MAX as usize {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if user_len == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let file = match get_file(fd) {
         Ok(f) => f,
@@ -2702,7 +2684,7 @@ pub fn syscall_getsockopt(
     if let Some(unix_sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
         if level == SOL_SOCKET && optname == SO_PEERCRED {
             let Some(cred) = unix_sock.peer_cred() else {
-                return ENOTCONN;
+                return err(SyscallError::ENOTCONN);
             };
             let cred_bytes = unsafe {
                 core::slice::from_raw_parts(
@@ -2715,32 +2697,32 @@ pub fn syscall_getsockopt(
         if level == SOL_SOCKET {
             let val: u32 = match optname {
                 SO_OOBINLINE => 0,
-                _ => return EOPNOTSUPP,
+                _ => return err(SyscallError::EOPNOTSUPP),
             };
             return write_sockopt_bytes(optval, optlen, user_len, &val.to_ne_bytes());
         }
         if level == SOL_UDP {
-            return EOPNOTSUPP;
+            return err(SyscallError::EOPNOTSUPP);
         }
         if level == SOL_IP || level == SOL_TCP {
-            return ENOPROTOOPT;
+            return err(SyscallError::ENOPROTOOPT);
         }
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     let val: u32 = match level {
         SOL_SOCKET => match optname {
             SO_SNDBUF => sock.getsockopt_sndbuf(),
             SO_RCVBUF => sock.getsockopt_rcvbuf(),
             SO_OOBINLINE => 0,
-            _ => return EOPNOTSUPP,
+            _ => return err(SyscallError::EOPNOTSUPP),
         },
-        SOL_UDP => return EOPNOTSUPP,
-        SOL_IP | SOL_TCP => return ENOPROTOOPT,
-        _ => return EOPNOTSUPP,
+        SOL_UDP => return err(SyscallError::EOPNOTSUPP),
+        SOL_IP | SOL_TCP => return err(SyscallError::ENOPROTOOPT),
+        _ => return err(SyscallError::EOPNOTSUPP),
     };
     if crate::debug_config::DEBUG_NET && (optname == SO_SNDBUF || optname == SO_RCVBUF) {
         crate::println!(
@@ -2759,7 +2741,7 @@ pub fn syscall_shutdown(_fd: usize, _how: usize) -> isize {
     const SHUT_WR: usize = 1;
     const SHUT_RDWR: usize = 2;
     if _how > SHUT_RDWR {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let file = match get_file(_fd) {
         Ok(f) => f,
@@ -2773,7 +2755,7 @@ pub fn syscall_shutdown(_fd: usize, _how: usize) -> isize {
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
         Some(s) => s,
-        None => return ENOTSOCK,
+        None => return err(SyscallError::ENOTSOCK),
     };
     if sock.kind() == crate::fs::NetSocketKind::TcpStream {
         if _how == SHUT_RD || _how == SHUT_RDWR {

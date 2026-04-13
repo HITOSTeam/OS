@@ -2,6 +2,8 @@
 
 use alloc::sync::Arc;
 
+use crate::syscall::error::{SyscallError, err};
+
 use crate::debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_TIMER};
 use crate::{
     arch,
@@ -90,7 +92,7 @@ pub fn sys_waittid(tid: usize) -> i32 {
     };
     // a thread cannot wait for itself
     if self_tid == tid {
-        return -1;
+        return err(SyscallError::EPERM) as i32;
     }
 
     // Clone the waited task Arc while holding the PCB lock, then drop the PCB lock

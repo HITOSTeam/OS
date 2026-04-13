@@ -35,6 +35,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use crate::syscall::error::{SyscallError, err};
 
 // ---- Linux-like TID encoding ------------------------------------------------
 //
@@ -50,16 +51,6 @@ use core::mem::size_of;
 // (tgid << 15) occupies bits [15..29] for typical OSComp PID ranges (< 32768).
 const LINUX_TID_PID_SHIFT: usize = 15;
 
-const EPERM: isize = -1;
-const EACCES: isize = -13;
-const EFAULT: isize = -14;
-const ENOMEM: isize = -12;
-const ENAMETOOLONG: isize = -36;
-const ENOENT: isize = -2;
-const ENODEV: isize = -19;
-const ENOTDIR: isize = -20;
-const ESRCH: isize = -3;
-const EINVAL: isize = -22;
 const NGROUPS_MAX: usize = 65536;
 
 pub(crate) fn encode_linux_tid(tgid: usize, tid_index: usize) -> usize {
@@ -177,7 +168,7 @@ fn collect_ioprio_targets(
         IOPRIO_WHO_PROCESS | IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => {
             collect_priority_targets(which - 1, who)
         }
-        _ => Err(EINVAL),
+        _ => Err(err(SyscallError::EINVAL)),
     }
 }
 
@@ -189,7 +180,7 @@ fn write_name_field(dst: &mut [u8; 65], src: &[u8]) {
 
 fn read_name_from_user(name: usize, len: usize) -> Result<[u8; 65], isize> {
     if len > 64 {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let mut field = [0u8; 65];
     if len == 0 {
@@ -197,7 +188,7 @@ fn read_name_from_user(name: usize, len: usize) -> Result<[u8; 65], isize> {
     }
     let token = get_current_token();
     if try_copy_from_user(token, name as *const u8, &mut field[..len]).is_err() {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     }
     Ok(field)
 }
@@ -205,7 +196,7 @@ fn read_name_from_user(name: usize, len: usize) -> Result<[u8; 65], isize> {
 pub fn syscall_sethostname(name: usize, len: usize) -> isize {
     let process = current_process();
     if process.borrow_mut().euid != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let new_name = match read_name_from_user(name, len) {
         Ok(v) => v,
@@ -219,7 +210,7 @@ pub fn syscall_sethostname(name: usize, len: usize) -> isize {
 pub fn syscall_setdomainname(name: usize, len: usize) -> isize {
     let process = current_process();
     if process.borrow_mut().euid != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let new_name = match read_name_from_user(name, len) {
         Ok(v) => v,
@@ -246,7 +237,7 @@ pub fn syscall_personality(persona: usize) -> isize {
 
 pub fn syscall_uname(buf: usize) -> isize {
     if buf == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let mut un = UtsName {
         sysname: [0; 65],
@@ -276,14 +267,14 @@ pub fn syscall_uname(buf: usize) -> isize {
 
     let token = get_current_token();
     if try_write_user_value(token, buf as *mut UtsName, &un).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 pub fn syscall_sysinfo(info: usize) -> isize {
     if info == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
 
     let totalram = phys_mem_end().saturating_sub(phys_mem_start());
@@ -309,17 +300,17 @@ pub fn syscall_sysinfo(info: usize) -> isize {
     };
     let token = get_current_token();
     if try_write_user_value(token, info as *mut LinuxSysinfo, &sysinfo).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 pub fn syscall_ioprio_set(which: isize, who: isize, ioprio: usize) -> isize {
     if !valid_ioprio(ioprio) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if ioprio_class(ioprio) == IOPRIO_CLASS_RT && current_process().borrow_mut().euid != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
 
     let targets = match collect_ioprio_targets(which, who) {
@@ -350,10 +341,10 @@ pub fn syscall_ioprio_get(which: isize, who: isize) -> isize {
 }
 
 /// Linux-compatible gethostname behavior used by some musl paths:
-/// return ENAMETOOLONG if the provided buffer cannot hold the full name.
+/// return err(SyscallError::ENAMETOOLONG) if the provided buffer cannot hold the full name.
 pub fn syscall_gethostname(name: usize, len: usize) -> isize {
     if name == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let nodename = {
         let uts_ns = current_process().uts_namespace();
@@ -364,26 +355,26 @@ pub fn syscall_gethostname(name: usize, len: usize) -> isize {
     let token = get_current_token();
 
     if len == 0 {
-        return ENAMETOOLONG;
+        return err(SyscallError::ENAMETOOLONG);
     }
 
     if len <= host_len {
         for i in 0..len {
             if try_write_user_value(token, (name + i) as *mut u8, &nodename[i]).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
         }
-        return ENAMETOOLONG;
+        return err(SyscallError::ENAMETOOLONG);
     }
 
     for i in 0..host_len {
         if try_write_user_value(token, (name + i) as *mut u8, &nodename[i]).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     let zero: u8 = 0;
     if try_write_user_value(token, (name + host_len) as *mut u8, &zero).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -460,27 +451,27 @@ fn cap_bit(cap: usize) -> u64 {
 /// Minimal support used by LTP capability helpers.
 pub fn syscall_capget(hdrp: usize, datap: usize) -> isize {
     if hdrp == 0 || datap == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let mut hdr = match try_read_user_value(token, hdrp as *const CapUserHeader) {
         Some(v) => v,
-        None => return EFAULT,
+        None => return err(SyscallError::EFAULT),
     };
 
     let Some(n_u32s) = cap_data_u32s(hdr.version) else {
         hdr.version = LINUX_CAPABILITY_VERSION_3;
         if try_write_user_value(token, hdrp as *mut CapUserHeader, &hdr).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if hdr.pid < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     if !cap_pid_matches_current(hdr.pid) {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     }
     let (effective, permitted, inheritable) = {
         let process = current_process();
@@ -500,7 +491,7 @@ pub fn syscall_capget(hdrp: usize, datap: usize) -> isize {
         };
         let ptr = (datap + i * size_of::<CapUserData>()) as *mut CapUserData;
         if try_write_user_value(token, ptr, &data).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     0
@@ -511,27 +502,27 @@ pub fn syscall_capget(hdrp: usize, datap: usize) -> isize {
 /// Minimal support used by LTP capability helpers.
 pub fn syscall_capset(hdrp: usize, datap: usize) -> isize {
     if hdrp == 0 || datap == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let mut hdr = match try_read_user_value(token, hdrp as *const CapUserHeader) {
         Some(v) => v,
-        None => return EFAULT,
+        None => return err(SyscallError::EFAULT),
     };
 
     let Some(n_u32s) = cap_data_u32s(hdr.version) else {
         hdr.version = LINUX_CAPABILITY_VERSION_3;
         if try_write_user_value(token, hdrp as *mut CapUserHeader, &hdr).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if hdr.pid < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     if !cap_pid_matches_current(hdr.pid) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
 
     let mut payload = [CapUserData {
@@ -542,7 +533,7 @@ pub fn syscall_capset(hdrp: usize, datap: usize) -> isize {
     for i in 0..n_u32s {
         let ptr = (datap + i * size_of::<CapUserData>()) as *const CapUserData;
         let Some(data) = try_read_user_value(token, ptr) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         payload[i] = data;
     }
@@ -558,16 +549,16 @@ pub fn syscall_capset(hdrp: usize, datap: usize) -> isize {
     let process = current_process();
     let mut inner = process.borrow_mut();
     if (new_effective & !new_permitted) != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if (new_permitted & !inner.cap_permitted) != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if (new_inheritable & !inner.cap_inheritable) != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if (new_inheritable & !inner.cap_bounding) != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     inner.cap_effective = new_effective;
     inner.cap_permitted = new_permitted;
@@ -581,7 +572,7 @@ pub fn syscall_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5:
     match option {
         PR_SET_PDEATHSIG => {
             if arg2 > MAX_SIGNAL_NUM {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let process = current_process();
             let mut inner = process.borrow_mut();
@@ -590,34 +581,34 @@ pub fn syscall_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5:
         }
         PR_GET_PDEATHSIG => {
             if arg2 == 0 {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             let process = current_process();
             let sig = process.borrow_mut().pdeath_signal;
             let token = get_current_token();
             if try_write_user_value(token, arg2 as *mut i32, &sig).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             0
         }
         PR_GET_DUMPABLE => 1,
         PR_SET_DUMPABLE => {
             if arg2 > 1 {
-                EINVAL
+                err(SyscallError::EINVAL)
             } else {
                 0
             }
         }
         PR_SET_NAME => {
             if arg2 == 0 {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             let token = get_current_token();
             let mut raw = [0u8; 16];
             for (i, byte) in raw.iter_mut().enumerate() {
                 let ptr = arg2.saturating_add(i) as *const u8;
                 if try_copy_from_user(token, ptr, core::slice::from_mut(byte)).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
             }
             let mut comm = String::new();
@@ -634,7 +625,7 @@ pub fn syscall_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5:
         }
         PR_GET_NAME => {
             if arg2 == 0 {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             let process = current_process();
             let comm = process.borrow_mut().comm.clone();
@@ -644,7 +635,7 @@ pub fn syscall_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5:
             out[..n].copy_from_slice(&name[..n]);
             let token = get_current_token();
             if try_copy_to_user(token, arg2 as *mut u8, &out).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             0
         }
@@ -670,18 +661,18 @@ pub fn syscall_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5:
         }
         PR_SET_SECUREBITS => {
             if arg3 != 0 || arg4 != 0 || arg5 != 0 {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let process = current_process();
             let inner = process.borrow_mut();
             if inner.euid != 0 || (inner.cap_effective & cap_bit(CAP_SETPCAP)) == 0 {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             0
         }
         PR_CAPBSET_READ => {
             if arg2 > CAP_LAST_CAP {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let process = current_process();
             let inner = process.borrow_mut();
@@ -693,17 +684,17 @@ pub fn syscall_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5:
         }
         PR_CAPBSET_DROP => {
             if arg2 > CAP_LAST_CAP {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let process = current_process();
             let mut inner = process.borrow_mut();
             if inner.euid != 0 || (inner.cap_effective & cap_bit(CAP_SETPCAP)) == 0 {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             inner.cap_bounding &= !cap_bit(arg2);
             0
         }
-        _ => EINVAL,
+        _ => err(SyscallError::EINVAL),
     }
 }
 
@@ -720,11 +711,11 @@ pub fn syscall_unshare(flags: usize) -> isize {
     const CLONE_NEWUTS: usize = 0x0400_0000;
     let valid = CLONE_FILES | CLONE_FS | CLONE_NEWNS | CLONE_NEWUTS;
     if (flags & !valid) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let process = current_process();
     if (flags & (CLONE_NEWNS | CLONE_NEWUTS)) != 0 && process.borrow_mut().euid != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if (flags & CLONE_FILES) != 0 {
         process.unshare_files();
@@ -767,35 +758,35 @@ pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
     };
 
     let Some(ns_file) = file.as_any().downcast_ref::<NamespaceFile>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
 
     let expected = ns_file.kind().clone_flag();
     if nstype != 0 && nstype != expected {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let process = current_process();
     let mut inner = process.borrow_mut();
     if inner.euid != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
 
     match ns_file.kind() {
         NamespaceKind::Ipc => {
             if expected != CLONE_NEWIPC {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             inner.ipc_ns_id = ns_file.ns_id();
             0
         }
         NamespaceKind::Mount => {
             if expected != CLONE_NEWNS {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             drop(inner);
             let Some(namespace) = ns_file.mount_namespace() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             process.set_mount_namespace(namespace);
             0
@@ -805,7 +796,7 @@ pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
 
 pub fn syscall_reboot(_magic1: usize, _magic2: usize, _cmd: usize, _arg: usize) -> isize {
     if current_process().borrow_mut().euid != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     arch::shutdown();
 }
@@ -844,7 +835,7 @@ fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {
 /// Minimal process-group support for waitpid job-control tests.
 pub fn syscall_setpgid(pid: usize, pgid: usize) -> isize {
     if (pid as isize) < 0 || (pgid as isize) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let cur = current_process();
@@ -867,7 +858,7 @@ pub fn syscall_setpgid(pid: usize, pgid: usize) -> isize {
     };
 
     let Some(target) = target else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
 
     let cur_sid = {
@@ -885,22 +876,22 @@ pub fn syscall_setpgid(pid: usize, pgid: usize) -> isize {
     };
 
     if target_pid != cur_pid && target_did_exec {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if target_sid != cur_sid || target_is_session_leader {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
 
     if new_pgid != target_pid {
         let Some(group_leader) = pid2process(new_pgid) else {
-            return EPERM;
+            return err(SyscallError::EPERM);
         };
         let group_sid = {
             let inner = group_leader.borrow_mut();
             normalized_sid(new_pgid, inner.sid, inner.pgid)
         };
         if group_sid != target_sid {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
     }
 
@@ -919,11 +910,11 @@ pub fn syscall_getpgid(pid: usize) -> isize {
         return normalized_pgid(cur_pid, inner.pgid) as isize;
     }
     let Some(target) = pid2process(target_pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     let inner = target.borrow_mut();
     if inner.is_zombie {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     }
     normalized_pgid(target_pid, inner.pgid) as isize
 }
@@ -938,7 +929,7 @@ pub fn syscall_getsid(pid: usize) -> isize {
         return normalized_sid(cur_pid, inner.sid, inner.pgid) as isize;
     }
     let Some(target) = pid2process(target_pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     let inner = target.borrow_mut();
     normalized_sid(target_pid, inner.sid, inner.pgid) as isize
@@ -956,7 +947,7 @@ pub fn syscall_setsid() -> isize {
         for proc in map.values() {
             let inner = proc.borrow_mut();
             if normalized_pgid(proc.getpid(), inner.pgid) == pid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
         }
     }
@@ -986,14 +977,14 @@ fn collect_priority_targets(
     };
 
     if who < 0 {
-        return Err(ESRCH);
+        return Err(err(SyscallError::ESRCH));
     }
 
     match which {
         PRIO_PROCESS => {
             let target_pid = if who == 0 { caller_pid } else { who as usize };
             let Some(proc) = pid2process(target_pid) else {
-                return Err(ESRCH);
+                return Err(err(SyscallError::ESRCH));
             };
             let mut out = Vec::new();
             out.push(proc);
@@ -1013,7 +1004,7 @@ fn collect_priority_targets(
                 }
             }
             if out.is_empty() {
-                return Err(ESRCH);
+                return Err(err(SyscallError::ESRCH));
             }
             Ok(out)
         }
@@ -1031,11 +1022,11 @@ fn collect_priority_targets(
                 }
             }
             if out.is_empty() {
-                return Err(ESRCH);
+                return Err(err(SyscallError::ESRCH));
             }
             Ok(out)
         }
-        _ => Err(EINVAL),
+        _ => Err(err(SyscallError::EINVAL)),
     }
 }
 
@@ -1058,15 +1049,15 @@ pub fn syscall_setpriority(which: isize, who: isize, prio: isize) -> isize {
         };
         if caller_euid != 0 && new_nice < cur_nice {
             // libc `nice()` is often emulated by getpriority()+setpriority().
-            // Linux reports EPERM for nice(-N), while plain setpriority() keeps EACCES.
-            return if from_nice_wrapper { EPERM } else { EACCES };
+            // Linux reports err(SyscallError::EPERM) for nice(-N), while plain setpriority() keeps err(SyscallError::EACCES).
+            return if from_nice_wrapper { err(SyscallError::EPERM) } else { err(SyscallError::EACCES) };
         }
         {
             let mut inner = task.borrow_mut();
             inner.nice = new_nice;
         }
         // Keep process-level default nice in sync for newly created threads.
-        caller.borrow_mut().nice = new_nice;
+        caller.borrow_mut().scheduling.nice = new_nice;
         refresh_process_runqueues(&caller);
         return 0;
     }
@@ -1090,20 +1081,20 @@ pub fn syscall_setpriority(which: isize, who: isize, prio: isize) -> isize {
         for proc in targets.iter() {
             let (uid, cur_nice) = {
                 let inner = proc.borrow_mut();
-                (inner.uid, inner.nice)
+                (inner.uid, inner.scheduling.nice)
             };
             if uid != caller_uid && uid != caller_euid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             if new_nice < cur_nice {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
         }
     }
 
     for proc in targets {
         let mut inner = proc.borrow_mut();
-        inner.nice = new_nice;
+        inner.scheduling.nice = new_nice;
         drop(inner);
         refresh_process_runqueues(&proc);
     }
@@ -1133,7 +1124,7 @@ pub fn syscall_getpriority(which: isize, who: isize) -> isize {
     for proc in targets {
         let nice = {
             let inner = proc.borrow_mut();
-            inner.nice
+            inner.scheduling.nice
         };
         if nice < best {
             best = nice;
@@ -1185,7 +1176,7 @@ pub fn syscall_getegid() -> isize {
 /// Linux `getgroups(2)` (syscall 158 on riscv64).
 pub fn syscall_getgroups(size: isize, list: usize) -> isize {
     if size < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let size = size as usize;
     let groups = {
@@ -1198,13 +1189,13 @@ pub fn syscall_getgroups(size: isize, list: usize) -> isize {
         return ngroups as isize;
     }
     if size < ngroups {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     for (idx, gid) in groups.iter().enumerate() {
         let dst = (list + idx * size_of::<u32>()) as *mut u32;
         if try_write_user_value(token, dst, gid).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     ngroups as isize
@@ -1213,13 +1204,13 @@ pub fn syscall_getgroups(size: isize, list: usize) -> isize {
 /// Linux `setgroups(2)` (syscall 159 on riscv64).
 pub fn syscall_setgroups(size: usize, list: usize) -> isize {
     if size > NGROUPS_MAX {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     {
         let process = current_process();
         let inner = process.borrow_mut();
         if inner.euid != 0 {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
     }
     let token = get_current_token();
@@ -1227,7 +1218,7 @@ pub fn syscall_setgroups(size: usize, list: usize) -> isize {
     for idx in 0..size {
         let src = (list + idx * size_of::<u32>()) as *const u32;
         let Some(gid) = try_read_user_value(token, src) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         groups.push(gid);
     }
@@ -1297,7 +1288,7 @@ pub fn syscall_setuid(uid: usize) -> isize {
         inner.fsuid = uid;
         return 0;
     }
-    EPERM
+    err(SyscallError::EPERM)
 }
 
 /// Linux `setgid(2)` (syscall 144 on riscv64).
@@ -1318,7 +1309,7 @@ pub fn syscall_setgid(gid: usize) -> isize {
         inner.fsgid = gid;
         return 0;
     }
-    EPERM
+    err(SyscallError::EPERM)
 }
 
 /// Linux `setreuid(2)` (syscall 145 on riscv64).
@@ -1333,12 +1324,12 @@ pub fn syscall_setreuid(ruid: usize, euid: usize) -> isize {
     if inner.euid != 0 {
         if let Some(r) = new_ruid {
             if r != old_ruid && r != old_euid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
         }
         if let Some(e) = new_euid {
             if !uid_allowed(e, old_ruid, old_euid, old_suid) {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
         }
     }
@@ -1369,12 +1360,12 @@ pub fn syscall_setregid(rgid: usize, egid: usize) -> isize {
     if inner.euid != 0 {
         if let Some(r) = new_rgid {
             if r != old_rgid && r != old_egid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
         }
         if let Some(e) = new_egid {
             if !gid_allowed(e, old_rgid, old_egid, old_sgid) {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
         }
     }
@@ -1404,7 +1395,7 @@ pub fn syscall_setresuid(ruid: usize, euid: usize, suid: usize) -> isize {
         for cand in [new_ruid, new_euid, new_suid] {
             if let Some(v) = cand {
                 if !uid_allowed(v, inner.uid, inner.euid, inner.suid) {
-                    return EPERM;
+                    return err(SyscallError::EPERM);
                 }
             }
         }
@@ -1433,7 +1424,7 @@ pub fn syscall_setresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
         for cand in [new_rgid, new_egid, new_sgid] {
             if let Some(v) = cand {
                 if !gid_allowed(v, inner.gid, inner.egid, inner.sgid) {
-                    return EPERM;
+                    return err(SyscallError::EPERM);
                 }
             }
         }
@@ -1492,13 +1483,13 @@ pub fn syscall_getresuid(ruid: usize, euid: usize, suid: usize) -> isize {
     };
     let token = get_current_token();
     if ruid != 0 && try_write_user_value(token, ruid as *mut u32, &uid).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if euid != 0 && try_write_user_value(token, euid as *mut u32, &euid_v).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if suid != 0 && try_write_user_value(token, suid as *mut u32, &suid_v).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -1512,13 +1503,13 @@ pub fn syscall_getresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
     };
     let token = get_current_token();
     if rgid != 0 && try_write_user_value(token, rgid as *mut u32, &gid).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if egid != 0 && try_write_user_value(token, egid as *mut u32, &egid_v).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if sgid != 0 && try_write_user_value(token, sgid as *mut u32, &sgid_v).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -1574,14 +1565,14 @@ pub fn syscall_getrusage(who: isize, usage: usize) -> isize {
     const RUSAGE_THREAD: isize = 1;
 
     if usage == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
 
     let cpu_ns = match who {
         RUSAGE_SELF => process_cpu_time_ns(&current_process()),
         RUSAGE_THREAD => current_task_cpu_time_ns(),
         RUSAGE_CHILDREN => current_process().borrow_mut().child_cpu_time_ns,
-        _ => return EINVAL,
+        _ => return err(SyscallError::EINVAL),
     };
     let (utime, stime) = (ns_to_rusage_timeval(cpu_ns), ns_to_rusage_timeval(0));
 
@@ -1605,7 +1596,7 @@ pub fn syscall_getrusage(who: isize, usage: usize) -> isize {
     };
     let token = get_current_token();
     if try_write_user_value(token, usage as *mut RUsage64, &ru).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -1616,7 +1607,7 @@ pub fn syscall_getrusage(who: isize, usage: usize) -> isize {
 /// best-effort cleanup on thread exit.
 pub fn syscall_set_robust_list(_head: usize, _len: usize) -> isize {
     if _len != ROBUST_LIST_HEAD_LEN {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let task = current_task().unwrap();
     let mut inner = task.borrow_mut();
@@ -1630,7 +1621,7 @@ pub fn syscall_set_robust_list(_head: usize, _len: usize) -> isize {
 /// We only support querying the current thread (pid=0).
 pub fn syscall_get_robust_list(pid: usize, head_ptr: usize, len_ptr: usize) -> isize {
     if head_ptr == 0 || len_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let caller = current_process();
     let caller_pid = caller.getpid();
@@ -1643,16 +1634,16 @@ pub fn syscall_get_robust_list(pid: usize, head_ptr: usize, len_ptr: usize) -> i
         current_task().unwrap()
     } else {
         // Linux permits querying self, but querying another task without
-        // privilege should fail with EPERM.
+        // privilege should fail with err(SyscallError::EPERM).
         if caller_euid != 0 && pid != caller_pid {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         let Some(target_proc) = pid2process(pid) else {
-            return ESRCH;
+            return err(SyscallError::ESRCH);
         };
         let inner = target_proc.borrow_mut();
         let Some(task) = inner.tasks.first().and_then(|t| t.as_ref()).cloned() else {
-            return ESRCH;
+            return err(SyscallError::ESRCH);
         };
         task
     };
@@ -1663,10 +1654,10 @@ pub fn syscall_get_robust_list(pid: usize, head_ptr: usize, len_ptr: usize) -> i
     };
     let token = get_current_token();
     if try_write_user_value(token, head_ptr as *mut usize, &robust_head).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if try_write_user_value(token, len_ptr as *mut usize, &robust_len).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -1703,22 +1694,22 @@ fn rlimit_for_resource(
 ) -> Option<(u64, u64)> {
     let inner = process.borrow_mut();
     match resource {
-        RLIMIT_CPU => Some((inner.rlimit_cpu_cur, inner.rlimit_cpu_max)),
-        RLIMIT_FSIZE => Some((inner.rlimit_fsize_cur, inner.rlimit_fsize_max)),
-        RLIMIT_DATA => Some((inner.rlimit_data_cur, inner.rlimit_data_max)),
-        RLIMIT_STACK => Some((inner.rlimit_stack_cur, inner.rlimit_stack_max)),
-        RLIMIT_CORE => Some((inner.rlimit_core_cur, inner.rlimit_core_max)),
-        RLIMIT_RSS => Some((inner.rlimit_rss_cur, inner.rlimit_rss_max)),
-        RLIMIT_NPROC => Some((inner.rlimit_nproc_cur, inner.rlimit_nproc_max)),
-        RLIMIT_NOFILE => Some((inner.rlimit_nofile_cur, inner.rlimit_nofile_max)),
-        RLIMIT_MEMLOCK => Some((inner.rlimit_memlock_cur, inner.rlimit_memlock_max)),
-        RLIMIT_AS => Some((inner.rlimit_as_cur, inner.rlimit_as_max)),
-        RLIMIT_LOCKS => Some((inner.rlimit_locks_cur, inner.rlimit_locks_max)),
-        RLIMIT_SIGPENDING => Some((inner.rlimit_sigpending_cur, inner.rlimit_sigpending_max)),
-        RLIMIT_MSGQUEUE => Some((inner.rlimit_msgqueue_cur, inner.rlimit_msgqueue_max)),
-        RLIMIT_NICE => Some((inner.rlimit_nice_cur, inner.rlimit_nice_max)),
-        RLIMIT_RTPRIO => Some((inner.rlimit_rtprio_cur, inner.rlimit_rtprio_max)),
-        RLIMIT_RTTIME => Some((inner.rlimit_rttime_cur, inner.rlimit_rttime_max)),
+        RLIMIT_CPU => Some((inner.rlimits.rlimit_cpu_cur, inner.rlimits.rlimit_cpu_max)),
+        RLIMIT_FSIZE => Some((inner.rlimits.rlimit_fsize_cur, inner.rlimits.rlimit_fsize_max)),
+        RLIMIT_DATA => Some((inner.rlimits.rlimit_data_cur, inner.rlimits.rlimit_data_max)),
+        RLIMIT_STACK => Some((inner.rlimits.rlimit_stack_cur, inner.rlimits.rlimit_stack_max)),
+        RLIMIT_CORE => Some((inner.rlimits.rlimit_core_cur, inner.rlimits.rlimit_core_max)),
+        RLIMIT_RSS => Some((inner.rlimits.rlimit_rss_cur, inner.rlimits.rlimit_rss_max)),
+        RLIMIT_NPROC => Some((inner.rlimits.rlimit_nproc_cur, inner.rlimits.rlimit_nproc_max)),
+        RLIMIT_NOFILE => Some((inner.rlimits.rlimit_nofile_cur, inner.rlimits.rlimit_nofile_max)),
+        RLIMIT_MEMLOCK => Some((inner.rlimits.rlimit_memlock_cur, inner.rlimits.rlimit_memlock_max)),
+        RLIMIT_AS => Some((inner.rlimits.rlimit_as_cur, inner.rlimits.rlimit_as_max)),
+        RLIMIT_LOCKS => Some((inner.rlimits.rlimit_locks_cur, inner.rlimits.rlimit_locks_max)),
+        RLIMIT_SIGPENDING => Some((inner.rlimits.rlimit_sigpending_cur, inner.rlimits.rlimit_sigpending_max)),
+        RLIMIT_MSGQUEUE => Some((inner.rlimits.rlimit_msgqueue_cur, inner.rlimits.rlimit_msgqueue_max)),
+        RLIMIT_NICE => Some((inner.rlimits.rlimit_nice_cur, inner.rlimits.rlimit_nice_max)),
+        RLIMIT_RTPRIO => Some((inner.rlimits.rlimit_rtprio_cur, inner.rlimits.rlimit_rtprio_max)),
+        RLIMIT_RTTIME => Some((inner.rlimits.rlimit_rttime_cur, inner.rlimits.rlimit_rttime_max)),
         _ => None,
     }
 }
@@ -1731,72 +1722,72 @@ fn apply_rlimit_to_resource(
     let mut inner = process.borrow_mut();
     match resource {
         RLIMIT_CPU => {
-            inner.rlimit_cpu_cur = new.rlim_cur;
-            inner.rlimit_cpu_max = new.rlim_max;
-            inner.rlimit_cpu_start_ms = get_time_ms();
-            inner.rlimit_cpu_soft_sent = false;
+            inner.rlimits.rlimit_cpu_cur = new.rlim_cur;
+            inner.rlimits.rlimit_cpu_max = new.rlim_max;
+            inner.rlimits.rlimit_cpu_start_ms = get_time_ms();
+            inner.rlimits.rlimit_cpu_soft_sent = false;
         }
         RLIMIT_FSIZE => {
-            inner.rlimit_fsize_cur = new.rlim_cur;
-            inner.rlimit_fsize_max = new.rlim_max;
+            inner.rlimits.rlimit_fsize_cur = new.rlim_cur;
+            inner.rlimits.rlimit_fsize_max = new.rlim_max;
         }
         RLIMIT_DATA => {
-            inner.rlimit_data_cur = new.rlim_cur;
-            inner.rlimit_data_max = new.rlim_max;
+            inner.rlimits.rlimit_data_cur = new.rlim_cur;
+            inner.rlimits.rlimit_data_max = new.rlim_max;
         }
         RLIMIT_STACK => {
-            inner.rlimit_stack_cur = new.rlim_cur;
-            inner.rlimit_stack_max = new.rlim_max;
+            inner.rlimits.rlimit_stack_cur = new.rlim_cur;
+            inner.rlimits.rlimit_stack_max = new.rlim_max;
         }
         RLIMIT_CORE => {
-            inner.rlimit_core_cur = new.rlim_cur;
-            inner.rlimit_core_max = new.rlim_max;
+            inner.rlimits.rlimit_core_cur = new.rlim_cur;
+            inner.rlimits.rlimit_core_max = new.rlim_max;
         }
         RLIMIT_RSS => {
-            inner.rlimit_rss_cur = new.rlim_cur;
-            inner.rlimit_rss_max = new.rlim_max;
+            inner.rlimits.rlimit_rss_cur = new.rlim_cur;
+            inner.rlimits.rlimit_rss_max = new.rlim_max;
         }
         RLIMIT_NPROC => {
-            inner.rlimit_nproc_cur = new.rlim_cur;
-            inner.rlimit_nproc_max = new.rlim_max;
+            inner.rlimits.rlimit_nproc_cur = new.rlim_cur;
+            inner.rlimits.rlimit_nproc_max = new.rlim_max;
         }
         RLIMIT_NOFILE => {
-            inner.rlimit_nofile_cur = new.rlim_cur;
-            inner.rlimit_nofile_max = new.rlim_max;
+            inner.rlimits.rlimit_nofile_cur = new.rlim_cur;
+            inner.rlimits.rlimit_nofile_max = new.rlim_max;
         }
         RLIMIT_MEMLOCK => {
-            inner.rlimit_memlock_cur = new.rlim_cur;
-            inner.rlimit_memlock_max = new.rlim_max;
+            inner.rlimits.rlimit_memlock_cur = new.rlim_cur;
+            inner.rlimits.rlimit_memlock_max = new.rlim_max;
         }
         RLIMIT_AS => {
-            inner.rlimit_as_cur = new.rlim_cur;
-            inner.rlimit_as_max = new.rlim_max;
+            inner.rlimits.rlimit_as_cur = new.rlim_cur;
+            inner.rlimits.rlimit_as_max = new.rlim_max;
         }
         RLIMIT_LOCKS => {
-            inner.rlimit_locks_cur = new.rlim_cur;
-            inner.rlimit_locks_max = new.rlim_max;
+            inner.rlimits.rlimit_locks_cur = new.rlim_cur;
+            inner.rlimits.rlimit_locks_max = new.rlim_max;
         }
         RLIMIT_SIGPENDING => {
-            inner.rlimit_sigpending_cur = new.rlim_cur;
-            inner.rlimit_sigpending_max = new.rlim_max;
+            inner.rlimits.rlimit_sigpending_cur = new.rlim_cur;
+            inner.rlimits.rlimit_sigpending_max = new.rlim_max;
         }
         RLIMIT_MSGQUEUE => {
-            inner.rlimit_msgqueue_cur = new.rlim_cur;
-            inner.rlimit_msgqueue_max = new.rlim_max;
+            inner.rlimits.rlimit_msgqueue_cur = new.rlim_cur;
+            inner.rlimits.rlimit_msgqueue_max = new.rlim_max;
         }
         RLIMIT_NICE => {
-            inner.rlimit_nice_cur = new.rlim_cur;
-            inner.rlimit_nice_max = new.rlim_max;
+            inner.rlimits.rlimit_nice_cur = new.rlim_cur;
+            inner.rlimits.rlimit_nice_max = new.rlim_max;
         }
         RLIMIT_RTPRIO => {
-            inner.rlimit_rtprio_cur = new.rlim_cur;
-            inner.rlimit_rtprio_max = new.rlim_max;
+            inner.rlimits.rlimit_rtprio_cur = new.rlim_cur;
+            inner.rlimits.rlimit_rtprio_max = new.rlim_max;
         }
         RLIMIT_RTTIME => {
-            inner.rlimit_rttime_cur = new.rlim_cur;
-            inner.rlimit_rttime_max = new.rlim_max;
+            inner.rlimits.rlimit_rttime_cur = new.rlim_cur;
+            inner.rlimits.rlimit_rttime_max = new.rlim_max;
         }
-        _ => return EINVAL,
+        _ => return err(SyscallError::EINVAL),
     }
     0
 }
@@ -1808,19 +1799,19 @@ fn set_rlimit_checked(
     caller_euid: u32,
 ) -> isize {
     if new.rlim_cur > new.rlim_max {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some((_, old_max)) = rlimit_for_resource(process, resource) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if caller_euid != 0 && new.rlim_max > old_max {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if resource == RLIMIT_NOFILE && new.rlim_max > FS_NR_OPEN {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if resource == RLIMIT_NOFILE && new.rlim_cur > FS_NR_OPEN {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     apply_rlimit_to_resource(process, resource, new)
 }
@@ -1840,10 +1831,10 @@ pub fn syscall_prlimit64(pid: usize, resource: usize, new_limit: usize, old_limi
         caller.clone()
     } else {
         if caller_euid != 0 {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         let Some(p) = pid2process(pid) else {
-            return ESRCH;
+            return err(SyscallError::ESRCH);
         };
         p
     };
@@ -1851,7 +1842,7 @@ pub fn syscall_prlimit64(pid: usize, resource: usize, new_limit: usize, old_limi
     if new_limit != 0 {
         let token = get_current_token();
         let Some(new) = try_read_user_value(token, new_limit as *const RLimit64) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let ret = set_rlimit_checked(&target, resource, new, caller_euid);
         if ret != 0 {
@@ -1860,12 +1851,12 @@ pub fn syscall_prlimit64(pid: usize, resource: usize, new_limit: usize, old_limi
     }
     if old_limit != 0 {
         let Some((rlim_cur, rlim_max)) = rlimit_for_resource(&target, resource) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         let token = get_current_token();
         let rl = RLimit64 { rlim_cur, rlim_max };
         if try_write_user_value(token, old_limit as *mut RLimit64, &rl).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     0
@@ -1874,16 +1865,16 @@ pub fn syscall_prlimit64(pid: usize, resource: usize, new_limit: usize, old_limi
 /// Linux `getrlimit(2)` (syscall 163 on riscv64).
 pub fn syscall_getrlimit(resource: usize, rlim: usize) -> isize {
     if rlim == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let process = current_process();
     let Some((rlim_cur, rlim_max)) = rlimit_for_resource(&process, resource) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let token = get_current_token();
     let rl = RLimit64 { rlim_cur, rlim_max };
     if try_write_user_value(token, rlim as *mut RLimit64, &rl).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -1891,11 +1882,11 @@ pub fn syscall_getrlimit(resource: usize, rlim: usize) -> isize {
 /// Linux `setrlimit(2)` (syscall 164 on riscv64).
 pub fn syscall_setrlimit(resource: usize, rlim: usize) -> isize {
     if rlim == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(new) = try_read_user_value(token, rlim as *const RLimit64) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let process = current_process();
     let caller_euid = {
@@ -1918,20 +1909,20 @@ pub fn check_current_rlimit_cpu() {
     let mut send_hard = false;
     {
         let mut inner = process.borrow_mut();
-        let soft = inner.rlimit_cpu_cur;
-        let hard = inner.rlimit_cpu_max;
+        let soft = inner.rlimits.rlimit_cpu_cur;
+        let hard = inner.rlimits.rlimit_cpu_max;
         if soft == RLIM_INFINITY && hard == RLIM_INFINITY {
             return;
         }
-        let elapsed_sec = (now_ms.saturating_sub(inner.rlimit_cpu_start_ms) / 1000) as u64;
-        if soft != RLIM_INFINITY && elapsed_sec >= soft && !inner.rlimit_cpu_soft_sent {
-            inner.rlimit_cpu_soft_sent = true;
+        let elapsed_sec = (now_ms.saturating_sub(inner.rlimits.rlimit_cpu_start_ms) / 1000) as u64;
+        if soft != RLIM_INFINITY && elapsed_sec >= soft && !inner.rlimits.rlimit_cpu_soft_sent {
+            inner.rlimits.rlimit_cpu_soft_sent = true;
             send_soft = true;
         } else if hard != RLIM_INFINITY && elapsed_sec >= hard {
-            if soft != RLIM_INFINITY && !inner.rlimit_cpu_soft_sent {
+            if soft != RLIM_INFINITY && !inner.rlimits.rlimit_cpu_soft_sent {
                 // If we reached hard limit before ever observing soft limit, queue
                 // SIGXCPU first and let the next tick deliver SIGKILL.
-                inner.rlimit_cpu_soft_sent = true;
+                inner.rlimits.rlimit_cpu_soft_sent = true;
                 send_soft = true;
             } else {
                 send_hard = true;
@@ -1954,13 +1945,13 @@ pub fn syscall_getrandom(buf: usize, len: usize, _flags: u32) -> isize {
     const GRND_RANDOM: u32 = 0x0002;
 
     if (_flags & !(GRND_NONBLOCK | GRND_RANDOM)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
     }
     if buf == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
 
     let token = get_current_token();
@@ -1977,7 +1968,7 @@ pub fn syscall_getrandom(buf: usize, len: usize, _flags: u32) -> isize {
         seed = x;
         let byte = (x & 0xff) as u8;
         if try_write_user_value(token, (buf + i) as *mut u8, &byte).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     len as isize
@@ -2054,7 +2045,7 @@ fn ppoll_write_back(token: usize, fds_ptr: usize, pfds: &[PollFd]) -> Result<(),
     for (i, pfd) in pfds.iter().enumerate() {
         let pfd_ptr = (fds_ptr + i * size_of::<PollFd>()) as *mut PollFd;
         if try_write_user_value(token, pfd_ptr, pfd).is_err() {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         }
     }
     Ok(())
@@ -2073,13 +2064,13 @@ pub fn syscall_ppoll(
 ) -> isize {
     const EINTR: isize = -4;
     if (nfds as isize) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if nfds > i32::MAX as usize {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if nfds > 0 && fds_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
 
     let token = get_current_token();
@@ -2089,10 +2080,10 @@ pub fn syscall_ppoll(
     } else {
         let Some(ts) = try_read_user_value::<PollTimeSpec>(token, _tmo_p as *const PollTimeSpec)
         else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let Some(delta_ns) = ppoll_timespec_to_ns(ts) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         Some(ppoll_now_ns().saturating_add(delta_ns))
     };
@@ -2101,10 +2092,10 @@ pub fn syscall_ppoll(
     let mut restore_mask = None;
     if _sigmask != 0 {
         if _sigsetsize < size_of::<u64>() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let Some(mut new_mask) = try_read_user_value::<u64>(token, _sigmask as *const u64) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let sigkill_bit = signal_bit(SIGKILL_NUM).unwrap_or(0);
         let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
@@ -2126,7 +2117,7 @@ pub fn syscall_ppoll(
                 let mut inner = task.borrow_mut();
                 inner.signal_mask = old_mask;
             }
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         pfd.revents = 0;
         pfds.push(pfd);
@@ -2213,7 +2204,7 @@ pub fn syscall_ppoll(
                 let mut inner = task.borrow_mut();
                 inner.signal_mask = old_mask;
             }
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
 
@@ -2249,8 +2240,6 @@ pub fn syscall_umask(mask: usize) -> isize {
 pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const EBADF: isize = -9;
     const ENOTTY: isize = -25;
-    const EFAULT: isize = -14;
-    const EINVAL: isize = -22;
     const TCGETS: usize = 0x5401;
     const TCSETS: usize = 0x5402;
     const TCSETSW: usize = 0x5403;
@@ -2318,75 +2307,75 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         match request {
             UFFDIO_API => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(mut api) =
                     try_read_user_value::<UffdioApi>(token, _argp as *const UffdioApi)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 if api.api != UFFD_API {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 api.features = 0;
                 api.ioctls = uffd.enable_api();
                 if try_write_user_value(token, _argp as *mut UffdioApi, &api).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             UFFDIO_REGISTER => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(mut reg) =
                     try_read_user_value::<UffdioRegister>(token, _argp as *const UffdioRegister)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 if reg.mode != UFFDIO_REGISTER_MODE_MISSING {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 let Ok(ioctls) = uffd.register_missing(
                     reg.range.start as usize,
                     reg.range.len as usize,
                     reg.mode,
                 ) else {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 };
                 reg.ioctls = ioctls;
                 if try_write_user_value(token, _argp as *mut UffdioRegister, &reg).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             UFFDIO_COPY => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(mut copy) =
                     try_read_user_value::<UffdioCopy>(token, _argp as *const UffdioCopy)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 let len = copy.len as usize;
                 if len == 0 {
                     copy.copy = 0;
                     if try_write_user_value(token, _argp as *mut UffdioCopy, &copy).is_err() {
-                        return EFAULT;
+                        return err(SyscallError::EFAULT);
                     }
                     return 0;
                 }
                 if len % PAGE_SIZE != 0 {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 const UFFDIO_COPY_MAX_LEN: usize = 64 * 1024 * 1024;
                 if len > UFFDIO_COPY_MAX_LEN {
-                    return ENOMEM;
+                    return err(SyscallError::ENOMEM);
                 }
                 let mut data = alloc::vec![0u8; len];
                 if try_copy_from_user(token, copy.src as *const u8, &mut data).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 {
                     let process = current_process();
@@ -2406,19 +2395,19 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                         if !mapped {
                             match inner.memory_set.resolve_lazy_fault(page, MapPermission::W) {
                                 crate::mm::LazyFaultResult::Resolved => {}
-                                crate::mm::LazyFaultResult::Oom => return ENOMEM,
-                                crate::mm::LazyFaultResult::Invalid => return EFAULT,
+                                crate::mm::LazyFaultResult::Oom => return err(SyscallError::ENOMEM),
+                                crate::mm::LazyFaultResult::Invalid => return err(SyscallError::EFAULT),
                             }
                         }
                         page += PAGE_SIZE;
                     }
                 }
                 if try_copy_to_user(token, copy.dst as *mut u8, &data).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 copy.copy = len as i64;
                 if try_write_user_value(token, _argp as *mut UffdioCopy, &copy).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 uffd.finish_copy(
                     copy.dst as usize,
@@ -2435,44 +2424,44 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         match request {
             TCGETS => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let termios = tty.termios();
                 if try_write_user_value(token, _argp as *mut LinuxTermios, &termios).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             TCSETS | TCSETSW | TCSETSF => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(termios) =
                     try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 tty.set_termios(termios);
                 return 0;
             }
             TCGETA => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let termio = tty.termio();
                 if try_write_user_value(token, _argp as *mut LinuxTermio, &termio).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             TCSETA | TCSETAW | TCSETAF => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(termio) =
                     try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 tty.set_termio(termio);
                 return 0;
@@ -2482,7 +2471,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 return if queue_sel == 0 || queue_sel == 1 || queue_sel == 2 {
                     0
                 } else {
-                    EINVAL
+                    err(SyscallError::EINVAL)
                 };
             }
             _ => return ENOTTY,
@@ -2493,44 +2482,44 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         match request {
             TCGETS => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let termios = pty.termios();
                 if try_write_user_value(token, _argp as *mut LinuxTermios, &termios).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             TCSETS | TCSETSW | TCSETSF => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(termios) =
                     try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 pty.set_termios(termios);
                 return 0;
             }
             TCGETA => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let termio = pty.termio();
                 if try_write_user_value(token, _argp as *mut LinuxTermio, &termio).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             TCSETA | TCSETAW | TCSETAF => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(termio) =
                     try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 pty.set_termio(termio);
                 return 0;
@@ -2540,26 +2529,26 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 return if queue_sel == 0 || queue_sel == 1 || queue_sel == 2 {
                     0
                 } else {
-                    EINVAL
+                    err(SyscallError::EINVAL)
                 };
             }
             TIOCGPTN => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let index = pty.pty_index();
                 if try_write_user_value(token, _argp as *mut u32, &index).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             TIOCSPTLCK => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(lock_value) = try_read_user_value::<i32>(token, _argp as *const i32)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 pty.set_locked(lock_value != 0);
                 return 0;
@@ -2572,44 +2561,44 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         match request {
             TCGETS => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let termios = pty.termios();
                 if try_write_user_value(token, _argp as *mut LinuxTermios, &termios).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             TCSETS | TCSETSW | TCSETSF => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(termios) =
                     try_read_user_value::<LinuxTermios>(token, _argp as *const LinuxTermios)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 pty.set_termios(termios);
                 return 0;
             }
             TCGETA => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let termio = pty.termio();
                 if try_write_user_value(token, _argp as *mut LinuxTermio, &termio).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             TCSETA | TCSETAW | TCSETAF => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(termio) =
                     try_read_user_value::<LinuxTermio>(token, _argp as *const LinuxTermio)
                 else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 pty.set_termio(termio);
                 return 0;
@@ -2619,7 +2608,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 return if queue_sel == 0 || queue_sel == 1 || queue_sel == 2 {
                     0
                 } else {
-                    EINVAL
+                    err(SyscallError::EINVAL)
                 };
             }
             _ => return ENOTTY,
@@ -2628,13 +2617,13 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
 
     if request == FIONREAD {
         if _argp == 0 {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         if let Some(pipe) = file.as_any().downcast_ref::<crate::fs::Pipe>() {
             // Linux reports unread bytes for both read and write pipe fds.
             let readable = pipe.queued_bytes() as i32;
             if try_write_user_value(token, _argp as *mut i32, &readable).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             return 0;
         }
@@ -2643,11 +2632,11 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     if let Some(pseudo) = file.as_any().downcast_ref::<crate::fs::PseudoFile>() {
         if request == RNDGETENTCNT && pseudo.kind_tag() == PseudoKindTag::Urandom {
             if _argp == 0 {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             let entropy: i32 = 256;
             if try_write_user_value(token, _argp as *mut i32, &entropy).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             return 0;
         }
@@ -2658,20 +2647,20 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         match request {
             FS_IOC_GETFLAGS => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let flags = crate::syscall::filesystem::inode_fs_flags(ino) as i32;
                 if try_write_user_value(token, _argp as *mut i32, &flags).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             FS_IOC_SETFLAGS => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(raw_flags) = try_read_user_value(token, _argp as *const i32) else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 let allowed = (raw_flags as u32) & (FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL);
                 crate::syscall::filesystem::set_inode_fs_flags(ino, allowed);
@@ -2705,24 +2694,24 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         return match request {
             SIOCATMARK => {
                 if _argp == 0 {
-                    EFAULT
+                    err(SyscallError::EFAULT)
                 } else if sock.kind() == crate::fs::NetSocketKind::Udp {
                     ENOTTY
                 } else if try_write_user_value(token, _argp as *mut i32, &0i32).is_err() {
-                    EFAULT
+                    err(SyscallError::EFAULT)
                 } else {
                     0
                 }
             }
             SIOCGIFCONF => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(mut ifc) = try_read_user_value(token, _argp as *const Ifconf) else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 if ifc.ifc_buf == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let mut ifr_name = [0u8; 16];
                 ifr_name[0] = b'l';
@@ -2739,24 +2728,24 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 };
                 if (ifc.ifc_len as usize) >= size_of::<IfreqAddr>() {
                     if try_write_user_value(token, ifc.ifc_buf as *mut IfreqAddr, &ifr).is_err() {
-                        return EFAULT;
+                        return err(SyscallError::EFAULT);
                     }
                     ifc.ifc_len = size_of::<IfreqAddr>() as i32;
                 } else {
                     ifc.ifc_len = 0;
                 }
                 if try_write_user_value(token, _argp as *mut Ifconf, &ifc).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 0
             }
             SIOCGIFFLAGS => {
                 if _argp == 0 {
-                    EFAULT
+                    err(SyscallError::EFAULT)
                 } else {
                     let flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
                     if try_write_user_value(token, (_argp + 16) as *mut i16, &flags).is_err() {
-                        EFAULT
+                        err(SyscallError::EFAULT)
                     } else {
                         0
                     }
@@ -2764,7 +2753,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
             }
             SIOCSIFFLAGS => {
                 if _argp == 0 {
-                    EFAULT
+                    err(SyscallError::EFAULT)
                 } else {
                     0
                 }
@@ -2782,31 +2771,31 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         match request {
             BLKROGET => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let ro: i32 = if pseudo_block_is_read_only() { 1 } else { 0 };
                 if try_write_user_value(token, _argp as *mut i32, &ro).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             BLKROSET => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let Some(ro) = try_read_user_value::<i32>(token, _argp as *const i32) else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 pseudo_block_set_read_only(ro != 0);
                 return 0;
             }
             BLKRAGET => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let ra = pseudo_block_read_ahead() as usize;
                 if try_write_user_value(token, _argp as *mut usize, &ra).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
@@ -2816,43 +2805,43 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
             }
             BLKGETSIZE64 | BLKGETSIZE64_COMPAT => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 if try_write_user_value(token, _argp as *mut u64, &PSEUDO_ROOT_DEV_BYTES).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             BLKGETSIZE => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 let sectors: usize =
                     (PSEUDO_ROOT_DEV_BYTES / PSEUDO_ROOT_DEV_SECTOR_SIZE as u64) as usize;
                 if try_write_user_value(token, _argp as *mut usize, &sectors).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             BLKSSZGET => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 if try_write_user_value(token, _argp as *mut u32, &PSEUDO_ROOT_DEV_SECTOR_SIZE)
                     .is_err()
                 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
             BLKPBSZGET => {
                 if _argp == 0 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 if try_write_user_value(token, _argp as *mut u32, &PSEUDO_ROOT_DEV_PHYS_BLOCK_SIZE)
                     .is_err()
                 {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 return 0;
             }
@@ -2907,7 +2896,6 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
 /// Busybox `dmesg` calls this. We don't maintain a kernel log buffer for userspace;
 /// return success and (for read requests) an empty buffer.
 pub fn syscall_syslog(_type: usize, bufp: usize, len: usize) -> isize {
-    const EINVAL: isize = -22;
 
     // `klogctl` actions (Linux uapi).
     const SYSLOG_ACTION_READ: usize = 2;
@@ -2928,7 +2916,7 @@ pub fn syscall_syslog(_type: usize, bufp: usize, len: usize) -> isize {
     }
 
     if bufp == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if len == 0 {
         return 0;
@@ -2937,7 +2925,7 @@ pub fn syscall_syslog(_type: usize, bufp: usize, len: usize) -> isize {
     let data = match _type {
         SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL => crate::klog::snapshot(len),
         SYSLOG_ACTION_READ_CLEAR => crate::klog::snapshot_and_clear(len),
-        _ => return EINVAL,
+        _ => return err(SyscallError::EINVAL),
     };
 
     let token = get_current_token();

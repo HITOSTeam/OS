@@ -827,6 +827,65 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
         }
     }
 }
+/// All POSIX resource limits (`getrlimit`/`setrlimit`) plus CPU-limit tracking state.
+#[derive(Clone)]
+pub struct ProcessResourceLimits {
+    pub rlimit_nofile_cur: u64,
+    pub rlimit_nofile_max: u64,
+    pub rlimit_nproc_cur: u64,
+    pub rlimit_nproc_max: u64,
+    pub rlimit_fsize_cur: u64,
+    pub rlimit_fsize_max: u64,
+    pub rlimit_data_cur: u64,
+    pub rlimit_data_max: u64,
+    pub rlimit_stack_cur: u64,
+    pub rlimit_stack_max: u64,
+    pub rlimit_cpu_cur: u64,
+    pub rlimit_cpu_max: u64,
+    /// Wall-clock ms at which the current RLIMIT_CPU interval started.
+    pub rlimit_cpu_start_ms: usize,
+    /// True after SIGXCPU has been sent for the soft CPU limit.
+    pub rlimit_cpu_soft_sent: bool,
+    pub rlimit_core_cur: u64,
+    pub rlimit_core_max: u64,
+    pub rlimit_rss_cur: u64,
+    pub rlimit_rss_max: u64,
+    pub rlimit_memlock_cur: u64,
+    pub rlimit_memlock_max: u64,
+    pub rlimit_as_cur: u64,
+    pub rlimit_as_max: u64,
+    pub rlimit_locks_cur: u64,
+    pub rlimit_locks_max: u64,
+    pub rlimit_msgqueue_cur: u64,
+    pub rlimit_msgqueue_max: u64,
+    pub rlimit_nice_cur: u64,
+    pub rlimit_nice_max: u64,
+    pub rlimit_rtprio_cur: u64,
+    pub rlimit_rtprio_max: u64,
+    pub rlimit_sigpending_cur: u64,
+    pub rlimit_sigpending_max: u64,
+    pub rlimit_rttime_cur: u64,
+    pub rlimit_rttime_max: u64,
+}
+
+/// Linux-like scheduler parameters: policy, RT priority, deadline attrs, nice, affinity.
+#[derive(Clone)]
+pub struct ProcessScheduling {
+    pub sched_policy: i32,
+    /// Process-wide CPU affinity mask used by `sched_*affinity` and `getcpu`.
+    pub cpu_affinity_mask: usize,
+    pub sched_priority: i32,
+    pub sched_runtime: u64,
+    pub sched_deadline: u64,
+    pub sched_period: u64,
+    /// POSIX nice value used by getpriority/setpriority.
+    pub nice: i32,
+}
+
+// TODO(credentials): ProcessCredentials (uid/euid/suid/fsuid, gid/egid/sgid/fsgid,
+// supplementary_gids, cap_*, securebits) has 200+ external access sites; defer to a
+// later refactoring pass once the access patterns are stabilised.
+
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
@@ -904,56 +963,8 @@ pub struct ProcessControlBlockInner {
     /// When set, file-descriptor operations are delegated to this owner process
     /// (Linux CLONE_FILES-style shared file table).
     pub files_owner: Option<Weak<ProcessControlBlock>>,
-    /// Per-process RLIMIT_NOFILE (soft/hard).
-    pub rlimit_nofile_cur: u64,
-    pub rlimit_nofile_max: u64,
-    /// Per-process RLIMIT_NPROC (soft/hard).
-    pub rlimit_nproc_cur: u64,
-    pub rlimit_nproc_max: u64,
-    /// Per-process RLIMIT_FSIZE (soft/hard).
-    pub rlimit_fsize_cur: u64,
-    pub rlimit_fsize_max: u64,
-    /// Per-process RLIMIT_DATA (soft/hard).
-    pub rlimit_data_cur: u64,
-    pub rlimit_data_max: u64,
-    /// Per-process RLIMIT_STACK (soft/hard).
-    pub rlimit_stack_cur: u64,
-    pub rlimit_stack_max: u64,
-    /// Per-process RLIMIT_CPU (seconds, soft/hard).
-    pub rlimit_cpu_cur: u64,
-    pub rlimit_cpu_max: u64,
-    pub rlimit_cpu_start_ms: usize,
-    pub rlimit_cpu_soft_sent: bool,
-    /// Per-process RLIMIT_CORE (soft/hard).
-    pub rlimit_core_cur: u64,
-    pub rlimit_core_max: u64,
-    /// Per-process RLIMIT_RSS (soft/hard).
-    pub rlimit_rss_cur: u64,
-    pub rlimit_rss_max: u64,
-    /// Per-process RLIMIT_MEMLOCK (soft/hard).
-    pub rlimit_memlock_cur: u64,
-    pub rlimit_memlock_max: u64,
-    /// Per-process RLIMIT_AS (soft/hard).
-    pub rlimit_as_cur: u64,
-    pub rlimit_as_max: u64,
-    /// Per-process RLIMIT_LOCKS (soft/hard).
-    pub rlimit_locks_cur: u64,
-    pub rlimit_locks_max: u64,
-    /// Per-process RLIMIT_MSGQUEUE (soft/hard).
-    pub rlimit_msgqueue_cur: u64,
-    pub rlimit_msgqueue_max: u64,
-    /// Per-process RLIMIT_NICE (soft/hard).
-    pub rlimit_nice_cur: u64,
-    pub rlimit_nice_max: u64,
-    /// Per-process RLIMIT_RTPRIO (soft/hard).
-    pub rlimit_rtprio_cur: u64,
-    pub rlimit_rtprio_max: u64,
-    /// Per-process RLIMIT_SIGPENDING (soft/hard).
-    pub rlimit_sigpending_cur: u64,
-    pub rlimit_sigpending_max: u64,
-    /// Per-process RLIMIT_RTTIME (soft/hard).
-    pub rlimit_rttime_cur: u64,
-    pub rlimit_rttime_max: u64,
+    /// All POSIX resource limits.
+    pub rlimits: ProcessResourceLimits,
     /// Process root directory (host-absolute path), used for `chroot`.
     pub root: String,
     pub cwd: String,
@@ -990,15 +1001,7 @@ pub struct ProcessControlBlockInner {
     /// Linux rt_sigaction handlers indexed by signal number.
     pub rt_sig_handlers: Vec<RtSigAction>,
     /// Linux-like scheduler state used by rt-tests (cyclictest/hackbench).
-    pub sched_policy: i32,
-    /// Process-wide CPU affinity mask used by `sched_*affinity` and `getcpu`.
-    pub cpu_affinity_mask: usize,
-    pub sched_priority: i32,
-    pub sched_runtime: u64,
-    pub sched_deadline: u64,
-    pub sched_period: u64,
-    /// POSIX nice value used by getpriority/setpriority.
-    pub nice: i32,
+    pub scheduling: ProcessScheduling,
     // TaskControlBlock实际上现在是线程
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     // 进程控制块 有一个分配 线程ID的分配器
@@ -1092,7 +1095,7 @@ impl ProcessControlBlockInner {
     }
 
     pub fn alloc_fd(&mut self) -> Option<usize> {
-        let limit = self.rlimit_nofile_cur as usize;
+        let limit = self.rlimits.rlimit_nofile_cur as usize;
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
             if fd >= limit {
                 return None;
@@ -1384,40 +1387,42 @@ impl ProcessControlBlock {
                 ],
                 fd_flags: vec![0; 3],
                 files_owner: None,
-                rlimit_nofile_cur: 1024,
-                rlimit_nofile_max: 1024,
-                rlimit_nproc_cur: u64::MAX,
-                rlimit_nproc_max: u64::MAX,
-                rlimit_fsize_cur: u64::MAX,
-                rlimit_fsize_max: u64::MAX,
-                rlimit_data_cur: u64::MAX,
-                rlimit_data_max: u64::MAX,
-                rlimit_stack_cur: 1 * 1024 * 1024,
-                rlimit_stack_max: 1 * 1024 * 1024,
-                rlimit_cpu_cur: u64::MAX,
-                rlimit_cpu_max: u64::MAX,
-                rlimit_cpu_start_ms: crate::time::get_time_ms(),
-                rlimit_cpu_soft_sent: false,
-                rlimit_core_cur: 8 * 1024 * 1024,
-                rlimit_core_max: 8 * 1024 * 1024,
-                rlimit_rss_cur: u64::MAX,
-                rlimit_rss_max: u64::MAX,
-                rlimit_memlock_cur: 64 * 1024,
-                rlimit_memlock_max: 64 * 1024,
-                rlimit_as_cur: u64::MAX,
-                rlimit_as_max: u64::MAX,
-                rlimit_locks_cur: u64::MAX,
-                rlimit_locks_max: u64::MAX,
-                rlimit_msgqueue_cur: 819_200,
-                rlimit_msgqueue_max: 819_200,
-                rlimit_nice_cur: 0,
-                rlimit_nice_max: 0,
-                rlimit_rtprio_cur: 0,
-                rlimit_rtprio_max: 0,
-                rlimit_sigpending_cur: u64::MAX,
-                rlimit_sigpending_max: u64::MAX,
-                rlimit_rttime_cur: u64::MAX,
-                rlimit_rttime_max: u64::MAX,
+                rlimits: ProcessResourceLimits {
+                    rlimit_nofile_cur: 1024,
+                    rlimit_nofile_max: 1024,
+                    rlimit_nproc_cur: u64::MAX,
+                    rlimit_nproc_max: u64::MAX,
+                    rlimit_fsize_cur: u64::MAX,
+                    rlimit_fsize_max: u64::MAX,
+                    rlimit_data_cur: u64::MAX,
+                    rlimit_data_max: u64::MAX,
+                    rlimit_stack_cur: 1 * 1024 * 1024,
+                    rlimit_stack_max: 1 * 1024 * 1024,
+                    rlimit_cpu_cur: u64::MAX,
+                    rlimit_cpu_max: u64::MAX,
+                    rlimit_cpu_start_ms: crate::time::get_time_ms(),
+                    rlimit_cpu_soft_sent: false,
+                    rlimit_core_cur: 8 * 1024 * 1024,
+                    rlimit_core_max: 8 * 1024 * 1024,
+                    rlimit_rss_cur: u64::MAX,
+                    rlimit_rss_max: u64::MAX,
+                    rlimit_memlock_cur: 64 * 1024,
+                    rlimit_memlock_max: 64 * 1024,
+                    rlimit_as_cur: u64::MAX,
+                    rlimit_as_max: u64::MAX,
+                    rlimit_locks_cur: u64::MAX,
+                    rlimit_locks_max: u64::MAX,
+                    rlimit_msgqueue_cur: 819_200,
+                    rlimit_msgqueue_max: 819_200,
+                    rlimit_nice_cur: 0,
+                    rlimit_nice_max: 0,
+                    rlimit_rtprio_cur: 0,
+                    rlimit_rtprio_max: 0,
+                    rlimit_sigpending_cur: u64::MAX,
+                    rlimit_sigpending_max: u64::MAX,
+                    rlimit_rttime_cur: u64::MAX,
+                    rlimit_rttime_max: u64::MAX,
+                },
                 root: String::from("/"),
                 cwd: String::from("/user"),
                 heap_start,
@@ -1442,17 +1447,19 @@ impl ProcessControlBlock {
                 signals_masks: SignalFlags::empty(),
                 handling_signal: -1,
                 rt_sig_handlers: vec![RtSigAction::default(); RT_SIG_MAX + 1],
-                sched_policy: 0,
-                cpu_affinity_mask: if MAX_HARTS >= usize::BITS as usize {
-                    usize::MAX
-                } else {
-                    (1usize << MAX_HARTS) - 1
+                scheduling: ProcessScheduling {
+                    sched_policy: 0,
+                    cpu_affinity_mask: if MAX_HARTS >= usize::BITS as usize {
+                        usize::MAX
+                    } else {
+                        (1usize << MAX_HARTS) - 1
+                    },
+                    sched_priority: 0,
+                    sched_runtime: 0,
+                    sched_deadline: 0,
+                    sched_period: 0,
+                    nice: 0,
                 },
-                sched_priority: 0,
-                sched_runtime: 0,
-                sched_deadline: 0,
-                sched_period: 0,
-                nice: 0,
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),
@@ -1748,12 +1755,12 @@ impl ProcessControlBlock {
                 thread_count
             );
         }
-        let sched_policy = parent.sched_policy;
-        let sched_priority = parent.sched_priority;
-        let sched_runtime = parent.sched_runtime;
-        let sched_deadline = parent.sched_deadline;
-        let sched_period = parent.sched_period;
-        let nice = parent.nice;
+        let sched_policy = parent.scheduling.sched_policy;
+        let sched_priority = parent.scheduling.sched_priority;
+        let sched_runtime = parent.scheduling.sched_runtime;
+        let sched_deadline = parent.scheduling.sched_deadline;
+        let sched_period = parent.scheduling.sched_period;
+        let nice = parent.scheduling.nice;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.sysv_shm_attaches.clone();
@@ -1892,40 +1899,7 @@ impl ProcessControlBlock {
                 fd_table: new_fd_table,
                 fd_flags: new_fd_flags,
                 files_owner: child_files_owner,
-                rlimit_nofile_cur: parent.rlimit_nofile_cur,
-                rlimit_nofile_max: parent.rlimit_nofile_max,
-                rlimit_nproc_cur: parent.rlimit_nproc_cur,
-                rlimit_nproc_max: parent.rlimit_nproc_max,
-                rlimit_fsize_cur: parent.rlimit_fsize_cur,
-                rlimit_fsize_max: parent.rlimit_fsize_max,
-                rlimit_data_cur: parent.rlimit_data_cur,
-                rlimit_data_max: parent.rlimit_data_max,
-                rlimit_stack_cur: parent.rlimit_stack_cur,
-                rlimit_stack_max: parent.rlimit_stack_max,
-                rlimit_cpu_cur: parent.rlimit_cpu_cur,
-                rlimit_cpu_max: parent.rlimit_cpu_max,
-                rlimit_cpu_start_ms: parent.rlimit_cpu_start_ms,
-                rlimit_cpu_soft_sent: parent.rlimit_cpu_soft_sent,
-                rlimit_core_cur: parent.rlimit_core_cur,
-                rlimit_core_max: parent.rlimit_core_max,
-                rlimit_rss_cur: parent.rlimit_rss_cur,
-                rlimit_rss_max: parent.rlimit_rss_max,
-                rlimit_memlock_cur: parent.rlimit_memlock_cur,
-                rlimit_memlock_max: parent.rlimit_memlock_max,
-                rlimit_as_cur: parent.rlimit_as_cur,
-                rlimit_as_max: parent.rlimit_as_max,
-                rlimit_locks_cur: parent.rlimit_locks_cur,
-                rlimit_locks_max: parent.rlimit_locks_max,
-                rlimit_msgqueue_cur: parent.rlimit_msgqueue_cur,
-                rlimit_msgqueue_max: parent.rlimit_msgqueue_max,
-                rlimit_nice_cur: parent.rlimit_nice_cur,
-                rlimit_nice_max: parent.rlimit_nice_max,
-                rlimit_rtprio_cur: parent.rlimit_rtprio_cur,
-                rlimit_rtprio_max: parent.rlimit_rtprio_max,
-                rlimit_sigpending_cur: parent.rlimit_sigpending_cur,
-                rlimit_sigpending_max: parent.rlimit_sigpending_max,
-                rlimit_rttime_cur: parent.rlimit_rttime_cur,
-                rlimit_rttime_max: parent.rlimit_rttime_max,
+                rlimits: parent.rlimits.clone(),
                 root: parent.root.clone(),
                 cwd: parent.cwd.clone(),
                 heap_start: parent.heap_start,
@@ -1953,13 +1927,15 @@ impl ProcessControlBlock {
                 signals_masks: SignalFlags::empty(),
                 handling_signal: -1,
                 rt_sig_handlers,
-                sched_policy,
-                cpu_affinity_mask: parent.cpu_affinity_mask,
-                sched_priority,
-                sched_runtime,
-                sched_deadline,
-                sched_period,
-                nice,
+                scheduling: ProcessScheduling {
+                    sched_policy,
+                    cpu_affinity_mask: parent.scheduling.cpu_affinity_mask,
+                    sched_priority,
+                    sched_runtime,
+                    sched_deadline,
+                    sched_period,
+                    nice,
+                },
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),

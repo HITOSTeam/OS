@@ -168,7 +168,7 @@ fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
     };
     let (policy, rt_priority) = {
         let inner = process.borrow_mut();
-        (inner.sched_policy, inner.sched_priority)
+        (inner.scheduling.sched_policy, inner.scheduling.sched_priority)
     };
     match sched_class(policy) {
         Some(SchedClass::Fifo) | Some(SchedClass::Rr) => {

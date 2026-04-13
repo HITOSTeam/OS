@@ -774,7 +774,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             inner.ensure_fd_flags_len();
             let old_flags = inner.fd_flags[fd];
             let minfd = arg;
-            let limit = inner.rlimit_nofile_cur as usize;
+            let limit = inner.rlimits.rlimit_nofile_cur as usize;
             if minfd >= limit {
                 return err(SyscallError::EINVAL);
             }

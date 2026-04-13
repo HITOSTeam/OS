@@ -7,6 +7,7 @@ use crate::arch::{
     REG_SP, REG_T0, REG_T1, REG_T2, REG_TP,
 };
 use crate::config::SIGRETURN_TRAMPOLINE;
+use crate::syscall::error::{SyscallError, err};
 use crate::{
     arch,
     debug_config::{DEBUG_PTHREAD, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
@@ -63,13 +64,6 @@ fn translate_sender_pid_for_receiver(sender_pid: i32) -> i32 {
     }
 }
 
-const EINVAL: isize = -22;
-const EAGAIN: isize = -11;
-const ENOMEM: isize = -12;
-const ESRCH: isize = -3;
-const EFAULT: isize = -14;
-const EINTR: isize = -4;
-const EPERM: isize = -1;
 const SIGCHLD: usize = 17;
 const SA_SIGINFO: usize = 0x4;
 const SA_ONSTACK: usize = 0x08000000;
@@ -204,18 +198,18 @@ pub(crate) fn queue_signal_with_info(
     sig_value: usize,
 ) -> isize {
     if signum == 0 || signum > RT_SIG_MAX {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(process) = pid2process(target_pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
 
     if let Some(tid) = target_tid {
         let Some((tid_proc, task)) = find_task_by_linux_tid(tid) else {
-            return ESRCH;
+            return err(SyscallError::ESRCH);
         };
         if tid_proc.getpid() != target_pid {
-            return ESRCH;
+            return err(SyscallError::ESRCH);
         }
         queue_signal_to_task(task, signum, sender_pid, sender_uid, si_code, sig_value);
         return 0;
@@ -231,7 +225,7 @@ pub(crate) fn queue_signal_with_info(
             .collect::<Vec<_>>()
     };
     let Some(task) = crate::task::signal::pick_task_for_signal(&tasks, bit) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     queue_signal_to_task(task, signum, sender_pid, sender_uid, si_code, sig_value);
     0
@@ -248,7 +242,7 @@ fn rt_sigpending_limit_reached(proc: &Arc<ProcessControlBlock>, signum: usize) -
             .iter()
             .filter_map(|t| t.as_ref().cloned())
             .collect::<Vec<_>>();
-        (inner.rlimit_sigpending_cur, tasks)
+        (inner.rlimits.rlimit_sigpending_cur, tasks)
     };
     if limit == u64::MAX {
         return false;
@@ -346,16 +340,16 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
     for target in targets {
         match kill(target, signum) {
             0 => delivered = true,
-            EPERM => denied = true,
+            e if e == err(SyscallError::EPERM) => denied = true,
             _ => {}
         }
     }
     if delivered {
         0
     } else if denied {
-        EPERM
+        err(SyscallError::EPERM)
     } else {
-        ESRCH
+        err(SyscallError::ESRCH)
     }
 }
 
@@ -364,35 +358,35 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
 /// Delivers a signal to a specific thread (Linux-style tid encoding).
 pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
     if sig < 0 || sig as usize > RT_SIG_MAX {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (tgid as isize) <= 0 || (tid as isize) <= 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if DEBUG_PTHREAD {
         crate::println!("[tgkill] tgid={} tid={} sig={}", tgid, tid, sig);
     }
     let Some(proc) = pid2process(tgid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     let Some(tid_index) = decode_linux_tid_strict(tgid, tid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     if !can_signal_process(&proc, sig) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let task = {
         let inner = proc.borrow_mut();
         inner.tasks.get(tid_index).and_then(|t| t.as_ref()).cloned()
     };
     let Some(task) = task else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     if sig == 0 {
         return 0;
     }
     if rt_sigpending_limit_reached(&proc, sig as usize) {
-        return EAGAIN;
+        return err(SyscallError::EAGAIN);
     }
     let sender = current_process();
     let sender_pid = sender.getpid() as i32;
@@ -426,22 +420,22 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
 /// Delivers a signal to a specific thread in the current process.
 pub fn syscall_tkill(tid: usize, sig: i32) -> isize {
     if sig < 0 || sig as usize > RT_SIG_MAX {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (tid as isize) <= 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some((proc, task)) = find_task_by_linux_tid(tid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     if !can_signal_process(&proc, sig) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if sig == 0 {
         return 0;
     }
     if rt_sigpending_limit_reached(&proc, sig as usize) {
-        return EAGAIN;
+        return err(SyscallError::EAGAIN);
     }
     let sender = current_process();
     let sender_pid = sender.getpid() as i32;
@@ -481,13 +475,13 @@ pub fn syscall_sigprocmask(how: u32) -> isize {
 /// Linux `rt_sigaction` (syscall 134).
 pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize: usize) -> isize {
     if signum == 0 || signum > RT_SIG_MAX {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if signum == crate::task::signal::SIGKILL_NUM || signum == crate::task::signal::SIGSTOP_NUM {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if !valid_sigset_size(sigsetsize) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let process = current_process();
@@ -499,12 +493,12 @@ pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize
             .copied()
             .unwrap_or_default();
         if try_write_user_value(token, oldact as *mut RtSigAction, &cur).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     if act != 0 {
         let Some(new) = try_read_user_value(token, act as *const RtSigAction) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         if DEBUG_UNIXBENCH && signum == 14 {
             crate::log_if!(
@@ -538,7 +532,7 @@ pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize
 /// Linux `rt_sigprocmask` (syscall 135).
 pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize: usize) -> isize {
     if !valid_sigset_size(sigsetsize) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let task = current_task().unwrap();
@@ -547,7 +541,7 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
     let new_mask = if set != 0 {
         // Read new mask before writing oldset to support aliasing set/oldset.
         let Some(v) = try_read_user_value(token, set as *const u64) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         v
     } else {
@@ -569,7 +563,7 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
             0 => old_mask | new_mask,  // SIG_BLOCK
             1 => old_mask & !new_mask, // SIG_UNBLOCK
             2 => new_mask,             // SIG_SETMASK
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         updated &= !(sigkill_bit | sigstop_bit);
         inner.signal_mask = updated;
@@ -591,7 +585,7 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
     }
     if oldset != 0 {
         if try_write_user_value(token, oldset as *mut u64, &old_mask).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     0
@@ -618,7 +612,7 @@ pub fn syscall_sigaltstack(ss: usize, old_ss: usize) -> isize {
             ss_size: inner.sigaltstack_size,
         };
         if try_write_user_value(token, old_ss as *mut SigStack, &old).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
 
@@ -626,13 +620,13 @@ pub fn syscall_sigaltstack(ss: usize, old_ss: usize) -> isize {
         return 0;
     }
     if inner.on_sigaltstack {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let Some(new_ss) = try_read_user_value(token, ss as *const SigStack) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     if (new_ss.ss_flags & !(SS_DISABLE)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (new_ss.ss_flags & SS_DISABLE) != 0 {
         inner.sigaltstack_enabled = false;
@@ -641,10 +635,10 @@ pub fn syscall_sigaltstack(ss: usize, old_ss: usize) -> isize {
         return 0;
     }
     if new_ss.ss_sp == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if new_ss.ss_size < MINSIGSTKSZ {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     }
     inner.sigaltstack_enabled = true;
     inner.sigaltstack_sp = new_ss.ss_sp;
@@ -655,10 +649,10 @@ pub fn syscall_sigaltstack(ss: usize, old_ss: usize) -> isize {
 /// Linux `rt_sigpending` (syscall 136).
 pub fn syscall_rt_sigpending(set: usize, sigsetsize: usize) -> isize {
     if set == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if !valid_sigset_size(sigsetsize) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let pending = {
         let task = current_task().unwrap();
@@ -667,14 +661,14 @@ pub fn syscall_rt_sigpending(set: usize, sigsetsize: usize) -> isize {
     };
     let token = get_current_token();
     if try_write_user_value(token, set as *mut u64, &pending).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     // User sigset_t may be larger than 8 bytes; zero trailing bytes.
     if sigsetsize > core::mem::size_of::<u64>() {
         let zero: u8 = 0;
         for off in core::mem::size_of::<u64>()..sigsetsize {
             if try_write_user_value(token, (set + off) as *mut u8, &zero).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
         }
     }
@@ -719,12 +713,12 @@ fn has_deliverable_pending(pending: u64, mask: u64) -> bool {
 /// Linux `rt_sigsuspend` (syscall 133).
 pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
     if !valid_sigset_size(sigsetsize) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let new_mask = if mask_ptr != 0 {
         let Some(v) = try_read_user_value(token, mask_ptr as *const u64) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         v
     } else {
@@ -746,7 +740,7 @@ pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
             (inner.pending_signals, inner.signal_mask)
         };
         if has_deliverable_pending(pending, mask) {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
         block_current_and_run_next();
     }
@@ -1095,14 +1089,14 @@ pub fn syscall_rt_sigtimedwait(
     sigsetsize: usize,
 ) -> isize {
     if set == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if !valid_sigset_size(sigsetsize) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let Some(mask) = try_read_user_value(token, set as *const u64) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
 
     let sigchld_bit = sig_bit(SIGCHLD).unwrap();
@@ -1118,13 +1112,13 @@ pub fn syscall_rt_sigtimedwait(
     let deadline_ms = if timeout != 0 {
         let Some(ts) = try_read_user_value(token, timeout as *const TimeSpec) else {
             clear_sigwait_mask(&task);
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let timeout_ms = match timespec_to_ms(ts) {
             Some(ms) => ms,
             None => {
                 clear_sigwait_mask(&task);
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
         };
         Some(get_time_ms().saturating_add(timeout_ms))
@@ -1139,7 +1133,7 @@ pub fn syscall_rt_sigtimedwait(
         {
             if write_siginfo(info, sig, sender_pid, sender_uid, si_code, sig_value).is_err() {
                 clear_sigwait_mask(&task);
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             clear_sigwait_mask(&task);
             return sig as isize;
@@ -1149,7 +1143,7 @@ pub fn syscall_rt_sigtimedwait(
         if (mask & sigchld_bit) != 0 && has_zombie_child() {
             if write_siginfo(info, SIGCHLD, 0, 0, 0, 0).is_err() {
                 clear_sigwait_mask(&task);
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             clear_sigwait_mask(&task);
             return SIGCHLD as isize;
@@ -1158,13 +1152,13 @@ pub fn syscall_rt_sigtimedwait(
         // Non-target signals interrupt the wait.
         if has_nonwait_interrupt(&task, mask) {
             clear_sigwait_mask(&task);
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
 
         if let Some(deadline_ms) = deadline_ms {
             if get_time_ms() >= deadline_ms {
                 clear_sigwait_mask(&task);
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
         }
 
@@ -1180,7 +1174,7 @@ pub fn syscall_rt_sigtimedwait(
                 if wait_ms == 0 {
                     remove_waiter(&task);
                     clear_sigwait_mask(&task);
-                    return EAGAIN;
+                    return err(SyscallError::EAGAIN);
                 }
                 add_timer(Arc::clone(&task), wait_ms);
                 timer_set = true;
