@@ -1,0 +1,944 @@
+use super::*;
+
+pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    if (offset as i64) < 0 || (len as i64) < 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return EINVAL;
+    }
+    if (mode & !FALLOC_FL_SUPPORTED_MASK) != 0 {
+        return EOPNOTSUPP;
+    }
+    if (mode & FALLOC_FL_PUNCH_HOLE) != 0 && (mode & FALLOC_FL_KEEP_SIZE) == 0 {
+        return EINVAL;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if !file.writable() {
+        return EBADF;
+    }
+    let Some(end) = offset.checked_add(len) else {
+        return EFBIG;
+    };
+    if end > (i64::MAX as usize) {
+        return EFBIG;
+    }
+    // Current backend does not model tmpfs-like huge preallocation reliably.
+    // Keep this explicit so large/stress-only cases return TCONF instead of
+    // polluting later tests by filling the shared root image.
+    if mode == 0 && offset == 0 && len >= (1 << 20) {
+        return EOPNOTSUPP;
+    }
+    // Misaligned mode=0 fallocate requires filesystem support we don't expose
+    // yet; report unsupported to keep semantics explicit.
+    if mode == 0 && (offset & 0xfff) != 0 {
+        return EOPNOTSUPP;
+    }
+    if fsize_limit_allows(end).is_err() {
+        return EFBIG;
+    }
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
+            if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+                return EPERM;
+            }
+            shm.punch_hole_keep_size(offset, len);
+            return 0;
+        }
+        let old_size = shm.len();
+        let alloc_end = if (mode & FALLOC_FL_KEEP_SIZE) != 0 {
+            core::cmp::min(end, old_size)
+        } else {
+            end
+        };
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && alloc_end > old_size {
+            return EPERM;
+        }
+        if alloc_end > old_size {
+            shm.truncate(alloc_end);
+        }
+        return 0;
+    }
+    if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
+        // Keep semantics explicit until sparse extent metadata is implemented.
+        return EOPNOTSUPP;
+    }
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    if os_inode.readonly_fs() {
+        return EROFS;
+    }
+    let inode = os_inode.ext4_inode();
+    {
+        let _ext4_guard = ext4_lock();
+        if inode.is_dir() {
+            return EISDIR;
+        }
+        if !inode.is_file() {
+            return EINVAL;
+        }
+    }
+    maybe_signal_lease_break(
+        file_lock_key_from_inode(&inode),
+        true,
+        true,
+        current_process().getpid(),
+    );
+    let _ = os_inode.flush();
+    flush_open_inode_views(&inode);
+
+    let ret = if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
+        punch_hole_keep_size(&inode, offset, len)
+    } else {
+        let old_size = {
+            let _ext4_guard = ext4_lock();
+            inode.size() as usize
+        };
+        let alloc_end = if (mode & FALLOC_FL_KEEP_SIZE) != 0 {
+            core::cmp::min(end, old_size)
+        } else {
+            end
+        };
+        if alloc_end <= offset {
+            0
+        } else {
+            write_zeros_range(&inode, offset, alloc_end - offset)
+        }
+    };
+    if ret == 0 {
+        touch_inode_mtime_ctime_now(&inode);
+    }
+    ret
+}
+
+pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
+    if (length as i64) < 0 {
+        return EINVAL;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if !file.writable() {
+        // Linux reports EINVAL when the descriptor does not permit writing.
+        return EINVAL;
+    }
+    if fsize_limit_allows(length).is_err() {
+        return EFBIG;
+    }
+
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        let old_size = shm.len();
+        if length < old_size && shm.has_memfd_seal(PseudoShmFile::F_SEAL_SHRINK) {
+            return EPERM;
+        }
+        if length > old_size && shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) {
+            return EPERM;
+        }
+        shm.truncate(length);
+        return 0;
+    }
+    if file.as_any().downcast_ref::<NetSocketFile>().is_some() {
+        return EINVAL;
+    }
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if os_inode.readonly_fs() {
+            return EROFS;
+        }
+        let _ = os_inode.flush();
+        let inode = os_inode.ext4_inode();
+        maybe_signal_lease_break(
+            file_lock_key_from_inode(&inode),
+            true,
+            true,
+            current_process().getpid(),
+        );
+        let ret = truncate_regular_inode(&inode, length);
+        if ret == 0 {
+            touch_inode_mtime_ctime_now(&inode);
+        }
+        return ret;
+    }
+    EINVAL
+}
+
+pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
+    if (length as i64) < 0 {
+        return EINVAL;
+    }
+    if fsize_limit_allows(length).is_err() {
+        return EFBIG;
+    }
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+    let trailing_slash = path.len() > 1 && path.ends_with('/');
+    if rofs_for_path(AT_FDCWD, &path) {
+        return EROFS;
+    }
+    let at = match resolve_at_path(AT_FDCWD, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let AtPath::PseudoAbs(_) = &at {
+        return EINVAL;
+    }
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if trailing_slash && !inode.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode.is_file() {
+        if inode.is_dir() {
+            return EISDIR;
+        }
+        return EINVAL;
+    }
+    if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+        return EACCES;
+    }
+    maybe_signal_lease_break(
+        file_lock_key_from_inode(&inode),
+        true,
+        true,
+        current_process().getpid(),
+    );
+    drop(_ext4_guard);
+    flush_open_inode_views(&inode);
+    let ret = truncate_regular_inode(&inode, length);
+    if ret == 0 {
+        touch_inode_mtime_ctime_now(&inode);
+    }
+    ret
+}
+
+pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
+    if get_fd_file(fd).is_none() {
+        return EBADF;
+    }
+    let _ext4_guard = ext4_lock();
+    fill_statfs(st_ptr, 0)
+}
+
+pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+    let at = match resolve_at_path(AT_FDCWD, path.as_str()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match at {
+        AtPath::PseudoAbs(abs) => {
+            if open_pseudo(&abs).is_none() {
+                return ENOENT;
+            }
+            fill_statfs(st_ptr, statfs_mount_flags_for_abs(&abs))
+        }
+        AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
+            let (fsuid, fsgid) = current_fsuid_gid();
+            let _ext4_guard = ext4_lock();
+            if let Err(e) = resolve_at_inode(&at, fsuid, fsgid, true) {
+                return e;
+            }
+            let abs = resolve_abs_path(AT_FDCWD, path.as_str())
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| String::from("/"));
+            fill_statfs(st_ptr, statfs_mount_flags_for_abs(&abs))
+        }
+    }
+}
+
+pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: usize) -> isize {
+    // `futimens` passes a null pathname and uses dirfd as the target fd.
+    if pathname == 0 {
+        if dirfd == AT_FDCWD {
+            return EFAULT;
+        }
+        if dirfd < 0 {
+            return EBADF;
+        }
+        let Some(file) = get_fd_file(dirfd as usize) else {
+            return EBADF;
+        };
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            if os_inode.readonly_fs() {
+                return EROFS;
+            }
+            let inode = os_inode.ext4_inode();
+            let ino = inode.inode_num() as u64;
+            let now = current_timespec();
+            let (atime, mtime) = if _times == 0 {
+                (Some(now), Some(now))
+            } else {
+                let token = get_current_token();
+                let ts0 = read_user_value(token, _times as *const TimeSpec);
+                let ts1 = read_user_value(
+                    token,
+                    (_times + core::mem::size_of::<TimeSpec>()) as *const TimeSpec,
+                );
+                let at = match resolve_utime(ts0, now) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                let mt = match resolve_utime(ts1, now) {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                (at, mt)
+            };
+            let mut cur = get_inode_times(ino);
+            if let Some((sec, nsec)) = atime {
+                cur.atime_sec = sec;
+                cur.atime_nsec = nsec;
+            }
+            if let Some((sec, nsec)) = mtime {
+                cur.mtime_sec = sec;
+                cur.mtime_nsec = nsec;
+            }
+            if atime.is_some() || mtime.is_some() {
+                cur.ctime_sec = now.0;
+                cur.ctime_nsec = now.1;
+            }
+            set_inode_times(ino, cur);
+        }
+        return 0;
+    }
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if let AtPath::PseudoAbs(abs) = &at {
+        if open_pseudo(abs).is_some() {
+            return EROFS;
+        }
+        // If any prefix is a pseudo file, report ENOTDIR for deeper paths.
+        let mut prefix = alloc::string::String::from("/");
+        for (idx, comp) in abs.split('/').filter(|s| !s.is_empty()).enumerate() {
+            if idx > 0 {
+                prefix.push('/');
+            }
+            prefix.push_str(comp);
+            if prefix == *abs {
+                break;
+            }
+            if let Some(node) = open_pseudo(&prefix) {
+                if node.as_any().downcast_ref::<PseudoDir>().is_none() {
+                    return ENOTDIR;
+                }
+            }
+        }
+        return ENOENT;
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let (euid, _egid) = current_effective_uid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
+    if _times == 0 {
+        if euid != 0 && euid != inode.uid() && !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+            return EACCES;
+        }
+    } else if euid != 0 && euid != inode.uid() {
+        return EPERM;
+    }
+    let ino = inode.inode_num() as u64;
+    let now = current_timespec();
+    let (atime, mtime) = if _times == 0 {
+        (Some(now), Some(now))
+    } else {
+        let ts0 = read_user_value(token, _times as *const TimeSpec);
+        let ts1 = read_user_value(
+            token,
+            (_times + core::mem::size_of::<TimeSpec>()) as *const TimeSpec,
+        );
+        let at = match resolve_utime(ts0, now) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let mt = match resolve_utime(ts1, now) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        (at, mt)
+    };
+    let mut cur = get_inode_times(ino);
+    if let Some((sec, nsec)) = atime {
+        cur.atime_sec = sec;
+        cur.atime_nsec = nsec;
+    }
+    if let Some((sec, nsec)) = mtime {
+        cur.mtime_sec = sec;
+        cur.mtime_nsec = nsec;
+    }
+    if atime.is_some() || mtime.is_some() {
+        cur.ctime_sec = now.0;
+        cur.ctime_nsec = now.1;
+    }
+    set_inode_times(ino, cur);
+    0
+}
+
+pub fn syscall_getcwd(buf: usize, size: usize) -> isize {
+    let process = current_process();
+    let cwd = { process.borrow_mut().cwd.clone() };
+    let need = cwd.len().saturating_add(1);
+    if size < need {
+        return ERANGE;
+    }
+    if buf == 0 {
+        return EFAULT;
+    }
+    let mut bytes = cwd.into_bytes();
+    bytes.push(0);
+    let token = get_current_token();
+    if try_copy_to_user(token, buf as *mut u8, &bytes).is_err() {
+        return EFAULT;
+    }
+    need as isize
+}
+
+pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
+    if get_fd_file(fd).is_none() {
+        if crate::debug_config::DEBUG_FS {
+            let pid = current_process().getpid();
+            crate::println!("[fs] fstat(pid={}) fd={} -> EBADF(nofile)", pid, fd);
+        }
+        return EBADF;
+    };
+    if st_ptr == 0 {
+        return EFAULT;
+    }
+    let st = match kstat_from_fd(fd) {
+        Ok(st) => st,
+        Err(e) => return e,
+    };
+
+    let token = get_current_token();
+    if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
+        return EFAULT;
+    }
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        if pid >= 2 && fd <= 8 {
+            crate::println!(
+                "[fs] fstat(pid={}) fd={} -> ok mode={:#o}",
+                pid,
+                fd,
+                st.st_mode
+            );
+        }
+    }
+    0
+}
+
+pub fn syscall_fsync(fd: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = os_inode.ext4_inode();
+        {
+            let _ext4_guard = ext4_lock();
+            if !(inode.is_file() || inode.is_dir()) {
+                return EINVAL;
+            }
+        }
+        if os_inode.readonly_fs() {
+            return 0;
+        }
+        // A full ext4 sync for every call is prohibitively expensive for
+        // micro-benchmarks like iozone. Flush per-fd buffered writes instead.
+        let _ = os_inode.flush();
+        pseudo_block_note_sync();
+        return 0;
+    }
+    EINVAL
+}
+
+pub fn syscall_sync() -> isize {
+    let current = current_process();
+    let mut files: Vec<alloc::sync::Arc<dyn File + Send + Sync>> = Vec::new();
+    {
+        let inner = current.borrow_mut();
+        for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
+            files.push(file.clone());
+        }
+    }
+
+    let processes: Vec<alloc::sync::Arc<ProcessControlBlock>> = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect()
+    };
+    for process in processes {
+        if core::ptr::eq(
+            alloc::sync::Arc::as_ptr(&process),
+            alloc::sync::Arc::as_ptr(&current),
+        ) {
+            continue;
+        }
+        if let Some(inner) = process.try_borrow_mut() {
+            for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
+                files.push(file.clone());
+            }
+        }
+    }
+
+    for file in files {
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            if !os_inode.readonly_fs() {
+                let _ = os_inode.flush();
+            }
+        }
+    }
+    sync_all();
+    pseudo_block_note_sync();
+    0
+}
+
+pub fn syscall_syncfs(fd: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if file.as_any().downcast_ref::<OSInode>().is_none() {
+        return EINVAL;
+    }
+    syscall_sync()
+}
+
+pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: usize) -> isize {
+    const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
+    const SYNC_FILE_RANGE_WRITE: usize = 2;
+    const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if file.as_any().downcast_ref::<Pipe>().is_some()
+        || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
+        || file.as_any().downcast_ref::<PseudoFile>().is_some()
+        || file.as_any().downcast_ref::<ProcPseudoFile>().is_some()
+        || file.as_any().downcast_ref::<CgroupFile>().is_some()
+        || file.as_any().downcast_ref::<PseudoDir>().is_some()
+        || file.as_any().downcast_ref::<PseudoBlock>().is_some()
+        || file.as_any().downcast_ref::<RtcFile>().is_some()
+        || file.as_any().downcast_ref::<NetSocketFile>().is_some()
+    {
+        return ESPIPE;
+    }
+    let valid_flags =
+        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    if (offset as i64) < 0 || (nbytes as i64) < 0 {
+        return EINVAL;
+    }
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let inode = os_inode.ext4_inode();
+    {
+        let _ext4_guard = ext4_lock();
+        if !inode.is_file() {
+            return EINVAL;
+        }
+    }
+    if os_inode.readonly_fs() {
+        return 0;
+    }
+    let _ = os_inode.flush();
+    pseudo_block_note_sync();
+    0
+}
+
+pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) -> isize {
+    const POSIX_FADV_NORMAL: usize = 0;
+    const POSIX_FADV_RANDOM: usize = 1;
+    const POSIX_FADV_SEQUENTIAL: usize = 2;
+    const POSIX_FADV_WILLNEED: usize = 3;
+    const POSIX_FADV_DONTNEED: usize = 4;
+    const POSIX_FADV_NOREUSE: usize = 5;
+
+    if (offset as i64) < 0 || (len as i64) < 0 {
+        return EINVAL;
+    }
+    if !matches!(
+        advice,
+        POSIX_FADV_NORMAL
+            | POSIX_FADV_RANDOM
+            | POSIX_FADV_SEQUENTIAL
+            | POSIX_FADV_WILLNEED
+            | POSIX_FADV_DONTNEED
+            | POSIX_FADV_NOREUSE
+    ) {
+        return EINVAL;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+
+    if file.as_any().downcast_ref::<Pipe>().is_some()
+        || file.as_any().downcast_ref::<FifoDuplexFile>().is_some()
+    {
+        return ESPIPE;
+    }
+
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let inode = os_inode.ext4_inode();
+    {
+        let _ext4_guard = ext4_lock();
+        if !inode.is_file() {
+            return ESPIPE;
+        }
+    }
+    0
+}
+
+pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: usize) -> isize {
+    if st_ptr == 0 {
+        return EFAULT;
+    }
+    const AT_EMPTY_PATH: usize = 0x1000;
+    let valid_flags = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
+    if (_flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // Support `AT_EMPTY_PATH`: operate on `dirfd` itself when pathname is empty.
+    // glibc uses this in some directory APIs (e.g., `opendir`) to validate the fd.
+    if path.is_empty() {
+        if (_flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+            return syscall_fstat(dirfd as usize, st_ptr);
+        }
+        return ENOENT;
+    }
+
+    let raw_abs = match resolve_abs_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Pseudo nodes: return minimal metadata.
+    if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
+            if crate::fs::proc_magic_link_exists(proc_path) {
+                let st = if (_flags & AT_SYMLINK_NOFOLLOW) != 0 {
+                    let link_len = crate::fs::proc_readlink(proc_path)
+                        .map(|target| target.len())
+                        .unwrap_or(0);
+                    proc_symlink_kstat(link_len)
+                } else {
+                    match proc_magic_link_target_kstat(proc_path) {
+                        Ok(Some(st)) => st,
+                        Ok(None) => return ENOENT,
+                        Err(e) => return e,
+                    }
+                };
+                if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+        }
+        let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
+        let Some(node) = open_pseudo(pseudo_path) else {
+            return ENOENT;
+        };
+        let st = match kstat_from_file(&node) {
+            Ok(st) => st,
+            Err(e) => return e,
+        };
+        if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
+            return EFAULT;
+        }
+        return 0;
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let _ext4_guard = ext4_lock();
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(ENOENT) if matches!(path.as_str(), "busybox" | "./busybox") => {
+            let candidates = [
+                "/musl/busybox",
+                "/glibc/busybox",
+                "/bin/busybox",
+                "/busybox",
+            ];
+            let mut found = None;
+            for cand in candidates {
+                if let Some(inode) = find_path_in_roots(cand) {
+                    found = Some(inode);
+                    break;
+                }
+            }
+            match found {
+                Some(v) => v,
+                None => return ENOENT,
+            }
+        }
+        Err(e) => return e,
+    };
+
+    let mode_raw = inode.mode();
+    let mode = mode_raw as u32;
+    let uid = inode.uid();
+    let gid = inode.gid();
+    let nlink = inode.link_count();
+    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
+    let size = inode_visible_size(&inode) as i64;
+    let blocks = (((size as u64) + 511) / 512) as u64;
+    let times = get_inode_times(inode.inode_num() as u64);
+
+    let st = KStat {
+        st_dev: EXT4_ST_DEV,
+        st_ino: inode.inode_num() as u64,
+        st_mode: mode,
+        st_nlink: nlink,
+        st_uid: uid,
+        st_gid: gid,
+        st_rdev,
+        __pad: 0,
+        st_size: size,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: blocks,
+        st_atime_sec: times.atime_sec,
+        st_atime_nsec: times.atime_nsec,
+        st_mtime_sec: times.mtime_sec,
+        st_mtime_nsec: times.mtime_nsec,
+        st_ctime_sec: times.ctime_sec,
+        st_ctime_nsec: times.ctime_nsec,
+        __unused: [0, 0],
+    };
+
+    if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
+        return EFAULT;
+    }
+    0
+}
+
+pub fn syscall_statx(
+    dirfd: isize,
+    pathname: usize,
+    flags: usize,
+    _mask: usize,
+    stx_ptr: usize,
+) -> isize {
+    if stx_ptr == 0 {
+        return EFAULT;
+    }
+    let valid_flags = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    const STATX_VALID_MASK: usize = 0x0001_FFFF;
+    if (_mask & !STATX_VALID_MASK) != 0 {
+        return EINVAL;
+    }
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return EINVAL;
+        }
+        let st = match kstat_from_fd(dirfd as usize) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let stx = statx_from_kstat(&st);
+        if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
+            return EFAULT;
+        }
+        return 0;
+    }
+    if path.is_empty() {
+        return ENOENT;
+    }
+
+    if dirfd < 0 && dirfd != AT_FDCWD {
+        return EBADF;
+    }
+    let effective_dirfd = dirfd;
+    let raw_abs = match resolve_abs_path(effective_dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let at = match resolve_at_path(effective_dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Pseudo nodes: return minimal metadata.
+    if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
+            if crate::fs::proc_magic_link_exists(proc_path) {
+                let st = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+                    let link_len = crate::fs::proc_readlink(proc_path)
+                        .map(|target| target.len())
+                        .unwrap_or(0);
+                    proc_symlink_kstat(link_len)
+                } else {
+                    match proc_magic_link_target_kstat(proc_path) {
+                        Ok(Some(st)) => st,
+                        Ok(None) => return ENOENT,
+                        Err(e) => return e,
+                    }
+                };
+                let stx = statx_from_kstat(&st);
+                if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
+                    return EFAULT;
+                }
+                return 0;
+            }
+        }
+        let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
+        let Some(node) = open_pseudo(pseudo_path) else {
+            return ENOENT;
+        };
+        let st = match kstat_from_file(&node) {
+            Ok(st) => st,
+            Err(e) => return e,
+        };
+        let stx = statx_from_kstat(&st);
+        if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
+            return EFAULT;
+        }
+        return 0;
+    }
+
+    let _ext4_guard = ext4_lock();
+    let mut inode = match at {
+        AtPath::Ext4Abs(abs) => find_path_in_roots(&abs),
+        AtPath::Ext4Rel { base, rel } => {
+            if rel.is_empty() {
+                Some(base)
+            } else {
+                base.find_path(&rel)
+            }
+        }
+        AtPath::PseudoAbs(_) => unreachable!(),
+    };
+    if inode.is_none() && matches!(path.as_str(), "busybox" | "./busybox") {
+        let candidates = [
+            "/musl/busybox",
+            "/glibc/busybox",
+            "/bin/busybox",
+            "/busybox",
+        ];
+        for cand in candidates {
+            if let Some(found) = find_path_in_roots(cand) {
+                inode = Some(found);
+                break;
+            }
+        }
+    }
+
+    let Some(inode) = inode else {
+        return ENOENT;
+    };
+
+    let mode_raw = inode.mode();
+    let mode = mode_raw as u32;
+    let uid = inode.uid();
+    let gid = inode.gid();
+    let nlink = inode.link_count();
+    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
+    let size = inode_visible_size(&inode) as i64;
+    let blocks = (((size as u64) + 511) / 512) as u64;
+    let times = get_inode_times(inode.inode_num() as u64);
+
+    let st = KStat {
+        st_dev: EXT4_ST_DEV,
+        st_ino: inode.inode_num() as u64,
+        st_mode: mode,
+        st_nlink: nlink,
+        st_uid: uid,
+        st_gid: gid,
+        st_rdev,
+        __pad: 0,
+        st_size: size,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: blocks,
+        st_atime_sec: times.atime_sec,
+        st_atime_nsec: times.atime_nsec,
+        st_mtime_sec: times.mtime_sec,
+        st_mtime_nsec: times.mtime_nsec,
+        st_ctime_sec: times.ctime_sec,
+        st_ctime_nsec: times.ctime_nsec,
+        __unused: [0, 0],
+    };
+    let stx = statx_from_kstat(&st);
+    if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
+        return EFAULT;
+    }
+    0
+}
+

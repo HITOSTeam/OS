@@ -1,0 +1,898 @@
+use super::*;
+
+pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usize) -> isize {
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if bufsiz == 0 {
+        return EINVAL;
+    }
+    if path.is_empty() {
+        if dirfd < 0 {
+            return ENOENT;
+        }
+        let Some(file) = get_fd_file(dirfd as usize) else {
+            return EBADF;
+        };
+        if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
+            let Some(target) = link.readlink_target() else {
+                return ENOENT;
+            };
+            let bytes = target.as_bytes();
+            let len = min(bytes.len(), bufsiz);
+            if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
+                return EFAULT;
+            }
+            return len as isize;
+        }
+        let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+            return EINVAL;
+        };
+        let _ext4_guard = ext4_lock();
+        let inode = os_inode.ext4_inode();
+        if !inode.is_symlink() {
+            return EINVAL;
+        }
+        let target = inode.read_all();
+        let len = min(target.len(), bufsiz);
+        if try_copy_to_user(token, buf as *mut u8, &target[..len]).is_err() {
+            return EFAULT;
+        }
+        return len as isize;
+    }
+
+    let raw_abs = match resolve_abs_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if let AtPath::PseudoAbs(abs) = &at {
+        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
+            if let Some(target) = crate::fs::proc_readlink(proc_path) {
+                let bytes = target.as_bytes();
+                let len = min(bytes.len(), bufsiz);
+                if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
+                    return EFAULT;
+                }
+                return len as isize;
+            }
+        }
+        if let Some(target) = crate::fs::proc_readlink(abs) {
+            let bytes = target.as_bytes();
+            let len = min(bytes.len(), bufsiz);
+            if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
+                return EFAULT;
+            }
+            return len as isize;
+        }
+        return if open_pseudo(abs).is_some() {
+            EINVAL
+        } else {
+            ENOENT
+        };
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !inode.is_symlink() {
+        return EINVAL;
+    }
+    let target = inode.read_all();
+    let len = min(target.len(), bufsiz);
+    if try_copy_to_user(token, buf as *mut u8, &target[..len]).is_err() {
+        return EFAULT;
+    }
+    len as isize
+}
+
+pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isize {
+    let token = get_current_token();
+    let target_path = match read_user_cstring(token, target) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path = match read_user_cstring(token, linkpath) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+
+    let at = match resolve_at_path(newdirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let AtPath::PseudoAbs(_) = &at {
+        return EROFS;
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !parent.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+        return EACCES;
+    }
+    if rofs_for_path(newdirfd, &path) {
+        return EROFS;
+    }
+
+    match parent.create_symlink(&name, &target_path) {
+        Ok(inode) => {
+            let gid = gid_for_created_inode(Some(&parent), fsgid);
+            inode.set_uid_gid(fsuid, gid);
+            inode.set_mode(0o777);
+            0
+        }
+        Err(e) => ext4_err_to_errno(e),
+    }
+}
+
+pub fn syscall_linkat(
+    olddirfd: isize,
+    oldpath: usize,
+    newdirfd: isize,
+    newpath: usize,
+    flags: usize,
+) -> isize {
+    let valid_flags = AT_SYMLINK_FOLLOW | AT_EMPTY_PATH;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+
+    let token = get_current_token();
+    let old_s = match read_user_cstring(token, oldpath) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_s = match read_user_cstring(token, newpath) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if new_s.is_empty() {
+        return ENOENT;
+    }
+
+    let old_at = if old_s.is_empty() {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return ENOENT;
+        }
+        None
+    } else {
+        match resolve_at_path(olddirfd, &old_s) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    };
+
+    let new_at = match resolve_at_path(newdirfd, &new_s) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if matches!(new_at, AtPath::PseudoAbs(_)) {
+        return EROFS;
+    }
+    if let Some(AtPath::PseudoAbs(abs)) = &old_at {
+        if parse_proc_fd_for_current_process(abs).is_none() {
+            return EXDEV;
+        }
+    }
+    if let (Some(AtPath::Ext4Abs(old_abs)), AtPath::Ext4Abs(new_abs)) = (&old_at, &new_at) {
+        if hardlink_cross_mount(old_abs, new_abs) {
+            return EXDEV;
+        }
+    }
+
+    if rofs_for_path(newdirfd, &new_s) {
+        return EROFS;
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let follow_old = (flags & AT_SYMLINK_FOLLOW) != 0;
+    let _ext4_guard = ext4_lock();
+
+    let source = if let Some(at) = old_at {
+        match at {
+            AtPath::PseudoAbs(abs) => {
+                let fd = match parse_proc_fd_for_current_process(&abs) {
+                    Some(v) => v,
+                    None => return EXDEV,
+                };
+                let Some(file) = get_fd_file(fd) else {
+                    return EBADF;
+                };
+                let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+                    return EPERM;
+                };
+                os_inode.ext4_inode()
+            }
+            other => match resolve_at_inode(&other, fsuid, fsgid, follow_old) {
+                Ok(v) => v,
+                Err(e) => return e,
+            },
+        }
+    } else {
+        if olddirfd < 0 {
+            return EBADF;
+        }
+        let Some(file) = get_fd_file(olddirfd as usize) else {
+            return EBADF;
+        };
+        let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+            return EPERM;
+        };
+        os_inode.ext4_inode()
+    };
+    if source.is_dir() {
+        return EPERM;
+    }
+
+    let (parent, name) = match resolve_parent_and_name(&new_at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !parent.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+        return EACCES;
+    }
+    if parent.find(&name).is_some() {
+        return EEXIST;
+    }
+    if parent.device_id() != source.device_id() {
+        return EXDEV;
+    }
+    if rofs_for_path(newdirfd, &new_s) {
+        return EROFS;
+    }
+
+    match parent.link_inode(&name, &source) {
+        Ok(_) => 0,
+        Err(ext4_fs::Ext4Error::Unsupported) => EPERM,
+        Err(e) => ext4_err_to_errno(e),
+    }
+}
+
+pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpath: usize) -> isize {
+    let token = get_current_token();
+    let old_s = match read_user_cstring(token, oldpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let new_s = match read_user_cstring(token, newpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if old_s.is_empty() || new_s.is_empty() {
+        return ENOENT;
+    }
+    do_renameat(olddirfd, &old_s, newdirfd, &new_s, false)
+}
+
+pub fn syscall_renameat2(
+    olddirfd: isize,
+    oldpath: usize,
+    newdirfd: isize,
+    newpath: usize,
+    flags: usize,
+) -> isize {
+    const RENAME_NOREPLACE: usize = 1;
+    const RENAME_EXCHANGE: usize = 2;
+    const RENAME_WHITEOUT: usize = 4;
+
+    if (flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT)) != 0 {
+        return EINVAL;
+    }
+    if (flags & RENAME_EXCHANGE) != 0 && (flags & (RENAME_NOREPLACE | RENAME_WHITEOUT)) != 0 {
+        return EINVAL;
+    }
+    if (flags & RENAME_WHITEOUT) != 0 {
+        return EINVAL;
+    }
+
+    let token = get_current_token();
+    let old_s = match read_user_cstring(token, oldpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let new_s = match read_user_cstring(token, newpath) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if old_s.is_empty() || new_s.is_empty() {
+        return ENOENT;
+    }
+
+    if flags == 0 {
+        return do_renameat(olddirfd, &old_s, newdirfd, &new_s, false);
+    }
+    if flags == RENAME_NOREPLACE {
+        return do_renameat(olddirfd, &old_s, newdirfd, &new_s, true);
+    }
+    if flags == RENAME_EXCHANGE {
+        return do_renameat_exchange(olddirfd, &old_s, newdirfd, &new_s);
+    }
+    EINVAL
+}
+
+pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -> isize {
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let AtPath::PseudoAbs(_) = &at {
+        return EROFS;
+    }
+    let (fsuid, fsgid) = current_fsuid_gid();
+
+    let _ext4_guard = ext4_lock();
+    let dirfd_rofs = matches!(
+        &at,
+        AtPath::Ext4Rel { base, .. } if inode_is_rofs_mount_root(base)
+    );
+    let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if dirfd_rofs || rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
+    if !parent.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+        return EACCES;
+    }
+    if parent.find(&name).is_some() {
+        return EEXIST;
+    }
+
+    let mut file_type = (mode as u16) & S_IFMT;
+    if file_type == 0 {
+        file_type = S_IFREG;
+    }
+    let valid_type = matches!(file_type, S_IFREG | S_IFIFO | S_IFCHR | S_IFBLK | S_IFSOCK);
+    if !valid_type {
+        return EINVAL;
+    }
+
+    let gid = gid_for_created_inode(Some(&parent), fsgid);
+    let perm_bits = apply_umask(mode) & 0o7777;
+    let create_mode = mode_for_created_file(file_type | perm_bits, gid);
+
+    if matches!(file_type, S_IFCHR | S_IFBLK) {
+        let (euid, _) = current_effective_uid_gid();
+        if euid != 0 {
+            return EPERM;
+        }
+    }
+
+    let create_result = match file_type {
+        S_IFREG => parent.create_file(&name),
+        S_IFIFO | S_IFSOCK => parent.create_special(&name, create_mode, 0),
+        S_IFCHR | S_IFBLK => parent.create_special(&name, create_mode, dev as u64),
+        _ => unreachable!(),
+    };
+
+    match create_result {
+        Ok(inode) => {
+            inode.set_uid_gid(fsuid, gid);
+            inode.set_mode(create_mode);
+            0
+        }
+        Err(e) => ext4_err_to_errno(e),
+    }
+}
+
+pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+    if crate::debug_config::DEBUG_SYSCALL {
+        let pid = current_process().getpid();
+        crate::println!(
+            "[mkdir] pid={} dirfd={} path='{}' mode=0o{:o}",
+            pid,
+            dirfd,
+            path,
+            mode
+        );
+    }
+
+    let create_mode = apply_umask(mode);
+    let (fsuid, fsgid) = current_fsuid_gid();
+
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if crate::debug_config::DEBUG_SYSCALL {
+        let pid = current_process().getpid();
+        match &at {
+            AtPath::Ext4Abs(abs) => {
+                crate::println!("[mkdir] pid={} abs='{}'", pid, abs);
+            }
+            AtPath::Ext4Rel { rel, .. } => {
+                crate::println!("[mkdir] pid={} rel='{}'", pid, rel);
+            }
+            AtPath::PseudoAbs(abs) => {
+                crate::println!("[mkdir] pid={} pseudo='{}'", pid, abs);
+            }
+        }
+    }
+
+    if let AtPath::PseudoAbs(abs) = &at {
+        if open_pseudo(abs).is_some() || crate::fs::proc_readlink(abs).is_some() {
+            return EEXIST;
+        }
+        if crate::fs::is_cgroup_pseudo_path(abs) {
+            return cgroup_mkdir(abs);
+        }
+        let rc = crate::fs::pseudo_dev_dir_mkdir(abs);
+        if rc != EROFS {
+            return rc;
+        }
+        return EROFS;
+    }
+
+    let _ext4_guard = ext4_lock();
+    if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
+        return EEXIST;
+    }
+    if matches!(at, AtPath::Ext4Rel { ref rel, .. } if rel.is_empty()) {
+        return EEXIST;
+    }
+    let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !parent.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+        return EACCES;
+    }
+    if parent.find(&name).is_some() {
+        return EEXIST;
+    }
+    if rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
+    match parent.create_dir(&name) {
+        Ok(dir) => {
+            let gid = gid_for_created_inode(Some(&parent), fsgid);
+            let mut dir_mode = create_mode;
+            if parent_forces_gid_inherit(&parent) {
+                dir_mode |= 0o2000;
+            }
+            dir.set_uid_gid(fsuid, gid);
+            dir.set_mode(dir_mode);
+            if crate::debug_config::DEBUG_SYSCALL {
+                let pid = current_process().getpid();
+                crate::println!(
+                    "[mkdir] pid={} inode={} mode=0o{:o} is_dir={}",
+                    pid,
+                    dir.inode_num(),
+                    dir.mode(),
+                    dir.is_dir()
+                );
+            }
+            0
+        }
+        Err(e) => {
+            let err = ext4_err_to_errno(e);
+            if crate::debug_config::DEBUG_SYSCALL {
+                let pid = current_process().getpid();
+                crate::println!("[mkdir] pid={} create_dir err={}", pid, err);
+            }
+            err
+        }
+    }
+}
+
+pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
+    const AT_REMOVEDIR: usize = 0x200;
+    if (flags & !AT_REMOVEDIR) != 0 {
+        return EINVAL;
+    }
+
+    let token = get_current_token();
+    let path = match read_user_cstring(token, pathname) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if path.is_empty() {
+        return ENOENT;
+    }
+    let remove_dir = (flags & AT_REMOVEDIR) != 0;
+
+    if remove_dir {
+        if final_non_empty_component(&path) == Some(".") {
+            return EINVAL;
+        }
+        if final_non_empty_component(&path) == Some("..") {
+            return ENOTEMPTY;
+        }
+        if let Some(abs) = match resolve_abs_path(dirfd, &path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        } {
+            if path_is_mount_point(&abs) {
+                return EBUSY;
+            }
+        }
+    }
+
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if let AtPath::PseudoAbs(abs) = &at {
+        // Minimal `/dev/shm` support for POSIX `shm_unlink`.
+        if abs == "/dev/shm" || abs == "/dev/shm/" {
+            return if remove_dir { EROFS } else { EISDIR };
+        }
+        if crate::fs::is_cgroup_pseudo_path(abs) {
+            return if remove_dir {
+                cgroup_rmdir(abs)
+            } else if open_pseudo(abs).is_some() {
+                EISDIR
+            } else {
+                ENOENT
+            };
+        }
+        if let Some(name) = shm_object_name(abs) {
+            if remove_dir {
+                return ENOTDIR;
+            }
+            return if shm_remove(name) { 0 } else { ENOENT };
+        }
+        if crate::fs::pseudo_dev_dir_exists(abs) {
+            return if remove_dir {
+                crate::fs::pseudo_dev_dir_rmdir(abs)
+            } else {
+                EISDIR
+            };
+        }
+        return EROFS;
+    }
+
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let _ext4_guard = ext4_lock();
+    if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
+        return EISDIR;
+    }
+    if matches!(at, AtPath::Ext4Rel { ref rel, .. } if rel.is_empty()) {
+        return EISDIR;
+    }
+    let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if !parent.is_dir() {
+        return ENOTDIR;
+    }
+    if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+        return EACCES;
+    }
+    if remove_dir && name == "." {
+        return EINVAL;
+    }
+    if remove_dir && name == ".." {
+        return ENOTEMPTY;
+    }
+
+    // Validate target type: unlink vs rmdir semantics.
+    let Some(child) = parent.find(&name) else {
+        if rofs_for_path(dirfd, &path) {
+            return EROFS;
+        }
+        return ENOENT;
+    };
+    if remove_dir {
+        if !child.is_dir() {
+            return ENOTDIR;
+        }
+        if !child.ls().is_empty() {
+            return ENOTEMPTY;
+        }
+    } else {
+        if child.is_dir() {
+            return EISDIR;
+        }
+    }
+    if !sticky_rename_allowed(&parent, &child, fsuid) {
+        return EPERM;
+    }
+    if inode_is_immutable_or_append(&child) {
+        return EPERM;
+    }
+    if rofs_for_path(dirfd, &path) {
+        return EROFS;
+    }
+
+    if !remove_dir {
+        match defer_unlink_open_file(&parent, &name, &child) {
+            Ok(true) => return 0,
+            Ok(false) => {}
+            Err(e) => return e,
+        }
+    }
+
+    match parent.unlink(&name) {
+        Ok(_) => 0,
+        Err(ext4_fs::Ext4Error::Unsupported) => ENOTEMPTY,
+        Err(e) => ext4_err_to_errno(e),
+    }
+}
+
+pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
+    // Avoid unbounded kernel heap allocations from user-provided buffer sizes.
+    // Returning fewer bytes is allowed; callers will retry with the remaining entries.
+    const MAX_DIRENT_BUF: usize = 256 * 1024;
+    let len = len.min(MAX_DIRENT_BUF);
+    if len > 0 && len < 24 {
+        return EINVAL;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    let token = get_current_token();
+
+    // Pseudo directories (e.g. /sys, /dev).
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        if crate::debug_config::DEBUG_FS {
+            let pid = current_process().getpid();
+            crate::println!("[fs] getdents64(pid={}) pseudo fd={} len={}", pid, fd, len);
+        }
+        let entries = pdir.entries();
+        let mut index = pdir.index();
+        if index >= entries.len() || len == 0 {
+            return 0;
+        }
+
+        let mut kbuf = alloc::vec![0u8; len];
+        let mut written = 0usize;
+        while index < entries.len() {
+            let ent = &entries[index];
+            let name_bytes = ent.name.as_bytes();
+            let reclen = align_up(19 + name_bytes.len() + 1, 8);
+            if written + reclen > len {
+                break;
+            }
+            let base = written;
+            kbuf[base..base + 8].copy_from_slice(&ent.ino.to_le_bytes());
+            kbuf[base + 8..base + 16].copy_from_slice(&((index + 1) as i64).to_le_bytes());
+            kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            kbuf[base + 18] = ent.dtype;
+            kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+            kbuf[base + 19 + name_bytes.len()] = 0;
+            for b in kbuf[base + 19 + name_bytes.len() + 1..base + reclen].iter_mut() {
+                *b = 0;
+            }
+
+            written += reclen;
+            index += 1;
+        }
+
+        let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
+        let mut src_off = 0usize;
+        for ub in user_bufs {
+            let end = src_off + ub.len();
+            ub.copy_from_slice(&kbuf[src_off..end]);
+            src_off = end;
+        }
+        pdir.set_index(index);
+        return written as isize;
+    }
+
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return ENOTDIR;
+    };
+    let inode = os_inode.ext4_inode();
+    if let Some(path) = inode_logical_path(&inode) {
+        if let Some(node) = open_pseudo(&path) {
+            if let Some(pdir) = node.as_any().downcast_ref::<PseudoDir>() {
+                let entries = pdir.entries();
+                let mut index = os_inode.dir_offset();
+                if index >= entries.len() || len == 0 {
+                    return 0;
+                }
+
+                let mut kbuf = alloc::vec![0u8; len];
+                let mut written = 0usize;
+                while index < entries.len() {
+                    let ent = &entries[index];
+                    let name_bytes = ent.name.as_bytes();
+                    let reclen = align_up(19 + name_bytes.len() + 1, 8);
+                    if written + reclen > len {
+                        break;
+                    }
+                    let base = written;
+                    kbuf[base..base + 8].copy_from_slice(&ent.ino.to_le_bytes());
+                    kbuf[base + 8..base + 16].copy_from_slice(&((index + 1) as i64).to_le_bytes());
+                    kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+                    kbuf[base + 18] = ent.dtype;
+                    kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+                    kbuf[base + 19 + name_bytes.len()] = 0;
+                    for b in kbuf[base + 19 + name_bytes.len() + 1..base + reclen].iter_mut() {
+                        *b = 0;
+                    }
+
+                    written += reclen;
+                    index += 1;
+                }
+
+                let user_bufs =
+                    translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
+                let mut src_off = 0usize;
+                for ub in user_bufs {
+                    let end = src_off + ub.len();
+                    ub.copy_from_slice(&kbuf[src_off..end]);
+                    src_off = end;
+                }
+                os_inode.set_dir_offset(index);
+                if written > 0 {
+                    maybe_update_inode_atime(&inode, true);
+                }
+                return written as isize;
+            }
+        }
+    }
+
+    let ext4_guard = ext4_lock();
+    if !inode.is_dir() {
+        return ENOTDIR;
+    };
+    if inode.link_count() == 0 {
+        return ENOENT;
+    }
+
+    if len == 0 {
+        return 0;
+    }
+
+    // Stream ext4 directory entries from the on-disk format using a byte offset.
+    //
+    // This avoids rebuilding `inode.dir_entries()` on every `getdents64` call, which
+    // becomes O(n^2) for large directories (busybox `du`/`find`).
+    let block_size = inode.block_size();
+    const EXT4_DIRENT_HDR: usize = 8; // u32 ino, u16 rec_len, u8 name_len, u8 file_type
+
+    let dir_size = inode.size() as usize;
+    let mut off = os_inode.dir_offset();
+    if off >= dir_size {
+        return 0;
+    }
+
+    if crate::debug_config::DEBUG_FS {
+        let pid = current_process().getpid();
+        if pid >= 2 && (fd == 3 || fd == 4) {
+            crate::println!(
+                "[fs] getdents64(pid={}) fd={} len={} off={} dir_size={}",
+                pid,
+                fd,
+                len,
+                off,
+                dir_size
+            );
+        }
+    }
+
+    let mut kbuf = alloc::vec![0u8; len];
+    let mut written = 0usize;
+
+    let mut scratch = alloc::vec![0u8; block_size];
+    while off < dir_size && written + 24 <= len {
+        let block_start = (off / block_size) * block_size;
+        let within = off - block_start;
+        let to_read = core::cmp::min(block_size, dir_size - block_start);
+        if to_read < EXT4_DIRENT_HDR || within >= to_read {
+            break;
+        }
+        inode.read_at(block_start, &mut scratch[..to_read]);
+
+        // Parse entries within this block, starting at `within`.
+        let mut pos = within;
+        while pos + EXT4_DIRENT_HDR <= to_read && written + 24 <= len {
+            let inode_num = read_u32_le(&scratch[pos..pos + 4]);
+            let rec_len = read_u16_le(&scratch[pos + 4..pos + 6]) as usize;
+            let name_len = scratch[pos + 6] as usize;
+            let file_type = scratch[pos + 7];
+
+            if rec_len < EXT4_DIRENT_HDR || pos + rec_len > to_read {
+                // Corrupt/unsupported entry; stop to avoid looping.
+                off = dir_size;
+                break;
+            }
+
+            let next_off = block_start + pos + rec_len;
+            // Skip unused entries (inode_num == 0).
+            if inode_num != 0 && name_len > 0 && pos + EXT4_DIRENT_HDR + name_len <= pos + rec_len {
+                let name_bytes = &scratch[pos + EXT4_DIRENT_HDR..pos + EXT4_DIRENT_HDR + name_len];
+                let reclen = align_up(19 + name_len + 1, 8);
+                if written + reclen > len {
+                    // Caller buffer full; keep current offset for next call.
+                    os_inode.set_dir_offset(block_start + pos);
+                    let user_bufs =
+                        translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
+                    let mut src_off = 0usize;
+                    for ub in user_bufs {
+                        let end = src_off + ub.len();
+                        ub.copy_from_slice(&kbuf[src_off..end]);
+                        src_off = end;
+                    }
+                    return written as isize;
+                }
+
+                let base = written;
+                kbuf[base..base + 8].copy_from_slice(&(inode_num as u64).to_le_bytes());
+                kbuf[base + 8..base + 16].copy_from_slice(&(next_off as i64).to_le_bytes());
+                kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+                kbuf[base + 18] = dt_type_from_ext4(file_type);
+                kbuf[base + 19..base + 19 + name_len].copy_from_slice(name_bytes);
+                kbuf[base + 19 + name_len] = 0;
+                for b in kbuf[base + 19 + name_len + 1..base + reclen].iter_mut() {
+                    *b = 0;
+                }
+                written += reclen;
+            }
+
+            pos += rec_len;
+            off = block_start + pos;
+            if off >= dir_size {
+                break;
+            }
+        }
+    }
+
+    // Copy back to user buffer with per-page translation, avoiding per-byte translation overhead.
+    let user_bufs = translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
+    let mut src_off = 0usize;
+    for ub in user_bufs {
+        let end = src_off + ub.len();
+        ub.copy_from_slice(&kbuf[src_off..end]);
+        src_off = end;
+    }
+
+    os_inode.set_dir_offset(off);
+    drop(ext4_guard);
+    if written > 0 {
+        maybe_update_inode_atime(&inode, true);
+    }
+    written as isize
+}
+

@@ -1,0 +1,1363 @@
+use super::*;
+
+pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if !file.readable() {
+        return EBADF;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, os_inode.offset()) {
+            return e;
+        }
+    }
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = os_inode.ext4_inode();
+        let is_dir = {
+            let _ext4_guard = ext4_lock();
+            inode.is_dir()
+        };
+        if is_dir {
+            return EISDIR;
+        }
+    }
+    if fd_has_nonblock(fd) {
+        if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+            if !pipe.poll_readable() {
+                return EAGAIN;
+            }
+        } else if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
+            if !sock.poll_readable() {
+                return EAGAIN;
+            }
+        } else if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
+            if !duplex.poll_readable() {
+                return EAGAIN;
+            }
+        } else if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
+            if !eventfd.poll_readable() {
+                return EAGAIN;
+            }
+        } else if let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() {
+            if !timerfd.poll_readable() {
+                return EAGAIN;
+            }
+        }
+    }
+    if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
+        if len < core::mem::size_of::<u64>() {
+            return EINVAL;
+        }
+        let value = match eventfd.read_counter(fd_has_nonblock(fd)) {
+            Ok(value) => value,
+            Err(e) => return e,
+        };
+        if try_write_user_value(get_current_token(), buffer as *mut u64, &value).is_err() {
+            return EFAULT;
+        }
+        return core::mem::size_of::<u64>() as isize;
+    }
+    if let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() {
+        if len < core::mem::size_of::<u64>() {
+            return EINVAL;
+        }
+        let value = match timerfd.read_counter(fd_has_nonblock(fd)) {
+            Ok(value) => value,
+            Err(e) => return e,
+        };
+        if try_write_user_value(get_current_token(), buffer as *mut u64, &value).is_err() {
+            return EFAULT;
+        }
+        return core::mem::size_of::<u64>() as isize;
+    }
+    let Ok(user_bufs) = try_translated_byte_buffer(
+        get_current_token(),
+        buffer as *mut u8,
+        len,
+        MapPermission::W,
+    ) else {
+        return EFAULT;
+    };
+    let buf = UserBuffer::new(user_bufs);
+    let read_len = file.read(buf) as isize;
+    if read_len >= 0 && !fd_has_noatime(fd) {
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            let inode = os_inode.ext4_inode();
+            maybe_update_inode_atime(&inode, false);
+        }
+    }
+    read_len
+}
+
+pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if file.as_any().downcast_ref::<TimerFdFile>().is_some() {
+        return EINVAL;
+    }
+    if !file.writable() {
+        return EBADF;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return EFAULT;
+        };
+        let mut data = Vec::with_capacity(len);
+        for slice in user_bufs {
+            data.extend_from_slice(slice);
+        }
+        return match cgroup.write_payload(&data) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
+    if file.as_any().downcast_ref::<ProcPseudoFile>().is_some() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return EFAULT;
+        };
+        let mut data = Vec::with_capacity(len);
+        for slice in user_bufs {
+            data.extend_from_slice(slice);
+        }
+        if let Some(ret) = try_write_proc_pseudo_file(
+            &file,
+            &data,
+            file.as_any()
+                .downcast_ref::<ProcPseudoFile>()
+                .map(ProcPseudoFile::offset)
+                .unwrap_or(0),
+            true,
+        ) {
+            return ret;
+        }
+    }
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, os_inode.offset()) {
+            return e;
+        }
+    }
+    let write_start_off = file
+        .as_any()
+        .downcast_ref::<OSInode>()
+        .map(|inode| inode.offset());
+    let mut write_len = len;
+    if fd_has_nonblock(fd) {
+        if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+            if pipe.all_read_ends_closed() {
+                return EPIPE;
+            }
+            let avail = pipe.available_write();
+            if avail == 0 {
+                return EAGAIN;
+            }
+            if write_len <= PIPE_BUF {
+                if avail < write_len {
+                    return EAGAIN;
+                }
+            } else {
+                write_len = write_len.min(avail);
+            }
+        } else if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
+            if !sock.poll_writable() {
+                return EAGAIN;
+            }
+        } else if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
+            if duplex.write_end_closed() {
+                return EPIPE;
+            }
+            let avail = duplex.available_write();
+            if avail == 0 {
+                return EAGAIN;
+            }
+            if write_len <= PIPE_BUF {
+                if avail < write_len {
+                    return EAGAIN;
+                }
+            } else {
+                write_len = write_len.min(avail);
+            }
+        } else if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
+            if !eventfd.poll_writable() {
+                return EAGAIN;
+            }
+        }
+    }
+    if let Some(eventfd) = file.as_any().downcast_ref::<EventFdFile>() {
+        if len < core::mem::size_of::<u64>() {
+            return EINVAL;
+        }
+        let Some(value) = try_read_user_value(get_current_token(), buffer as *const u64) else {
+            return EFAULT;
+        };
+        match eventfd.write_counter(value, fd_has_nonblock(fd)) {
+            Ok(()) => return core::mem::size_of::<u64>() as isize,
+            Err(e) => return e,
+        }
+    }
+    let mut hit_fsize_limit = false;
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let fsize_limit = {
+            let process = current_process();
+            let inner = process.borrow_mut();
+            inner.rlimit_fsize_cur
+        };
+        if fsize_limit != u64::MAX {
+            let start = os_inode.offset() as u64;
+            if start >= fsize_limit && len > 0 {
+                let pid = current_process().getpid();
+                queue_process_signal(pid, SIGXFSZ_NUM);
+                return EFBIG;
+            }
+            let remain = (fsize_limit.saturating_sub(start)).min(usize::MAX as u64) as usize;
+            if write_len > remain {
+                write_len = remain;
+                hit_fsize_limit = true;
+            }
+        }
+    }
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+            return EPERM;
+        }
+        let start = shm.offset();
+        let end = start.saturating_add(write_len);
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && end > shm.len() {
+            return EPERM;
+        }
+    }
+    let Ok(user_bufs) = try_translated_byte_buffer(
+        get_current_token(),
+        buffer as *mut u8,
+        write_len,
+        MapPermission::R,
+    ) else {
+        return EFAULT;
+    };
+    let buf = UserBuffer::new(user_bufs);
+    let written = file.write(buf) as isize;
+    if written == 0 && write_len > 0 {
+        if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+            if pipe.all_read_ends_closed() {
+                return EPIPE;
+            }
+        }
+        if let Some(duplex) = file.as_any().downcast_ref::<FifoDuplexFile>() {
+            if duplex.write_end_closed() {
+                return EPIPE;
+            }
+        }
+    }
+    if written > 0 {
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            cgroup_charge_file_write(current_process().getpid(), written as usize);
+            mirror_inode_write_to_current_mmaps(
+                os_inode,
+                write_start_off.unwrap_or(0),
+                buffer,
+                written as usize,
+            );
+            if let Err(e) = os_inode.flush_with_error() {
+                return ext4_err_to_errno(e);
+            }
+        }
+    }
+    if hit_fsize_limit {
+        let pid = current_process().getpid();
+        queue_process_signal(pid, SIGXFSZ_NUM);
+    }
+    written
+}
+
+pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isize {
+    if pos < 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if !file_is_seekable_for_preadwrite(&file) {
+        return ESPIPE;
+    }
+    if !file.readable() {
+        return EBADF;
+    }
+    if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, pos as usize) {
+        return e;
+    }
+
+    // ext4 regular files
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = os_inode.ext4_inode();
+        let is_dir = {
+            let _ext4_guard = ext4_lock();
+            inode.is_dir()
+        };
+        if is_dir {
+            return EISDIR;
+        }
+
+        let mut total = 0usize;
+        let token = get_current_token();
+        let mut off = pos as usize;
+        let mut user_ptr = buffer;
+        const CHUNK_MAX: usize = 16 * 1024;
+        let buf_cap = core::cmp::min(len, CHUNK_MAX);
+        let mut kbuf = vec![0u8; buf_cap];
+        while total < len {
+            let want = core::cmp::min(len - total, buf_cap);
+            let n = os_inode.pread_at(off, &mut kbuf[..want]);
+            if n == 0 {
+                break;
+            }
+            if try_copy_to_user(token, user_ptr as *mut u8, &kbuf[..n]).is_err() {
+                return if total > 0 { total as isize } else { EFAULT };
+            }
+            total += n;
+            off += n;
+            user_ptr += n;
+            if n < want {
+                break;
+            }
+        }
+        if !fd_has_noatime(fd) {
+            maybe_update_inode_atime(&inode, false);
+        }
+        return total as isize;
+    }
+
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        let old = shm.offset();
+        shm.set_offset(pos as usize);
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            shm.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
+        let n = file.read(buf) as isize;
+        shm.set_offset(old);
+        return n;
+    }
+
+    if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
+        let old = proc_file.offset();
+        proc_file.set_offset(pos as usize);
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            proc_file.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
+        let n = file.read(buf) as isize;
+        proc_file.set_offset(old);
+        return n;
+    }
+
+    // Seekable pseudo files: emulate by temporarily adjusting the per-fd offset.
+    if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+        if pf.len().is_none() {
+            return ESPIPE;
+        }
+        let old = pf.offset();
+        pf.set_offset(pos as usize);
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            pf.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
+        let n = file.read(buf) as isize;
+        pf.set_offset(old);
+        return n;
+    }
+
+    ESPIPE
+}
+
+pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isize {
+    if pos < 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    if !file_is_seekable_for_preadwrite(&file) {
+        return ESPIPE;
+    }
+    if !file.writable() {
+        return EBADF;
+    }
+    if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, pos as usize) {
+        return e;
+    }
+
+    // ext4 regular files
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = os_inode.ext4_inode();
+        let is_dir = {
+            let _ext4_guard = ext4_lock();
+            inode.is_dir()
+        };
+        if is_dir {
+            return EISDIR;
+        }
+
+        let effective_pos = if os_inode.append() {
+            let disk_end = {
+                let _ext4_guard = ext4_lock();
+                inode.size() as usize
+            };
+            core::cmp::max(disk_end, os_inode.pending_write_end())
+        } else {
+            pos as usize
+        };
+
+        let mut write_len = len;
+        let mut hit_fsize_limit = false;
+        let fsize_limit = {
+            let process = current_process();
+            let inner = process.borrow_mut();
+            inner.rlimit_fsize_cur
+        };
+        if fsize_limit != u64::MAX {
+            let start = effective_pos as u64;
+            if start >= fsize_limit && len > 0 {
+                let pid = current_process().getpid();
+                queue_process_signal(pid, SIGXFSZ_NUM);
+                return EFBIG;
+            }
+            let remain = (fsize_limit.saturating_sub(start)).min(usize::MAX as u64) as usize;
+            if write_len > remain {
+                write_len = remain;
+                hit_fsize_limit = true;
+            }
+        }
+        let mut total = 0usize;
+        let token = get_current_token();
+        let mut off = effective_pos;
+        let mut user_ptr = buffer;
+        const CHUNK_MAX: usize = 16 * 1024;
+        let buf_cap = core::cmp::min(write_len, CHUNK_MAX);
+        let mut kbuf = vec![0u8; buf_cap];
+        while total < write_len {
+            let want = core::cmp::min(write_len - total, buf_cap);
+            if try_copy_from_user(token, user_ptr as *const u8, &mut kbuf[..want]).is_err() {
+                return if total > 0 { total as isize } else { EFAULT };
+            }
+            match os_inode.pwrite_at(off, &kbuf[..want]) {
+                Ok(n) => {
+                    total += n;
+                    off += n;
+                    user_ptr += n;
+                    if n < want {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    crate::println!("[ext4] Warning: pwrite failed");
+                    return if total > 0 { total as isize } else { EIO };
+                }
+            }
+        }
+        if hit_fsize_limit {
+            let pid = current_process().getpid();
+            queue_process_signal(pid, SIGXFSZ_NUM);
+        }
+        if total > 0 {
+            cgroup_charge_file_write(current_process().getpid(), total);
+        }
+        return total as isize;
+    }
+
+    if file.as_any().downcast_ref::<ProcPseudoFile>().is_some() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return EFAULT;
+        };
+        let mut data = Vec::with_capacity(len);
+        for slice in user_bufs {
+            data.extend_from_slice(slice);
+        }
+        if let Some(ret) = try_write_proc_pseudo_file(&file, &data, pos as usize, false) {
+            return ret;
+        }
+    }
+
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+            return EPERM;
+        }
+        let start = pos as usize;
+        let end = start.saturating_add(len);
+        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && end > shm.len() {
+            return EPERM;
+        }
+        let old = shm.offset();
+        shm.set_offset(start);
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            shm.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
+        let n = file.write(buf) as isize;
+        shm.set_offset(old);
+        return n;
+    }
+
+    // Seekable pseudo files: emulate by temporarily adjusting the per-fd offset.
+    if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+        if pf.len().is_none() {
+            return ESPIPE;
+        }
+        let old = pf.offset();
+        pf.set_offset(pos as usize);
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            pf.set_offset(old);
+            return EFAULT;
+        };
+        let buf = UserBuffer::new(user_bufs);
+        let n = file.write(buf) as isize;
+        pf.set_offset(old);
+        return n;
+    }
+
+    if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+        if pos != 0 {
+            return EINVAL;
+        }
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return EFAULT;
+        };
+        let mut data = Vec::with_capacity(len);
+        for slice in user_bufs {
+            data.extend_from_slice(slice);
+        }
+        return match cgroup.write_payload(&data) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
+
+    ESPIPE
+}
+
+pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize) -> isize {
+    if count == 0 {
+        return 0;
+    }
+    if fd_has_o_path(in_fd) || fd_has_o_path(out_fd) {
+        return EBADF;
+    }
+    let Some(in_file) = get_fd_file(in_fd) else {
+        return EBADF;
+    };
+    let Some(out_file) = get_fd_file(out_fd) else {
+        return EBADF;
+    };
+    if !in_file.readable() || !out_file.writable() {
+        return EBADF;
+    }
+
+    let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let raw_in_pos = match read_optional_offset(offset) {
+        Ok(Some(v)) => v,
+        Ok(None) => in_inode.offset(),
+        Err(e) => return e,
+    };
+
+    let out_is_socketpair = out_file.as_any().downcast_ref::<SocketPairEnd>().is_some();
+    let nonblock = fd_has_nonblock(out_fd);
+    if nonblock && out_is_socketpair {
+        let Some(sock) = out_file.as_any().downcast_ref::<SocketPairEnd>() else {
+            return EINVAL;
+        };
+        if !sock.poll_writable() {
+            return EAGAIN;
+        }
+    }
+
+    let mut in_pos = raw_in_pos;
+    let mut total = 0usize;
+    let mut remaining = count;
+    let mut out_pos = 0usize;
+    let mut out_inode_opt = out_file.as_any().downcast_ref::<OSInode>();
+    if let Some(out_inode) = out_inode_opt {
+        if out_inode.readonly_fs() {
+            return EROFS;
+        }
+        out_pos = out_inode.offset();
+    }
+    let mut buf = vec![0u8; core::cmp::min(remaining, 16 * 1024)];
+    while remaining > 0 {
+        let want = core::cmp::min(remaining, buf.len());
+        let read = in_inode.pread_at(in_pos, &mut buf[..want]);
+        if read == 0 {
+            break;
+        }
+        let wrote = if let Some(out_inode) = out_inode_opt {
+            match out_inode.pwrite_at(out_pos, &buf[..read]) {
+                Ok(n) => n,
+                Err(_) => return if total > 0 { total as isize } else { EIO },
+            }
+        } else if out_is_socketpair {
+            match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if total > 0 { total as isize } else { e },
+            }
+        } else {
+            return if total > 0 { total as isize } else { EINVAL };
+        };
+        if wrote == 0 {
+            break;
+        }
+        total += wrote;
+        remaining -= wrote;
+        in_pos += wrote;
+        if out_inode_opt.is_some() {
+            out_pos += wrote;
+        }
+        if wrote < read {
+            break;
+        }
+    }
+
+    let mut flush_failed = false;
+    if let Some(out_inode) = out_inode_opt {
+        flush_failed = total > 0 && out_inode.flush().is_err();
+        out_inode.set_offset(out_pos);
+    }
+
+    if offset == 0 {
+        in_inode.set_offset(in_pos);
+    } else if let Err(e) = write_optional_offset(offset, in_pos) {
+        return e;
+    }
+    if flush_failed {
+        return EIO;
+    }
+    total as isize
+}
+
+pub fn syscall_splice(
+    fd_in: usize,
+    off_in: usize,
+    fd_out: usize,
+    off_out: usize,
+    len: usize,
+    flags: usize,
+) -> isize {
+    let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
+        return EBADF;
+    }
+    let Some(in_file) = get_fd_file(fd_in) else {
+        return EBADF;
+    };
+    let Some(out_file) = get_fd_file(fd_out) else {
+        return EBADF;
+    };
+    if !in_file.readable() || !out_file.writable() {
+        return EBADF;
+    }
+    let in_is_pipe = file_is_pipe(&in_file);
+    let out_is_pipe = file_is_pipe(&out_file);
+    if !in_is_pipe && !out_is_pipe {
+        return EINVAL;
+    }
+    if in_is_pipe && off_in != 0 {
+        return ESPIPE;
+    }
+    if out_is_pipe && off_out != 0 {
+        return ESPIPE;
+    }
+    if !out_is_pipe
+        && (fd_has_append(fd_out)
+            || out_file
+                .as_any()
+                .downcast_ref::<OSInode>()
+                .map(|f| f.append())
+                .unwrap_or(false))
+    {
+        return EINVAL;
+    }
+    let out_is_inode = out_file.as_any().downcast_ref::<OSInode>().is_some();
+    let out_is_socketpair = out_file.as_any().downcast_ref::<SocketPairEnd>().is_some();
+    if !out_is_pipe && !out_is_inode && !out_is_socketpair {
+        return EINVAL;
+    }
+    let in_is_inode = in_file.as_any().downcast_ref::<OSInode>().is_some();
+    if !in_is_pipe && !in_is_inode {
+        return EINVAL;
+    }
+
+    let nonblock =
+        (flags & SPLICE_F_NONBLOCK) != 0 || fd_has_nonblock(fd_in) || fd_has_nonblock(fd_out);
+    let mut in_pos = if in_is_pipe {
+        0usize
+    } else {
+        match read_optional_offset(off_in) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
+                    return EINVAL;
+                };
+                in_inode.offset()
+            }
+            Err(e) => return e,
+        }
+    };
+    let mut out_pos = if out_is_pipe {
+        0usize
+    } else {
+        match read_optional_offset(off_out) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                if let Some(out_inode) = out_file.as_any().downcast_ref::<OSInode>() {
+                    out_inode.offset()
+                } else {
+                    0
+                }
+            }
+            Err(e) => return e,
+        }
+    };
+
+    let mut moved = 0usize;
+    let mut buf = vec![0u8; core::cmp::min(len, PIPE_BUF)];
+    while moved < len {
+        let want = core::cmp::min(buf.len(), len - moved);
+        let read = if in_is_pipe {
+            if nonblock {
+                if let Some(pipe) = out_file.as_any().downcast_ref::<Pipe>() {
+                    if !pipe.poll_writable() {
+                        return if moved > 0 { moved as isize } else { EAGAIN };
+                    }
+                } else if let Some(sock) = out_file.as_any().downcast_ref::<SocketPairEnd>() {
+                    if !sock.poll_writable() {
+                        return if moved > 0 { moved as isize } else { EAGAIN };
+                    }
+                }
+            }
+            match pipe_read_to_kernel(&in_file, &mut buf[..want], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if moved > 0 { moved as isize } else { e },
+            }
+        } else {
+            let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
+                return if moved > 0 { moved as isize } else { EINVAL };
+            };
+            let is_file = {
+                let inode = in_inode.ext4_inode();
+                let _ext4_guard = ext4_lock();
+                inode.is_file()
+            };
+            if !is_file {
+                return if moved > 0 { moved as isize } else { EINVAL };
+            }
+            let n = in_inode.pread_at(in_pos, &mut buf[..want]);
+            if n == 0 {
+                break;
+            }
+            n
+        };
+        if read == 0 {
+            break;
+        }
+
+        let wrote = if out_is_pipe {
+            match pipe_write_from_kernel(&out_file, &buf[..read], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if moved > 0 { moved as isize } else { e },
+            }
+        } else if let Some(out_inode) = out_file.as_any().downcast_ref::<OSInode>() {
+            let is_file = {
+                let inode = out_inode.ext4_inode();
+                let _ext4_guard = ext4_lock();
+                inode.is_file()
+            };
+            if !is_file {
+                return if moved > 0 { moved as isize } else { EINVAL };
+            }
+            if out_inode.readonly_fs() {
+                return if moved > 0 { moved as isize } else { EROFS };
+            }
+            match out_inode.pwrite_at(out_pos, &buf[..read]) {
+                Ok(n) => n,
+                Err(_) => return if moved > 0 { moved as isize } else { EIO },
+            }
+        } else if out_file.as_any().downcast_ref::<SocketPairEnd>().is_some() {
+            match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if moved > 0 { moved as isize } else { e },
+            }
+        } else {
+            return if moved > 0 { moved as isize } else { EINVAL };
+        };
+        if wrote == 0 {
+            break;
+        }
+        moved += wrote;
+        if !in_is_pipe {
+            in_pos += wrote;
+        }
+        if !out_is_pipe && out_file.as_any().downcast_ref::<OSInode>().is_some() {
+            out_pos += wrote;
+        }
+        if wrote < read {
+            break;
+        }
+    }
+
+    if !in_is_pipe {
+        if off_in == 0 {
+            if let Some(in_inode) = in_file.as_any().downcast_ref::<OSInode>() {
+                in_inode.set_offset(in_pos);
+            }
+        } else if let Err(e) = write_optional_offset(off_in, in_pos) {
+            return e;
+        }
+    }
+    if !out_is_pipe {
+        if let Some(out_inode) = out_file.as_any().downcast_ref::<OSInode>() {
+            if moved > 0 && out_inode.flush().is_err() {
+                return EIO;
+            }
+            if off_out == 0 {
+                out_inode.set_offset(out_pos);
+            } else if let Err(e) = write_optional_offset(off_out, out_pos) {
+                return e;
+            }
+        }
+    }
+    moved as isize
+}
+
+pub fn syscall_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isize {
+    let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
+        return EBADF;
+    }
+    let Some(in_file) = get_fd_file(fd_in) else {
+        return EBADF;
+    };
+    let Some(out_file) = get_fd_file(fd_out) else {
+        return EBADF;
+    };
+    if !in_file.readable() || !out_file.writable() {
+        return EBADF;
+    }
+    let Some(in_pipe) = in_file.as_any().downcast_ref::<Pipe>() else {
+        return EINVAL;
+    };
+    let Some(out_pipe) = out_file.as_any().downcast_ref::<Pipe>() else {
+        return EINVAL;
+    };
+    if in_pipe.same_buffer(out_pipe) {
+        return EINVAL;
+    }
+    let nonblock =
+        (flags & SPLICE_F_NONBLOCK) != 0 || fd_has_nonblock(fd_in) || fd_has_nonblock(fd_out);
+    let mut copied = 0usize;
+    let mut buf = vec![0u8; core::cmp::min(len, PIPE_BUF)];
+    let mut consume_buf = vec![0u8; core::cmp::min(len, PIPE_BUF)];
+    while copied < len {
+        let want = core::cmp::min(len - copied, buf.len());
+        let peeked = match in_pipe.peek_to_slice(&mut buf[..want], nonblock) {
+            Ok(n) => n,
+            Err(e) => return if copied > 0 { copied as isize } else { e },
+        };
+        if peeked == 0 {
+            break;
+        }
+        let wrote = match out_pipe.write_from_slice(&buf[..peeked], nonblock) {
+            Ok(n) => n,
+            Err(e) => return if copied > 0 { copied as isize } else { e },
+        };
+        if wrote == 0 {
+            break;
+        }
+        let consumed = match in_pipe.read_to_slice(&mut consume_buf[..wrote], true) {
+            Ok(n) => n,
+            Err(e) => return if copied > 0 { copied as isize } else { e },
+        };
+        if consumed == 0 {
+            break;
+        }
+        copied += consumed;
+        if consumed < peeked {
+            break;
+        }
+    }
+    copied as isize
+}
+
+pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize) -> isize {
+    let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
+    if (flags & !valid_flags) != 0 {
+        return EINVAL;
+    }
+    if fd_has_o_path(fd) {
+        return EBADF;
+    }
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+    let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
+        return EBADF;
+    };
+    if nr_segs > IOV_MAX {
+        return EINVAL;
+    }
+    if nr_segs == 0 {
+        return 0;
+    }
+    let nonblock = (flags & SPLICE_F_NONBLOCK) != 0 || fd_has_nonblock(fd);
+    let token = get_current_token();
+    let mut total = 0usize;
+    let mut scratch = vec![0u8; PIPE_BUF];
+    for i in 0..nr_segs {
+        let iv = match read_vm_iovec(token, iov_ptr, i) {
+            Ok(v) => v,
+            Err(e) => return if total > 0 { total as isize } else { e },
+        };
+        if iv.iov_len == 0 {
+            continue;
+        }
+        if file.writable() {
+            let mut seg_off = 0usize;
+            while seg_off < iv.iov_len {
+                let want = core::cmp::min(iv.iov_len - seg_off, scratch.len());
+                let src_ptr = (iv.iov_base + seg_off) as *const u8;
+                if try_copy_from_user(token, src_ptr, &mut scratch[..want]).is_err() {
+                    return if total > 0 { total as isize } else { EFAULT };
+                }
+                // Linux may return a short vmsplice() once some bytes are moved.
+                // Avoid blocking indefinitely trying to drain very large iovecs.
+                let write_nonblock = nonblock || total > 0 || seg_off > 0;
+                let wrote = match pipe.write_from_slice(&scratch[..want], write_nonblock) {
+                    Ok(n) => n,
+                    Err(e) => return if total > 0 { total as isize } else { e },
+                };
+                if wrote == 0 {
+                    return if total > 0 { total as isize } else { EPIPE };
+                }
+                total += wrote;
+                seg_off += wrote;
+                if wrote < want {
+                    break;
+                }
+            }
+        } else if file.readable() {
+            let mut seg_off = 0usize;
+            while seg_off < iv.iov_len {
+                let want = core::cmp::min(iv.iov_len - seg_off, scratch.len());
+                let read = match pipe.read_to_slice(&mut scratch[..want], nonblock) {
+                    Ok(n) => n,
+                    Err(e) => return if total > 0 { total as isize } else { e },
+                };
+                if read == 0 {
+                    return total as isize;
+                }
+                let dst_ptr = (iv.iov_base + seg_off) as *mut u8;
+                if try_copy_to_user(token, dst_ptr, &scratch[..read]).is_err() {
+                    return if total > 0 { total as isize } else { EFAULT };
+                }
+                total += read;
+                seg_off += read;
+                if read < want {
+                    break;
+                }
+            }
+        } else {
+            return if total > 0 { total as isize } else { EBADF };
+        }
+    }
+    total as isize
+}
+
+pub fn syscall_copy_file_range(
+    fd_in: usize,
+    off_in: usize,
+    fd_out: usize,
+    off_out: usize,
+    len: usize,
+    flags: usize,
+) -> isize {
+    // Keep an explicit max file-size guard so oversized ranges still report EFBIG
+    // (used by LTP copy_file_range02), but do not cap normal file copies too low.
+    const COPY_FILE_RANGE_MAX_FILE_SIZE: u64 = 1u64 << 40; // 1 TiB
+    if flags != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if len > i64::MAX as usize {
+        return EOVERFLOW;
+    }
+    if fd_has_o_path(fd_in) || fd_has_o_path(fd_out) {
+        return EBADF;
+    }
+    let Some(in_file) = get_fd_file(fd_in) else {
+        return EBADF;
+    };
+    let Some(out_file) = get_fd_file(fd_out) else {
+        return EBADF;
+    };
+    if !in_file.readable() {
+        return EBADF;
+    }
+    let Some(in_os_inode) = in_file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let Some(out_os_inode) = out_file.as_any().downcast_ref::<OSInode>() else {
+        return EINVAL;
+    };
+    let in_inode = in_os_inode.ext4_inode();
+    let out_inode = out_os_inode.ext4_inode();
+    if out_inode.is_dir() {
+        return EISDIR;
+    }
+    if !out_file.writable() {
+        return EBADF;
+    }
+    if out_os_inode.append() {
+        return EBADF;
+    }
+    if out_os_inode.readonly_fs() {
+        return EROFS;
+    }
+    if in_inode.device_id() != out_inode.device_id() {
+        return EXDEV;
+    }
+    if !in_inode.is_file() || !out_inode.is_file() {
+        return EINVAL;
+    }
+
+    let token = get_current_token();
+    let mut in_pos = if off_in == 0 {
+        in_os_inode.offset()
+    } else {
+        let Some(v) = try_read_user_value(token, off_in as *const i64) else {
+            return EFAULT;
+        };
+        if v < 0 {
+            return EINVAL;
+        }
+        v as usize
+    };
+    let mut out_pos = if off_out == 0 {
+        out_os_inode.offset()
+    } else {
+        let Some(v) = try_read_user_value(token, off_out as *const i64) else {
+            return EFAULT;
+        };
+        if v < 0 {
+            return EINVAL;
+        }
+        v as usize
+    };
+
+    if len > 0 && (out_pos as u64) >= COPY_FILE_RANGE_MAX_FILE_SIZE {
+        return EFBIG;
+    }
+    if in_inode.inode_num() == out_inode.inode_num() {
+        let in_end = in_pos.saturating_add(len);
+        let out_end = out_pos.saturating_add(len);
+        if in_pos < out_end && out_pos < in_end {
+            return EINVAL;
+        }
+    }
+
+    let mut copied = 0usize;
+    let mut remaining = len;
+    let mut buf = vec![0u8; core::cmp::min(remaining, 16 * 1024)];
+    while remaining > 0 {
+        let room = COPY_FILE_RANGE_MAX_FILE_SIZE.saturating_sub(out_pos as u64) as usize;
+        if room == 0 {
+            if copied == 0 {
+                return EFBIG;
+            }
+            break;
+        }
+        let want = core::cmp::min(remaining, core::cmp::min(buf.len(), room));
+        let read = in_os_inode.pread_at(in_pos, &mut buf[..want]);
+        if read == 0 {
+            break;
+        }
+        let written = match out_os_inode.pwrite_at(out_pos, &buf[..read]) {
+            Ok(v) => v,
+            Err(_) => return EIO,
+        };
+        if written == 0 {
+            break;
+        }
+        copied += written;
+        in_pos += written;
+        out_pos += written;
+        remaining -= written;
+        if written < read {
+            break;
+        }
+    }
+    if copied > 0 {
+        let _ = out_os_inode.flush();
+        touch_inode_mtime_ctime_now(&out_inode);
+    }
+
+    if off_in == 0 {
+        in_os_inode.set_offset(in_pos);
+    } else {
+        let next = in_pos as i64;
+        if try_write_user_value(token, off_in as *mut i64, &next).is_err() {
+            return EFAULT;
+        }
+    }
+    if off_out == 0 {
+        out_os_inode.set_offset(out_pos);
+    } else {
+        let next = out_pos as i64;
+        if try_write_user_value(token, off_out as *mut i64, &next).is_err() {
+            return EFAULT;
+        }
+    }
+
+    copied as isize
+}
+
+pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
+    const SEEK_SET: usize = 0;
+    const SEEK_CUR: usize = 1;
+    const SEEK_END: usize = 2;
+    const PSEUDO_ROOT_DEV_BYTES: usize = 1024 * 1024 * 1024;
+
+    let Some(file) = get_fd_file(fd) else {
+        return EBADF;
+    };
+
+    // Directories: map seek position to our per-fd `dir_offset`.
+    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
+        let cur = pdir.index() as isize;
+        let end = pdir.entries().len() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        pdir.set_index(new as usize);
+        return new;
+    }
+
+    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let inode = os_inode.ext4_inode();
+        let (is_dir, is_fifo, end) = {
+            let _ext4_guard = ext4_lock();
+            let disk = inode.size() as usize;
+            let end = core::cmp::max(disk, os_inode.pending_write_end()) as isize;
+            (inode.is_dir(), inode.is_fifo(), end)
+        };
+        if is_fifo {
+            return ESPIPE;
+        }
+
+        if is_dir {
+            let cur = os_inode.dir_offset() as isize;
+            let new = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => cur.saturating_add(offset),
+                SEEK_END => end.saturating_add(offset),
+                _ => return EINVAL,
+            };
+            if new < 0 {
+                return EINVAL;
+            }
+            os_inode.set_dir_offset(new as usize);
+            return new;
+        }
+
+        // Regular files: adjust read/write offset.
+        let cur = os_inode.offset() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        os_inode.set_offset(new as usize);
+        return new;
+    }
+
+    if let Some(pblk) = file.as_any().downcast_ref::<PseudoBlock>() {
+        let cur = pblk.offset() as isize;
+        let end = PSEUDO_ROOT_DEV_BYTES as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        pblk.set_offset(new as usize);
+        return new;
+    }
+
+    // Pseudo regular files: allow seeking for static content (e.g., `/dev` nodes),
+    // which libc helpers (busybox `df`) may `rewind()` via lseek.
+    if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
+        let Some(end) = pf.len().map(|n| n as isize) else {
+            return ESPIPE;
+        };
+        let cur = pf.offset() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        pf.set_offset(new as usize);
+        return new;
+    }
+
+    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        let end = shm.len() as isize;
+        let cur = shm.offset() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        shm.set_offset(new as usize);
+        return new;
+    }
+
+    if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
+        let cur = proc_file.offset() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => proc_file.seek_end().saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        proc_file.set_offset(new as usize);
+        return new;
+    }
+
+    if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
+        let cur = cgroup.offset() as isize;
+        let end = cgroup.len() as isize;
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return EINVAL,
+        };
+        if new < 0 {
+            return EINVAL;
+        }
+        cgroup.set_offset(new as usize);
+        return new;
+    }
+
+    ESPIPE
+}
+
