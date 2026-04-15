@@ -1,8 +1,9 @@
 pub mod mm;
 pub mod trap;
 
-use crate::task::task_block::TaskControlBlock;
+use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
 use alloc::sync::Arc;
+use spin::MutexGuard;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -166,9 +167,191 @@ pub fn read_time() -> usize {
     counter
 }
 
-pub fn save_user_fp_state(_task: &Arc<TaskControlBlock>) {}
+/// Enable LoongArch floating-point unit (EUEN.FPE = 1, CSR 0x2 bit 0).
+#[inline]
+fn ensure_fp_enabled() {
+    unsafe {
+        let mut euen: usize;
+        asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
+        if (euen & 1) == 0 {
+            euen |= 1;
+            asm!("csrwr {}, 0x2", in(reg) euen, options(nostack));
+        }
+    }
+}
 
-pub fn restore_user_fp_state(_task: &Arc<TaskControlBlock>) {}
+#[inline]
+fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
+    ensure_fp_enabled();
+    let ptr = inner.fp_regs.as_mut_ptr();
+    unsafe {
+        asm!(
+            "fst.d $f0, {base}, 0",
+            "fst.d $f1, {base}, 8",
+            "fst.d $f2, {base}, 16",
+            "fst.d $f3, {base}, 24",
+            "fst.d $f4, {base}, 32",
+            "fst.d $f5, {base}, 40",
+            "fst.d $f6, {base}, 48",
+            "fst.d $f7, {base}, 56",
+            "fst.d $f8, {base}, 64",
+            "fst.d $f9, {base}, 72",
+            "fst.d $f10, {base}, 80",
+            "fst.d $f11, {base}, 88",
+            "fst.d $f12, {base}, 96",
+            "fst.d $f13, {base}, 104",
+            "fst.d $f14, {base}, 112",
+            "fst.d $f15, {base}, 120",
+            "fst.d $f16, {base}, 128",
+            "fst.d $f17, {base}, 136",
+            "fst.d $f18, {base}, 144",
+            "fst.d $f19, {base}, 152",
+            "fst.d $f20, {base}, 160",
+            "fst.d $f21, {base}, 168",
+            "fst.d $f22, {base}, 176",
+            "fst.d $f23, {base}, 184",
+            "fst.d $f24, {base}, 192",
+            "fst.d $f25, {base}, 200",
+            "fst.d $f26, {base}, 208",
+            "fst.d $f27, {base}, 216",
+            "fst.d $f28, {base}, 224",
+            "fst.d $f29, {base}, 232",
+            "fst.d $f30, {base}, 240",
+            "fst.d $f31, {base}, 248",
+            base = in(reg) ptr,
+            options(nostack)
+        );
+        // Save FCSR (floating-point control/status register).
+        let fcsr: u32;
+        asm!("movfcsr2gr {}, $fcsr0", out(reg) fcsr, options(nostack));
+        inner.fp_fcsr = fcsr;
+        // Save FCC0-FCC7 (condition code registers, 1 bit each).
+        let fcc0: u32;
+        let fcc1: u32;
+        let fcc2: u32;
+        let fcc3: u32;
+        let fcc4: u32;
+        let fcc5: u32;
+        let fcc6: u32;
+        let fcc7: u32;
+        asm!(
+            "movcf2gr {fcc0}, $fcc0",
+            "movcf2gr {fcc1}, $fcc1",
+            "movcf2gr {fcc2}, $fcc2",
+            "movcf2gr {fcc3}, $fcc3",
+            "movcf2gr {fcc4}, $fcc4",
+            "movcf2gr {fcc5}, $fcc5",
+            "movcf2gr {fcc6}, $fcc6",
+            "movcf2gr {fcc7}, $fcc7",
+            fcc0 = out(reg) fcc0,
+            fcc1 = out(reg) fcc1,
+            fcc2 = out(reg) fcc2,
+            fcc3 = out(reg) fcc3,
+            fcc4 = out(reg) fcc4,
+            fcc5 = out(reg) fcc5,
+            fcc6 = out(reg) fcc6,
+            fcc7 = out(reg) fcc7,
+            options(nostack)
+        );
+        inner.fp_fcc = ((fcc0 & 1)
+            | ((fcc1 & 1) << 1)
+            | ((fcc2 & 1) << 2)
+            | ((fcc3 & 1) << 3)
+            | ((fcc4 & 1) << 4)
+            | ((fcc5 & 1) << 5)
+            | ((fcc6 & 1) << 6)
+            | ((fcc7 & 1) << 7)) as u8;
+        inner.fp_valid = true;
+    }
+}
+
+#[inline]
+fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
+    if !inner.fp_valid {
+        return;
+    }
+    ensure_fp_enabled();
+    let ptr = inner.fp_regs.as_ptr();
+    unsafe {
+        asm!(
+            "fld.d $f0, {base}, 0",
+            "fld.d $f1, {base}, 8",
+            "fld.d $f2, {base}, 16",
+            "fld.d $f3, {base}, 24",
+            "fld.d $f4, {base}, 32",
+            "fld.d $f5, {base}, 40",
+            "fld.d $f6, {base}, 48",
+            "fld.d $f7, {base}, 56",
+            "fld.d $f8, {base}, 64",
+            "fld.d $f9, {base}, 72",
+            "fld.d $f10, {base}, 80",
+            "fld.d $f11, {base}, 88",
+            "fld.d $f12, {base}, 96",
+            "fld.d $f13, {base}, 104",
+            "fld.d $f14, {base}, 112",
+            "fld.d $f15, {base}, 120",
+            "fld.d $f16, {base}, 128",
+            "fld.d $f17, {base}, 136",
+            "fld.d $f18, {base}, 144",
+            "fld.d $f19, {base}, 152",
+            "fld.d $f20, {base}, 160",
+            "fld.d $f21, {base}, 168",
+            "fld.d $f22, {base}, 176",
+            "fld.d $f23, {base}, 184",
+            "fld.d $f24, {base}, 192",
+            "fld.d $f25, {base}, 200",
+            "fld.d $f26, {base}, 208",
+            "fld.d $f27, {base}, 216",
+            "fld.d $f28, {base}, 224",
+            "fld.d $f29, {base}, 232",
+            "fld.d $f30, {base}, 240",
+            "fld.d $f31, {base}, 248",
+            base = in(reg) ptr,
+            options(nostack)
+        );
+        // Restore FCSR.
+        asm!("movgr2fcsr $fcsr0, {}", in(reg) inner.fp_fcsr, options(nostack));
+        // Restore FCC0-FCC7.
+        let fcc = inner.fp_fcc;
+        let fcc0 = (fcc & 1) as u32;
+        let fcc1 = ((fcc >> 1) & 1) as u32;
+        let fcc2 = ((fcc >> 2) & 1) as u32;
+        let fcc3 = ((fcc >> 3) & 1) as u32;
+        let fcc4 = ((fcc >> 4) & 1) as u32;
+        let fcc5 = ((fcc >> 5) & 1) as u32;
+        let fcc6 = ((fcc >> 6) & 1) as u32;
+        let fcc7 = ((fcc >> 7) & 1) as u32;
+        asm!(
+            "movgr2cf $fcc0, {fcc0}",
+            "movgr2cf $fcc1, {fcc1}",
+            "movgr2cf $fcc2, {fcc2}",
+            "movgr2cf $fcc3, {fcc3}",
+            "movgr2cf $fcc4, {fcc4}",
+            "movgr2cf $fcc5, {fcc5}",
+            "movgr2cf $fcc6, {fcc6}",
+            "movgr2cf $fcc7, {fcc7}",
+            fcc0 = in(reg) fcc0,
+            fcc1 = in(reg) fcc1,
+            fcc2 = in(reg) fcc2,
+            fcc3 = in(reg) fcc3,
+            fcc4 = in(reg) fcc4,
+            fcc5 = in(reg) fcc5,
+            fcc6 = in(reg) fcc6,
+            fcc7 = in(reg) fcc7,
+            options(nostack)
+        );
+    }
+}
+
+pub fn save_user_fp_state(task: &Arc<TaskControlBlock>) {
+    let mut inner = task.borrow_mut();
+    save_fp_registers(&mut inner);
+}
+
+pub fn restore_user_fp_state(task: &Arc<TaskControlBlock>) {
+    let inner = task.borrow_mut();
+    restore_fp_registers(&inner);
+}
 
 fn read_cpucfg(index: u32) -> u32 {
     let mut value = index;

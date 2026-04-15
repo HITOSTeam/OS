@@ -512,6 +512,8 @@ pub struct TaskControlBlockInner {
     pub fp_regs: [u64; 32],
     /// Saved floating-point control/status register.
     pub fp_fcsr: u32,
+    /// Saved floating-point condition code registers (LoongArch FCC0-FCC7).
+    pub fp_fcc: u8,
     /// Whether `fp_regs/fp_fcsr` contain a valid snapshot.
     pub fp_valid: bool,
 }
@@ -596,6 +598,7 @@ impl TaskControlBlock {
                 nice_query_hint: false,
                 fp_regs: [0; 32],
                 fp_fcsr: 0,
+                fp_fcc: 0,
                 fp_valid: false,
             }),
         })
@@ -675,6 +678,7 @@ impl TaskControlBlock {
                 nice_query_hint: false,
                 fp_regs: [0; 32],
                 fp_fcsr: 0,
+                fp_fcc: 0,
                 fp_valid: false,
             }),
         })
