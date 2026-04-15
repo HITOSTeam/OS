@@ -20,9 +20,6 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
             .into_iter()
             .filter_map(|p| {
                 let inner = p.borrow_mut();
-                if p.getpid() == self_pid {
-                    return None;
-                }
                 if current_ns_id != 0
                     && !crate::task::process_visible_in_pid_namespace(&p, current_ns_id)
                 {
@@ -38,7 +35,7 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
         -1 => procs
             .into_iter()
             .filter_map(|p| {
-                if p.getpid() == 0 || p.getpid() == self_pid {
+                if p.getpid() <= 1 || p.getpid() == self_pid {
                     return None;
                 }
                 if current_ns_id != 0
@@ -55,9 +52,6 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
                 .into_iter()
                 .filter_map(|p| {
                     let inner = p.borrow_mut();
-                    if p.getpid() == self_pid {
-                        return None;
-                    }
                     if current_ns_id != 0
                         && !crate::task::process_visible_in_pid_namespace(&p, current_ns_id)
                     {
