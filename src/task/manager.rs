@@ -26,7 +26,7 @@ pub fn mark_hart_online(hart_id: usize) {
     }
 }
 
-fn online_hart_mask() -> usize {
+pub fn online_hart_mask() -> usize {
     let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
     // Fallback: at least hart0 exists.
     if mask == 0 {

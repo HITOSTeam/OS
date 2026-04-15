@@ -973,6 +973,27 @@ impl MemorySet {
         for (vpn, flags) in parent_updates {
             user_space.set_pte_flags(vpn, flags);
         }
+        if parent_update_count != 0 {
+            // SAFETY: after fork demotes parent PTEs from writable to read-only+COW,
+            // every hart running the parent must drop stale writable TLB entries
+            // before it can resume, or it may keep writing shared pages behind COW.
+            #[cfg(target_arch = "riscv64")]
+            {
+                let remote_hart_mask = crate::task::manager::online_hart_mask()
+                    & !(1usize << crate::arch::hart_id());
+                unsafe {
+                    asm!("sfence.vma");
+                }
+                crate::sbi::remote_sfence_vma_all(remote_hart_mask);
+            }
+            // SAFETY: LoongArch64 currently runs single-core only (no SMP boot),
+            // so a local full TLB flush is sufficient. When SMP is added, a
+            // remote TLB shootdown (IPI + invtlb on each hart) will be needed.
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                asm!("invtlb 0x1, $r0, $r0");
+            }
+        }
         if diag_enabled {
             let end_cycles = crate::arch::read_time();
             let to_us = |delta_cycles: usize| -> usize {

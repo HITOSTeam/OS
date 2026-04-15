@@ -85,6 +85,26 @@ mod riscv {
         }
     }
 
+    /// Request a full remote TLB flush on the selected harts.
+    ///
+    /// Legacy SBI expects a pointer to a hart mask in memory. We reuse the same
+    /// low, identity-mapped `.bss` storage as `send_ipi()`.
+    pub fn remote_sfence_vma_all(hart_mask: usize) {
+        if hart_mask == 0 {
+            return;
+        }
+        let _g = IPI_LOCK.lock();
+        // SAFETY: IPI_LOCK serializes access to IPI_HART_MASK, which lives in
+        // low identity-mapped `.bss`, so its address is a valid SBI hart-mask
+        // pointer. start=0,size=0 requests a full TLB flush on the target harts.
+        unsafe {
+            IPI_HART_MASK = hart_mask;
+            let mask_ptr = &raw const IPI_HART_MASK as usize;
+            sbi_call(SBI_REMOTE_SFENCE_VMA, mask_ptr, 0, 0);
+            IPI_HART_MASK = 0;
+        }
+    }
+
     pub fn shutdown() -> ! {
         sbi_call(SBI_SHUTDOWN, 0, 0, 0);
         panic!("It should shutdown!");
@@ -125,6 +145,10 @@ mod stub {
 
     pub fn send_ipi(_hart_id: usize) {
         unsupported("send_ipi");
+    }
+
+    pub fn remote_sfence_vma_all(_hart_mask: usize) {
+        unsupported("remote_sfence_vma_all");
     }
 
     pub fn shutdown() -> ! {
