@@ -1318,7 +1318,8 @@ impl ProcessControlBlock {
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
+        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)
+            .expect("failed to parse init_proc ELF");
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         // allocate a pid
@@ -1519,8 +1520,8 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
-        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
+    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) -> Result<(), isize> {
+        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)?;
         self.exec_with_memory_set(
             memory_set,
             ustack_base,
@@ -1530,6 +1531,7 @@ impl ProcessControlBlock {
             elf_aux,
             (0, 0),
         );
+        Ok(())
     }
 
     /// Exec a dynamically-linked ELF (with PT_INTERP) in a Linux-like way:
@@ -1541,9 +1543,9 @@ impl ProcessControlBlock {
         interp_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
-    ) {
+    ) -> Result<(), isize> {
         let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
-            MemorySet::from_elf_with_interp(elf_data, interp_data);
+            MemorySet::from_elf_with_interp(elf_data, interp_data)?;
         self.exec_dyn_with_memory_set(
             memory_set,
             ustack_base,
@@ -1556,6 +1558,7 @@ impl ProcessControlBlock {
             envs,
             (0, 0),
         );
+        Ok(())
     }
 
     pub fn exec_with_memory_set(

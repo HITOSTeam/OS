@@ -329,13 +329,13 @@ impl MemorySet {
     /// Include sections in elf and trampoline and TrapContext and user stack,
     /// also returns user_sp and entry poremove_areeint.
     /// 用户占 被设计为 程序地址 (虚拟地址) 的最高端.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize, ElfAux) {
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, usize, usize, ElfAux), isize> {
         let mut memory_set = Self::new_bare();
         // map trap trampoline (kernel-only) and sigreturn trampoline (user accessible)
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
         // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
         let load_bias: usize = match elf.header.pt2.type_().as_type() {
             // Map ET_DYN (shared objects / PIE) at a non-zero base so that:
             // - the null page stays unmapped by default, and
@@ -345,7 +345,9 @@ impl MemorySet {
         };
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
-        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
+        if magic != [0x7f, 0x45, 0x4c, 0x46] {
+            return Err(-8);
+        }
         let ph_count = elf_header.pt2.ph_count();
         let ph_entry_size = elf_header.pt2.ph_entry_size() as usize;
         let ph_offset = elf_header.pt2.ph_offset() as usize;
@@ -353,12 +355,16 @@ impl MemorySet {
         let mut phdr_vaddr: usize = 0;
         let mut max_end_vpn = VirtPageNum(0);
         for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
+            let ph = elf.program_header(i).map_err(|_| -8isize)?;
             // Prefer explicit PHDR segment when present.
-            if phdr_vaddr == 0 && ph.get_type().unwrap() == xmas_elf::program::Type::Phdr {
+            let ph_type = match ph.get_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if phdr_vaddr == 0 && ph_type == xmas_elf::program::Type::Phdr {
                 phdr_vaddr = load_bias + ph.virtual_addr() as usize;
             }
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+            if ph_type == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (load_bias + ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr =
                     (load_bias + (ph.virtual_addr() + ph.mem_size()) as usize).into();
@@ -439,7 +445,7 @@ impl MemorySet {
         );
         // Return user_stack_bottom as ustack_base for thread allocation
         // Each thread will calculate its stack as: ustack_base + tid * (PAGE_SIZE + USER_STACK_SIZE)
-        (
+        Ok((
             memory_set,
             user_stack_bottom,
             load_bias + elf.header.pt2.entry_point() as usize,
@@ -448,7 +454,7 @@ impl MemorySet {
                 phent: ph_entry_size,
                 phnum: ph_count as usize,
             },
-        )
+        ))
     }
 
     /// Build a user address space from an ELF reader to avoid loading the full file into memory.
@@ -525,11 +531,13 @@ impl MemorySet {
         elf_data: &[u8],
         load_bias: usize,
         max_end_vpn: &mut VirtPageNum,
-    ) -> (usize, ElfAux) {
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+    ) -> Result<(usize, ElfAux), isize> {
+        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
-        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
+        if magic != [0x7f, 0x45, 0x4c, 0x46] {
+            return Err(-8);
+        }
         let ph_count = elf_header.pt2.ph_count();
         let ph_entry_size = elf_header.pt2.ph_entry_size() as usize;
         let ph_offset = elf_header.pt2.ph_offset() as usize;
@@ -537,11 +545,15 @@ impl MemorySet {
 
         let mut phdr_vaddr: usize = 0;
         for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
-            if phdr_vaddr == 0 && ph.get_type().unwrap() == xmas_elf::program::Type::Phdr {
+            let ph = elf.program_header(i).map_err(|_| -8isize)?;
+            let ph_type = match ph.get_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if phdr_vaddr == 0 && ph_type == xmas_elf::program::Type::Phdr {
                 phdr_vaddr = load_bias + ph.virtual_addr() as usize;
             }
-            if ph.get_type().unwrap() != xmas_elf::program::Type::Load {
+            if ph_type != xmas_elf::program::Type::Load {
                 continue;
             }
             let start_va: VirtAddr = (load_bias + ph.virtual_addr() as usize).into();
@@ -579,14 +591,14 @@ impl MemorySet {
             }
         }
 
-        (
+        Ok((
             load_bias + elf.header.pt2.entry_point() as usize,
             ElfAux {
                 phdr: phdr_vaddr,
                 phent: ph_entry_size,
                 phnum: ph_count as usize,
             },
-        )
+        ))
     }
 
     fn map_elf_segments_from_reader<F>(
@@ -680,13 +692,13 @@ impl MemorySet {
     pub fn from_elf_with_interp(
         main_elf: &[u8],
         interp_elf: &[u8],
-    ) -> (Self, usize, usize, usize, ElfAux, usize) {
+    ) -> Result<(Self, usize, usize, usize, ElfAux, usize), isize> {
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
 
-        let main = xmas_elf::ElfFile::new(main_elf).unwrap();
-        let interp = xmas_elf::ElfFile::new(interp_elf).unwrap();
+        let main = xmas_elf::ElfFile::new(main_elf).map_err(|_| -8isize)?;
+        let _interp = xmas_elf::ElfFile::new(interp_elf).map_err(|_| -8isize)?;
 
         // Place PIE/shared objects away from zero so the null page stays unmapped.
         let main_bias = match main.header.pt2.type_().as_type() {
@@ -704,9 +716,9 @@ impl MemorySet {
 
         let mut max_end_vpn = VirtPageNum(0);
         let (main_entry, main_aux) =
-            Self::map_elf_segments_into(&mut memory_set, main_elf, main_bias, &mut max_end_vpn);
+            Self::map_elf_segments_into(&mut memory_set, main_elf, main_bias, &mut max_end_vpn)?;
         let (interp_entry, _interp_aux) =
-            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn);
+            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn)?;
 
         // Map user stack with U flags, placed above all mapped ELF segments.
         let max_end_va: VirtAddr = max_end_vpn.into();
@@ -746,14 +758,14 @@ impl MemorySet {
             None,
         );
 
-        (
+        Ok((
             memory_set,
             user_stack_bottom,
             interp_entry,
             main_entry,
             main_aux,
             interp_bias,
-        )
+        ))
     }
 
     /// Build a user address space from a main ELF reader and an in-memory interpreter.
@@ -785,7 +797,7 @@ impl MemorySet {
             &mut max_end_vpn,
         )?;
         let (interp_entry, _interp_aux) =
-            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn);
+            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn)?;
 
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_bottom: usize = max_end_va.into();

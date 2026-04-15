@@ -191,9 +191,13 @@ fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) 
             Ok(data) => data,
             Err(e) => return e,
         };
-        process.exec_dyn(&interp_data, &interp_interp_data, args, envs);
+        if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, args, envs) {
+            return e;
+        }
     } else {
-        process.exec(&interp_data, args, envs);
+        if let Err(e) = process.exec(&interp_data, args, envs) {
+            return e;
+        }
     }
     maybe_stop_after_ptrace_exec();
     0
@@ -546,9 +550,13 @@ fn execve_with_inode(
                     Ok(data) => data,
                     Err(e) => return e,
                 };
-                process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec);
+                if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec) {
+                    return e;
+                }
             } else {
-                process.exec(&interp_data, new_args, envs_vec);
+                if let Err(e) = process.exec(&interp_data, new_args, envs_vec) {
+                    return e;
+                }
             }
             maybe_stop_after_ptrace_exec();
             return 0;
@@ -585,9 +593,13 @@ fn execve_with_inode(
                 Ok(data) => data,
                 Err(e) => return e,
             };
-            process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec);
+            if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec) {
+                return e;
+            }
         } else {
-            process.exec(&interp_data, new_args, envs_vec);
+            if let Err(e) = process.exec(&interp_data, new_args, envs_vec) {
+                return e;
+            }
         }
         maybe_stop_after_ptrace_exec();
         return 0;
