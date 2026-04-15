@@ -384,10 +384,10 @@ impl OSInode {
 
     /// Read all data inside an inode into vector
     pub fn read_all(&self) -> Vec<u8> {
-        if self.writable {
-            let _ = self.flush();
-        }
         let mut inner = self.inner.lock();
+        if self.writable {
+            let _ = Self::flush_inner(&mut inner);
+        }
         let file_size = inner.inode.size() as usize;
 
         let mut buffer = [0u8; 4096]; // Use larger buffer for ext4 (4K blocks)
@@ -429,10 +429,10 @@ impl OSInode {
 
     /// Read from this inode at the given offset without updating the file offset.
     pub fn pread_at(&self, offset: usize, buf: &mut [u8]) -> usize {
-        if self.writable {
-            let _ = self.flush();
-        }
         let mut inner = self.inner.lock();
+        if self.writable {
+            let _ = Self::flush_inner(&mut inner);
+        }
         let inode_num = inner.inode.inode_num();
 
         if inner.read_buf.len() < READBUF_MAX {
@@ -496,11 +496,9 @@ impl OSInode {
 
         if buf.len() >= WRITEBUF_MAX {
             if !inner.write_buf.is_empty() {
-                drop(inner);
-                if self.flush().is_err() {
+                if Self::flush_inner(&mut inner).is_err() {
                     return Err(());
                 }
-                inner = self.inner.lock();
                 inner.read_buf_valid = 0;
             }
             let result = {
@@ -539,11 +537,9 @@ impl OSInode {
         if !inner.write_buf.is_empty()
             && offset != inner.write_buf_off.saturating_add(inner.write_buf.len())
         {
-            drop(inner);
-            if self.flush().is_err() {
+            if Self::flush_inner(&mut inner).is_err() {
                 return Err(());
             }
-            inner = self.inner.lock();
             inner.read_buf_valid = 0;
         }
 
@@ -553,8 +549,7 @@ impl OSInode {
 
         inner.write_buf.extend_from_slice(buf);
         if inner.write_buf.len() >= WRITEBUF_MAX {
-            drop(inner);
-            if self.flush().is_err() {
+            if Self::flush_inner(&mut inner).is_err() {
                 return Err(());
             }
             return Ok(buf.len());
@@ -563,8 +558,8 @@ impl OSInode {
         Ok(buf.len())
     }
 
-    pub fn flush_with_error(&self) -> Result<(), ext4_fs::Ext4Error> {
-        let mut inner = self.inner.lock();
+    /// Flush buffered writes to disk. Caller must already hold `self.inner`.
+    fn flush_inner(inner: &mut OSInodeInner) -> Result<(), ext4_fs::Ext4Error> {
         if inner.write_buf.is_empty() {
             return Ok(());
         }
@@ -580,7 +575,7 @@ impl OSInode {
             let size_after = inner.inode.size() as usize;
             match result {
                 Ok(n) => {
-                    println!(
+                    crate::println!(
                         "[iozone-debug] flush inode={} off={} len={} wrote={} size={}->{}",
                         inode_num,
                         off,
@@ -591,7 +586,7 @@ impl OSInode {
                     );
                 }
                 Err(_) => {
-                    println!(
+                    crate::println!(
                         "[iozone-debug] flush inode={} off={} len={} err size={}->{}",
                         inode_num,
                         off,
@@ -605,7 +600,6 @@ impl OSInode {
         match result {
             Ok(n) if n == data.len() => Ok(()),
             Ok(_) => {
-                // Restore buffer best-effort (so we don't silently drop data).
                 inner.write_buf_off = off;
                 inner.write_buf = data;
                 Err(ext4_fs::Ext4Error::NoSpace)
@@ -618,6 +612,11 @@ impl OSInode {
         }
     }
 
+    pub fn flush_with_error(&self) -> Result<(), ext4_fs::Ext4Error> {
+        let mut inner = self.inner.lock();
+        Self::flush_inner(&mut inner)
+    }
+
     pub fn flush(&self) -> Result<(), ()> {
         self.flush_with_error().map_err(|_| ())
     }
@@ -627,10 +626,10 @@ impl OSInode {
     }
 
     pub fn set_offset(&self, offset: usize) {
-        if self.writable {
-            let _ = self.flush();
-        }
         let mut inner = self.inner.lock();
+        if self.writable {
+            let _ = Self::flush_inner(&mut inner);
+        }
         inner.offset = offset;
         inner.read_buf_valid = 0;
     }
@@ -945,10 +944,10 @@ impl File for OSInode {
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
-        if self.writable {
-            let _ = self.flush();
-        }
         let mut inner = self.inner.lock();
+        if self.writable {
+            let _ = Self::flush_inner(&mut inner);
+        }
         let mut total_read_size = 0usize;
 
         if inner.read_buf.len() < READBUF_MAX {
