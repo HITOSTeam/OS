@@ -224,6 +224,9 @@ pub fn syscall_getsockopt(
             let Some(cred) = unix_sock.peer_cred() else {
                 return err(SyscallError::ENOTCONN);
             };
+            // SAFETY: `cred` is a fully initialized local `UCred`, and we reborrow exactly
+            // `size_of::<UCred>()` bytes from it while `cred` stays alive. If the layout or
+            // length were wrong, userspace would observe uninitialized or out-of-bounds bytes.
             let cred_bytes = unsafe {
                 core::slice::from_raw_parts(
                     (&cred as *const UCred) as *const u8,

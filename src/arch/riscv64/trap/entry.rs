@@ -10,6 +10,8 @@ unsafe extern "C" {
 }
 /// timer interrupt enabled
 pub fn enable_timer_interrupt() {
+    // SAFETY: Enabling STimer in `sie` is a privileged S-mode CSR update performed during kernel
+    // trap setup. Doing this in the wrong mode or at the wrong time would break interrupt delivery.
     unsafe {
         sie::set_stimer();
     }

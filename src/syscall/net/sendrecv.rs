@@ -273,6 +273,9 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
         };
         if msg.msg_name != 0 && msg.msg_namelen != 0 {
             let sa = netlink_sock.local_addr();
+            // SAFETY: `sa` is a fully initialized stack local `SockAddrNl`, and we expose
+            // exactly its in-memory bytes for the duration of this call. A wrong pointer or
+            // length here would read invalid memory and copy garbage into userspace.
             let r = write_msg_name_bytes(msg, unsafe {
                 core::slice::from_raw_parts(
                     (&sa as *const SockAddrNl) as *const u8,

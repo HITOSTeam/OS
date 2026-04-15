@@ -45,6 +45,8 @@ const PALEN: usize = 48;
 
 #[inline(always)]
 fn flush_tlb_vaddr(vaddr: usize) {
+    // SAFETY: `invtlb` is a privileged instruction and this kernel-only helper uses it to evict
+    // the translation for `vaddr` on the current hart. Issuing it outside kernel mode would trap.
     unsafe {
         asm!("invtlb 0x4, $r0, {}", in(reg) vaddr);
     }
@@ -52,6 +54,8 @@ fn flush_tlb_vaddr(vaddr: usize) {
 
 #[inline(always)]
 fn flush_tlb_all() {
+    // SAFETY: This is the kernel's full-TLB invalidation path; executing `invtlb` in kernel mode
+    // is required after page-table changes. Running it in the wrong context would fault.
     unsafe {
         asm!("invtlb 0x1, $r0, $r0");
     }
@@ -59,6 +63,8 @@ fn flush_tlb_all() {
 
 #[inline(always)]
 fn write_pgdl(base: usize) {
+    // SAFETY: `base` is a kernel-constructed page-table root physical address, and writing PGDL
+    // is only valid in kernel mode. A bogus base would redirect low-half translations incorrectly.
     unsafe {
         asm!("csrwr {}, 0x19", in(reg) base);
     }
@@ -66,6 +72,8 @@ fn write_pgdl(base: usize) {
 
 #[inline(always)]
 fn write_pgdh(base: usize) {
+    // SAFETY: `base` is the current root page-table base and this privileged CSR write updates
+    // the high-half walker state. An invalid base would break kernel address translation.
     unsafe {
         asm!("csrwr {}, 0x1a", in(reg) base);
     }
@@ -515,6 +523,9 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
 }
 pub fn translated_mutref<T>(token: usize, ptr: *mut T) -> &'static mut T {
     let real_addr = translated_address_with(token, ptr as *const u8, MapPermission::W);
+    // SAFETY: `translated_address_with` resolved `ptr` to writable mapped memory for this token,
+    // and the caller expects that location to contain a properly aligned `T`. If not, this cast
+    // would fabricate an invalid mutable reference into user memory.
     unsafe { &mut *(real_addr as *mut u8 as *mut T) }
 }
 
@@ -544,6 +555,9 @@ pub fn try_copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) -> Resul
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
+        // SAFETY: `resolve_user_pte` established that this page is readable and `written + n`
+        // remains inside `dst`; the source span is limited to the current mapped page. If any
+        // of those assumptions failed, this raw copy would read from an invalid physical address.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (pa.0 + page_off) as *const u8,
@@ -583,6 +597,8 @@ pub fn try_copy_to_user(token: usize, dst: *mut u8, src: &[u8]) -> Result<(), ()
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
+        // SAFETY: The destination user page was resolved writable for this token and `read + n`
+        // is bounded by `src.len()`. A stale translation or incorrect bounds would corrupt memory.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr().add(read), (pa.0 + page_off) as *mut u8, n);
         }
@@ -610,6 +626,9 @@ pub fn try_copy_to_user_unchecked(token: usize, dst: *mut u8, src: &[u8]) -> Res
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
+        // SAFETY: This follows the same bounded copy discipline as `try_copy_to_user`, but it is
+        // used for kernel-internal writes where permission checks are intentionally bypassed.
+        // A wrong physical destination or length would still corrupt memory.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr().add(read), (pa.0 + page_off) as *mut u8, n);
         }
@@ -621,25 +640,33 @@ pub fn try_copy_to_user_unchecked(token: usize, dst: *mut u8, src: &[u8]) -> Res
 
 pub fn read_user_value<T: Copy>(token: usize, src: *const T) -> T {
     let mut value = MaybeUninit::<T>::uninit();
+    // SAFETY: `value` owns enough writable storage for exactly one `T`, and we expose its raw
+    // bytes so `copy_from_user` can initialize them. A mismatched length would clobber the stack.
     let dst_bytes = unsafe {
         core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
     };
     copy_from_user(token, src as *const u8, dst_bytes);
+    // SAFETY: The preceding copy initialized all bytes of `value`.
     unsafe { value.assume_init() }
 }
 
 pub fn try_read_user_value<T: Copy>(token: usize, src: *const T) -> Option<T> {
     let mut value = MaybeUninit::<T>::uninit();
+    // SAFETY: The slice covers exactly the storage reserved for `value`, no more and no less.
+    // Otherwise the user copy could either overflow or leave `value` partially uninitialized.
     let dst_bytes = unsafe {
         core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
     };
     if try_copy_from_user(token, src as *const u8, dst_bytes).is_err() {
         return None;
     }
+    // SAFETY: A successful `try_copy_from_user` populated the entire object representation.
     Some(unsafe { value.assume_init() })
 }
 
 pub fn write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) {
+    // SAFETY: `value` is a live reference and we expose exactly its object bytes for copying.
+    // Extending the slice beyond `size_of::<T>()` would read unrelated kernel memory.
     let src_bytes = unsafe {
         core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
     };
@@ -647,6 +674,8 @@ pub fn write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) {
 }
 
 pub fn try_write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) -> Result<(), ()> {
+    // SAFETY: The raw byte slice borrows `value` for this call only and matches its exact size.
+    // A bad pointer/length pair here would copy invalid kernel bytes into userspace.
     let src_bytes = unsafe {
         core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
     };

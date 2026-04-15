@@ -43,6 +43,8 @@ static TRAP_HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[inline(always)]
 fn read_estat() -> usize {
     let val: usize;
+    // SAFETY: Reading ESTAT is valid in kernel mode and returns the current exception status.
+    // Using the wrong CSR would misdecode the active trap cause.
     unsafe { asm!("csrrd {}, 0x5", out(reg) val) };
     val
 }
@@ -50,6 +52,8 @@ fn read_estat() -> usize {
 #[inline(always)]
 fn read_badv() -> usize {
     let val: usize;
+    // SAFETY: Reading BADV is valid in kernel mode and reports the faulting virtual address.
+    // If this read were wrong, page-fault reporting and recovery would use a bogus address.
     unsafe { asm!("csrrd {}, 0x7", out(reg) val) };
     val
 }
@@ -57,12 +61,16 @@ fn read_badv() -> usize {
 #[inline(always)]
 fn read_badi() -> usize {
     let val: usize;
+    // SAFETY: Reading BADI is valid in kernel mode and exposes the trapped instruction metadata.
+    // Reading an unrelated CSR here would make trap diagnostics and emulation incorrect.
     unsafe { asm!("csrrd {}, 0x8", out(reg) val) };
     val
 }
 
 #[inline(always)]
 fn write_eentry(val: usize) {
+    // SAFETY: `val` is a kernel trap-entry address chosen by the caller, and writing EENTRY is
+    // only valid in kernel mode. A bad address here would redirect traps to invalid code.
     unsafe { asm!("csrwr {}, 0xc", in(reg) val) };
 }
 
@@ -335,6 +343,9 @@ pub fn trap_return() -> ! {
         fn restore();
     }
     let restore_va = restore as usize - alltraps as usize + TRAMPOLINE;
+    // SAFETY: `restore_va` points at the trampoline restore stub, and the argument registers are
+    // loaded with the trap context pointer and user token expected by that stub. Jumping to the
+    // wrong address or with mismatched registers would not return to userspace correctly.
     unsafe {
         asm!(
             "jirl $r0, {restore_va}, 0",

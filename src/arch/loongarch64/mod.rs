@@ -109,6 +109,8 @@ pub fn enable_interrupts() {
     // SAFETY: CRMD (CSR 0x0) read/write is valid in kernel mode on LoongArch.
     unsafe { asm!("csrrd {}, 0x0", out(reg) crmd) };
     crmd |= CRMD_IE;
+    // SAFETY: This writes the updated interrupt-enable bit back to CRMD in kernel mode. Writing
+    // an invalid value would leave interrupts misconfigured for the current hart.
     unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
 }
 
@@ -160,6 +162,8 @@ pub fn enable_timer_interrupt() {
     // Ensure vector spacing (VS) is zero so timer interrupts use the base entry.
     ecfg &= !(ECFG_VS_MASK << ECFG_VS_SHIFT);
     ecfg |= ECFG_LIE_TI;
+    // SAFETY: This writes back a kernel-constructed ECFG value that only changes timer interrupt
+    // delivery bits. A malformed write would route interrupts incorrectly on this hart.
     unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
 }
 
@@ -408,6 +412,9 @@ pub fn bootstrap_init() {
         fn __rfill();
     }
     // Configure paging and TLB refill to match the Sv39-style page tables we build.
+    // SAFETY: Bootstrap runs in kernel mode before user execution, so these CSR/TLB updates
+    // target machine-defined paging state for the current hart. Programming inconsistent values
+    // here would break address translation or trap refill before the kernel can recover.
     unsafe {
         // Enable base floating-point instructions for user programs (needed by busybox/musl).
         let mut euen: usize;
