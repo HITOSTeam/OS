@@ -527,10 +527,6 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = local_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_ptr();
     drop(processor);
-    // println!(
-    //     "schedule: switch from {:x} to {:x}",
-    //     switched_task_cx_ptr as usize, idle_task_cx_ptr as usize
-    // );
     unsafe {
         switch::switch(
             switched_task_cx_ptr as *const usize,
@@ -770,7 +766,6 @@ pub fn idle_task() {
                 core::hint::spin_loop();
                 continue;
             }
-            // crate::println!("[idle] No tasks, entering wfi...");
             // No ready tasks - enable interrupts and wait
             // Use wfi to save power while waiting for timer interrupt
             // Timer interrupt will call check_timer() to wake up sleeping tasks
@@ -779,7 +774,6 @@ pub fn idle_task() {
             // because the interrupt handler may have woken up a task
             arch::enable_interrupts();
             arch::wait_for_interrupt();
-            // crate::println!("[idle] Woke up from wfi");
             // Loop back immediately to check for newly ready tasks
         }
     }
@@ -1054,11 +1048,6 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // strong Arc from this never-returning exit path.
     queue_exiting_task_drop(task);
     drop(process);
-    // we do not have to save task context
-    // println!(
-    //     "[DEBUG] exit_current_and_run_next: about to schedule, tid={}",
-    //     tid
-    // );
     let mut _unused = TaskContext::new();
     schedule(&mut _unused as *mut _);
     unreachable!("schedule should not return after task exit");

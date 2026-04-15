@@ -115,11 +115,8 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             if DEBUG_TRAP && kcnt < 4 {
                 log::debug!("[trap_from_kernel] hart={} timer interrupt", hart);
             }
-            // crate::println!("[trap_from_kernel] Timer interrupt, checking timers...");
             set_next_trigger();
             check_timer();
-            // crate::println!("[trap_from_kernel] Done checking timers");
-            // do not schedule, just return to kernel
         }
         Trap::Interrupt(_) => {
             // Clear possible software interrupt and ignore others
@@ -318,8 +315,6 @@ pub fn trap_handler() {
             );
         }
     }
-    // println!("handle siganl");
-    // handle_signals();
 
     if let Some((errno, msg)) = check_if_current_signals_error() {
         println!("[kernel] {}", msg);

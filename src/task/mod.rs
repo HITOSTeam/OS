@@ -37,7 +37,8 @@ pub mod task_block;
 pub mod task_context;
 lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("/user/init_proc.bin", OpenFlags::RDONLY).unwrap();
+        let inode = open_file("/user/init_proc.bin", OpenFlags::RDONLY)
+            .expect("failed to open /user/init_proc.bin — check sdcard image");
         let data = inode.read_all();
         ProcessControlBlock::new(&data)
     };
