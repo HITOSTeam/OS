@@ -62,7 +62,7 @@ impl PidAllocator {
         }
     }
 
-    fn alloc(&mut self) -> usize {
+    fn alloc(&mut self) -> Option<usize> {
         let pid_max = pid_max();
         if self.next >= pid_max {
             self.next = 1;
@@ -73,15 +73,18 @@ impl PidAllocator {
             self.next = if pid + 1 >= pid_max { 1 } else { pid + 1 };
             if self.active.insert(pid) {
                 maybe_log_pid_active("alloc", self.active.len());
-                return pid;
+                return Some(pid);
             }
         }
 
-        panic!("pid allocator exhausted (pid_max={pid_max})");
+        None
     }
 
     fn dealloc(&mut self, pid: usize) {
-        assert!(self.active.remove(&pid), "pid {pid} has been deallocated!");
+        if !self.active.remove(&pid) {
+            log::warn!("pid {} double-dealloc (already freed)", pid);
+            return;
+        }
         maybe_log_pid_active("dealloc", self.active.len());
     }
 }
@@ -106,8 +109,8 @@ pub fn set_pid_max(pid_max: usize) -> usize {
     clamped
 }
 
-pub fn pid_alloc() -> PidHandle {
-    PidHandle(PID_ALLOCATOR.lock().alloc())
+pub fn pid_alloc() -> Option<PidHandle> {
+    Some(PidHandle(PID_ALLOCATOR.lock().alloc()?))
 }
 
 impl Drop for PidHandle {

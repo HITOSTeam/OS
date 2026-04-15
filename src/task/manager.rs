@@ -645,7 +645,8 @@ pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
 pub fn remove_from_pid2process(pid: usize) {
     let mut map = PID2PCB.lock();
     if map.remove(&pid).is_none() {
-        panic!("cannot find pid {} in pid2task!", pid);
+        log::warn!("remove_from_pid2process: pid {} not found (already reaped?)", pid);
+        return;
     }
     let len = map.len();
     if crate::debug_config::DEBUG_PID_MAP && len >= 64 && (len & (len - 1)) == 0 {

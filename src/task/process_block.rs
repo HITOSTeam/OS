@@ -1323,7 +1323,7 @@ impl ProcessControlBlock {
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         // allocate a pid
-        let pid_handle = pid_alloc();
+        let pid_handle = pid_alloc().expect("failed to allocate PID for init process");
         let pid = pid_handle.0;
         let args = vec![String::from("init_proc")];
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
@@ -1820,7 +1820,9 @@ impl ProcessControlBlock {
             after_mem_cycles = crate::arch::read_time();
         }
         // alloc a pid
-        let pid = pid_alloc();
+        let Some(pid) = pid_alloc() else {
+            return None;
+        };
         let pid_value = pid.0;
         let inherited_owner = parent.files_owner.as_ref().and_then(Weak::upgrade);
         // remove parent's invalid table
