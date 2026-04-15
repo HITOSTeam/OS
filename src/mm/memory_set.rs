@@ -1294,6 +1294,12 @@ impl MemorySet {
                 .saturating_sub(area.vpn_range.get_start().0);
             let accounted_pages = area.charged_pages.max(area.data_frames.len());
             let new_charge_pages = total_pages.saturating_sub(accounted_pages);
+            let Some(frame) = frame_alloc() else {
+                crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
+                return LazyFaultResult::Oom;
+            };
+            // Allocate before charging so OOM in frame_alloc() cannot leak cgroup accounting;
+            // if charging fails, the uninstalled frame is dropped immediately.
             if new_charge_pages > 0
                 && area.map_perm.contains(MapPermission::U)
                 && area.map_perm.contains(MapPermission::W)
@@ -1304,10 +1310,6 @@ impl MemorySet {
                 }
                 area.charged_pages = accounted_pages.saturating_add(new_charge_pages);
             }
-            let Some(frame) = frame_alloc() else {
-                crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
-                return LazyFaultResult::Oom;
-            };
             let pte_flags = PTEFlags::from(area.map_perm);
             self.page_table.map(vpn, frame.ppn, pte_flags);
             area.data_frames.insert(vpn, frame);
