@@ -527,6 +527,8 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = local_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_ptr();
     drop(processor);
+    // SAFETY: both task contexts are valid kernel stack pointers owned by their respective tasks;
+    // switched_task_cx_ptr is the current task's context, idle_task_cx_ptr is the idle context.
     unsafe {
         switch::switch(
             switched_task_cx_ptr as *const usize,
@@ -744,6 +746,8 @@ pub fn idle_task() {
             drop(processor);
 
             // Keep interrupts disabled while resuming kernel context; sret will enable them for user.
+            // SAFETY: both task contexts are valid kernel stack pointers owned by their respective tasks;
+            // idle_task_cx_ptr is the idle context, next_task_cx_ptr is the next task's saved context.
             unsafe {
                 switch::switch(
                     idle_task_cx_ptr as *const usize,

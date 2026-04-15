@@ -19,6 +19,7 @@ mod riscv {
 
     fn sbi_call(which: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
         let mut ret;
+        // SAFETY: ecall follows RISC-V SBI calling convention; arguments in a0-a2, extension in a7.
         unsafe {
             asm!(
                 "ecall",
@@ -33,6 +34,7 @@ mod riscv {
 
     fn sbi_call_ext(eid: usize, fid: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
         let mut ret;
+        // SAFETY: ecall follows RISC-V SBI calling convention; args in a0-a2, fid in a6, eid in a7.
         unsafe {
             asm!(
                 "ecall",
@@ -70,6 +72,10 @@ mod riscv {
             return;
         }
         let _g = IPI_LOCK.lock();
+        // SAFETY: hart_id is bounds-checked above; IPI_LOCK serializes access to IPI_HART_MASK.
+        // IPI_HART_MASK is in kernel .bss with identity mapping (VA == PA), giving a valid
+        // physical address for the SBI ecall.
+        // IPI_HART_MASK is in .bss so its address is a low, identity-mapped physical address.
         unsafe {
             IPI_HART_MASK = 1usize << hart_id;
             let mask_ptr = &raw const IPI_HART_MASK as usize;

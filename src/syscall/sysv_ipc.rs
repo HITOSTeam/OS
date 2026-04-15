@@ -1141,6 +1141,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             for sem in set.sems.iter() {
                 vals.push(sem.val as u16);
             }
+            // SAFETY: vals is an owned Vec<u16>; byte length equals vals.len() * size_of::<u16>().
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     vals.as_ptr() as *const u8,
@@ -1157,6 +1158,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
                 return err(SyscallError::EACCES);
             }
             let mut vals = vec![0u16; set.sems.len()];
+            // SAFETY: vals is an owned Vec<u16>; byte length equals vals.len() * size_of::<u16>().
             let bytes = unsafe {
                 core::slice::from_raw_parts_mut(
                     vals.as_mut_ptr() as *mut u8,

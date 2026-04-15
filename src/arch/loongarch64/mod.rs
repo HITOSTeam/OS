@@ -46,6 +46,7 @@ fn uart_init_once() {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        // SAFETY: UART_LCR and UART_FCR are MMIO addresses for 16550-compatible UART.
         unsafe {
             // 8N1 + enable FIFO, clear RX/TX queues.
             write_volatile(UART_LCR as *mut u8, 0x03);
@@ -56,6 +57,7 @@ fn uart_init_once() {
 
 pub fn console_putchar(c: usize) {
     uart_init_once();
+    // SAFETY: UART_RBR_THR is the MMIO address for UART transmit hold register.
     unsafe {
         write_volatile(UART_RBR_THR as *mut u8, c as u8);
     }
@@ -63,11 +65,13 @@ pub fn console_putchar(c: usize) {
 
 pub fn console_flush() {
     uart_init_once();
+    // SAFETY: UART_LSR is the MMIO address for UART line status register.
     unsafe { while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {} }
 }
 
 pub fn console_getchar() -> usize {
     uart_init_once();
+    // SAFETY: UART_LSR and UART_RBR_THR are MMIO addresses for UART status and data registers.
     unsafe {
         if read_volatile(UART_LSR as *const u8) & 0x01 == 0 {
             return usize::MAX;
@@ -78,9 +82,11 @@ pub fn console_getchar() -> usize {
 
 pub fn disable_interrupts() -> bool {
     let mut crmd: usize;
+    // SAFETY: CRMD (CSR 0x0) read/write is valid in kernel mode on LoongArch.
     unsafe { asm!("csrrd {}, 0x0", out(reg) crmd) };
     let prev = (crmd & (1 << 2)) != 0;
     crmd &= !(1 << 2);
+    // SAFETY: CRMD write disables interrupts.
     unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
     prev
 }
@@ -93,6 +99,7 @@ pub fn restore_interrupts(prev: bool) {
 
 pub fn enable_interrupts() {
     let mut crmd: usize;
+    // SAFETY: CRMD (CSR 0x0) read/write is valid in kernel mode on LoongArch.
     unsafe { asm!("csrrd {}, 0x0", out(reg) crmd) };
     crmd |= 1 << 2;
     unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
@@ -103,6 +110,7 @@ pub fn wait_for_interrupt() {
 }
 
 pub fn disable_direct_map_windows() {
+    // SAFETY: DMW0/DMW1 (CSR 0x180/0x181) write and invtlb are valid in kernel mode.
     unsafe {
         asm!("csrwr {}, 0x180", in(reg) 0usize);
         asm!("csrwr {}, 0x181", in(reg) 0usize);
@@ -112,11 +120,13 @@ pub fn disable_direct_map_windows() {
 
 pub fn hart_id() -> usize {
     let mut id: usize;
+    // SAFETY: CPUID (CSR 0x20) read is valid in kernel mode on LoongArch.
     unsafe { asm!("csrrd {}, 0x20", out(reg) id) };
     id
 }
 
 pub fn set_tp(hart_id: usize) {
+    // SAFETY: $r2 (tp) register write is valid; used to store hart ID.
     unsafe {
         asm!("add.d $r2, {}, $r0", in(reg) hart_id);
     }
@@ -129,6 +139,7 @@ pub fn hart_start(_hart_id: usize, _start_addr: usize, _opaque: usize) -> usize 
 }
 
 pub fn shutdown() -> ! {
+    // SAFETY: 0x100e_001c is the power control MMIO address on LoongArch QEMU virt.
     unsafe {
         (0x100e_001c as *mut u8).write_volatile(0x34);
     }
@@ -137,6 +148,7 @@ pub fn shutdown() -> ! {
 
 pub fn enable_timer_interrupt() {
     let mut ecfg: usize;
+    // SAFETY: ECFG (CSR 0x4) read/write is valid in kernel mode on LoongArch.
     unsafe { asm!("csrrd {}, 0x4", out(reg) ecfg) };
     // Ensure vector spacing (VS) is zero so timer interrupts use the base entry.
     ecfg &= !(0x7 << 16);
@@ -145,6 +157,7 @@ pub fn enable_timer_interrupt() {
 }
 
 pub fn clear_timer_interrupt() {
+    // SAFETY: TIClr (CSR 0x44) write is valid in kernel mode; clears timer interrupt.
     unsafe {
         asm!("csrwr {}, 0x44", in(reg) 1usize);
     }
@@ -154,6 +167,7 @@ pub fn set_timer(timer: usize) {
     // For LoongArch, TCFG holds a relative countdown value in bits [2..].
     let delta = timer.max(4);
     let tcfg = (delta & !0x3) | 0x1;
+    // SAFETY: TCFG (CSR 0x41) write is valid in kernel mode; configures timer countdown.
     unsafe {
         asm!("csrwr {}, 0x41", in(reg) tcfg);
     }
@@ -161,6 +175,7 @@ pub fn set_timer(timer: usize) {
 
 pub fn read_time() -> usize {
     let mut counter: usize;
+    // SAFETY: rdtime.d is a valid instruction to read the stable counter.
     unsafe {
         asm!("rdtime.d {},{}", out(reg) counter, out(reg) _);
     }
@@ -170,6 +185,7 @@ pub fn read_time() -> usize {
 /// Enable LoongArch floating-point unit (EUEN.FPE = 1, CSR 0x2 bit 0).
 #[inline]
 fn ensure_fp_enabled() {
+    // SAFETY: EUEN (CSR 0x2) read/write is valid in kernel mode; FPE bit controls FPU access.
     unsafe {
         let mut euen: usize;
         asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
@@ -184,6 +200,8 @@ fn ensure_fp_enabled() {
 fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
     ensure_fp_enabled();
     let ptr = inner.fp_regs.as_mut_ptr();
+    // SAFETY: ptr points to a valid fp_regs array in the task control block;
+    // FPU is enabled via ensure_fp_enabled(); all 32 FP registers are saved.
     unsafe {
         asm!(
             "fst.d $f0, {base}, 0",
@@ -272,6 +290,8 @@ fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
     }
     ensure_fp_enabled();
     let ptr = inner.fp_regs.as_ptr();
+    // SAFETY: ptr points to a valid fp_regs array in the task control block;
+    // FPU is enabled via ensure_fp_enabled(); all 32 FP registers are restored.
     unsafe {
         asm!(
             "fld.d $f0, {base}, 0",
@@ -355,6 +375,7 @@ pub fn restore_user_fp_state(task: &Arc<TaskControlBlock>) {
 
 fn read_cpucfg(index: u32) -> u32 {
     let mut value = index;
+    // SAFETY: cpucfg is a valid instruction to read CPU configuration on LoongArch.
     unsafe {
         asm!("cpucfg {}, {}", out(reg) value, in(reg) value);
     }

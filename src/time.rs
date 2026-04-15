@@ -54,6 +54,7 @@ pub fn set_next_trigger() {
             "[time] hart={} set_next_trigger delta={:#x}",
             {
                 let hart: usize;
+                // SAFETY: tp register holds the current hart ID in our convention.
                 unsafe { core::arch::asm!("mv {}, tp", out(reg) hart) };
                 hart
             },
@@ -71,6 +72,7 @@ pub fn set_next_trigger() {
             "[time] hart={} set_next_trigger -> {:#x} (now={:#x})",
             {
                 let hart: usize;
+                // SAFETY: tp register holds the current hart ID in our convention.
                 unsafe { core::arch::asm!("mv {}, tp", out(reg) hart) };
                 hart
             },

@@ -894,6 +894,7 @@ fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {
         let Some(dst) = it.next() else {
             break;
         };
+        // SAFETY: dst is a valid mutable pointer from UserBuffer iterator; src[copied] is in bounds.
         unsafe { *dst = src[copied] };
         copied += 1;
     }
@@ -903,6 +904,7 @@ fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {
 fn copy_user_buffer_to_vec(buf: UserBuffer) -> Vec<u8> {
     let mut data = Vec::with_capacity(buf.len());
     for p in buf.into_iter() {
+        // SAFETY: p is a valid pointer from UserBuffer iterator which guarantees page is mapped.
         data.push(unsafe { *p });
     }
     data
@@ -1128,6 +1130,7 @@ pub(super) fn write_sockaddr_in(
     let required = size_of::<SockAddrIn>();
     let copy_len = core::cmp::min(len, required);
     if copy_len > 0 {
+        // SAFETY: sa is a stack-local struct with known layout; copy_len <= size_of::<SockAddrIn>().
         let bytes = unsafe {
             core::slice::from_raw_parts((&sa as *const SockAddrIn) as *const u8, copy_len)
         };
@@ -1156,6 +1159,7 @@ pub(super) fn write_sockaddr_nl(user_ptr: usize, user_len_ptr: usize, sa: &SockA
     let required = size_of::<SockAddrNl>();
     let copy_len = core::cmp::min(len, required);
     if copy_len > 0 {
+        // SAFETY: sa is a reference to a valid SockAddrNl; copy_len <= size_of::<SockAddrNl>().
         let bytes = unsafe {
             core::slice::from_raw_parts((&*sa as *const SockAddrNl) as *const u8, copy_len)
         };
@@ -1202,6 +1206,7 @@ pub(super) fn write_sockaddr_un(user_ptr: usize, user_len_ptr: usize, addr: Opti
     let required = size_of::<SockAddrUn>();
     let copy_len = core::cmp::min(len, required);
     if copy_len > 0 {
+        // SAFETY: sa is a stack-local struct with known layout; copy_len <= size_of::<SockAddrUn>().
         let bytes = unsafe {
             core::slice::from_raw_parts((&sa as *const SockAddrUn) as *const u8, copy_len)
         };
@@ -1310,6 +1315,7 @@ pub(super) fn write_msg_name_in(msg: &mut MsgHdr, ip: smoltcp::wire::Ipv4Address
         },
         sin_zero: [0; 8],
     };
+    // SAFETY: sa is a stack-local struct with known layout; length equals size_of::<SockAddrIn>().
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&sa as *const SockAddrIn) as *const u8,
@@ -1338,6 +1344,7 @@ pub(super) fn write_msg_name_un(msg: &mut MsgHdr, addr: Option<&UnixBoundAddr>) 
             }
         }
     }
+    // SAFETY: sa is a stack-local struct with known layout; length equals size_of::<SockAddrUn>().
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&sa as *const SockAddrUn) as *const u8,

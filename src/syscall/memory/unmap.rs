@@ -189,10 +189,12 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
     }
     if cleared_dirty {
         #[cfg(target_arch = "riscv64")]
+        // SAFETY: sfence.vma is a privileged instruction valid in S-mode; flushes TLB.
         unsafe {
             core::arch::asm!("sfence.vma");
         }
         #[cfg(target_arch = "loongarch64")]
+        // SAFETY: invtlb is a privileged instruction valid in S-mode; flushes TLB.
         unsafe {
             core::arch::asm!("invtlb 0x1, $r0, $r0");
         }
@@ -245,10 +247,12 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     inner.mmap_areas = next_regions;
     // Ensure permission changes take effect immediately.
     #[cfg(target_arch = "riscv64")]
+    // SAFETY: sfence.vma is a privileged instruction valid in S-mode; flushes TLB.
     unsafe {
         core::arch::asm!("sfence.vma");
     }
     #[cfg(target_arch = "loongarch64")]
+    // SAFETY: invtlb is a privileged instruction valid in S-mode; flushes TLB.
     unsafe {
         core::arch::asm!("invtlb 0x1, $r0, $r0");
     }

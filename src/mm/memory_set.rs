@@ -1232,10 +1232,12 @@ impl MemorySet {
 
         // Flush TLB for this address.
         #[cfg(target_arch = "riscv64")]
+        // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.
         unsafe {
             core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
         }
         #[cfg(target_arch = "loongarch64")]
+        // SAFETY: invtlb is valid in S-mode; fault_va is the address to flush from TLB.
         unsafe {
             core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
         }
@@ -1289,10 +1291,12 @@ impl MemorySet {
             self.page_table.map(vpn, frame.ppn, pte_flags);
             area.data_frames.insert(vpn, frame);
             #[cfg(target_arch = "riscv64")]
+            // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.
             unsafe {
                 core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
             }
             #[cfg(target_arch = "loongarch64")]
+            // SAFETY: invtlb is valid in S-mode; fault_va is the address to flush from TLB.
             unsafe {
                 core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
             }
@@ -1304,6 +1308,7 @@ impl MemorySet {
         #[cfg(target_arch = "riscv64")]
         {
             let satp = self.page_table.token();
+            // SAFETY: satp is a valid page table token; sfence.vma flushes TLB after satp change.
             unsafe {
                 satp::write(Satp::from_bits(satp));
                 asm!("sfence.vma");
@@ -2040,6 +2045,7 @@ pub fn kernel_token() -> usize {
 
 pub fn activate_token(token: usize) {
     #[cfg(target_arch = "riscv64")]
+    // SAFETY: token is a valid satp value; sfence.vma flushes TLB after satp change.
     unsafe {
         satp::write(Satp::from_bits(token));
         asm!("sfence.vma");

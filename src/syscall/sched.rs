@@ -166,6 +166,7 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
     let sp = SchedParam {
         sched_priority: prio,
     };
+    // SAFETY: sp is a stack-local struct with known layout; length equals size_of::<SchedParam>().
     if try_copy_to_user(token, param_ptr as *mut u8, unsafe {
         core::slice::from_raw_parts(
             &sp as *const SchedParam as *const u8,
@@ -434,6 +435,7 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     attr.sched_runtime = runtime;
     attr.sched_deadline = deadline;
     attr.sched_period = period;
+    // SAFETY: attr is a stack-local struct with known layout; copy_len bounded by size_of::<SchedAttr>().
     let bytes =
         unsafe { core::slice::from_raw_parts(&attr as *const SchedAttr as *const u8, copy_len) };
     let token = get_current_token();
@@ -461,6 +463,7 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
     }
     let token = get_current_token();
     let mut attr = SchedAttr::default();
+    // SAFETY: attr is a stack-local struct with known layout; length equals size_of::<SchedAttr>().
     let dst_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             &mut attr as *mut SchedAttr as *mut u8,

@@ -29,26 +29,31 @@ pub const REG_A7: usize = 17;
 
 pub fn disable_interrupts() -> bool {
     let prev = sstatus::read().sie();
+    // SAFETY: sstatus CSR write is valid in S-mode.
     unsafe { sstatus::clear_sie() };
     prev
 }
 
 pub fn restore_interrupts(prev: bool) {
     if prev {
+        // SAFETY: sstatus CSR write is valid in S-mode.
         unsafe { sstatus::set_sie() };
     }
 }
 
 pub fn enable_interrupts() {
+    // SAFETY: sstatus CSR write is valid in S-mode.
     unsafe { sstatus::set_sie() };
 }
 
 pub fn wait_for_interrupt() {
+    // SAFETY: wfi is valid in S-mode; suspends until an interrupt.
     unsafe { asm!("wfi") };
 }
 
 pub fn hart_id() -> usize {
     let mut id: usize;
+    // SAFETY: tp register holds the current hart ID in our convention.
     unsafe {
         asm!("mv {}, tp", out(reg) id);
     }
@@ -56,6 +61,7 @@ pub fn hart_id() -> usize {
 }
 
 pub fn set_tp(hart_id: usize) {
+    // SAFETY: tp register write is valid; used to store hart ID.
     unsafe { asm!("mv tp, {}", in(reg) hart_id) };
 }
 
@@ -95,6 +101,7 @@ pub fn read_time() -> usize {
 fn ensure_fs_enabled() {
     // sstatus.FS = Dirty, so S-mode can execute floating-point save/restore ops.
     const SSTATUS_FS_DIRTY: usize = 0x6000;
+    // SAFETY: sstatus CSR read/write is valid in S-mode; FS field controls FPU access.
     unsafe {
         let mut sstatus_bits: usize;
         asm!("csrr {}, sstatus", out(reg) sstatus_bits, options(nostack));
@@ -109,6 +116,8 @@ fn ensure_fs_enabled() {
 fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
     ensure_fs_enabled();
     let ptr = inner.fp_regs.as_mut_ptr();
+    // SAFETY: ptr points to a valid fp_regs array in the task control block;
+    // FPU is enabled via ensure_fs_enabled(); all 32 FP registers are saved.
     unsafe {
         asm!(
             "fsd f0, 0({base})",
@@ -160,6 +169,8 @@ fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
     }
     ensure_fs_enabled();
     let ptr = inner.fp_regs.as_ptr();
+    // SAFETY: ptr points to a valid fp_regs array in the task control block;
+    // FPU is enabled via ensure_fs_enabled(); all 32 FP registers are restored.
     unsafe {
         asm!(
             "fld f0, 0({base})",

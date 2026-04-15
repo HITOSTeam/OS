@@ -139,6 +139,7 @@ pub fn acct_process_exit(process: &Arc<ProcessControlBlock>, exit_code: i32) {
         ac_comm: acct_comm_from_argv(&argv),
         ac_pad: [0; 10],
     };
+    // SAFETY: record is a stack-local struct with known layout; length equals size_of::<Acct>().
     let bytes = unsafe {
         core::slice::from_raw_parts(
             &record as *const Acct as *const u8,

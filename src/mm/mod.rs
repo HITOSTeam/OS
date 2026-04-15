@@ -101,6 +101,8 @@ impl Iterator for UserBufferIterator {
             return self.next();
         }
 
+        // SAFETY: buffer_index and offset_in_buffer are bounds-checked above;
+        // the underlying slice is valid for the lifetime of the iterator.
         let ptr = unsafe {
             self.buffers[self.buffer_index]
                 .as_mut_ptr()
