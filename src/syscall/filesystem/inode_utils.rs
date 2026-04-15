@@ -791,7 +791,10 @@ pub(crate) fn has_open_inode_view(target: &Arc<ext4_fs::Inode>) -> bool {
     };
     for process in processes {
         let Some(inner) = process.try_borrow_mut() else {
-            continue;
+            // Cannot inspect this process — conservatively report the inode
+            // as open so the caller defers the unlink rather than deleting
+            // a file that may still be in use.
+            return true;
         };
         if inner
             .fd_table

@@ -683,7 +683,10 @@ fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
     };
     for process in processes {
         let Some(inner) = process.try_borrow_mut() else {
-            continue;
+            // Cannot inspect this process (lock held) — conservatively assume
+            // it may reference the inode.  The cleanup will be retried on the
+            // next OSInode::drop for the same inode.
+            return true;
         };
         if inner
             .fd_table
@@ -703,6 +706,24 @@ fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
         }
     }
     false
+}
+
+/// Attempt to clean up any lingering deferred-unlink entries whose inodes
+/// no longer have open file descriptors.  Called opportunistically after a
+/// successful cleanup to prevent orphan accumulation.
+fn sweep_deferred_unlinks() {
+    let keys: Vec<(usize, u32)> = {
+        DEFERRED_UNLINK_CLEANUP.lock().keys().cloned().collect()
+    };
+    for key in keys {
+        // Only proceed if we can definitively confirm no refs remain.
+        if !has_open_inode_fd_refs(key.0, key.1) {
+            if let Some(cleanup) = DEFERRED_UNLINK_CLEANUP.lock().remove(&key) {
+                let _fs_guard = ext4_lock();
+                let _ = cleanup.parent.unlink(&cleanup.name);
+            }
+        }
+    }
 }
 
 lazy_static! {
@@ -1148,6 +1169,8 @@ impl Drop for OSInode {
                     let _fs_guard = ext4_lock();
                     cleanup.parent.unlink(&cleanup.name)
                 };
+                // Opportunistically clean up other lingering deferred entries.
+                sweep_deferred_unlinks();
             }
         }
     }
