@@ -10,23 +10,23 @@ use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{
-    File, MountNamespace, PollWaitQueue, Stdin, Stdout, cgroup_attach_fork_child,
-    clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
+    cgroup_attach_fork_child, clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
+    File, MountNamespace, PollWaitQueue, Stdin, Stdout,
 };
 use crate::mm::{
-    ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
+    read_user_value, translated_mutref, write_user_value, ElfAux, MemorySet, KERNEL_SPACE,
 };
 use crate::println;
 use crate::task::condvar::Condvar;
-use crate::task::id::{PidHandle, pid_alloc};
+use crate::task::id::{pid_alloc, PidHandle};
 use crate::task::manager::{
-    PID2PCB, add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task,
-    wakeup_task,
+    add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
+    PID2PCB,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
-    RT_SIG_MAX, RtSigAction, SIG_IGN, SignalAction, SignalActions, SignalFlags,
+    RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN,
 };
 use crate::task::task_block::TaskControlBlock;
 use crate::trap::context::TrapContext;
@@ -790,7 +790,7 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     // Walk argv/envp to find auxv.
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-    // Skip envp pointers (NULL terminated).
+                                                                        // Skip envp pointers (NULL terminated).
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();
@@ -1820,6 +1820,7 @@ impl ProcessControlBlock {
         let pid = pid_alloc();
         let pid_value = pid.0;
         let inherited_owner = parent.files_owner.as_ref().and_then(Weak::upgrade);
+        // remove parent's invalid table
         if parent.files_owner.is_some() && inherited_owner.is_none() {
             parent.files_owner = None;
         }

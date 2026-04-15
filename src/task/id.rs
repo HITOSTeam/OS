@@ -2,7 +2,7 @@ use alloc::{collections::BTreeSet, sync::Arc, sync::Weak};
 
 use crate::{
     config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
-    mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr},
+    mm::{MapPermission, PhysPageNum, VirtAddr, KERNEL_SPACE},
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
 };
@@ -167,7 +167,7 @@ impl Drop for KernelStack {
     }
 }
 
-//THREAD USER RESOURCES
+///THREAD USER RESOURCES
 pub struct TaskUserRes {
     pub tid: usize,
     pub ustack_base: usize,
@@ -271,6 +271,7 @@ impl TaskUserRes {
             }
         }
         // alloc trap_cx
+        // if trap alloc failed,we will remove the user_stack too
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
         if !process_inner.memory_set.try_insert_framed_area(

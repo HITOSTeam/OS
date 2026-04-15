@@ -896,7 +896,7 @@ pub fn block_current_and_run_next() {
 pub const IDLE_PID: usize = 0;
 
 // 线程(task)  单位的推出
-pub fn exit_current_and_run_next(exit_code: i32) {
+pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // 标记线程状态,
     let task = take_current_task().unwrap();
     charge_running_task(&task);
@@ -909,7 +909,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         queue_exiting_task_drop(task);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
-        return;
+        unreachable!("schedule should not return after task exit");
     };
 
     // Extract exit bookkeeping first, then perform Linux-thread cleanup without
@@ -1048,7 +1048,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         drop(process);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
-        return;
+        unreachable!("schedule should not return after task exit");
     }
     // Drop the current task after switching to idle to avoid leaking the final
     // strong Arc from this never-returning exit path.
@@ -1061,10 +1061,11 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // );
     let mut _unused = TaskContext::new();
     schedule(&mut _unused as *mut _);
+    unreachable!("schedule should not return after task exit");
 }
 
 /// Terminate the entire process, even when called from a non-main thread.
-pub fn exit_group_and_run_next(exit_code: i32) {
+pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     let task = take_current_task().unwrap();
     charge_running_task(&task);
     task.clear_on_cpu();
@@ -1075,7 +1076,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         queue_exiting_task_drop(task);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
-        return;
+        unreachable!("schedule should not return after group exit");
     };
 
     let (tid, _is_linux_thread, _clear_child_tid_addr) =
@@ -1165,4 +1166,5 @@ pub fn exit_group_and_run_next(exit_code: i32) {
     drop(process);
     let mut _unused = TaskContext::new();
     schedule(&mut _unused as *mut _);
+    unreachable!("schedule should not return after group exit");
 }

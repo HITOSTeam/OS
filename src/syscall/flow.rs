@@ -271,14 +271,12 @@ pub fn syscall_pwritev2(
 
 pub fn syscall_exit(_code: usize) -> isize {
     let code = ((_code as i32) & 0xff) as i32;
-    exit_current_and_run_next(code);
-    return 0;
+    exit_current_and_run_next(code)
 }
 
 pub fn syscall_exit_group(_code: usize) -> isize {
     let code = ((_code as i32) & 0xff) as i32;
-    exit_group_and_run_next(code);
-    0
+    exit_group_and_run_next(code)
 }
 // the below one is just for testing
 pub fn syscall_fortest(a: usize, b: usize) -> isize {

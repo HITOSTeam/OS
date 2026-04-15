@@ -669,8 +669,7 @@ pub fn trap_return() -> ! {
                 res.trap_cx_user_va()
             } else {
                 drop(task_inner);
-                exit_current_and_run_next(-1);
-                unreachable!("exit_current_and_run_next should not return");
+                exit_current_and_run_next(-1)
             }
         };
         let user_satp = task

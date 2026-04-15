@@ -9,10 +9,10 @@ use crate::arch;
 use crate::config::MAX_HARTS;
 use crate::debug_config::DEBUG_SCHED;
 use crate::fs::legacy_cpu_fair_group;
-use crate::task::block_sleep::{TIMERS, TimeWrap};
+use crate::task::block_sleep::{TimeWrap, TIMERS};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::sched::{
-    RT_PRIO_LEVELS, RT_PRIO_MAX, RT_PRIO_MIN, SchedClass, rt_queue_index, sched_class,
+    rt_queue_index, sched_class, SchedClass, RT_PRIO_LEVELS, RT_PRIO_MAX, RT_PRIO_MIN,
 };
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use spin::Mutex;
@@ -29,7 +29,11 @@ pub fn mark_hart_online(hart_id: usize) {
 fn online_hart_mask() -> usize {
     let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
     // Fallback: at least hart0 exists.
-    if mask == 0 { 1 } else { mask }
+    if mask == 0 {
+        1
+    } else {
+        mask
+    }
 }
 
 fn pick_online_hart(start: usize) -> usize {
@@ -162,14 +166,21 @@ enum ReadyQueueSlot {
     Fair,
 }
 
+/// get where the task should be
+///
 fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
+    // if getting processblock fails,we set this to fair
     let Some(process) = task.process.upgrade() else {
         return ReadyQueueSlot::Fair;
     };
     let (policy, rt_priority) = {
         let inner = process.borrow_mut();
-        (inner.scheduling.sched_policy, inner.scheduling.sched_priority)
+        (
+            inner.scheduling.sched_policy,
+            inner.scheduling.sched_priority,
+        )
     };
+    // according to the policy number,decide the target position
     match sched_class(policy) {
         Some(SchedClass::Fifo) | Some(SchedClass::Rr) => {
             ReadyQueueSlot::Rt(rt_queue_index(rt_priority))

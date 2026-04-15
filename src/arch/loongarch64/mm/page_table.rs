@@ -450,8 +450,7 @@ fn user_access_fail(va: usize, access: MapPermission) -> ! {
         va,
         access
     );
-    crate::task::processor::exit_current_and_run_next(EFAULT);
-    unreachable!("killed current task due to invalid user access")
+    crate::task::processor::exit_current_and_run_next(EFAULT)
 }
 
 fn resolve_user_pte(token: usize, va: usize, access: MapPermission) -> Result<PageTableEntry, ()> {

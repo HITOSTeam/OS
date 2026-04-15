@@ -83,8 +83,7 @@ pub fn syscall_rt_sigreturn() -> isize {
     }
     let Some(saved) = inner.sig_saved_ctx.pop() else {
         drop(inner);
-        exit_current_and_run_next(-1);
-        unreachable!("exit_current_and_run_next should not return");
+        exit_current_and_run_next(-1)
     };
     if saved.uses_ucontext && saved.ucontext_ptr != 0 {
         let token = get_current_token();
