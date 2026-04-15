@@ -1,3 +1,4 @@
+pub mod csr_defs;
 pub mod mm;
 pub mod trap;
 
@@ -7,6 +8,12 @@ use spin::MutexGuard;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use csr_defs::{
+    CRMD_DA, CRMD_IE, CRMD_PG,
+    ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT,
+    TCFG_EN, TCFG_INITVAL_MASK,
+};
 
 global_asm!(include_str!("tlb_refill.S"));
 
@@ -84,8 +91,8 @@ pub fn disable_interrupts() -> bool {
     let mut crmd: usize;
     // SAFETY: CRMD (CSR 0x0) read/write is valid in kernel mode on LoongArch.
     unsafe { asm!("csrrd {}, 0x0", out(reg) crmd) };
-    let prev = (crmd & (1 << 2)) != 0;
-    crmd &= !(1 << 2);
+    let prev = (crmd & CRMD_IE) != 0;
+    crmd &= !CRMD_IE;
     // SAFETY: CRMD write disables interrupts.
     unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
     prev
@@ -101,7 +108,7 @@ pub fn enable_interrupts() {
     let mut crmd: usize;
     // SAFETY: CRMD (CSR 0x0) read/write is valid in kernel mode on LoongArch.
     unsafe { asm!("csrrd {}, 0x0", out(reg) crmd) };
-    crmd |= 1 << 2;
+    crmd |= CRMD_IE;
     unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
 }
 
@@ -151,8 +158,8 @@ pub fn enable_timer_interrupt() {
     // SAFETY: ECFG (CSR 0x4) read/write is valid in kernel mode on LoongArch.
     unsafe { asm!("csrrd {}, 0x4", out(reg) ecfg) };
     // Ensure vector spacing (VS) is zero so timer interrupts use the base entry.
-    ecfg &= !(0x7 << 16);
-    ecfg |= 1 << 11;
+    ecfg &= !(ECFG_VS_MASK << ECFG_VS_SHIFT);
+    ecfg |= ECFG_LIE_TI;
     unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
 }
 
@@ -166,7 +173,7 @@ pub fn clear_timer_interrupt() {
 pub fn set_timer(timer: usize) {
     // For LoongArch, TCFG holds a relative countdown value in bits [2..].
     let delta = timer.max(4);
-    let tcfg = (delta & !0x3) | 0x1;
+    let tcfg = (delta & TCFG_INITVAL_MASK) | TCFG_EN;
     // SAFETY: TCFG (CSR 0x41) write is valid in kernel mode; configures timer countdown.
     unsafe {
         asm!("csrwr {}, 0x41", in(reg) tcfg);
@@ -415,9 +422,9 @@ pub fn bootstrap_init() {
         // Enable paging: CRMD.PG=1, CRMD.DA=0, CRMD.IE=0.
         let mut crmd: usize;
         asm!("csrrd {}, 0x0", out(reg) crmd);
-        crmd &= !(1 << 2);
-        crmd &= !(1 << 3);
-        crmd |= 1 << 4;
+        crmd &= !CRMD_IE;
+        crmd &= !CRMD_DA;
+        crmd |= CRMD_PG;
         asm!("csrwr {}, 0x0", in(reg) crmd);
 
         // TLB refill entry (must be 4K aligned).

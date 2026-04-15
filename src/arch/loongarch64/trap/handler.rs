@@ -27,6 +27,8 @@ const ECODE_PAGE_PRIV: usize = 0x7;
 const ECODE_ADDR_ERROR: usize = 0x8;
 const ECODE_ADDR_ALIGN: usize = 0x9;
 
+use super::super::csr_defs::{ECFG_LIE_TI, ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, PRMD_USER_IE, PRMD_USER_IE_MASK};
+
 const ESTAT_TIMER_BIT: usize = 11;
 
 /// Log only the first trap_return to see initial user entry.
@@ -93,7 +95,7 @@ pub fn init_trap() {
 #[unsafe(no_mangle)]
 pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     let estat = read_estat();
-    let ecode = (estat >> 16) & 0x3f;
+    let ecode = (estat >> ESTAT_ECODE_SHIFT) & ESTAT_ECODE_MASK;
     if ecode == 0 && (estat & (1 << ESTAT_TIMER_BIT)) != 0 {
         super::super::clear_timer_interrupt();
         set_next_trigger();
@@ -176,7 +178,7 @@ pub fn trap_handler() {
     set_kernel_trap_entry();
 
     let estat = read_estat();
-    let ecode = (estat >> 16) & 0x3f;
+    let ecode = (estat >> ESTAT_ECODE_SHIFT) & ESTAT_ECODE_MASK;
     let badv = read_badv();
     let badi = read_badi();
 
@@ -267,7 +269,7 @@ pub fn trap_return() -> ! {
     set_kernel_trap_entry();
     {
         let cx = get_trap_context();
-        cx.sstatus = (cx.sstatus & !0x7) | 0x7;
+        cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
     }
     // IMPORTANT: `trap_return()` diverges, so keep Arc owners in a short scope.
     let (trap_cx_ptr, user_token) = {

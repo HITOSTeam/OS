@@ -39,8 +39,9 @@ impl TrapContext {
         unsafe {
             asm!("csrrd {}, 0x1", out(reg) prmd);
         }
+        use super::super::csr_defs::{PRMD_USER_IE, PRMD_USER_IE_MASK};
         // PRMD[1:0]=PPLV (0b11 for user), PRMD[2]=PIE.
-        prmd = (prmd & !0x7) | 0x7;
+        prmd = (prmd & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
         let mut cx = Self {
             x: [0; 32],
             sstatus: prmd,
