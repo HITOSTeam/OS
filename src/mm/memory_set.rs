@@ -864,14 +864,13 @@ impl MemorySet {
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
 
-        let mut parent_updates: Vec<(VirtPageNum, PTEFlags)> = Vec::new();
+        let mut parent_update_count = 0usize;
         let mut src_walk_cache = PageWalkCache::new();
         let mut dst_walk_cache = PageWalkCache::new();
         let mut area_count = 0usize;
         let mut identical_pages = 0usize;
         let mut shared_pages = 0usize;
         let mut kernel_private_pages = 0usize;
-        let mut cow_marked_pages = 0usize;
 
         for area in user_space.areas.iter() {
             area_count = area_count.saturating_add(1);
@@ -946,8 +945,10 @@ impl MemorySet {
                             src_flags.remove(PTEFlags::W);
                             src_flags.remove(PTEFlags::D);
                             src_flags.insert(PTEFlags::COW);
-                            parent_updates.push((vpn, src_flags));
-                            cow_marked_pages = cow_marked_pages.saturating_add(1);
+                            // Apply parent PTE demotion immediately to minimize the window where
+                            // another thread could write through a still-writable PTE on another hart.
+                            user_space.page_table.set_flags(vpn, src_flags);
+                            parent_update_count = parent_update_count.saturating_add(1);
                         }
                         memory_set.page_table.map_cached(
                             vpn,
@@ -968,11 +969,6 @@ impl MemorySet {
         } else {
             0
         };
-        let parent_update_count = parent_updates.len();
-        // Apply parent COW flag updates after we finish iterating its areas.
-        for (vpn, flags) in parent_updates {
-            user_space.set_pte_flags(vpn, flags);
-        }
         if parent_update_count != 0 {
             // SAFETY: after fork demotes parent PTEs from writable to read-only+COW,
             // every hart running the parent must drop stale writable TLB entries
@@ -1019,7 +1015,7 @@ impl MemorySet {
                     identical_pages,
                     shared_pages,
                     kernel_private_pages,
-                    cow_marked_pages,
+                    parent_update_count,
                     parent_update_count
                 );
             }
