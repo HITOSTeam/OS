@@ -54,6 +54,8 @@ pub fn select_hart_for_new_task() -> usize {
 
 pub fn dump_system_state() {
     log::warn!("==== [watchdog] system state dump ====");
+    // Disable interrupts to prevent deadlock with timer-driven wakeup_task().
+    let prev_sie = arch::disable_interrupts();
     let mgr = TASK_MANAGER.lock();
     let total_ready: usize = mgr.ready_queues.iter().map(HartRunQueue::len).sum();
     log::warn!(
@@ -128,6 +130,7 @@ pub fn dump_system_state() {
     }
     drop(map);
     log::warn!("==== [watchdog] end ====");
+    arch::restore_interrupts(prev_sie);
 }
 
 #[derive(Default)]
