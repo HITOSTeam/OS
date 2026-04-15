@@ -131,6 +131,19 @@ pub(crate) fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send 
 }
 
 /// Get the file for `fd`, returning `-EBADF` if the descriptor is not open.
+macro_rules! fd_file {
+    ($inner:expr, $fd:expr) => {
+        match $inner.fd_table.get($fd).and_then(|slot| slot.as_ref()) {
+            Some(f) => f.clone(),
+            None => {
+                return $crate::syscall::error::err($crate::syscall::error::SyscallError::EBADF);
+            }
+        }
+    };
+}
+pub(crate) use fd_file;
+
+/// Get the file for `fd`, returning `-EBADF` if the descriptor is not open.
 macro_rules! require_fd_file {
     ($fd:expr) => {
         match $crate::syscall::filesystem::get_fd_file($fd as usize) {

@@ -7,7 +7,7 @@ use super::{
     SyscallError, TMPFILE_SEQ,
     apply_umask, current_effective_uid_gid, current_files_process, current_fsuid_gid,
     current_process, err, ext4_err_to_errno, ext4_lock, fifo_pipe_state_for_inode,
-    file_lock_key, file_lock_key_from_inode, get_current_token,
+    fd_file, file_lock_key, file_lock_key_from_inode, get_current_token,
     gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid,
     is_privileged_or_owner,
     install_open_file_fd, is_inode_currently_executed_locked, lock_executing_inodes,
@@ -646,10 +646,7 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
 pub fn syscall_dup(oldfd: usize) -> isize {
     let process = current_files_process();
     let mut inner = process.borrow_mut();
-    if !inner.is_fd_open(oldfd) {
-        return err(SyscallError::EBADF);
-    }
-    let file = inner.fd_table[oldfd].as_ref().unwrap().clone();
+    let file = fd_file!(inner, oldfd);
     inner.ensure_fd_flags_len();
     let old_flags = inner.fd_flags[oldfd];
     let Some(newfd) = inner.alloc_fd() else {
@@ -672,9 +669,7 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     if newfd >= inner.rlimits.rlimit_nofile_cur as usize {
         return err(SyscallError::EBADF);
     }
-    if !inner.is_fd_open(oldfd) {
-        return err(SyscallError::EBADF);
-    }
+    let file = fd_file!(inner, oldfd);
     let owner_pid = current_process().getpid();
     let mut replaced_lock_key = None;
     if inner.is_fd_open(newfd) {
@@ -685,7 +680,6 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
         remove_process_record_locks_for_key(owner_pid, key);
         remove_owner_file_lease_for_key(owner_pid, key);
     }
-    let file = inner.fd_table[oldfd].as_ref().unwrap().clone();
     inner.ensure_fd_flags_len();
     let old_flags = inner.fd_flags[oldfd];
     while inner.fd_table.len() <= newfd {
@@ -702,4 +696,3 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     inner.fd_flags[newfd] = new_flags;
     newfd as isize
 }
-

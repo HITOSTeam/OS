@@ -10,7 +10,7 @@ use super::{
     current_files_process, current_process, current_task,
     detect_record_lock_deadlock,
     enqueue_record_lock_waiter, err,
-    file_lock_key, first_conflicting_lock,
+    fd_file, file_lock_key, first_conflicting_lock,
     get_current_token, get_file_lease_type,
     has_pending_unmasked_signal, lock_conflicts,
     lock_range_from_flock, ofd_lock_owner_id,
@@ -19,15 +19,6 @@ use super::{
     set_record_lock_waiting, try_read_user_value,
     try_write_user_value, wake_record_lock_waiters,
 };
-
-macro_rules! fd_file {
-    ($inner:expr, $fd:expr) => {
-        match $inner.fd_table.get($fd).and_then(|slot| slot.as_ref()) {
-            Some(f) => f.clone(),
-            None => return err(SyscallError::EBADF),
-        }
-    };
-}
 
 pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     // Minimal `fcntl(2)` support for busybox/ash/glibc startup.
