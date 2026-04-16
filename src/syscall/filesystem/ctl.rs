@@ -25,6 +25,7 @@ use super::{
     wake_record_lock_waiters,
 };
 
+/// Enables or disables BSD-style process accounting on an ext4 regular file.
 pub fn syscall_acct(pathname: usize) -> isize {
     if current_effective_uid_gid().0 != 0 {
         return err(SyscallError::EPERM);
@@ -80,6 +81,7 @@ pub fn syscall_acct(pathname: usize) -> isize {
     0
 }
 
+/// Derives the fixed-width `ac_comm` field from the process `argv[0]`.
 fn acct_comm_from_argv(argv: &[String]) -> [u8; ACCT_COMM + 1] {
     let mut out = [0u8; ACCT_COMM + 1];
     let name = argv.get(0).map(|s| s.as_str()).unwrap_or("");
@@ -90,6 +92,7 @@ fn acct_comm_from_argv(argv: &[String]) -> [u8; ACCT_COMM + 1] {
     out
 }
 
+/// Encodes a task exit status into the on-disk accounting record format.
 fn acct_exitcode(exit_code: i32) -> u32 {
     if exit_code < 0 {
         (-exit_code as u32) & 0x7f
@@ -98,6 +101,7 @@ fn acct_exitcode(exit_code: i32) -> u32 {
     }
 }
 
+/// Appends one accounting record for a process that is exiting.
 pub fn acct_process_exit(process: &Arc<ProcessControlBlock>, exit_code: i32) {
     let inode = {
         let state = ACCT_STATE.lock();
@@ -152,6 +156,7 @@ pub fn acct_process_exit(process: &Arc<ProcessControlBlock>, exit_code: i32) {
     let _ = inode.write_at(offset, bytes);
 }
 
+/// Counts how many record-lock wait queues currently reference the given task.
 pub fn debug_count_record_lock_waiters_for_task(task: &Arc<TaskControlBlock>) -> usize {
     RECORD_LOCK_WAITERS
         .lock()
@@ -165,6 +170,7 @@ pub fn debug_count_record_lock_waiters_for_task(task: &Arc<TaskControlBlock>) ->
         .sum()
 }
 
+/// Releases all POSIX record locks owned by the given process and wakes waiters.
 pub fn release_all_record_locks_for_owner(owner_pid: usize) {
     clear_record_lock_waiting(owner_pid);
     let changed_keys = {
@@ -192,12 +198,14 @@ pub fn release_all_record_locks_for_owner(owner_pid: usize) {
     }
 }
 
+/// Releases every file lease owned by the given process.
 pub fn release_all_file_leases_for_owner(owner_pid: usize) {
     let mut table = FILE_LEASES.lock();
     table.retain(|_, lease| lease.owner_pid != owner_pid);
 }
 
 
+/// Checks pathname accessibility using Linux-like `faccessat(2)` permission rules.
 pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usize) -> isize {
     if mode & !0x7 != 0 {
         return err(SyscallError::EINVAL);
@@ -272,6 +280,7 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     0
 }
 
+/// Changes mode bits on the inode referenced by an open file descriptor.
 pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
@@ -299,14 +308,17 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
     0
 }
 
+/// Compatibility wrapper for `fchmodat(2)` that delegates to `fchmodat2`.
 pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
     do_fchmodat(dirfd, pathname, mode, flags, false)
 }
 
+/// Changes mode bits on a path, including `AT_EMPTY_PATH` and symlink-control handling.
 pub fn syscall_fchmodat2(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
     do_fchmodat(dirfd, pathname, mode, flags, true)
 }
 
+/// Changes ownership on the inode referenced by an open file descriptor.
 pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
@@ -328,6 +340,7 @@ pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     0
 }
 
+/// Changes ownership on a pathname, with support for `dirfd` and proc-fd empty paths.
 pub fn syscall_fchownat(
     dirfd: isize,
     pathname: usize,
@@ -383,6 +396,7 @@ pub fn syscall_fchownat(
     0
 }
 
+/// Moves the calling process into a new filesystem root directory.
 pub fn syscall_chroot(pathname: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -442,6 +456,7 @@ pub fn syscall_chroot(pathname: usize) -> isize {
     0
 }
 
+/// Changes the calling process's current working directory by pathname.
 pub fn syscall_chdir(pathname: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -523,6 +538,7 @@ pub fn syscall_chdir(pathname: usize) -> isize {
     0
 }
 
+/// Changes the current working directory using an already opened directory fd.
 pub fn syscall_fchdir(fd: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return err(SyscallError::EBADF);
@@ -559,4 +575,3 @@ pub fn syscall_fchdir(fd: usize) -> isize {
     current_process().borrow_mut().cwd = final_cwd;
     0
 }
-

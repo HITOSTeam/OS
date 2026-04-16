@@ -12,6 +12,7 @@ use super::{
     try_read_user_value, update_mount_record_flags,
 };
 
+/// Creates a new filesystem context fd for the modern mount API.
 pub fn syscall_fsopen(fsname: usize, flags: usize) -> isize {
     if (flags & !FSOPEN_CLOEXEC) != 0 {
         return err(SyscallError::EINVAL);
@@ -34,6 +35,7 @@ pub fn syscall_fsopen(fsname: usize, flags: usize) -> isize {
     alloc_internal_fd(Arc::new(FsContextFile::new_create(&fsname)), fd_flags).unwrap_or_else(|e| e)
 }
 
+/// Applies configuration commands to an `fsopen(2)` filesystem context.
 pub fn syscall_fsconfig(fd: usize, cmd: usize, key: usize, value: usize, aux: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return err(SyscallError::EINVAL);
@@ -144,6 +146,7 @@ pub fn syscall_fsconfig(fd: usize, cmd: usize, key: usize, value: usize, aux: us
     }
 }
 
+/// Materializes a configured filesystem context as a detached mount handle.
 pub fn syscall_fsmount(fd: usize, flags: usize, mount_attrs: usize) -> isize {
     if (flags & !FSMOUNT_CLOEXEC) != 0 {
         return err(SyscallError::EINVAL);
@@ -182,6 +185,7 @@ pub fn syscall_fsmount(fd: usize, flags: usize, mount_attrs: usize) -> isize {
     .unwrap_or_else(|e| e)
 }
 
+/// Picks an existing mount and returns a reconfiguration-capable filesystem context.
 pub fn syscall_fspick(dirfd: isize, path: usize, flags: usize) -> isize {
     let valid_flags =
         FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
@@ -219,6 +223,7 @@ pub fn syscall_fspick(dirfd: isize, path: usize, flags: usize) -> isize {
     .unwrap_or_else(|e| e)
 }
 
+/// Opens a mount tree as a detached handle, optionally cloning the source tree.
 pub fn syscall_open_tree(dirfd: isize, path: usize, flags: usize) -> isize {
     let valid_flags =
         OPEN_TREE_CLONE | O_CLOEXEC | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
@@ -257,6 +262,7 @@ pub fn syscall_open_tree(dirfd: isize, path: usize, flags: usize) -> isize {
     .unwrap_or_else(|e| e)
 }
 
+/// Attaches or moves a detached mount handle onto a target mountpoint.
 pub fn syscall_move_mount(
     from_dirfd: isize,
     from_path: usize,
@@ -308,6 +314,7 @@ pub fn syscall_move_mount(
     0
 }
 
+/// Updates mount attribute bits on a detached mount handle.
 pub fn syscall_mount_setattr(
     dirfd: isize,
     path: usize,
@@ -353,6 +360,7 @@ pub fn syscall_mount_setattr(
     0
 }
 
+/// Legacy `mount(2)` entry point delegated to the shared mount implementation.
 pub fn syscall_mount(
     special: usize,
     dir: usize,
@@ -363,7 +371,7 @@ pub fn syscall_mount(
     syscall_mount_impl(special, dir, fstype, flags, data)
 }
 
+/// Legacy `umount2(2)` entry point delegated to the shared unmount implementation.
 pub fn syscall_umount2(special: usize, flags: usize) -> isize {
     syscall_umount2_impl(special, flags)
 }
-

@@ -21,6 +21,7 @@ use super::{
     truncate_regular_inode, try_copy_to_user, try_write_user_value, write_zeros_range,
 };
 
+/// Preallocates file space or punches holes on supported file types.
 pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
@@ -136,6 +137,7 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
     ret
 }
 
+/// Changes the length of an opened regular file or memfd-like shm object.
 pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
     if (length as i64) < 0 {
         return err(SyscallError::EINVAL);
@@ -187,6 +189,7 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
     err(SyscallError::EINVAL)
 }
 
+/// Changes the length of a regular file resolved by pathname.
 pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
     if (length as i64) < 0 {
         return err(SyscallError::EINVAL);
@@ -246,6 +249,7 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
     ret
 }
 
+/// Returns `statfs` data for the filesystem containing an open file descriptor.
 pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
     if get_fd_file(fd).is_none() {
         return err(SyscallError::EBADF);
@@ -254,6 +258,7 @@ pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
     fill_statfs(st_ptr, 0)
 }
 
+/// Returns `statfs` data for the filesystem containing the resolved path.
 pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -290,6 +295,7 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
     }
 }
 
+/// Updates inode timestamps by path or fd, including Linux `UTIME_*` semantics.
 pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: usize) -> isize {
     // `futimens` passes a null pathname and uses dirfd as the target fd.
     if pathname == 0 {
@@ -434,6 +440,7 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
     0
 }
 
+/// Copies the caller's current working directory into a userspace buffer.
 pub fn syscall_getcwd(buf: usize, size: usize) -> isize {
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
@@ -453,6 +460,7 @@ pub fn syscall_getcwd(buf: usize, size: usize) -> isize {
     need as isize
 }
 
+/// Returns `fstat(2)` metadata for an open file descriptor.
 pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     if get_fd_file(fd).is_none() {
         if crate::debug_config::DEBUG_FS {
@@ -487,6 +495,7 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     0
 }
 
+/// Flushes dirty state for one open file descriptor when the backend supports it.
 pub fn syscall_fsync(fd: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
@@ -512,6 +521,7 @@ pub fn syscall_fsync(fd: usize) -> isize {
     err(SyscallError::EINVAL)
 }
 
+/// Flushes dirty file data across currently open descriptors and the ext4 backend.
 pub fn syscall_sync() -> isize {
     let current = current_process();
     let mut files: Vec<alloc::sync::Arc<dyn File + Send + Sync>> = Vec::new();
@@ -552,6 +562,7 @@ pub fn syscall_sync() -> isize {
     0
 }
 
+/// Flushes the filesystem that contains the given file descriptor.
 pub fn syscall_syncfs(fd: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
@@ -563,6 +574,7 @@ pub fn syscall_syncfs(fd: usize) -> isize {
     syscall_sync()
 }
 
+/// Validates `sync_file_range(2)` arguments and flushes dirty regular-file state.
 pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: usize) -> isize {
     const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
     const SYNC_FILE_RANGE_WRITE: usize = 2;
@@ -609,6 +621,7 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
     0
 }
 
+/// Accepts advisory access-pattern hints for regular files.
 pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) -> isize {
     const POSIX_FADV_NORMAL: usize = 0;
     const POSIX_FADV_RANDOM: usize = 1;
@@ -655,6 +668,7 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
     0
 }
 
+/// Returns `newfstatat(2)` metadata for ext4, pseudo, and proc magic-link paths.
 pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: usize) -> isize {
     if st_ptr == 0 {
         return err(SyscallError::EFAULT);
@@ -788,6 +802,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     0
 }
 
+/// Returns `statx(2)` metadata with Linux-like path and `AT_EMPTY_PATH` handling.
 pub fn syscall_statx(
     dirfd: isize,
     pathname: usize,
@@ -948,4 +963,3 @@ pub fn syscall_statx(
     }
     0
 }
-

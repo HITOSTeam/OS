@@ -3,6 +3,30 @@ name = "os"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unreachable_patterns = "warn"
+unused_must_use = "deny"
+unsafe_op_in_unsafe_fn = "warn"
+static_mut_refs = "warn"
+non_ascii_idents = "deny"
+
+[lints.clippy]
+not_unsafe_ptr_arg_deref = "deny"
+ptr_cast_constness = "deny"
+precedence = "deny"
+
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+cast_ptr_alignment = "warn"
+arithmetic_side_effects = "warn"
+
+too_many_arguments = "allow"
+new_without_default = "allow"
+module_inception = "allow"
+if_same_then_else = "allow"
+many_single_char_names = "allow"
+
 [dependencies]
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 buddy_system_allocator = "0.6"

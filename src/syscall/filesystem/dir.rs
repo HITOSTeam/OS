@@ -18,6 +18,7 @@ use super::{
     translated_byte_buffer, try_copy_to_user,
 };
 
+/// Reads a symlink target by pathname or, with `AT_EMPTY_PATH`, directly from an fd.
 pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -113,6 +114,7 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
     len as isize
 }
 
+/// Creates a symbolic link in an ext4 directory.
 pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isize {
     let token = get_current_token();
     let target_path = match read_user_cstring(token, target) {
@@ -162,6 +164,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
     }
 }
 
+/// Creates a hard link while enforcing mount-boundary and proc-fd rules.
 pub fn syscall_linkat(
     olddirfd: isize,
     oldpath: usize,
@@ -288,6 +291,7 @@ pub fn syscall_linkat(
     }
 }
 
+/// Renames or moves a filesystem entry with classic `renameat(2)` semantics.
 pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpath: usize) -> isize {
     let token = get_current_token();
     let old_s = match read_user_cstring(token, oldpath) {
@@ -304,6 +308,7 @@ pub fn syscall_renameat(olddirfd: isize, oldpath: usize, newdirfd: isize, newpat
     do_renameat(olddirfd, &old_s, newdirfd, &new_s, false)
 }
 
+/// Handles `renameat2(2)` extensions such as `RENAME_NOREPLACE` and `RENAME_EXCHANGE`.
 pub fn syscall_renameat2(
     olddirfd: isize,
     oldpath: usize,
@@ -350,6 +355,7 @@ pub fn syscall_renameat2(
     err(SyscallError::EINVAL)
 }
 
+/// Creates regular, FIFO, socket, block, or char special nodes in ext4.
 pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -428,6 +434,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     }
 }
 
+/// Creates a directory and applies Linux-like gid inheritance and permission checks.
 pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -539,6 +546,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     }
 }
 
+/// Removes a directory entry, optionally enforcing `rmdir` semantics.
 pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     const AT_REMOVEDIR: usize = 0x200;
     if (flags & !AT_REMOVEDIR) != 0 {
@@ -677,6 +685,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     }
 }
 
+/// Emits Linux `dirent64` records for pseudo and ext4-backed directories.
 pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     // Avoid unbounded kernel heap allocations from user-provided buffer sizes.
     // Returning fewer bytes is allowed; callers will retry with the remaining entries.
@@ -913,4 +922,3 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     }
     written as isize
 }
-

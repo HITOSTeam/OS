@@ -20,6 +20,7 @@ use super::{
     touch_inode_mtime_ctime_now, try_write_user_value, union_root_dir_entries,
 };
 
+/// Opens or creates a filesystem object across ext4, proc, pseudo-fs, and tmpfile paths.
 pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
@@ -526,6 +527,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     fd as isize
 }
 
+/// Closes a single file descriptor and releases any lock or lease state tied to it.
 pub fn syscall_close(fd: usize) -> isize {
     let process = current_files_process();
     let mut inner = process.borrow_mut();
@@ -549,6 +551,7 @@ pub fn syscall_close(fd: usize) -> isize {
     0
 }
 
+/// Applies `close_range(2)` semantics, including optional `UNSHARE` and `CLOEXEC`.
 pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
     const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
     const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
@@ -599,6 +602,7 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
     0
 }
 
+/// Creates a pipe pair and installs both ends into the caller's fd table.
 pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
     let process = current_files_process();
     let token = get_current_token();
@@ -644,6 +648,7 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
     0
 }
 
+/// Duplicates a file descriptor into the lowest-numbered free slot.
 pub fn syscall_dup(oldfd: usize) -> isize {
     let process = current_files_process();
     let mut inner = process.borrow_mut();
@@ -658,6 +663,7 @@ pub fn syscall_dup(oldfd: usize) -> isize {
     newfd as isize
 }
 
+/// Duplicates or replaces a file descriptor with optional `O_CLOEXEC` handling.
 pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     if (flags & !O_CLOEXEC) != 0 {
         return err(SyscallError::EINVAL);

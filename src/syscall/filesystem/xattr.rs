@@ -7,6 +7,7 @@ use super::{
     xattr_is_user_namespace,
 };
 
+/// Sets an extended attribute on the target path after following the final symlink.
 pub fn syscall_setxattr(
     path: usize,
     name: usize,
@@ -30,6 +31,7 @@ pub fn syscall_setxattr(
     do_setxattr(&inode, &name, value.as_slice(), flags)
 }
 
+/// Sets an extended attribute on the target path without following the final symlink.
 pub fn syscall_lsetxattr(
     path: usize,
     name: usize,
@@ -53,6 +55,7 @@ pub fn syscall_lsetxattr(
     do_setxattr(&inode, &name, value.as_slice(), flags)
 }
 
+/// Sets an extended attribute on the inode referenced by an open file descriptor.
 pub fn syscall_fsetxattr(fd: usize, name: usize, value: usize, size: usize, flags: usize) -> isize {
     let token = get_current_token();
     let inode = match resolve_xattr_fd_inode(fd) {
@@ -80,6 +83,7 @@ pub fn syscall_fsetxattr(fd: usize, name: usize, value: usize, size: usize, flag
     do_setxattr(&inode, &name, value.as_slice(), flags)
 }
 
+/// Reads an extended attribute from the target path after following the final symlink.
 pub fn syscall_getxattr(path: usize, name: usize, value: usize, size: usize) -> isize {
     let token = get_current_token();
     let name = match read_user_xattr_name(token, name) {
@@ -93,6 +97,7 @@ pub fn syscall_getxattr(path: usize, name: usize, value: usize, size: usize) -> 
     do_getxattr(&inode, &name, value, size, token)
 }
 
+/// Reads an extended attribute from the target path without following the final symlink.
 pub fn syscall_lgetxattr(path: usize, name: usize, value: usize, size: usize) -> isize {
     let token = get_current_token();
     let name = match read_user_xattr_name(token, name) {
@@ -106,6 +111,7 @@ pub fn syscall_lgetxattr(path: usize, name: usize, value: usize, size: usize) ->
     do_getxattr(&inode, &name, value, size, token)
 }
 
+/// Reads an extended attribute from the inode referenced by an open file descriptor.
 pub fn syscall_fgetxattr(fd: usize, name: usize, value: usize, size: usize) -> isize {
     let token = get_current_token();
     let inode = match resolve_xattr_fd_inode(fd) {
@@ -123,6 +129,7 @@ pub fn syscall_fgetxattr(fd: usize, name: usize, value: usize, size: usize) -> i
     do_getxattr(&inode, &name, value, size, token)
 }
 
+/// Lists extended attribute names for the target path after following the final symlink.
 pub fn syscall_listxattr(path: usize, list: usize, size: usize) -> isize {
     let token = get_current_token();
     let inode = match resolve_xattr_path_inode(path, true) {
@@ -132,6 +139,7 @@ pub fn syscall_listxattr(path: usize, list: usize, size: usize) -> isize {
     do_listxattr(&inode, list, size, token)
 }
 
+/// Lists extended attribute names for the target path without following the final symlink.
 pub fn syscall_llistxattr(path: usize, list: usize, size: usize) -> isize {
     let token = get_current_token();
     let inode = match resolve_xattr_path_inode(path, false) {
@@ -141,6 +149,7 @@ pub fn syscall_llistxattr(path: usize, list: usize, size: usize) -> isize {
     do_listxattr(&inode, list, size, token)
 }
 
+/// Lists extended attribute names for the inode referenced by an open file descriptor.
 pub fn syscall_flistxattr(fd: usize, list: usize, size: usize) -> isize {
     let token = get_current_token();
     let inode = match resolve_xattr_fd_inode(fd) {
@@ -151,6 +160,7 @@ pub fn syscall_flistxattr(fd: usize, list: usize, size: usize) -> isize {
     do_listxattr(&inode, list, size, token)
 }
 
+/// Removes an extended attribute from the target path after following the final symlink.
 pub fn syscall_removexattr(path: usize, name: usize) -> isize {
     let token = get_current_token();
     let name = match read_user_xattr_name(token, name) {
@@ -164,6 +174,7 @@ pub fn syscall_removexattr(path: usize, name: usize) -> isize {
     do_removexattr(&inode, &name)
 }
 
+/// Removes an extended attribute from the target path without following the final symlink.
 pub fn syscall_lremovexattr(path: usize, name: usize) -> isize {
     let token = get_current_token();
     let name = match read_user_xattr_name(token, name) {
@@ -177,6 +188,7 @@ pub fn syscall_lremovexattr(path: usize, name: usize) -> isize {
     do_removexattr(&inode, &name)
 }
 
+/// Removes an extended attribute from the inode referenced by an open file descriptor.
 pub fn syscall_fremovexattr(fd: usize, name: usize) -> isize {
     let token = get_current_token();
     let inode = match resolve_xattr_fd_inode(fd) {
@@ -193,4 +205,3 @@ pub fn syscall_fremovexattr(fd: usize, name: usize) -> isize {
     };
     do_removexattr(&inode, &name)
 }
-

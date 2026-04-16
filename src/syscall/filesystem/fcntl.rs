@@ -20,6 +20,7 @@ use super::{
     try_write_user_value, wake_record_lock_waiters,
 };
 
+/// Handles descriptor flags, record locks, leases, and async-owner state for `fcntl(2)`.
 pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     // Minimal `fcntl(2)` support for busybox/ash/glibc startup.
     const F_DUPFD: usize = 0;

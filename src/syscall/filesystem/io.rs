@@ -15,6 +15,7 @@ use super::{
 };
 use alloc::vec;
 
+/// Reads from regular files and special waitable descriptors into a user buffer.
 pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
@@ -109,6 +110,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     read_len
 }
 
+/// Writes to regular files and special descriptors with nonblocking and rlimit handling.
 pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if fd_has_o_path(fd) {
         return err(SyscallError::EBADF);
@@ -303,6 +305,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     written
 }
 
+/// Reads from a fixed offset without advancing the shared file position.
 pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isize {
     if pos < 0 {
         return err(SyscallError::EINVAL);
@@ -425,6 +428,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     err(SyscallError::ESPIPE)
 }
 
+/// Writes to a fixed offset without advancing the shared file position.
 pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isize {
     if pos < 0 {
         return err(SyscallError::EINVAL);
@@ -615,6 +619,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     err(SyscallError::ESPIPE)
 }
 
+/// Copies bytes from one fd to another using kernel-side buffering.
 pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize) -> isize {
     if count == 0 {
         return 0;
@@ -710,6 +715,7 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
     total as isize
 }
 
+/// Moves data between pipes and seekable files while honoring optional offset pointers.
 pub fn syscall_splice(
     fd_in: usize,
     off_in: usize,
@@ -906,6 +912,7 @@ pub fn syscall_splice(
     moved as isize
 }
 
+/// Duplicates pipe data into another pipe without consuming the input stream.
 pub fn syscall_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isize {
     let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
     if (flags & !valid_flags) != 0 {
@@ -967,6 +974,7 @@ pub fn syscall_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isi
     copied as isize
 }
 
+/// Feeds pipe buffers from an iovec array supplied by userspace.
 pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize) -> isize {
     let valid_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
     if (flags & !valid_flags) != 0 {
@@ -1049,6 +1057,7 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
     total as isize
 }
 
+/// Copies a byte range between regular files with optional explicit offsets.
 pub fn syscall_copy_file_range(
     fd_in: usize,
     off_in: usize,
@@ -1195,6 +1204,7 @@ pub fn syscall_copy_file_range(
     copied as isize
 }
 
+/// Repositions the offset of a seekable file descriptor.
 pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
     const SEEK_SET: usize = 0;
     const SEEK_CUR: usize = 1;
@@ -1347,4 +1357,3 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
 
     err(SyscallError::ESPIPE)
 }
-
