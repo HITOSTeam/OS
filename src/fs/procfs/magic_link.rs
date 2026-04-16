@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use crate::fs::{
     File, NamespaceFile, NamespaceKind, OSInode, Pipe, PseudoDir, PseudoFile, PseudoKindTag,
-    PseudoShmFile, RtcFile, ext4_lock, inode_logical_path, inode_path_hint, inode_path_in_roots,
+    PseudoShmFile, RtcFile, inode_logical_path, inode_path_hint, inode_path_in_roots,
     path_resolves_to_inode,
 };
 use crate::task::manager::pid2process;
@@ -120,10 +120,9 @@ fn proc_magic_link_dir_target_path(
         return Err(err(SyscallError::ENOTDIR));
     };
     let inode = os_inode.ext4_inode();
-    let is_dir = {
-        let _ext4_guard = ext4_lock();
-        inode.is_dir()
-    };
+    // is_dir() reads immutable inode type metadata — no ext4_lock() needed,
+    // consistent with the unguarded call in proc_fd_target().
+    let is_dir = inode.is_dir();
     if !is_dir {
         return Err(err(SyscallError::ENOTDIR));
     }
