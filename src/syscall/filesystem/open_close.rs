@@ -529,7 +529,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 pub fn syscall_close(fd: usize) -> isize {
     let process = current_files_process();
     let mut inner = process.borrow_mut();
-    if fd >= inner.fd_table.len() {
+    // EBADF if fd not open (POSIX close() semantics)
+    if !inner.is_fd_open(fd) {
         return err(SyscallError::EBADF);
     }
     let lock_key = inner.fd_table[fd].as_ref().and_then(file_lock_key);
