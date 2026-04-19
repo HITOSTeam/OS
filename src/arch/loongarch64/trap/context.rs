@@ -36,11 +36,14 @@ impl TrapContext {
         trap_handler: usize,
     ) -> Self {
         let mut prmd: usize;
+        // SAFETY: Reading PRMD is valid in kernel mode and yields the saved privilege bits used
+        // to seed a user trap context. Reading the wrong CSR would build an invalid return state.
         unsafe {
             asm!("csrrd {}, 0x1", out(reg) prmd);
         }
+        use super::super::csr_defs::{PRMD_USER_IE, PRMD_USER_IE_MASK};
         // PRMD[1:0]=PPLV (0b11 for user), PRMD[2]=PIE.
-        prmd = (prmd & !0x7) | 0x7;
+        prmd = (prmd & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
         let mut cx = Self {
             x: [0; 32],
             sstatus: prmd,
@@ -56,6 +59,8 @@ impl TrapContext {
 }
 
 pub fn push_trap_context_at(dst: usize, cx: &TrapContext) {
+    // SAFETY: Trap entry passes a writable kernel address reserved for a `TrapContext`, and `cx`
+    // is fully initialized. If `dst` were not valid trap-context storage, this would corrupt memory.
     unsafe {
         let dst_ptr = dst as *mut TrapContext;
         *dst_ptr = *cx;

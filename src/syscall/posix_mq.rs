@@ -23,6 +23,7 @@ use crate::task::signal::{RT_SIG_MAX, has_unmasked_pending, signal_bit};
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::time::get_time;
 use crate::trap::get_current_token;
+use crate::syscall::error::{SyscallError, err};
 
 const O_ACCMODE: usize = 0x3;
 const O_RDONLY: usize = 0x0;
@@ -40,20 +41,6 @@ const SIGEV_THREAD: i32 = 2;
 const SIGEV_THREAD_ID: i32 = 4;
 const SI_MESGQ: i32 = -3;
 
-const EACCES: isize = -13;
-const EAGAIN: isize = -11;
-const EBADF: isize = -9;
-const EBUSY: isize = -16;
-const EEXIST: isize = -17;
-const EFAULT: isize = -14;
-const EINVAL: isize = -22;
-const EINTR: isize = -4;
-const EMFILE: isize = -24;
-const EMSGSIZE: isize = -90;
-const ENAMETOOLONG: isize = -36;
-const ENOENT: isize = -2;
-const ENOSPC: isize = -28;
-const ETIMEDOUT: isize = -110;
 
 const MQ_NAME_MAX: usize = 255;
 const MQ_NAME_MAX_WITH_SLASH: usize = MQ_NAME_MAX + 1;
@@ -413,11 +400,11 @@ pub fn queues_max_limit_for_procfs() -> usize {
 
 pub fn write_mqueue_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
     if path != PROCFS_QUEUES_MAX {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let value = parse_proc_sys_usize(data)?;
     if !(1..=MQ_HARD_QUEUES_MAX).contains(&value) {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     MQ_QUEUES_MAX_LIMIT.store(value, Ordering::Relaxed);
     Ok(alloc::format!("{}\n", value).into_bytes())
@@ -444,10 +431,10 @@ fn parse_abs_timeout(timeout_ptr: usize) -> Result<Option<u64>, isize> {
     }
     let token = get_current_token();
     let Some(ts) = try_read_user_value(token, timeout_ptr as *const TimeSpecUser) else {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     };
     if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC as i64 {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let sec = ts.tv_sec as u64;
     let nsec = ts.tv_nsec as u64;
@@ -484,45 +471,45 @@ fn current_ipc_namespace_id() -> usize {
 
 fn read_queue_name(ptr: usize) -> Result<String, isize> {
     if ptr == 0 {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     }
     let token = get_current_token();
     let mut bytes = Vec::new();
     let mut cur = ptr;
     loop {
         let Some(ch) = try_read_user_value(token, cur as *const u8) else {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         };
         if ch == 0 {
             break;
         }
         bytes.push(ch);
         if bytes.len() > MQ_NAME_MAX_WITH_SLASH {
-            return Err(ENAMETOOLONG);
+            return Err(err(SyscallError::ENAMETOOLONG));
         }
         cur = cur.saturating_add(1);
     }
     if bytes.is_empty() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let name = if bytes[0] == b'/' {
         if bytes.len() == 1 {
-            return Err(EINVAL);
+            return Err(err(SyscallError::EINVAL));
         }
         &bytes[1..]
     } else {
         &bytes[..]
     };
     if name.is_empty() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     if name.len() > MQ_NAME_MAX {
-        return Err(ENAMETOOLONG);
+        return Err(err(SyscallError::ENAMETOOLONG));
     }
     if name.iter().any(|ch| *ch == b'/') {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
-    String::from_utf8(name.to_vec()).map_err(|_| EINVAL)
+    String::from_utf8(name.to_vec()).map_err(|_| err(SyscallError::EINVAL))
 }
 
 fn resolve_fd_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
@@ -530,9 +517,9 @@ fn resolve_fd_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
     {
         let inner = process.borrow_mut();
         if fd >= inner.fd_table.len() {
-            return Err(EBADF);
+            return Err(err(SyscallError::EBADF));
         }
-        inner.fd_table[fd].clone().ok_or(EBADF)
+        inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
     }
 }
 
@@ -541,7 +528,7 @@ fn install_descriptor(desc: Arc<MqDescriptor>, oflag: usize) -> Result<usize, is
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     let Some(fd) = inner.alloc_fd() else {
-        return Err(EMFILE);
+        return Err(err(SyscallError::EMFILE));
     };
     inner.fd_table[fd] = Some(file);
     inner.ensure_fd_flags_len();
@@ -591,7 +578,7 @@ pub fn syscall_mq_open(name: usize, oflag: usize, mode: usize, attr: usize) -> i
         O_RDONLY => (true, false),
         O_WRONLY => (false, true),
         O_RDWR => (true, true),
-        _ => return EINVAL,
+        _ => return err(SyscallError::EINVAL),
     };
     let cred = current_cred();
     let ipc_ns_id = current_ipc_namespace_id();
@@ -602,36 +589,36 @@ pub fn syscall_mq_open(name: usize, oflag: usize, mode: usize, attr: usize) -> i
         let mgr = managers.entry(ipc_ns_id).or_default();
         if let Some(id) = mgr.by_name.get(&qname).copied() {
             if (oflag & O_CREAT) != 0 && (oflag & O_EXCL) != 0 {
-                return EEXIST;
+                return err(SyscallError::EEXIST);
             }
             let Some(queue) = mgr.by_id.get(&id).cloned() else {
-                return ENOENT;
+                return err(SyscallError::ENOENT);
             };
             let state = queue.state.lock();
             if !check_access(&state.perm, &cred, readable, writable) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             drop(state);
             queue
         } else {
             if (oflag & O_CREAT) == 0 {
-                return ENOENT;
+                return err(SyscallError::ENOENT);
             }
             let mut mq_maxmsg = MQ_DEFAULT_MAXMSG;
             let mut mq_msgsize = MQ_DEFAULT_MSGSIZE;
             if attr != 0 {
                 let token = get_current_token();
                 let Some(user_attr) = try_read_user_value(token, attr as *const MqAttrUser) else {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 };
                 if user_attr.mq_maxmsg <= 0 || user_attr.mq_msgsize <= 0 {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 mq_maxmsg = user_attr.mq_maxmsg as usize;
                 mq_msgsize = user_attr.mq_msgsize as usize;
             }
             if mgr.by_id.len() >= mq_queues_max_limit() {
-                return ENOSPC;
+                return err(SyscallError::ENOSPC);
             }
             let id = mgr.alloc_id();
             let queue = Arc::new(MqQueue {
@@ -672,7 +659,7 @@ pub fn syscall_mq_open(name: usize, oflag: usize, mode: usize, attr: usize) -> i
         Ok(fd) => fd as isize,
         Err(e) => {
             // Keep mq_open atomic: if queue creation succeeded but fd install failed
-            // (e.g. EMFILE), drop the freshly created queue from the global namespace.
+            // (e.g. err(SyscallError::EMFILE)), drop the freshly created queue from the global namespace.
             if created_new_queue {
                 let mut managers = MQ_MANAGERS.lock();
                 let Some(mgr) = managers.get_mut(&ipc_ns_id) else {
@@ -698,20 +685,20 @@ pub fn syscall_mq_unlink(name: usize) -> isize {
     let queue = {
         let mut managers = MQ_MANAGERS.lock();
         let Some(mgr) = managers.get_mut(&ipc_ns_id) else {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         };
         let Some(id) = mgr.by_name.get(&qname).copied() else {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         };
         let Some(queue) = mgr.by_id.get(&id).cloned() else {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         };
         let allowed = {
             let state = queue.state.lock();
             is_owner_or_root(&state.perm, &cred)
         };
         if !allowed {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         mgr.by_name.remove(&qname);
         queue
@@ -727,7 +714,7 @@ pub fn syscall_mq_getsetattr(mqdes: usize, newattr: usize, oldattr: usize) -> is
         Err(e) => return e,
     };
     let Some(desc) = file.as_any().downcast_ref::<MqDescriptor>() else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let state = desc.queue.state.lock();
     let old = MqAttrUser {
@@ -745,11 +732,11 @@ pub fn syscall_mq_getsetattr(mqdes: usize, newattr: usize, oldattr: usize) -> is
 
     let token = get_current_token();
     if oldattr != 0 && try_write_user_value(token, oldattr as *mut MqAttrUser, &old).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if newattr != 0 {
         let Some(new_attr) = try_read_user_value(token, newattr as *const MqAttrUser) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         desc.set_nonblock((new_attr.mq_flags as usize & O_NONBLOCK) != 0);
     }
@@ -762,7 +749,7 @@ pub fn syscall_mq_notify(mqdes: usize, notification: usize) -> isize {
     if notification != 0 {
         let token = get_current_token();
         let Some(ev) = try_read_user_value(token, notification as *const SigeventUser) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let parsed_ev = match ev.sigev_notify {
             SIGEV_NONE => NotifyRegistration {
@@ -776,7 +763,7 @@ pub fn syscall_mq_notify(mqdes: usize, notification: usize) -> isize {
             },
             SIGEV_SIGNAL => {
                 if ev.sigev_signo <= 0 || ev.sigev_signo as usize > RT_SIG_MAX {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 NotifyRegistration {
                     owner_pid: cred.pid,
@@ -790,7 +777,7 @@ pub fn syscall_mq_notify(mqdes: usize, notification: usize) -> isize {
             }
             SIGEV_THREAD => {
                 if ev.sigev_signo < 0 {
-                    return EBADF;
+                    return err(SyscallError::EBADF);
                 }
                 let sockfd = ev.sigev_signo as usize;
                 let sock_ok =
@@ -800,7 +787,7 @@ pub fn syscall_mq_notify(mqdes: usize, notification: usize) -> isize {
                 }
                 let mut cookie = [0u8; MQ_NOTIFY_COOKIE_LEN];
                 if try_copy_from_user(token, ev.sigev_value as *const u8, &mut cookie).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
                 NotifyRegistration {
                     owner_pid: cred.pid,
@@ -814,11 +801,11 @@ pub fn syscall_mq_notify(mqdes: usize, notification: usize) -> isize {
             }
             SIGEV_THREAD_ID => {
                 if ev.sigev_signo <= 0 || ev.sigev_signo as usize > RT_SIG_MAX {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 let tid = ev.sigev_data[0] & 0x3fff_ffff;
                 if tid == 0 {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
                 NotifyRegistration {
                     owner_pid: cred.pid,
@@ -830,7 +817,7 @@ pub fn syscall_mq_notify(mqdes: usize, notification: usize) -> isize {
                     thread_cookie: [0; MQ_NOTIFY_COOKIE_LEN],
                 }
             }
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         };
         parsed = Some(parsed_ev);
     }
@@ -840,12 +827,12 @@ pub fn syscall_mq_notify(mqdes: usize, notification: usize) -> isize {
         Err(e) => return e,
     };
     let Some(desc) = file.as_any().downcast_ref::<MqDescriptor>() else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let mut state = desc.queue.state.lock();
     if let Some(reg) = parsed {
         if state.notify.is_some() {
-            return EBUSY;
+            return err(SyscallError::EBUSY);
         }
         state.notify = Some(reg);
         return 0;
@@ -880,7 +867,7 @@ pub fn syscall_mq_timedsend(
     timeout_ptr: usize,
 ) -> isize {
     if msg_prio >= MQ_PRIO_MAX {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let deadline_ns = match parse_abs_timeout(timeout_ptr) {
         Ok(v) => v,
@@ -891,10 +878,10 @@ pub fn syscall_mq_timedsend(
         Err(e) => return e,
     };
     let Some(desc) = file.as_any().downcast_ref::<MqDescriptor>() else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !desc.writable {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
 
     let msgsize = {
@@ -902,13 +889,13 @@ pub fn syscall_mq_timedsend(
         state.msgsize
     };
     if msg_len > msgsize {
-        return EMSGSIZE;
+        return err(SyscallError::EMSGSIZE);
     }
     let mut payload = vec![0u8; msg_len];
     if msg_len > 0 {
         let token = get_current_token();
         if try_copy_from_user(token, msg_ptr as *const u8, &mut payload).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     let cred = current_cred();
@@ -940,16 +927,16 @@ pub fn syscall_mq_timedsend(
         }
 
         if desc.nonblock() {
-            return EAGAIN;
+            return err(SyscallError::EAGAIN);
         }
         if timed_out(deadline_ns) {
-            return ETIMEDOUT;
+            return err(SyscallError::ETIMEDOUT);
         }
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
         let Some(task) = current_task() else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         add_waiter_once(&mut state.send_waiters, &task);
         if let Some(deadline) = deadline_ns {
@@ -958,10 +945,10 @@ pub fn syscall_mq_timedsend(
         drop(state);
         block_current_and_run_next();
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
         if timed_out(deadline_ns) {
-            return ETIMEDOUT;
+            return err(SyscallError::ETIMEDOUT);
         }
     }
 }
@@ -982,10 +969,10 @@ pub fn syscall_mq_timedreceive(
         Err(e) => return e,
     };
     let Some(desc) = file.as_any().downcast_ref::<MqDescriptor>() else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     if !desc.readable {
-        return EBADF;
+        return err(SyscallError::EBADF);
     }
     let token = get_current_token();
 
@@ -993,7 +980,7 @@ pub fn syscall_mq_timedreceive(
         let mut state = desc.queue.state.lock();
         if let Some(front) = state.messages.front() {
             if msg_len < front.data.len() {
-                return EMSGSIZE;
+                return err(SyscallError::EMSGSIZE);
             }
             let msg = state.messages.pop_front().unwrap();
             wake_all_waiters(&mut state.send_waiters);
@@ -1002,27 +989,27 @@ pub fn syscall_mq_timedreceive(
             if !msg.data.is_empty()
                 && try_copy_to_user(token, msg_ptr as *mut u8, msg.data.as_slice()).is_err()
             {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             if msg_prio != 0
                 && try_write_user_value(token, msg_prio as *mut u32, &(msg.prio as u32)).is_err()
             {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             return msg.data.len() as isize;
         }
 
         if desc.nonblock() {
-            return EAGAIN;
+            return err(SyscallError::EAGAIN);
         }
         if timed_out(deadline_ns) {
-            return ETIMEDOUT;
+            return err(SyscallError::ETIMEDOUT);
         }
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
         let Some(task) = current_task() else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         add_waiter_once(&mut state.recv_waiters, &task);
         if let Some(deadline) = deadline_ns {
@@ -1031,10 +1018,10 @@ pub fn syscall_mq_timedreceive(
         drop(state);
         block_current_and_run_next();
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
         if timed_out(deadline_ns) {
-            return ETIMEDOUT;
+            return err(SyscallError::ETIMEDOUT);
         }
     }
 }

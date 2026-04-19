@@ -2,7 +2,7 @@ use alloc::{collections::BTreeSet, sync::Arc, sync::Weak};
 
 use crate::{
     config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
-    mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr},
+    mm::{MapPermission, PhysPageNum, VirtAddr, KERNEL_SPACE},
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
 };
@@ -62,7 +62,7 @@ impl PidAllocator {
         }
     }
 
-    fn alloc(&mut self) -> usize {
+    fn alloc(&mut self) -> Option<usize> {
         let pid_max = pid_max();
         if self.next >= pid_max {
             self.next = 1;
@@ -73,15 +73,18 @@ impl PidAllocator {
             self.next = if pid + 1 >= pid_max { 1 } else { pid + 1 };
             if self.active.insert(pid) {
                 maybe_log_pid_active("alloc", self.active.len());
-                return pid;
+                return Some(pid);
             }
         }
 
-        panic!("pid allocator exhausted (pid_max={pid_max})");
+        None
     }
 
     fn dealloc(&mut self, pid: usize) {
-        assert!(self.active.remove(&pid), "pid {pid} has been deallocated!");
+        if !self.active.remove(&pid) {
+            log::warn!("pid {} double-dealloc (already freed)", pid);
+            return;
+        }
         maybe_log_pid_active("dealloc", self.active.len());
     }
 }
@@ -91,6 +94,13 @@ lazy_static! {
 }
 
 pub struct PidHandle(pub usize);
+
+/// Reason why PID allocation failed.
+#[derive(Debug, Clone, Copy)]
+pub enum PidAllocError {
+    /// All PIDs in [0, pid_max) are currently in use.
+    Exhausted,
+}
 
 pub fn pid_max() -> usize {
     clamp_pid_max(PID_MAX_VALUE.load(Ordering::Relaxed))
@@ -106,8 +116,12 @@ pub fn set_pid_max(pid_max: usize) -> usize {
     clamped
 }
 
-pub fn pid_alloc() -> PidHandle {
-    PidHandle(PID_ALLOCATOR.lock().alloc())
+pub fn pid_alloc() -> Result<PidHandle, PidAllocError> {
+    PID_ALLOCATOR
+        .lock()
+        .alloc()
+        .map(PidHandle)
+        .ok_or(PidAllocError::Exhausted)
 }
 
 impl Drop for PidHandle {
@@ -167,7 +181,7 @@ impl Drop for KernelStack {
     }
 }
 
-//THREAD USER RESOURCES
+///THREAD USER RESOURCES
 pub struct TaskUserRes {
     pub tid: usize,
     pub ustack_base: usize,
@@ -271,6 +285,7 @@ impl TaskUserRes {
             }
         }
         // alloc trap_cx
+        // if trap alloc failed,we will remove the user_stack too
         let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
         if !process_inner.memory_set.try_insert_framed_area(

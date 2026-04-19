@@ -27,6 +27,7 @@ use crate::{
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use spin::Mutex;
+use crate::syscall::error::{SyscallError, err};
 
 const CYCLICTEST_LOG_LIMIT: usize = 32;
 static CLOCK_NS_LOGS: AtomicUsize = AtomicUsize::new(0);
@@ -46,11 +47,6 @@ const CLOCKFD: i32 = 3;
 const CPUCLOCK_CLOCK_MASK: i32 = 0x3;
 const CPUCLOCK_PERTHREAD_MASK: i32 = 0x4;
 
-const EINVAL: isize = -22;
-const EFAULT: isize = -14;
-const EPERM: isize = -1;
-const EOPNOTSUPP: isize = -95;
-const EINTR: isize = -4;
 const TIMER_ABSTIME: usize = 1;
 const SIGEV_SIGNAL: i32 = 0;
 const ADJ_OFFSET: u32 = 0x0001;
@@ -347,29 +343,29 @@ fn timex_tick_limits() -> (i64, i64) {
 
 fn apply_adjtimex(ptr: usize) -> isize {
     if ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(mut tx) = try_read_user_value::<Timex>(token, ptr as *const Timex) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let modes = tx.modes;
     if modes != ADJ_OFFSET_SINGLESHOT && modes != ADJ_OFFSET_SS_READ && (modes & 0x8000) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (modes & !TIMEX_ALLOWED_MODES) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let mut state = ADJTIMEX_STATE.lock();
     if modes != 0 && modes != ADJ_OFFSET_SS_READ {
         if !can_adjust_wallclock() {
-            return EPERM;
+            return err(SyscallError::EPERM);
         }
         if (modes & ADJ_TICK) != 0 {
             let (min_tick, max_tick) = timex_tick_limits();
             if tx.tick < min_tick || tx.tick > max_tick {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             state.tick = tx.tick;
         }
@@ -419,7 +415,7 @@ fn apply_adjtimex(ptr: usize) -> isize {
     };
 
     if try_write_user_value(token, ptr as *mut Timex, &tx).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     // TIME_OK
     0
@@ -430,23 +426,23 @@ pub fn syscall_settimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
         if tz_ptr != 0 {
             let token = get_current_token();
             if try_read_user_value::<TimeZone>(token, tz_ptr as *const TimeZone).is_none() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
         }
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let Some(tv) = try_read_user_value::<TimeVal64>(token, tv_ptr as *const TimeVal64) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     if tv.sec < 0 || tv.usec < 0 || tv.usec >= 1_000_000 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if !can_adjust_wallclock() {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if tz_ptr != 0 && try_read_user_value::<TimeZone>(token, tz_ptr as *const TimeZone).is_none() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let target_ns = (tv.sec as u64)
         .saturating_mul(NSEC_PER_SEC)
@@ -466,10 +462,10 @@ pub fn syscall_adjtimex(ptr: usize) -> isize {
 
 pub fn syscall_clock_adjtime(clk_id: usize, ptr: usize) -> isize {
     if decode_dynamic_cpu_clock(clk_id as i32).is_some() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if clk_id != CLOCK_REALTIME {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     apply_adjtimex(ptr)
 }
@@ -483,25 +479,25 @@ pub fn syscall_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
             usec: (ns % NSEC_PER_SEC) / 1_000,
         };
         if try_write_user_value(token, tv_ptr as *mut TimeVal, &tv).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     if tz_ptr != 0 && try_read_user_value::<TimeZone>(token, tz_ptr as *const TimeZone).is_none() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
     if req_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(ts) = try_read_user_value(token, req_ptr as *const TimeSpec) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let Some(req_ns) = timespec_to_ns(ts) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if req_ns == 0 {
         return 0;
@@ -534,7 +530,7 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
         let remaining = deadline_ns.saturating_sub(current);
         let ms = ((remaining + 999_999) / 1_000_000) as usize;
         let ret = thread::sys_sleep(ms.max(1));
-        if ret == EINTR {
+        if ret == err(SyscallError::EINTR) {
             if DEBUG_SIGNAL {
                 let now_ms = (get_time() as u64)
                     .saturating_mul(1_000)
@@ -542,7 +538,7 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
                 crate::log_if!(
                     DEBUG_SIGNAL,
                     info,
-                    "[nanosleep] ret=EINTR now_ms={} elapsed_ns={}",
+                    "[nanosleep] ret=err(SyscallError::EINTR) now_ms={} elapsed_ns={}",
                     now_ms,
                     now_ns().saturating_sub(start_ns)
                 );
@@ -553,7 +549,7 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
                 let token = get_current_token();
                 write_user_value(token, _rem_ptr as *mut TimeSpec, &rem);
             }
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
     }
     if DEBUG_SIGNAL {
@@ -573,7 +569,7 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
 
 pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
     if tp_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let dynamic_clk = decode_dynamic_cpu_clock(clk_id as i32);
     if dynamic_clk.is_none() {
@@ -586,12 +582,12 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
             | CLOCK_REALTIME_COARSE
             | CLOCK_MONOTONIC_COARSE
             | CLOCK_BOOTTIME => {}
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         }
     }
     let ns = if let Some(clk) = dynamic_clk {
         let Some(ns) = dynamic_cpu_clock_time_ns(clk) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         ns
     } else {
@@ -602,7 +598,7 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
             }
             CLOCK_PROCESS_CPUTIME_ID => process_cpu_time_ns(&current_process()),
             CLOCK_THREAD_CPUTIME_ID => current_task_cpu_time_ns(),
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         }
     };
     let ts = TimeSpec {
@@ -611,30 +607,30 @@ pub fn syscall_clock_gettime(clk_id: usize, tp_ptr: usize) -> isize {
     };
     let token = get_current_token();
     if try_write_user_value(token, tp_ptr as *mut TimeSpec, &ts).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 pub fn syscall_clock_settime(clk_id: usize, tp_ptr: usize) -> isize {
     if decode_dynamic_cpu_clock(clk_id as i32).is_some() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if clk_id != CLOCK_REALTIME {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if tp_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(ts) = try_read_user_value(token, tp_ptr as *const TimeSpec) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let Some(target_ns) = timespec_to_ns(ts) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if !can_adjust_wallclock() {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let current_mono_ns = now_ns();
     let offset = (target_ns as i128)
@@ -656,7 +652,7 @@ pub fn syscall_clock_getres(clk_id: usize, tp_ptr: usize) -> isize {
             | CLOCK_REALTIME_COARSE
             | CLOCK_MONOTONIC_COARSE
             | CLOCK_BOOTTIME => {}
-            _ => return EINVAL,
+            _ => return err(SyscallError::EINVAL),
         }
     }
     if tp_ptr == 0 {
@@ -668,7 +664,7 @@ pub fn syscall_clock_getres(clk_id: usize, tp_ptr: usize) -> isize {
         nsec: 1_000_000,
     };
     if try_write_user_value(token, tp_ptr as *mut TimeSpec, &ts).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -676,30 +672,30 @@ pub fn syscall_clock_getres(clk_id: usize, tp_ptr: usize) -> isize {
 pub fn syscall_timer_create(clock_id: usize, sevp_ptr: usize, timerid_ptr: usize) -> isize {
     match clock_id {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {}
-        _ => return EINVAL,
+        _ => return err(SyscallError::EINVAL),
     }
     if timerid_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let signum = if sevp_ptr == 0 {
         SIGALRM_NUM
     } else {
         let Some(sev) = try_read_user_value(token, sevp_ptr as *const SigEvent) else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         if sev.sigev_notify != SIGEV_SIGNAL {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         if sev.sigev_signo <= 0 || sev.sigev_signo > 64 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         sev.sigev_signo as usize
     };
     let pid = current_process().getpid();
     let thread_tid = if clock_id == CLOCK_THREAD_CPUTIME_ID {
         let Some(task) = current_task() else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         let inner = task.borrow_mut();
         inner.res.as_ref().map(|res| res.tid)
@@ -707,30 +703,30 @@ pub fn syscall_timer_create(clock_id: usize, sevp_ptr: usize, timerid_ptr: usize
         None
     };
     let Some(timer_id) = create_posix_timer(pid, clock_id, signum, thread_tid) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let timer_id_i32 = timer_id as i32;
     if try_write_user_value(token, timerid_ptr as *mut i32, &timer_id_i32).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 pub fn syscall_timer_gettime(timer_id: isize, curr_ptr: usize) -> isize {
     if timer_id < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if curr_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let pid = current_process().getpid();
     let Ok((clock_id, deadline_ns, interval_ns, thread_tid)) =
         query_posix_timer(pid, timer_id as usize)
     else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(now_ns) = timer_clock_now_ns(clock_id, pid, thread_tid) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let value_ns = deadline_ns.map(|d| d.saturating_sub(now_ns)).unwrap_or(0);
     let spec = ITimerSpec {
@@ -739,7 +735,7 @@ pub fn syscall_timer_gettime(timer_id: isize, curr_ptr: usize) -> isize {
     };
     let token = get_current_token();
     if try_write_user_value(token, curr_ptr as *mut ITimerSpec, &spec).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -751,30 +747,30 @@ pub fn syscall_timer_settime(
     old_ptr: usize,
 ) -> isize {
     if timer_id < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if new_ptr == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & !TIMER_ABSTIME) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let Some(new_spec) = try_read_user_value(token, new_ptr as *const ITimerSpec) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let pid = current_process().getpid();
     let Ok((clock_id, _, _, thread_tid)) = query_posix_timer(pid, timer_id as usize) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(value_ns) = timespec_to_ns(new_spec.it_value) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(interval_ns) = timespec_to_ns(new_spec.it_interval) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(now_base) = timer_clock_now_ns(clock_id, pid, thread_tid) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let mut initial_overrun = 0usize;
     let deadline_ns = if value_ns == 0 {
@@ -796,7 +792,7 @@ pub fn syscall_timer_settime(
         interval_ns,
         initial_overrun,
     ) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if old_ptr != 0 {
         let old_spec = ITimerSpec {
@@ -804,7 +800,7 @@ pub fn syscall_timer_settime(
             it_value: ns_to_timespec(prev_remain_ns),
         };
         if try_write_user_value(token, old_ptr as *mut ITimerSpec, &old_spec).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     0
@@ -812,7 +808,7 @@ pub fn syscall_timer_settime(
 
 pub fn syscall_timer_delete(timer_id: isize) -> isize {
     if timer_id < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let pid = current_process().getpid();
     delete_posix_timer(pid, timer_id as usize)
@@ -820,11 +816,11 @@ pub fn syscall_timer_delete(timer_id: isize) -> isize {
 
 pub fn syscall_timer_getoverrun(timer_id: isize) -> isize {
     if timer_id < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let pid = current_process().getpid();
     let Ok(overrun) = take_posix_timer_overrun(pid, timer_id as usize) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     overrun
 }
@@ -840,17 +836,17 @@ pub fn syscall_clock_nanosleep(
 ) -> isize {
     const TIMER_ABSTIME: usize = 1;
     if req_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if clk_id != CLOCK_REALTIME && clk_id != CLOCK_MONOTONIC {
-        return EOPNOTSUPP;
+        return err(SyscallError::EOPNOTSUPP);
     }
     let token = get_current_token();
     let Some(ts) = try_read_user_value(token, req_ptr as *const TimeSpec) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let Some(req_ns) = timespec_to_ns(ts) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let clock_now_ns = || match clk_id {
         CLOCK_REALTIME => realtime_now_ns(),
@@ -924,7 +920,7 @@ pub fn syscall_clock_nanosleep(
             return 0;
         }
         let ret = thread::sys_sleep(ms);
-        if ret == EINTR {
+        if ret == err(SyscallError::EINTR) {
             if DEBUG_SIGNAL {
                 let now_ms = (get_time() as u64)
                     .saturating_mul(1_000)
@@ -932,7 +928,7 @@ pub fn syscall_clock_nanosleep(
                 crate::log_if!(
                     DEBUG_SIGNAL,
                     info,
-                    "[clock_nanosleep] ret=EINTR now_ms={} elapsed_ns={}",
+                    "[clock_nanosleep] ret=err(SyscallError::EINTR) now_ms={} elapsed_ns={}",
                     now_ms,
                     clock_now_ns().saturating_sub(start_ns)
                 );
@@ -942,10 +938,10 @@ pub fn syscall_clock_nanosleep(
                 let rem = ns_to_timespec(remaining);
                 let token = get_current_token();
                 if try_write_user_value(token, rem_ptr as *mut TimeSpec, &rem).is_err() {
-                    return EFAULT;
+                    return err(SyscallError::EFAULT);
                 }
             }
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
     }
 }
@@ -1021,44 +1017,44 @@ fn build_itimerval(remaining_ms: usize, interval_ms: usize) -> ITimerVal {
 
 pub fn syscall_getitimer(which: usize, curr_ptr: usize) -> isize {
     if itimer_signum(which).is_none() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if curr_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let pid = crate::task::processor::current_process().getpid();
     let (remaining_ms, interval_ms) = itimer_remaining_and_interval_ms(pid, which);
     let val = build_itimerval(remaining_ms, interval_ms);
     if try_write_user_value(token, curr_ptr as *mut ITimerVal, &val).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 pub fn syscall_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
     let Some(signum) = itimer_signum(which) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if new_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let token = get_current_token();
     let Some(new_val) = try_read_user_value(token, new_ptr as *const ITimerVal) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let Some(delay_us) = timeval_to_us(new_val.it_value) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(interval_us) = timeval_to_us(new_val.it_interval) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let pid = crate::task::processor::current_process().getpid();
     let (prev_ms, prev_interval_ms) = itimer_remaining_and_interval_ms(pid, which);
     if old_ptr != 0 {
         let old_val = build_itimerval(prev_ms, prev_interval_ms);
         if try_write_user_value(token, old_ptr as *mut ITimerVal, &old_val).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
     let delay_ms = if delay_us == 0 {
@@ -1102,10 +1098,10 @@ pub fn syscall_pselect6(
     const EBADF: isize = -9;
     const MAX_FDSET_BYTES: usize = 256 * 1024;
     if (_nfds as isize) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if _nfds > i32::MAX as usize {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let nfds = _nfds;
     let readfds = _readfds;
@@ -1121,16 +1117,16 @@ pub fn syscall_pselect6(
         let Some(arg) =
             try_read_user_value::<PSelectSigmaskArg>(token, _sigmask as *const PSelectSigmaskArg)
         else {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         if arg.sigset_size < core::mem::size_of::<u64>() {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
         let mut new_mask = 0u64;
         if arg.sigmask_ptr != 0 {
             let Some(mask) = try_read_user_value::<u64>(token, arg.sigmask_ptr as *const u64)
             else {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             };
             new_mask = mask;
         }
@@ -1155,14 +1151,14 @@ pub fn syscall_pselect6(
                 let mut inner = task.borrow_mut();
                 inner.signal_mask = old_mask;
             }
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         };
         let Some(delta_ns) = timespec_to_ns(ts) else {
             if let Some(old_mask) = restore_mask {
                 let mut inner = task.borrow_mut();
                 inner.signal_mask = old_mask;
             }
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         Some(now_ns().saturating_add(delta_ns))
     };
@@ -1174,7 +1170,7 @@ pub fn syscall_pselect6(
                 (inner.pending_signals, inner.signal_mask)
             };
             if has_unmasked_pending(pending, mask, false) {
-                break EINTR;
+                break err(SyscallError::EINTR);
             }
             if let Some(deadline) = deadline_ns {
                 if now_ns() >= deadline {
@@ -1198,7 +1194,7 @@ pub fn syscall_pselect6(
             let mut inner = task.borrow_mut();
             inner.signal_mask = old_mask;
         }
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let mut in_r = alloc::vec![0u8; bytes_len];
@@ -1214,7 +1210,7 @@ pub fn syscall_pselect6(
             let mut inner = task.borrow_mut();
             inner.signal_mask = old_mask;
         }
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if writefds != 0
         && try_copy_from_user(token, writefds as *const u8, in_w.as_mut_slice()).is_err()
@@ -1223,7 +1219,7 @@ pub fn syscall_pselect6(
             let mut inner = task.borrow_mut();
             inner.signal_mask = old_mask;
         }
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if exceptfds != 0
         && try_copy_from_user(token, exceptfds as *const u8, in_e.as_mut_slice()).is_err()
@@ -1232,18 +1228,18 @@ pub fn syscall_pselect6(
             let mut inner = task.borrow_mut();
             inner.signal_mask = old_mask;
         }
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
 
     let write_sets = |r: &[u8], w: &[u8], e: &[u8]| -> isize {
         if readfds != 0 && try_copy_to_user(token, readfds as *mut u8, r).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         if writefds != 0 && try_copy_to_user(token, writefds as *mut u8, w).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         if exceptfds != 0 && try_copy_to_user(token, exceptfds as *mut u8, e).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         0
     };
@@ -1254,7 +1250,7 @@ pub fn syscall_pselect6(
             (inner.pending_signals, inner.signal_mask)
         };
         if has_unmasked_pending(pending, mask, false) {
-            break EINTR;
+            break err(SyscallError::EINTR);
         }
 
         let mut ready = 0isize;

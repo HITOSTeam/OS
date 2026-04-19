@@ -49,16 +49,17 @@ alltraps:
 
 restore:
     # a0: TrapContext pointer, a1: user page table token
-    # Switch PGDL to user page table.
+    # Set EENTRY first so any interrupt during page-table switch still
+    # vectors to the trampoline handler (which is mapped in both page tables).
+    la $t0, alltraps
+    csrwr $t0, 0xc
+    # Now switch PGDL to user page table.
     slli.d $t0, $a1, 12
     csrwr $t0, 0x19
     invtlb 0x3, $r0, $r0
     add.d $sp, $a0, $r0
     # Keep SAVE0 as the TrapContext pointer for the next trap entry.
     csrwr $a0, 0x30
-    # If a fault happens after this point, route to user-trap entry.
-    la $t0, alltraps
-    csrwr $t0, 0xc
     # Restore PRMD/ERA.
     ld.d $t0, $sp, 32*8
     ld.d $t1, $sp, 33*8

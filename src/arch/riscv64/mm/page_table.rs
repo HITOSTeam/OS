@@ -356,8 +356,7 @@ fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => {
             drop(inner);
-            crate::task::processor::exit_group_and_run_next(-9);
-            false
+            crate::task::processor::exit_group_and_run_next(-9)
         }
         LazyFaultResult::Invalid => false,
     }
@@ -383,8 +382,7 @@ fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => {
             drop(inner);
-            crate::task::processor::exit_group_and_run_next(-9);
-            false
+            crate::task::processor::exit_group_and_run_next(-9)
         }
         LazyFaultResult::Invalid => false,
     }
@@ -397,8 +395,7 @@ fn user_access_fail(va: usize, access: MapPermission) -> ! {
         va,
         access
     );
-    crate::task::processor::exit_current_and_run_next(EFAULT);
-    unreachable!("killed current task due to invalid user access")
+    crate::task::processor::exit_current_and_run_next(EFAULT)
 }
 
 fn resolve_user_pte(token: usize, va: usize, access: MapPermission) -> Result<PageTableEntry, ()> {
@@ -463,6 +460,9 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
 }
 pub fn translated_mutref<T>(token: usize, ptr: *mut T) -> &'static mut T {
     let real_addr = translated_address_with(token, ptr as *const u8, MapPermission::W);
+    // SAFETY: `translated_address_with` resolved `ptr` to a writable mapped byte in the current
+    // user address space, and the caller treats that location as a properly aligned `T`. If the
+    // user pointer does not actually refer to a valid `T`, this cast would create an invalid reference.
     unsafe { &mut *(real_addr as *mut u8 as *mut T) }
 }
 
@@ -492,6 +492,9 @@ pub fn try_copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) -> Resul
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
+        // SAFETY: `resolve_user_pte` verified this user page is readable, `written + n` stays
+        // within `dst`, and the source physical range is page-local. Any overlap or bad mapping
+        // here would turn the copy into memory corruption instead of a user-access failure.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (pa.0 + page_off) as *const u8,
@@ -531,6 +534,9 @@ pub fn try_copy_to_user(token: usize, dst: *mut u8, src: &[u8]) -> Result<(), ()
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
+        // SAFETY: `resolve_user_pte` verified this user page is writable, `read + n` stays within
+        // `src`, and the destination range is limited to this mapped page. If those invariants were
+        // wrong, the kernel would write through an invalid or overlapping pointer.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr().add(read), (pa.0 + page_off) as *mut u8, n);
         }
@@ -558,6 +564,9 @@ pub fn try_copy_to_user_unchecked(token: usize, dst: *mut u8, src: &[u8]) -> Res
         let pa: PhysAddr = ppn.into();
         let page_off = start_va.page_offset();
         let n = min(PAGE_SIZE - page_off, end - start);
+        // SAFETY: This uses the same bounds reasoning as `try_copy_to_user`, except permission
+        // checks are intentionally relaxed after the page has already been resolved for this token.
+        // A wrong page translation or length would still corrupt kernel-visible memory.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr().add(read), (pa.0 + page_off) as *mut u8, n);
         }
@@ -569,25 +578,35 @@ pub fn try_copy_to_user_unchecked(token: usize, dst: *mut u8, src: &[u8]) -> Res
 
 pub fn read_user_value<T: Copy>(token: usize, src: *const T) -> T {
     let mut value = MaybeUninit::<T>::uninit();
+    // SAFETY: `value` is stack-allocated and we expose exactly `size_of::<T>()` bytes of its
+    // storage so `copy_from_user` can initialize it. Using the wrong size would leave bytes
+    // uninitialized or write past `value`.
     let dst_bytes = unsafe {
         core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
     };
     copy_from_user(token, src as *const u8, dst_bytes);
+    // SAFETY: `copy_from_user` filled every byte in `dst_bytes`, so `value` is fully initialized.
+    // Calling `assume_init` earlier would read uninitialized data.
     unsafe { value.assume_init() }
 }
 
 pub fn try_read_user_value<T: Copy>(token: usize, src: *const T) -> Option<T> {
     let mut value = MaybeUninit::<T>::uninit();
+    // SAFETY: `value` provides `size_of::<T>()` writable bytes for the incoming user copy. Any
+    // mismatch between the slice length and `T` would corrupt stack memory or leave bytes unset.
     let dst_bytes = unsafe {
         core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
     };
     if try_copy_from_user(token, src as *const u8, dst_bytes).is_err() {
         return None;
     }
+    // SAFETY: The successful copy initialized the whole object representation of `value`.
     Some(unsafe { value.assume_init() })
 }
 
 pub fn write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) {
+    // SAFETY: `value` is a valid reference to `T`, so reborrowing exactly its object bytes is
+    // sound for copying into userspace. A wrong length would read beyond `value`.
     let src_bytes = unsafe {
         core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
     };
@@ -595,6 +614,8 @@ pub fn write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) {
 }
 
 pub fn try_write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) -> Result<(), ()> {
+    // SAFETY: `value` stays alive for this call and `size_of::<T>()` matches the byte slice we
+    // expose. Misstating the range here would read invalid kernel memory before copying it out.
     let src_bytes = unsafe {
         core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
     };

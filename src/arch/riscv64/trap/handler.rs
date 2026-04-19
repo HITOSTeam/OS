@@ -67,6 +67,7 @@ fn set_kernel_trap_entry() {
         fn alltraps_k();
     }
     let alltraps_k_va = alltraps_k as usize;
+    // SAFETY: stvec write is valid in S-mode; alltraps_k_va is a valid kernel trap entry address.
     unsafe {
         let to_write = riscv::register::stvec::Stvec::new(
             alltraps_k_va,
@@ -77,6 +78,7 @@ fn set_kernel_trap_entry() {
 }
 
 fn set_user_trap_entry() {
+    // SAFETY: stvec write is valid in S-mode; TRAMPOLINE is a valid user trap entry address.
     unsafe {
         let to_write = riscv::register::stvec::Stvec::new(
             TRAMPOLINE as usize,
@@ -87,12 +89,14 @@ fn set_user_trap_entry() {
 }
 
 fn enable_supervisor_interrupt() {
+    // SAFETY: sstatus CSR write is valid in S-mode.
     unsafe {
         sstatus::set_sie();
     }
 }
 
 fn disable_supervisor_interrupt() {
+    // SAFETY: sstatus CSR write is valid in S-mode.
     unsafe {
         sstatus::clear_sie();
     }
@@ -107,6 +111,7 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
         Trap::Interrupt(TIME_INTERVAL) => {
             let hart = {
                 let h: usize;
+                // SAFETY: tp register holds the current hart ID in our convention.
                 unsafe { asm!("mv {}, tp", out(reg) h) };
                 h
             };
@@ -115,14 +120,12 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             if DEBUG_TRAP && kcnt < 4 {
                 log::debug!("[trap_from_kernel] hart={} timer interrupt", hart);
             }
-            // crate::println!("[trap_from_kernel] Timer interrupt, checking timers...");
             set_next_trigger();
             check_timer();
-            // crate::println!("[trap_from_kernel] Done checking timers");
-            // do not schedule, just return to kernel
         }
         Trap::Interrupt(_) => {
             // Clear possible software interrupt and ignore others
+            // SAFETY: sip CSR write is valid in S-mode.
             unsafe { riscv::register::sip::clear_ssoft() };
         }
         Trap::Exception(BREAKPOINT) => {
@@ -146,6 +149,7 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
                 let sstatus_bits = sstatus::read().bits();
                 let stvec_bits = riscv::register::stvec::read().bits();
                 let sp: usize;
+                // SAFETY: sp register read is always valid.
                 unsafe { asm!("mv {}, sp", out(reg) sp) };
                 let ra = trap_cx.x[1];
                 log::error!(
@@ -231,6 +235,7 @@ pub fn trap_handler() {
     if DEBUG_TRAP && idx < 6 {
         let hart = {
             let h: usize;
+            // SAFETY: tp register holds the current hart ID in our convention.
             unsafe { asm!("mv {}, tp", out(reg) h) };
             h
         };
@@ -309,6 +314,7 @@ pub fn trap_handler() {
         }
         Trap::Interrupt(SOFTWARE_INTERRUPT) => {
             // Used as an IPI to wake up harts from `wfi` (e.g., when a remote hart enqueues a task).
+            // SAFETY: sip CSR write is valid in S-mode.
             unsafe { riscv::register::sip::clear_ssoft() };
         }
         Trap::Interrupt(interrupt) => {
@@ -318,8 +324,6 @@ pub fn trap_handler() {
             );
         }
     }
-    // println!("handle siganl");
-    // handle_signals();
 
     if let Some((errno, msg)) = check_if_current_signals_error() {
         println!("[kernel] {}", msg);
@@ -641,11 +645,13 @@ pub fn trap_return() -> ! {
     if DEBUG_TRAP && entered < 4 {
         let hart = {
             let h: usize;
+            // SAFETY: tp register holds the current hart ID in our convention.
             unsafe { asm!("mv {}, tp", out(reg) h) };
             h
         };
         log::debug!("[trap_return entry#{}] hart={} sp={:#x}", entered, hart, {
             let s: usize;
+            // SAFETY: sp register read is always valid.
             unsafe { asm!("mv {}, sp", out(reg) s) };
             s
         });
@@ -669,8 +675,7 @@ pub fn trap_return() -> ! {
                 res.trap_cx_user_va()
             } else {
                 drop(task_inner);
-                exit_current_and_run_next(-1);
-                unreachable!("exit_current_and_run_next should not return");
+                exit_current_and_run_next(-1)
             }
         };
         let user_satp = task
@@ -687,12 +692,14 @@ pub fn trap_return() -> ! {
     if DEBUG_TRAP && cnt < 4 {
         let hart = {
             let h: usize;
+            // SAFETY: tp register holds the current hart ID in our convention.
             unsafe { asm!("mv {}, tp", out(reg) h) };
             h
         };
         if !FIRST_TRAP_RETURN_LOGGED.swap(true, Ordering::SeqCst) {
             let cx = get_trap_context();
             let tp_kernel: usize;
+            // SAFETY: tp register read is always valid.
             unsafe { asm!("mv {}, tp", out(reg) tp_kernel) };
             log::debug!(
                 "[trap_return#{}] hart={} trap_cx_ptr={:#x} sepc={:#x} user_satp={:#x} tp={:#x}",
@@ -740,6 +747,8 @@ pub fn trap_return() -> ! {
         fn restore();
     }
     let restore_va = restore as usize - alltraps as usize + TRAMPOLINE;
+    // SAFETY: restore_va points to valid trampoline code; trap_cx_ptr and user_satp are valid.
+    // This asm block never returns; control transfers to user mode via sret in the trampoline.
     unsafe {
         asm!(
             "fence.i",

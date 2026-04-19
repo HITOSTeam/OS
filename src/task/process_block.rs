@@ -10,30 +10,30 @@ use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{
-    File, MountNamespace, PollWaitQueue, Stdin, Stdout, cgroup_attach_fork_child,
-    clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
+    cgroup_attach_fork_child, clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
+    File, MountNamespace, PollWaitQueue, Stdin, Stdout,
 };
 use crate::mm::{
-    ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
+    read_user_value, translated_mutref, write_user_value, ElfAux, MemorySet, KERNEL_SPACE,
 };
 use crate::println;
 use crate::task::condvar::Condvar;
-use crate::task::id::{PidHandle, pid_alloc};
+use crate::task::id::{pid_alloc, PidHandle, PidAllocError};
 use crate::task::manager::{
-    PID2PCB, add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task,
-    wakeup_task,
+    add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
+    PID2PCB,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
-    RT_SIG_MAX, RtSigAction, SIG_IGN, SignalAction, SignalActions, SignalFlags,
+    RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN,
 };
-use crate::task::task_block::TaskControlBlock;
+use crate::task::task_block::{TaskAllocError, TaskControlBlock};
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
 use lazy_static::lazy_static;
-use spin::{Mutex as SpinMutex, MutexGuard};
+use spin::{Mutex as SpinMutex, MutexGuard, RwLock};
 
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
@@ -41,6 +41,40 @@ static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FORK_PRE_COW_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPC_NS_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_PID_NS_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Reason why `fork_impl()` failed.
+#[derive(Debug)]
+pub enum ForkError {
+    /// All PIDs in the PID space are in use.
+    PidExhausted,
+    /// RLIMIT_NPROC would be exceeded (not yet enforced).
+    RlimitNprocExceeded,
+    /// cgroup pids.max would be exceeded.
+    CgroupPidsMaxExceeded,
+    /// Kernel-stack frame allocation failed (OOM).
+    KernelStackOom,
+    /// Mapping the child's trap-context page failed (OOM).
+    TrapCxAllocFailed,
+    /// Cloning the parent address space failed (OOM).
+    VmCloneOom,
+}
+
+impl From<PidAllocError> for ForkError {
+    fn from(e: PidAllocError) -> Self {
+        match e {
+            PidAllocError::Exhausted => ForkError::PidExhausted,
+        }
+    }
+}
+
+impl From<TaskAllocError> for ForkError {
+    fn from(e: TaskAllocError) -> Self {
+        match e {
+            TaskAllocError::TrapCxAllocFailed => ForkError::TrapCxAllocFailed,
+            TaskAllocError::KernelStackOom => ForkError::KernelStackOom,
+        }
+    }
+}
 
 pub fn alloc_ipc_namespace_id() -> usize {
     NEXT_IPC_NS_ID.fetch_add(1, Ordering::Relaxed)
@@ -55,7 +89,7 @@ pub fn register_pid_namespace(parent_ns_id: usize, child_ns_id: usize) {
         return;
     }
     PID_NAMESPACE_PARENTS
-        .lock()
+        .write()
         .insert(child_ns_id, parent_ns_id);
 }
 
@@ -66,7 +100,7 @@ pub fn pid_namespace_descends_from(ns_id: usize, ancestor_ns_id: usize) -> bool 
     if ns_id == ancestor_ns_id {
         return true;
     }
-    let parents = PID_NAMESPACE_PARENTS.lock();
+    let parents = PID_NAMESPACE_PARENTS.read();
     let mut current = ns_id;
     while current != 0 {
         let Some(parent) = parents.get(&current).copied() else {
@@ -261,8 +295,8 @@ lazy_static! {
     static ref SHARED_FILES_SHARERS: SpinMutex<BTreeMap<usize, Vec<Weak<ProcessControlBlock>>>> =
         SpinMutex::new(BTreeMap::new());
     /// child pid namespace id -> parent pid namespace id.
-    static ref PID_NAMESPACE_PARENTS: SpinMutex<BTreeMap<usize, usize>> =
-        SpinMutex::new(BTreeMap::new());
+    static ref PID_NAMESPACE_PARENTS: RwLock<BTreeMap<usize, usize>> =
+        RwLock::new(BTreeMap::new());
 }
 
 fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
@@ -790,7 +824,7 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     // Walk argv/envp to find auxv.
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-    // Skip envp pointers (NULL terminated).
+                                                                        // Skip envp pointers (NULL terminated).
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();
@@ -827,6 +861,65 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
         }
     }
 }
+/// All POSIX resource limits (`getrlimit`/`setrlimit`) plus CPU-limit tracking state.
+#[derive(Clone)]
+pub struct ProcessResourceLimits {
+    pub rlimit_nofile_cur: u64,
+    pub rlimit_nofile_max: u64,
+    pub rlimit_nproc_cur: u64,
+    pub rlimit_nproc_max: u64,
+    pub rlimit_fsize_cur: u64,
+    pub rlimit_fsize_max: u64,
+    pub rlimit_data_cur: u64,
+    pub rlimit_data_max: u64,
+    pub rlimit_stack_cur: u64,
+    pub rlimit_stack_max: u64,
+    pub rlimit_cpu_cur: u64,
+    pub rlimit_cpu_max: u64,
+    /// Wall-clock ms at which the current RLIMIT_CPU interval started.
+    pub rlimit_cpu_start_ms: usize,
+    /// True after SIGXCPU has been sent for the soft CPU limit.
+    pub rlimit_cpu_soft_sent: bool,
+    pub rlimit_core_cur: u64,
+    pub rlimit_core_max: u64,
+    pub rlimit_rss_cur: u64,
+    pub rlimit_rss_max: u64,
+    pub rlimit_memlock_cur: u64,
+    pub rlimit_memlock_max: u64,
+    pub rlimit_as_cur: u64,
+    pub rlimit_as_max: u64,
+    pub rlimit_locks_cur: u64,
+    pub rlimit_locks_max: u64,
+    pub rlimit_msgqueue_cur: u64,
+    pub rlimit_msgqueue_max: u64,
+    pub rlimit_nice_cur: u64,
+    pub rlimit_nice_max: u64,
+    pub rlimit_rtprio_cur: u64,
+    pub rlimit_rtprio_max: u64,
+    pub rlimit_sigpending_cur: u64,
+    pub rlimit_sigpending_max: u64,
+    pub rlimit_rttime_cur: u64,
+    pub rlimit_rttime_max: u64,
+}
+
+/// Linux-like scheduler parameters: policy, RT priority, deadline attrs, nice, affinity.
+#[derive(Clone)]
+pub struct ProcessScheduling {
+    pub sched_policy: i32,
+    /// Process-wide CPU affinity mask used by `sched_*affinity` and `getcpu`.
+    pub cpu_affinity_mask: usize,
+    pub sched_priority: i32,
+    pub sched_runtime: u64,
+    pub sched_deadline: u64,
+    pub sched_period: u64,
+    /// POSIX nice value used by getpriority/setpriority.
+    pub nice: i32,
+}
+
+// TODO(credentials): ProcessCredentials (uid/euid/suid/fsuid, gid/egid/sgid/fsgid,
+// supplementary_gids, cap_*, securebits) has 200+ external access sites; defer to a
+// later refactoring pass once the access patterns are stabilised.
+
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
@@ -904,56 +997,8 @@ pub struct ProcessControlBlockInner {
     /// When set, file-descriptor operations are delegated to this owner process
     /// (Linux CLONE_FILES-style shared file table).
     pub files_owner: Option<Weak<ProcessControlBlock>>,
-    /// Per-process RLIMIT_NOFILE (soft/hard).
-    pub rlimit_nofile_cur: u64,
-    pub rlimit_nofile_max: u64,
-    /// Per-process RLIMIT_NPROC (soft/hard).
-    pub rlimit_nproc_cur: u64,
-    pub rlimit_nproc_max: u64,
-    /// Per-process RLIMIT_FSIZE (soft/hard).
-    pub rlimit_fsize_cur: u64,
-    pub rlimit_fsize_max: u64,
-    /// Per-process RLIMIT_DATA (soft/hard).
-    pub rlimit_data_cur: u64,
-    pub rlimit_data_max: u64,
-    /// Per-process RLIMIT_STACK (soft/hard).
-    pub rlimit_stack_cur: u64,
-    pub rlimit_stack_max: u64,
-    /// Per-process RLIMIT_CPU (seconds, soft/hard).
-    pub rlimit_cpu_cur: u64,
-    pub rlimit_cpu_max: u64,
-    pub rlimit_cpu_start_ms: usize,
-    pub rlimit_cpu_soft_sent: bool,
-    /// Per-process RLIMIT_CORE (soft/hard).
-    pub rlimit_core_cur: u64,
-    pub rlimit_core_max: u64,
-    /// Per-process RLIMIT_RSS (soft/hard).
-    pub rlimit_rss_cur: u64,
-    pub rlimit_rss_max: u64,
-    /// Per-process RLIMIT_MEMLOCK (soft/hard).
-    pub rlimit_memlock_cur: u64,
-    pub rlimit_memlock_max: u64,
-    /// Per-process RLIMIT_AS (soft/hard).
-    pub rlimit_as_cur: u64,
-    pub rlimit_as_max: u64,
-    /// Per-process RLIMIT_LOCKS (soft/hard).
-    pub rlimit_locks_cur: u64,
-    pub rlimit_locks_max: u64,
-    /// Per-process RLIMIT_MSGQUEUE (soft/hard).
-    pub rlimit_msgqueue_cur: u64,
-    pub rlimit_msgqueue_max: u64,
-    /// Per-process RLIMIT_NICE (soft/hard).
-    pub rlimit_nice_cur: u64,
-    pub rlimit_nice_max: u64,
-    /// Per-process RLIMIT_RTPRIO (soft/hard).
-    pub rlimit_rtprio_cur: u64,
-    pub rlimit_rtprio_max: u64,
-    /// Per-process RLIMIT_SIGPENDING (soft/hard).
-    pub rlimit_sigpending_cur: u64,
-    pub rlimit_sigpending_max: u64,
-    /// Per-process RLIMIT_RTTIME (soft/hard).
-    pub rlimit_rttime_cur: u64,
-    pub rlimit_rttime_max: u64,
+    /// All POSIX resource limits.
+    pub rlimits: ProcessResourceLimits,
     /// Process root directory (host-absolute path), used for `chroot`.
     pub root: String,
     pub cwd: String,
@@ -990,15 +1035,7 @@ pub struct ProcessControlBlockInner {
     /// Linux rt_sigaction handlers indexed by signal number.
     pub rt_sig_handlers: Vec<RtSigAction>,
     /// Linux-like scheduler state used by rt-tests (cyclictest/hackbench).
-    pub sched_policy: i32,
-    /// Process-wide CPU affinity mask used by `sched_*affinity` and `getcpu`.
-    pub cpu_affinity_mask: usize,
-    pub sched_priority: i32,
-    pub sched_runtime: u64,
-    pub sched_deadline: u64,
-    pub sched_period: u64,
-    /// POSIX nice value used by getpriority/setpriority.
-    pub nice: i32,
+    pub scheduling: ProcessScheduling,
     // TaskControlBlock实际上现在是线程
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     // 进程控制块 有一个分配 线程ID的分配器
@@ -1092,7 +1129,7 @@ impl ProcessControlBlockInner {
     }
 
     pub fn alloc_fd(&mut self) -> Option<usize> {
-        let limit = self.rlimit_nofile_cur as usize;
+        let limit = self.rlimits.rlimit_nofile_cur as usize;
         if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
             if fd >= limit {
                 return None;
@@ -1315,11 +1352,12 @@ impl ProcessControlBlock {
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
+        let (memory_set, ustack_base, entry_point, elf_aux) =
+            MemorySet::from_elf(elf_data).expect("failed to parse init_proc ELF");
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         // allocate a pid
-        let pid_handle = pid_alloc();
+        let pid_handle = pid_alloc().expect("failed to allocate PID for init process (PID exhausted)");
         let pid = pid_handle.0;
         let args = vec![String::from("init_proc")];
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
@@ -1384,40 +1422,42 @@ impl ProcessControlBlock {
                 ],
                 fd_flags: vec![0; 3],
                 files_owner: None,
-                rlimit_nofile_cur: 1024,
-                rlimit_nofile_max: 1024,
-                rlimit_nproc_cur: u64::MAX,
-                rlimit_nproc_max: u64::MAX,
-                rlimit_fsize_cur: u64::MAX,
-                rlimit_fsize_max: u64::MAX,
-                rlimit_data_cur: u64::MAX,
-                rlimit_data_max: u64::MAX,
-                rlimit_stack_cur: 1 * 1024 * 1024,
-                rlimit_stack_max: 1 * 1024 * 1024,
-                rlimit_cpu_cur: u64::MAX,
-                rlimit_cpu_max: u64::MAX,
-                rlimit_cpu_start_ms: crate::time::get_time_ms(),
-                rlimit_cpu_soft_sent: false,
-                rlimit_core_cur: 8 * 1024 * 1024,
-                rlimit_core_max: 8 * 1024 * 1024,
-                rlimit_rss_cur: u64::MAX,
-                rlimit_rss_max: u64::MAX,
-                rlimit_memlock_cur: 64 * 1024,
-                rlimit_memlock_max: 64 * 1024,
-                rlimit_as_cur: u64::MAX,
-                rlimit_as_max: u64::MAX,
-                rlimit_locks_cur: u64::MAX,
-                rlimit_locks_max: u64::MAX,
-                rlimit_msgqueue_cur: 819_200,
-                rlimit_msgqueue_max: 819_200,
-                rlimit_nice_cur: 0,
-                rlimit_nice_max: 0,
-                rlimit_rtprio_cur: 0,
-                rlimit_rtprio_max: 0,
-                rlimit_sigpending_cur: u64::MAX,
-                rlimit_sigpending_max: u64::MAX,
-                rlimit_rttime_cur: u64::MAX,
-                rlimit_rttime_max: u64::MAX,
+                rlimits: ProcessResourceLimits {
+                    rlimit_nofile_cur: 1024,
+                    rlimit_nofile_max: 1024,
+                    rlimit_nproc_cur: u64::MAX,
+                    rlimit_nproc_max: u64::MAX,
+                    rlimit_fsize_cur: u64::MAX,
+                    rlimit_fsize_max: u64::MAX,
+                    rlimit_data_cur: u64::MAX,
+                    rlimit_data_max: u64::MAX,
+                    rlimit_stack_cur: 1 * 1024 * 1024,
+                    rlimit_stack_max: 1 * 1024 * 1024,
+                    rlimit_cpu_cur: u64::MAX,
+                    rlimit_cpu_max: u64::MAX,
+                    rlimit_cpu_start_ms: crate::time::get_time_ms(),
+                    rlimit_cpu_soft_sent: false,
+                    rlimit_core_cur: 8 * 1024 * 1024,
+                    rlimit_core_max: 8 * 1024 * 1024,
+                    rlimit_rss_cur: u64::MAX,
+                    rlimit_rss_max: u64::MAX,
+                    rlimit_memlock_cur: 64 * 1024,
+                    rlimit_memlock_max: 64 * 1024,
+                    rlimit_as_cur: u64::MAX,
+                    rlimit_as_max: u64::MAX,
+                    rlimit_locks_cur: u64::MAX,
+                    rlimit_locks_max: u64::MAX,
+                    rlimit_msgqueue_cur: 819_200,
+                    rlimit_msgqueue_max: 819_200,
+                    rlimit_nice_cur: 0,
+                    rlimit_nice_max: 0,
+                    rlimit_rtprio_cur: 0,
+                    rlimit_rtprio_max: 0,
+                    rlimit_sigpending_cur: u64::MAX,
+                    rlimit_sigpending_max: u64::MAX,
+                    rlimit_rttime_cur: u64::MAX,
+                    rlimit_rttime_max: u64::MAX,
+                },
                 root: String::from("/"),
                 cwd: String::from("/user"),
                 heap_start,
@@ -1442,17 +1482,19 @@ impl ProcessControlBlock {
                 signals_masks: SignalFlags::empty(),
                 handling_signal: -1,
                 rt_sig_handlers: vec![RtSigAction::default(); RT_SIG_MAX + 1],
-                sched_policy: 0,
-                cpu_affinity_mask: if MAX_HARTS >= usize::BITS as usize {
-                    usize::MAX
-                } else {
-                    (1usize << MAX_HARTS) - 1
+                scheduling: ProcessScheduling {
+                    sched_policy: 0,
+                    cpu_affinity_mask: if MAX_HARTS >= usize::BITS as usize {
+                        usize::MAX
+                    } else {
+                        (1usize << MAX_HARTS) - 1
+                    },
+                    sched_priority: 0,
+                    sched_runtime: 0,
+                    sched_deadline: 0,
+                    sched_period: 0,
+                    nice: 0,
                 },
-                sched_priority: 0,
-                sched_runtime: 0,
-                sched_deadline: 0,
-                sched_period: 0,
-                nice: 0,
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),
@@ -1512,8 +1554,13 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) {
-        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data);
+    pub fn exec(
+        self: &Arc<Self>,
+        elf_data: &[u8],
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) -> Result<(), isize> {
+        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)?;
         self.exec_with_memory_set(
             memory_set,
             ustack_base,
@@ -1523,6 +1570,7 @@ impl ProcessControlBlock {
             elf_aux,
             (0, 0),
         );
+        Ok(())
     }
 
     /// Exec a dynamically-linked ELF (with PT_INTERP) in a Linux-like way:
@@ -1534,9 +1582,9 @@ impl ProcessControlBlock {
         interp_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
-    ) {
+    ) -> Result<(), isize> {
         let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
-            MemorySet::from_elf_with_interp(elf_data, interp_data);
+            MemorySet::from_elf_with_interp(elf_data, interp_data)?;
         self.exec_dyn_with_memory_set(
             memory_set,
             ustack_base,
@@ -1549,6 +1597,7 @@ impl ProcessControlBlock {
             envs,
             (0, 0),
         );
+        Ok(())
     }
 
     pub fn exec_with_memory_set(
@@ -1728,7 +1777,7 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         share_files: bool,
         share_vm: bool,
-    ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
+    ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
         let diag_enabled = DEBUG_FUTEX;
         let fork_start_cycles = if diag_enabled {
             crate::arch::read_time()
@@ -1748,12 +1797,12 @@ impl ProcessControlBlock {
                 thread_count
             );
         }
-        let sched_policy = parent.sched_policy;
-        let sched_priority = parent.sched_priority;
-        let sched_runtime = parent.sched_runtime;
-        let sched_deadline = parent.sched_deadline;
-        let sched_period = parent.sched_period;
-        let nice = parent.nice;
+        let sched_policy = parent.scheduling.sched_policy;
+        let sched_priority = parent.scheduling.sched_priority;
+        let sched_runtime = parent.scheduling.sched_runtime;
+        let sched_deadline = parent.scheduling.sched_deadline;
+        let sched_period = parent.scheduling.sched_period;
+        let nice = parent.scheduling.nice;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.sysv_shm_attaches.clone();
@@ -1810,9 +1859,10 @@ impl ProcessControlBlock {
             after_mem_cycles = crate::arch::read_time();
         }
         // alloc a pid
-        let pid = pid_alloc();
+        let pid = pid_alloc()?;
         let pid_value = pid.0;
         let inherited_owner = parent.files_owner.as_ref().and_then(Weak::upgrade);
+        // remove parent's invalid table
         if parent.files_owner.is_some() && inherited_owner.is_none() {
             parent.files_owner = None;
         }
@@ -1892,40 +1942,7 @@ impl ProcessControlBlock {
                 fd_table: new_fd_table,
                 fd_flags: new_fd_flags,
                 files_owner: child_files_owner,
-                rlimit_nofile_cur: parent.rlimit_nofile_cur,
-                rlimit_nofile_max: parent.rlimit_nofile_max,
-                rlimit_nproc_cur: parent.rlimit_nproc_cur,
-                rlimit_nproc_max: parent.rlimit_nproc_max,
-                rlimit_fsize_cur: parent.rlimit_fsize_cur,
-                rlimit_fsize_max: parent.rlimit_fsize_max,
-                rlimit_data_cur: parent.rlimit_data_cur,
-                rlimit_data_max: parent.rlimit_data_max,
-                rlimit_stack_cur: parent.rlimit_stack_cur,
-                rlimit_stack_max: parent.rlimit_stack_max,
-                rlimit_cpu_cur: parent.rlimit_cpu_cur,
-                rlimit_cpu_max: parent.rlimit_cpu_max,
-                rlimit_cpu_start_ms: parent.rlimit_cpu_start_ms,
-                rlimit_cpu_soft_sent: parent.rlimit_cpu_soft_sent,
-                rlimit_core_cur: parent.rlimit_core_cur,
-                rlimit_core_max: parent.rlimit_core_max,
-                rlimit_rss_cur: parent.rlimit_rss_cur,
-                rlimit_rss_max: parent.rlimit_rss_max,
-                rlimit_memlock_cur: parent.rlimit_memlock_cur,
-                rlimit_memlock_max: parent.rlimit_memlock_max,
-                rlimit_as_cur: parent.rlimit_as_cur,
-                rlimit_as_max: parent.rlimit_as_max,
-                rlimit_locks_cur: parent.rlimit_locks_cur,
-                rlimit_locks_max: parent.rlimit_locks_max,
-                rlimit_msgqueue_cur: parent.rlimit_msgqueue_cur,
-                rlimit_msgqueue_max: parent.rlimit_msgqueue_max,
-                rlimit_nice_cur: parent.rlimit_nice_cur,
-                rlimit_nice_max: parent.rlimit_nice_max,
-                rlimit_rtprio_cur: parent.rlimit_rtprio_cur,
-                rlimit_rtprio_max: parent.rlimit_rtprio_max,
-                rlimit_sigpending_cur: parent.rlimit_sigpending_cur,
-                rlimit_sigpending_max: parent.rlimit_sigpending_max,
-                rlimit_rttime_cur: parent.rlimit_rttime_cur,
-                rlimit_rttime_max: parent.rlimit_rttime_max,
+                rlimits: parent.rlimits.clone(),
                 root: parent.root.clone(),
                 cwd: parent.cwd.clone(),
                 heap_start: parent.heap_start,
@@ -1953,13 +1970,15 @@ impl ProcessControlBlock {
                 signals_masks: SignalFlags::empty(),
                 handling_signal: -1,
                 rt_sig_handlers,
-                sched_policy,
-                cpu_affinity_mask: parent.cpu_affinity_mask,
-                sched_priority,
-                sched_runtime,
-                sched_deadline,
-                sched_period,
-                nice,
+                scheduling: ProcessScheduling {
+                    sched_policy,
+                    cpu_affinity_mask: parent.scheduling.cpu_affinity_mask,
+                    sched_priority,
+                    sched_runtime,
+                    sched_deadline,
+                    sched_period,
+                    nice,
+                },
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),
@@ -1981,16 +2000,13 @@ impl ProcessControlBlock {
         drop(parent);
 
         // create main thread of child process (allocates a fresh kernel stack)
-        let task = match TaskControlBlock::try_new(
+        let task = Arc::new(TaskControlBlock::try_new(
             Arc::clone(&child),
             parent_ustack_base,
             // here we do not allocate trap_cx or ustack again
             // but mention that we allocate a new kstack here
             false,
-        ) {
-            Some(task) => Arc::new(task),
-            None => return None,
-        };
+        )?);
         // Distribute child processes across harts.
         task.set_cpu_id(select_hart_for_new_task());
         // attach task to child process
@@ -2066,15 +2082,15 @@ impl ProcessControlBlock {
                 );
             }
         }
-        Some((child, task))
+        Ok((child, task))
     }
 
     /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>) -> Option<Arc<Self>> {
+    pub fn fork(self: &Arc<Self>) -> Result<Arc<Self>, ForkError> {
         let (child, task) = self.fork_impl(false, false)?;
         // add this thread to scheduler
         add_task(task);
-        Some(child)
+        Ok(child)
     }
 
     /// Fork and return both the child process and its main task, without scheduling it.
@@ -2082,7 +2098,7 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         share_files: bool,
         share_vm: bool,
-    ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
+    ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
         self.fork_impl(share_files, share_vm)
     }
 

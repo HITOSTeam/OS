@@ -152,6 +152,8 @@ impl PhysAddr {
         self.page_offset() == 0
     }
     pub fn get_mut<T>(&self) -> &'static mut T {
+        // SAFETY: kernel uses identity mapping (VA == PA) for all physical memory;
+        // caller ensures this physical address belongs to an allocated page.
         unsafe { (self.0 as *mut T).as_mut().unwrap() }
     }
 }
@@ -182,14 +184,18 @@ impl VirtPageNum {
 impl PhysPageNum {
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
+        // SAFETY: pa is a valid physical address for an allocated page table frame; 512 PTEs fit in one page.
         unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, 512) }
     }
     pub fn get_bytes_array(&self) -> &'static mut [u8] {
         let pa: PhysAddr = (*self).into();
+        // SAFETY: pa is a valid physical address for an allocated frame; 4096 bytes fit in one page.
         unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, 4096) }
     }
     pub fn get_mut<T>(&self) -> &'static mut T {
         let pa: PhysAddr = (*self).into();
+        // SAFETY: kernel uses identity mapping (VA == PA) for all physical memory;
+        // caller ensures page is allocated and T fits within the page.
         unsafe { (pa.0 as *mut T).as_mut().unwrap() }
     }
 }

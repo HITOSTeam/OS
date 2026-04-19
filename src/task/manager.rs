@@ -9,10 +9,10 @@ use crate::arch;
 use crate::config::MAX_HARTS;
 use crate::debug_config::DEBUG_SCHED;
 use crate::fs::legacy_cpu_fair_group;
-use crate::task::block_sleep::{TIMERS, TimeWrap};
+use crate::task::block_sleep::{TimeWrap, TIMERS};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::sched::{
-    RT_PRIO_LEVELS, RT_PRIO_MAX, RT_PRIO_MIN, SchedClass, rt_queue_index, sched_class,
+    rt_queue_index, sched_class, SchedClass, RT_PRIO_LEVELS, RT_PRIO_MAX, RT_PRIO_MIN,
 };
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use spin::Mutex;
@@ -26,10 +26,14 @@ pub fn mark_hart_online(hart_id: usize) {
     }
 }
 
-fn online_hart_mask() -> usize {
+pub fn online_hart_mask() -> usize {
     let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
     // Fallback: at least hart0 exists.
-    if mask == 0 { 1 } else { mask }
+    if mask == 0 {
+        1
+    } else {
+        mask
+    }
 }
 
 fn pick_online_hart(start: usize) -> usize {
@@ -50,6 +54,8 @@ pub fn select_hart_for_new_task() -> usize {
 
 pub fn dump_system_state() {
     log::warn!("==== [watchdog] system state dump ====");
+    // Disable interrupts to prevent deadlock with timer-driven wakeup_task().
+    let prev_sie = arch::disable_interrupts();
     let mgr = TASK_MANAGER.lock();
     let total_ready: usize = mgr.ready_queues.iter().map(HartRunQueue::len).sum();
     log::warn!(
@@ -124,6 +130,7 @@ pub fn dump_system_state() {
     }
     drop(map);
     log::warn!("==== [watchdog] end ====");
+    arch::restore_interrupts(prev_sie);
 }
 
 #[derive(Default)]
@@ -162,14 +169,21 @@ enum ReadyQueueSlot {
     Fair,
 }
 
+/// get where the task should be
+///
 fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
+    // if getting processblock fails,we set this to fair
     let Some(process) = task.process.upgrade() else {
         return ReadyQueueSlot::Fair;
     };
     let (policy, rt_priority) = {
         let inner = process.borrow_mut();
-        (inner.sched_policy, inner.sched_priority)
+        (
+            inner.scheduling.sched_policy,
+            inner.scheduling.sched_priority,
+        )
     };
+    // according to the policy number,decide the target position
     match sched_class(policy) {
         Some(SchedClass::Fifo) | Some(SchedClass::Rr) => {
             ReadyQueueSlot::Rt(rt_queue_index(rt_priority))
@@ -634,7 +648,8 @@ pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
 pub fn remove_from_pid2process(pid: usize) {
     let mut map = PID2PCB.lock();
     if map.remove(&pid).is_none() {
-        panic!("cannot find pid {} in pid2task!", pid);
+        log::warn!("remove_from_pid2process: pid {} not found (already reaped?)", pid);
+        return;
     }
     let len = map.len();
     if crate::debug_config::DEBUG_PID_MAP && len >= 64 && (len & (len - 1)) == 0 {

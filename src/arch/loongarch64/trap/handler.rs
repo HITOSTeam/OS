@@ -27,6 +27,8 @@ const ECODE_PAGE_PRIV: usize = 0x7;
 const ECODE_ADDR_ERROR: usize = 0x8;
 const ECODE_ADDR_ALIGN: usize = 0x9;
 
+use super::super::csr_defs::{ECFG_LIE_TI, ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, PRMD_USER_IE, PRMD_USER_IE_MASK};
+
 const ESTAT_TIMER_BIT: usize = 11;
 
 /// Log only the first trap_return to see initial user entry.
@@ -41,6 +43,8 @@ static TRAP_HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[inline(always)]
 fn read_estat() -> usize {
     let val: usize;
+    // SAFETY: Reading ESTAT is valid in kernel mode and returns the current exception status.
+    // Using the wrong CSR would misdecode the active trap cause.
     unsafe { asm!("csrrd {}, 0x5", out(reg) val) };
     val
 }
@@ -48,6 +52,8 @@ fn read_estat() -> usize {
 #[inline(always)]
 fn read_badv() -> usize {
     let val: usize;
+    // SAFETY: Reading BADV is valid in kernel mode and reports the faulting virtual address.
+    // If this read were wrong, page-fault reporting and recovery would use a bogus address.
     unsafe { asm!("csrrd {}, 0x7", out(reg) val) };
     val
 }
@@ -55,12 +61,16 @@ fn read_badv() -> usize {
 #[inline(always)]
 fn read_badi() -> usize {
     let val: usize;
+    // SAFETY: Reading BADI is valid in kernel mode and exposes the trapped instruction metadata.
+    // Reading an unrelated CSR here would make trap diagnostics and emulation incorrect.
     unsafe { asm!("csrrd {}, 0x8", out(reg) val) };
     val
 }
 
 #[inline(always)]
 fn write_eentry(val: usize) {
+    // SAFETY: `val` is a kernel trap-entry address chosen by the caller, and writing EENTRY is
+    // only valid in kernel mode. A bad address here would redirect traps to invalid code.
     unsafe { asm!("csrwr {}, 0xc", in(reg) val) };
 }
 
@@ -93,7 +103,7 @@ pub fn init_trap() {
 #[unsafe(no_mangle)]
 pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     let estat = read_estat();
-    let ecode = (estat >> 16) & 0x3f;
+    let ecode = (estat >> ESTAT_ECODE_SHIFT) & ESTAT_ECODE_MASK;
     if ecode == 0 && (estat & (1 << ESTAT_TIMER_BIT)) != 0 {
         super::super::clear_timer_interrupt();
         set_next_trigger();
@@ -176,7 +186,7 @@ pub fn trap_handler() {
     set_kernel_trap_entry();
 
     let estat = read_estat();
-    let ecode = (estat >> 16) & 0x3f;
+    let ecode = (estat >> ESTAT_ECODE_SHIFT) & ESTAT_ECODE_MASK;
     let badv = read_badv();
     let badi = read_badi();
 
@@ -267,7 +277,7 @@ pub fn trap_return() -> ! {
     set_kernel_trap_entry();
     {
         let cx = get_trap_context();
-        cx.sstatus = (cx.sstatus & !0x7) | 0x7;
+        cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
     }
     // IMPORTANT: `trap_return()` diverges, so keep Arc owners in a short scope.
     let (trap_cx_ptr, user_token) = {
@@ -278,8 +288,7 @@ pub fn trap_return() -> ! {
                 res.trap_cx_user_va()
             } else {
                 drop(task_inner);
-                exit_current_and_run_next(-1);
-                unreachable!("exit_current_and_run_next should not return");
+                exit_current_and_run_next(-1)
             }
         };
         let user_token = task
@@ -334,6 +343,9 @@ pub fn trap_return() -> ! {
         fn restore();
     }
     let restore_va = restore as usize - alltraps as usize + TRAMPOLINE;
+    // SAFETY: `restore_va` points at the trampoline restore stub, and the argument registers are
+    // loaded with the trap context pointer and user token expected by that stub. Jumping to the
+    // wrong address or with mismatched registers would not return to userspace correctly.
     unsafe {
         asm!(
             "jirl $r0, {restore_va}, 0",

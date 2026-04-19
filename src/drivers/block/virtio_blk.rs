@@ -75,6 +75,8 @@ mod virtio_mmio {
 
         pub fn try_new_with_base(base: usize) -> Option<Self> {
             let header = NonNull::new(base as *mut VirtIOHeader)?;
+            // SAFETY: base is the MMIO address from device tree or known constant;
+            // header is a valid non-null pointer to VirtIOHeader.
             let transport = unsafe { MmioTransport::new(header) }.ok()?;
             if transport.device_type() != DeviceType::Block {
                 return None;
@@ -248,6 +250,8 @@ mod virtio_pci {
             }
             let mut shared = vec![0u8; buffer.len()].into_boxed_slice();
             if let BufferDirection::DriverToDevice | BufferDirection::Both = direction {
+                // SAFETY: buffer is a valid non-null slice; shared has the same length;
+                // both pointers are valid for copy_nonoverlapping.
                 unsafe {
                     let src =
                         core::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len());
@@ -550,12 +554,14 @@ mod virtio_pci {
         }
 
         fn try_new_with_index(index: usize) -> Option<Self> {
+            // SAFETY: DEVICE_TREE_ADDR is the FDT address passed by bootloader; valid during init.
             let fdt = unsafe { Fdt::from_ptr(DEVICE_TREE_ADDR as *const u8).ok()? };
             let pci_node = fdt.find_compatible(&["pci-host-ecam-generic"])?;
             ensure_pci_ecam_mapped(&pci_node);
             ensure_pci_allocator(&pci_node);
             let reg = pci_node.reg()?;
             for region in reg {
+                // SAFETY: region.starting_address is the ECAM base from FDT; mapped by ensure_pci_ecam_mapped.
                 let mut pci_root =
                     unsafe { PciRoot::new(region.starting_address as *mut u8, Cam::Ecam) };
                 let mut blk_index = 0usize;

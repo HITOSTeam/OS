@@ -14,6 +14,7 @@ use crate::task::processor::{block_current_and_run_next, current_process, curren
 use crate::task::signal::has_unmasked_pending;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::trap::get_current_token;
+use crate::syscall::error::{SyscallError, err};
 
 const IPC_PRIVATE: usize = 0;
 const IPC_CREAT: usize = 0x200;
@@ -67,20 +68,6 @@ static RUNTIME_SEMMNS_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNS);
 static RUNTIME_SEMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNI);
 static RUNTIME_SEMOPM_LIMIT: AtomicUsize = AtomicUsize::new(SEMOPM);
 
-const EPERM: isize = -1;
-const ENOENT: isize = -2;
-const EINTR: isize = -4;
-const EACCES: isize = -13;
-const EFAULT: isize = -14;
-const EEXIST: isize = -17;
-const EINVAL: isize = -22;
-const E2BIG: isize = -7;
-const ENOMSG: isize = -42;
-const EIDRM: isize = -43;
-const ERANGE: isize = -34;
-const EFBIG: isize = -27;
-const EAGAIN: isize = -11;
-const ENOSPC: isize = -28;
 
 pub fn msgmax_limit() -> usize {
     MSGMAX
@@ -152,11 +139,11 @@ pub fn write_msg_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
         PROCFS_MSGMAX => &RUNTIME_MSGMAX_LIMIT,
         PROCFS_MSGMNB => &RUNTIME_MSGMNB_LIMIT,
         PROCFS_MSGMNI => &RUNTIME_MSGMNI_LIMIT,
-        _ => return Err(EINVAL),
+        _ => return Err(err(SyscallError::EINVAL)),
     };
     let value = parse_proc_sys_usize(data)?;
     if value == 0 || value > i32::MAX as usize {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     slot.store(value, Ordering::Relaxed);
     Ok(alloc::format!("{}\n", value).into_bytes())
@@ -164,36 +151,36 @@ pub fn write_msg_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
 
 pub fn write_sem_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
     if path != PROCFS_SEM {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let Ok(raw) = core::str::from_utf8(data) else {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     };
     let mut parts = raw.split_whitespace();
     let Some(semmsl) = parts.next().and_then(|v| v.parse::<usize>().ok()) else {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     };
     let Some(semmns) = parts.next().and_then(|v| v.parse::<usize>().ok()) else {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     };
     let Some(semopm) = parts.next().and_then(|v| v.parse::<usize>().ok()) else {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     };
     let Some(semmni) = parts.next().and_then(|v| v.parse::<usize>().ok()) else {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     };
     if parts.next().is_some() {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     let values = [semmsl, semmns, semopm, semmni];
     if values
         .iter()
         .any(|value| *value == 0 || *value > i32::MAX as usize)
     {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     if semmns < semmsl {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     RUNTIME_SEMMSL_LIMIT.store(semmsl, Ordering::Relaxed);
     RUNTIME_SEMMNS_LIMIT.store(semmns, Ordering::Relaxed);
@@ -665,23 +652,23 @@ pub fn syscall_msgget(key: usize, msgflg: usize) -> isize {
     if key != IPC_PRIVATE {
         if let Some(id) = mgr.key2id.get(&key_u32).copied() {
             if (msgflg & IPC_CREAT) != 0 && (msgflg & IPC_EXCL) != 0 {
-                return EEXIST;
+                return err(SyscallError::EEXIST);
             }
             let Some(queue) = mgr.queues.get(&id) else {
-                return ENOENT;
+                return err(SyscallError::ENOENT);
             };
             let req = (msgflg & 0o700) as u16;
             if !check_ipc_access(&queue.perm, req, &cred) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             return id as isize;
         }
         if (msgflg & IPC_CREAT) == 0 {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         }
     }
     if mgr.queues.len() >= runtime_msgmni_limit() {
-        return ENOSPC;
+        return err(SyscallError::ENOSPC);
     }
 
     let id = mgr.alloc_id();
@@ -739,32 +726,32 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
             ..MsgInfoUser::default()
         };
         if try_write_user_value(token, buf as *mut MsgInfoUser, &info).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return highest_index as isize;
     }
 
     if cmd == MSG_STAT || cmd == MSG_STAT_ANY {
         let Some((&queue_id, queue)) = mgr.queues.iter().nth(msqid) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         if cmd == MSG_STAT_ANY || check_ipc_access(&queue.perm, MSG_R, &cred) {
             let ds = msq_to_user(queue);
             if try_write_user_value(token, buf as *mut MsqidDsUser, &ds).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             return queue_id as isize;
         }
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
 
     let Some(queue) = mgr.queues.get_mut(&msqid) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     match cmd {
         IPC_RMID => {
             if !is_owner_or_root(&queue.perm, &cred) {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let wake = mgr.remove_queue(msqid);
             drop(mgr);
@@ -776,20 +763,20 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
         }
         IPC_STAT => {
             if !check_ipc_access(&queue.perm, MSG_R, &cred) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             let ds = msq_to_user(queue);
             if try_write_user_value(token, buf as *mut MsqidDsUser, &ds).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             0
         }
         IPC_SET => {
             if !is_owner_or_root(&queue.perm, &cred) {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let Some(ds) = try_read_user_value(token, buf as *const MsqidDsUser) else {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             };
             queue.perm.uid = ds.msg_perm.uid;
             queue.perm.gid = ds.msg_perm.gid;
@@ -799,24 +786,24 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
             wake_msg_waiters(&mut queue.send_waiters);
             0
         }
-        _ => EINVAL,
+        _ => err(SyscallError::EINVAL),
     }
 }
 
 pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) -> isize {
     if (msgsz as isize) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if msgsz > runtime_msgmax_limit() {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let cred = current_cred();
     let token = get_current_token();
     let Some(mtype) = try_read_user_value(token, msgp as *const i64) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     if mtype <= 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut mtext = vec![0u8; msgsz];
     if try_copy_from_user(
@@ -826,7 +813,7 @@ pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) ->
     )
     .is_err()
     {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
 
     let mut waited = false;
@@ -835,10 +822,10 @@ pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) ->
         let mut managers = MSG_MANAGERS.lock();
         let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(queue) = mgr.queues.get_mut(&msqid) else {
-            return if waited { EIDRM } else { EINVAL };
+            return if waited { err(SyscallError::EIDRM) } else { err(SyscallError::EINVAL) };
         };
         if !check_ipc_access(&queue.perm, MSG_W, &cred) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         if queue.cbytes.saturating_add(msgsz) <= queue.qbytes {
             queue.msgs.push_back(Msg {
@@ -852,20 +839,20 @@ pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) ->
             return 0;
         }
         if (msgflg & IPC_NOWAIT) != 0 {
-            return EAGAIN;
+            return err(SyscallError::EAGAIN);
         }
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
         let Some(task) = current_task() else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         add_waiter_once(&mut queue.send_waiters, &task);
         drop(managers);
         block_current_and_run_next();
         waited = true;
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
     }
 }
@@ -878,7 +865,7 @@ pub fn syscall_msgrcv(
     msgflg: usize,
 ) -> isize {
     if (msgsz as isize) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let cred = current_cred();
     let token = get_current_token();
@@ -886,10 +873,10 @@ pub fn syscall_msgrcv(
     let msg_except = (msgflg & MSG_EXCEPT) != 0;
     if msg_copy {
         if (msgflg & IPC_NOWAIT) == 0 || msg_except || msgtyp < 0 {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         }
     } else if msg_except && msgtyp == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let mut waited = false;
@@ -898,10 +885,10 @@ pub fn syscall_msgrcv(
         let mut managers = MSG_MANAGERS.lock();
         let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(queue) = mgr.queues.get_mut(&msqid) else {
-            return if waited { EIDRM } else { EINVAL };
+            return if waited { err(SyscallError::EIDRM) } else { err(SyscallError::EINVAL) };
         };
         if !check_ipc_access(&queue.perm, MSG_R, &cred) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
 
         let pick_idx = if queue.msgs.is_empty() {
@@ -935,7 +922,7 @@ pub fn syscall_msgrcv(
         if let Some(idx) = pick_idx {
             let src = queue.msgs.get(idx).unwrap();
             if src.mtext.len() > msgsz && (msgflg & MSG_NOERROR) == 0 {
-                return E2BIG;
+                return err(SyscallError::E2BIG);
             }
             let copy_len = src.mtext.len().min(msgsz);
             let msg_type = src.mtype;
@@ -951,7 +938,7 @@ pub fn syscall_msgrcv(
             drop(managers);
 
             if try_write_user_value(token, msgp as *mut i64, &msg_type).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             if try_copy_to_user(
                 token,
@@ -960,26 +947,26 @@ pub fn syscall_msgrcv(
             )
             .is_err()
             {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             return copy_len as isize;
         }
 
         if (msgflg & IPC_NOWAIT) != 0 {
-            return ENOMSG;
+            return err(SyscallError::ENOMSG);
         }
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
         let Some(task) = current_task() else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         add_waiter_once(&mut queue.recv_waiters, &task);
         drop(managers);
         block_current_and_run_next();
         waited = true;
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
     }
 }
@@ -994,38 +981,38 @@ pub fn syscall_semget(key: usize, nsems: usize, semflg: usize) -> isize {
     if key != IPC_PRIVATE {
         if let Some(id) = mgr.key2id.get(&key_u32).copied() {
             if (semflg & IPC_CREAT) != 0 && (semflg & IPC_EXCL) != 0 {
-                return EEXIST;
+                return err(SyscallError::EEXIST);
             }
             let Some(set) = mgr.sets.get(&id) else {
-                return ENOENT;
+                return err(SyscallError::ENOENT);
             };
             if nsems != 0 && nsems > set.sems.len() {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let req = (semflg & 0o700) as u16;
             if !check_ipc_access(&set.perm, req, &cred) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             return id as isize;
         }
         if (semflg & IPC_CREAT) == 0 {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         }
     }
 
     let (semmsl, semmns, _semopm, semmni) = runtime_sem_limits();
     if nsems == 0 || nsems > semmsl {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if mgr.sets.len() >= semmni {
-        return ENOSPC;
+        return err(SyscallError::ENOSPC);
     }
     let total_sems = mgr
         .sets
         .values()
         .fold(0usize, |acc, set| acc.saturating_add(set.sems.len()));
     if total_sems.saturating_add(nsems) > semmns {
-        return ENOSPC;
+        return err(SyscallError::ENOSPC);
     }
     let id = mgr.alloc_id();
     let mode = (semflg & 0o777) as u16;
@@ -1080,7 +1067,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
                 ..SemInfoUser::default()
             };
             if try_write_user_value(token, arg as *mut SemInfoUser, &info).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             return highest_index as isize;
         }
@@ -1091,29 +1078,29 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
     let mgr = managers.entry(ipc_ns_id).or_default();
     if cmd == SEM_STAT {
         let Some((&set_id, _)) = mgr.sets.iter().nth(semid) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         let Some(set) = mgr.sets.get(&set_id) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         if !check_ipc_access(&set.perm, SEM_R, &cred) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         let ds = sem_to_user(set);
         if try_write_user_value(token, arg as *mut SemidDsUser, &ds).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return set_id as isize;
     }
 
     let Some(set) = mgr.sets.get_mut(&semid) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
 
     match cmd {
         IPC_RMID => {
             if !is_owner_or_root(&set.perm, &cred) {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let wake = mgr.remove_set(semid);
             drop(mgr);
@@ -1125,20 +1112,20 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
         }
         IPC_STAT => {
             if !check_ipc_access(&set.perm, SEM_R, &cred) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             let ds = sem_to_user(set);
             if try_write_user_value(token, arg as *mut SemidDsUser, &ds).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             0
         }
         IPC_SET => {
             if !is_owner_or_root(&set.perm, &cred) {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let Some(ds) = try_read_user_value(token, arg as *const SemidDsUser) else {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             };
             set.perm.uid = ds.sem_perm.uid;
             set.perm.gid = ds.sem_perm.gid;
@@ -1148,12 +1135,13 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
         }
         GETALL => {
             if semnum > set.sems.len() {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let mut vals = Vec::with_capacity(set.sems.len());
             for sem in set.sems.iter() {
                 vals.push(sem.val as u16);
             }
+            // SAFETY: vals is an owned Vec<u16>; byte length equals vals.len() * size_of::<u16>().
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     vals.as_ptr() as *const u8,
@@ -1161,15 +1149,16 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
                 )
             };
             if try_copy_to_user(token, arg as *mut u8, bytes).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             0
         }
         SETALL => {
             if !is_owner_or_root(&set.perm, &cred) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             let mut vals = vec![0u16; set.sems.len()];
+            // SAFETY: vals is an owned Vec<u16>; byte length equals vals.len() * size_of::<u16>().
             let bytes = unsafe {
                 core::slice::from_raw_parts_mut(
                     vals.as_mut_ptr() as *mut u8,
@@ -1177,10 +1166,10 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
                 )
             };
             if try_copy_from_user(token, arg as *const u8, bytes).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             if vals.iter().any(|&val| (val as i32) > SEMVMX) {
-                return ERANGE;
+                return err(SyscallError::ERANGE);
             }
             for (sem, val) in set.sems.iter_mut().zip(vals.into_iter()) {
                 sem.val = val as i32;
@@ -1192,20 +1181,20 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
         }
         GETVAL => {
             let Some(sem) = set.sems.get(semnum) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             sem.val as isize
         }
         SETVAL => {
             if !is_owner_or_root(&set.perm, &cred) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             let Some(sem) = set.sems.get_mut(semnum) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             let val = arg as i32;
             if val < 0 || val > SEMVMX {
-                return ERANGE;
+                return err(SyscallError::ERANGE);
             }
             sem.val = val;
             sem.last_pid = cred.pid;
@@ -1215,38 +1204,38 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
         }
         GETPID => {
             let Some(sem) = set.sems.get(semnum) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             sem.last_pid as isize
         }
         GETNCNT => {
             let Some(sem) = set.sems.get_mut(semnum) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             retain_blocked_waiters(&mut sem.ncnt_waiters);
             sem.ncnt_waiters.len() as isize
         }
         GETZCNT => {
             let Some(sem) = set.sems.get_mut(semnum) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             retain_blocked_waiters(&mut sem.zcnt_waiters);
             sem.zcnt_waiters.len() as isize
         }
-        _ => EINVAL,
+        _ => err(SyscallError::EINVAL),
     }
 }
 
 fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
     if nsops == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if nsops > 1 {
-        return E2BIG;
+        return err(SyscallError::E2BIG);
     }
     let token = get_current_token();
     let Some(op) = try_read_user_value(token, sops as *const SemBuf) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let cred = current_cred();
     let ipc_ns_id = current_ipc_namespace_id();
@@ -1256,19 +1245,19 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
         let mut managers = SEM_MANAGERS.lock();
         let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(set) = mgr.sets.get_mut(&semid) else {
-            return if waited { EIDRM } else { EINVAL };
+            return if waited { err(SyscallError::EIDRM) } else { err(SyscallError::EINVAL) };
         };
         let Some(sem) = set.sems.get_mut(op.sem_num as usize) else {
-            return EFBIG;
+            return err(SyscallError::EFBIG);
         };
         let req = if op.sem_op == 0 { SEM_R } else { SEM_A };
         if !check_ipc_access(&set.perm, req, &cred) {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         if op.sem_op > 0 {
             let next = sem.val.saturating_add(op.sem_op as i32);
             if next > SEMVMX {
-                return ERANGE;
+                return err(SyscallError::ERANGE);
             }
             sem.val = next;
             sem.last_pid = cred.pid;
@@ -1281,20 +1270,20 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
                 return 0;
             }
             if (op.sem_flg as usize & IPC_NOWAIT) != 0 {
-                return EAGAIN;
+                return err(SyscallError::EAGAIN);
             }
             if has_pending_unmasked_signal() {
-                return EINTR;
+                return err(SyscallError::EINTR);
             }
             let Some(task) = current_task() else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             add_waiter_once(&mut sem.zcnt_waiters, &task);
             drop(managers);
             block_current_and_run_next();
             waited = true;
             if has_pending_unmasked_signal() {
-                return EINTR;
+                return err(SyscallError::EINTR);
             }
             continue;
         }
@@ -1307,20 +1296,20 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
             return 0;
         }
         if (op.sem_flg as usize & IPC_NOWAIT) != 0 {
-            return EAGAIN;
+            return err(SyscallError::EAGAIN);
         }
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
         let Some(task) = current_task() else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         add_waiter_once(&mut sem.ncnt_waiters, &task);
         drop(managers);
         block_current_and_run_next();
         waited = true;
         if has_pending_unmasked_signal() {
-            return EINTR;
+            return err(SyscallError::EINTR);
         }
     }
 }

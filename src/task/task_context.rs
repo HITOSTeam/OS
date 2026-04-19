@@ -1,4 +1,4 @@
-use core::{fmt::Display, ptr::write};
+use core::fmt::Display;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -25,22 +25,10 @@ impl TaskContext {
 }
 impl Display for TaskContext {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "TaskContext {{ ra: {:#x}, sp: {:#x} }}",
-            self.ra, self.sp
-        );
-        // println the s registers too?
+        write!(f, "TaskContext {{ ra: {:#x}, sp: {:#x}", self.ra, self.sp)?;
         for (i, reg) in self.s.iter().enumerate() {
             write!(f, ", s{}: {:#x}", i, reg)?;
         }
-        write!(f, "\n")?;
-        // ok next print the first 34 bytes of the sp,i need better format!
-        for i in 0..34 {
-            let ptr = (self.sp + i * 8) as *const usize;
-            let val = unsafe { *ptr };
-            write!(f, ", [sp+{}]: {:#x}", i * 8, val)?;
-        }
-        return Ok(());
+        write!(f, " }}")
     }
 }

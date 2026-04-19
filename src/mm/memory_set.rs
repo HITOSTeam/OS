@@ -11,8 +11,11 @@ use crate::config::{
 use crate::fs::cgroup_charge_anon_current;
 use crate::println;
 use crate::task::processor::current_process;
+use super::elf_loader::{
+    ElfHeader64, ElfPhdr64, ENOMEM, ENOEXEC, ET_DYN, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
+    parse_elf_headers, read_exact_with,
+};
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -35,133 +38,7 @@ unsafe extern "C" {
     safe fn strampoline();
 }
 
-const ENOEXEC: isize = -8;
-const ENOMEM: isize = -12;
 static COW_CLONE_DIAG_SEQ: AtomicUsize = AtomicUsize::new(0);
-
-const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const ELFCLASS64: u8 = 2;
-const ELFDATA2LSB: u8 = 1;
-const ET_DYN: u16 = 3;
-const PT_LOAD: u32 = 1;
-const PT_INTERP: u32 = 3;
-const PT_PHDR: u32 = 6;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const PF_R: u32 = 4;
-
-#[derive(Clone, Copy)]
-struct ElfHeader64 {
-    e_type: u16,
-    e_entry: u64,
-    e_phoff: u64,
-    e_phentsize: u16,
-    e_phnum: u16,
-}
-
-#[derive(Clone, Copy)]
-struct ElfPhdr64 {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-}
-
-fn read_exact_with<F>(read_at: &mut F, offset: usize, buf: &mut [u8]) -> Result<(), isize>
-where
-    F: FnMut(usize, &mut [u8]) -> usize,
-{
-    let mut done = 0usize;
-    while done < buf.len() {
-        let n = read_at(offset + done, &mut buf[done..]);
-        if n == 0 {
-            return Err(ENOEXEC);
-        }
-        done += n;
-    }
-    Ok(())
-}
-
-fn parse_elf_headers<F>(read_at: &mut F) -> Result<(ElfHeader64, Vec<ElfPhdr64>), isize>
-where
-    F: FnMut(usize, &mut [u8]) -> usize,
-{
-    let mut hdr = [0u8; 64];
-    read_exact_with(read_at, 0, &mut hdr)?;
-    if hdr[0..4] != ELF_MAGIC {
-        return Err(ENOEXEC);
-    }
-    if hdr[4] != ELFCLASS64 || hdr[5] != ELFDATA2LSB {
-        return Err(ENOEXEC);
-    }
-    let e_type = u16::from_le_bytes([hdr[16], hdr[17]]);
-    let e_entry = u64::from_le_bytes([
-        hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31],
-    ]);
-    let e_phoff = u64::from_le_bytes([
-        hdr[32], hdr[33], hdr[34], hdr[35], hdr[36], hdr[37], hdr[38], hdr[39],
-    ]);
-    let e_phentsize = u16::from_le_bytes([hdr[54], hdr[55]]);
-    let e_phnum = u16::from_le_bytes([hdr[56], hdr[57]]);
-    if e_phentsize < 56 {
-        return Err(ENOEXEC);
-    }
-    let header = ElfHeader64 {
-        e_type,
-        e_entry,
-        e_phoff,
-        e_phentsize,
-        e_phnum,
-    };
-    let mut phdrs = Vec::with_capacity(e_phnum as usize);
-    let mut ph_buf = [0u8; 56];
-    for idx in 0..e_phnum as usize {
-        let off = e_phoff as usize + idx * e_phentsize as usize;
-        read_exact_with(read_at, off, &mut ph_buf)?;
-        let ph = ElfPhdr64 {
-            p_type: u32::from_le_bytes([ph_buf[0], ph_buf[1], ph_buf[2], ph_buf[3]]),
-            p_flags: u32::from_le_bytes([ph_buf[4], ph_buf[5], ph_buf[6], ph_buf[7]]),
-            p_offset: u64::from_le_bytes([
-                ph_buf[8], ph_buf[9], ph_buf[10], ph_buf[11], ph_buf[12], ph_buf[13], ph_buf[14],
-                ph_buf[15],
-            ]),
-            p_vaddr: u64::from_le_bytes([
-                ph_buf[16], ph_buf[17], ph_buf[18], ph_buf[19], ph_buf[20], ph_buf[21], ph_buf[22],
-                ph_buf[23],
-            ]),
-            p_filesz: u64::from_le_bytes([
-                ph_buf[32], ph_buf[33], ph_buf[34], ph_buf[35], ph_buf[36], ph_buf[37], ph_buf[38],
-                ph_buf[39],
-            ]),
-            p_memsz: u64::from_le_bytes([
-                ph_buf[40], ph_buf[41], ph_buf[42], ph_buf[43], ph_buf[44], ph_buf[45], ph_buf[46],
-                ph_buf[47],
-            ]),
-        };
-        phdrs.push(ph);
-    }
-    Ok((header, phdrs))
-}
-
-pub(crate) fn elf_interp_path_from_reader<F>(mut read_at: F) -> Result<Option<String>, isize>
-where
-    F: FnMut(usize, &mut [u8]) -> usize,
-{
-    let (_hdr, phdrs) = parse_elf_headers(&mut read_at)?;
-    for ph in phdrs {
-        if ph.p_type != PT_INTERP {
-            continue;
-        }
-        let mut buf = vec![0u8; ph.p_filesz as usize];
-        read_exact_with(&mut read_at, ph.p_offset as usize, &mut buf)?;
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        let s = core::str::from_utf8(&buf[..end]).map_err(|_| ENOEXEC)?;
-        return Ok(Some(String::from(s)));
-    }
-    Ok(None)
-}
 
 lazy_static! {
     /// a memory set instance through lazy_static! managing kernel space
@@ -452,13 +329,13 @@ impl MemorySet {
     /// Include sections in elf and trampoline and TrapContext and user stack,
     /// also returns user_sp and entry poremove_areeint.
     /// 用户占 被设计为 程序地址 (虚拟地址) 的最高端.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize, ElfAux) {
+    pub fn from_elf(elf_data: &[u8]) -> Result<(Self, usize, usize, ElfAux), isize> {
         let mut memory_set = Self::new_bare();
         // map trap trampoline (kernel-only) and sigreturn trampoline (user accessible)
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
         // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
         let load_bias: usize = match elf.header.pt2.type_().as_type() {
             // Map ET_DYN (shared objects / PIE) at a non-zero base so that:
             // - the null page stays unmapped by default, and
@@ -468,7 +345,9 @@ impl MemorySet {
         };
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
-        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
+        if magic != [0x7f, 0x45, 0x4c, 0x46] {
+            return Err(-8);
+        }
         let ph_count = elf_header.pt2.ph_count();
         let ph_entry_size = elf_header.pt2.ph_entry_size() as usize;
         let ph_offset = elf_header.pt2.ph_offset() as usize;
@@ -476,12 +355,16 @@ impl MemorySet {
         let mut phdr_vaddr: usize = 0;
         let mut max_end_vpn = VirtPageNum(0);
         for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
+            let ph = elf.program_header(i).map_err(|_| -8isize)?;
             // Prefer explicit PHDR segment when present.
-            if phdr_vaddr == 0 && ph.get_type().unwrap() == xmas_elf::program::Type::Phdr {
+            let ph_type = match ph.get_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if phdr_vaddr == 0 && ph_type == xmas_elf::program::Type::Phdr {
                 phdr_vaddr = load_bias + ph.virtual_addr() as usize;
             }
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
+            if ph_type == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (load_bias + ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr =
                     (load_bias + (ph.virtual_addr() + ph.mem_size()) as usize).into();
@@ -562,7 +445,7 @@ impl MemorySet {
         );
         // Return user_stack_bottom as ustack_base for thread allocation
         // Each thread will calculate its stack as: ustack_base + tid * (PAGE_SIZE + USER_STACK_SIZE)
-        (
+        Ok((
             memory_set,
             user_stack_bottom,
             load_bias + elf.header.pt2.entry_point() as usize,
@@ -571,7 +454,7 @@ impl MemorySet {
                 phent: ph_entry_size,
                 phnum: ph_count as usize,
             },
-        )
+        ))
     }
 
     /// Build a user address space from an ELF reader to avoid loading the full file into memory.
@@ -648,11 +531,13 @@ impl MemorySet {
         elf_data: &[u8],
         load_bias: usize,
         max_end_vpn: &mut VirtPageNum,
-    ) -> (usize, ElfAux) {
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
+    ) -> Result<(usize, ElfAux), isize> {
+        let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
-        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
+        if magic != [0x7f, 0x45, 0x4c, 0x46] {
+            return Err(-8);
+        }
         let ph_count = elf_header.pt2.ph_count();
         let ph_entry_size = elf_header.pt2.ph_entry_size() as usize;
         let ph_offset = elf_header.pt2.ph_offset() as usize;
@@ -660,11 +545,15 @@ impl MemorySet {
 
         let mut phdr_vaddr: usize = 0;
         for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
-            if phdr_vaddr == 0 && ph.get_type().unwrap() == xmas_elf::program::Type::Phdr {
+            let ph = elf.program_header(i).map_err(|_| -8isize)?;
+            let ph_type = match ph.get_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if phdr_vaddr == 0 && ph_type == xmas_elf::program::Type::Phdr {
                 phdr_vaddr = load_bias + ph.virtual_addr() as usize;
             }
-            if ph.get_type().unwrap() != xmas_elf::program::Type::Load {
+            if ph_type != xmas_elf::program::Type::Load {
                 continue;
             }
             let start_va: VirtAddr = (load_bias + ph.virtual_addr() as usize).into();
@@ -702,14 +591,14 @@ impl MemorySet {
             }
         }
 
-        (
+        Ok((
             load_bias + elf.header.pt2.entry_point() as usize,
             ElfAux {
                 phdr: phdr_vaddr,
                 phent: ph_entry_size,
                 phnum: ph_count as usize,
             },
-        )
+        ))
     }
 
     fn map_elf_segments_from_reader<F>(
@@ -803,13 +692,13 @@ impl MemorySet {
     pub fn from_elf_with_interp(
         main_elf: &[u8],
         interp_elf: &[u8],
-    ) -> (Self, usize, usize, usize, ElfAux, usize) {
+    ) -> Result<(Self, usize, usize, usize, ElfAux, usize), isize> {
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
 
-        let main = xmas_elf::ElfFile::new(main_elf).unwrap();
-        let interp = xmas_elf::ElfFile::new(interp_elf).unwrap();
+        let main = xmas_elf::ElfFile::new(main_elf).map_err(|_| -8isize)?;
+        let _interp = xmas_elf::ElfFile::new(interp_elf).map_err(|_| -8isize)?;
 
         // Place PIE/shared objects away from zero so the null page stays unmapped.
         let main_bias = match main.header.pt2.type_().as_type() {
@@ -827,9 +716,9 @@ impl MemorySet {
 
         let mut max_end_vpn = VirtPageNum(0);
         let (main_entry, main_aux) =
-            Self::map_elf_segments_into(&mut memory_set, main_elf, main_bias, &mut max_end_vpn);
+            Self::map_elf_segments_into(&mut memory_set, main_elf, main_bias, &mut max_end_vpn)?;
         let (interp_entry, _interp_aux) =
-            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn);
+            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn)?;
 
         // Map user stack with U flags, placed above all mapped ELF segments.
         let max_end_va: VirtAddr = max_end_vpn.into();
@@ -869,14 +758,14 @@ impl MemorySet {
             None,
         );
 
-        (
+        Ok((
             memory_set,
             user_stack_bottom,
             interp_entry,
             main_entry,
             main_aux,
             interp_bias,
-        )
+        ))
     }
 
     /// Build a user address space from a main ELF reader and an in-memory interpreter.
@@ -908,7 +797,7 @@ impl MemorySet {
             &mut max_end_vpn,
         )?;
         let (interp_entry, _interp_aux) =
-            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn);
+            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn)?;
 
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_bottom: usize = max_end_va.into();
@@ -975,14 +864,13 @@ impl MemorySet {
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
 
-        let mut parent_updates: Vec<(VirtPageNum, PTEFlags)> = Vec::new();
+        let mut parent_update_count = 0usize;
         let mut src_walk_cache = PageWalkCache::new();
         let mut dst_walk_cache = PageWalkCache::new();
         let mut area_count = 0usize;
         let mut identical_pages = 0usize;
         let mut shared_pages = 0usize;
         let mut kernel_private_pages = 0usize;
-        let mut cow_marked_pages = 0usize;
 
         for area in user_space.areas.iter() {
             area_count = area_count.saturating_add(1);
@@ -1057,8 +945,10 @@ impl MemorySet {
                             src_flags.remove(PTEFlags::W);
                             src_flags.remove(PTEFlags::D);
                             src_flags.insert(PTEFlags::COW);
-                            parent_updates.push((vpn, src_flags));
-                            cow_marked_pages = cow_marked_pages.saturating_add(1);
+                            // Apply parent PTE demotion immediately to minimize the window where
+                            // another thread could write through a still-writable PTE on another hart.
+                            user_space.page_table.set_flags(vpn, src_flags);
+                            parent_update_count = parent_update_count.saturating_add(1);
                         }
                         memory_set.page_table.map_cached(
                             vpn,
@@ -1079,10 +969,26 @@ impl MemorySet {
         } else {
             0
         };
-        let parent_update_count = parent_updates.len();
-        // Apply parent COW flag updates after we finish iterating its areas.
-        for (vpn, flags) in parent_updates {
-            user_space.set_pte_flags(vpn, flags);
+        if parent_update_count != 0 {
+            // SAFETY: after fork demotes parent PTEs from writable to read-only+COW,
+            // every hart running the parent must drop stale writable TLB entries
+            // before it can resume, or it may keep writing shared pages behind COW.
+            #[cfg(target_arch = "riscv64")]
+            {
+                let remote_hart_mask = crate::task::manager::online_hart_mask()
+                    & !(1usize << crate::arch::hart_id());
+                unsafe {
+                    asm!("sfence.vma");
+                }
+                crate::sbi::remote_sfence_vma_all(remote_hart_mask);
+            }
+            // SAFETY: LoongArch64 currently runs single-core only (no SMP boot),
+            // so a local full TLB flush is sufficient. When SMP is added, a
+            // remote TLB shootdown (IPI + invtlb on each hart) will be needed.
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                asm!("invtlb 0x1, $r0, $r0");
+            }
         }
         if diag_enabled {
             let end_cycles = crate::arch::read_time();
@@ -1109,7 +1015,7 @@ impl MemorySet {
                     identical_pages,
                     shared_pages,
                     kernel_private_pages,
-                    cow_marked_pages,
+                    parent_update_count,
                     parent_update_count
                 );
             }
@@ -1343,10 +1249,12 @@ impl MemorySet {
 
         // Flush TLB for this address.
         #[cfg(target_arch = "riscv64")]
+        // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.
         unsafe {
             core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
         }
         #[cfg(target_arch = "loongarch64")]
+        // SAFETY: invtlb is valid in S-mode; fault_va is the address to flush from TLB.
         unsafe {
             core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
         }
@@ -1382,6 +1290,12 @@ impl MemorySet {
                 .saturating_sub(area.vpn_range.get_start().0);
             let accounted_pages = area.charged_pages.max(area.data_frames.len());
             let new_charge_pages = total_pages.saturating_sub(accounted_pages);
+            let Some(frame) = frame_alloc() else {
+                crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
+                return LazyFaultResult::Oom;
+            };
+            // Allocate before charging so OOM in frame_alloc() cannot leak cgroup accounting;
+            // if charging fails, the uninstalled frame is dropped immediately.
             if new_charge_pages > 0
                 && area.map_perm.contains(MapPermission::U)
                 && area.map_perm.contains(MapPermission::W)
@@ -1392,18 +1306,16 @@ impl MemorySet {
                 }
                 area.charged_pages = accounted_pages.saturating_add(new_charge_pages);
             }
-            let Some(frame) = frame_alloc() else {
-                crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
-                return LazyFaultResult::Oom;
-            };
             let pte_flags = PTEFlags::from(area.map_perm);
             self.page_table.map(vpn, frame.ppn, pte_flags);
             area.data_frames.insert(vpn, frame);
             #[cfg(target_arch = "riscv64")]
+            // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.
             unsafe {
                 core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
             }
             #[cfg(target_arch = "loongarch64")]
+            // SAFETY: invtlb is valid in S-mode; fault_va is the address to flush from TLB.
             unsafe {
                 core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
             }
@@ -1415,6 +1327,7 @@ impl MemorySet {
         #[cfg(target_arch = "riscv64")]
         {
             let satp = self.page_table.token();
+            // SAFETY: satp is a valid page table token; sfence.vma flushes TLB after satp change.
             unsafe {
                 satp::write(Satp::from_bits(satp));
                 asm!("sfence.vma");
@@ -2151,6 +2064,7 @@ pub fn kernel_token() -> usize {
 
 pub fn activate_token(token: usize) {
     #[cfg(target_arch = "riscv64")]
+    // SAFETY: token is a valid satp value; sfence.vma flushes TLB after satp change.
     unsafe {
         satp::write(Satp::from_bits(token));
         asm!("sfence.vma");

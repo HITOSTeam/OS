@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     fs::{
@@ -13,13 +14,6 @@ use crate::{
     trap::get_current_token,
 };
 
-const EINVAL: isize = -22;
-const EMFILE: isize = -24;
-const EBADF: isize = -9;
-const EFAULT: isize = -14;
-const ECANCELED: isize = -125;
-const ENOSYS: isize = -38;
-const ESRCH: isize = -3;
 
 const O_NONBLOCK: u32 = 0x800;
 const O_PATH: u32 = 0x200000;
@@ -50,7 +44,7 @@ fn alloc_fd(file: Arc<dyn File + Send + Sync>, fd_flags: u32) -> isize {
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     let Some(fd) = inner.alloc_fd() else {
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[fd] = Some(file);
     inner.fd_flags[fd] = fd_flags;
@@ -64,21 +58,21 @@ fn alloc_dummy_fd(fd_flags: u32) -> isize {
 
 fn validate_user_cstr(name: usize, max_len: usize) -> Result<(), isize> {
     if name == 0 {
-        return Err(EFAULT);
+        return Err(err(SyscallError::EFAULT));
     }
     let token = get_current_token();
     let mut byte = [0u8; 1];
     for i in 0..=max_len {
-        let ptr = name.checked_add(i).ok_or(EFAULT)? as *const u8;
+        let ptr = name.checked_add(i).ok_or(err(SyscallError::EFAULT))? as *const u8;
         if try_copy_from_user(token, ptr, &mut byte).is_err() {
-            return Err(EFAULT);
+            return Err(err(SyscallError::EFAULT));
         }
         if byte[0] == 0 {
             return Ok(());
         }
     }
-    // Linux memfd_create rejects unterminated or overlong names with EINVAL.
-    Err(EINVAL)
+    // Linux memfd_create rejects unterminated or overlong names with err(SyscallError::EINVAL).
+    Err(err(SyscallError::EINVAL))
 }
 
 fn timespec_to_ns(ts: TimeSpec) -> Option<u64> {
@@ -101,7 +95,7 @@ fn ns_to_timespec(ns: u64) -> TimeSpec {
 
 pub fn syscall_epoll_create(size: isize) -> isize {
     if size <= 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     alloc_dummy_fd(0)
 }
@@ -109,7 +103,7 @@ pub fn syscall_epoll_create(size: isize) -> isize {
 pub fn syscall_epoll_create1(flags: usize) -> isize {
     const EPOLL_CLOEXEC: usize = CLOEXEC_FLAG;
     if (flags & !EPOLL_CLOEXEC) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut fd_flags = 0u32;
     if (flags & EPOLL_CLOEXEC) != 0 {
@@ -123,7 +117,7 @@ pub fn syscall_eventfd2(_count: u64, flags: usize) -> isize {
     const EFD_NONBLOCK: usize = NONBLOCK_FLAG;
     const EFD_CLOEXEC: usize = CLOEXEC_FLAG;
     if (flags & !(EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut fd_flags = 0u32;
     if (flags & EFD_NONBLOCK) != 0 {
@@ -146,7 +140,7 @@ pub fn syscall_signalfd4(_fd: isize, _mask: usize, _sigsetsize: usize, flags: us
     const SFD_NONBLOCK: usize = NONBLOCK_FLAG;
     const SFD_CLOEXEC: usize = CLOEXEC_FLAG;
     if (flags & !(SFD_NONBLOCK | SFD_CLOEXEC)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut fd_flags = 0u32;
     if (flags & SFD_NONBLOCK) != 0 {
@@ -160,13 +154,13 @@ pub fn syscall_signalfd4(_fd: isize, _mask: usize, _sigsetsize: usize, flags: us
         let process = current_files_process();
         let mut inner = process.borrow_mut();
         if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
-            return EBADF;
+            return err(SyscallError::EBADF);
         }
         inner.fd_flags[fd] = fd_flags;
         return fd as isize;
     }
     if _fd != -1 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     alloc_dummy_fd(fd_flags)
 }
@@ -175,10 +169,10 @@ pub fn syscall_timerfd_create(clockid: usize, flags: usize) -> isize {
     const TFD_NONBLOCK: usize = NONBLOCK_FLAG;
     const TFD_CLOEXEC: usize = CLOEXEC_FLAG;
     if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if (flags & !(TFD_NONBLOCK | TFD_CLOEXEC)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut fd_flags = 0u32;
     if (flags & TFD_NONBLOCK) != 0 {
@@ -195,21 +189,21 @@ pub fn syscall_timerfd_gettime(fd: usize, curr_value: usize) -> isize {
     let file = {
         let inner = process.borrow_mut();
         if fd >= inner.fd_table.len() {
-            return EBADF;
+            return err(SyscallError::EBADF);
         }
-        inner.fd_table[fd].clone().ok_or(EBADF)
+        inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
     };
     let Ok(file) = file else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if curr_value == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let Ok((remain_ns, interval_ns)) = timerfd.get_time() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let spec = ITimerSpec {
         it_interval: ns_to_timespec(interval_ns),
@@ -217,7 +211,7 @@ pub fn syscall_timerfd_gettime(fd: usize, curr_value: usize) -> isize {
     };
     let token = get_current_token();
     if try_write_user_value(token, curr_value as *mut ITimerSpec, &spec).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
@@ -229,43 +223,43 @@ pub fn syscall_timerfd_settime(
     old_value: usize,
 ) -> isize {
     if (flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let process = current_files_process();
     let file = {
         let inner = process.borrow_mut();
         if fd >= inner.fd_table.len() {
-            return EBADF;
+            return err(SyscallError::EBADF);
         }
-        inner.fd_table[fd].clone().ok_or(EBADF)
+        inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
     };
     let Ok(file) = file else {
-        return EBADF;
+        return err(SyscallError::EBADF);
     };
     let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if new_value == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if (flags & TFD_TIMER_CANCEL_ON_SET) != 0
         && ((flags & TFD_TIMER_ABSTIME) == 0 || timerfd.clock_id() != CLOCK_REALTIME)
     {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let Some(new_spec) = try_read_user_value(token, new_value as *const ITimerSpec) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     let Some(value_ns) = timespec_to_ns(new_spec.it_value) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let Some(interval_ns) = timespec_to_ns(new_spec.it_interval) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
-    let now_ns = crate::syscall::timer_clock_now_ns(timerfd.clock_id(), 0, None).ok_or(EINVAL);
+    let now_ns = crate::syscall::timer_clock_now_ns(timerfd.clock_id(), 0, None).ok_or(err(SyscallError::EINVAL));
     let Ok(now_ns) = now_ns else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let deadline_ns = if value_ns == 0 {
         None
@@ -279,7 +273,7 @@ pub fn syscall_timerfd_settime(
         interval_ns,
         (flags & TFD_TIMER_CANCEL_ON_SET) != 0,
     ) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     if old_value != 0 {
         let spec = ITimerSpec {
@@ -287,31 +281,31 @@ pub fn syscall_timerfd_settime(
             it_value: ns_to_timespec(prev_remain_ns),
         };
         if try_write_user_value(token, old_value as *mut ITimerSpec, &spec).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
     }
-    if was_canceled { ECANCELED } else { 0 }
+    if was_canceled { err(SyscallError::ECANCELED) } else { 0 }
 }
 
 pub fn syscall_inotify_init1(flags: usize) -> isize {
     const IN_NONBLOCK: usize = NONBLOCK_FLAG;
     const IN_CLOEXEC: usize = CLOEXEC_FLAG;
     if (flags & !(IN_NONBLOCK | IN_CLOEXEC)) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
-    ENOSYS
+    err(SyscallError::ENOSYS)
 }
 
 pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {
     const PIDFD_NONBLOCK: usize = NONBLOCK_FLAG;
     if (flags & !PIDFD_NONBLOCK) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if pid == 0 || (pid as isize) < 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if pid2process(pid).is_none() {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     }
     let mut fd_flags = 0u32;
     // Linux pidfds are always close-on-exec.
@@ -323,17 +317,17 @@ pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {
 }
 
 pub fn syscall_fanotify_init(_flags: usize, _event_f_flags: usize) -> isize {
-    // We do not implement the fanotify subsystem yet. Linux reports ENOSYS
+    // We do not implement the fanotify subsystem yet. Linux reports err(SyscallError::ENOSYS)
     // when the syscall is unavailable, which lets LTP treat fanotify cases as
     // TCONF instead of tripping later on a dummy fd.
-    ENOSYS
+    err(SyscallError::ENOSYS)
 }
 
 pub fn syscall_userfaultfd(flags: usize) -> isize {
     const UFFD_USER_MODE_ONLY: usize = 0x1;
     let known = CLOEXEC_FLAG | NONBLOCK_FLAG | UFFD_USER_MODE_ONLY;
     if (flags & !known) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut fd_flags = 0u32;
     if (flags & NONBLOCK_FLAG) != 0 {
@@ -377,7 +371,7 @@ pub fn syscall_perf_event_open(
 }
 
 pub fn syscall_io_uring_setup(_entries: usize, _params: usize) -> isize {
-    ENOSYS
+    err(SyscallError::ENOSYS)
 }
 
 pub fn syscall_bpf(cmd: usize, attr: usize, size: usize) -> isize {
@@ -402,7 +396,7 @@ pub fn syscall_memfd_create(name: usize, flags: usize) -> isize {
     const MEMFD_NAME_MAX: usize = 249;
     const KNOWN_FLAGS: usize = MFD_CLOEXEC | MFD_ALLOW_SEALING;
     if (flags & !KNOWN_FLAGS) != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if let Err(e) = validate_user_cstr(name, MEMFD_NAME_MAX) {
         return e;

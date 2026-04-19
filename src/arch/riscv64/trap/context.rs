@@ -60,10 +60,14 @@ impl TrapContext {
 #[inline(always)]
 fn read_tp() -> usize {
     let tp: usize;
+    // SAFETY: Reading `tp` is valid in S-mode; the kernel maintains it as the current hart
+    // pointer. If that invariant were broken, trap context setup would use the wrong hart data.
     unsafe { asm!("mv {}, tp", out(reg) tp) };
     tp
 }
 pub fn push_trap_context_at(dst: usize, cx: &TrapContext) {
+    // SAFETY: Trap entry chooses `dst` to point at writable trap-context storage for this task,
+    // and `cx` is a valid initialized source. An invalid destination would corrupt memory.
     unsafe {
         let dst_ptr = dst as *mut TrapContext;
         *dst_ptr = *cx;

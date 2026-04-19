@@ -1,0 +1,101 @@
+use crate::{
+    fs::NamespaceFile,
+    syscall::error::{SyscallError, err},
+    task::processor::{current_files_process, current_process},
+};
+
+/// Linux `unshare(2)` (syscall 97 on riscv64).
+///
+/// Minimal support:
+/// - `CLONE_FILES`: unshare file descriptor table from CLONE_FILES owner.
+/// - `CLONE_FS`: currently a no-op (cwd/umask are already process-local).
+/// - `CLONE_NEWNS`: clone the current mount namespace.
+pub fn syscall_unshare(flags: usize) -> isize {
+    const CLONE_FS: usize = 0x0000_0200;
+    const CLONE_FILES: usize = 0x0000_0400;
+    const CLONE_NEWNS: usize = 0x0002_0000;
+    const CLONE_NEWUTS: usize = 0x0400_0000;
+    let valid = CLONE_FILES | CLONE_FS | CLONE_NEWNS | CLONE_NEWUTS;
+    if (flags & !valid) != 0 {
+        return err(SyscallError::EINVAL);
+    }
+    let process = current_process();
+    if (flags & (CLONE_NEWNS | CLONE_NEWUTS)) != 0 && process.borrow_mut().euid != 0 {
+        return err(SyscallError::EPERM);
+    }
+    if (flags & CLONE_FILES) != 0 {
+        process.unshare_files();
+    }
+    if (flags & CLONE_NEWNS) != 0 {
+        process.unshare_mount_namespace();
+    }
+    if (flags & CLONE_NEWUTS) != 0 {
+        process.unshare_uts_namespace();
+    }
+    0
+}
+
+/// Linux `setns(2)` (syscall 268 on riscv64).
+///
+/// Minimal support:
+/// - IPC namespace fd from `/proc/<pid>/ns/ipc`
+/// - mount namespace fd from `/proc/<pid>/ns/mnt`
+/// - `nstype` of 0, `CLONE_NEWIPC`, or `CLONE_NEWNS`
+pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
+    const EBADF: isize = -9;
+    const CLONE_NEWNS: usize = 0x0002_0000;
+    const CLONE_NEWIPC: usize = 0x0800_0000;
+
+    if fd < 0 {
+        return EBADF;
+    }
+
+    let files_process = current_files_process();
+    let file = {
+        let files_inner = files_process.borrow_mut();
+        let idx = fd as usize;
+        if idx >= files_inner.fd_table.len() {
+            return EBADF;
+        }
+        let Some(file) = files_inner.fd_table[idx].as_ref().cloned() else {
+            return EBADF;
+        };
+        file
+    };
+
+    let Some(ns_file) = file.as_any().downcast_ref::<NamespaceFile>() else {
+        return err(SyscallError::EINVAL);
+    };
+
+    let expected = ns_file.kind().clone_flag();
+    if nstype != 0 && nstype != expected {
+        return err(SyscallError::EINVAL);
+    }
+
+    let process = current_process();
+    let mut inner = process.borrow_mut();
+    if inner.euid != 0 {
+        return err(SyscallError::EPERM);
+    }
+
+    match ns_file.kind() {
+        crate::fs::NamespaceKind::Ipc => {
+            if expected != CLONE_NEWIPC {
+                return err(SyscallError::EINVAL);
+            }
+            inner.ipc_ns_id = ns_file.ns_id();
+            0
+        }
+        crate::fs::NamespaceKind::Mount => {
+            if expected != CLONE_NEWNS {
+                return err(SyscallError::EINVAL);
+            }
+            drop(inner);
+            let Some(namespace) = ns_file.mount_namespace() else {
+                return err(SyscallError::EINVAL);
+            };
+            process.set_mount_namespace(namespace);
+            0
+        }
+    }
+}

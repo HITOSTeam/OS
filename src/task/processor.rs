@@ -289,7 +289,7 @@ fn process_dumped_core(process: &Arc<ProcessControlBlock>, exit_code: i32) -> bo
     }
     let signum = (-exit_code) as usize;
     let inner = process.borrow_mut();
-    inner.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
+    inner.rlimits.rlimit_core_cur != 0 && crate::task::signal::signal_has_core_dump(signum)
 }
 
 fn cleanup_process_threads_for_group_exit(
@@ -527,10 +527,8 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     let mut processor = local_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_ptr();
     drop(processor);
-    // println!(
-    //     "schedule: switch from {:x} to {:x}",
-    //     switched_task_cx_ptr as usize, idle_task_cx_ptr as usize
-    // );
+    // SAFETY: both task contexts are valid kernel stack pointers owned by their respective tasks;
+    // switched_task_cx_ptr is the current task's context, idle_task_cx_ptr is the idle context.
     unsafe {
         switch::switch(
             switched_task_cx_ptr as *const usize,
@@ -552,7 +550,7 @@ pub fn should_preempt_current_on_tick() -> bool {
     };
     let (policy, rt_prio) = {
         let inner = process.borrow_mut();
-        (inner.sched_policy, inner.sched_priority)
+        (inner.scheduling.sched_policy, inner.scheduling.sched_priority)
     };
     match sched_class(policy) {
         Some(SchedClass::Fair) | None => {
@@ -748,6 +746,8 @@ pub fn idle_task() {
             drop(processor);
 
             // Keep interrupts disabled while resuming kernel context; sret will enable them for user.
+            // SAFETY: both task contexts are valid kernel stack pointers owned by their respective tasks;
+            // idle_task_cx_ptr is the idle context, next_task_cx_ptr is the next task's saved context.
             unsafe {
                 switch::switch(
                     idle_task_cx_ptr as *const usize,
@@ -770,7 +770,6 @@ pub fn idle_task() {
                 core::hint::spin_loop();
                 continue;
             }
-            // crate::println!("[idle] No tasks, entering wfi...");
             // No ready tasks - enable interrupts and wait
             // Use wfi to save power while waiting for timer interrupt
             // Timer interrupt will call check_timer() to wake up sleeping tasks
@@ -779,7 +778,6 @@ pub fn idle_task() {
             // because the interrupt handler may have woken up a task
             arch::enable_interrupts();
             arch::wait_for_interrupt();
-            // crate::println!("[idle] Woke up from wfi");
             // Loop back immediately to check for newly ready tasks
         }
     }
@@ -896,7 +894,7 @@ pub fn block_current_and_run_next() {
 pub const IDLE_PID: usize = 0;
 
 // 线程(task)  单位的推出
-pub fn exit_current_and_run_next(exit_code: i32) {
+pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // 标记线程状态,
     let task = take_current_task().unwrap();
     charge_running_task(&task);
@@ -909,7 +907,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         queue_exiting_task_drop(task);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
-        return;
+        unreachable!("schedule should not return after task exit");
     };
 
     // Extract exit bookkeeping first, then perform Linux-thread cleanup without
@@ -1048,23 +1046,19 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         drop(process);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
-        return;
+        unreachable!("schedule should not return after task exit");
     }
     // Drop the current task after switching to idle to avoid leaking the final
     // strong Arc from this never-returning exit path.
     queue_exiting_task_drop(task);
     drop(process);
-    // we do not have to save task context
-    // println!(
-    //     "[DEBUG] exit_current_and_run_next: about to schedule, tid={}",
-    //     tid
-    // );
     let mut _unused = TaskContext::new();
     schedule(&mut _unused as *mut _);
+    unreachable!("schedule should not return after task exit");
 }
 
 /// Terminate the entire process, even when called from a non-main thread.
-pub fn exit_group_and_run_next(exit_code: i32) {
+pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     let task = take_current_task().unwrap();
     charge_running_task(&task);
     task.clear_on_cpu();
@@ -1075,7 +1069,7 @@ pub fn exit_group_and_run_next(exit_code: i32) {
         queue_exiting_task_drop(task);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
-        return;
+        unreachable!("schedule should not return after group exit");
     };
 
     let (tid, _is_linux_thread, _clear_child_tid_addr) =
@@ -1165,4 +1159,5 @@ pub fn exit_group_and_run_next(exit_code: i32) {
     drop(process);
     let mut _unused = TaskContext::new();
     schedule(&mut _unused as *mut _);
+    unreachable!("schedule should not return after group exit");
 }

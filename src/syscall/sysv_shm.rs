@@ -13,6 +13,7 @@ use crate::mm::{
     try_write_user_value,
 };
 use crate::task::processor::current_process;
+use crate::syscall::error::{SyscallError, err};
 
 const IPC_PRIVATE: usize = 0;
 const IPC_CREAT: usize = 0x200;
@@ -48,14 +49,6 @@ static RUNTIME_SHMMAX_LIMIT: AtomicUsize = AtomicUsize::new(SHMMAX);
 static RUNTIME_SHMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SHMMNI);
 static RUNTIME_SHMALL_LIMIT: AtomicUsize = AtomicUsize::new(SHMALL);
 
-const EACCES: isize = -13;
-const EFAULT: isize = -14;
-const EINVAL: isize = -22;
-const ENOMEM: isize = -12;
-const ENOENT: isize = -2;
-const EEXIST: isize = -17;
-const EPERM: isize = -1;
-const ENOSPC: isize = -28;
 
 pub fn shmmax_limit() -> usize {
     SHMMAX
@@ -74,11 +67,11 @@ pub fn write_shm_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
         PROCFS_SHMMAX => (&RUNTIME_SHMMAX_LIMIT, SHMMIN, SHMMAX),
         PROCFS_SHMMNI => (&RUNTIME_SHMMNI_LIMIT, 1, SHMMNI),
         PROCFS_SHMALL => (&RUNTIME_SHMALL_LIMIT, 1, SHMALL),
-        _ => return Err(EINVAL),
+        _ => return Err(err(SyscallError::EINVAL)),
     };
     let value = parse_proc_sys_usize(data)?;
     if value < min || value > max {
-        return Err(EINVAL);
+        return Err(err(SyscallError::EINVAL));
     }
     slot.store(value, Ordering::Relaxed);
     Ok(format!("{}\n", value).into_bytes())
@@ -365,7 +358,7 @@ pub fn exit_cleanup(ipc_ns_id: usize, attaches: &[ShmAttach]) {
 pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
     if (shmflg & SHM_HUGETLB) != 0 {
         // HugeTLB shared memory is not supported yet.
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let shmmax_limit = runtime_shmmax_limit();
     let shmmni_limit = runtime_shmmni_limit();
@@ -377,40 +370,40 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
     if key != IPC_PRIVATE {
         if let Some(id) = mgr.key2id.get(&key).copied() {
             if (shmflg & IPC_CREAT) != 0 && (shmflg & IPC_EXCL) != 0 {
-                return EEXIST;
+                return err(SyscallError::EEXIST);
             }
             let Some(seg) = mgr.segments.get(&id) else {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             };
             if size > seg.size {
-                return EINVAL;
+                return err(SyscallError::EINVAL);
             }
             let (uid, gid, _, groups) = current_ids();
             let req = (shmflg & 0o600) as u16;
             if !check_perm(
                 seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, req, uid, gid, &groups,
             ) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             return id as isize;
         }
         if (shmflg & IPC_CREAT) == 0 {
-            return ENOENT;
+            return err(SyscallError::ENOENT);
         }
     }
     if size < SHMMIN || size > shmmax_limit {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let size_aligned = align_up(size, PAGE_SIZE);
     let pages = size_aligned / PAGE_SIZE;
     if mgr.segments.len() >= shmmni_limit {
-        return ENOSPC;
+        return err(SyscallError::ENOSPC);
     }
     let used_pages = mgr.segments.values().fold(0usize, |acc, seg| {
         acc.saturating_add(align_up(seg.size, PAGE_SIZE) / PAGE_SIZE)
     });
     if pages > shmall_limit.saturating_sub(used_pages) {
-        return ENOSPC;
+        return err(SyscallError::ENOSPC);
     }
 
     let id = mgr.alloc_id();
@@ -418,7 +411,7 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
     let mut frames = Vec::with_capacity(pages);
     for _ in 0..pages {
         let Some(frame) = frame_alloc() else {
-            return ENOMEM;
+            return err(SyscallError::ENOMEM);
         };
         frames.push(frame);
     }
@@ -450,26 +443,26 @@ pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
 
 pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     if shmaddr % PAGE_SIZE != 0 && (shmflg & SHM_RND) == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let ipc_ns_id = current_ipc_namespace_id();
     let mut managers = SHM_MANAGERS.lock();
     let mgr = managers.entry(ipc_ns_id).or_default();
     let Some(seg) = mgr.segments.get_mut(&shmid) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     let (uid, gid, pid, groups) = current_ids();
     if !check_perm(
         seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, 0o400, uid, gid, &groups,
     ) {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
     if (shmflg & SHM_RDONLY) == 0
         && !check_perm(
             seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, 0o200, uid, gid, &groups,
         )
     {
-        return EACCES;
+        return err(SyscallError::EACCES);
     }
 
     let map_len = align_up(seg.size, PAGE_SIZE);
@@ -483,10 +476,10 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     };
     if (shmflg & SHM_REMAP) != 0 && start < SHM_MMAP_MIN_ADDR {
         // Keep low-page protection when SHM_RND rounds down close-to-null hints.
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(end) = start.checked_add(map_len) else {
-        return ENOMEM;
+        return err(SyscallError::ENOMEM);
     };
 
     // If the caller asks for a fixed address, follow SHM_REMAP by replacing
@@ -497,10 +490,10 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
             let vpn = VirtAddr::from(cur).floor();
             if let Some(pte) = inner.memory_set.translate(vpn) {
                 if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
-                    return ENOMEM;
+                    return err(SyscallError::ENOMEM);
                 }
                 if pte.is_valid() && (shmflg & SHM_REMAP) == 0 {
-                    return EINVAL;
+                    return err(SyscallError::EINVAL);
                 }
             }
             cur += PAGE_SIZE;
@@ -536,7 +529,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
 
 pub fn syscall_shmdt(shmaddr: usize) -> isize {
     if shmaddr % PAGE_SIZE != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let process = current_process();
     let mut inner = process.borrow_mut();
@@ -547,7 +540,7 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
         .find(|(_i, a)| a.addr == shmaddr)
         .map(|(i, a)| (i, *a))
     else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
 
     let end = a.addr + a.len;
@@ -612,7 +605,7 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
             ..ShminfoUser::default()
         };
         if try_write_user_value(token, _buf as *mut ShminfoUser, &info).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return highest_index as isize;
     }
@@ -631,36 +624,36 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
             ..ShmInfoUser::default()
         };
         if try_write_user_value(token, _buf as *mut ShmInfoUser, &info).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return highest_index as isize;
     }
 
     if cmd == SHM_STAT || cmd == SHM_STAT_ANY {
         let Some((&seg_id, seg)) = mgr.segments.iter().nth(shmid) else {
-            return EINVAL;
+            return err(SyscallError::EINVAL);
         };
         if cmd == SHM_STAT
             && !check_perm(
                 seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, 0o400, uid, gid, &groups,
             )
         {
-            return EACCES;
+            return err(SyscallError::EACCES);
         }
         let ds = shm_to_user(seg);
         if try_write_user_value(token, _buf as *mut ShmidDsUser, &ds).is_err() {
-            return EFAULT;
+            return err(SyscallError::EFAULT);
         }
         return seg_id as isize;
     }
 
     let Some(seg) = mgr.segments.get_mut(&shmid) else {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     };
     match cmd {
         IPC_RMID => {
             if uid != 0 && uid != seg.uid && uid != seg.cuid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             seg.marked_for_deletion = true;
             if seg.nattch == 0 {
@@ -672,20 +665,20 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
             if !check_perm(
                 seg.uid, seg.gid, seg.cuid, seg.cgid, seg.mode, 0o400, uid, gid, &groups,
             ) {
-                return EACCES;
+                return err(SyscallError::EACCES);
             }
             let ds = shm_to_user(seg);
             if try_write_user_value(token, _buf as *mut ShmidDsUser, &ds).is_err() {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             }
             0
         }
         IPC_SET => {
             if uid != 0 && uid != seg.uid && uid != seg.cuid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             let Some(ds) = try_read_user_value(token, _buf as *const ShmidDsUser) else {
-                return EFAULT;
+                return err(SyscallError::EFAULT);
             };
             seg.uid = ds.shm_perm.uid;
             seg.gid = ds.shm_perm.gid;
@@ -695,18 +688,18 @@ pub fn syscall_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
         }
         SHM_LOCK => {
             if uid != 0 && uid != seg.uid && uid != seg.cuid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             seg.mode |= SHM_LOCKED;
             0
         }
         SHM_UNLOCK => {
             if uid != 0 && uid != seg.uid && uid != seg.cuid {
-                return EPERM;
+                return err(SyscallError::EPERM);
             }
             seg.mode &= !SHM_LOCKED;
             0
         }
-        _ => EINVAL,
+        _ => err(SyscallError::EINVAL),
     }
 }

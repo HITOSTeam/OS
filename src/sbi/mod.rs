@@ -19,6 +19,7 @@ mod riscv {
 
     fn sbi_call(which: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
         let mut ret;
+        // SAFETY: ecall follows RISC-V SBI calling convention; arguments in a0-a2, extension in a7.
         unsafe {
             asm!(
                 "ecall",
@@ -33,6 +34,7 @@ mod riscv {
 
     fn sbi_call_ext(eid: usize, fid: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
         let mut ret;
+        // SAFETY: ecall follows RISC-V SBI calling convention; args in a0-a2, fid in a6, eid in a7.
         unsafe {
             asm!(
                 "ecall",
@@ -70,11 +72,35 @@ mod riscv {
             return;
         }
         let _g = IPI_LOCK.lock();
+        // SAFETY: hart_id is bounds-checked above; IPI_LOCK serializes access to IPI_HART_MASK.
+        // IPI_HART_MASK is in kernel .bss with identity mapping (VA == PA), giving a valid
+        // physical address for the SBI ecall.
+        // IPI_HART_MASK is in .bss so its address is a low, identity-mapped physical address.
         unsafe {
             IPI_HART_MASK = 1usize << hart_id;
             let mask_ptr = &raw const IPI_HART_MASK as usize;
             // hart_mask_base = 0
             sbi_call(SBI_SEND_IPI, mask_ptr, 0, 0);
+            IPI_HART_MASK = 0;
+        }
+    }
+
+    /// Request a full remote TLB flush on the selected harts.
+    ///
+    /// Legacy SBI expects a pointer to a hart mask in memory. We reuse the same
+    /// low, identity-mapped `.bss` storage as `send_ipi()`.
+    pub fn remote_sfence_vma_all(hart_mask: usize) {
+        if hart_mask == 0 {
+            return;
+        }
+        let _g = IPI_LOCK.lock();
+        // SAFETY: IPI_LOCK serializes access to IPI_HART_MASK, which lives in
+        // low identity-mapped `.bss`, so its address is a valid SBI hart-mask
+        // pointer. start=0,size=0 requests a full TLB flush on the target harts.
+        unsafe {
+            IPI_HART_MASK = hart_mask;
+            let mask_ptr = &raw const IPI_HART_MASK as usize;
+            sbi_call(SBI_REMOTE_SFENCE_VMA, mask_ptr, 0, 0);
             IPI_HART_MASK = 0;
         }
     }
@@ -119,6 +145,10 @@ mod stub {
 
     pub fn send_ipi(_hart_id: usize) {
         unsupported("send_ipi");
+    }
+
+    pub fn remote_sfence_vma_all(_hart_mask: usize) {
+        unsupported("remote_sfence_vma_all");
     }
 
     pub fn shutdown() -> ! {

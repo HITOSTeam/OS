@@ -18,12 +18,12 @@ use lazy_static::lazy_static;
 pub mod block_sleep;
 pub mod condvar;
 mod id;
-pub(crate) use id::{pid_max, pid_max_bounds, set_pid_max};
+pub(crate) use id::{pid_max, pid_max_bounds, set_pid_max, PidAllocError};
 pub mod manager;
 pub mod mutex;
 mod process_block;
 pub(crate) use process_block::{
-    MmapRegion, ProcessControlBlock, UtsNamespaceState, alloc_ipc_namespace_id,
+    ForkError, MmapRegion, ProcessControlBlock, UtsNamespaceState, alloc_ipc_namespace_id,
     alloc_pid_namespace_id, pid_namespace_member_pids, process_visible_in_pid_namespace,
     register_pid_namespace, resolve_process_in_pid_namespace,
 };
@@ -37,7 +37,8 @@ pub mod task_block;
 pub mod task_context;
 lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("/user/init_proc.bin", OpenFlags::RDONLY).unwrap();
+        let inode = open_file("/user/init_proc.bin", OpenFlags::RDONLY)
+            .expect("failed to open /user/init_proc.bin — check sdcard image");
         let data = inode.read_all();
         ProcessControlBlock::new(&data)
     };

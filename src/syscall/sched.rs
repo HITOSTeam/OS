@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     config::MAX_HARTS,
@@ -18,10 +19,6 @@ use crate::{
     trap::get_current_token,
 };
 
-const EPERM: isize = -1;
-const ESRCH: isize = -3;
-const EINVAL: isize = -22;
-const EFAULT: isize = -14;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -125,12 +122,12 @@ pub fn syscall_sched_getscheduler(pid: usize) -> isize {
         log::warn!("[sched_getscheduler] pid={}", pid);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(process) = resolve_process(pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
-    let policy = process.borrow_mut().sched_policy;
+    let policy = process.borrow_mut().scheduling.sched_policy;
     if check_policy(policy) {
         policy as isize
     } else {
@@ -144,31 +141,32 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
     }
     if param_ptr == 0 {
         if DEBUG_CYCLICTEST {
-            log::warn!("[sched_getparam] EINVAL pid={} param_ptr=0", pid);
+            log::warn!("[sched_getparam] err(SyscallError::EINVAL) pid={} param_ptr=0", pid);
         }
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(process) = resolve_process(pid) else {
         if DEBUG_CYCLICTEST {
             log::warn!(
-                "[sched_getparam] ESRCH pid={} param_ptr={:#x}",
+                "[sched_getparam] err(SyscallError::ESRCH) pid={} param_ptr={:#x}",
                 pid,
                 param_ptr
             );
         }
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     let prio = {
         let inner = process.borrow_mut();
-        inner.sched_priority
+        inner.scheduling.sched_priority
     };
     let token = get_current_token();
     let sp = SchedParam {
         sched_priority: prio,
     };
+    // SAFETY: sp is a stack-local struct with known layout; length equals size_of::<SchedParam>().
     if try_copy_to_user(token, param_ptr as *mut u8, unsafe {
         core::slice::from_raw_parts(
             &sp as *const SchedParam as *const u8,
@@ -179,12 +177,12 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
     {
         if DEBUG_CYCLICTEST {
             log::warn!(
-                "[sched_getparam] EFAULT pid={} param_ptr={:#x}",
+                "[sched_getparam] err(SyscallError::EFAULT) pid={} param_ptr={:#x}",
                 pid,
                 param_ptr
             );
         }
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if DEBUG_CYCLICTEST {
         log::warn!("[sched_getparam] ok pid={} prio={}", pid, prio);
@@ -194,66 +192,66 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
 
 pub fn syscall_sched_setparam(pid: usize, param_ptr: usize) -> isize {
     if param_ptr == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(process) = resolve_process(pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     let token = get_current_token();
     let Some(param) = try_read_user_value(token, param_ptr as *const SchedParam) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     if !can_control_target(&process) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let prio = param.sched_priority;
-    let policy = process.borrow_mut().sched_policy;
+    let policy = process.borrow_mut().scheduling.sched_policy;
     if !check_policy(policy) || !valid_priority_for_policy(policy, prio) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
-    process.borrow_mut().sched_priority = prio;
+    process.borrow_mut().scheduling.sched_priority = prio;
     refresh_process_runqueues(&process);
     0
 }
 
 pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -> isize {
     if param_ptr == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(process) = resolve_process(pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     let policy = policy as i32;
     if !check_policy(policy) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     let Some(param) = try_read_user_value(token, param_ptr as *const SchedParam) else {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     };
     if !can_control_target(&process) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     if !allowed_unpriv_policy(policy) && current_process().borrow_mut().euid != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let prio = param.sched_priority;
     if !valid_priority_for_policy(policy, prio) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut inner = process.borrow_mut();
-    inner.sched_policy = policy;
-    inner.sched_priority = prio;
+    inner.scheduling.sched_policy = policy;
+    inner.scheduling.sched_priority = prio;
     if policy != SCHED_DEADLINE {
-        inner.sched_runtime = 0;
-        inner.sched_deadline = 0;
-        inner.sched_period = 0;
+        inner.scheduling.sched_runtime = 0;
+        inner.scheduling.sched_deadline = 0;
+        inner.scheduling.sched_period = 0;
     }
     drop(inner);
     refresh_process_runqueues(&process);
@@ -262,20 +260,20 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
 
 pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
     if mask_ptr == 0 || cpusetsize == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     // Avoid large kernel allocations from bogus cpusetsize values.
     const MAX_CPUSET_BYTES: usize = 128;
     let cpusetsize = core::cmp::min(cpusetsize, MAX_CPUSET_BYTES);
     let Some(process) = resolve_process(pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     let affinity_mask = {
         let inner = process.borrow_mut();
-        let mask = inner.cpu_affinity_mask;
+        let mask = inner.scheduling.cpu_affinity_mask;
         if mask == 0 {
             full_affinity_mask()
         } else {
@@ -294,7 +292,7 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     }
     let token = get_current_token();
     if try_copy_to_user(token, mask_ptr as *mut u8, tmp.as_slice()).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     // Linux `sched_getaffinity` syscall returns the number of bytes written.
     // musl uses this return value (not the wrapper) when implementing `sysconf(_SC_NPROCESSORS_*)`.
@@ -303,10 +301,10 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
 
 pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
     if mask_ptr == 0 || cpusetsize == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     // Avoid large allocations from bogus cpusetsize values.
     const MAX_CPUSET_BYTES: usize = 128;
@@ -314,21 +312,21 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     let Some(process) = resolve_process(pid) else {
         if DEBUG_CYCLICTEST {
             log::warn!(
-                "[sched_setaffinity] ESRCH pid={} cpusetsize={} mask_ptr={:#x}",
+                "[sched_setaffinity] err(SyscallError::ESRCH) pid={} cpusetsize={} mask_ptr={:#x}",
                 pid,
                 cpusetsize,
                 mask_ptr
             );
         }
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     if !can_control_target(&process) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let token = get_current_token();
     let mut mask = alloc::vec![0u8; cpusetsize];
     if try_copy_from_user(token, mask_ptr as *const u8, mask.as_mut_slice()).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let max_bits = cpusetsize * 8;
     let mut requested_mask = 0usize;
@@ -341,7 +339,7 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
         }
     }
     if requested_mask == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
 
     let current_hart = hart_id() % MAX_HARTS;
@@ -353,7 +351,7 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
 
     let tasks = {
         let mut inner = process.borrow_mut();
-        inner.cpu_affinity_mask = requested_mask;
+        inner.scheduling.cpu_affinity_mask = requested_mask;
         inner
             .tasks
             .iter()
@@ -373,24 +371,24 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
 }
 
 pub fn syscall_sched_get_priority_max(policy: usize) -> isize {
-    policy_priority_max(policy as i32).map_or(EINVAL, |v| v as isize)
+    policy_priority_max(policy as i32).map_or(err(SyscallError::EINVAL), |v| v as isize)
 }
 
 pub fn syscall_sched_get_priority_min(policy: usize) -> isize {
-    policy_priority_min(policy as i32).map_or(EINVAL, |v| v as isize)
+    policy_priority_min(policy as i32).map_or(err(SyscallError::EINVAL), |v| v as isize)
 }
 
 pub fn syscall_sched_rr_get_interval(pid: usize, interval_ptr: usize) -> isize {
     if interval_ptr == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(process) = resolve_process(pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
-    let policy = process.borrow_mut().sched_policy;
+    let policy = process.borrow_mut().scheduling.sched_policy;
     let interval_ms = match sched_class(policy) {
         Some(SchedClass::Rr) => RR_TIMESLICE_MS,
         _ => 0,
@@ -401,30 +399,30 @@ pub fn syscall_sched_rr_get_interval(pid: usize, interval_ptr: usize) -> isize {
         tv_nsec: (interval_ms % 1000) * 1_000_000,
     };
     if try_write_user_value(token, interval_ptr as *mut TimeSpec, &ts).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: usize) -> isize {
     if attr_ptr == 0 || size < SCHED_ATTR_SIZE_V0 || flags != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(process) = resolve_process(pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     let (policy, prio, nice, runtime, deadline, period) = {
         let inner = process.borrow_mut();
         (
-            inner.sched_policy as u32,
-            inner.sched_priority as u32,
-            inner.nice,
-            inner.sched_runtime,
-            inner.sched_deadline,
-            inner.sched_period,
+            inner.scheduling.sched_policy as u32,
+            inner.scheduling.sched_priority as u32,
+            inner.scheduling.nice,
+            inner.scheduling.sched_runtime,
+            inner.scheduling.sched_deadline,
+            inner.scheduling.sched_period,
         )
     };
     let mut attr = SchedAttr::default();
@@ -437,33 +435,35 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     attr.sched_runtime = runtime;
     attr.sched_deadline = deadline;
     attr.sched_period = period;
+    // SAFETY: attr is a stack-local struct with known layout; copy_len bounded by size_of::<SchedAttr>().
     let bytes =
         unsafe { core::slice::from_raw_parts(&attr as *const SchedAttr as *const u8, copy_len) };
     let token = get_current_token();
     if try_copy_to_user(token, attr_ptr as *mut u8, bytes).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     0
 }
 
 pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused: usize) -> isize {
     if attr_ptr == 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if invalid_pid(pid) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if flags != 0 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let Some(process) = resolve_process(pid) else {
-        return ESRCH;
+        return err(SyscallError::ESRCH);
     };
     if !can_control_target(&process) {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let token = get_current_token();
     let mut attr = SchedAttr::default();
+    // SAFETY: attr is a stack-local struct with known layout; length equals size_of::<SchedAttr>().
     let dst_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             &mut attr as *mut SchedAttr as *mut u8,
@@ -471,21 +471,21 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
         )
     };
     if try_copy_from_user(token, attr_ptr as *const u8, dst_bytes).is_err() {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     if attr.size < SCHED_ATTR_SIZE_V0 as u32 {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let policy = attr.sched_policy as i32;
     if !check_policy(policy) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     if !allowed_unpriv_policy(policy) && current_process().borrow_mut().euid != 0 {
-        return EPERM;
+        return err(SyscallError::EPERM);
     }
     let prio = attr.sched_priority as i32;
     if !valid_priority_for_policy(policy, prio) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let nice = clamp_nice(attr.sched_nice);
     if policy == SCHED_DEADLINE
@@ -495,20 +495,20 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
             || attr.sched_runtime > attr.sched_deadline
             || attr.sched_deadline > attr.sched_period)
     {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let mut inner = process.borrow_mut();
-    inner.sched_policy = policy;
-    inner.sched_priority = prio;
-    inner.nice = nice;
+    inner.scheduling.sched_policy = policy;
+    inner.scheduling.sched_priority = prio;
+    inner.scheduling.nice = nice;
     if policy == SCHED_DEADLINE {
-        inner.sched_runtime = attr.sched_runtime;
-        inner.sched_deadline = attr.sched_deadline;
-        inner.sched_period = attr.sched_period;
+        inner.scheduling.sched_runtime = attr.sched_runtime;
+        inner.scheduling.sched_deadline = attr.sched_deadline;
+        inner.scheduling.sched_period = attr.sched_period;
     } else {
-        inner.sched_runtime = 0;
-        inner.sched_deadline = 0;
-        inner.sched_period = 0;
+        inner.scheduling.sched_runtime = 0;
+        inner.scheduling.sched_deadline = 0;
+        inner.scheduling.sched_period = 0;
     }
     drop(inner);
     refresh_process_runqueues(&process);

@@ -8,6 +8,7 @@
 
 mod address;
 mod dtb;
+mod elf_loader;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
@@ -45,7 +46,7 @@ pub fn activate_kernel_space() {
         memory_set::activate_token(token);
     }
 }
-pub(crate) use memory_set::elf_interp_path_from_reader;
+pub(crate) use elf_loader::elf_interp_path_from_reader;
 pub use memory_set::remap_test;
 pub use memory_set::{ElfAux, KERNEL_SPACE, LazyFaultResult, MapPermission, MemorySet};
 pub use page_table::{PTEFlags, PageTable, PageWalkCache};
@@ -100,6 +101,8 @@ impl Iterator for UserBufferIterator {
             return self.next();
         }
 
+        // SAFETY: buffer_index and offset_in_buffer are bounds-checked above;
+        // the underlying slice is valid for the lifetime of the iterator.
         let ptr = unsafe {
             self.buffers[self.buffer_index]
                 .as_mut_ptr()

@@ -16,32 +16,46 @@ use ext4_fs::{Ext4FileSystem, Inode};
 use lazy_static::*;
 use spin::Mutex;
 
+/// Yield-aware spinlock for serializing ext4 filesystem operations.
+///
+/// Unlike a pure spinlock, this lock cooperatively yields the current task
+/// (via `suspend_current_and_run_next`) when contended and a task context
+/// is available. During early boot (before the task system is initialized),
+/// it falls back to a spin-loop hint. This avoids wasting CPU on busy-wait
+/// while still working correctly outside of a multitasking context.
 struct Ext4Lock {
-    locked: AtomicBool,
+    held: AtomicBool,
 }
 
 impl Ext4Lock {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            held: AtomicBool::new(false),
         }
     }
 
     fn lock(&self) {
         loop {
-            if !self.locked.swap(true, Ordering::Acquire) {
+            // Attempt to acquire: CAS is more efficient than swap on
+            // weakly-ordered architectures (RISC-V, LoongArch) because it
+            // avoids writing when the lock is already held.
+            if self
+                .held
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 return;
             }
+            // Hint the CPU we are in a spin-wait before deciding to yield.
+            spin_loop();
             if crate::task::processor::current_task().is_some() {
                 crate::task::processor::suspend_current_and_run_next();
-            } else {
-                spin_loop();
             }
         }
     }
 
     fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
+        self.held.store(false, Ordering::Release);
     }
 }
 
@@ -370,10 +384,10 @@ impl OSInode {
 
     /// Read all data inside an inode into vector
     pub fn read_all(&self) -> Vec<u8> {
-        if self.writable {
-            let _ = self.flush();
-        }
         let mut inner = self.inner.lock();
+        if self.writable {
+            let _ = Self::flush_inner(&mut inner);
+        }
         let file_size = inner.inode.size() as usize;
 
         let mut buffer = [0u8; 4096]; // Use larger buffer for ext4 (4K blocks)
@@ -415,10 +429,10 @@ impl OSInode {
 
     /// Read from this inode at the given offset without updating the file offset.
     pub fn pread_at(&self, offset: usize, buf: &mut [u8]) -> usize {
-        if self.writable {
-            let _ = self.flush();
-        }
         let mut inner = self.inner.lock();
+        if self.writable {
+            let _ = Self::flush_inner(&mut inner);
+        }
         let inode_num = inner.inode.inode_num();
 
         if inner.read_buf.len() < READBUF_MAX {
@@ -482,11 +496,9 @@ impl OSInode {
 
         if buf.len() >= WRITEBUF_MAX {
             if !inner.write_buf.is_empty() {
-                drop(inner);
-                if self.flush().is_err() {
+                if Self::flush_inner(&mut inner).is_err() {
                     return Err(());
                 }
-                inner = self.inner.lock();
                 inner.read_buf_valid = 0;
             }
             let result = {
@@ -525,11 +537,9 @@ impl OSInode {
         if !inner.write_buf.is_empty()
             && offset != inner.write_buf_off.saturating_add(inner.write_buf.len())
         {
-            drop(inner);
-            if self.flush().is_err() {
+            if Self::flush_inner(&mut inner).is_err() {
                 return Err(());
             }
-            inner = self.inner.lock();
             inner.read_buf_valid = 0;
         }
 
@@ -539,8 +549,7 @@ impl OSInode {
 
         inner.write_buf.extend_from_slice(buf);
         if inner.write_buf.len() >= WRITEBUF_MAX {
-            drop(inner);
-            if self.flush().is_err() {
+            if Self::flush_inner(&mut inner).is_err() {
                 return Err(());
             }
             return Ok(buf.len());
@@ -549,8 +558,8 @@ impl OSInode {
         Ok(buf.len())
     }
 
-    pub fn flush_with_error(&self) -> Result<(), ext4_fs::Ext4Error> {
-        let mut inner = self.inner.lock();
+    /// Flush buffered writes to disk. Caller must already hold `self.inner`.
+    fn flush_inner(inner: &mut OSInodeInner) -> Result<(), ext4_fs::Ext4Error> {
         if inner.write_buf.is_empty() {
             return Ok(());
         }
@@ -566,7 +575,7 @@ impl OSInode {
             let size_after = inner.inode.size() as usize;
             match result {
                 Ok(n) => {
-                    println!(
+                    crate::println!(
                         "[iozone-debug] flush inode={} off={} len={} wrote={} size={}->{}",
                         inode_num,
                         off,
@@ -577,7 +586,7 @@ impl OSInode {
                     );
                 }
                 Err(_) => {
-                    println!(
+                    crate::println!(
                         "[iozone-debug] flush inode={} off={} len={} err size={}->{}",
                         inode_num,
                         off,
@@ -591,7 +600,6 @@ impl OSInode {
         match result {
             Ok(n) if n == data.len() => Ok(()),
             Ok(_) => {
-                // Restore buffer best-effort (so we don't silently drop data).
                 inner.write_buf_off = off;
                 inner.write_buf = data;
                 Err(ext4_fs::Ext4Error::NoSpace)
@@ -604,6 +612,11 @@ impl OSInode {
         }
     }
 
+    pub fn flush_with_error(&self) -> Result<(), ext4_fs::Ext4Error> {
+        let mut inner = self.inner.lock();
+        Self::flush_inner(&mut inner)
+    }
+
     pub fn flush(&self) -> Result<(), ()> {
         self.flush_with_error().map_err(|_| ())
     }
@@ -613,10 +626,10 @@ impl OSInode {
     }
 
     pub fn set_offset(&self, offset: usize) {
-        if self.writable {
-            let _ = self.flush();
-        }
         let mut inner = self.inner.lock();
+        if self.writable {
+            let _ = Self::flush_inner(&mut inner);
+        }
         inner.offset = offset;
         inner.read_buf_valid = 0;
     }
@@ -669,7 +682,10 @@ fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
     };
     for process in processes {
         let Some(inner) = process.try_borrow_mut() else {
-            continue;
+            // Cannot inspect this process (lock held) — conservatively assume
+            // it may reference the inode.  The cleanup will be retried on the
+            // next OSInode::drop for the same inode.
+            return true;
         };
         if inner
             .fd_table
@@ -689,6 +705,24 @@ fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
         }
     }
     false
+}
+
+/// Attempt to clean up any lingering deferred-unlink entries whose inodes
+/// no longer have open file descriptors.  Called opportunistically after a
+/// successful cleanup to prevent orphan accumulation.
+fn sweep_deferred_unlinks() {
+    let keys: Vec<(usize, u32)> = {
+        DEFERRED_UNLINK_CLEANUP.lock().keys().cloned().collect()
+    };
+    for key in keys {
+        // Only proceed if we can definitively confirm no refs remain.
+        if !has_open_inode_fd_refs(key.0, key.1) {
+            if let Some(cleanup) = DEFERRED_UNLINK_CLEANUP.lock().remove(&key) {
+                let _fs_guard = ext4_lock();
+                let _ = cleanup.parent.unlink(&cleanup.name);
+            }
+        }
+    }
 }
 
 lazy_static! {
@@ -910,10 +944,10 @@ impl File for OSInode {
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
-        if self.writable {
-            let _ = self.flush();
-        }
         let mut inner = self.inner.lock();
+        if self.writable {
+            let _ = Self::flush_inner(&mut inner);
+        }
         let mut total_read_size = 0usize;
 
         if inner.read_buf.len() < READBUF_MAX {
@@ -1134,6 +1168,8 @@ impl Drop for OSInode {
                     let _fs_guard = ext4_lock();
                     cleanup.parent.unlink(&cleanup.name)
                 };
+                // Opportunistically clean up other lingering deferred entries.
+                sweep_deferred_unlinks();
             }
         }
     }

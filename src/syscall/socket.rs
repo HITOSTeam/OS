@@ -1,4 +1,5 @@
 use core::mem::size_of;
+use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     fs::make_socketpair,
@@ -8,12 +9,6 @@ use crate::{
 };
 
 // Linux errno (negative return in kernel ABI).
-const EINVAL: isize = -22;
-const EFAULT: isize = -14;
-const EAFNOSUPPORT: isize = -97;
-const EPROTONOSUPPORT: isize = -93;
-const EOPNOTSUPP: isize = -95;
-const EMFILE: isize = -24;
 
 const AF_UNIX: usize = 1;
 const AF_INET: usize = 2;
@@ -31,35 +26,35 @@ const FD_CLOEXEC: u32 = 1;
 /// Minimal support for `AF_UNIX` + `SOCK_STREAM`, sufficient for rt-tests `hackbench`.
 pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: usize) -> isize {
     if sv_ptr == 0 {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     let sock_type = type_ & SOCK_TYPE_MASK;
     if !matches!(sock_type, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) {
-        return EINVAL;
+        return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
     if try_write_user_value(token, sv_ptr as *mut i32, &0i32).is_err()
         || try_write_user_value(token, (sv_ptr + size_of::<i32>()) as *mut i32, &0i32).is_err()
     {
-        return EFAULT;
+        return err(SyscallError::EFAULT);
     }
     match domain {
         AF_UNIX => {
             if protocol != 0 {
-                return EPROTONOSUPPORT;
+                return err(SyscallError::EPROTONOSUPPORT);
             }
             if !matches!(sock_type, SOCK_STREAM | SOCK_DGRAM) {
-                return EPROTONOSUPPORT;
+                return err(SyscallError::EPROTONOSUPPORT);
             }
         }
         AF_INET => {
             return match (sock_type, protocol) {
-                (SOCK_STREAM, 6) | (SOCK_DGRAM, 17) => EOPNOTSUPP,
-                (SOCK_DGRAM, 6) | (SOCK_STREAM, 1) | (SOCK_RAW, 0) => EPROTONOSUPPORT,
-                _ => EPROTONOSUPPORT,
+                (SOCK_STREAM, 6) | (SOCK_DGRAM, 17) => err(SyscallError::EOPNOTSUPP),
+                (SOCK_DGRAM, 6) | (SOCK_STREAM, 1) | (SOCK_RAW, 0) => err(SyscallError::EPROTONOSUPPORT),
+                _ => err(SyscallError::EPROTONOSUPPORT),
             };
         }
-        _ => return EAFNOSUPPORT,
+        _ => return err(SyscallError::EAFNOSUPPORT),
     }
     let cloexec = (type_ & SOCK_CLOEXEC) != 0;
     let nonblock = (type_ & SOCK_NONBLOCK) != 0;
@@ -69,12 +64,12 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     let Some(fd0) = inner.alloc_fd() else {
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[fd0] = Some(end0);
     let Some(fd1) = inner.alloc_fd() else {
         inner.fd_table[fd0] = None;
-        return EMFILE;
+        return err(SyscallError::EMFILE);
     };
     inner.fd_table[fd1] = Some(end1);
     let mut fd_flags = 0u32;
