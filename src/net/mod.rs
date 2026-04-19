@@ -82,6 +82,7 @@ pub fn with_sockets_mut<R>(
     f(&mut stack.iface, &mut stack.dev, &mut stack.sockets)
 }
 
+#[allow(dead_code)]
 pub fn ip_endpoint_from_v4(ip: Ipv4Address, port: u16) -> IpEndpoint {
     IpEndpoint::new(IpAddress::Ipv4(ip), port)
 }

@@ -1,7 +1,7 @@
 use crate::{
-    mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value},
+    mm::{try_read_user_value, try_write_user_value},
     syscall::error::{SyscallError, err},
-    task::processor::{current_process, current_task},
+    task::processor::current_process,
     trap::get_current_token,
 };
 use alloc::vec::Vec;
@@ -385,11 +385,13 @@ pub fn syscall_umask(mask: usize) -> isize {
 }
 
 /// Linux `seteuid(2)` — convenience wrapper used by some LTP tests.
+#[allow(dead_code)]
 pub fn syscall_seteuid(euid: usize) -> isize {
     syscall_setreuid(usize::MAX, euid)
 }
 
 /// Linux `setegid(2)` — convenience wrapper used by some LTP tests.
+#[allow(dead_code)]
 pub fn syscall_setegid(egid: usize) -> isize {
     syscall_setregid(usize::MAX, egid)
 }

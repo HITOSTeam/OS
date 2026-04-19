@@ -14,5 +14,5 @@ pub use crate::arch::loongarch64::trap::{
 };
 #[cfg(target_arch = "riscv64")]
 pub use crate::arch::riscv64::trap::{
-    get_current_token, init_trap, trap_from_kernel, trap_handler, trap_return,
+    get_current_token, init_trap, trap_handler, trap_return,
 };

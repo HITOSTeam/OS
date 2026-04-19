@@ -50,14 +50,17 @@ static RUNTIME_SHMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SHMMNI);
 static RUNTIME_SHMALL_LIMIT: AtomicUsize = AtomicUsize::new(SHMALL);
 
 
+#[allow(dead_code)]
 pub fn shmmax_limit() -> usize {
     SHMMAX
 }
 
+#[allow(dead_code)]
 pub fn shmmni_limit() -> usize {
     SHMMNI
 }
 
+#[allow(dead_code)]
 pub fn shmall_limit() -> usize {
     SHMALL
 }

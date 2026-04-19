@@ -1,12 +1,11 @@
 use super::{
-    Any, Arc, File, Mutex, String, UserBuffer, SyscallError,
-    MOUNT_ATTR_NOATIME, MOUNT_ATTR_NODEV, MOUNT_ATTR_NODIRATIME, MOUNT_ATTR_NOEXEC,
-    MOUNT_ATTR_NOSUID, MOUNT_ATTR_NOSYMFOLLOW, MOUNT_ATTR_RDONLY, MOUNT_ATTR_STRICTATIME,
-    MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW,
-    MS_RDONLY, MS_STRICTATIME,
     current_files_process, err, ext4_lock, find_path_in_roots, get_current_token,
     mount_lookup_for_abs, read_user_cstring, register_rofs_mount, resolve_abs_path,
-    unregister_rofs_mount,
+    unregister_rofs_mount, Any, Arc, File, Mutex, String, SyscallError, UserBuffer,
+    MOUNT_ATTR_NOATIME, MOUNT_ATTR_NODEV, MOUNT_ATTR_NODIRATIME, MOUNT_ATTR_NOEXEC,
+    MOUNT_ATTR_NOSUID, MOUNT_ATTR_NOSYMFOLLOW, MOUNT_ATTR_RDONLY, MOUNT_ATTR_STRICTATIME,
+    MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_RDONLY,
+    MS_STRICTATIME,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -30,6 +29,7 @@ pub(crate) struct FsContextFile {
 }
 
 impl FsContextFile {
+    /// Creates a filesystem-context file for `fsopen(2)` create mode.
     pub(crate) fn new_create(fs_type: &str) -> Self {
         Self {
             state: Mutex::new(FsContextState {
@@ -44,6 +44,7 @@ impl FsContextFile {
         }
     }
 
+    /// Creates a filesystem-context file bound to an existing mount for reconfiguration.
     pub(crate) fn new_reconfigure(
         fs_type: &str,
         source_display: &str,
@@ -95,6 +96,7 @@ pub(crate) struct MountHandleFile {
 }
 
 impl MountHandleFile {
+    /// Creates a detached mount-handle file with the captured source metadata.
     pub(crate) fn new(source: &str, source_display: &str, fs_type: &str, flags: usize) -> Self {
         Self {
             state: Mutex::new(MountHandleState {
@@ -134,7 +136,11 @@ pub(crate) struct KMountAttr {
     pub(crate) userns_fd: u64,
 }
 
-pub(crate) fn alloc_internal_fd(file: Arc<dyn File + Send + Sync>, fd_flags: u32) -> Result<isize, isize> {
+/// Allocates an internal fd slot for mount-api helper files.
+pub(crate) fn alloc_internal_fd(
+    file: Arc<dyn File + Send + Sync>,
+    fd_flags: u32,
+) -> Result<isize, isize> {
     let process = current_files_process();
     let mut inner = process.borrow_mut();
     let Some(fd) = inner.alloc_fd() else {
@@ -145,6 +151,7 @@ pub(crate) fn alloc_internal_fd(file: Arc<dyn File + Send + Sync>, fd_flags: u32
     Ok(fd as isize)
 }
 
+/// Converts modern `mount_setattr(2)` bits into the legacy `MS_*` flag set.
 pub(crate) fn mount_attr_bits_to_legacy_flags(attrs: usize) -> usize {
     let mut flags = 0usize;
     if (attrs & MOUNT_ATTR_RDONLY) != 0 {
@@ -174,6 +181,7 @@ pub(crate) fn mount_attr_bits_to_legacy_flags(attrs: usize) -> usize {
     flags
 }
 
+/// Mirrors the effective read-only mount flag into the path-based rofs registry.
 pub(crate) fn sync_rofs_state(target: &str, flags: usize) {
     if (flags & MS_RDONLY) != 0 {
         register_rofs_mount(target);
@@ -182,6 +190,7 @@ pub(crate) fn sync_rofs_state(target: &str, flags: usize) {
     }
 }
 
+/// Reads a userspace path and resolves it to an absolute path string.
 pub(crate) fn read_user_path_abs(dirfd: isize, ptr: usize) -> Result<String, isize> {
     let token = get_current_token();
     let path = read_user_cstring(token, ptr)?;
@@ -191,6 +200,7 @@ pub(crate) fn read_user_path_abs(dirfd: isize, ptr: usize) -> Result<String, isi
     resolve_abs_path(dirfd, &path)?.ok_or_else(|| err(SyscallError::EBADF))
 }
 
+/// Ensures that a mount target exists and names a directory.
 pub(crate) fn ensure_mount_target_dir(abs: &str) -> Result<(), isize> {
     let _ext4_guard = ext4_lock();
     let Some(inode) = find_path_in_roots(abs) else {
@@ -202,12 +212,14 @@ pub(crate) fn ensure_mount_target_dir(abs: &str) -> Result<(), isize> {
     Ok(())
 }
 
+/// Returns the filesystem type currently associated with an absolute mount path.
 pub(crate) fn mount_fs_type_for_abs(abs: &str) -> String {
     mount_lookup_for_abs(abs)
         .map(|m| m.fs_type)
         .unwrap_or_else(|| String::from("ext4"))
 }
 
+/// Returns the source string that should be shown for an existing mount.
 pub(crate) fn mount_source_display_for_abs(abs: &str) -> String {
     mount_lookup_for_abs(abs)
         .map(|m| m.source_display)

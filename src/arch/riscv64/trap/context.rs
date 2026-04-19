@@ -65,6 +65,7 @@ fn read_tp() -> usize {
     unsafe { asm!("mv {}, tp", out(reg) tp) };
     tp
 }
+#[allow(dead_code)]
 pub fn push_trap_context_at(dst: usize, cx: &TrapContext) {
     // SAFETY: Trap entry chooses `dst` to point at writable trap-context storage for this task,
     // and `cx` is a valid initialized source. An invalid destination would corrupt memory.

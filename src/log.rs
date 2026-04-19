@@ -5,6 +5,7 @@ use log::{self, Level, LevelFilter, Log, Metadata, Record};
 use crate::debug_config::{DEBUG_LOG_TEST, DEFAULT_LOG_LEVEL};
 use crate::println;
 /// a simple logger
+#[allow(dead_code)]
 struct SimpleLogger;
 
 impl Log for SimpleLogger {
@@ -34,6 +35,7 @@ impl Log for SimpleLogger {
 }
 
 /// initiate logger
+#[allow(dead_code)]
 pub fn init() {
     static LOGGER: SimpleLogger = SimpleLogger;
     log::set_logger(&LOGGER).unwrap();
@@ -63,6 +65,7 @@ macro_rules! log_if {
     };
 }
 
+#[allow(dead_code)]
 pub fn test() {
     println!("[test] logging test starts");
     // from highest to lowest

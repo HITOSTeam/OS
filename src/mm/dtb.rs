@@ -4,6 +4,7 @@ use fdt::Fdt;
 
 use crate::config::{DEFAULT_MEMORY_END, DEFAULT_MEMORY_START, set_phys_mem_range};
 
+#[allow(dead_code)]
 pub fn init_phys_mem_from_dtb(dtb_pa: usize) {
     if dtb_pa == 0 {
         crate::println!(

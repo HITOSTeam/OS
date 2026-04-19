@@ -1,39 +1,32 @@
 use super::{
-    ACCT_COMM, ACCT_STATE, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW,
-    Acct, AcctState, Arc, AtPath, ClassifiedAbsPath,
-    FILE_LEASES, FileLockKey,
-    OSInode,
-    ProcessControlBlock, PseudoDir,
-    RECORD_LOCKS, RECORD_LOCK_WAITERS, String,
-    SyscallError, TaskControlBlock, Vec,
-    apply_chown_to_inode,
-    busybox_exists, classify_current_abs_path, clear_record_lock_waiting,
-    current_cwd_path, current_effective_uid_gid,
-    current_fsuid_gid, current_in_group, current_process,
-    current_real_uid_gid, do_fchmodat,
-    empty_path_fd_for_at_op, err, ext4_lock,
-    fd_has_o_path, find_path_in_roots,
-    get_current_token, get_fd_file, get_time_ms,
-    inode_mode_allows, inode_mode_allows_uid_gid,
-    is_privileged_or_owner,
-    logical_path_for_open_fd, maybe_dispatch_proc_fd_at,
-    mount_note_path_access, normalize_path, open_pseudo,
-    pseudo_path_exists_result, read_user_cstring,
-    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_final_symlink_abs_path,
-    resolve_final_symlink_abs_path_locked, rofs_for_path,
-    should_try_busybox_applet_path,
-    wake_record_lock_waiters,
+    apply_chown_to_inode, busybox_exists, classify_current_abs_path, clear_record_lock_waiting,
+    current_cwd_path, current_effective_uid_gid, current_fsuid_gid, current_in_group,
+    current_process, current_real_uid_gid, do_fchmodat, empty_path_fd_for_at_op, err, ext4_lock,
+    fd_has_o_path, find_path_in_roots, get_current_token, get_fd_file, get_time_ms,
+    inode_mode_allows, inode_mode_allows_uid_gid, is_privileged_or_owner, logical_path_for_open_fd,
+    maybe_dispatch_proc_fd_at, mount_note_path_access, normalize_path, open_pseudo,
+    pseudo_path_exists_result, read_user_cstring, resolve_abs_path, resolve_at_inode,
+    resolve_at_path, resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked,
+    rofs_for_path, should_try_busybox_applet_path, wake_record_lock_waiters, Acct, AcctState, Arc,
+    AtPath, ClassifiedAbsPath, FileLockKey, OSInode, ProcessControlBlock, PseudoDir, String,
+    SyscallError, TaskControlBlock, Vec, ACCT_COMM, ACCT_STATE, AT_EMPTY_PATH, AT_FDCWD,
+    AT_SYMLINK_NOFOLLOW, FILE_LEASES, RECORD_LOCKS, RECORD_LOCK_WAITERS,
 };
 
 /// Enables or disables BSD-style process accounting on an ext4 regular file.
+/// Note:
+/// Basically It just operates on the global ACC_STATE varaible
 pub fn syscall_acct(pathname: usize) -> isize {
+    // only sudo user can do this.
     if current_effective_uid_gid().0 != 0 {
         return err(SyscallError::EPERM);
     }
+    // if NULL, we clear the acct state
     if pathname == 0 {
         *ACCT_STATE.lock() = None;
         return 0;
     }
+    // read the pathname from the user space
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
         Ok(v) => v,
@@ -102,6 +95,7 @@ fn acct_exitcode(exit_code: i32) -> u32 {
 }
 
 /// Appends one accounting record for a process that is exiting.
+/// use this to account the process
 pub fn acct_process_exit(process: &Arc<ProcessControlBlock>, exit_code: i32) {
     let inode = {
         let state = ACCT_STATE.lock();
@@ -204,7 +198,6 @@ pub fn release_all_file_leases_for_owner(owner_pid: usize) {
     table.retain(|_, lease| lease.owner_pid != owner_pid);
 }
 
-
 /// Checks pathname accessibility using Linux-like `faccessat(2)` permission rules.
 pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usize) -> isize {
     if mode & !0x7 != 0 {
@@ -243,7 +236,10 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, uid, gid, true) {
         Ok(v) => v,
-        Err(e) if e == err(SyscallError::ENOENT) && matches!(path.as_str(), "busybox" | "./busybox") => {
+        Err(e)
+            if e == err(SyscallError::ENOENT)
+                && matches!(path.as_str(), "busybox" | "./busybox") =>
+        {
             let candidates = [
                 "/musl/busybox",
                 "/glibc/busybox",
@@ -566,8 +562,10 @@ pub fn syscall_fchdir(fd: usize) -> isize {
 
     let fallback_cwd = current_cwd_path();
     let target_path = logical_path_for_open_fd(fd, &file, &fallback_cwd);
-    let final_cwd = if matches!(classify_current_abs_path(&target_path), ClassifiedAbsPath::Pseudo(_))
-    {
+    let final_cwd = if matches!(
+        classify_current_abs_path(&target_path),
+        ClassifiedAbsPath::Pseudo(_)
+    ) {
         target_path
     } else {
         resolve_final_symlink_abs_path(&target_path)

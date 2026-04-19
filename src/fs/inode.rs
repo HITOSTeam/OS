@@ -69,7 +69,7 @@ impl Drop for Ext4Guard {
     }
 }
 
-/// Serialize ext4 operations across harts.
+// Serialize ext4 operations across harts.
 lazy_static! {
     static ref EXT4_LOCK: Arc<Ext4Lock> = Arc::new(Ext4Lock::new());
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -341,6 +341,7 @@ impl OSInode {
         )
     }
 
+    #[allow(dead_code)]
     pub fn new_replace_on_write(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
         Self::new_with_append_rofs_tmp_cleanup(readable, writable, false, inode, false, true, None)
     }
@@ -799,6 +800,7 @@ struct RootSelection {
     primary_root: Arc<Inode>,
     secondary_root: Option<Arc<Inode>>,
     primary_fs: Arc<spin::Mutex<Ext4FileSystem>>,
+    #[allow(dead_code)]
     secondary_fs: Option<Arc<spin::Mutex<Ext4FileSystem>>>,
 }
 
@@ -836,6 +838,7 @@ impl RootSelection {
 }
 
 /// List all files in the filesystem
+#[allow(dead_code)]
 pub fn list_apps() {
     let _fs_guard = ext4_lock();
     println!("/**** APPS ****");

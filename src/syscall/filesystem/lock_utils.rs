@@ -1,8 +1,7 @@
 use super::{
-    Arc, BTreeMap, BTreeSet, File, Mutex, OSInode, PID2PCB, ProcessControlBlock,
-    SIGIO_NUM, SyscallError, TaskControlBlock, Vec, VecDeque,
-    current_task, err, has_unmasked_pending, inode_visible_size,
-    queue_process_signal, wakeup_task,
+    current_task, err, has_unmasked_pending, inode_visible_size, queue_process_signal, wakeup_task,
+    Arc, BTreeMap, BTreeSet, File, Mutex, OSInode, ProcessControlBlock, SyscallError,
+    TaskControlBlock, Vec, VecDeque, PID2PCB, SIGIO_NUM,
 };
 use lazy_static::lazy_static;
 
@@ -66,15 +65,18 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     pub(crate) static ref RECORD_LOCK_BLOCKED: Mutex<BTreeMap<usize, WaitingRecordLock>> =
         Mutex::new(BTreeMap::new());
-    pub(crate) static ref FILE_LEASES: Mutex<BTreeMap<FileLockKey, FileLease>> = Mutex::new(BTreeMap::new());
+    pub(crate) static ref FILE_LEASES: Mutex<BTreeMap<FileLockKey, FileLease>> =
+        Mutex::new(BTreeMap::new());
 }
 
+/// Derives the lock-table key for a file when it is backed by an ext4 inode.
 pub(crate) fn file_lock_key(file: &Arc<dyn File + Send + Sync>) -> Option<FileLockKey> {
     let os_inode = file.as_any().downcast_ref::<OSInode>()?;
     let inode = os_inode.ext4_inode();
     Some(file_lock_key_from_inode(&inode))
 }
 
+/// Builds the canonical device/inode key used by record locks and leases.
 pub(crate) fn file_lock_key_from_inode(inode: &Arc<ext4_fs::Inode>) -> FileLockKey {
     FileLockKey {
         dev: inode.device_id() as u64,
@@ -82,15 +84,23 @@ pub(crate) fn file_lock_key_from_inode(inode: &Arc<ext4_fs::Inode>) -> FileLockK
     }
 }
 
+/// Returns a stable owner id for open-file-description locks on this handle.
 pub(crate) fn ofd_lock_owner_id(file: &Arc<dyn File + Send + Sync>) -> usize {
     Arc::as_ptr(file) as *const () as usize
 }
 
+/// Treats `None` as an unbounded range end for comparisons.
 pub(crate) fn range_end_i128(end: Option<i64>) -> i128 {
     end.map(|v| v as i128).unwrap_or(i128::MAX)
 }
 
-pub(crate) fn ranges_overlap(a_start: i64, a_end: Option<i64>, b_start: i64, b_end: Option<i64>) -> bool {
+/// Returns whether two byte ranges intersect.
+pub(crate) fn ranges_overlap(
+    a_start: i64,
+    a_end: Option<i64>,
+    b_start: i64,
+    b_end: Option<i64>,
+) -> bool {
     let a0 = a_start as i128;
     let b0 = b_start as i128;
     let a1 = range_end_i128(a_end);
@@ -98,6 +108,7 @@ pub(crate) fn ranges_overlap(a_start: i64, a_end: Option<i64>, b_start: i64, b_e
     a0 <= b1 && b0 <= a1
 }
 
+/// Returns the larger of two optional range ends, preserving infinity.
 pub(crate) fn max_range_end(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     match (a, b) {
         (None, _) | (_, None) => None,
@@ -105,6 +116,7 @@ pub(crate) fn max_range_end(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
+/// Returns whether two sorted ranges either overlap or are immediately adjacent.
 pub(crate) fn ranges_touch_or_overlap_sorted(left_end: Option<i64>, right_start: i64) -> bool {
     match left_end {
         None => true,
@@ -112,6 +124,7 @@ pub(crate) fn ranges_touch_or_overlap_sorted(left_end: Option<i64>, right_start:
     }
 }
 
+/// Tests whether a requested record lock conflicts with an existing one.
 pub(crate) fn lock_conflicts(
     req_type: i16,
     req_start: i64,
@@ -136,6 +149,7 @@ pub(crate) fn lock_conflicts(
     }
 }
 
+/// Returns the first conflicting lock in deterministic order, if any.
 pub(crate) fn first_conflicting_lock(
     locks: &[RecordLock],
     req_type: i16,
@@ -156,6 +170,7 @@ pub(crate) fn first_conflicting_lock(
         .copied()
 }
 
+/// Drops unlock records, sorts by owner/range, and merges adjacent compatible locks.
 pub(crate) fn normalize_record_locks(locks: &mut Vec<RecordLock>) {
     const F_UNLCK: i16 = 2;
 
@@ -185,6 +200,7 @@ pub(crate) fn normalize_record_locks(locks: &mut Vec<RecordLock>) {
     *locks = merged;
 }
 
+/// Applies one lock or unlock request to the locks owned by a single owner.
 pub(crate) fn apply_record_lock_for_owner(
     locks: &mut Vec<RecordLock>,
     owner: RecordLockOwner,
@@ -248,6 +264,7 @@ pub(crate) fn apply_record_lock_for_owner(
     changed
 }
 
+/// Collects process owners whose locks block the requested range.
 pub(crate) fn collect_conflict_process_owners(
     locks: &[RecordLock],
     req_type: i16,
@@ -267,14 +284,17 @@ pub(crate) fn collect_conflict_process_owners(
     owners.into_iter().collect()
 }
 
+/// Records that `pid` is currently blocked on a record-lock request.
 pub(crate) fn set_record_lock_waiting(pid: usize, waiting: WaitingRecordLock) {
     RECORD_LOCK_BLOCKED.lock().insert(pid, waiting);
 }
 
+/// Clears the remembered blocked-lock state for `pid`.
 pub(crate) fn clear_record_lock_waiting(pid: usize) {
     RECORD_LOCK_BLOCKED.lock().remove(&pid);
 }
 
+/// Detects whether granting a wait would create a process-level lock dependency cycle.
 pub(crate) fn detect_record_lock_deadlock(waiter_pid: usize, conflict_owners: &[usize]) -> bool {
     let table = RECORD_LOCKS.lock();
     let blocked = RECORD_LOCK_BLOCKED.lock();
@@ -309,6 +329,7 @@ pub(crate) fn detect_record_lock_deadlock(waiter_pid: usize, conflict_owners: &[
     false
 }
 
+/// Converts a userspace `struct flock` into an absolute byte range for this file.
 pub(crate) fn lock_range_from_flock(
     file: &Arc<dyn File + Send + Sync>,
     flock: &FcntlFlock,
@@ -320,32 +341,46 @@ pub(crate) fn lock_range_from_flock(
     let base = match flock.l_whence {
         SEEK_SET => 0i64,
         SEEK_CUR => {
-            let os_inode = file.as_any().downcast_ref::<OSInode>().ok_or_else(|| err(SyscallError::EINVAL))?;
+            let os_inode = file
+                .as_any()
+                .downcast_ref::<OSInode>()
+                .ok_or_else(|| err(SyscallError::EINVAL))?;
             i64::try_from(os_inode.offset()).map_err(|_| err(SyscallError::EOVERFLOW))?
         }
         SEEK_END => {
-            let os_inode = file.as_any().downcast_ref::<OSInode>().ok_or_else(|| err(SyscallError::EINVAL))?;
+            let os_inode = file
+                .as_any()
+                .downcast_ref::<OSInode>()
+                .ok_or_else(|| err(SyscallError::EINVAL))?;
             let inode = os_inode.ext4_inode();
             i64::try_from(inode_visible_size(&inode)).map_err(|_| err(SyscallError::EOVERFLOW))?
         }
         _ => return Err(err(SyscallError::EINVAL)),
     };
 
-    let mut start = base.checked_add(flock.l_start).ok_or_else(|| err(SyscallError::EOVERFLOW))?;
+    let mut start = base
+        .checked_add(flock.l_start)
+        .ok_or_else(|| err(SyscallError::EOVERFLOW))?;
     if start < 0 {
         return Err(err(SyscallError::EINVAL));
     }
 
     if flock.l_len > 0 {
-        let end = start.checked_add(flock.l_len - 1).ok_or_else(|| err(SyscallError::EOVERFLOW))?;
+        let end = start
+            .checked_add(flock.l_len - 1)
+            .ok_or_else(|| err(SyscallError::EOVERFLOW))?;
         return Ok((start, Some(end)));
     }
     if flock.l_len == 0 {
         return Ok((start, None));
     }
 
-    let neg_start = start.checked_add(flock.l_len).ok_or_else(|| err(SyscallError::EOVERFLOW))?;
-    let end = start.checked_sub(1).ok_or_else(|| err(SyscallError::EOVERFLOW))?;
+    let neg_start = start
+        .checked_add(flock.l_len)
+        .ok_or_else(|| err(SyscallError::EOVERFLOW))?;
+    let end = start
+        .checked_sub(1)
+        .ok_or_else(|| err(SyscallError::EOVERFLOW))?;
     if neg_start < 0 {
         return Err(err(SyscallError::EINVAL));
     }
@@ -353,6 +388,7 @@ pub(crate) fn lock_range_from_flock(
     Ok((start, Some(end)))
 }
 
+/// Enqueues a task on the wait list for a lock key unless it is already present.
 pub(crate) fn enqueue_record_lock_waiter(key: FileLockKey, task: &Arc<TaskControlBlock>) {
     let mut waiters = RECORD_LOCK_WAITERS.lock();
     let queue = waiters.entry(key).or_insert_with(VecDeque::new);
@@ -362,6 +398,7 @@ pub(crate) fn enqueue_record_lock_waiter(key: FileLockKey, task: &Arc<TaskContro
     queue.push_back(Arc::clone(task));
 }
 
+/// Removes one task from a lock wait queue and drops the queue if it becomes empty.
 pub(crate) fn remove_record_lock_waiter(key: FileLockKey, task: &Arc<TaskControlBlock>) {
     let mut waiters = RECORD_LOCK_WAITERS.lock();
     let Some(queue) = waiters.get_mut(&key) else {
@@ -373,7 +410,7 @@ pub(crate) fn remove_record_lock_waiter(key: FileLockKey, task: &Arc<TaskControl
     }
 }
 
-
+/// Drains and returns all waiters currently parked on a lock key.
 pub(crate) fn take_record_lock_waiters(key: FileLockKey) -> Vec<Arc<TaskControlBlock>> {
     RECORD_LOCK_WAITERS
         .lock()
@@ -382,12 +419,14 @@ pub(crate) fn take_record_lock_waiters(key: FileLockKey) -> Vec<Arc<TaskControlB
         .unwrap_or_default()
 }
 
+/// Wakes every task currently blocked on a record-lock key.
 pub(crate) fn wake_record_lock_waiters(key: FileLockKey) {
     for waiter in take_record_lock_waiters(key) {
         wakeup_task(waiter);
     }
 }
 
+/// Removes all process-owned locks for `key` and wakes waiters if anything changed.
 pub(crate) fn remove_process_record_locks_for_key(owner_pid: usize, key: FileLockKey) {
     let changed = {
         let mut table = RECORD_LOCKS.lock();
@@ -409,7 +448,7 @@ pub(crate) fn remove_process_record_locks_for_key(owner_pid: usize, key: FileLoc
     }
 }
 
-
+/// Drops the file lease for `key` when it belongs to `owner_pid`.
 pub(crate) fn remove_owner_file_lease_for_key(owner_pid: usize, key: FileLockKey) {
     let mut table = FILE_LEASES.lock();
     if table
@@ -420,7 +459,7 @@ pub(crate) fn remove_owner_file_lease_for_key(owner_pid: usize, key: FileLockKey
     }
 }
 
-
+/// Counts open descriptors across all processes that still reference this inode key.
 pub(crate) fn count_open_fds_for_key(key: FileLockKey) -> usize {
     let processes: Vec<alloc::sync::Arc<ProcessControlBlock>> = {
         let map = PID2PCB.lock();
@@ -439,6 +478,7 @@ pub(crate) fn count_open_fds_for_key(key: FileLockKey) -> usize {
     count
 }
 
+/// Installs, updates, or removes a file lease after Linux-style ownership checks.
 pub(crate) fn set_file_lease(
     key: FileLockKey,
     owner_pid: usize,
@@ -498,6 +538,7 @@ pub(crate) fn set_file_lease(
     }
 }
 
+/// Returns the lease type held by `owner_pid` for `key`, or `F_UNLCK` when absent.
 pub(crate) fn get_file_lease_type(key: FileLockKey, owner_pid: usize) -> i16 {
     FILE_LEASES
         .lock()
@@ -507,6 +548,7 @@ pub(crate) fn get_file_lease_type(key: FileLockKey, owner_pid: usize) -> i16 {
         .unwrap_or(2)
 }
 
+/// Sends a lease-break notification when an operation would conflict with an existing lease.
 pub(crate) fn maybe_signal_lease_break(
     key: FileLockKey,
     open_write: bool,
@@ -543,6 +585,7 @@ pub(crate) fn maybe_signal_lease_break(
     }
 }
 
+/// Returns whether the current task has an unmasked pending signal that should abort waits.
 pub(crate) fn has_pending_unmasked_signal() -> bool {
     let Some(task) = current_task() else {
         return false;

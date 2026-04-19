@@ -1,17 +1,15 @@
 use super::{
-    CgroupFile, EventFdFile, FifoDuplexFile, IOV_MAX, MapPermission,
-    OSInode, PIPE_BUF, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile,
-    PseudoShmFile, SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK,
-    SocketPairEnd, SyscallError, TimerFdFile, UserBuffer, Vec,
-    cgroup_charge_file_write, current_process, err, ext4_err_to_errno, ext4_lock,
-    fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe,
-    file_is_seekable_for_preadwrite, get_current_token, get_fd_file, require_fd_file,
-    maybe_update_inode_atime, mirror_inode_write_to_current_mmaps,
-    pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal,
-    read_optional_offset, read_vm_iovec, socketpair_write_from_kernel,
-    touch_inode_mtime_ctime_now, try_copy_from_user, try_copy_to_user,
-    try_read_user_value, try_translated_byte_buffer, try_write_proc_pseudo_file,
-    try_write_user_value, validate_direct_io_request, write_optional_offset,
+    cgroup_charge_file_write, current_process, err, ext4_err_to_errno, ext4_lock, fd_has_append,
+    fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe, file_is_seekable_for_preadwrite,
+    get_current_token, maybe_update_inode_atime, mirror_inode_write_to_current_mmaps,
+    pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal, read_optional_offset,
+    read_vm_iovec, require_fd_file, socketpair_write_from_kernel, touch_inode_mtime_ctime_now,
+    try_copy_from_user, try_copy_to_user, try_read_user_value, try_translated_byte_buffer,
+    try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
+    write_optional_offset, CgroupFile, EventFdFile, FifoDuplexFile, MapPermission, OSInode, Pipe,
+    ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, SocketPairEnd, SyscallError,
+    TimerFdFile, UserBuffer, Vec, IOV_MAX, PIPE_BUF, SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE,
+    SPLICE_F_MOVE, SPLICE_F_NONBLOCK,
 };
 use alloc::vec;
 
@@ -352,7 +350,11 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
                 break;
             }
             if try_copy_to_user(token, user_ptr as *mut u8, &kbuf[..n]).is_err() {
-                return if total > 0 { total as isize } else { err(SyscallError::EFAULT) };
+                return if total > 0 {
+                    total as isize
+                } else {
+                    err(SyscallError::EFAULT)
+                };
             }
             total += n;
             off += n;
@@ -501,7 +503,11 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         while total < write_len {
             let want = core::cmp::min(write_len - total, buf_cap);
             if try_copy_from_user(token, user_ptr as *const u8, &mut kbuf[..want]).is_err() {
-                return if total > 0 { total as isize } else { err(SyscallError::EFAULT) };
+                return if total > 0 {
+                    total as isize
+                } else {
+                    err(SyscallError::EFAULT)
+                };
             }
             match os_inode.pwrite_at(off, &kbuf[..want]) {
                 Ok(n) => {
@@ -514,7 +520,11 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
                 }
                 Err(_) => {
                     crate::println!("[ext4] Warning: pwrite failed");
-                    return if total > 0 { total as isize } else { err(SyscallError::EIO) };
+                    return if total > 0 {
+                        total as isize
+                    } else {
+                        err(SyscallError::EIO)
+                    };
                 }
             }
         }
@@ -657,7 +667,7 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
     let mut total = 0usize;
     let mut remaining = count;
     let mut out_pos = 0usize;
-    let mut out_inode_opt = out_file.as_any().downcast_ref::<OSInode>();
+    let out_inode_opt = out_file.as_any().downcast_ref::<OSInode>();
     if let Some(out_inode) = out_inode_opt {
         if out_inode.readonly_fs() {
             return err(SyscallError::EROFS);
@@ -674,7 +684,13 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
         let wrote = if let Some(out_inode) = out_inode_opt {
             match out_inode.pwrite_at(out_pos, &buf[..read]) {
                 Ok(n) => n,
-                Err(_) => return if total > 0 { total as isize } else { err(SyscallError::EIO) },
+                Err(_) => {
+                    return if total > 0 {
+                        total as isize
+                    } else {
+                        err(SyscallError::EIO)
+                    }
+                }
             }
         } else if out_is_socketpair {
             match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
@@ -682,7 +698,11 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
                 Err(e) => return if total > 0 { total as isize } else { e },
             }
         } else {
-            return if total > 0 { total as isize } else { err(SyscallError::EINVAL) };
+            return if total > 0 {
+                total as isize
+            } else {
+                err(SyscallError::EINVAL)
+            };
         };
         if wrote == 0 {
             break;
@@ -810,11 +830,19 @@ pub fn syscall_splice(
             if nonblock {
                 if let Some(pipe) = out_file.as_any().downcast_ref::<Pipe>() {
                     if !pipe.poll_writable() {
-                        return if moved > 0 { moved as isize } else { err(SyscallError::EAGAIN) };
+                        return if moved > 0 {
+                            moved as isize
+                        } else {
+                            err(SyscallError::EAGAIN)
+                        };
                     }
                 } else if let Some(sock) = out_file.as_any().downcast_ref::<SocketPairEnd>() {
                     if !sock.poll_writable() {
-                        return if moved > 0 { moved as isize } else { err(SyscallError::EAGAIN) };
+                        return if moved > 0 {
+                            moved as isize
+                        } else {
+                            err(SyscallError::EAGAIN)
+                        };
                     }
                 }
             }
@@ -832,7 +860,11 @@ pub fn syscall_splice(
                 inode.is_file()
             };
             if !is_file {
-                return if moved > 0 { moved as isize } else { err(SyscallError::EINVAL) };
+                return if moved > 0 {
+                    moved as isize
+                } else {
+                    err(SyscallError::EINVAL)
+                };
             }
             let n = in_inode.pread_at(in_pos, &mut buf[..want]);
             if n == 0 {
@@ -856,14 +888,28 @@ pub fn syscall_splice(
                 inode.is_file()
             };
             if !is_file {
-                return if moved > 0 { moved as isize } else { err(SyscallError::EINVAL) };
+                return if moved > 0 {
+                    moved as isize
+                } else {
+                    err(SyscallError::EINVAL)
+                };
             }
             if out_inode.readonly_fs() {
-                return if moved > 0 { moved as isize } else { err(SyscallError::EROFS) };
+                return if moved > 0 {
+                    moved as isize
+                } else {
+                    err(SyscallError::EROFS)
+                };
             }
             match out_inode.pwrite_at(out_pos, &buf[..read]) {
                 Ok(n) => n,
-                Err(_) => return if moved > 0 { moved as isize } else { err(SyscallError::EIO) },
+                Err(_) => {
+                    return if moved > 0 {
+                        moved as isize
+                    } else {
+                        err(SyscallError::EIO)
+                    }
+                }
             }
         } else if out_file.as_any().downcast_ref::<SocketPairEnd>().is_some() {
             match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
@@ -871,7 +917,11 @@ pub fn syscall_splice(
                 Err(e) => return if moved > 0 { moved as isize } else { e },
             }
         } else {
-            return if moved > 0 { moved as isize } else { err(SyscallError::EINVAL) };
+            return if moved > 0 {
+                moved as isize
+            } else {
+                err(SyscallError::EINVAL)
+            };
         };
         if wrote == 0 {
             break;
@@ -1011,7 +1061,11 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
                 let want = core::cmp::min(iv.iov_len - seg_off, scratch.len());
                 let src_ptr = (iv.iov_base + seg_off) as *const u8;
                 if try_copy_from_user(token, src_ptr, &mut scratch[..want]).is_err() {
-                    return if total > 0 { total as isize } else { err(SyscallError::EFAULT) };
+                    return if total > 0 {
+                        total as isize
+                    } else {
+                        err(SyscallError::EFAULT)
+                    };
                 }
                 // Linux may return a short vmsplice() once some bytes are moved.
                 // Avoid blocking indefinitely trying to drain very large iovecs.
@@ -1021,7 +1075,11 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
                     Err(e) => return if total > 0 { total as isize } else { e },
                 };
                 if wrote == 0 {
-                    return if total > 0 { total as isize } else { err(SyscallError::EPIPE) };
+                    return if total > 0 {
+                        total as isize
+                    } else {
+                        err(SyscallError::EPIPE)
+                    };
                 }
                 total += wrote;
                 seg_off += wrote;
@@ -1042,7 +1100,11 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
                 }
                 let dst_ptr = (iv.iov_base + seg_off) as *mut u8;
                 if try_copy_to_user(token, dst_ptr, &scratch[..read]).is_err() {
-                    return if total > 0 { total as isize } else { err(SyscallError::EFAULT) };
+                    return if total > 0 {
+                        total as isize
+                    } else {
+                        err(SyscallError::EFAULT)
+                    };
                 }
                 total += read;
                 seg_off += read;
@@ -1051,7 +1113,11 @@ pub fn syscall_vmsplice(fd: usize, iov_ptr: usize, nr_segs: usize, flags: usize)
                 }
             }
         } else {
-            return if total > 0 { total as isize } else { err(SyscallError::EBADF) };
+            return if total > 0 {
+                total as isize
+            } else {
+                err(SyscallError::EBADF)
+            };
         }
     }
     total as isize

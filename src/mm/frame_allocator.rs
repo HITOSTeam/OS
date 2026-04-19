@@ -3,7 +3,7 @@
 
 use super::{PhysAddr, PhysPageNum};
 use crate::{
-    config::{phys_mem_end, phys_mem_start},
+    config::phys_mem_end,
     println,
 };
 use alloc::collections::BTreeMap;
@@ -87,6 +87,7 @@ pub struct StackFrameAllocator {
     recycled: Vec<usize>,
 }
 
+#[allow(dead_code)]
 impl StackFrameAllocator {
     pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
         self.current = l.0;
@@ -151,7 +152,9 @@ lazy_static! {
 }
 
 /// initiate the frame allocator using `ekernel` and detected physical memory end
+#[allow(dead_code)]
 pub fn init_frame_allocator() {
+    #[allow(dead_code)]
     unsafe extern "C" {
         safe fn ekernel();
         safe fn stext();
@@ -161,6 +164,7 @@ pub fn init_frame_allocator() {
     allocator.init(kernel_end, PhysAddr::from(phys_mem_end()).floor());
     #[cfg(target_arch = "loongarch64")]
     {
+        use crate::config::phys_mem_start;
         let low_start = PhysAddr::from(phys_mem_start()).ceil();
         let kernel_start = PhysAddr::from(stext as usize).floor();
         allocator.add_range(low_start, kernel_start);

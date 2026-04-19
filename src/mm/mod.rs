@@ -24,18 +24,21 @@ pub use address::StepByOne;
 use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
+#[allow(unused_imports)]
 pub use dtb::init_phys_mem_from_dtb;
 pub use frame_allocator::{
-    FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages, frame_dealloc,
+    FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages,
     frame_refcount_entries,
 };
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.
+#[allow(dead_code)]
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn cached_kernel_token() -> usize {
     KERNEL_SATP.load(Ordering::Acquire)
 }
+#[allow(dead_code)]
 pub fn activate_kernel_space() {
     let cached = KERNEL_SATP.load(Ordering::Acquire);
     if cached != 0 {
@@ -47,12 +50,13 @@ pub fn activate_kernel_space() {
     }
 }
 pub(crate) use elf_loader::elf_interp_path_from_reader;
+#[allow(unused_imports)]
 pub use memory_set::remap_test;
 pub use memory_set::{ElfAux, KERNEL_SPACE, LazyFaultResult, MapPermission, MemorySet};
 pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub use page_table::{
-    PageTableEntry, copy_from_user, copy_to_user, read_user_value, translated_byte_buffer,
-    translated_mutref, translated_single_address, translated_str, try_translated_byte_buffer,
+    PageTableEntry, read_user_value, translated_byte_buffer,
+    translated_mutref, translated_single_address, try_translated_byte_buffer,
     write_user_value,
 };
 pub use page_table::{
@@ -115,6 +119,7 @@ impl Iterator for UserBufferIterator {
 }
 
 /// initiate heap allocator, frame allocator and kernel space
+#[allow(dead_code)]
 pub fn init() {
     heap_allocator::init_heap();
     println!("[kernel] heap initialized.");

@@ -3,7 +3,7 @@ use crate::{
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{POLLIN, POLLOUT, POLLPRI},
     mm::{
-        read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
+        try_copy_from_user, try_copy_to_user, try_read_user_value,
         try_write_user_value, write_user_value,
     },
     syscall::misc::decode_linux_tid,
@@ -14,7 +14,6 @@ use crate::{
     },
     task::signal::{SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
     task::{
-        ProcessControlBlock,
         manager::pid2process,
         processor::{current_files_process, current_process, current_task},
         runtime::{
@@ -24,7 +23,6 @@ use crate::{
     time::{get_time, get_time_ns},
     trap::get_current_token,
 };
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use spin::Mutex;
 use crate::syscall::error::{SyscallError, err};
@@ -323,6 +321,7 @@ struct ITimerSpec {
     it_value: TimeSpec,
 }
 
+#[allow(dead_code)]
 fn current_euid() -> u32 {
     let process = current_process();
     let inner = process.borrow_mut();

@@ -7,7 +7,7 @@ pub use unmap::*;
 pub use mlock::*;
 
 pub(super) use crate::{
-    config::{PAGE_SIZE, TRAP_CONTEXT, USER_HEAP_GAP},
+    config::{PAGE_SIZE, USER_HEAP_GAP},
     fs::{
         File, OSInode, PseudoShmFile, ext4_lock, vm_commit_limit_bytes, vm_committed_as_bytes,
         vm_overcommit_memory,
@@ -51,7 +51,7 @@ pub(super) const MREMAP_MAYMOVE: usize = 0x1;
 pub(super) const MREMAP_FIXED: usize = 0x2;
 
 #[cfg(target_arch = "loongarch64")]
-pub(super) const USER_VA_TOP: usize = TRAP_CONTEXT;
+pub(super) const USER_VA_TOP: usize = crate::config::TRAP_CONTEXT;
 // Sv39 user-space low canonical range is [0, 2^38).
 // Reject higher addresses so mmap() can't wrap/alias via VirtAddr masking.
 #[cfg(not(target_arch = "loongarch64"))]

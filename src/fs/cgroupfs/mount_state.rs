@@ -368,13 +368,13 @@ impl CgroupMountState {
         }
         let current_usage = self.subtree_memory_usage(path);
         let max_reclaim = current_usage.saturating_sub(protected_budget);
-        let mut need = target.min(max_reclaim);
+        let need = target.min(max_reclaim);
         if need == 0 {
             return 0;
         }
 
         let mut reclaimed = 0usize;
-        let mut children = self
+        let children = self
             .child_paths(path)
             .into_iter()
             .map(|child| {

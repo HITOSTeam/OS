@@ -1,10 +1,9 @@
 use super::{
-    Arc, BTreeMap, DIRECT_IO_ALIGN, FD_CLOEXEC, File, Mutex,
-    OSInode, O_APPEND, O_ASYNC, O_CLOEXEC, O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH,
-    Pipe, ProcPseudoFile, PseudoFile, PseudoShmFile, SocketPairEnd,
-    SyscallError, TaskControlBlock, UserBuffer,
-    current_files_process, err, ext4_lock, get_current_token, make_pipe,
-    try_read_user_value, try_write_user_value,
+    current_files_process, err, ext4_lock, get_current_token, make_pipe, try_read_user_value,
+    try_write_user_value, Arc, BTreeMap, File, Mutex, OSInode, Pipe, ProcPseudoFile, PseudoFile,
+    PseudoShmFile, SocketPairEnd, SyscallError, TaskControlBlock, UserBuffer, DIRECT_IO_ALIGN,
+    FD_CLOEXEC, O_APPEND, O_ASYNC, O_CLOEXEC, O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH, O_RDONLY,
+    O_RDWR, O_WRONLY,
 };
 use lazy_static::lazy_static;
 
@@ -14,6 +13,7 @@ pub(crate) struct FifoDuplexFile {
 }
 
 impl FifoDuplexFile {
+    /// Builds a duplex FIFO handle that exposes both read and write directions.
     pub(crate) fn new(read_end: Arc<Pipe>, write_end: Arc<Pipe>) -> Self {
         Self {
             read_end,
@@ -21,18 +21,23 @@ impl FifoDuplexFile {
         }
     }
 
+    /// Returns whether the FIFO write side has lost all user-visible readers.
     pub(crate) fn write_end_closed(&self) -> bool {
         self.write_end.all_read_ends_closed()
     }
 
+    /// Checks readiness for reading from the duplex FIFO.
     pub(crate) fn poll_readable(&self) -> bool {
         self.read_end.poll_readable()
     }
 
+    /// Checks readiness for writing into the duplex FIFO.
+    #[allow(dead_code)]
     pub(crate) fn poll_writable(&self) -> bool {
         self.write_end.poll_writable()
     }
 
+    /// Returns how many bytes can currently be written without blocking.
     pub(crate) fn available_write(&self) -> usize {
         self.write_end.available_write()
     }
@@ -83,6 +88,7 @@ pub(crate) struct FifoPipeState {
 }
 
 impl FifoPipeState {
+    /// Creates or resets the backing pipe pair used to model one FIFO inode.
     pub(crate) fn new() -> Self {
         let (read_end, write_end) = make_pipe();
         // Keep one registry reference to each end, but exclude it from
@@ -94,14 +100,17 @@ impl FifoPipeState {
         }
     }
 
+    /// Returns whether any opened descriptor still references the read side.
     pub(crate) fn has_open_readers(&self) -> bool {
         self.read_end.open_read_end_count() > 0
     }
 
+    /// Returns whether any opened descriptor still references the write side.
     pub(crate) fn has_open_writers(&self) -> bool {
         self.write_end.open_write_end_count() > 0
     }
 
+    /// Materializes the file view requested by the FIFO access mode.
     pub(crate) fn open_file(&self, accmode: usize) -> Option<Arc<dyn File + Send + Sync>> {
         match accmode {
             O_RDONLY => Some(self.read_end.clone()),
@@ -115,12 +124,12 @@ impl FifoPipeState {
     }
 }
 
-
 lazy_static! {
     pub(crate) static ref FIFO_PIPE_STATES: Mutex<BTreeMap<u64, Arc<FifoPipeState>>> =
         Mutex::new(BTreeMap::new());
 }
 
+/// Returns the file currently installed at `fd`, if any.
 pub(crate) fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
     let process = current_files_process();
     let inner = process.borrow_mut();
@@ -154,6 +163,7 @@ macro_rules! require_fd_file {
 }
 pub(crate) use require_fd_file;
 
+/// Writes bytes into a writable `/proc` pseudo file and optionally advances its offset.
 pub(crate) fn try_write_proc_pseudo_file(
     file: &Arc<dyn File + Send + Sync>,
     data: &[u8],
@@ -174,6 +184,7 @@ pub(crate) fn try_write_proc_pseudo_file(
     Some(written as isize)
 }
 
+/// Returns whether `fd` names a writable proc pseudo file.
 pub(crate) fn fd_is_writable_proc_pseudo(fd: usize) -> bool {
     let Some(file) = get_fd_file(fd) else {
         return false;
@@ -184,6 +195,7 @@ pub(crate) fn fd_is_writable_proc_pseudo(fd: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Writes data to a proc pseudo fd using either an explicit or the tracked file offset.
 pub(crate) fn write_proc_pseudo_fd(fd: usize, data: &[u8], offset: Option<usize>) -> Option<isize> {
     let file = get_fd_file(fd)?;
     let effective_offset = if let Some(offset) = offset {
@@ -194,7 +206,10 @@ pub(crate) fn write_proc_pseudo_fd(fd: usize, data: &[u8], offset: Option<usize>
     try_write_proc_pseudo_file(&file, data, effective_offset, offset.is_none())
 }
 
-pub(crate) fn file_is_seekable_for_preadwrite(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> bool {
+/// Reports whether a file supports positional I/O for `pread`/`pwrite` style calls.
+pub(crate) fn file_is_seekable_for_preadwrite(
+    file: &alloc::sync::Arc<dyn File + Send + Sync>,
+) -> bool {
     if file.as_any().downcast_ref::<OSInode>().is_some() {
         return true;
     }
@@ -210,6 +225,7 @@ pub(crate) fn file_is_seekable_for_preadwrite(file: &alloc::sync::Arc<dyn File +
     false
 }
 
+/// Returns whether the descriptor was opened with `O_PATH`.
 pub(crate) fn fd_has_o_path(fd: usize) -> bool {
     let process = current_files_process();
     let inner = process.borrow_mut();
@@ -219,6 +235,7 @@ pub(crate) fn fd_has_o_path(fd: usize) -> bool {
     (inner.fd_flags[fd] & O_PATH as u32) != 0
 }
 
+/// Returns whether the descriptor was opened with `O_NONBLOCK`.
 pub(crate) fn fd_has_nonblock(fd: usize) -> bool {
     let process = current_files_process();
     let inner = process.borrow_mut();
@@ -228,6 +245,7 @@ pub(crate) fn fd_has_nonblock(fd: usize) -> bool {
     (inner.fd_flags[fd] & O_NONBLOCK as u32) != 0
 }
 
+/// Returns whether the descriptor tracks append-on-write semantics.
 pub(crate) fn fd_has_append(fd: usize) -> bool {
     let process = current_files_process();
     let inner = process.borrow_mut();
@@ -237,6 +255,7 @@ pub(crate) fn fd_has_append(fd: usize) -> bool {
     (inner.fd_flags[fd] & O_APPEND as u32) != 0
 }
 
+/// Returns whether the descriptor requested `O_DIRECT`.
 pub(crate) fn fd_has_odirect(fd: usize) -> bool {
     let process = current_files_process();
     let inner = process.borrow_mut();
@@ -246,6 +265,7 @@ pub(crate) fn fd_has_odirect(fd: usize) -> bool {
     (inner.fd_flags[fd] & O_DIRECT as u32) != 0
 }
 
+/// Returns whether access-time updates are suppressed for this descriptor.
 pub(crate) fn fd_has_noatime(fd: usize) -> bool {
     let process = current_files_process();
     let inner = process.borrow_mut();
@@ -255,6 +275,7 @@ pub(crate) fn fd_has_noatime(fd: usize) -> bool {
     (inner.fd_flags[fd] & O_NOATIME as u32) != 0
 }
 
+/// Validates Linux-style alignment constraints for direct I/O requests.
 pub(crate) fn validate_direct_io_request(
     fd: usize,
     file: &alloc::sync::Arc<dyn File + Send + Sync>,
@@ -283,6 +304,7 @@ pub(crate) fn validate_direct_io_request(
     Ok(())
 }
 
+/// Reads an optional userspace `loff_t *` and converts it into a kernel offset.
 pub(crate) fn read_optional_offset(ptr: usize) -> Result<Option<usize>, isize> {
     if ptr == 0 {
         return Ok(None);
@@ -296,6 +318,7 @@ pub(crate) fn read_optional_offset(ptr: usize) -> Result<Option<usize>, isize> {
     Ok(Some(raw as usize))
 }
 
+/// Stores an updated optional offset back to userspace when a pointer was supplied.
 pub(crate) fn write_optional_offset(ptr: usize, value: usize) -> Result<(), isize> {
     if ptr == 0 {
         return Ok(());
@@ -307,10 +330,12 @@ pub(crate) fn write_optional_offset(ptr: usize, value: usize) -> Result<(), isiz
     Ok(())
 }
 
+/// Returns whether the file is backed by a pipe object.
 pub(crate) fn file_is_pipe(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> bool {
     file.as_any().downcast_ref::<Pipe>().is_some()
 }
 
+/// Pulls bytes from a pipe into a kernel buffer.
 pub(crate) fn pipe_read_to_kernel(
     file: &alloc::sync::Arc<dyn File + Send + Sync>,
     out: &mut [u8],
@@ -322,6 +347,7 @@ pub(crate) fn pipe_read_to_kernel(
     Err(err(SyscallError::EINVAL))
 }
 
+/// Pushes bytes from a kernel buffer into a pipe.
 pub(crate) fn pipe_write_from_kernel(
     file: &alloc::sync::Arc<dyn File + Send + Sync>,
     data: &[u8],
@@ -333,6 +359,7 @@ pub(crate) fn pipe_write_from_kernel(
     Err(err(SyscallError::EINVAL))
 }
 
+/// Pushes bytes from a kernel buffer into a socketpair endpoint.
 pub(crate) fn socketpair_write_from_kernel(
     file: &alloc::sync::Arc<dyn File + Send + Sync>,
     data: &[u8],
@@ -344,6 +371,7 @@ pub(crate) fn socketpair_write_from_kernel(
     Err(err(SyscallError::EINVAL))
 }
 
+/// Extracts the per-fd flags that should be persisted in the descriptor table.
 pub(crate) fn open_fd_flags(flags: usize, o_path: bool) -> u32 {
     let mut fd_flags = 0u32;
     if (flags & O_CLOEXEC) != 0 {
@@ -370,6 +398,7 @@ pub(crate) fn open_fd_flags(flags: usize, o_path: bool) -> u32 {
     fd_flags
 }
 
+/// Allocates a new descriptor slot and installs the opened file with derived fd flags.
 pub(crate) fn install_open_file_fd(
     file: alloc::sync::Arc<dyn File + Send + Sync>,
     flags: usize,
@@ -385,6 +414,7 @@ pub(crate) fn install_open_file_fd(
     Ok(fd)
 }
 
+/// Returns the shared pipe state for a FIFO inode, recreating it once all ends are gone.
 pub(crate) fn fifo_pipe_state_for_inode(inode_num: u64) -> Arc<FifoPipeState> {
     let mut states = FIFO_PIPE_STATES.lock();
     if let Some(state) = states.get(&inode_num) {
@@ -400,6 +430,8 @@ pub(crate) fn fifo_pipe_state_for_inode(inode_num: u64) -> Arc<FifoPipeState> {
     state
 }
 
+/// Returns the ext4 inode currently referenced by `fd`, if the descriptor targets one.
+#[allow(dead_code)]
 pub(crate) fn get_fd_inode(fd: usize) -> Option<alloc::sync::Arc<ext4_fs::Inode>> {
     let file = get_fd_file(fd)?;
     file.as_any()

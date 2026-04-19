@@ -317,16 +317,16 @@ pub fn maybe_deliver_signal() {
         user_sp = inner.sigaltstack_sp.saturating_add(inner.sigaltstack_size);
         inner.on_sigaltstack = true;
     }
-    let mut siginfo_ptr = 0usize;
-    let mut ucontext_ptr = 0usize;
+    let mut _siginfo_ptr = 0usize;
+    let mut _ucontext_ptr = 0usize;
     if (action.flags & SA_SIGINFO) != 0 {
         user_sp = (user_sp.saturating_sub(15)) & !0x0f;
         user_sp = user_sp.saturating_sub(core::mem::size_of::<LinuxSigInfo>());
-        siginfo_ptr = user_sp;
+        _siginfo_ptr = user_sp;
 
         user_sp = (user_sp.saturating_sub(15)) & !0x0f;
         user_sp = user_sp.saturating_sub(core::mem::size_of::<UContext>());
-        ucontext_ptr = user_sp;
+        _ucontext_ptr = user_sp;
 
         let mut siginfo = LinuxSigInfo::default();
         siginfo.si_signo = signum as i32;
@@ -362,21 +362,21 @@ pub fn maybe_deliver_signal() {
         };
 
         let token = get_current_token();
-        write_user_value(token, siginfo_ptr as *mut LinuxSigInfo, &siginfo);
-        write_user_value(token, ucontext_ptr as *mut UContext, &ucontext);
+        write_user_value(token, _siginfo_ptr as *mut LinuxSigInfo, &siginfo);
+        write_user_value(token, _ucontext_ptr as *mut UContext, &ucontext);
         if let Some(saved) = inner.sig_saved_ctx.last_mut() {
-            saved.ucontext_ptr = ucontext_ptr;
+            saved.ucontext_ptr = _ucontext_ptr;
             saved.uses_ucontext = true;
         }
 
-        cx.x[REG_A1] = siginfo_ptr;
-        cx.x[REG_A2] = ucontext_ptr;
+        cx.x[REG_A1] = _siginfo_ptr;
+        cx.x[REG_A2] = _ucontext_ptr;
         if DEBUG_PTHREAD && signum == 33 {
             log::debug!(
                 "[sigcancel] frame sp={:#x} siginfo={:#x} ucontext={:#x}",
                 user_sp,
-                siginfo_ptr,
-                ucontext_ptr
+                _siginfo_ptr,
+                _ucontext_ptr
             );
         }
     } else {

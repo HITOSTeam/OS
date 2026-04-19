@@ -1,7 +1,7 @@
 use crate::{
     mm::{try_copy_from_user, try_copy_to_user, try_write_user_value},
     syscall::error::{SyscallError, err},
-    task::processor::{current_process, current_task},
+    task::processor::current_process,
     trap::get_current_token,
 };
 use alloc::string::String;

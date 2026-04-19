@@ -107,6 +107,7 @@ impl Pipe {
         ring.available_write() >= ring.poll_writable_threshold() || ring.all_read_ends_closed()
     }
 
+    #[allow(dead_code)]
     pub fn available_read(&self) -> usize {
         if !self.readable {
             return 0;
@@ -154,6 +155,7 @@ impl Pipe {
         self.buffer.lock().attached_bpf = Some(prog);
     }
 
+    #[allow(dead_code)]
     pub fn attached_bpf(&self) -> Option<Arc<BpfProgFile>> {
         self.buffer.lock().attached_bpf.clone()
     }

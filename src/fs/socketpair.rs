@@ -32,6 +32,7 @@ impl SocketPairEnd {
         self.write_end.poll_writable()
     }
 
+    #[allow(dead_code)]
     pub fn read_to_slice(&self, out: &mut [u8], nonblock: bool) -> Result<usize, isize> {
         self.read_end.read_to_slice(out, nonblock)
     }

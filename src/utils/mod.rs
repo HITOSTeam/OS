@@ -1,4 +1,3 @@
-#![no_std]
 use crate::println;
 use core::cell::{Ref, RefCell, RefMut};
 use core::panic::Location;
@@ -6,6 +5,7 @@ use core::str;
 mod id_allocator;
 pub use id_allocator::RecycleAllocator;
 /// RefCellSafe 改良版：记录上一次借用位置并打印当前借用尝试位置
+#[allow(dead_code)]
 pub struct RefCellSafe<T> {
     refcell: RefCell<T>,
     last_borrow_loc: RefCell<Option<&'static Location<'static>>>,
@@ -14,6 +14,7 @@ pub struct RefCellSafe<T> {
 
 unsafe impl<T> Sync for RefCellSafe<T> {}
 
+#[allow(dead_code)]
 impl<T> RefCellSafe<T> {
     pub const fn new(val: T) -> Self {
         Self {
@@ -25,7 +26,7 @@ impl<T> RefCellSafe<T> {
 
     /// 不可变 borrow
     #[track_caller]
-    pub fn borrow(&self) -> Ref<T> {
+    pub fn borrow(&self) -> Ref<'_, T> {
         let caller = Location::caller();
         match self.refcell.try_borrow() {
             Ok(r) => {
@@ -55,7 +56,7 @@ impl<T> RefCellSafe<T> {
 
     /// 可变 borrow
     #[track_caller]
-    pub fn borrow_mut(&self) -> RefMut<T> {
+    pub fn borrow_mut(&self) -> RefMut<'_, T> {
         let caller = Location::caller();
         match self.refcell.try_borrow_mut() {
             Ok(rm) => {
@@ -90,6 +91,7 @@ impl<T> RefCellSafe<T> {
     }
 }
 
+#[allow(dead_code)]
 pub fn is_equal_two_string(string1: usize, string2: usize) -> bool {
     unsafe {
         let mut ptr1 = string1 as *const u8;
@@ -113,6 +115,7 @@ pub fn is_equal_two_string(string1: usize, string2: usize) -> bool {
     }
 }
 
+#[allow(dead_code)]
 pub fn get_app_data_by_name(name: usize, number_of_apps: usize, start_loc: usize) -> &'static [u8] {
     unsafe {
         let mut now_ptr = start_loc as *const usize;

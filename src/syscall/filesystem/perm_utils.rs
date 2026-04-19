@@ -1,10 +1,9 @@
 use super::{
-    OSInode, PID2PCB, ProcessControlBlock,
-    S_IFBLK, S_IFCHR, S_IFMT,
-    SyscallError, Vec,
-    current_process, err,
+    current_process, err, OSInode, ProcessControlBlock, SyscallError, Vec, PID2PCB, S_IFBLK,
+    S_IFCHR, S_IFMT,
 };
 
+/// Converts ext4 backend errors into Linux-style `errno` values.
 pub(crate) fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
     match e {
         ext4_fs::Ext4Error::NotADirectory => err(SyscallError::ENOTDIR),
@@ -18,24 +17,29 @@ pub(crate) fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
     }
 }
 
+/// Returns the calling task's real uid/gid pair.
 pub(crate) fn current_real_uid_gid() -> (u32, u32) {
     crate::syscall::misc::current_real_uid_gid()
 }
 
+/// Returns the calling task's effective uid/gid pair.
 pub(crate) fn current_effective_uid_gid() -> (u32, u32) {
     crate::syscall::misc::current_effective_uid_gid()
 }
 
+/// Returns the calling task's filesystem uid/gid pair.
 pub(crate) fn current_fsuid_gid() -> (u32, u32) {
     crate::syscall::misc::current_fsuid_gid()
 }
 
+/// Checks whether the current process belongs to `gid`, including supplementary groups.
 pub(crate) fn current_in_group(gid: u32) -> bool {
     let process = current_process();
     let inner = process.borrow_mut();
     gid == inner.fsgid || inner.supplementary_gids.iter().any(|g| *g == gid)
 }
 
+/// Converts Linux's `-1`/`UINT_MAX` sentinel into "leave unchanged".
 pub(crate) fn parse_chown_id(id: usize) -> Option<u32> {
     if id == usize::MAX || id == u32::MAX as usize {
         None
@@ -44,6 +48,7 @@ pub(crate) fn parse_chown_id(id: usize) -> Option<u32> {
     }
 }
 
+/// Clears setuid/setgid bits after ownership changes when Linux would do so.
 pub(crate) fn maybe_clear_suid_sgid_after_chown(inode: &ext4_fs::Inode, touched_owner: bool) {
     if !touched_owner || !inode.is_file() {
         return;
@@ -57,6 +62,7 @@ pub(crate) fn maybe_clear_suid_sgid_after_chown(inode: &ext4_fs::Inode, touched_
     inode.set_mode(mode);
 }
 
+/// Applies `chown`/`chgrp` semantics to an inode using current credentials.
 pub(crate) fn apply_chown_to_inode(inode: &ext4_fs::Inode, uid: usize, gid: usize) -> isize {
     let uid_req = parse_chown_id(uid);
     let gid_req = parse_chown_id(gid);
@@ -92,7 +98,13 @@ pub(crate) fn is_privileged_or_owner(euid: u32, inode: &ext4_fs::Inode) -> bool 
     euid == 0 || euid == inode.uid()
 }
 
-pub(crate) fn inode_mode_allows_uid_gid(inode: &ext4_fs::Inode, mask: usize, uid: u32, gid: u32) -> bool {
+/// Evaluates rwx permission bits for an explicit uid/gid credential pair.
+pub(crate) fn inode_mode_allows_uid_gid(
+    inode: &ext4_fs::Inode,
+    mask: usize,
+    uid: u32,
+    gid: u32,
+) -> bool {
     if mask == 0 {
         return true;
     }
@@ -125,11 +137,13 @@ pub(crate) fn inode_mode_allows_uid_gid(inode: &ext4_fs::Inode, mask: usize, uid
     true
 }
 
+/// Evaluates rwx permission bits using the caller's fsuid/fsgid.
 pub(crate) fn inode_mode_allows(inode: &ext4_fs::Inode, mask: usize) -> bool {
     let (uid, gid) = current_fsuid_gid();
     inode_mode_allows_uid_gid(inode, mask, uid, gid)
 }
 
+/// Applies the current process umask to a newly created inode mode.
 pub(crate) fn apply_umask(mode: usize) -> u16 {
     let umask = crate::syscall::misc::current_umask() as u16;
     let perm = (mode as u16) & 0o777;
@@ -137,10 +151,12 @@ pub(crate) fn apply_umask(mode: usize) -> u16 {
     special | (perm & !umask)
 }
 
+/// Returns whether a parent directory forces gid inheritance via `S_ISGID`.
 pub(crate) fn parent_forces_gid_inherit(parent: &ext4_fs::Inode) -> bool {
     parent.is_dir() && (parent.mode() & 0o2000) != 0
 }
 
+/// Selects the gid that should be assigned to a freshly created inode.
 pub(crate) fn gid_for_created_inode(parent: Option<&ext4_fs::Inode>, fallback_gid: u32) -> u32 {
     match parent {
         Some(dir) if parent_forces_gid_inherit(dir) => dir.gid(),
@@ -148,6 +164,7 @@ pub(crate) fn gid_for_created_inode(parent: Option<&ext4_fs::Inode>, fallback_gi
     }
 }
 
+/// Normalizes mode bits for a newly created regular file after gid checks.
 pub(crate) fn mode_for_created_file(mut mode: u16, gid: u32) -> u16 {
     // Linux clears S_ISGID on new regular files when caller is unprivileged
     // and outside the target group.
@@ -160,6 +177,7 @@ pub(crate) fn mode_for_created_file(mut mode: u16, gid: u32) -> u16 {
     mode
 }
 
+/// Returns the device number that should surface through `stat` for special files.
 pub(crate) fn inode_rdev_for_mode(inode: &ext4_fs::Inode, mode: u16) -> u64 {
     match mode & S_IFMT {
         S_IFCHR | S_IFBLK => inode.special_rdev(),
@@ -167,14 +185,17 @@ pub(crate) fn inode_rdev_for_mode(inode: &ext4_fs::Inode, mode: u16) -> u64 {
     }
 }
 
+/// Extracts the Linux major number from an encoded device id.
 pub(crate) fn linux_dev_major(dev: u64) -> u32 {
     ((((dev >> 8) & 0x0fff) | ((dev >> 32) & 0xffff_f000)) & 0xffff_ffff) as u32
 }
 
+/// Extracts the Linux minor number from an encoded device id.
 pub(crate) fn linux_dev_minor(dev: u64) -> u32 {
     (((dev & 0x00ff) | ((dev >> 12) & 0x0fff_ff00)) & 0xffff_ffff) as u32
 }
 
+/// Reports the largest visible size across disk state and open writable views of an inode.
 pub(crate) fn inode_visible_size(inode: &ext4_fs::Inode) -> usize {
     let mut size = inode.size() as usize;
     let target_ino = inode.inode_num();

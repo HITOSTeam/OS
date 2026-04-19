@@ -81,8 +81,10 @@ impl From<SyscallError> for usize {
 }
 
 /// `EWOULDBLOCK` is an alias for `EAGAIN` on Linux.
+#[allow(dead_code)]
 pub const EWOULDBLOCK: SyscallError = SyscallError::EAGAIN;
 
+#[allow(dead_code)]
 pub type SyscallResult = Result<usize, SyscallError>;
 
 /// Shorthand: convert a `SyscallError` to the negative `isize` the kernel ABI expects.

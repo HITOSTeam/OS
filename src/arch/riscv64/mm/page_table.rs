@@ -2,8 +2,8 @@
 
 use crate::config::PAGE_SIZE;
 use crate::mm::{
-    FrameTracker, LazyFaultResult, MapPermission, PhysAddr, PhysPageNum, StepByOne, VirtAddr,
-    VirtPageNum, frame_alloc,
+    frame_alloc, FrameTracker, LazyFaultResult, MapPermission, PhysAddr, PhysPageNum, StepByOne,
+    VirtAddr, VirtPageNum,
 };
 use crate::task::processor::current_task;
 use alloc::string::String;
@@ -330,6 +330,7 @@ impl PageTable {
     pub fn token(&self) -> usize {
         8usize << 60 | self.root_ppn.0
     }
+    #[allow(dead_code)]
     pub fn clone(&self) -> Self {
         //todo:alloc new frames...
         return Self {
@@ -339,6 +340,7 @@ impl PageTable {
     }
 }
 
+#[allow(dead_code)]
 fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool {
     let Some(task) = current_task() else {
         return false;
@@ -445,6 +447,7 @@ fn translated_address_with(token: usize, ptr: *const u8, access: MapPermission) 
 }
 
 /// Load a string from other address spaces into kernel space without an end `\0`.
+#[allow(dead_code)]
 pub fn translated_str(token: usize, ptr: *const u8) -> String {
     let mut string = String::new();
     let mut va = ptr as usize;
@@ -576,6 +579,9 @@ pub fn try_copy_to_user_unchecked(token: usize, dst: *mut u8, src: &[u8]) -> Res
     Ok(())
 }
 
+// Why we use MaybeUninit Here? On the one hand,it is because we want to use this function for
+// multi-types, we don't know if this type have Default trait and for some types,it can be heavy to initialize an empty value.This is a very
+// frequently used function.So we use this to optimiz
 pub fn read_user_value<T: Copy>(token: usize, src: *const T) -> T {
     let mut value = MaybeUninit::<T>::uninit();
     // SAFETY: `value` is stack-allocated and we expose exactly `size_of::<T>()` bytes of its

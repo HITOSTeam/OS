@@ -1,6 +1,4 @@
 use alloc::vec;
-use alloc::vec::Vec;
-use core::any::Any;
 use core::mem::size_of;
 
 use crate::fs::NetSocketFile;
@@ -68,7 +66,7 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
         if !unix_sock.is_dgram() {
             return err(SyscallError::EOPNOTSUPP);
         }
-        let mut kbuf = match gather_iovecs_data(&iovs) {
+        let kbuf = match gather_iovecs_data(&iovs) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -121,7 +119,7 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
     if send_flag_check != 0 {
         return send_flag_check;
     }
-    let mut kbuf = match gather_iovecs_data(&iovs) {
+    let kbuf = match gather_iovecs_data(&iovs) {
         Ok(v) => v,
         Err(e) => return e,
     };
