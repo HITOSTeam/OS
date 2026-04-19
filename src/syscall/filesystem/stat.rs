@@ -1,24 +1,19 @@
 use super::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE, AT_SYMLINK_NOFOLLOW,
-    AtPath, CgroupFile, EXT4_ST_DEV, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
-    FALLOC_FL_SUPPORTED_MASK, FifoDuplexFile, File, KStat, NetSocketFile,
-    OSInode, PID2PCB, Pipe, ProcPseudoFile, ProcessControlBlock,
-    PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile, Statx,
-    String, SyscallError, TimeSpec, Vec,
-    current_effective_uid_gid, current_fsuid_gid, current_process, current_timespec,
-    err, ext4_lock, fd_has_o_path, file_lock_key_from_inode, fill_statfs,
-    find_path_in_roots, flush_open_inode_views, fsize_limit_allows,
-    get_current_token, get_fd_file, get_inode_times, inode_mode_allows_uid_gid,
-    is_privileged_or_owner,
-    require_fd_file,
-    inode_rdev_for_mode, inode_visible_size, kstat_from_fd, kstat_from_file,
-    maybe_signal_lease_break, open_pseudo, proc_magic_link_target_kstat,
-    proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync,
-    punch_hole_keep_size, read_user_cstring, read_user_value,
-    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_utime,
-    rofs_for_path, set_inode_times, statfs_mount_flags_for_abs,
-    statx_from_kstat, sync_all, touch_inode_mtime_ctime_now,
-    truncate_regular_inode, try_copy_to_user, try_write_user_value, write_zeros_range,
+    current_effective_uid_gid, current_fsuid_gid, current_process, current_timespec, err,
+    ext4_lock, fd_has_o_path, file_lock_key_from_inode, fill_statfs, find_path_in_roots,
+    flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file, get_inode_times,
+    inode_mode_allows_uid_gid, inode_rdev_for_mode, inode_visible_size, is_privileged_or_owner,
+    kstat_from_fd, kstat_from_file, maybe_signal_lease_break, open_pseudo,
+    proc_magic_link_target_kstat, proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync,
+    punch_hole_keep_size, read_user_cstring, read_user_value, require_fd_file, resolve_abs_path,
+    resolve_at_inode, resolve_at_path, resolve_utime, rofs_for_path, set_inode_times,
+    statfs_mount_flags_for_abs, statx_from_kstat, sync_all, touch_inode_mtime_ctime_now,
+    truncate_regular_inode, try_copy_to_user, try_write_user_value, write_zeros_range, AtPath,
+    CgroupFile, FifoDuplexFile, File, KStat, NetSocketFile, OSInode, Pipe, ProcPseudoFile,
+    ProcessControlBlock, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile, Statx, String,
+    SyscallError, TimeSpec, Vec, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
+    AT_SYMLINK_NOFOLLOW, EXT4_ST_DEV, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
+    FALLOC_FL_SUPPORTED_MASK, PID2PCB,
 };
 
 /// Preallocates file space or punches holes on supported file types.
@@ -397,7 +392,9 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         return err(SyscallError::EROFS);
     }
     if _times == 0 {
-        if !is_privileged_or_owner(euid, &inode) && !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+        if !is_privileged_or_owner(euid, &inode)
+            && !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid)
+        {
             return err(SyscallError::EACCES);
         }
     } else if !is_privileged_or_owner(euid, &inode) {
@@ -465,7 +462,11 @@ pub fn syscall_fstat(fd: usize, st_ptr: usize) -> isize {
     if get_fd_file(fd).is_none() {
         if crate::debug_config::DEBUG_FS {
             let pid = current_process().getpid();
-            crate::println!("[fs] fstat(pid={}) fd={} -> err(SyscallError::EBADF)(nofile)", pid, fd);
+            crate::println!(
+                "[fs] fstat(pid={}) fd={} -> err(SyscallError::EBADF)(nofile)",
+                pid,
+                fd
+            );
         }
         return err(SyscallError::EBADF);
     };
@@ -742,7 +743,10 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
         Ok(v) => v,
-        Err(e) if e == err(SyscallError::ENOENT) && matches!(path.as_str(), "busybox" | "./busybox") => {
+        Err(e)
+            if e == err(SyscallError::ENOENT)
+                && matches!(path.as_str(), "busybox" | "./busybox") =>
+        {
             let candidates = [
                 "/musl/busybox",
                 "/glibc/busybox",

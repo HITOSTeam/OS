@@ -1,4 +1,4 @@
-use crate::arch::{console_flush, console_putchar, disable_interrupts, restore_interrupts};
+use crate::arch::{console_putchar, disable_interrupts, restore_interrupts};
 use core::fmt::{self, Write};
 use spin::Mutex;
 

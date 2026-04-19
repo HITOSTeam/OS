@@ -12,11 +12,10 @@ use crate::fs::cgroup_charge_anon_current;
 use crate::println;
 use crate::task::processor::current_process;
 use super::elf_loader::{
-    ElfHeader64, ElfPhdr64, ENOMEM, ENOEXEC, ET_DYN, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
+    ElfHeader64, ElfPhdr64, ENOMEM, ET_DYN, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
     parse_elf_headers, read_exact_with,
 };
 use alloc::collections::BTreeMap;
-use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
 use core::arch::asm;
@@ -99,6 +98,7 @@ impl MemorySet {
         )
     }
     /// Assume that no conflicts.
+    #[allow(dead_code)]
     pub fn insert_framed_area(
         &mut self,
         start_va: VirtAddr,
@@ -157,6 +157,7 @@ impl MemorySet {
     }
 
     /// Map an identical (VA=PA) range into the address space.
+    #[allow(dead_code)]
     pub fn map_identical_range(
         &mut self,
         start: usize,
@@ -173,6 +174,7 @@ impl MemorySet {
     }
 
     /// Map an identical (VA=PA) range, skipping pages already mapped.
+    #[allow(dead_code)]
     pub fn map_identical_range_skip_mapped(
         &mut self,
         start: usize,
@@ -1115,6 +1117,7 @@ impl MemorySet {
     /// Fork a user address space by copying all mapped pages (no COW).
     ///
     /// This is slower than COW but avoids COW corner cases on some platforms.
+    #[allow(dead_code)]
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
@@ -1808,6 +1811,7 @@ impl MemorySet {
         };
     }
 
+    #[allow(dead_code)]
     pub fn clone(&self) -> Self {
         let mut new_memory_set = Self::new_bare();
         let has_user = self
@@ -1863,6 +1867,7 @@ impl MemorySet {
 
         new_memory_set
     }
+    #[allow(dead_code)]
     pub fn recycle_data_pages(&mut self) {
         //*self = Self::new_bare();
         self.areas.clear();
@@ -2034,6 +2039,7 @@ pub enum LazyFaultResult {
 }
 
 impl LazyFaultResult {
+    #[allow(dead_code)]
     pub fn is_resolved(self) -> bool {
         matches!(self, Self::Resolved)
     }
@@ -2062,6 +2068,7 @@ pub fn kernel_token() -> usize {
     KERNEL_SPACE.lock().token()
 }
 
+#[allow(dead_code)]
 pub fn activate_token(token: usize) {
     #[cfg(target_arch = "riscv64")]
     // SAFETY: token is a valid satp value; sfence.vma flushes TLB after satp change.

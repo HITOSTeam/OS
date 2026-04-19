@@ -363,11 +363,13 @@ impl NetSocketFile {
         (self.current_poll_mask() & POLLIN) != 0
     }
 
+    #[allow(dead_code)]
     pub fn poll_writable(&self) -> bool {
         crate::net::poll();
         (self.current_poll_mask() & POLLOUT) != 0
     }
 
+    #[allow(dead_code)]
     pub fn poll_rdhup(&self) -> bool {
         crate::net::poll();
         (self.current_poll_mask() & POLLRDHUP) != 0
@@ -828,20 +830,18 @@ impl NetSocketFile {
                 })
             });
             if let Some((n, meta)) = res {
-                if let IpAddress::Ipv4(ip) = meta.endpoint.addr {
-                    if crate::debug_config::DEBUG_NET && n == 4 {
-                        let v = u32::from_ne_bytes(buf[..4].try_into().unwrap_or([0; 4]));
-                        crate::println!(
-                            "[net] udp recv {} bytes from {}:{} val=0x{:08x}",
-                            n,
-                            ip,
-                            meta.endpoint.port,
-                            v
-                        );
-                    }
-                    return Ok((n, ip, meta.endpoint.port));
+                let IpAddress::Ipv4(ip) = meta.endpoint.addr;
+                if crate::debug_config::DEBUG_NET && n == 4 {
+                    let v = u32::from_ne_bytes(buf[..4].try_into().unwrap_or([0; 4]));
+                    crate::println!(
+                        "[net] udp recv {} bytes from {}:{} val=0x{:08x}",
+                        n,
+                        ip,
+                        meta.endpoint.port,
+                        v
+                    );
                 }
-                return Ok((n, Ipv4Address::UNSPECIFIED, meta.endpoint.port));
+                return Ok((n, ip, meta.endpoint.port));
             }
             if pending_unmasked_signal() {
                 return Err(EINTR);
@@ -860,12 +860,8 @@ impl NetSocketFile {
             let s = sockets.get::<tcp::Socket>(handle);
             let local = s.local_endpoint()?;
             let remote = s.remote_endpoint()?;
-            let IpAddress::Ipv4(lip) = local.addr else {
-                return None;
-            };
-            let IpAddress::Ipv4(rip) = remote.addr else {
-                return None;
-            };
+            let IpAddress::Ipv4(lip) = local.addr;
+            let IpAddress::Ipv4(rip) = remote.addr;
             Some((lip, local.port, rip, remote.port))
         })
     }
@@ -876,9 +872,8 @@ impl NetSocketFile {
             Inner::TcpStream { handle } => crate::net::with_sockets_mut(|_iface, _dev, sockets| {
                 let s = sockets.get::<tcp::Socket>(*handle);
                 if let Some(local) = s.local_endpoint() {
-                    if let IpAddress::Ipv4(ip) = local.addr {
-                        return Some((ip, local.port));
-                    }
+                    let IpAddress::Ipv4(ip) = local.addr;
+                    return Some((ip, local.port));
                 }
                 let bound = s.get_bound_endpoint();
                 let ip = match bound.addr {
@@ -917,7 +912,6 @@ impl NetSocketFile {
                 ..
             } => match peer.addr {
                 IpAddress::Ipv4(ip) => Some((ip, peer.port)),
-                _ => None,
             },
             _ => None,
         }

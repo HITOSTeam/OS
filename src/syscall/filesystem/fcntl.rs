@@ -1,23 +1,13 @@
 use super::{
-    FD_CLOEXEC, FcntlFlock, FcntlOwnerEx,
-    OSInode, O_APPEND, O_ASYNC, O_DIRECT, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY,
-    Pipe, PseudoShmFile,
-    RECORD_LOCKS, RecordLockOwner,
-    SyscallError, Vec, WaitingRecordLock,
-    apply_record_lock_for_owner, block_current_and_run_next,
-    clear_record_lock_waiting,
-    collect_conflict_process_owners,
-    current_files_process, current_process, current_task,
-    detect_record_lock_deadlock,
-    enqueue_record_lock_waiter, err,
-    fd_file, file_lock_key, first_conflicting_lock,
-    get_current_token, get_file_lease_type,
-    has_pending_unmasked_signal, lock_conflicts,
-    lock_range_from_flock, ofd_lock_owner_id,
-    remove_record_lock_waiter,
-    set_file_lease,
-    set_record_lock_waiting, try_read_user_value,
-    try_write_user_value, wake_record_lock_waiters,
+    apply_record_lock_for_owner, block_current_and_run_next, clear_record_lock_waiting,
+    collect_conflict_process_owners, current_files_process, current_process, current_task,
+    detect_record_lock_deadlock, enqueue_record_lock_waiter, err, fd_file, file_lock_key,
+    first_conflicting_lock, get_current_token, get_file_lease_type, has_pending_unmasked_signal,
+    lock_conflicts, lock_range_from_flock, ofd_lock_owner_id, remove_record_lock_waiter,
+    set_file_lease, set_record_lock_waiting, try_read_user_value, try_write_user_value,
+    wake_record_lock_waiters, FcntlFlock, FcntlOwnerEx, OSInode, Pipe, PseudoShmFile,
+    RecordLockOwner, SyscallError, Vec, WaitingRecordLock, FD_CLOEXEC, O_APPEND, O_ASYNC, O_DIRECT,
+    O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, RECORD_LOCKS,
 };
 
 /// Handles descriptor flags, record locks, leases, and async-owner state for `fcntl(2)`.
@@ -405,7 +395,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 }
                 let waiter_task = if blocking { current_task() } else { None };
                 let ret = loop {
-                    let mut conflict_exists = false;
+                    let conflict_exists;
                     let mut conflict_owners = Vec::new();
                     let mut should_wake_waiters = false;
                     {

@@ -1,23 +1,22 @@
 use super::{
-    AT_FDCWD, Arc, BTreeMap, BTreeSet, CgroupMountSpec, File,
-    InodeTimes, MNT_DETACH, MNT_EXPIRE, MNT_FORCE,
-    MS_BIND, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID,
-    MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_REMOUNT, MS_SHARED, MS_SLAVE,
-    MS_STRICTATIME, MS_UNBINDABLE,
-    MountNamespace, MountNamespaceState, MountPropagation, MountRecord, Mutex,
-    NEXT_MOUNT_EVENT_ID, NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ,
-    OSInode, Ordering, PID2PCB, ProcessControlBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile,
-    ST_NOSYMFOLLOW, String, SyscallError, TMPFILE_SEQ, UMOUNT_NOFOLLOW, Vec,
-    cgroup_logical_path_for_file, cgroup_mount, cgroup_umount,
-    current_fsuid_gid, current_process, current_timespec, err, ext4_err_to_errno, ext4_lock,
-    find_path_in_roots, get_current_token, get_inode_times, inode_logical_path,
-    mount_namespace_id, normalize_path, open_pseudo, pseudo_block_is_read_only,
-    read_user_cstring, resolve_at_inode, resolve_at_path, set_inode_times,
+    cgroup_logical_path_for_file, cgroup_mount, cgroup_umount, current_fsuid_gid, current_process,
+    current_timespec, err, ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token,
+    get_inode_times, inode_logical_path, mount_namespace_id, normalize_path, open_pseudo,
+    pseudo_block_is_read_only, read_user_cstring, resolve_at_inode, resolve_at_path,
+    set_inode_times, Arc, BTreeMap, BTreeSet, CgroupMountSpec, File, InodeTimes, MountNamespace,
+    MountNamespaceState, MountPropagation, MountRecord, Mutex, OSInode, Ordering,
+    ProcessControlBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile, String, SyscallError, Vec,
+    AT_FDCWD, MNT_DETACH, MNT_EXPIRE, MNT_FORCE, MS_BIND, MS_MOVE, MS_NOATIME, MS_NODEV,
+    MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_REMOUNT,
+    MS_SHARED, MS_SLAVE, MS_STRICTATIME, MS_UNBINDABLE, NEXT_MOUNT_EVENT_ID,
+    NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ, PID2PCB, ST_NOSYMFOLLOW, TMPFILE_SEQ,
+    UMOUNT_NOFOLLOW,
 };
 use lazy_static::lazy_static;
 
 lazy_static! {
-    pub(crate) static ref DEVICE_MOUNT_SOURCES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+    pub(crate) static ref DEVICE_MOUNT_SOURCES: Mutex<BTreeMap<String, String>> =
+        Mutex::new(BTreeMap::new());
     pub(crate) static ref TMPFS_REATTACH_SOURCES: Mutex<BTreeMap<String, String>> =
         Mutex::new(BTreeMap::new());
 }
@@ -195,7 +194,11 @@ pub(crate) fn push_mount_record(
     );
 }
 
-pub(crate) fn update_mount_record_flags_in(ns: &MountNamespace, target: &str, flags: usize) -> bool {
+pub(crate) fn update_mount_record_flags_in(
+    ns: &MountNamespace,
+    target: &str,
+    flags: usize,
+) -> bool {
     with_mount_namespace_mut(ns, |state| state.update_top_mount_flags(target, flags))
 }
 
@@ -203,8 +206,14 @@ pub(crate) fn update_mount_record_flags(target: &str, flags: usize) -> bool {
     update_mount_record_flags_in(&current_mount_namespace(), target, flags)
 }
 
-pub(crate) fn move_mount_record_target_in(ns: &MountNamespace, old_target: &str, new_target: &str) -> bool {
-    with_mount_namespace_mut(ns, |state| state.move_top_mount_target(old_target, new_target))
+pub(crate) fn move_mount_record_target_in(
+    ns: &MountNamespace,
+    old_target: &str,
+    new_target: &str,
+) -> bool {
+    with_mount_namespace_mut(ns, |state| {
+        state.move_top_mount_target(old_target, new_target)
+    })
 }
 
 pub(crate) fn move_mount_record_target(old_target: &str, new_target: &str) -> bool {
@@ -241,6 +250,7 @@ pub(crate) fn proc_self_fd_path(fd: usize) -> String {
     alloc::format!("/proc/self/fd/{}", fd)
 }
 
+/// Get the path string of the fd,if failed return the fallback
 pub(crate) fn logical_path_for_open_fd(
     fd: usize,
     file: &Arc<dyn File + Send + Sync>,
@@ -431,7 +441,9 @@ pub(crate) struct MountPropagationDestination {
     pub(crate) propagation: MountPropagation,
 }
 
-pub(crate) fn inherited_mount_propagation(target: &str) -> (MountPropagation, Option<usize>, Option<usize>) {
+pub(crate) fn inherited_mount_propagation(
+    target: &str,
+) -> (MountPropagation, Option<usize>, Option<usize>) {
     let Some(base) = mount_lookup_for_abs(target) else {
         return (MountPropagation::Private, None, None);
     };
@@ -455,7 +467,10 @@ pub(crate) fn mount_target_suffix(base_target: &str, target: &str) -> String {
     String::from(target[base_target.len()..].trim_start_matches('/'))
 }
 
-pub(crate) fn shared_group_destinations(base: &MountRecord, target: &str) -> Vec<MountPropagationDestination> {
+pub(crate) fn shared_group_destinations(
+    base: &MountRecord,
+    target: &str,
+) -> Vec<MountPropagationDestination> {
     let Some(peer_group) = base.peer_group_id else {
         return Vec::new();
     };
@@ -871,7 +886,12 @@ pub(crate) fn sync_mount_record_rofs(target: &str) {
     }
 }
 
-pub(crate) fn should_update_inode_atime(path: &str, is_dir: bool, times: InodeTimes, now_sec: i64) -> bool {
+pub(crate) fn should_update_inode_atime(
+    path: &str,
+    is_dir: bool,
+    times: InodeTimes,
+    now_sec: i64,
+) -> bool {
     let flags = mount_flags_for_abs(path);
     if (flags & MS_NOATIME) != 0 {
         return false;

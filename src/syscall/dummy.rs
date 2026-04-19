@@ -16,6 +16,7 @@ use crate::{
 
 
 const O_NONBLOCK: u32 = 0x800;
+#[allow(dead_code)]
 const O_PATH: u32 = 0x200000;
 const FD_CLOEXEC: u32 = 1;
 
@@ -93,6 +94,7 @@ fn ns_to_timespec(ns: u64) -> TimeSpec {
     }
 }
 
+#[allow(dead_code)]
 pub fn syscall_epoll_create(size: isize) -> isize {
     if size <= 0 {
         return err(SyscallError::EINVAL);
@@ -100,6 +102,7 @@ pub fn syscall_epoll_create(size: isize) -> isize {
     alloc_dummy_fd(0)
 }
 
+#[allow(dead_code)]
 pub fn syscall_epoll_create1(flags: usize) -> isize {
     const EPOLL_CLOEXEC: usize = CLOEXEC_FLAG;
     if (flags & !EPOLL_CLOEXEC) != 0 {
@@ -378,14 +381,17 @@ pub fn syscall_bpf(cmd: usize, attr: usize, size: usize) -> isize {
     crate::bpf::syscall_bpf(cmd, attr, size)
 }
 
+#[allow(dead_code)]
 pub fn syscall_fsopen(_fsname: usize, _flags: usize) -> isize {
     alloc_dummy_fd(0)
 }
 
+#[allow(dead_code)]
 pub fn syscall_fspick(_dirfd: isize, _path: usize, _flags: usize) -> isize {
     alloc_dummy_fd(0)
 }
 
+#[allow(dead_code)]
 pub fn syscall_open_tree(_dirfd: isize, _path: usize, _flags: usize) -> isize {
     alloc_dummy_fd(O_PATH)
 }

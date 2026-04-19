@@ -279,6 +279,7 @@ pub fn syscall_exit_group(_code: usize) -> isize {
     exit_group_and_run_next(code)
 }
 // the below one is just for testing
+#[allow(dead_code)]
 pub fn syscall_fortest(a: usize, b: usize) -> isize {
     println!("[kernel] syscall_fortest called with args: {}, {}", a, b);
     0
@@ -287,6 +288,7 @@ pub fn syscall_yield() -> isize {
     suspend_current_and_run_next();
     0
 }
+#[allow(dead_code)]
 pub fn syscall_get_time() -> isize {
     crate::time::get_time_ms() as isize
 }

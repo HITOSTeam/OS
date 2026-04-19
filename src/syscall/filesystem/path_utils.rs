@@ -1,18 +1,15 @@
 use super::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, BTreeMap,
-    ClassifiedAbsPath, File, INODE_XATTRS, MAX_SYMLINKS, NAME_MAX,
-    OSInode, O_TRUNC, PATH_MAX, PseudoDir, PseudoDirent, PseudoShmFile,
-    String, SyscallError, Vec,
-    XATTR_CREATE, XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX,
     current_cwd_path, current_files_process, current_fsuid_gid, current_mount_namespace,
-    current_process, dt_type_from_ext4, err, ext4_lock, fd_has_o_path,
-    find_path_in_roots, get_current_token, get_fd_file, inode_is_immutable_or_append,
-    inode_mode_allows_uid_gid, install_open_file_fd, logical_path_for_inode,
-    logical_path_for_open_fd, mount_lookup_for_abs, open_pseudo,
-    path_is_noexec, path_is_rofs, pseudo_abs_for_ext4_dirfd,
-    resolve_proc_magic_intermediate_abs_path, secondary_root_inode,
-    shm_get, shm_object_name, syscall_ftruncate, touch_inode_mtime_ctime_now,
-    translate_mount_abs, try_copy_from_user, try_copy_to_user, try_read_user_value,
+    current_process, dt_type_from_ext4, err, ext4_lock, fd_has_o_path, find_path_in_roots,
+    get_current_token, get_fd_file, inode_is_immutable_or_append, inode_mode_allows_uid_gid,
+    install_open_file_fd, logical_path_for_inode, logical_path_for_open_fd, mount_lookup_for_abs,
+    open_pseudo, path_is_noexec, path_is_rofs, pseudo_abs_for_ext4_dirfd,
+    resolve_proc_magic_intermediate_abs_path, secondary_root_inode, shm_get, shm_object_name,
+    syscall_ftruncate, touch_inode_mtime_ctime_now, translate_mount_abs, try_copy_from_user,
+    try_copy_to_user, try_read_user_value, Arc, BTreeMap, ClassifiedAbsPath, File, OSInode,
+    PseudoDir, PseudoDirent, PseudoShmFile, String, SyscallError, Vec, AT_EMPTY_PATH, AT_FDCWD,
+    AT_SYMLINK_NOFOLLOW, INODE_XATTRS, MAX_SYMLINKS, NAME_MAX, O_TRUNC, PATH_MAX, XATTR_CREATE,
+    XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX,
 };
 use alloc::vec;
 
@@ -20,6 +17,7 @@ pub(crate) fn current_timespec() -> (i64, i64) {
     crate::syscall::time_sys::realtime_now_timespec()
 }
 
+/// Normalize a path by connect cwd + path. Remove dot
 pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
     let absolute = path.starts_with('/');
@@ -215,7 +213,10 @@ pub(crate) fn resolve_relative_at_path_base(dirfd: isize) -> Result<RelativeAtPa
     })
 }
 
-pub(crate) fn resolve_relative_at_path_from_logical_base(base_path: &str, path: &str) -> Result<AtPath, isize> {
+pub(crate) fn resolve_relative_at_path_from_logical_base(
+    base_path: &str,
+    path: &str,
+) -> Result<AtPath, isize> {
     let logical_abs = normalize_path(base_path, path);
     let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
     let classified_abs = classify_current_abs_path(&abs);
@@ -305,10 +306,10 @@ pub(crate) fn resolve_ext4_abs_path(
     let abs = crate::fs::normalize_proc_magic_path(path).into_owned();
 
     // Prefer the secondary disk for OSComp test roots when available.
-    if (abs == "/musl"
+    if abs == "/musl"
         || abs.starts_with("/musl/")
         || abs == "/glibc"
-        || abs.starts_with("/glibc/"))
+        || abs.starts_with("/glibc/")
     {
         if let Some(secondary) = secondary_root_inode() {
             let mut sec_depth = 0usize;
@@ -443,7 +444,11 @@ pub(crate) fn reopen_proc_link_file(
 
 pub(crate) fn pseudo_path_exists_result(abs: &str) -> isize {
     if let Some(name) = shm_object_name(abs) {
-        return if shm_get(name).is_some() { 0 } else { err(SyscallError::ENOENT) };
+        return if shm_get(name).is_some() {
+            0
+        } else {
+            err(SyscallError::ENOENT)
+        };
     }
     if open_pseudo(abs).is_some() {
         0
@@ -494,6 +499,7 @@ pub(crate) fn union_root_dir_entries() -> Vec<PseudoDirent> {
     entries
 }
 
+/// read a C string by ptr from the space specified by token,
 pub(crate) fn read_user_cstring(token: usize, ptr: usize) -> Result<String, isize> {
     if ptr == 0 {
         return Err(err(SyscallError::EFAULT));
@@ -534,7 +540,11 @@ pub(crate) fn read_user_xattr_name(token: usize, ptr: usize) -> Result<String, i
     Ok(name)
 }
 
-pub(crate) fn read_user_xattr_value(token: usize, value: usize, size: usize) -> Result<Vec<u8>, isize> {
+pub(crate) fn read_user_xattr_value(
+    token: usize,
+    value: usize,
+    size: usize,
+) -> Result<Vec<u8>, isize> {
     if size > XATTR_SIZE_MAX {
         return Err(err(SyscallError::E2BIG));
     }
@@ -588,7 +598,12 @@ pub(crate) fn resolve_xattr_fd_inode(fd: usize) -> Result<Option<Arc<ext4_fs::In
     Ok(Some(os_inode.ext4_inode()))
 }
 
-pub(crate) fn do_setxattr(inode: &Arc<ext4_fs::Inode>, name: &str, value: &[u8], flags: usize) -> isize {
+pub(crate) fn do_setxattr(
+    inode: &Arc<ext4_fs::Inode>,
+    name: &str,
+    value: &[u8],
+    flags: usize,
+) -> isize {
     let valid_flags = XATTR_CREATE | XATTR_REPLACE;
     if (flags & !valid_flags) != 0 || (flags & valid_flags) == valid_flags {
         return err(SyscallError::EINVAL);
@@ -652,7 +667,12 @@ pub(crate) fn do_getxattr(
     value.len() as isize
 }
 
-pub(crate) fn do_listxattr(inode: &Arc<ext4_fs::Inode>, list_ptr: usize, size: usize, token: usize) -> isize {
+pub(crate) fn do_listxattr(
+    inode: &Arc<ext4_fs::Inode>,
+    list_ptr: usize,
+    size: usize,
+    token: usize,
+) -> isize {
     let data = {
         let mut out = Vec::new();
         let all = INODE_XATTRS.lock();
@@ -1017,6 +1037,7 @@ pub(crate) fn resolve_abs_path(dirfd: isize, path: &str) -> Result<Option<String
     resolve_proc_magic_intermediate_abs_path(&abs).map(Some)
 }
 
+/// is path on Read only file sytem?
 pub(crate) fn rofs_for_path(dirfd: isize, path: &str) -> bool {
     resolve_abs_path(dirfd, path)
         .ok()

@@ -19,7 +19,7 @@ use crate::{
             SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit,
         },
     },
-    time::{get_time, get_time_ms},
+    time::get_time,
     trap::get_current_token,
 };
 use alloc::vec::Vec;
@@ -55,6 +55,7 @@ pub fn syscall_gettid_linux() -> isize {
     current_linux_tid() as isize
 }
 
+#[allow(dead_code)]
 pub fn syscall_mount(
     _special: usize,
     _dir: usize,
@@ -65,6 +66,7 @@ pub fn syscall_mount(
     crate::syscall::filesystem::syscall_mount_impl(_special, _dir, _fstype, _flags, _data)
 }
 
+#[allow(dead_code)]
 pub fn syscall_umount2(_special: usize, _flags: usize) -> isize {
     crate::syscall::filesystem::syscall_umount2_impl(_special, _flags)
 }

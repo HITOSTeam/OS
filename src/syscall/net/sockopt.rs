@@ -1,4 +1,3 @@
-use core::any::Any;
 use core::mem::size_of;
 
 use crate::bpf::get_prog_clone;

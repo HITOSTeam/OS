@@ -10,6 +10,7 @@ pub const USER_HEAP_GAP: usize = 64 * 1024; // 64 KiB
 pub const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32KB
 // Kernel heap must be large enough for fork-heavy LTP runs on glibc.
 // 256 MiB reduces allocator OOMs in long `fork13` stress loops.
+#[allow(dead_code)]
 pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
@@ -35,9 +36,11 @@ pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 #[cfg(target_arch = "loongarch64")]
 pub const KERNEL_STACK_TOP: usize = 0xffff_ffff_ffff_f000;
 pub const MAX_HARTS: usize = 4;
+#[allow(dead_code)]
 pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;
 /// Return (bottom, top) of a kernel stack in kernel space. Bottom is smaller while top is bigger.
 /// and we use top - xx to push data...
+#[allow(dead_code)]
 pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
     #[cfg(target_arch = "loongarch64")]
     let top = KERNEL_STACK_TOP - app_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
@@ -85,6 +88,7 @@ pub const DEVICE_TREE_MAX_SIZE: usize = 0x200000;
 static PHYS_MEM_START: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_START);
 static PHYS_MEM_END: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_END);
 
+#[allow(dead_code)]
 pub fn set_phys_mem_range(start: usize, end: usize) {
     if end > start {
         PHYS_MEM_START.store(start, Ordering::SeqCst);

@@ -1,21 +1,16 @@
 use super::{
-    AT_EMPTY_PATH, AT_SYMLINK_FOLLOW, AtPath, MapPermission,
-    OSInode, ProcMagicLinkFile, PseudoDir,
-    S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
-    SyscallError,
-    align_up, apply_umask, cgroup_mkdir, cgroup_rmdir,
-    current_effective_uid_gid, current_fsuid_gid, current_process,
-    defer_unlink_open_file, do_renameat, do_renameat_exchange, dt_type_from_ext4,
-    err, ext4_err_to_errno, ext4_lock, final_non_empty_component,
+    align_up, apply_umask, cgroup_mkdir, cgroup_rmdir, current_effective_uid_gid,
+    current_fsuid_gid, current_process, defer_unlink_open_file, do_renameat, do_renameat_exchange,
+    dt_type_from_ext4, err, ext4_err_to_errno, ext4_lock, final_non_empty_component,
     get_current_token, get_fd_file, gid_for_created_inode, hardlink_cross_mount,
     inode_is_immutable_or_append, inode_is_rofs_mount_root, inode_logical_path,
-    inode_mode_allows_uid_gid, maybe_update_inode_atime, min,
-    mode_for_created_file, open_pseudo, parent_forces_gid_inherit,
-    parse_proc_fd_for_current_process, path_is_mount_point, proc_path_for_at,
-    read_u16_le, read_u32_le, read_user_cstring, resolve_abs_path,
-    resolve_at_inode, resolve_at_path, resolve_parent_and_name,
-    rofs_for_path, shm_object_name, shm_remove, sticky_rename_allowed,
-    translated_byte_buffer, try_copy_to_user,
+    inode_mode_allows_uid_gid, maybe_update_inode_atime, min, mode_for_created_file, open_pseudo,
+    parent_forces_gid_inherit, parse_proc_fd_for_current_process, path_is_mount_point,
+    proc_path_for_at, read_u16_le, read_u32_le, read_user_cstring, resolve_abs_path,
+    resolve_at_inode, resolve_at_path, resolve_parent_and_name, rofs_for_path, shm_object_name,
+    shm_remove, sticky_rename_allowed, translated_byte_buffer, try_copy_to_user, AtPath,
+    MapPermission, OSInode, ProcMagicLinkFile, PseudoDir, SyscallError, AT_EMPTY_PATH,
+    AT_SYMLINK_FOLLOW, S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK,
 };
 
 /// Reads a symlink target by pathname or, with `AT_EMPTY_PATH`, directly from an fd.
@@ -588,7 +583,11 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     if let AtPath::PseudoAbs(abs) = &at {
         // Minimal `/dev/shm` support for POSIX `shm_unlink`.
         if abs == "/dev/shm" || abs == "/dev/shm/" {
-            return if remove_dir { err(SyscallError::EROFS) } else { err(SyscallError::EISDIR) };
+            return if remove_dir {
+                err(SyscallError::EROFS)
+            } else {
+                err(SyscallError::EISDIR)
+            };
         }
         if crate::fs::is_cgroup_pseudo_path(abs) {
             return if remove_dir {
@@ -603,7 +602,11 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
             if remove_dir {
                 return err(SyscallError::ENOTDIR);
             }
-            return if shm_remove(name) { 0 } else { err(SyscallError::ENOENT) };
+            return if shm_remove(name) {
+                0
+            } else {
+                err(SyscallError::ENOENT)
+            };
         }
         if crate::fs::pseudo_dev_dir_exists(abs) {
             return if remove_dir {

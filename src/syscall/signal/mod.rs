@@ -35,7 +35,7 @@ use crate::{
         signal::{
             RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGKILL_NUM,
             SIGSTOP_NUM, SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags,
-            can_signal_process, has_unmasked_pending, kill, kill_current, pending_unmasked_bits,
+            can_signal_process, kill, kill_current, pending_unmasked_bits,
             set_signal, set_signal_mask, signal_bit, take_first_unmasked,
         },
         task_block::{SigSavedContext, TaskControlBlock, TaskStatus},

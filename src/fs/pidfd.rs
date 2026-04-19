@@ -4,12 +4,12 @@ use core::any::Any;
 use crate::{
     mm::UserBuffer,
     task::{
-        manager::{pid2process, wakeup_task},
+        manager::pid2process,
         task_block::TaskControlBlock,
     },
 };
 
-use super::{File, POLLIN, PollWaitQueue, wake_tasks};
+use super::{File, POLLIN, wake_tasks};
 
 /// pidfd object used by `pidfd_open(2)` and `waitid(P_PIDFD, ...)`.
 pub struct PidFdFile {

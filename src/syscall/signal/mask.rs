@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(dead_code)]
 pub fn syscall_sigaction(
     signum: i32,
     action: *const SignalAction,
@@ -22,6 +23,7 @@ pub fn syscall_sigaction(
     }
     set_signal(signum, action, old_action)
 }
+#[allow(dead_code)]
 pub fn syscall_sigprocmask(how: u32) -> isize {
     set_signal_mask(how)
 }

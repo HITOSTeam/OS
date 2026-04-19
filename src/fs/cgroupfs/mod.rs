@@ -90,7 +90,7 @@ pub(crate) use registry::CgroupRegistry;
 pub(crate) use node::{CgroupNode, CgroupThreadId, LegacyFreezerState};
 pub(crate) use mount_state::CgroupMountState;
 pub(crate) use helpers::*;
-pub(crate) use file::{CgroupFileInner, CgroupFileKind, build_dir_entries};
+pub(crate) use file::{CgroupFileKind, build_dir_entries};
 pub use file::{CgroupFile, cgroup_maybe_block_current};
 
 #[derive(Clone)]

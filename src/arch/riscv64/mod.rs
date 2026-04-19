@@ -69,6 +69,7 @@ pub fn console_putchar(c: usize) {
     crate::sbi::console_putchar(c);
 }
 
+#[allow(dead_code)]
 pub fn console_flush() {
     // SBI console doesn't need an explicit flush.
 }
@@ -89,6 +90,7 @@ pub fn shutdown() -> ! {
     crate::sbi::shutdown();
 }
 
+#[allow(dead_code)]
 pub fn hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> usize {
     crate::sbi::hart_start(hart_id, start_addr, opaque)
 }

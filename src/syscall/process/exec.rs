@@ -550,7 +550,9 @@ fn execve_with_inode(
                     Ok(data) => data,
                     Err(e) => return e,
                 };
-                if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec) {
+                if let Err(e) =
+                    process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec)
+                {
                     return e;
                 }
             } else {
@@ -593,7 +595,8 @@ fn execve_with_inode(
                 Ok(data) => data,
                 Err(e) => return e,
             };
-            if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec) {
+            if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec)
+            {
                 return e;
             }
         } else {
@@ -620,6 +623,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     };
 
     let mut args_vec: Vec<String> = Vec::new();
+    // try to read the arg from the args vector(arg_v)
     if argv_ptr != 0 {
         let mut i = 0usize;
         loop {

@@ -1,10 +1,7 @@
 use super::{
-    SyscallError, err,
-    get_current_token,
-    do_getxattr, do_listxattr, do_removexattr, do_setxattr,
-    read_user_xattr_name, read_user_xattr_value,
-    resolve_xattr_fd_inode, resolve_xattr_path_inode,
-    xattr_is_user_namespace,
+    do_getxattr, do_listxattr, do_removexattr, do_setxattr, err, get_current_token,
+    read_user_xattr_name, read_user_xattr_value, resolve_xattr_fd_inode, resolve_xattr_path_inode,
+    xattr_is_user_namespace, SyscallError,
 };
 
 /// Sets an extended attribute on the target path after following the final symlink.

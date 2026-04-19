@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use core::any::Any;
 use core::mem::size_of;
 
 use crate::fs::NetSocketFile;

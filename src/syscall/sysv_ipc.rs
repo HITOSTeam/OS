@@ -69,30 +69,37 @@ static RUNTIME_SEMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNI);
 static RUNTIME_SEMOPM_LIMIT: AtomicUsize = AtomicUsize::new(SEMOPM);
 
 
+#[allow(dead_code)]
 pub fn msgmax_limit() -> usize {
     MSGMAX
 }
 
+#[allow(dead_code)]
 pub fn msgmnb_limit() -> usize {
     MSGMNB
 }
 
+#[allow(dead_code)]
 pub fn msgmni_limit() -> usize {
     MSGMNI
 }
 
+#[allow(dead_code)]
 pub fn semmsl_limit() -> usize {
     SEMMSL
 }
 
+#[allow(dead_code)]
 pub fn semmns_limit() -> usize {
     SEMMNS
 }
 
+#[allow(dead_code)]
 pub fn semopm_limit() -> usize {
     SEMOPM
 }
 
+#[allow(dead_code)]
 pub fn semmni_limit() -> usize {
     SEMMNI
 }
@@ -754,7 +761,6 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
                 return err(SyscallError::EPERM);
             }
             let wake = mgr.remove_queue(msqid);
-            drop(mgr);
             drop(managers);
             for task in wake {
                 wakeup_task(task);
@@ -1103,7 +1109,6 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
                 return err(SyscallError::EPERM);
             }
             let wake = mgr.remove_set(semid);
-            drop(mgr);
             drop(managers);
             for task in wake {
                 wakeup_task(task);

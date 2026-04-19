@@ -46,6 +46,7 @@ impl EventFdFile {
         }
     }
 
+    #[allow(dead_code)]
     pub fn nonblock(&self) -> bool {
         self.nonblock
     }

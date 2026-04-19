@@ -1,21 +1,17 @@
 use super::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap,
-    FS_APPEND_FL, FS_IMMUTABLE_FL, Mutex, OSInode,
-    O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOATIME, O_NONBLOCK, O_RDONLY, O_TMPFILE, O_TRUNC, O_WRONLY,
-    Ordering, PID2PCB, SIGXFSZ_NUM,
-    S_IFBLK, S_IFCHR, S_IFMT,
-    String, SyscallError, TMPFILE_SEQ, Vec,
     cgroup_rename, current_effective_uid_gid, current_files_process, current_fsuid_gid,
-    current_in_group, current_process, current_timespec,
-    empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock,
-    fifo_pipe_state_for_inode, file_lock_key_from_inode, get_current_token,
-    inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
-    is_inode_currently_executed_locked, lock_executing_inodes,
-    maybe_dispatch_proc_fd_at, maybe_signal_lease_break, note_inode_path_hint,
-    open_pseudo, path_is_nodev, path_is_rofs, pseudo_path_exists_result,
-    queue_process_signal, read_user_cstring, register_deferred_unlink_cleanup,
-    resolve_at_inode, resolve_at_path, resolve_parent_and_name,
-    rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
+    current_in_group, current_process, current_timespec, empty_path_fd_for_at_op, err,
+    ext4_err_to_errno, ext4_lock, fifo_pipe_state_for_inode, file_lock_key_from_inode,
+    get_current_token, inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
+    is_inode_currently_executed_locked, lock_executing_inodes, maybe_dispatch_proc_fd_at,
+    maybe_signal_lease_break, note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs,
+    pseudo_path_exists_result, queue_process_signal, read_user_cstring,
+    register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
+    rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked, Arc, AtPath,
+    BTreeMap, Mutex, OSInode, Ordering, String, SyscallError, Vec, AT_EMPTY_PATH, AT_FDCWD,
+    AT_SYMLINK_NOFOLLOW, FS_APPEND_FL, FS_IMMUTABLE_FL, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOATIME,
+    O_NONBLOCK, O_RDONLY, O_TMPFILE, O_TRUNC, O_WRONLY, PID2PCB, SIGXFSZ_NUM, S_IFBLK, S_IFCHR,
+    S_IFMT, TMPFILE_SEQ,
 };
 use alloc::vec;
 use lazy_static::lazy_static;
@@ -58,9 +54,9 @@ pub(crate) struct AcctState {
     pub(crate) inode: alloc::sync::Arc<ext4_fs::Inode>,
 }
 
-
 lazy_static! {
-    pub(crate) static ref INODE_TIMES: Mutex<BTreeMap<u64, InodeTimes>> = Mutex::new(BTreeMap::new());
+    pub(crate) static ref INODE_TIMES: Mutex<BTreeMap<u64, InodeTimes>> =
+        Mutex::new(BTreeMap::new());
     pub(crate) static ref INODE_XATTRS: Mutex<BTreeMap<u64, BTreeMap<String, Vec<u8>>>> =
         Mutex::new(BTreeMap::new());
     pub(crate) static ref INODE_FSFLAGS: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
@@ -262,7 +258,6 @@ pub(crate) fn open_existing_target_path(
     )
 }
 
-
 /// Linux `faccessat(2)` (syscall 48 on riscv64).
 ///
 /// Used by busybox `which` and shells to locate executables.
@@ -376,7 +371,10 @@ pub(crate) fn inode_eq(a: &Arc<ext4_fs::Inode>, b: &Arc<ext4_fs::Inode>) -> bool
     a.device_id() == b.device_id() && a.inode_num() == b.inode_num()
 }
 
-pub(crate) fn path_is_descendant_of(dir: Arc<ext4_fs::Inode>, ancestor: &Arc<ext4_fs::Inode>) -> bool {
+pub(crate) fn path_is_descendant_of(
+    dir: Arc<ext4_fs::Inode>,
+    ancestor: &Arc<ext4_fs::Inode>,
+) -> bool {
     let mut cur = dir;
     for _ in 0..256 {
         if inode_eq(&cur, ancestor) {
@@ -540,7 +538,12 @@ pub(crate) fn do_renameat(
     }
 }
 
-pub(crate) fn do_renameat_exchange(olddirfd: isize, old_s: &str, newdirfd: isize, new_s: &str) -> isize {
+pub(crate) fn do_renameat_exchange(
+    olddirfd: isize,
+    old_s: &str,
+    newdirfd: isize,
+    new_s: &str,
+) -> isize {
     let old_at = match resolve_at_path(olddirfd, old_s) {
         Ok(v) => v,
         Err(e) => return e,
@@ -644,14 +647,11 @@ pub(crate) fn do_renameat_exchange(olddirfd: isize, old_s: &str, newdirfd: isize
 
 /// Linux `renameat2(2)` (syscall 276 on riscv64).
 
-
 /// Linux `close_range(2)` (syscall 436 on riscv64/loongarch64).
 ///
 /// Supported flags:
 /// - `CLOSE_RANGE_UNSHARE` (materialize a private fd table before update)
 /// - `CLOSE_RANGE_CLOEXEC`
-
-
 
 pub(crate) fn mirror_inode_write_to_current_mmaps(
     os_inode: &OSInode,
@@ -734,16 +734,9 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
 ///
 /// Unlike `write(2)`, this does not update the file offset.
 
-
-
-
 /// Linux `chroot(2)` (syscall 51 on riscv64/loongarch64).
 
-
 /// Linux `fchdir(2)` (syscall 50 on riscv64/loongarch64).
-
-
-
 
 pub(crate) fn fsize_limit_allows(new_len: usize) -> Result<(), isize> {
     let limit = {
@@ -951,7 +944,11 @@ pub(crate) fn write_zeros_range(inode: &Arc<ext4_fs::Inode>, offset: usize, len:
     0
 }
 
-pub(crate) fn punch_hole_keep_size(inode: &Arc<ext4_fs::Inode>, offset: usize, len: usize) -> isize {
+pub(crate) fn punch_hole_keep_size(
+    inode: &Arc<ext4_fs::Inode>,
+    offset: usize,
+    len: usize,
+) -> isize {
     let old_size = {
         let _ext4_guard = ext4_lock();
         inode.size() as usize

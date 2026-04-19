@@ -17,7 +17,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::mm::{
-    UserBuffer, read_user_value, try_copy_from_user, try_copy_to_user, try_read_user_value,
+    UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value,
     try_write_user_value,
 };
 use crate::syscall::filesystem::normalize_path;
@@ -29,12 +29,9 @@ use crate::task::processor::{
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::trap::get_current_token;
 use crate::syscall::error::{SyscallError, err};
-use crate::{
-    bpf::get_prog_clone,
-    fs::{
-        File, NetSocketFile, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, ext4_lock,
-        find_path_in_roots, make_socketpair, wake_tasks,
-    },
+use crate::fs::{
+    File, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, ext4_lock, find_path_in_roots,
+    make_socketpair, wake_tasks,
 };
 
 pub(super) const AF_UNIX: u16 = 1;
@@ -414,6 +411,7 @@ impl UnixSocketFile {
         false
     }
 
+    #[allow(dead_code)]
     pub(crate) fn poll_writable(&self) -> bool {
         if self.is_stream_like() {
             let (listening, stream_end) = {
@@ -660,7 +658,7 @@ impl NetlinkSocketFile {
 
     pub(super) fn recv_packet(
         &self,
-        len: usize,
+        _len: usize,
         flags: usize,
     ) -> Result<[u8; MQ_THREAD_NOTIFY_COOKIE_LEN], isize> {
         let peek = (flags & MSG_PEEK) != 0;
@@ -688,10 +686,12 @@ impl NetlinkSocketFile {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn poll_readable(&self) -> bool {
         !self.state.lock().messages.is_empty()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn poll_writable(&self) -> bool {
         true
     }

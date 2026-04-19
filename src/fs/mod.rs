@@ -647,7 +647,7 @@ pub use cgroupfs::{
     cgroup_exit_thread, cgroup_fork_precheck, cgroup_logical_path_for_file,
     cgroup_maybe_block_current, cgroup_mkdir, cgroup_mount, cgroup_proc_cgroups_content,
     cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
-    legacy_cpu_fair_group, open_cgroup_pseudo,
+    legacy_cpu_fair_group,
 };
 pub use dummy::DummyFile;
 pub use eventfd::EventFdFile;
@@ -659,7 +659,8 @@ pub(crate) use timerfd::{
     cancel_realtime_timerfds_on_set, has_pending_timerfds, process_timerfd_expirations,
 };
 pub(crate) use pidfd::wake_pidfd_poll_waiters;
-pub use inode::{EXT4_FS, OSInode, OpenFlags, ROOT_INODE, USER_INODE, list_apps, open_file};
+#[allow(unused_imports)]
+pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, inode_path_hint,
     inode_path_in_roots, note_inode_path_hint, path_resolves_to_inode,
@@ -687,15 +688,14 @@ pub(crate) use procfs::resolve_proc_magic_intermediate_abs_path;
 pub use pseudo::PseudoBlock;
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub(crate) use pseudo::{
-    open_pseudo_dev_dir, pseudo_block_is_read_only, pseudo_block_note_sync,
+    pseudo_block_is_read_only, pseudo_block_note_sync,
     pseudo_block_read_ahead, pseudo_block_set_read_ahead, pseudo_block_set_read_only,
-    pseudo_block_stat_snapshot, pseudo_dev_dir_entries, pseudo_dev_dir_exists,
+    pseudo_dev_dir_exists,
     pseudo_dev_dir_mkdir, pseudo_dev_dir_rmdir, shm_create, shm_create_anonymous, shm_get,
-    shm_list, shm_remove,
+    shm_remove,
 };
 pub use socketpair::{SocketPairEnd, make_socketpair};
 pub use stdio::{Stdin, Stdout};
 pub use tty::{
-    LinuxTermio, LinuxTermios, PtyMasterFile, PtySlaveFile, TtyFile, list_dev_pts, open_dev_ptmx,
-    open_dev_pts, open_dev_tty,
+    LinuxTermio, LinuxTermios, PtyMasterFile, PtySlaveFile, TtyFile,
 };

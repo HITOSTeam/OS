@@ -178,6 +178,7 @@ pub fn syscall_sysinfo(info: usize) -> isize {
 
 /// Linux-compatible gethostname behavior used by some musl paths:
 /// return err(SyscallError::ENAMETOOLONG) if the provided buffer cannot hold the full name.
+#[allow(dead_code)]
 pub fn syscall_gethostname(name: usize, len: usize) -> isize {
     if name == 0 {
         return err(SyscallError::EFAULT);

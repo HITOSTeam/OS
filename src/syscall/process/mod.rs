@@ -35,7 +35,7 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        ForkError, ProcessControlBlock,
+        ProcessControlBlock,
         manager::{
             PID2PCB, add_task, pid2process, remove_inactive_task, select_hart_for_new_task,
             wakeup_task,
@@ -49,7 +49,7 @@ use crate::{
             MAX_SIG, RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,
             SignalFlags, pending_unmasked_bits, queue_process_signal,
         },
-        task_block::{TaskAllocError, TaskControlBlock, TaskStatus},
+        task_block::{TaskControlBlock, TaskStatus},
     },
     trap::{get_current_token, trap_handler},
 };
@@ -167,6 +167,7 @@ pub(super) fn debug_task_ref_breakdown(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn is_inode_currently_executed(device_id: usize, inode_num: u32) -> bool {
     if device_id == 0 && inode_num == 0 {
         return false;

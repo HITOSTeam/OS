@@ -1,12 +1,11 @@
 use super::{
-    AT_FDCWD, AtPath, CgroupFile, FS_APPEND_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL,
-    File, NamespaceFile, OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile,
-    PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile,
-    RtcFile, SyscallError, TtyFile,
-    current_fsuid_gid, err, ext4_lock, get_current_token, get_fd_file,
-    get_inode_times, inode_fs_flags, inode_rdev_for_mode, inode_visible_size,
-    linux_dev_major, linux_dev_minor, open_pseudo, resolve_at_inode, resolve_at_path,
-    translated_mutref, try_read_user_value, try_write_user_value,
+    current_fsuid_gid, err, ext4_lock, get_current_token, get_fd_file, get_inode_times,
+    inode_fs_flags, inode_rdev_for_mode, inode_visible_size, linux_dev_major, linux_dev_minor,
+    open_pseudo, resolve_at_inode, resolve_at_path, translated_mutref, try_read_user_value,
+    try_write_user_value, AtPath, CgroupFile, File, NamespaceFile, OSInode, Pipe,
+    ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
+    PtyMasterFile, PtySlaveFile, RtcFile, SyscallError, TtyFile, AT_FDCWD, FS_APPEND_FL,
+    FS_IMMUTABLE_FL, FS_NODUMP_FL,
 };
 
 #[repr(C)]
@@ -16,6 +15,7 @@ pub(crate) struct VmIoVec {
     pub(crate) iov_len: usize,
 }
 
+/// Reads one `iovec`/`vmsplice` segment descriptor from userspace.
 pub(crate) fn read_vm_iovec(token: usize, iov_ptr: usize, index: usize) -> Result<VmIoVec, isize> {
     let iov_size = core::mem::size_of::<VmIoVec>();
     let Some(off) = index
@@ -26,10 +26,6 @@ pub(crate) fn read_vm_iovec(token: usize, iov_ptr: usize, index: usize) -> Resul
     };
     try_read_user_value(token, off as *const VmIoVec).ok_or_else(|| err(SyscallError::EFAULT))
 }
-
-/// Linux `vmsplice(2)` (syscall 75 on riscv64).
-
-/// Linux `copy_file_range(2)` (syscall 285 on riscv64).
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -48,6 +44,7 @@ pub(crate) struct KStatFs {
     pub(crate) f_spare: [i64; 4],
 }
 
+/// Fills a userspace `statfs` buffer with best-effort ext4 superblock data.
 pub(crate) fn fill_statfs(st_ptr: usize, mount_flags: i64) -> isize {
     if st_ptr == 0 {
         return err(SyscallError::EFAULT);
@@ -84,10 +81,6 @@ pub(crate) fn fill_statfs(st_ptr: usize, mount_flags: i64) -> isize {
     0
 }
 
-/// Linux `fstatfs(2)` (syscall 44 on riscv64).
-
-/// Linux `statfs(2)` (syscall 43 on riscv64).
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct TimeSpec {
@@ -98,6 +91,7 @@ pub(crate) struct TimeSpec {
 pub(crate) const UTIME_OMIT: i64 = 0x3ffffffe;
 pub(crate) const UTIME_NOW: i64 = 0x3fffffff;
 
+/// Resolves one userspace `timespec` into an explicit timestamp or "leave unchanged".
 pub(crate) fn resolve_utime(ts: TimeSpec, now: (i64, i64)) -> Result<Option<(i64, i64)>, isize> {
     match ts.nsec {
         UTIME_OMIT => Ok(None),
@@ -112,11 +106,6 @@ pub(crate) fn resolve_utime(ts: TimeSpec, now: (i64, i64)) -> Result<Option<(i64
         _ => Err(err(SyscallError::EINVAL)),
     }
 }
-
-/// Linux `utimensat(2)` (syscall 88 on riscv64).
-///
-/// Update inode timestamps for compatibility (busybox `touch`, libc tests).
-
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -176,13 +165,16 @@ pub(crate) struct Statx {
     pub(crate) __spare2: [u64; 14],
 }
 
+/// `statx(2)` mask selecting the basic metadata fields.
 pub(crate) const STATX_BASIC_STATS: u32 = 0x07ff;
+/// `statx(2)` attribute bits mirrored from inode flags.
 pub(crate) const STATX_ATTR_IMMUTABLE: u64 = 0x0000_0010;
 pub(crate) const STATX_ATTR_APPEND: u64 = 0x0000_0020;
 pub(crate) const STATX_ATTR_NODUMP: u64 = 0x0000_0040;
 
 pub(crate) const EXT4_ST_DEV: u64 = 1;
 
+/// Maps ext4 dirent file types to Linux `DT_*` values.
 pub(crate) fn dt_type_from_ext4(ftype: u8) -> u8 {
     match ftype {
         1 => 8,  // DT_REG
@@ -196,18 +188,23 @@ pub(crate) fn dt_type_from_ext4(ftype: u8) -> u8 {
     }
 }
 
+/// Rounds `x` up to the next multiple of `align`.
 pub(crate) fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
 
+/// Reads a little-endian `u32` from a short byte slice.
 pub(crate) fn read_u32_le(buf: &[u8]) -> u32 {
     u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
 }
 
+/// Reads a little-endian `u16` from a short byte slice.
 pub(crate) fn read_u16_le(buf: &[u8]) -> u16 {
     u16::from_le_bytes([buf[0], buf[1]])
 }
 
+/// Copies an arbitrary byte slice into userspace one byte at a time.
+#[allow(dead_code)]
 pub(crate) fn write_bytes_user(token: usize, mut dst: usize, bytes: &[u8]) {
     for b in bytes {
         *translated_mutref(token, dst as *mut u8) = *b;
@@ -215,6 +212,7 @@ pub(crate) fn write_bytes_user(token: usize, mut dst: usize, bytes: &[u8]) {
     }
 }
 
+/// Builds a `statx_timestamp`, clamping nanoseconds into the kernel ABI range.
 pub(crate) fn statx_timestamp(sec: i64, nsec: i64) -> StatxTimestamp {
     let ns = if nsec < 0 {
         0
@@ -230,6 +228,7 @@ pub(crate) fn statx_timestamp(sec: i64, nsec: i64) -> StatxTimestamp {
     }
 }
 
+/// Synthesizes `stat` metadata for a proc magic symlink from its target length.
 pub(crate) fn proc_symlink_kstat(link_len: usize) -> KStat {
     let st_size = link_len as i64;
     let st_blocks = if st_size <= 0 {
@@ -260,7 +259,10 @@ pub(crate) fn proc_symlink_kstat(link_len: usize) -> KStat {
     }
 }
 
-pub(crate) fn kstat_from_file(file: &alloc::sync::Arc<dyn File + Send + Sync>) -> Result<KStat, isize> {
+/// Synthesizes `stat` metadata for open descriptors across pseudo, proc, and ext4 files.
+pub(crate) fn kstat_from_file(
+    file: &alloc::sync::Arc<dyn File + Send + Sync>,
+) -> Result<KStat, isize> {
     if let Some(link) = file.as_any().downcast_ref::<ProcMagicLinkFile>() {
         return Ok(proc_symlink_kstat(link.target_len_hint()));
     }
@@ -442,6 +444,7 @@ pub(crate) fn kstat_from_file(file: &alloc::sync::Arc<dyn File + Send + Sync>) -
     })
 }
 
+/// Resolves an absolute path and produces the `stat` view userspace should observe.
 pub(crate) fn kstat_from_abs_path(abs: &str) -> Result<KStat, isize> {
     let at = resolve_at_path(AT_FDCWD, abs)?;
     if let AtPath::PseudoAbs(_) = &at {
@@ -487,6 +490,7 @@ pub(crate) fn kstat_from_abs_path(abs: &str) -> Result<KStat, isize> {
     })
 }
 
+/// Resolves the effective target metadata exposed by a proc magic link.
 pub(crate) fn proc_magic_link_target_kstat(path: &str) -> Result<Option<KStat>, isize> {
     if !crate::fs::proc_magic_link_exists(path) {
         return Ok(None);
@@ -506,6 +510,7 @@ pub(crate) fn proc_magic_link_target_kstat(path: &str) -> Result<Option<KStat>, 
     kstat_from_abs_path(&target).map(Some)
 }
 
+/// Converts the internal `KStat` form into the Linux `statx` ABI layout.
 pub(crate) fn statx_from_kstat(st: &KStat) -> Statx {
     let stx_rdev_major = linux_dev_major(st.st_rdev);
     let stx_rdev_minor = linux_dev_minor(st.st_rdev);
@@ -561,6 +566,7 @@ pub(crate) fn statx_from_kstat(st: &KStat) -> Statx {
     }
 }
 
+/// Returns `stat` metadata for an already opened descriptor.
 pub(crate) fn kstat_from_fd(fd: usize) -> Result<KStat, isize> {
     let Some(file) = get_fd_file(fd) else {
         return Err(err(SyscallError::EBADF));

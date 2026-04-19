@@ -484,7 +484,7 @@ impl PseudoShmFile {
         if len == 0 {
             return;
         }
-        let mut data = self.data.lock();
+        let data = self.data.lock();
         if offset >= data.len() {
             return;
         }
@@ -503,6 +503,7 @@ impl PseudoShmFile {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_memfd(&self) -> bool {
         self.data.lock().is_memfd
     }
@@ -648,6 +649,7 @@ impl PseudoFile {
         Self::new_static_with_writable(content, false)
     }
 
+    #[allow(dead_code)]
     pub fn new_static_rw(content: &str) -> Self {
         Self::new_static_with_writable(content, true)
     }

@@ -63,6 +63,7 @@ pub fn init_trap() {
 // so some sleeping task can be waked up.
 fn set_kernel_trap_entry() {
     unsafe extern "C" {
+        #[allow(dead_code)]
         fn alltraps();
         fn alltraps_k();
     }
@@ -88,6 +89,7 @@ fn set_user_trap_entry() {
     }
 }
 
+#[allow(dead_code)]
 fn enable_supervisor_interrupt() {
     // SAFETY: sstatus CSR write is valid in S-mode.
     unsafe {
@@ -205,7 +207,6 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
         LazyFaultResult::Oom => {
             drop(inner);
             exit_group_and_run_next(-9);
-            false
         }
         LazyFaultResult::Invalid => false,
     }
@@ -421,7 +422,6 @@ fn try_expand_mmap_growsdown(fault_va: usize, access: MapPermission) -> bool {
             LazyFaultResult::Oom => {
                 drop(inner);
                 exit_group_and_run_next(-9);
-                false
             }
             LazyFaultResult::Invalid => false,
         };

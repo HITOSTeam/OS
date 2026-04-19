@@ -35,7 +35,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     // Fully initialize the new thread (PCB slot + TrapContext) *before* enqueueing it.
     // Otherwise, another hart might schedule it and jump to user with an uninitialized TrapContext.
     let new_task_tid = {
-        let mut new_task_inner = new_task.borrow_mut();
+        let new_task_inner = new_task.borrow_mut();
         let Some(new_task_res) = new_task_inner.res.as_ref() else { return -1 };
         let new_task_tid = new_task_res.tid;
 

@@ -21,11 +21,13 @@ static BLK_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 static BLK_WRITE_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
+#[allow(dead_code)]
 pub fn enabled() -> bool {
     DEBUG_PERF
 }
 
 #[inline]
+#[allow(dead_code)]
 pub fn record_uart_bytes(bytes: usize) {
     if !DEBUG_PERF || bytes == 0 {
         return;
@@ -34,11 +36,13 @@ pub fn record_uart_bytes(bytes: usize) {
 }
 
 #[inline]
+#[allow(dead_code)]
 pub fn uart_flush_begin() -> usize {
     if DEBUG_PERF { arch::read_time() } else { 0 }
 }
 
 #[inline]
+#[allow(dead_code)]
 pub fn uart_flush_end(start: usize) {
     if !DEBUG_PERF {
         return;
