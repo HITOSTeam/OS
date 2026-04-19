@@ -117,10 +117,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         if let Err(e) = cgroup_fork_precheck(process.getpid()) {
             return e;
         }
-        let Some(new_task) =
-            TaskControlBlock::try_new_linux_thread(Arc::clone(&process)).map(Arc::new)
-        else {
-            return err(SyscallError::ENOMEM);
+        let new_task = match TaskControlBlock::try_new_linux_thread(Arc::clone(&process)) {
+            Ok(t) => Arc::new(t),
+            Err(e) => return err(SyscallError::from(e)),
         };
         new_task.set_cpu_id(select_hart_for_new_task());
 
@@ -215,8 +214,9 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     if let Err(e) = cgroup_fork_precheck(process.getpid()) {
         return e;
     }
-    let Some((child, task)) = process.fork_with_task(share_files, share_vm) else {
-        return err(SyscallError::ENOMEM);
+    let (child, task) = match process.fork_with_task(share_files, share_vm) {
+        Ok(pair) => pair,
+        Err(e) => return err(SyscallError::from(e)),
     };
     if (flags & CLONE_NEWIPC) != 0 {
         let (parent_ipc_ns_id, inherited_attaches) = {
@@ -382,7 +382,7 @@ pub fn syscall_vfork() -> isize {
         return e;
     }
     match process.fork() {
-        Some(child) => {
+        Ok(child) => {
             crate::log_if!(
                 DEBUG_SIGNAL,
                 info,
@@ -397,6 +397,6 @@ pub fn syscall_vfork() -> isize {
             }
             child.getpid() as isize
         }
-        None => -12,
+        Err(e) => err(SyscallError::from(e)),
     }
 }

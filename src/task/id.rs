@@ -95,6 +95,13 @@ lazy_static! {
 
 pub struct PidHandle(pub usize);
 
+/// Reason why PID allocation failed.
+#[derive(Debug, Clone, Copy)]
+pub enum PidAllocError {
+    /// All PIDs in [0, pid_max) are currently in use.
+    Exhausted,
+}
+
 pub fn pid_max() -> usize {
     clamp_pid_max(PID_MAX_VALUE.load(Ordering::Relaxed))
 }
@@ -109,8 +116,12 @@ pub fn set_pid_max(pid_max: usize) -> usize {
     clamped
 }
 
-pub fn pid_alloc() -> Option<PidHandle> {
-    Some(PidHandle(PID_ALLOCATOR.lock().alloc()?))
+pub fn pid_alloc() -> Result<PidHandle, PidAllocError> {
+    PID_ALLOCATOR
+        .lock()
+        .alloc()
+        .map(PidHandle)
+        .ok_or(PidAllocError::Exhausted)
 }
 
 impl Drop for PidHandle {

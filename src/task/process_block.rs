@@ -18,7 +18,7 @@ use crate::mm::{
 };
 use crate::println;
 use crate::task::condvar::Condvar;
-use crate::task::id::{pid_alloc, PidHandle};
+use crate::task::id::{pid_alloc, PidHandle, PidAllocError};
 use crate::task::manager::{
     add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
     PID2PCB,
@@ -28,7 +28,7 @@ use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
     RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN,
 };
-use crate::task::task_block::TaskControlBlock;
+use crate::task::task_block::{TaskAllocError, TaskControlBlock};
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
@@ -41,6 +41,40 @@ static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FORK_PRE_COW_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPC_NS_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_PID_NS_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Reason why `fork_impl()` failed.
+#[derive(Debug)]
+pub enum ForkError {
+    /// All PIDs in the PID space are in use.
+    PidExhausted,
+    /// RLIMIT_NPROC would be exceeded (not yet enforced).
+    RlimitNprocExceeded,
+    /// cgroup pids.max would be exceeded.
+    CgroupPidsMaxExceeded,
+    /// Kernel-stack frame allocation failed (OOM).
+    KernelStackOom,
+    /// Mapping the child's trap-context page failed (OOM).
+    TrapCxAllocFailed,
+    /// Cloning the parent address space failed (OOM).
+    VmCloneOom,
+}
+
+impl From<PidAllocError> for ForkError {
+    fn from(e: PidAllocError) -> Self {
+        match e {
+            PidAllocError::Exhausted => ForkError::PidExhausted,
+        }
+    }
+}
+
+impl From<TaskAllocError> for ForkError {
+    fn from(e: TaskAllocError) -> Self {
+        match e {
+            TaskAllocError::TrapCxAllocFailed => ForkError::TrapCxAllocFailed,
+            TaskAllocError::KernelStackOom => ForkError::KernelStackOom,
+        }
+    }
+}
 
 pub fn alloc_ipc_namespace_id() -> usize {
     NEXT_IPC_NS_ID.fetch_add(1, Ordering::Relaxed)
@@ -1318,12 +1352,12 @@ impl ProcessControlBlock {
 
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)
-            .expect("failed to parse init_proc ELF");
+        let (memory_set, ustack_base, entry_point, elf_aux) =
+            MemorySet::from_elf(elf_data).expect("failed to parse init_proc ELF");
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         // allocate a pid
-        let pid_handle = pid_alloc().expect("failed to allocate PID for init process");
+        let pid_handle = pid_alloc().expect("failed to allocate PID for init process (PID exhausted)");
         let pid = pid_handle.0;
         let args = vec![String::from("init_proc")];
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
@@ -1520,7 +1554,12 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>, envs: Vec<String>) -> Result<(), isize> {
+    pub fn exec(
+        self: &Arc<Self>,
+        elf_data: &[u8],
+        args: Vec<String>,
+        envs: Vec<String>,
+    ) -> Result<(), isize> {
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)?;
         self.exec_with_memory_set(
             memory_set,
@@ -1738,7 +1777,7 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         share_files: bool,
         share_vm: bool,
-    ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
+    ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
         let diag_enabled = DEBUG_FUTEX;
         let fork_start_cycles = if diag_enabled {
             crate::arch::read_time()
@@ -1820,9 +1859,7 @@ impl ProcessControlBlock {
             after_mem_cycles = crate::arch::read_time();
         }
         // alloc a pid
-        let Some(pid) = pid_alloc() else {
-            return None;
-        };
+        let pid = pid_alloc()?;
         let pid_value = pid.0;
         let inherited_owner = parent.files_owner.as_ref().and_then(Weak::upgrade);
         // remove parent's invalid table
@@ -1963,16 +2000,13 @@ impl ProcessControlBlock {
         drop(parent);
 
         // create main thread of child process (allocates a fresh kernel stack)
-        let task = match TaskControlBlock::try_new(
+        let task = Arc::new(TaskControlBlock::try_new(
             Arc::clone(&child),
             parent_ustack_base,
             // here we do not allocate trap_cx or ustack again
             // but mention that we allocate a new kstack here
             false,
-        ) {
-            Some(task) => Arc::new(task),
-            None => return None,
-        };
+        )?);
         // Distribute child processes across harts.
         task.set_cpu_id(select_hart_for_new_task());
         // attach task to child process
@@ -2048,15 +2082,15 @@ impl ProcessControlBlock {
                 );
             }
         }
-        Some((child, task))
+        Ok((child, task))
     }
 
     /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>) -> Option<Arc<Self>> {
+    pub fn fork(self: &Arc<Self>) -> Result<Arc<Self>, ForkError> {
         let (child, task) = self.fork_impl(false, false)?;
         // add this thread to scheduler
         add_task(task);
-        Some(child)
+        Ok(child)
     }
 
     /// Fork and return both the child process and its main task, without scheduling it.
@@ -2064,7 +2098,7 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         share_files: bool,
         share_vm: bool,
-    ) -> Option<(Arc<Self>, Arc<TaskControlBlock>)> {
+    ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
         self.fork_impl(share_files, share_vm)
     }
 

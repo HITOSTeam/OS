@@ -90,3 +90,32 @@ pub type SyscallResult = Result<usize, SyscallError>;
 pub fn err(e: SyscallError) -> isize {
     isize::from(e)
 }
+
+// ---------------------------------------------------------------------------
+// From impls for subsystem error types → SyscallError
+// ---------------------------------------------------------------------------
+
+impl From<crate::task::ForkError> for SyscallError {
+    fn from(e: crate::task::ForkError) -> Self {
+        use crate::task::ForkError;
+        match e {
+            ForkError::PidExhausted
+            | ForkError::RlimitNprocExceeded
+            | ForkError::CgroupPidsMaxExceeded => SyscallError::EAGAIN,
+
+            ForkError::KernelStackOom
+            | ForkError::TrapCxAllocFailed
+            | ForkError::VmCloneOom => SyscallError::ENOMEM,
+        }
+    }
+}
+
+impl From<crate::task::task_block::TaskAllocError> for SyscallError {
+    fn from(e: crate::task::task_block::TaskAllocError) -> Self {
+        use crate::task::task_block::TaskAllocError;
+        match e {
+            TaskAllocError::TrapCxAllocFailed
+            | TaskAllocError::KernelStackOom => SyscallError::ENOMEM,
+        }
+    }
+}

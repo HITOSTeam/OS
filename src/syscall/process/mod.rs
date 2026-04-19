@@ -35,7 +35,7 @@ use crate::{
         signal::{ERESTARTSYS, SA_RESTART},
     },
     task::{
-        ProcessControlBlock,
+        ForkError, ProcessControlBlock,
         manager::{
             PID2PCB, add_task, pid2process, remove_inactive_task, select_hart_for_new_task,
             wakeup_task,
@@ -49,7 +49,7 @@ use crate::{
             MAX_SIG, RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,
             SignalFlags, pending_unmasked_bits, queue_process_signal,
         },
-        task_block::{TaskControlBlock, TaskStatus},
+        task_block::{TaskAllocError, TaskControlBlock, TaskStatus},
     },
     trap::{get_current_token, trap_handler},
 };

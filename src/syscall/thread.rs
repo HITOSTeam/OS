@@ -21,15 +21,13 @@ use crate::{
 };
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
-    const ENOMEM: isize = -12;
     let task = current_task().expect("sys_thread_create: no current task");
     let Some(process) = task.process.upgrade() else { return -1 };
     let Some(ustack_base) = task.borrow_mut().res.as_ref().map(|r| r.ustack_base) else { return -1 };
     // create a new thread
-    let Some(new_task) =
-        TaskControlBlock::try_new(Arc::clone(&process), ustack_base, true).map(Arc::new)
-    else {
-        return ENOMEM;
+    let new_task = match TaskControlBlock::try_new(Arc::clone(&process), ustack_base, true) {
+        Ok(t) => Arc::new(t),
+        Err(e) => return err(SyscallError::from(e)),
     };
     // Spread newly created threads across harts (Linux-like: task has a target cpu).
     new_task.set_cpu_id(select_hart_for_new_task());

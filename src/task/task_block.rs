@@ -198,21 +198,31 @@ impl TaskControlBlockInner {
     }
 }
 
+/// Reason why `TaskControlBlock` allocation failed.
+#[derive(Debug, Clone, Copy)]
+pub enum TaskAllocError {
+    /// Mapping the per-thread trap-context (or user-stack) page failed (OOM).
+    TrapCxAllocFailed,
+    /// Kernel-stack frame allocation failed (OOM).
+    KernelStackOom,
+}
+
 impl TaskControlBlock {
     pub fn try_new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
         alloc_user_res: bool,
-    ) -> Option<Self> {
-        let res = TaskUserRes::try_new(Arc::clone(&process), ustack_base, alloc_user_res)?;
+    ) -> Result<Self, TaskAllocError> {
+        let res = TaskUserRes::try_new(Arc::clone(&process), ustack_base, alloc_user_res)
+            .ok_or(TaskAllocError::TrapCxAllocFailed)?;
         let trap_cx_ppn = res.trap_cx_ppn();
-        let kstack = kstack_alloc()?;
+        let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
         let process_nice = {
             let inner = process.borrow_mut();
             inner.scheduling.nice
         };
-        Some(Self {
+        let tcb = Self {
             process: Arc::downgrade(&process),
             kstack: Mutex::new(Some(kstack)),
             cpu_id: AtomicUsize::new(0),
@@ -260,12 +270,10 @@ impl TaskControlBlock {
                 fp_fcc: 0,
                 fp_valid: false,
             }),
-        })
-        .map(|tcb| {
-            TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-            maybe_log_tcb_inflight("alloc");
-            tcb
-        })
+        };
+        TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        maybe_log_tcb_inflight("alloc");
+        Ok(tcb)
     }
 
     pub fn new(
@@ -276,16 +284,17 @@ impl TaskControlBlock {
         Self::try_new(process, ustack_base, alloc_user_res).expect("OOM: TaskControlBlock::new")
     }
 
-    pub fn try_new_linux_thread(process: Arc<ProcessControlBlock>) -> Option<Self> {
-        let res = TaskUserRes::try_new_trap_cx_only(Arc::clone(&process))?;
+    pub fn try_new_linux_thread(process: Arc<ProcessControlBlock>) -> Result<Self, TaskAllocError> {
+        let res = TaskUserRes::try_new_trap_cx_only(Arc::clone(&process))
+            .ok_or(TaskAllocError::TrapCxAllocFailed)?;
         let trap_cx_ppn = res.trap_cx_ppn();
-        let kstack = kstack_alloc()?;
+        let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
         let process_nice = {
             let inner = process.borrow_mut();
             inner.scheduling.nice
         };
-        Some(Self {
+        let tcb = Self {
             process: Arc::downgrade(&process),
             kstack: Mutex::new(Some(kstack)),
             cpu_id: AtomicUsize::new(0),
@@ -333,12 +342,10 @@ impl TaskControlBlock {
                 fp_fcc: 0,
                 fp_valid: false,
             }),
-        })
-        .map(|tcb| {
-            TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-            maybe_log_tcb_inflight("alloc");
-            tcb
-        })
+        };
+        TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        maybe_log_tcb_inflight("alloc");
+        Ok(tcb)
     }
 
     pub fn new_linux_thread(process: Arc<ProcessControlBlock>) -> Self {
