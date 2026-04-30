@@ -1,3 +1,5 @@
+#[cfg(target_arch = "loongarch64")]
+use crate::arch::console_flush;
 use crate::arch::{console_putchar, disable_interrupts, restore_interrupts};
 use core::fmt::{self, Write};
 use spin::Mutex;
