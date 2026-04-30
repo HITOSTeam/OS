@@ -1,5 +1,7 @@
 //!Stdin & Stdout
 use super::File;
+#[cfg(target_arch = "loongarch64")]
+use crate::arch::console_flush;
 use crate::arch::{console_getchar, console_putchar};
 use crate::mm::UserBuffer;
 use crate::task::processor::suspend_current_and_run_next;
