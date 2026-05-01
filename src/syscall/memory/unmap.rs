@@ -7,6 +7,7 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
     if addr % PAGE_SIZE != 0 {
         return err(SyscallError::EINVAL);
     }
+    let files_snapshot = current_files().lock().iter_files_snapshot();
     let process = current_process();
     let mut inner = process.borrow_mut();
     let start = addr;
@@ -32,7 +33,7 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
             .get(&region.backing_id)
             .cloned()
             .or_else(|| {
-                find_inode_file_in_fd_table(&inner.fd_table, region.file_dev, region.file_ino)
+                find_inode_file_in_snapshot(&files_snapshot, region.file_dev, region.file_ino)
                     .or_else(|| find_open_inode_file(region.file_dev, region.file_ino))
             })
         else {
@@ -106,6 +107,7 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
     if !user_range_valid(addr, end) {
         return err(SyscallError::EINVAL);
     }
+    let files_snapshot = current_files().lock().iter_files_snapshot();
     let process = current_process();
     let mut inner = process.borrow_mut();
     if !inner
@@ -132,7 +134,7 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
             .get(&region.backing_id)
             .cloned()
             .or_else(|| {
-                find_inode_file_in_fd_table(&inner.fd_table, region.file_dev, region.file_ino)
+                find_inode_file_in_snapshot(&files_snapshot, region.file_dev, region.file_ino)
                     .or_else(|| find_open_inode_file(region.file_dev, region.file_ino))
             })
         else {

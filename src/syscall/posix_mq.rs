@@ -14,16 +14,17 @@ use crate::fs::{File, POLLIN, POLLOUT, PollWaitQueue, parse_proc_sys_usize, wake
 use crate::mm::{
     UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
 };
+use crate::syscall::error::{SyscallError, err};
 use crate::task::block_sleep::add_timer;
 use crate::task::manager::wakeup_task;
 use crate::task::processor::{
-    block_current_and_run_next, current_files_process, current_process, current_task,
+    block_current_and_run_next, current_files, current_files_and_nofile_limit, current_process,
+    current_task,
 };
 use crate::task::signal::{RT_SIG_MAX, has_unmasked_pending, signal_bit};
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::time::get_time;
 use crate::trap::get_current_token;
-use crate::syscall::error::{SyscallError, err};
 
 const O_ACCMODE: usize = 0x3;
 const O_RDONLY: usize = 0x0;
@@ -40,7 +41,6 @@ const SIGEV_NONE: i32 = 1;
 const SIGEV_THREAD: i32 = 2;
 const SIGEV_THREAD_ID: i32 = 4;
 const SI_MESGQ: i32 = -3;
-
 
 const MQ_NAME_MAX: usize = 255;
 const MQ_NAME_MAX_WITH_SLASH: usize = MQ_NAME_MAX + 1;
@@ -513,34 +513,26 @@ fn read_queue_name(ptr: usize) -> Result<String, isize> {
 }
 
 fn resolve_fd_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
-    let process = current_files_process();
-    {
-        let inner = process.borrow_mut();
-        if fd >= inner.fd_table.len() {
-            return Err(err(SyscallError::EBADF));
-        }
-        inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
-    }
+    current_files()
+        .lock()
+        .get_file(fd)
+        .ok_or(err(SyscallError::EBADF))
 }
 
 fn install_descriptor(desc: Arc<MqDescriptor>, oflag: usize) -> Result<usize, isize> {
     let file: Arc<dyn File + Send + Sync> = desc;
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd) = inner.alloc_fd() else {
-        return Err(err(SyscallError::EMFILE));
-    };
-    inner.fd_table[fd] = Some(file);
-    inner.ensure_fd_flags_len();
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (oflag & O_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     if (oflag & O_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK as u32;
+        descriptor_flags |= O_NONBLOCK as u32;
     }
-    inner.fd_flags[fd] = fd_flags;
-    Ok(fd)
+    let (files, limit) = current_files_and_nofile_limit();
+    files
+        .lock()
+        .install_fd(file, descriptor_flags, limit)
+        .ok_or(err(SyscallError::EMFILE))
 }
 
 fn deliver_notification(reg: NotifyRegistration, sender_pid: i32, sender_uid: u32) {

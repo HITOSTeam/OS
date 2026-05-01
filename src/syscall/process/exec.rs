@@ -6,12 +6,15 @@ fn is_inode_open_for_write(inode_num: u32) -> bool {
         let map = PID2PCB.lock();
         map.values().cloned().collect()
     };
+    let mut seen_tables = alloc::collections::BTreeSet::new();
     for process in processes {
         let inner = process.borrow_mut();
-        for file in inner.fd_table.iter() {
-            let Some(file) = file else {
-                continue;
-            };
+        let files = Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
+            continue;
+        }
+        for (_fd, file) in files.lock().iter_files_snapshot() {
             if !file.writable() {
                 continue;
             }

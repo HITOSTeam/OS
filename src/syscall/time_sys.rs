@@ -1,10 +1,11 @@
+use crate::syscall::error::{SyscallError, err};
 use crate::{
     config::clock_freq,
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
     fs::{POLLIN, POLLOUT, POLLPRI},
     mm::{
-        try_copy_from_user, try_copy_to_user, try_read_user_value,
-        try_write_user_value, write_user_value,
+        try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
+        write_user_value,
     },
     syscall::misc::decode_linux_tid,
     syscall::thread,
@@ -15,7 +16,7 @@ use crate::{
     task::signal::{SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
     task::{
         manager::pid2process,
-        processor::{current_files_process, current_process, current_task},
+        processor::{current_files, current_process, current_task},
         runtime::{
             current_task_cpu_time_ns, process_cpu_time_ns, process_task_by_index, task_cpu_time_ns,
         },
@@ -25,7 +26,6 @@ use crate::{
 };
 use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use spin::Mutex;
-use crate::syscall::error::{SyscallError, err};
 
 const CYCLICTEST_LOG_LIMIT: usize = 32;
 static CLOCK_NS_LOGS: AtomicUsize = AtomicUsize::new(0);
@@ -1108,7 +1108,7 @@ pub fn syscall_pselect6(
     let exceptfds = _exceptfds;
 
     let token = get_current_token();
-    let process = current_files_process();
+    let files = current_files();
     let task = current_task().unwrap();
 
     let mut restore_mask = None;
@@ -1268,14 +1268,7 @@ pub fn syscall_pselect6(
             if !want_r && !want_w && !want_e {
                 continue;
             }
-            let file = {
-                let inner = process.borrow_mut();
-                if fd >= inner.fd_table.len() {
-                    None
-                } else {
-                    inner.fd_table[fd].clone()
-                }
-            };
+            let file = files.lock().get_file(fd);
             let Some(file) = file else {
                 bad_fd = true;
                 break;

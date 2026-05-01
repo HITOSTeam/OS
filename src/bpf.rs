@@ -5,7 +5,7 @@ use spin::Mutex;
 use crate::{
     fs::File,
     mm::{UserBuffer, try_copy_from_user, try_copy_to_user},
-    task::processor::current_files_process,
+    task::processor::{current_files, current_files_and_nofile_limit},
     trap::get_current_token,
 };
 
@@ -740,20 +740,16 @@ fn copy_user_insns(user_ptr: usize, count: usize) -> Result<Vec<BpfInsn>, isize>
 }
 
 fn alloc_fd(file: Arc<dyn File + Send + Sync>) -> isize {
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd) = inner.alloc_fd() else {
-        return EMFILE;
-    };
-    inner.fd_table[fd] = Some(file);
-    inner.fd_flags[fd] = 0;
-    fd as isize
+    let (files, limit) = current_files_and_nofile_limit();
+    files
+        .lock()
+        .install_fd(file, 0, limit)
+        .map(|fd| fd as isize)
+        .unwrap_or(EMFILE)
 }
 
 fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    inner.fd_table.get(fd).and_then(|f| f.as_ref().cloned())
+    current_files().lock().get_file(fd)
 }
 
 fn with_map<R>(fd: usize, f: impl FnOnce(&BpfMapFile) -> R) -> Option<R> {

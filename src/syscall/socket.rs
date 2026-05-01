@@ -1,10 +1,10 @@
-use core::mem::size_of;
 use crate::syscall::error::{SyscallError, err};
+use core::mem::size_of;
 
 use crate::{
     fs::make_socketpair,
     mm::{try_write_user_value, write_user_value},
-    task::processor::current_files_process,
+    task::processor::current_files_and_nofile_limit,
     trap::get_current_token,
 };
 
@@ -50,7 +50,9 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
         AF_INET => {
             return match (sock_type, protocol) {
                 (SOCK_STREAM, 6) | (SOCK_DGRAM, 17) => err(SyscallError::EOPNOTSUPP),
-                (SOCK_DGRAM, 6) | (SOCK_STREAM, 1) | (SOCK_RAW, 0) => err(SyscallError::EPROTONOSUPPORT),
+                (SOCK_DGRAM, 6) | (SOCK_STREAM, 1) | (SOCK_RAW, 0) => {
+                    err(SyscallError::EPROTONOSUPPORT)
+                }
                 _ => err(SyscallError::EPROTONOSUPPORT),
             };
         }
@@ -61,27 +63,23 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
 
     let (end0, end1) = make_socketpair();
 
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd0) = inner.alloc_fd() else {
-        return err(SyscallError::EMFILE);
-    };
-    inner.fd_table[fd0] = Some(end0);
-    let Some(fd1) = inner.alloc_fd() else {
-        inner.fd_table[fd0] = None;
-        return err(SyscallError::EMFILE);
-    };
-    inner.fd_table[fd1] = Some(end1);
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if cloexec {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     if nonblock {
-        fd_flags |= O_NONBLOCK;
+        descriptor_flags |= O_NONBLOCK;
     }
-    inner.fd_flags[fd0] = fd_flags;
-    inner.fd_flags[fd1] = fd_flags;
-    drop(inner);
+    let (files, limit) = current_files_and_nofile_limit();
+    let mut files = files.lock();
+    let Some(fd0) = files.install_fd(end0, descriptor_flags, limit) else {
+        return err(SyscallError::EMFILE);
+    };
+    let Some(fd1) = files.install_fd(end1, descriptor_flags, limit) else {
+        let _ = files.clear_fd(fd0);
+        return err(SyscallError::EMFILE);
+    };
+    drop(files);
 
     // ABI: `int sv[2]` (i32).
     write_user_value(token, sv_ptr as *mut i32, &(fd0 as i32));

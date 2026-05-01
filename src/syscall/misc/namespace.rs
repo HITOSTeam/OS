@@ -1,7 +1,7 @@
 use crate::{
     fs::NamespaceFile,
     syscall::error::{SyscallError, err},
-    task::processor::{current_files_process, current_process},
+    task::processor::{current_files, current_process},
 };
 
 /// Linux `unshare(2)` (syscall 97 on riscv64).
@@ -50,14 +50,10 @@ pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
         return EBADF;
     }
 
-    let files_process = current_files_process();
     let file = {
-        let files_inner = files_process.borrow_mut();
         let idx = fd as usize;
-        if idx >= files_inner.fd_table.len() {
-            return EBADF;
-        }
-        let Some(file) = files_inner.fd_table[idx].as_ref().cloned() else {
+        let files = current_files();
+        let Some(file) = files.lock().get_file(idx) else {
             return EBADF;
         };
         file

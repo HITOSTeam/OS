@@ -10,23 +10,24 @@ use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{
-    cgroup_attach_fork_child, clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
-    File, MountNamespace, PollWaitQueue, Stdin, Stdout,
+    File, MountNamespace, PollWaitQueue, cgroup_attach_fork_child, clone_mount_namespace,
+    initial_mount_namespace, mount_namespace_id,
 };
 use crate::mm::{
-    read_user_value, translated_mutref, write_user_value, ElfAux, MemorySet, KERNEL_SPACE,
+    ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
 };
 use crate::println;
+use crate::task::FilesStruct;
 use crate::task::condvar::Condvar;
-use crate::task::id::{pid_alloc, PidHandle, PidAllocError};
+use crate::task::id::{PidAllocError, PidHandle, pid_alloc};
 use crate::task::manager::{
-    add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task, wakeup_task,
-    PID2PCB,
+    PID2PCB, add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task,
+    wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
-    RtSigAction, SignalAction, SignalActions, SignalFlags, RT_SIG_MAX, SIG_IGN,
+    RT_SIG_MAX, RtSigAction, SIG_IGN, SignalAction, SignalActions, SignalFlags,
 };
 use crate::task::task_block::{TaskAllocError, TaskControlBlock};
 use crate::trap::context::TrapContext;
@@ -291,9 +292,6 @@ impl MmapRegion {
 }
 
 lazy_static! {
-    /// owner_pid -> processes currently sharing that owner's file table.
-    static ref SHARED_FILES_SHARERS: SpinMutex<BTreeMap<usize, Vec<Weak<ProcessControlBlock>>>> =
-        SpinMutex::new(BTreeMap::new());
     /// child pid namespace id -> parent pid namespace id.
     static ref PID_NAMESPACE_PARENTS: RwLock<BTreeMap<usize, usize>> =
         RwLock::new(BTreeMap::new());
@@ -824,7 +822,7 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
     // Walk argv/envp to find auxv.
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-                                                                        // Skip envp pointers (NULL terminated).
+    // Skip envp pointers (NULL terminated).
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();
@@ -990,13 +988,10 @@ pub struct ProcessControlBlockInner {
     pub ioprio: u16,
     /// Per-process file mode creation mask (umask).
     pub umask: usize,
-    //
-    pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
-    /// Per-fd flags (e.g., FD_CLOEXEC, O_NONBLOCK).
-    pub fd_flags: Vec<u32>,
-    /// When set, file-descriptor operations are delegated to this owner process
-    /// (Linux CLONE_FILES-style shared file table).
-    pub files_owner: Option<Weak<ProcessControlBlock>>,
+    /// File descriptor table.  Regular fork snapshots this object; CLONE_FILES
+    /// shares the Arc, which lets lifetime follow references instead of a
+    /// process-owner forwarding model.
+    pub(crate) files: Arc<SpinMutex<FilesStruct>>,
     /// All POSIX resource limits.
     pub rlimits: ProcessResourceLimits,
     /// Process root directory (host-absolute path), used for `chroot`.
@@ -1050,101 +1045,9 @@ pub struct ProcessControlBlockInner {
 }
 
 impl ProcessControlBlockInner {
-    fn effective_fd_state_len(&self) -> usize {
-        let mut len = self.fd_table.len();
-        while len > 0 {
-            let idx = len - 1;
-            let has_file = self.fd_table[idx].is_some();
-            let has_flag = self.fd_flags.get(idx).copied().unwrap_or(0) != 0;
-            if has_file || has_flag {
-                break;
-            }
-            len -= 1;
-        }
-        len
-    }
-
-    fn trim_fd_state(&mut self) {
-        let len = self.effective_fd_state_len();
-        self.fd_table.truncate(len);
-        self.fd_flags.truncate(len);
-    }
-
-    pub fn snapshot_fd_state(&self) -> (Vec<Option<Arc<dyn File + Send + Sync>>>, Vec<u32>) {
-        let len = self.effective_fd_state_len();
-        let fd_table = self
-            .fd_table
-            .iter()
-            .take(len)
-            .map(|fd| fd.as_ref().map(Arc::clone))
-            .collect::<Vec<_>>();
-        let mut fd_flags = self.fd_flags.iter().take(len).copied().collect::<Vec<_>>();
-        if fd_flags.len() < fd_table.len() {
-            fd_flags.resize(fd_table.len(), 0);
-        }
-        (fd_table, fd_flags)
-    }
-
-    fn close_cloexec_fds(&mut self) {
-        const FD_CLOEXEC: u32 = 1;
-        self.ensure_fd_flags_len();
-        for (idx, flags) in self.fd_flags.iter_mut().enumerate() {
-            if (*flags & FD_CLOEXEC) != 0 {
-                self.fd_table[idx] = None;
-                *flags = 0;
-            }
-        }
-        self.trim_fd_state();
-    }
-
-    /// Keep `fd_flags` aligned with `fd_table` length.
-    pub fn ensure_fd_flags_len(&mut self) {
-        if self.fd_flags.len() < self.fd_table.len() {
-            self.fd_flags.resize(self.fd_table.len(), 0);
-        }
-    }
-
-    /// True when `fd` currently refers to an open file descriptor.
-    pub fn is_fd_open(&self, fd: usize) -> bool {
-        fd < self.fd_table.len() && self.fd_table[fd].is_some()
-    }
-
-    /// Close an fd slot and clear its per-fd flags.
-    ///
-    /// Returns `false` if `fd` is out of range.
-    pub fn clear_fd(&mut self, fd: usize) -> bool {
-        if fd >= self.fd_table.len() {
-            return false;
-        }
-        self.fd_table[fd] = None;
-        self.ensure_fd_flags_len();
-        self.fd_flags[fd] = 0;
-        self.trim_fd_state();
-        true
-    }
-
     #[allow(unused)]
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
-    }
-
-    pub fn alloc_fd(&mut self) -> Option<usize> {
-        let limit = self.rlimits.rlimit_nofile_cur as usize;
-        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
-            if fd >= limit {
-                return None;
-            }
-            self.ensure_fd_flags_len();
-            self.fd_flags[fd] = 0;
-            Some(fd)
-        } else {
-            if self.fd_table.len() >= limit {
-                return None;
-            }
-            self.fd_table.push(None);
-            self.fd_flags.push(0);
-            Some(self.fd_table.len() - 1)
-        }
     }
 
     pub fn alloc_tid(&mut self) -> usize {
@@ -1174,93 +1077,6 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
-    fn register_files_sharer(owner: &Arc<Self>, sharer: &Arc<Self>) {
-        if Arc::ptr_eq(owner, sharer) {
-            return;
-        }
-        let mut map = SHARED_FILES_SHARERS.lock();
-        let entry = map.entry(owner.getpid()).or_default();
-        entry.retain(|w| w.upgrade().is_some());
-        if entry
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|p| Arc::ptr_eq(&p, sharer))
-        {
-            return;
-        }
-        entry.push(Arc::downgrade(sharer));
-    }
-
-    fn unregister_files_sharer(owner_pid: usize, sharer: &Arc<Self>) {
-        let mut map = SHARED_FILES_SHARERS.lock();
-        let Some(entry) = map.get_mut(&owner_pid) else {
-            return;
-        };
-        entry.retain(|w| w.upgrade().is_some_and(|p| !Arc::ptr_eq(&p, sharer)));
-        if entry.is_empty() {
-            map.remove(&owner_pid);
-        }
-    }
-
-    fn clone_fd_table(
-        src: &[Option<Arc<dyn File + Send + Sync>>],
-    ) -> Vec<Option<Arc<dyn File + Send + Sync>>> {
-        src.iter()
-            .map(|fd| fd.as_ref().map(Arc::clone))
-            .collect::<Vec<_>>()
-    }
-
-    /// If this process owns a shared file table and exits, transfer ownership
-    /// to one alive sharer so CLONE_FILES users keep Linux-like semantics.
-    pub fn handoff_files_owner_on_exit(self: &Arc<Self>) {
-        let sharers = {
-            let mut map = SHARED_FILES_SHARERS.lock();
-            map.remove(&self.getpid()).unwrap_or_default()
-        };
-        if sharers.is_empty() {
-            return;
-        }
-        let mut alive = sharers
-            .into_iter()
-            .filter_map(|w| w.upgrade())
-            .filter(|p| !Arc::ptr_eq(p, self))
-            .collect::<Vec<_>>();
-        if alive.is_empty() {
-            return;
-        }
-
-        let (fd_table, fd_flags) = {
-            let inner = self.borrow_mut();
-            inner.snapshot_fd_state()
-        };
-
-        let new_owner = alive.swap_remove(0);
-        {
-            let mut inner = new_owner.borrow_mut();
-            inner.fd_table = Self::clone_fd_table(fd_table.as_slice());
-            inner.fd_flags = fd_flags.clone();
-            inner.files_owner = None;
-        }
-
-        let mut reassigned = Vec::new();
-        for sharer in alive {
-            {
-                let mut inner = sharer.borrow_mut();
-                inner.fd_table = Self::clone_fd_table(fd_table.as_slice());
-                inner.fd_flags = fd_flags.clone();
-                inner.files_owner = Some(Arc::downgrade(&new_owner));
-            }
-            reassigned.push(Arc::downgrade(&sharer));
-        }
-
-        if !reassigned.is_empty() {
-            let mut map = SHARED_FILES_SHARERS.lock();
-            let entry = map.entry(new_owner.getpid()).or_default();
-            entry.retain(|w| w.upgrade().is_some());
-            entry.extend(reassigned);
-        }
-    }
-
     fn terminate_other_threads(&self) {
         let current = current_task();
         let current_ptr = current.as_ref().map(Arc::as_ptr);
@@ -1305,51 +1121,39 @@ impl ProcessControlBlock {
         self.inner.try_lock()
     }
 
-    /// Resolve the process that currently owns this process's file table.
-    pub fn files_owner_process(self: &Arc<Self>) -> Arc<Self> {
-        let direct_owner = {
-            let mut inner = self.borrow_mut();
-            let owner = inner.files_owner.as_ref().and_then(Weak::upgrade);
-            if owner.is_none() {
-                inner.files_owner = None;
-            }
-            owner
-        };
-        if let Some(owner) = direct_owner {
-            if Arc::ptr_eq(&owner, self) {
-                return Arc::clone(self);
-            }
-            return owner;
-        }
-        Arc::clone(self)
+    pub(crate) fn files(&self) -> Arc<SpinMutex<FilesStruct>> {
+        let inner = self.borrow_mut();
+        Arc::clone(&inner.files)
     }
 
-    /// Materialize a private fd table for this process when it currently
-    /// shares another process's table (close_range UNSHARE semantics).
+    pub(crate) fn nofile_limit(&self) -> usize {
+        self.borrow_mut().rlimits.rlimit_nofile_cur as usize
+    }
+
+    /// Materialize a private descriptor table when this process shares one.
+    ///
+    /// The fast path is safe because fork/clone are the paths that add a
+    /// process-held reference to `files`, and they take the parent PCB lock
+    /// while doing so.  `unshare_files()` checks and replaces this process's
+    /// reference under the same PCB lock.  Temporary helper clones can only make
+    /// the count larger, causing an unnecessary but harmless copy.
     pub fn unshare_files(self: &Arc<Self>) {
-        let owner = self.files_owner_process();
-        if Arc::ptr_eq(&owner, self) {
-            return;
-        }
-        let (fd_table, fd_flags) = {
-            let owner_inner = owner.borrow_mut();
-            owner_inner.snapshot_fd_state()
-        };
-        let mut unshared = false;
-        {
-            let mut inner = self.borrow_mut();
-            if inner.files_owner.is_some() {
-                inner.fd_table = fd_table;
-                inner.fd_flags = fd_flags;
-                inner.files_owner = None;
-                unshared = true;
+        let old_files = {
+            let inner = self.borrow_mut();
+            if Arc::strong_count(&inner.files) == 1 {
+                return;
             }
-        }
-        if unshared {
-            Self::unregister_files_sharer(owner.getpid(), self);
+            Arc::clone(&inner.files)
+        };
+        let new_files = {
+            let files = old_files.lock();
+            Arc::new(SpinMutex::new(files.clone_private()))
+        };
+        let mut inner = self.borrow_mut();
+        if Arc::ptr_eq(&inner.files, &old_files) && Arc::strong_count(&inner.files) > 1 {
+            inner.files = new_files;
         }
     }
-
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point, elf_aux) =
@@ -1357,7 +1161,8 @@ impl ProcessControlBlock {
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         // allocate a pid
-        let pid_handle = pid_alloc().expect("failed to allocate PID for init process (PID exhausted)");
+        let pid_handle =
+            pid_alloc().expect("failed to allocate PID for init process (PID exhausted)");
         let pid = pid_handle.0;
         let args = vec![String::from("init_proc")];
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
@@ -1412,16 +1217,7 @@ impl ProcessControlBlock {
                 personality: 0,
                 ioprio: 0,
                 umask: 0,
-                fd_table: vec![
-                    // 0 -> stdin
-                    Some(Arc::new(Stdin)),
-                    // 1 -> stdout
-                    Some(Arc::new(Stdout)),
-                    // 2 -> stderr
-                    Some(Arc::new(Stdout)),
-                ],
-                fd_flags: vec![0; 3],
-                files_owner: None,
+                files: Arc::new(SpinMutex::new(FilesStruct::with_stdio())),
                 rlimits: ProcessResourceLimits {
                     rlimit_nofile_cur: 1024,
                     rlimit_nofile_max: 1024,
@@ -1621,11 +1417,11 @@ impl ProcessControlBlock {
             );
             self.terminate_other_threads();
         }
+        self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         {
             let mut inner = self.borrow_mut();
-            inner.close_cloexec_fds();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
             crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
             reset_signal_handlers_on_exec(&mut inner);
@@ -1705,11 +1501,11 @@ impl ProcessControlBlock {
             );
             self.terminate_other_threads();
         }
+        self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
         let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         {
             let mut inner = self.borrow_mut();
-            inner.close_cloexec_fds();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
             crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
             reset_signal_handlers_on_exec(&mut inner);
@@ -1803,6 +1599,7 @@ impl ProcessControlBlock {
         let sched_deadline = parent.scheduling.sched_deadline;
         let sched_period = parent.scheduling.sched_period;
         let nice = parent.scheduling.nice;
+        let cpu_affinity_mask = parent.scheduling.cpu_affinity_mask;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.sysv_shm_attaches.clone();
@@ -1861,30 +1658,43 @@ impl ProcessControlBlock {
         // alloc a pid
         let pid = pid_alloc()?;
         let pid_value = pid.0;
-        let inherited_owner = parent.files_owner.as_ref().and_then(Weak::upgrade);
-        // remove parent's invalid table
-        if parent.files_owner.is_some() && inherited_owner.is_none() {
-            parent.files_owner = None;
-        }
-        let (new_fd_table, new_fd_flags) = if let Some(owner) = inherited_owner.as_ref() {
-            if Arc::ptr_eq(owner, self) {
-                parent.snapshot_fd_state()
-            } else {
-                let owner_inner = owner.borrow_mut();
-                owner_inner.snapshot_fd_state()
-            }
-        } else {
-            parent.snapshot_fd_state()
-        };
-        let root_files_owner = inherited_owner
-            .as_ref()
-            .map(Arc::clone)
-            .unwrap_or_else(|| Arc::clone(self));
-        let child_files_owner = if share_files {
-            Some(Arc::downgrade(&root_files_owner))
-        } else {
-            None
-        };
+        let parent_files = Arc::clone(&parent.files);
+        let pgid = parent.pgid;
+        let sid = parent.sid;
+        let comm = parent.comm.clone();
+        let timer_slack_ns = parent.timer_slack_ns;
+        let uid = parent.uid;
+        let euid = parent.euid;
+        let suid = parent.suid;
+        let fsuid = parent.fsuid;
+        let gid = parent.gid;
+        let egid = parent.egid;
+        let sgid = parent.sgid;
+        let fsgid = parent.fsgid;
+        let supplementary_gids = parent.supplementary_gids.clone();
+        let cap_effective = parent.cap_effective;
+        let cap_permitted = parent.cap_permitted;
+        let cap_inheritable = parent.cap_inheritable;
+        let cap_bounding = parent.cap_bounding;
+        let personality = parent.personality;
+        let ioprio = parent.ioprio;
+        let umask = parent.umask;
+        let rlimits = parent.rlimits.clone();
+        let root = parent.root.clone();
+        let cwd = parent.cwd.clone();
+        let heap_start = parent.heap_start;
+        let brk = parent.brk;
+        let mmap_next = parent.mmap_next;
+        let mmap_areas = parent.mmap_areas.clone();
+        let mmap_backings = parent.mmap_backings.clone();
+        let next_mmap_backing_id = parent.next_mmap_backing_id;
+        let ipc_ns_id = parent.ipc_ns_id;
+        let uts_ns = Arc::clone(&parent.uts_ns);
+        let mnt_ns = Arc::clone(&parent.mnt_ns);
+        let cgroup_ns_root = parent.cgroup_ns_root.clone();
+        let pid_ns_id = parent.pid_ns_id;
+        let exec_inode_dev = parent.exec_inode_dev;
+        let exec_inode_num = parent.exec_inode_num;
         // Remember parent's user-stack base for the calling thread.
         let parent_ustack_base = crate::task::processor::current_task()
             .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.ustack_base()))
@@ -1897,6 +1707,16 @@ impl ProcessControlBlock {
                     .unwrap()
                     .ustack_base()
             });
+        // Fork state is not a single atomic snapshot across all PCB fields and
+        // the descriptor table.  Linux allows those domains to move separately;
+        // here that choice also keeps the PCB lock from nesting with the files
+        // lock.
+        drop(parent);
+        let child_files = if share_files {
+            Arc::clone(&parent_files)
+        } else {
+            Arc::new(SpinMutex::new(parent_files.lock().clone_private()))
+        };
 
         // create child process pcb
         let child = Arc::new(Self {
@@ -1904,8 +1724,8 @@ impl ProcessControlBlock {
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
                 dumped_core: false,
-                pgid: parent.pgid,
-                sid: parent.sid,
+                pgid,
+                sid,
                 did_exec: false,
                 stopped: false,
                 stop_signal: 0,
@@ -1917,54 +1737,52 @@ impl ProcessControlBlock {
                 children: Vec::new(),
                 exit_code: 0,
                 argv,
-                comm: parent.comm.clone(),
+                comm,
                 pdeath_signal: 0,
-                timer_slack_ns: parent.timer_slack_ns,
-                timer_slack_default_ns: parent.timer_slack_ns,
+                timer_slack_ns,
+                timer_slack_default_ns: timer_slack_ns,
                 start_time_ms: crate::time::get_time_ms(),
                 child_cpu_time_ns: 0,
-                uid: parent.uid,
-                euid: parent.euid,
-                suid: parent.suid,
-                fsuid: parent.fsuid,
-                gid: parent.gid,
-                egid: parent.egid,
-                sgid: parent.sgid,
-                fsgid: parent.fsgid,
-                supplementary_gids: parent.supplementary_gids.clone(),
-                cap_effective: parent.cap_effective,
-                cap_permitted: parent.cap_permitted,
-                cap_inheritable: parent.cap_inheritable,
-                cap_bounding: parent.cap_bounding,
-                personality: parent.personality,
-                ioprio: parent.ioprio,
-                umask: parent.umask,
-                fd_table: new_fd_table,
-                fd_flags: new_fd_flags,
-                files_owner: child_files_owner,
-                rlimits: parent.rlimits.clone(),
-                root: parent.root.clone(),
-                cwd: parent.cwd.clone(),
-                heap_start: parent.heap_start,
-                brk: parent.brk,
-                mmap_next: parent.mmap_next,
-                mmap_areas: parent.mmap_areas.clone(),
-                mmap_backings: parent.mmap_backings.clone(),
-                next_mmap_backing_id: parent.next_mmap_backing_id,
+                uid,
+                euid,
+                suid,
+                fsuid,
+                gid,
+                egid,
+                sgid,
+                fsgid,
+                supplementary_gids,
+                cap_effective,
+                cap_permitted,
+                cap_inheritable,
+                cap_bounding,
+                personality,
+                ioprio,
+                umask,
+                files: child_files,
+                rlimits,
+                root,
+                cwd,
+                heap_start,
+                brk,
+                mmap_next,
+                mmap_areas,
+                mmap_backings,
+                next_mmap_backing_id,
                 // Linux does not inherit mlock/mlockall locks across fork.
                 mlocked_ranges: Vec::new(),
                 mlockall_future: false,
-                ipc_ns_id: parent.ipc_ns_id,
-                uts_ns: Arc::clone(&parent.uts_ns),
-                mnt_ns: Arc::clone(&parent.mnt_ns),
-                cgroup_ns_root: parent.cgroup_ns_root.clone(),
-                pid_ns_id: parent.pid_ns_id,
+                ipc_ns_id,
+                uts_ns,
+                mnt_ns,
+                cgroup_ns_root,
+                pid_ns_id,
                 pid_ns_vpid: pid_value,
                 pid_ns_init: false,
                 sysv_shm_attaches: inherited_shm.clone(),
-                exec_inode_dev: parent.exec_inode_dev,
-                exec_inode_num: parent.exec_inode_num,
-                // is right here?
+                exec_inode_dev,
+                exec_inode_num,
+                // Pending signals are not inherited across fork.
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
@@ -1972,7 +1790,7 @@ impl ProcessControlBlock {
                 rt_sig_handlers,
                 scheduling: ProcessScheduling {
                     sched_policy,
-                    cpu_affinity_mask: parent.scheduling.cpu_affinity_mask,
+                    cpu_affinity_mask,
                     sched_priority,
                     sched_runtime,
                     sched_deadline,
@@ -1988,16 +1806,10 @@ impl ProcessControlBlock {
                 pidfd_poll_waiters: PollWaitQueue::default(),
             }),
         });
-        if share_files {
-            Self::register_files_sharer(&root_files_owner, &child);
-        }
-        crate::syscall::sysv_shm::fork_inherit(parent.ipc_ns_id, &inherited_shm);
+        crate::syscall::sysv_shm::fork_inherit(ipc_ns_id, &inherited_shm);
         if diag_enabled {
             after_pcb_cycles = crate::arch::read_time();
         }
-
-        // Drop parent lock before allocating child task resources.
-        drop(parent);
 
         // create main thread of child process (allocates a fresh kernel stack)
         let task = Arc::new(TaskControlBlock::try_new(

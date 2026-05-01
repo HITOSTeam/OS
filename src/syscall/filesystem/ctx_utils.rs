@@ -1,11 +1,10 @@
 use super::{
-    current_files_process, err, ext4_lock, find_path_in_roots, get_current_token,
-    mount_lookup_for_abs, read_user_cstring, register_rofs_mount, resolve_abs_path,
-    unregister_rofs_mount, Any, Arc, File, Mutex, String, SyscallError, UserBuffer,
-    MOUNT_ATTR_NOATIME, MOUNT_ATTR_NODEV, MOUNT_ATTR_NODIRATIME, MOUNT_ATTR_NOEXEC,
+    Any, Arc, File, MOUNT_ATTR_NOATIME, MOUNT_ATTR_NODEV, MOUNT_ATTR_NODIRATIME, MOUNT_ATTR_NOEXEC,
     MOUNT_ATTR_NOSUID, MOUNT_ATTR_NOSYMFOLLOW, MOUNT_ATTR_RDONLY, MOUNT_ATTR_STRICTATIME,
     MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_RDONLY,
-    MS_STRICTATIME,
+    MS_STRICTATIME, Mutex, String, SyscallError, UserBuffer, current_files_and_nofile_limit, err,
+    ext4_lock, find_path_in_roots, get_current_token, mount_lookup_for_abs, read_user_cstring,
+    register_rofs_mount, resolve_abs_path, unregister_rofs_mount,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -139,15 +138,12 @@ pub(crate) struct KMountAttr {
 /// Allocates an internal fd slot for mount-api helper files.
 pub(crate) fn alloc_internal_fd(
     file: Arc<dyn File + Send + Sync>,
-    fd_flags: u32,
+    descriptor_flags: u32,
 ) -> Result<isize, isize> {
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd) = inner.alloc_fd() else {
+    let (files, limit) = current_files_and_nofile_limit();
+    let Some(fd) = files.lock().install_fd(file, descriptor_flags, limit) else {
         return Err(err(SyscallError::EMFILE));
     };
-    inner.fd_table[fd] = Some(file);
-    inner.fd_flags[fd] = fd_flags;
     Ok(fd as isize)
 }
 

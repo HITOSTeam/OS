@@ -574,23 +574,19 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     let mut pidfd_target_pid = 0usize;
     let mut pidfd_nonblock = false;
     if idtype == P_PIDFD {
-        let files_process = current_files_process();
-        let (file, fd_flags) = {
-            let files_inner = files_process.borrow_mut();
-            if id >= files_inner.fd_table.len() {
-                return EBADF;
-            }
-            let Some(file) = files_inner.fd_table[id].as_ref().cloned() else {
+        let (file, descriptor_flags) = {
+            let files = current_files();
+            let files = files.lock();
+            let Some((file, descriptor_flags)) = files.get_file_and_flags(id) else {
                 return EBADF;
             };
-            let fd_flags = files_inner.fd_flags.get(id).copied().unwrap_or(0);
-            (file, fd_flags)
+            (file, descriptor_flags)
         };
         let Some(pidfd) = file.as_any().downcast_ref::<PidFdFile>() else {
             return EBADF;
         };
         pidfd_target_pid = pidfd.target_pid();
-        pidfd_nonblock = (fd_flags & O_NONBLOCK) != 0;
+        pidfd_nonblock = (descriptor_flags & O_NONBLOCK) != 0;
     }
 
     let token = get_current_token();

@@ -1,7 +1,7 @@
 use super::{
-    current_task, err, has_unmasked_pending, inode_visible_size, queue_process_signal, wakeup_task,
-    Arc, BTreeMap, BTreeSet, File, Mutex, OSInode, ProcessControlBlock, SyscallError,
-    TaskControlBlock, Vec, VecDeque, PID2PCB, SIGIO_NUM,
+    Arc, BTreeMap, BTreeSet, File, Mutex, OSInode, PID2PCB, ProcessControlBlock, SIGIO_NUM,
+    SyscallError, TaskControlBlock, Vec, VecDeque, current_task, err, has_unmasked_pending,
+    inode_visible_size, queue_process_signal, wakeup_task,
 };
 use lazy_static::lazy_static;
 
@@ -466,12 +466,19 @@ pub(crate) fn count_open_fds_for_key(key: FileLockKey) -> usize {
         map.values().cloned().collect()
     };
     let mut count = 0usize;
+    let mut seen_tables = BTreeSet::new();
     for process in processes {
-        if let Some(inner) = process.try_borrow_mut() {
-            for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
-                if file_lock_key(file).is_some_and(|k| k == key) {
-                    count += 1;
-                }
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        let table = alloc::sync::Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(alloc::sync::Arc::as_ptr(&table) as usize) {
+            continue;
+        }
+        for (_fd, file) in table.lock().iter_files_snapshot() {
+            if file_lock_key(&file).is_some_and(|k| k == key) {
+                count += 1;
             }
         }
     }

@@ -6,6 +6,7 @@ pub use exec::*;
 pub use fork::*;
 pub use wait::*;
 
+use crate::syscall::error::{SyscallError, err};
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::{
     mem::size_of,
@@ -13,7 +14,6 @@ use core::{
 };
 use lazy_static::lazy_static;
 use spin::{Mutex, MutexGuard};
-use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
@@ -41,8 +41,8 @@ use crate::{
             wakeup_task,
         },
         processor::{
-            block_current_and_run_next, current_files_process, current_process, current_task,
-            hart_id, suspend_current_and_run_next,
+            block_current_and_run_next, current_files, current_process, current_task, hart_id,
+            suspend_current_and_run_next,
         },
         sched::{SchedClass, sched_class},
         signal::{
@@ -233,7 +233,8 @@ pub(super) fn try_read_user_cstr(token: usize, ptr: usize) -> Result<String, isi
     const MAX_USER_CSTR: usize = 256 * 1024;
     let mut s = String::new();
     for i in 0..MAX_USER_CSTR {
-        let ch = try_read_user_value(token, (ptr + i) as *const u8).ok_or(err(SyscallError::EFAULT))?;
+        let ch =
+            try_read_user_value(token, (ptr + i) as *const u8).ok_or(err(SyscallError::EFAULT))?;
         if ch == 0 {
             return Ok(s);
         }

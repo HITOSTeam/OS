@@ -1,3 +1,4 @@
+use crate::syscall::error::{SyscallError, err};
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
@@ -6,14 +7,15 @@ use alloc::{
 use core::any::Any;
 use core::mem::size_of;
 use spin::Mutex;
-use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     config::clock_freq,
     fs::{File, POLLIN, PollWaitQueue, wake_tasks},
     mm::{UserBuffer, try_read_user_value, try_write_user_value},
     task::{
-        processor::{block_current_and_run_next, current_files_process, current_task},
+        processor::{
+            block_current_and_run_next, current_files, current_files_and_nofile_limit, current_task,
+        },
         signal::{SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
         task_block::TaskControlBlock,
     },
@@ -397,12 +399,10 @@ impl File for EpollFile {
 }
 
 fn get_fd_file(fd: usize) -> Result<FileArc, isize> {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_table.len() {
-        return Err(err(SyscallError::EBADF));
-    }
-    inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
+    current_files()
+        .lock()
+        .get_file(fd)
+        .ok_or(err(SyscallError::EBADF))
 }
 
 fn get_epoll_file(fd: usize) -> Result<FileArc, isize> {
@@ -423,7 +423,8 @@ fn parse_user_event(token: usize, event_ptr: usize) -> Result<UserEpollEvent, is
     if event_ptr == 0 {
         return Err(err(SyscallError::EFAULT));
     }
-    try_read_user_value::<UserEpollEvent>(token, event_ptr as *const UserEpollEvent).ok_or(err(SyscallError::EFAULT))
+    try_read_user_value::<UserEpollEvent>(token, event_ptr as *const UserEpollEvent)
+        .ok_or(err(SyscallError::EFAULT))
 }
 
 fn write_ready_events(
@@ -612,18 +613,16 @@ pub fn syscall_epoll_create1(flags: usize) -> isize {
     if (flags & !EPOLL_CLOEXEC) != 0 {
         return err(SyscallError::EINVAL);
     }
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd) = inner.alloc_fd() else {
-        return err(SyscallError::EMFILE);
-    };
-    inner.fd_table[fd] = Some(Arc::new(EpollFile::new()));
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & EPOLL_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
-    inner.fd_flags[fd] = fd_flags;
-    fd as isize
+    let (files, limit) = current_files_and_nofile_limit();
+    files
+        .lock()
+        .install_fd(Arc::new(EpollFile::new()), descriptor_flags, limit)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|| err(SyscallError::EMFILE))
 }
 
 pub fn syscall_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {

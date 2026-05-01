@@ -1,5 +1,5 @@
-use alloc::sync::Arc;
 use crate::syscall::error::{SyscallError, err};
+use alloc::sync::Arc;
 
 use crate::{
     fs::{
@@ -9,11 +9,10 @@ use crate::{
     mm::{try_copy_from_user, try_read_user_value, try_write_user_value},
     task::{
         manager::pid2process,
-        processor::{current_files_process, current_process},
+        processor::{current_files, current_files_and_nofile_limit},
     },
     trap::get_current_token,
 };
-
 
 const O_NONBLOCK: u32 = 0x800;
 #[allow(dead_code)]
@@ -41,20 +40,18 @@ struct ITimerSpec {
     it_value: TimeSpec,
 }
 
-fn alloc_fd(file: Arc<dyn File + Send + Sync>, fd_flags: u32) -> isize {
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd) = inner.alloc_fd() else {
-        return err(SyscallError::EMFILE);
-    };
-    inner.fd_table[fd] = Some(file);
-    inner.fd_flags[fd] = fd_flags;
-    fd as isize
+fn alloc_fd(file: Arc<dyn File + Send + Sync>, descriptor_flags: u32) -> isize {
+    let (files, limit) = current_files_and_nofile_limit();
+    files
+        .lock()
+        .install_fd(file, descriptor_flags, limit)
+        .map(|fd| fd as isize)
+        .unwrap_or_else(|| err(SyscallError::EMFILE))
 }
 
 // this function allocates a dummy file descriptor with given flags
-fn alloc_dummy_fd(fd_flags: u32) -> isize {
-    alloc_fd(Arc::new(DummyFile::new(true, true)), fd_flags)
+fn alloc_dummy_fd(descriptor_flags: u32) -> isize {
+    alloc_fd(Arc::new(DummyFile::new(true, true)), descriptor_flags)
 }
 
 fn validate_user_cstr(name: usize, max_len: usize) -> Result<(), isize> {
@@ -108,11 +105,11 @@ pub fn syscall_epoll_create1(flags: usize) -> isize {
     if (flags & !EPOLL_CLOEXEC) != 0 {
         return err(SyscallError::EINVAL);
     }
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & EPOLL_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
-    alloc_dummy_fd(fd_flags)
+    alloc_dummy_fd(descriptor_flags)
 }
 
 pub fn syscall_eventfd2(_count: u64, flags: usize) -> isize {
@@ -122,12 +119,12 @@ pub fn syscall_eventfd2(_count: u64, flags: usize) -> isize {
     if (flags & !(EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC)) != 0 {
         return err(SyscallError::EINVAL);
     }
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & EFD_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK;
+        descriptor_flags |= O_NONBLOCK;
     }
     if (flags & EFD_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     alloc_fd(
         Arc::new(EventFdFile::new(
@@ -135,7 +132,7 @@ pub fn syscall_eventfd2(_count: u64, flags: usize) -> isize {
             (flags & EFD_SEMAPHORE) != 0,
             (flags & EFD_NONBLOCK) != 0,
         )),
-        fd_flags,
+        descriptor_flags,
     )
 }
 
@@ -145,27 +142,27 @@ pub fn syscall_signalfd4(_fd: isize, _mask: usize, _sigsetsize: usize, flags: us
     if (flags & !(SFD_NONBLOCK | SFD_CLOEXEC)) != 0 {
         return err(SyscallError::EINVAL);
     }
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & SFD_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK;
+        descriptor_flags |= O_NONBLOCK;
     }
     if (flags & SFD_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     if _fd >= 0 {
         let fd = _fd as usize;
-        let process = current_files_process();
-        let mut inner = process.borrow_mut();
-        if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
+        let files = current_files();
+        let mut files = files.lock();
+        if !files.is_fd_open(fd) {
             return err(SyscallError::EBADF);
         }
-        inner.fd_flags[fd] = fd_flags;
+        let _ = files.set_flags(fd, descriptor_flags);
         return fd as isize;
     }
     if _fd != -1 {
         return err(SyscallError::EINVAL);
     }
-    alloc_dummy_fd(fd_flags)
+    alloc_dummy_fd(descriptor_flags)
 }
 
 pub fn syscall_timerfd_create(clockid: usize, flags: usize) -> isize {
@@ -177,26 +174,18 @@ pub fn syscall_timerfd_create(clockid: usize, flags: usize) -> isize {
     if (flags & !(TFD_NONBLOCK | TFD_CLOEXEC)) != 0 {
         return err(SyscallError::EINVAL);
     }
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & TFD_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK;
+        descriptor_flags |= O_NONBLOCK;
     }
     if (flags & TFD_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
-    alloc_fd(TimerFdFile::new(clockid), fd_flags)
+    alloc_fd(TimerFdFile::new(clockid), descriptor_flags)
 }
 
 pub fn syscall_timerfd_gettime(fd: usize, curr_value: usize) -> isize {
-    let process = current_files_process();
-    let file = {
-        let inner = process.borrow_mut();
-        if fd >= inner.fd_table.len() {
-            return err(SyscallError::EBADF);
-        }
-        inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
-    };
-    let Ok(file) = file else {
+    let Some(file) = current_files().lock().get_file(fd) else {
         return err(SyscallError::EBADF);
     };
     let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() else {
@@ -228,15 +217,7 @@ pub fn syscall_timerfd_settime(
     if (flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET)) != 0 {
         return err(SyscallError::EINVAL);
     }
-    let process = current_files_process();
-    let file = {
-        let inner = process.borrow_mut();
-        if fd >= inner.fd_table.len() {
-            return err(SyscallError::EBADF);
-        }
-        inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
-    };
-    let Ok(file) = file else {
+    let Some(file) = current_files().lock().get_file(fd) else {
         return err(SyscallError::EBADF);
     };
     let Some(timerfd) = file.as_any().downcast_ref::<TimerFdFile>() else {
@@ -260,7 +241,8 @@ pub fn syscall_timerfd_settime(
     let Some(interval_ns) = timespec_to_ns(new_spec.it_interval) else {
         return err(SyscallError::EINVAL);
     };
-    let now_ns = crate::syscall::timer_clock_now_ns(timerfd.clock_id(), 0, None).ok_or(err(SyscallError::EINVAL));
+    let now_ns = crate::syscall::timer_clock_now_ns(timerfd.clock_id(), 0, None)
+        .ok_or(err(SyscallError::EINVAL));
     let Ok(now_ns) = now_ns else {
         return err(SyscallError::EINVAL);
     };
@@ -287,7 +269,11 @@ pub fn syscall_timerfd_settime(
             return err(SyscallError::EFAULT);
         }
     }
-    if was_canceled { err(SyscallError::ECANCELED) } else { 0 }
+    if was_canceled {
+        err(SyscallError::ECANCELED)
+    } else {
+        0
+    }
 }
 
 pub fn syscall_inotify_init1(flags: usize) -> isize {
@@ -310,13 +296,13 @@ pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {
     if pid2process(pid).is_none() {
         return err(SyscallError::ESRCH);
     }
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     // Linux pidfds are always close-on-exec.
-    fd_flags |= FD_CLOEXEC;
+    descriptor_flags |= FD_CLOEXEC;
     if (flags & PIDFD_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK;
+        descriptor_flags |= O_NONBLOCK;
     }
-    alloc_fd(Arc::new(PidFdFile::new(pid)), fd_flags)
+    alloc_fd(Arc::new(PidFdFile::new(pid)), descriptor_flags)
 }
 
 pub fn syscall_fanotify_init(_flags: usize, _event_f_flags: usize) -> isize {
@@ -332,27 +318,19 @@ pub fn syscall_userfaultfd(flags: usize) -> isize {
     if (flags & !known) != 0 {
         return err(SyscallError::EINVAL);
     }
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & NONBLOCK_FLAG) != 0 {
-        fd_flags |= O_NONBLOCK;
+        descriptor_flags |= O_NONBLOCK;
     }
     if (flags & CLOEXEC_FLAG) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
-    alloc_fd(Arc::new(UserfaultfdFile::new()), fd_flags)
+    alloc_fd(Arc::new(UserfaultfdFile::new()), descriptor_flags)
 }
 
 pub fn try_handle_userfaultfd_page_fault(addr: usize, is_write: bool) -> bool {
-    let files = {
-        let process = current_process();
-        let inner = process.borrow_mut();
-        inner
-            .fd_table
-            .iter()
-            .filter_map(|file| file.as_ref().cloned())
-            .collect::<alloc::vec::Vec<_>>()
-    };
-    for file in files {
+    let files = current_files().lock().iter_files_snapshot();
+    for (_fd, file) in files {
         let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() else {
             continue;
         };
@@ -407,14 +385,14 @@ pub fn syscall_memfd_create(name: usize, flags: usize) -> isize {
     if let Err(e) = validate_user_cstr(name, MEMFD_NAME_MAX) {
         return e;
     }
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & MFD_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     let allow_sealing = (flags & MFD_ALLOW_SEALING) != 0;
     let file: Arc<dyn File + Send + Sync> =
         Arc::new(PseudoShmFile::new(shm_create_anonymous(allow_sealing)));
-    alloc_fd(file, fd_flags)
+    alloc_fd(file, descriptor_flags)
 }
 
 pub fn syscall_memfd_secret(_flags: usize) -> isize {

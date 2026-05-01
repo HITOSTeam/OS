@@ -1,17 +1,17 @@
 use super::{
-    cgroup_rename, current_effective_uid_gid, current_files_process, current_fsuid_gid,
-    current_in_group, current_process, current_timespec, empty_path_fd_for_at_op, err,
-    ext4_err_to_errno, ext4_lock, fifo_pipe_state_for_inode, file_lock_key_from_inode,
-    get_current_token, inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
-    is_inode_currently_executed_locked, lock_executing_inodes, maybe_dispatch_proc_fd_at,
-    maybe_signal_lease_break, note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs,
-    pseudo_path_exists_result, queue_process_signal, read_user_cstring,
-    register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
-    rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked, Arc, AtPath,
-    BTreeMap, Mutex, OSInode, Ordering, String, SyscallError, Vec, AT_EMPTY_PATH, AT_FDCWD,
-    AT_SYMLINK_NOFOLLOW, FS_APPEND_FL, FS_IMMUTABLE_FL, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOATIME,
-    O_NONBLOCK, O_RDONLY, O_TMPFILE, O_TRUNC, O_WRONLY, PID2PCB, SIGXFSZ_NUM, S_IFBLK, S_IFCHR,
-    S_IFMT, TMPFILE_SEQ,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, BTreeSet, FS_APPEND_FL,
+    FS_IMMUTABLE_FL, Mutex, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOATIME, O_NONBLOCK, O_RDONLY,
+    O_TMPFILE, O_TRUNC, O_WRONLY, OSInode, Ordering, PID2PCB, S_IFBLK, S_IFCHR, S_IFMT,
+    SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec, cgroup_rename, current_effective_uid_gid,
+    current_files, current_fsuid_gid, current_in_group, current_process, current_timespec,
+    empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock, fifo_pipe_state_for_inode,
+    file_lock_key_from_inode, get_current_token, inode_mode_allows, inode_mode_allows_uid_gid,
+    install_open_file_fd, is_inode_currently_executed_locked, lock_executing_inodes,
+    maybe_dispatch_proc_fd_at, maybe_signal_lease_break, note_inode_path_hint, open_pseudo,
+    path_is_nodev, path_is_rofs, pseudo_path_exists_result, queue_process_signal,
+    read_user_cstring, register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path,
+    resolve_parent_and_name, rofs_for_path, syscall_fchmod, try_copy_from_user,
+    try_copy_to_user_unchecked,
 };
 use alloc::vec;
 use lazy_static::lazy_static;
@@ -755,16 +755,8 @@ pub(crate) fn fsize_limit_allows(new_len: usize) -> Result<(), isize> {
 pub(crate) fn flush_open_inode_views(target: &Arc<ext4_fs::Inode>) {
     let target_ino = target.inode_num();
     let target_dev = target.device_id();
-    let files = {
-        let process = current_files_process();
-        let inner = process.borrow_mut();
-        inner
-            .fd_table
-            .iter()
-            .filter_map(|f| f.as_ref().map(Arc::clone))
-            .collect::<Vec<_>>()
-    };
-    for file in files {
+    let files = current_files().lock().iter_files_snapshot();
+    for (_fd, file) in files {
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
             continue;
         };
@@ -782,6 +774,7 @@ pub(crate) fn has_open_inode_view(target: &Arc<ext4_fs::Inode>) -> bool {
         let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
     };
+    let mut seen_tables = BTreeSet::new();
     for process in processes {
         let Some(inner) = process.try_borrow_mut() else {
             // Cannot inspect this process — conservatively report the inode
@@ -789,11 +782,16 @@ pub(crate) fn has_open_inode_view(target: &Arc<ext4_fs::Inode>) -> bool {
             // a file that may still be in use.
             return true;
         };
-        if inner
-            .fd_table
-            .iter()
-            .filter_map(|f| f.as_ref())
-            .any(|file| {
+        let table = Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(Arc::as_ptr(&table) as usize) {
+            continue;
+        }
+        if table
+            .lock()
+            .iter_files_snapshot()
+            .into_iter()
+            .any(|(_fd, file)| {
                 file.as_any()
                     .downcast_ref::<OSInode>()
                     .map(|o| {

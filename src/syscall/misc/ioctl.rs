@@ -1,18 +1,16 @@
 use crate::{
     config::PAGE_SIZE,
     fs::{
-        LinuxTermio, LinuxTermios,
-        PseudoKindTag, PtyMasterFile, PtySlaveFile, TtyFile, UserfaultfdFile,
-        pseudo_block_is_read_only, pseudo_block_read_ahead, pseudo_block_set_read_ahead,
-        pseudo_block_set_read_only,
+        LinuxTermio, LinuxTermios, PseudoKindTag, PtyMasterFile, PtySlaveFile, TtyFile,
+        UserfaultfdFile, pseudo_block_is_read_only, pseudo_block_read_ahead,
+        pseudo_block_set_read_ahead, pseudo_block_set_read_only,
     },
     mm::{
-        MapPermission, VirtAddr,
-        try_copy_from_user, try_copy_to_user, try_read_user_value,
+        MapPermission, VirtAddr, try_copy_from_user, try_copy_to_user, try_read_user_value,
         try_write_user_value, write_user_value,
     },
     syscall::error::{SyscallError, err},
-    task::processor::{current_files_process, current_process},
+    task::processor::{current_files, current_process},
     trap::get_current_token,
 };
 use core::mem::size_of;
@@ -103,15 +101,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const PSEUDO_ROOT_DEV_SECTOR_SIZE: u32 = 512;
     const PSEUDO_ROOT_DEV_PHYS_BLOCK_SIZE: u32 = 4096;
 
-    let process = current_files_process();
-    let file = {
-        let inner = process.borrow_mut();
-        if fd >= inner.fd_table.len() {
-            None
-        } else {
-            inner.fd_table[fd].clone()
-        }
-    };
+    let file = current_files().lock().get_file(fd);
     let Some(file) = file else {
         return EBADF;
     };
@@ -212,8 +202,12 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                         if !mapped {
                             match inner.memory_set.resolve_lazy_fault(page, MapPermission::W) {
                                 crate::mm::LazyFaultResult::Resolved => {}
-                                crate::mm::LazyFaultResult::Oom => return err(SyscallError::ENOMEM),
-                                crate::mm::LazyFaultResult::Invalid => return err(SyscallError::EFAULT),
+                                crate::mm::LazyFaultResult::Oom => {
+                                    return err(SyscallError::ENOMEM);
+                                }
+                                crate::mm::LazyFaultResult::Invalid => {
+                                    return err(SyscallError::EFAULT);
+                                }
                             }
                         }
                         page += PAGE_SIZE;

@@ -4,7 +4,7 @@ use core::mem::size_of;
 use crate::fs::NetSocketFile;
 use crate::mm::{try_copy_to_user, try_read_user_value};
 use crate::syscall::error::{SyscallError, err};
-use crate::task::processor::{current_files_process, current_process};
+use crate::task::processor::{current_files, current_files_and_nofile_limit, current_process};
 use crate::trap::get_current_token;
 
 use super::*;
@@ -55,27 +55,20 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
             return err(SyscallError::EAFNOSUPPORT);
         }
     };
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd) = inner.alloc_fd() else {
-        return err(SyscallError::EMFILE);
-    };
-    inner.fd_table[fd] = Some(file);
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if cloexec {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     if nonblock {
-        fd_flags |= O_NONBLOCK;
+        descriptor_flags |= O_NONBLOCK;
     }
-    inner.fd_flags[fd] = fd_flags;
+    let (files, limit) = current_files_and_nofile_limit();
+    let Some(fd) = files.lock().install_fd(file, descriptor_flags, limit) else {
+        return err(SyscallError::EMFILE);
+    };
     if crate::debug_config::DEBUG_NET {
-        crate::println!(
-            "[net] pid={} socket() -> fd={} type={}",
-            process.pid.0,
-            fd,
-            st
-        );
+        let pid = current_process().getpid();
+        crate::println!("[net] pid={} socket() -> fd={} type={}", pid, fd, st);
     }
     fd as isize
 }
@@ -199,21 +192,15 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
             Err(e) => return e,
         };
         let peer_addr = new_sock.peer_addr();
-        let process = current_files_process();
-        let mut inner = process.borrow_mut();
-        if fd >= inner.fd_flags.len() {
-            let len = inner.fd_table.len();
-            inner.fd_flags.resize(len, 0);
-        }
-        let mut inherited_flags = inner.fd_flags.get(fd).copied().unwrap_or(0);
+        let (files, limit) = current_files_and_nofile_limit();
+        let mut files = files.lock();
+        let mut inherited_flags = files.get_flags(fd);
         inherited_flags &= !FD_CLOEXEC;
-        let Some(newfd) = inner.alloc_fd() else {
+        let new_file: FileArc = new_sock;
+        let Some(newfd) = files.install_fd(new_file, inherited_flags, limit) else {
             return err(SyscallError::EMFILE);
         };
-        let new_file: FileArc = new_sock;
-        inner.fd_table[newfd] = Some(new_file);
-        inner.fd_flags[newfd] = inherited_flags;
-        drop(inner);
+        drop(files);
         if addr != 0 && addrlen != 0 {
             let r = write_sockaddr_un(addr, addrlen, peer_addr.as_ref());
             if r != 0 {
@@ -263,20 +250,14 @@ pub fn syscall_accept(fd: usize, addr: usize, addrlen: usize) -> isize {
         }
     };
     let peer = new_sock.tcp_endpoints_v4();
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    if fd >= inner.fd_flags.len() {
-        let len = inner.fd_table.len();
-        inner.fd_flags.resize(len, 0);
-    }
-    let mut inherited_flags = inner.fd_flags.get(fd).copied().unwrap_or(0);
+    let (files, limit) = current_files_and_nofile_limit();
+    let mut files = files.lock();
+    let mut inherited_flags = files.get_flags(fd);
     inherited_flags &= !FD_CLOEXEC;
-    let Some(newfd) = inner.alloc_fd() else {
+    let Some(newfd) = files.install_fd(new_sock, inherited_flags, limit) else {
         return err(SyscallError::EMFILE);
     };
-    inner.fd_table[newfd] = Some(new_sock);
-    inner.fd_flags[newfd] = inherited_flags;
-    drop(inner);
+    drop(files);
     if addr != 0 && addrlen != 0 {
         if let Some((_lip, _lport, rip, rport)) = peer {
             let r = write_sockaddr_in(addr, addrlen, rip, rport);
@@ -296,14 +277,10 @@ pub fn syscall_accept4(fd: usize, addr: usize, addrlen: usize, flags: usize) -> 
     if newfd < 0 {
         return newfd;
     }
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
+    let files = current_files();
+    let mut files = files.lock();
     let fd = newfd as usize;
-    if fd >= inner.fd_flags.len() {
-        let len = inner.fd_table.len();
-        inner.fd_flags.resize(len, 0);
-    }
-    let mut cur = inner.fd_flags[fd];
+    let mut cur = files.get_flags(fd);
     if (flags & SOCK_CLOEXEC) != 0 {
         cur |= FD_CLOEXEC;
     } else {
@@ -314,7 +291,7 @@ pub fn syscall_accept4(fd: usize, addr: usize, addrlen: usize, flags: usize) -> 
     } else {
         cur &= !O_NONBLOCK;
     }
-    inner.fd_flags[fd] = cur;
+    let _ = files.set_flags(fd, cur);
     newfd
 }
 

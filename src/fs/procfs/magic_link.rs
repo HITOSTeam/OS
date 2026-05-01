@@ -13,8 +13,8 @@ use crate::fs::{
 use crate::task::manager::pid2process;
 use crate::task::processor::{current_process, current_task};
 
-use super::{ProcMagicLinkFile, is_proc_pseudo_path};
 use super::entries::{encode_proc_linux_tid, proc_pid_exists, proc_pid_task_alive};
+use super::{ProcMagicLinkFile, is_proc_pseudo_path};
 use crate::syscall::error::{SyscallError, err};
 
 const MAX_PROC_MAGIC_SYMLINKS: usize = 40;
@@ -217,14 +217,11 @@ pub fn normalize_proc_magic_path(path: &str) -> Cow<'_, str> {
 
 fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     let proc = pid2process(pid as usize)?;
-    let files_proc = proc.files_owner_process();
-    let (file, cwd) = {
-        let inner = files_proc.try_borrow_mut()?;
-        if fd >= inner.fd_table.len() {
-            return None;
-        }
-        (inner.fd_table[fd].as_ref()?.clone(), inner.cwd.clone())
+    let (files, cwd) = {
+        let inner = proc.try_borrow_mut()?;
+        (Arc::clone(&inner.files), inner.cwd.clone())
     };
+    let file = files.lock().get_file(fd)?;
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         return Some(String::from(pdir.path()));
@@ -270,9 +267,11 @@ fn proc_pid_cwd(pid: u32) -> Option<String> {
 
 fn proc_pid_fd_file(pid: u32, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
     let proc = pid2process(pid as usize)?;
-    let files_proc = proc.files_owner_process();
-    let inner = files_proc.try_borrow_mut()?;
-    inner.fd_table.get(fd)?.as_ref().cloned()
+    let files = {
+        let inner = proc.try_borrow_mut()?;
+        Arc::clone(&inner.files)
+    };
+    files.lock().get_file(fd)
 }
 
 fn proc_pid_namespace_target(pid: u32, kind: NamespaceKind) -> Option<String> {

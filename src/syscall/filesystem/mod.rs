@@ -7,42 +7,42 @@ use core::cmp::min;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
-use crate::task::manager::{wakeup_task, PID2PCB};
+use crate::task::manager::{PID2PCB, wakeup_task};
 use crate::{
     fs::{
+        CgroupFile, CgroupMountSpec, ClassifiedAbsPath, EventFdFile, File, MountNamespace,
+        MountNamespaceState, MountPropagation, MountRecord, NamespaceFile, NetSocketFile, OSInode,
+        Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
+        PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TimerFdFile, TtyFile,
         cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount,
         cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots,
-        inode_logical_path, make_pipe, mount_namespace_id, note_inode_path_hint,
-        open_pseudo, pseudo_block_is_read_only, pseudo_block_note_sync,
-        register_deferred_unlink_cleanup, resolve_final_symlink_abs_path,
-        resolve_final_symlink_abs_path_locked, resolve_proc_magic_intermediate_abs_path,
-        secondary_root_inode, shm_create, shm_get, shm_object_name, shm_remove, CgroupFile,
-        CgroupMountSpec, ClassifiedAbsPath, EventFdFile, File, MountNamespace, MountNamespaceState,
-        MountPropagation, MountRecord, NamespaceFile, NetSocketFile, OSInode, Pipe,
-        ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
-        PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TimerFdFile, TtyFile,
+        inode_logical_path, make_pipe, mount_namespace_id, note_inode_path_hint, open_pseudo,
+        pseudo_block_is_read_only, pseudo_block_note_sync, register_deferred_unlink_cleanup,
+        resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked,
+        resolve_proc_magic_intermediate_abs_path, secondary_root_inode, shm_create, shm_get,
+        shm_object_name, shm_remove,
     },
     mm::{
-        read_user_value, translated_byte_buffer, translated_mutref,
+        MapPermission, UserBuffer, read_user_value, translated_byte_buffer, translated_mutref,
         try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
-        try_translated_byte_buffer, try_write_user_value, MapPermission,
-        UserBuffer,
+        try_translated_byte_buffer, try_write_user_value,
     },
     syscall::process::{is_inode_currently_executed_locked, lock_executing_inodes},
     task::processor::{
-        block_current_and_run_next, current_files_process, current_process, current_task,
+        block_current_and_run_next, current_files, current_files_and_nofile_limit, current_process,
+        current_task,
     },
     task::{
-        signal::{has_unmasked_pending, queue_process_signal, SIGXFSZ_NUM},
-        task_block::TaskControlBlock,
         ProcessControlBlock,
+        signal::{SIGXFSZ_NUM, has_unmasked_pending, queue_process_signal},
+        task_block::TaskControlBlock,
     },
     time::get_time_ms,
     trap::get_current_token,
 };
 use ext4_fs::sync_all;
 
-pub(crate) use crate::syscall::error::{err, SyscallError};
+pub(crate) use crate::syscall::error::{SyscallError, err};
 
 mod ctl;
 pub use ctl::*;

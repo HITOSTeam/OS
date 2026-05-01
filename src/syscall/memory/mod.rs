@@ -1,11 +1,12 @@
+mod mlock;
 mod mmap;
 mod unmap;
-mod mlock;
 
+pub use mlock::*;
 pub use mmap::*;
 pub use unmap::*;
-pub use mlock::*;
 
+pub(super) use crate::syscall::error::{SyscallError, err};
 pub(super) use crate::{
     config::{PAGE_SIZE, USER_HEAP_GAP},
     fs::{
@@ -16,13 +17,12 @@ pub(super) use crate::{
     task::{
         MmapRegion,
         manager::PID2PCB,
-        processor::{current_files_process, current_process},
+        processor::{current_files, current_process},
     },
     trap::get_current_token,
 };
-pub(super) use alloc::{sync::Arc, vec::Vec};
+pub(super) use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
 pub(super) use core::cmp::min;
-pub(super) use crate::syscall::error::{SyscallError, err};
 
 pub(super) const PROT_READ: usize = 1;
 pub(super) const PROT_WRITE: usize = 2;
@@ -41,7 +41,6 @@ pub(super) const MAP_FIXED_NOREPLACE: usize = 0x100000;
 pub(super) const MAP_TYPE_MASK: usize = 0x0f;
 
 pub(super) const LARGE_ANON_MMAP: usize = 1 * 1024 * 1024;
-
 
 pub(super) const MCL_CURRENT: usize = 0x01;
 pub(super) const MCL_FUTURE: usize = 0x02;
@@ -101,7 +100,11 @@ pub(super) fn exceeds_overcommit_limit(additional_bytes: usize) -> bool {
     vm_committed_as_bytes().saturating_add(additional_bytes) > limit
 }
 
-pub(super) fn find_free_user_range(ranges: &[(usize, usize)], min_start: usize, len: usize) -> Option<usize> {
+pub(super) fn find_free_user_range(
+    ranges: &[(usize, usize)],
+    min_start: usize,
+    len: usize,
+) -> Option<usize> {
     if len == 0 {
         return None;
     }
@@ -121,15 +124,13 @@ pub(super) fn find_free_user_range(ranges: &[(usize, usize)], min_start: usize, 
 }
 
 pub(super) fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_table.len() {
-        return None;
-    }
-    inner.fd_table[fd].clone()
+    current_files().lock().get_file(fd)
 }
 
-pub(super) fn push_mmap_region_merged(regions: &mut alloc::vec::Vec<MmapRegion>, region: MmapRegion) {
+pub(super) fn push_mmap_region_merged(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    region: MmapRegion,
+) {
     if region.len == 0 {
         return;
     }
@@ -176,7 +177,11 @@ pub(super) fn move_mmap_region(region: MmapRegion, new_start: usize) -> MmapRegi
     }
 }
 
-pub(super) fn trim_mmap_regions(regions: &mut alloc::vec::Vec<MmapRegion>, start: usize, end: usize) {
+pub(super) fn trim_mmap_regions(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    start: usize,
+    end: usize,
+) {
     let mut next = alloc::vec::Vec::new();
     for region in regions.drain(..) {
         let r_end = region.end();
@@ -232,12 +237,12 @@ pub(super) fn apply_mprotect_to_mmap_regions(
     Ok(())
 }
 
-pub(super) fn find_inode_file_in_fd_table(
-    fd_table: &[Option<Arc<dyn File + Send + Sync>>],
+pub(super) fn find_inode_file_in_snapshot(
+    files: &[(usize, Arc<dyn File + Send + Sync>)],
     device_id: usize,
     inode_num: u32,
 ) -> Option<Arc<dyn File + Send + Sync>> {
-    for file in fd_table.iter().filter_map(|f| f.as_ref()) {
+    for (_fd, file) in files {
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
             continue;
         };
@@ -249,23 +254,37 @@ pub(super) fn find_inode_file_in_fd_table(
     None
 }
 
-pub(super) fn find_open_inode_file(device_id: usize, inode_num: u32) -> Option<Arc<dyn File + Send + Sync>> {
+pub(super) fn find_open_inode_file(
+    device_id: usize,
+    inode_num: u32,
+) -> Option<Arc<dyn File + Send + Sync>> {
     let processes = {
         let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
     };
+    let mut seen_tables = BTreeSet::new();
     for process in processes {
         let Some(inner) = process.try_borrow_mut() else {
             continue;
         };
-        if let Some(file) = find_inode_file_in_fd_table(&inner.fd_table, device_id, inode_num) {
+        let files = Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
+            continue;
+        }
+        let snapshot = files.lock().iter_files_snapshot();
+        if let Some(file) = find_inode_file_in_snapshot(&snapshot, device_id, inode_num) {
             return Some(file);
         }
     }
     None
 }
 
-pub(super) fn push_range_merged(ranges: &mut alloc::vec::Vec<(usize, usize)>, start: usize, end: usize) {
+pub(super) fn push_range_merged(
+    ranges: &mut alloc::vec::Vec<(usize, usize)>,
+    start: usize,
+    end: usize,
+) {
     if end <= start {
         return;
     }

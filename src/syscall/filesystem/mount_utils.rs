@@ -1,16 +1,15 @@
 use super::{
-    cgroup_logical_path_for_file, cgroup_mount, cgroup_umount, current_fsuid_gid, current_process,
-    current_timespec, err, ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token,
-    get_inode_times, inode_logical_path, mount_namespace_id, normalize_path, open_pseudo,
-    pseudo_block_is_read_only, read_user_cstring, resolve_at_inode, resolve_at_path,
-    set_inode_times, Arc, BTreeMap, BTreeSet, CgroupMountSpec, File, InodeTimes, MountNamespace,
-    MountNamespaceState, MountPropagation, MountRecord, Mutex, OSInode, Ordering,
-    ProcessControlBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile, String, SyscallError, Vec,
-    AT_FDCWD, MNT_DETACH, MNT_EXPIRE, MNT_FORCE, MS_BIND, MS_MOVE, MS_NOATIME, MS_NODEV,
-    MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_REMOUNT,
-    MS_SHARED, MS_SLAVE, MS_STRICTATIME, MS_UNBINDABLE, NEXT_MOUNT_EVENT_ID,
-    NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ, PID2PCB, ST_NOSYMFOLLOW, TMPFILE_SEQ,
-    UMOUNT_NOFOLLOW,
+    AT_FDCWD, Arc, BTreeMap, BTreeSet, CgroupMountSpec, File, InodeTimes, MNT_DETACH, MNT_EXPIRE,
+    MNT_FORCE, MS_BIND, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID,
+    MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_REMOUNT, MS_SHARED, MS_SLAVE, MS_STRICTATIME,
+    MS_UNBINDABLE, MountNamespace, MountNamespaceState, MountPropagation, MountRecord, Mutex,
+    NEXT_MOUNT_EVENT_ID, NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ, OSInode, Ordering,
+    PID2PCB, ProcessControlBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile, ST_NOSYMFOLLOW,
+    String, SyscallError, TMPFILE_SEQ, UMOUNT_NOFOLLOW, Vec, cgroup_logical_path_for_file,
+    cgroup_mount, cgroup_umount, current_fsuid_gid, current_process, current_timespec, err,
+    ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token, get_inode_times,
+    inode_logical_path, mount_namespace_id, normalize_path, open_pseudo, pseudo_block_is_read_only,
+    read_user_cstring, resolve_at_inode, resolve_at_path, set_inode_times,
 };
 use lazy_static::lazy_static;
 
@@ -302,23 +301,22 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
         let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
     };
+    let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let (cwd, root, fd_table, is_zombie) = match process.try_borrow_mut() {
-            Some(inner) => {
-                let (fd_table, _fd_flags) = inner.snapshot_fd_state();
-                (
-                    inner.cwd.clone(),
-                    inner.root.clone(),
-                    fd_table,
-                    inner.is_zombie,
-                )
-            }
+        let (cwd, root, is_zombie, namespace, files) = match process.try_borrow_mut() {
+            Some(inner) => (
+                inner.cwd.clone(),
+                inner.root.clone(),
+                inner.is_zombie,
+                Arc::clone(&inner.mnt_ns),
+                Arc::clone(&inner.files),
+            ),
             None => continue,
         };
         if is_zombie {
             continue;
         }
-        if process.mount_namespace_id() != current_ns_id {
+        if mount_namespace_id(&namespace) != current_ns_id {
             continue;
         }
         let cwd_busy = path_under_mount(&cwd, target) && !(self_bind_root && cwd == target);
@@ -326,7 +324,10 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
         if cwd_busy || root_busy {
             return true;
         }
-        for file in fd_table.into_iter().flatten() {
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
+            continue;
+        }
+        for (_fd, file) in files.lock().iter_files_snapshot() {
             if writable_only && !file.writable() {
                 continue;
             }
