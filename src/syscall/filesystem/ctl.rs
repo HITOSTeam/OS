@@ -520,7 +520,7 @@ pub fn syscall_chdir(pathname: usize) -> isize {
         if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
             return err(SyscallError::EACCES);
         }
-        resolve_final_symlink_abs_path(&new_cwd)
+        resolve_final_symlink_abs_path_locked(&new_cwd)
     } else if let Some(node) = open_pseudo(&new_cwd) {
         if node.as_any().downcast_ref::<PseudoDir>().is_none() {
             return err(SyscallError::ENOTDIR);

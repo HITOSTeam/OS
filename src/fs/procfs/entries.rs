@@ -13,8 +13,7 @@ use super::ProcFileKind;
 use crate::syscall::error::{SyscallError, err};
 
 const PROC_LINUX_TID_PID_SHIFT: usize = 15;
-static PROC_SIMPLE_TEXT_FILES: Mutex<BTreeMap<&'static str, Vec<u8>>> =
-    Mutex::new(BTreeMap::new());
+static PROC_SIMPLE_TEXT_FILES: Mutex<BTreeMap<&'static str, Vec<u8>>> = Mutex::new(BTreeMap::new());
 
 pub(crate) fn collect_pids() -> Vec<usize> {
     let mut pids: Vec<usize> = {
@@ -448,38 +447,37 @@ pub(crate) fn proc_pid_fd_entries(pid: u32) -> Vec<PseudoDirent> {
     let Some(proc) = pid2process(pid as usize) else {
         return entries;
     };
-    let files_proc = proc.files_owner_process();
-    let Some(inner) = files_proc.try_borrow_mut() else {
+    let Some(inner) = proc.try_borrow_mut() else {
         return entries;
     };
+    let files = alloc::sync::Arc::clone(&inner.files);
+    let limit = inner.rlimits.rlimit_nofile_cur as usize;
+    drop(inner);
+    let files_guard = files.lock();
     let mut has_predicted = false;
     let predicted_fd = if pid as usize == current_process().getpid() {
-        let limit = inner.rlimits.rlimit_nofile_cur as usize;
-        let fd =
-            if let Some(fd) = (0..inner.fd_table.len()).find(|fd| inner.fd_table[*fd].is_none()) {
-                (fd < limit).then_some(fd)
-            } else if inner.fd_table.len() < limit {
-                Some(inner.fd_table.len())
-            } else {
-                None
-            };
+        let fd = if let Some(fd) = (0..files_guard.len()).find(|fd| !files_guard.is_fd_open(*fd)) {
+            (fd < limit).then_some(fd)
+        } else if files_guard.len() < limit {
+            Some(files_guard.len())
+        } else {
+            None
+        };
         fd
     } else {
         None
     };
 
-    for (fd, file) in inner.fd_table.iter().enumerate() {
-        if file.is_some() {
-            if predicted_fd == Some(fd) {
-                has_predicted = true;
-            }
-            entries.push(PseudoDirent {
-                name: alloc::format!("{fd}"),
-                // glibc may skip dirents whose inode is 0; keep procfd inodes non-zero.
-                ino: (fd + 1) as u64,
-                dtype: 10,
-            });
+    for (fd, _file) in files_guard.iter_files_snapshot() {
+        if predicted_fd == Some(fd) {
+            has_predicted = true;
         }
+        entries.push(PseudoDirent {
+            name: alloc::format!("{fd}"),
+            // glibc may skip dirents whose inode is 0; keep procfd inodes non-zero.
+            ino: (fd + 1) as u64,
+            dtype: 10,
+        });
     }
     if let Some(fd) = predicted_fd {
         if !has_predicted {

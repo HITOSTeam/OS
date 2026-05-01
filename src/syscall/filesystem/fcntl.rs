@@ -1,14 +1,22 @@
 use super::{
-    apply_record_lock_for_owner, block_current_and_run_next, clear_record_lock_waiting,
-    collect_conflict_process_owners, current_files_process, current_process, current_task,
-    detect_record_lock_deadlock, enqueue_record_lock_waiter, err, fd_file, file_lock_key,
+    Arc, FD_CLOEXEC, FcntlFlock, FcntlOwnerEx, File, O_APPEND, O_ASYNC, O_DIRECT, O_NONBLOCK,
+    O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe, PseudoShmFile, RECORD_LOCKS,
+    RecordLockOwner, SyscallError, Vec, WaitingRecordLock, apply_record_lock_for_owner,
+    block_current_and_run_next, clear_record_lock_waiting, collect_conflict_process_owners,
+    current_files, current_files_and_nofile_limit, current_process, current_task,
+    detect_record_lock_deadlock, enqueue_record_lock_waiter, err, file_lock_key,
     first_conflicting_lock, get_current_token, get_file_lease_type, has_pending_unmasked_signal,
     lock_conflicts, lock_range_from_flock, ofd_lock_owner_id, remove_record_lock_waiter,
     set_file_lease, set_record_lock_waiting, try_read_user_value, try_write_user_value,
-    wake_record_lock_waiters, FcntlFlock, FcntlOwnerEx, OSInode, Pipe, PseudoShmFile,
-    RecordLockOwner, SyscallError, Vec, WaitingRecordLock, FD_CLOEXEC, O_APPEND, O_ASYNC, O_DIRECT,
-    O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, RECORD_LOCKS,
+    wake_record_lock_waiters,
 };
+
+fn get_fcntl_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
+    current_files()
+        .lock()
+        .get_file(fd)
+        .ok_or(err(SyscallError::EBADF))
+}
 
 /// Handles descriptor flags, record locks, leases, and async-owner state for `fcntl(2)`.
 pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
@@ -47,43 +55,37 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
 
     let ret = match cmd {
         F_GETFD => {
-            let process = current_files_process();
-            let mut inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
+            let files = current_files();
+            let files = files.lock();
+            let Some((_file, descriptor_flags)) = files.get_file_and_flags(fd) else {
                 return err(SyscallError::EBADF);
-            }
-            inner.ensure_fd_flags_len();
-            if (inner.fd_flags[fd] & FD_CLOEXEC) != 0 {
+            };
+            if (descriptor_flags & FD_CLOEXEC) != 0 {
                 FD_CLOEXEC as isize
             } else {
                 0
             }
         }
         F_SETFD => {
-            let process = current_files_process();
-            let mut inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
+            let files = current_files();
+            let mut files = files.lock();
+            let Some((_file, mut cur)) = files.get_file_and_flags(fd) else {
                 return err(SyscallError::EBADF);
-            }
-            inner.ensure_fd_flags_len();
-            let mut cur = inner.fd_flags[fd];
+            };
             if (arg as u32 & FD_CLOEXEC) != 0 {
                 cur |= FD_CLOEXEC;
             } else {
                 cur &= !FD_CLOEXEC;
             }
-            inner.fd_flags[fd] = cur;
+            let _ = files.set_flags(fd, cur);
             0
         }
         F_SETFL => {
-            let process = current_files_process();
-            let mut inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
+            let files = current_files();
+            let mut files = files.lock();
+            let Some((file, mut cur)) = files.get_file_and_flags(fd) else {
                 return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            inner.ensure_fd_flags_len();
-            let mut cur = inner.fd_flags[fd];
+            };
             if (arg & O_NONBLOCK) != 0 {
                 cur |= O_NONBLOCK as u32;
             } else {
@@ -94,21 +96,19 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             } else {
                 cur &= !(O_ASYNC as u32);
             }
-            inner.fd_flags[fd] = cur;
+            let _ = files.set_flags(fd, cur);
+            drop(files);
             if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
                 pipe.set_async_enabled((cur & O_ASYNC as u32) != 0);
             }
             0
         }
         F_GETFL => {
-            let process = current_files_process();
-            let mut inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
+            let files = current_files();
+            let files = files.lock();
+            let Some((file, cur_flags)) = files.get_file_and_flags(fd) else {
                 return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            inner.ensure_fd_flags_len();
-            let cur_flags = inner.fd_flags[fd];
+            };
             let mut flags = match (file.readable(), file.writable()) {
                 (true, false) => O_RDONLY,
                 (false, true) => O_WRONLY,
@@ -135,13 +135,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             flags as isize
         }
         F_SETOWN => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
             };
@@ -173,13 +170,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_GETOWN => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
             };
@@ -191,13 +185,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_SETOWN_EX => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let token = get_current_token();
             let own = match try_read_user_value::<FcntlOwnerEx>(token, arg as *const FcntlOwnerEx) {
                 Some(v) => v,
@@ -233,13 +224,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_GETOWN_EX => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
             };
@@ -255,13 +243,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             0
         }
         F_SETSIG => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
             };
@@ -272,26 +257,20 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_GETSIG => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
             };
             pipe.get_async_signal() as isize
         }
         F_SETLEASE => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(key) = file_lock_key(&file) else {
                 return err(SyscallError::EINVAL);
             };
@@ -299,13 +278,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             set_file_lease(key, owner_pid, arg as i16, &file)
         }
         F_GETLEASE => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(key) = file_lock_key(&file) else {
                 return err(SyscallError::EINVAL);
             };
@@ -313,13 +289,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             get_file_lease_type(key, owner_pid) as isize
         }
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
 
             let token = get_current_token();
             let flock = match try_read_user_value::<FcntlFlock>(token, arg as *const FcntlFlock) {
@@ -382,7 +355,6 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                     };
                 } else {
                     out.l_type = F_UNLCK;
-                    out.l_pid = 0;
                 }
                 if try_write_user_value(token, arg as *mut FcntlFlock, &out).is_err() {
                     return err(SyscallError::EFAULT);
@@ -498,13 +470,10 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_SETPIPE_SZ => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
             };
@@ -514,26 +483,20 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_GETPIPE_SZ => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 return err(SyscallError::EINVAL);
             };
             pipe.pipe_size() as isize
         }
         F_GET_SEALS => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            drop(inner);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
                 return err(SyscallError::EINVAL);
             };
@@ -543,22 +506,21 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             seals as isize
         }
         F_ADD_SEALS => {
-            let process = current_files_process();
-            let inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
-                return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
+            let file = match get_fcntl_file(fd) {
+                Ok(file) => file,
+                Err(e) => return e,
+            };
             let has_writable_shared_map =
                 if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
                     let id = shm.memfd_id();
+                    let process = current_process();
+                    let inner = process.borrow_mut();
                     inner.mmap_areas.iter().any(|region| {
                         region.memfd_id == id && region.shared && (region.prot & PROT_WRITE) != 0
                     })
                 } else {
                     false
                 };
-            drop(inner);
             if !file.writable() {
                 return err(SyscallError::EPERM);
             }
@@ -581,39 +543,29 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let process = current_files_process();
-            let mut inner = process.borrow_mut();
-            if !inner.is_fd_open(fd) {
+            let (files, limit) = current_files_and_nofile_limit();
+            let mut files = files.lock();
+            let Some((file, old_flags)) = files.get_file_and_flags(fd) else {
                 return err(SyscallError::EBADF);
-            }
-            let file = fd_file!(inner, fd);
-            inner.ensure_fd_flags_len();
-            let old_flags = inner.fd_flags[fd];
+            };
             let minfd = arg;
-            let limit = inner.rlimits.rlimit_nofile_cur as usize;
             if minfd >= limit {
                 return err(SyscallError::EINVAL);
             }
             let mut newfd = minfd;
-            while newfd < inner.fd_table.len() && inner.fd_table[newfd].is_some() {
+            while newfd < files.len() && files.is_fd_open(newfd) {
                 newfd += 1;
             }
             if newfd >= limit {
                 return err(SyscallError::EMFILE);
             }
-            if newfd >= inner.fd_table.len() {
-                // Extend fd table to fit the selected target descriptor.
-                inner.fd_table.resize(newfd + 1, None);
-                inner.fd_flags.resize(newfd + 1, 0);
-            }
-            inner.fd_table[newfd] = Some(file);
             let mut new_flags = old_flags;
             if cmd == F_DUPFD {
                 new_flags &= !FD_CLOEXEC;
             } else {
                 new_flags |= FD_CLOEXEC;
             }
-            inner.fd_flags[newfd] = new_flags;
+            let _ = files.install_fd_at(newfd, file, new_flags, limit);
             newfd as isize
         }
         _ => err(SyscallError::EINVAL),

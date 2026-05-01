@@ -1,9 +1,9 @@
 use super::{
-    current_files_process, err, ext4_lock, get_current_token, make_pipe, try_read_user_value,
-    try_write_user_value, Arc, BTreeMap, File, Mutex, OSInode, Pipe, ProcPseudoFile, PseudoFile,
-    PseudoShmFile, SocketPairEnd, SyscallError, TaskControlBlock, UserBuffer, DIRECT_IO_ALIGN,
-    FD_CLOEXEC, O_APPEND, O_ASYNC, O_CLOEXEC, O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH, O_RDONLY,
-    O_RDWR, O_WRONLY,
+    Arc, BTreeMap, DIRECT_IO_ALIGN, FD_CLOEXEC, File, Mutex, O_APPEND, O_ASYNC, O_CLOEXEC,
+    O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe,
+    ProcPseudoFile, PseudoFile, PseudoShmFile, SocketPairEnd, SyscallError, TaskControlBlock,
+    UserBuffer, current_files, current_files_and_nofile_limit, err, ext4_lock, get_current_token,
+    make_pipe, try_read_user_value, try_write_user_value,
 };
 use lazy_static::lazy_static;
 
@@ -131,26 +131,8 @@ lazy_static! {
 
 /// Returns the file currently installed at `fd`, if any.
 pub(crate) fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send + Sync>> {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_table.len() {
-        return None;
-    }
-    inner.fd_table[fd].clone()
+    current_files().lock().get_file(fd)
 }
-
-/// Get the file for `fd`, returning `-EBADF` if the descriptor is not open.
-macro_rules! fd_file {
-    ($inner:expr, $fd:expr) => {
-        match $inner.fd_table.get($fd).and_then(|slot| slot.as_ref()) {
-            Some(f) => f.clone(),
-            None => {
-                return $crate::syscall::error::err($crate::syscall::error::SyscallError::EBADF);
-            }
-        }
-    };
-}
-pub(crate) use fd_file;
 
 /// Get the file for `fd`, returning `-EBADF` if the descriptor is not open.
 macro_rules! require_fd_file {
@@ -227,52 +209,27 @@ pub(crate) fn file_is_seekable_for_preadwrite(
 
 /// Returns whether the descriptor was opened with `O_PATH`.
 pub(crate) fn fd_has_o_path(fd: usize) -> bool {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_flags.len() {
-        return false;
-    }
-    (inner.fd_flags[fd] & O_PATH as u32) != 0
+    (current_files().lock().get_flags(fd) & O_PATH as u32) != 0
 }
 
 /// Returns whether the descriptor was opened with `O_NONBLOCK`.
 pub(crate) fn fd_has_nonblock(fd: usize) -> bool {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_flags.len() {
-        return false;
-    }
-    (inner.fd_flags[fd] & O_NONBLOCK as u32) != 0
+    (current_files().lock().get_flags(fd) & O_NONBLOCK as u32) != 0
 }
 
 /// Returns whether the descriptor tracks append-on-write semantics.
 pub(crate) fn fd_has_append(fd: usize) -> bool {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_flags.len() {
-        return false;
-    }
-    (inner.fd_flags[fd] & O_APPEND as u32) != 0
+    (current_files().lock().get_flags(fd) & O_APPEND as u32) != 0
 }
 
 /// Returns whether the descriptor requested `O_DIRECT`.
 pub(crate) fn fd_has_odirect(fd: usize) -> bool {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_flags.len() {
-        return false;
-    }
-    (inner.fd_flags[fd] & O_DIRECT as u32) != 0
+    (current_files().lock().get_flags(fd) & O_DIRECT as u32) != 0
 }
 
 /// Returns whether access-time updates are suppressed for this descriptor.
 pub(crate) fn fd_has_noatime(fd: usize) -> bool {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_flags.len() {
-        return false;
-    }
-    (inner.fd_flags[fd] & O_NOATIME as u32) != 0
+    (current_files().lock().get_flags(fd) & O_NOATIME as u32) != 0
 }
 
 /// Validates Linux-style alignment constraints for direct I/O requests.
@@ -372,30 +329,30 @@ pub(crate) fn socketpair_write_from_kernel(
 }
 
 /// Extracts the per-fd flags that should be persisted in the descriptor table.
-pub(crate) fn open_fd_flags(flags: usize, o_path: bool) -> u32 {
-    let mut fd_flags = 0u32;
+pub(crate) fn open_descriptor_flags(flags: usize, o_path: bool) -> u32 {
+    let mut descriptor_flags = 0u32;
     if (flags & O_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     if (flags & O_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK as u32;
+        descriptor_flags |= O_NONBLOCK as u32;
     }
     if (flags & O_APPEND) != 0 {
-        fd_flags |= O_APPEND as u32;
+        descriptor_flags |= O_APPEND as u32;
     }
     if (flags & O_DIRECT) != 0 {
-        fd_flags |= O_DIRECT as u32;
+        descriptor_flags |= O_DIRECT as u32;
     }
     if (flags & O_ASYNC) != 0 {
-        fd_flags |= O_ASYNC as u32;
+        descriptor_flags |= O_ASYNC as u32;
     }
     if (flags & O_NOATIME) != 0 {
-        fd_flags |= O_NOATIME as u32;
+        descriptor_flags |= O_NOATIME as u32;
     }
     if o_path {
-        fd_flags |= O_PATH as u32;
+        descriptor_flags |= O_PATH as u32;
     }
-    fd_flags
+    descriptor_flags
 }
 
 /// Allocates a new descriptor slot and installs the opened file with derived fd flags.
@@ -404,13 +361,13 @@ pub(crate) fn install_open_file_fd(
     flags: usize,
     o_path: bool,
 ) -> Result<usize, isize> {
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let Some(fd) = inner.alloc_fd() else {
+    let (files, limit) = current_files_and_nofile_limit();
+    let Some(fd) = files
+        .lock()
+        .install_fd(file, open_descriptor_flags(flags, o_path), limit)
+    else {
         return Err(err(SyscallError::EMFILE));
     };
-    inner.fd_table[fd] = Some(file);
-    inner.fd_flags[fd] = open_fd_flags(flags, o_path);
     Ok(fd)
 }
 

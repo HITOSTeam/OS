@@ -1,15 +1,15 @@
 use super::{
-    alloc_internal_fd, create_mount_record_with_propagation, ensure_mount_target_dir, err,
-    get_current_token, get_fd_file, mount_attr_bits_to_legacy_flags, mount_flags_for_abs,
-    mount_fs_type_for_abs, mount_source_display_for_abs, read_user_cstring, read_user_path_abs,
-    sync_rofs_state, syscall_mount_impl, syscall_umount2_impl, translate_mount_abs,
-    try_read_user_value, update_mount_record_flags, Arc, FsContextFile, FsContextMode, KMountAttr,
-    MountHandleFile, String, SyscallError, AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW,
-    FD_CLOEXEC, FSCONFIG_CMD_CREATE, FSCONFIG_CMD_RECONFIGURE, FSCONFIG_SET_BINARY,
-    FSCONFIG_SET_FD, FSCONFIG_SET_FLAG, FSCONFIG_SET_PATH, FSCONFIG_SET_PATH_EMPTY,
-    FSCONFIG_SET_STRING, FSMOUNT_CLOEXEC, FSMOUNT_SUPPORTED_ATTRS, FSOPEN_CLOEXEC, FSPICK_CLOEXEC,
-    FSPICK_EMPTY_PATH, FSPICK_NO_AUTOMOUNT, FSPICK_SYMLINK_NOFOLLOW, MOVE_MOUNT_F_EMPTY_PATH,
-    MOVE_MOUNT__MASK, MS_RDONLY, OPEN_TREE_CLONE, O_CLOEXEC, O_PATH,
+    AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW, Arc, FD_CLOEXEC, FSCONFIG_CMD_CREATE,
+    FSCONFIG_CMD_RECONFIGURE, FSCONFIG_SET_BINARY, FSCONFIG_SET_FD, FSCONFIG_SET_FLAG,
+    FSCONFIG_SET_PATH, FSCONFIG_SET_PATH_EMPTY, FSCONFIG_SET_STRING, FSMOUNT_CLOEXEC,
+    FSMOUNT_SUPPORTED_ATTRS, FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_EMPTY_PATH,
+    FSPICK_NO_AUTOMOUNT, FSPICK_SYMLINK_NOFOLLOW, FsContextFile, FsContextMode, KMountAttr,
+    MOVE_MOUNT__MASK, MOVE_MOUNT_F_EMPTY_PATH, MS_RDONLY, MountHandleFile, O_CLOEXEC, O_PATH,
+    OPEN_TREE_CLONE, String, SyscallError, alloc_internal_fd, create_mount_record_with_propagation,
+    ensure_mount_target_dir, err, get_current_token, get_fd_file, mount_attr_bits_to_legacy_flags,
+    mount_flags_for_abs, mount_fs_type_for_abs, mount_source_display_for_abs, read_user_cstring,
+    read_user_path_abs, sync_rofs_state, syscall_mount_impl, syscall_umount2_impl,
+    translate_mount_abs, try_read_user_value, update_mount_record_flags,
 };
 
 /// Creates a new filesystem context fd for the modern mount API.
@@ -28,11 +28,15 @@ pub fn syscall_fsopen(fsname: usize, flags: usize) -> isize {
     if fsname == "invalid" || fsname == "error" {
         return err(SyscallError::ENODEV);
     }
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & FSOPEN_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
-    alloc_internal_fd(Arc::new(FsContextFile::new_create(&fsname)), fd_flags).unwrap_or_else(|e| e)
+    alloc_internal_fd(
+        Arc::new(FsContextFile::new_create(&fsname)),
+        descriptor_flags,
+    )
+    .unwrap_or_else(|e| e)
 }
 
 /// Applies configuration commands to an `fsopen(2)` filesystem context.
@@ -169,9 +173,9 @@ pub fn syscall_fsmount(fd: usize, flags: usize, mount_attrs: usize) -> isize {
         .clone()
         .unwrap_or_else(|| String::from("/"));
     let handle_flags = state.pending_flags | mount_attr_bits_to_legacy_flags(mount_attrs);
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & FSMOUNT_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     alloc_internal_fd(
         Arc::new(MountHandleFile::new(
@@ -180,7 +184,7 @@ pub fn syscall_fsmount(fd: usize, flags: usize, mount_attrs: usize) -> isize {
             &state.fs_type,
             handle_flags,
         )),
-        fd_flags,
+        descriptor_flags,
     )
     .unwrap_or_else(|e| e)
 }
@@ -206,9 +210,9 @@ pub fn syscall_fspick(dirfd: isize, path: usize, flags: usize) -> isize {
     let fs_type = mount_fs_type_for_abs(&abs);
     let source_abs = translate_mount_abs(&abs);
     let source_display = mount_source_display_for_abs(&abs);
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & FSPICK_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     alloc_internal_fd(
         Arc::new(FsContextFile::new_reconfigure(
@@ -218,7 +222,7 @@ pub fn syscall_fspick(dirfd: isize, path: usize, flags: usize) -> isize {
             &abs,
             mount_flags_for_abs(&abs),
         )),
-        fd_flags,
+        descriptor_flags,
     )
     .unwrap_or_else(|e| e)
 }
@@ -245,11 +249,11 @@ pub fn syscall_open_tree(dirfd: isize, path: usize, flags: usize) -> isize {
     let source_display = mount_source_display_for_abs(&abs);
     let fs_type = mount_fs_type_for_abs(&abs);
     let mount_flags = mount_flags_for_abs(&abs);
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (flags & O_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
-    fd_flags |= O_PATH as u32;
+    descriptor_flags |= O_PATH as u32;
     alloc_internal_fd(
         Arc::new(MountHandleFile::new(
             &source_abs,
@@ -257,7 +261,7 @@ pub fn syscall_open_tree(dirfd: isize, path: usize, flags: usize) -> isize {
             &fs_type,
             mount_flags,
         )),
-        fd_flags,
+        descriptor_flags,
     )
     .unwrap_or_else(|e| e)
 }

@@ -1,19 +1,19 @@
 use super::{
-    current_effective_uid_gid, current_fsuid_gid, current_process, current_timespec, err,
-    ext4_lock, fd_has_o_path, file_lock_key_from_inode, fill_statfs, find_path_in_roots,
-    flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file, get_inode_times,
-    inode_mode_allows_uid_gid, inode_rdev_for_mode, inode_visible_size, is_privileged_or_owner,
-    kstat_from_fd, kstat_from_file, maybe_signal_lease_break, open_pseudo,
-    proc_magic_link_target_kstat, proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync,
-    punch_hole_keep_size, read_user_cstring, read_user_value, require_fd_file, resolve_abs_path,
-    resolve_at_inode, resolve_at_path, resolve_utime, rofs_for_path, set_inode_times,
-    statfs_mount_flags_for_abs, statx_from_kstat, sync_all, touch_inode_mtime_ctime_now,
-    truncate_regular_inode, try_copy_to_user, try_write_user_value, write_zeros_range, AtPath,
-    CgroupFile, FifoDuplexFile, File, KStat, NetSocketFile, OSInode, Pipe, ProcPseudoFile,
-    ProcessControlBlock, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile, Statx, String,
-    SyscallError, TimeSpec, Vec, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
-    AT_SYMLINK_NOFOLLOW, EXT4_ST_DEV, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
-    FALLOC_FL_SUPPORTED_MASK, PID2PCB,
+    AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE, AT_SYMLINK_NOFOLLOW, AtPath,
+    BTreeSet, CgroupFile, EXT4_ST_DEV, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
+    FALLOC_FL_SUPPORTED_MASK, FifoDuplexFile, File, KStat, NetSocketFile, OSInode, PID2PCB, Pipe,
+    ProcPseudoFile, ProcessControlBlock, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
+    RtcFile, Statx, String, SyscallError, TimeSpec, Vec, current_effective_uid_gid,
+    current_fsuid_gid, current_process, current_timespec, err, ext4_lock, fd_has_o_path,
+    file_lock_key_from_inode, fill_statfs, find_path_in_roots, flush_open_inode_views,
+    fsize_limit_allows, get_current_token, get_fd_file, get_inode_times, inode_mode_allows_uid_gid,
+    inode_rdev_for_mode, inode_visible_size, is_privileged_or_owner, kstat_from_fd,
+    kstat_from_file, maybe_signal_lease_break, open_pseudo, proc_magic_link_target_kstat,
+    proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync, punch_hole_keep_size,
+    read_user_cstring, read_user_value, require_fd_file, resolve_abs_path, resolve_at_inode,
+    resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, statfs_mount_flags_for_abs,
+    statx_from_kstat, sync_all, touch_inode_mtime_ctime_now, truncate_regular_inode,
+    try_copy_to_user, try_write_user_value, write_zeros_range,
 };
 
 /// Preallocates file space or punches holes on supported file types.
@@ -524,31 +524,28 @@ pub fn syscall_fsync(fd: usize) -> isize {
 
 /// Flushes dirty file data across currently open descriptors and the ext4 backend.
 pub fn syscall_sync() -> isize {
-    let current = current_process();
     let mut files: Vec<alloc::sync::Arc<dyn File + Send + Sync>> = Vec::new();
-    {
-        let inner = current.borrow_mut();
-        for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
-            files.push(file.clone());
-        }
-    }
-
     let processes: Vec<alloc::sync::Arc<ProcessControlBlock>> = {
         let map = PID2PCB.lock();
         map.values().cloned().collect()
     };
+    let mut seen_tables = BTreeSet::new();
     for process in processes {
-        if core::ptr::eq(
-            alloc::sync::Arc::as_ptr(&process),
-            alloc::sync::Arc::as_ptr(&current),
-        ) {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        let table = alloc::sync::Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(alloc::sync::Arc::as_ptr(&table) as usize) {
             continue;
         }
-        if let Some(inner) = process.try_borrow_mut() {
-            for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
-                files.push(file.clone());
-            }
-        }
+        files.extend(
+            table
+                .lock()
+                .iter_files_snapshot()
+                .into_iter()
+                .map(|(_, file)| file),
+        );
     }
 
     for file in files {

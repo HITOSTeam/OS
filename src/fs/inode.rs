@@ -5,7 +5,7 @@ use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
 use crate::mm::UserBuffer;
 use crate::println;
 use crate::task::manager::PID2PCB;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -75,7 +75,8 @@ lazy_static! {
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref DEFERRED_UNLINK_CLEANUP: Mutex<BTreeMap<(usize, u32), TmpfileCleanup>> =
         Mutex::new(BTreeMap::new());
-    static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> = Mutex::new(BTreeMap::new());
+    static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> =
+        Mutex::new(BTreeMap::new());
 }
 
 pub(crate) fn ext4_lock() -> Ext4Guard {
@@ -681,6 +682,7 @@ fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
         let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
     };
+    let mut seen_tables = BTreeSet::new();
     for process in processes {
         let Some(inner) = process.try_borrow_mut() else {
             // Cannot inspect this process (lock held) — conservatively assume
@@ -688,11 +690,16 @@ fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
             // next OSInode::drop for the same inode.
             return true;
         };
-        if inner
-            .fd_table
-            .iter()
-            .filter_map(|f| f.as_ref())
-            .any(|file| {
+        let files = Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
+            continue;
+        }
+        if files
+            .lock()
+            .iter_files_snapshot()
+            .into_iter()
+            .any(|(_fd, file)| {
                 file.as_any()
                     .downcast_ref::<OSInode>()
                     .map(|o| {
@@ -712,9 +719,7 @@ fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
 /// no longer have open file descriptors.  Called opportunistically after a
 /// successful cleanup to prevent orphan accumulation.
 fn sweep_deferred_unlinks() {
-    let keys: Vec<(usize, u32)> = {
-        DEFERRED_UNLINK_CLEANUP.lock().keys().cloned().collect()
-    };
+    let keys: Vec<(usize, u32)> = { DEFERRED_UNLINK_CLEANUP.lock().keys().cloned().collect() };
     for key in keys {
         // Only proceed if we can definitively confirm no refs remain.
         if !has_open_inode_fd_refs(key.0, key.1) {

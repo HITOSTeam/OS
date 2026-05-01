@@ -1,6 +1,6 @@
 use super::{
-    current_process, err, OSInode, ProcessControlBlock, SyscallError, Vec, PID2PCB, S_IFBLK,
-    S_IFCHR, S_IFMT,
+    BTreeSet, OSInode, PID2PCB, ProcessControlBlock, S_IFBLK, S_IFCHR, S_IFMT, SyscallError, Vec,
+    current_process, err,
 };
 
 /// Converts ext4 backend errors into Linux-style `errno` values.
@@ -205,16 +205,23 @@ pub(crate) fn inode_visible_size(inode: &ext4_fs::Inode) -> usize {
         let map = PID2PCB.lock();
         map.values().cloned().collect()
     };
+    let mut seen_tables = BTreeSet::new();
     for process in processes {
-        if let Some(inner) = process.try_borrow_mut() {
-            for file in inner.fd_table.iter().filter_map(|f| f.as_ref()) {
-                let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-                    continue;
-                };
-                let fd_inode = os_inode.ext4_inode();
-                if fd_inode.inode_num() == target_ino && fd_inode.device_id() == target_dev {
-                    size = core::cmp::max(size, os_inode.pending_write_end());
-                }
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        let table = alloc::sync::Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(alloc::sync::Arc::as_ptr(&table) as usize) {
+            continue;
+        }
+        for (_fd, file) in table.lock().iter_files_snapshot() {
+            let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+                continue;
+            };
+            let opened_inode = os_inode.ext4_inode();
+            if opened_inode.inode_num() == target_ino && opened_inode.device_id() == target_dev {
+                size = core::cmp::max(size, os_inode.pending_write_end());
             }
         }
     }

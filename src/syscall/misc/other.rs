@@ -2,22 +2,15 @@ use crate::{
     config::clock_freq,
     debug_config::DEBUG_PTHREAD,
     fs::{POLLERR, POLLHUP, POLLNVAL},
-    mm::{
-        MapPermission, translated_byte_buffer,
-        try_read_user_value, try_write_user_value,
-    },
+    mm::{MapPermission, translated_byte_buffer, try_read_user_value, try_write_user_value},
     syscall::{
-        robust_list::ROBUST_LIST_HEAD_LEN,
         error::{SyscallError, err},
+        robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
         manager::pid2process,
-        processor::{
-            block_current_and_run_next, current_files_process, current_process, current_task,
-        },
-        signal::{
-            SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit,
-        },
+        processor::{block_current_and_run_next, current_files, current_process, current_task},
+        signal::{SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
     },
     time::get_time,
     trap::get_current_token,
@@ -238,7 +231,7 @@ pub fn syscall_ppoll(
     }
 
     let token = get_current_token();
-    let process = current_files_process();
+    let files = current_files();
     let deadline_ns = if _tmo_p == 0 {
         None
     } else {
@@ -305,14 +298,7 @@ pub fn syscall_ppoll(
                 continue;
             }
             let fd = pfd.fd as usize;
-            let file = {
-                let inner = process.borrow_mut();
-                if fd >= inner.fd_table.len() {
-                    None
-                } else {
-                    inner.fd_table[fd].clone()
-                }
-            };
+            let file = files.lock().get_file(fd);
             let Some(file) = file else {
                 pfd.revents = POLLNVAL;
                 ready += 1;
@@ -387,7 +373,6 @@ pub fn syscall_ppoll(
 /// Busybox `dmesg` calls this. We don't maintain a kernel log buffer for userspace;
 /// return success and (for read requests) an empty buffer.
 pub fn syscall_syslog(_type: usize, bufp: usize, len: usize) -> isize {
-
     // `klogctl` actions (Linux uapi).
     const SYSLOG_ACTION_READ: usize = 2;
     const SYSLOG_ACTION_READ_ALL: usize = 3;

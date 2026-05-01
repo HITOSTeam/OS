@@ -740,19 +740,19 @@ pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
         map.values().cloned().collect::<Vec<_>>()
     };
     let mut seen = BTreeSet::new();
+    let mut seen_tables = BTreeSet::new();
     let mut refs = 0usize;
     for process in processes {
         let files = {
             let Some(inner) = process.try_borrow_mut() else {
                 continue;
             };
-            inner
-                .fd_table
-                .iter()
-                .filter_map(|f| f.as_ref().cloned())
-                .collect::<Vec<_>>()
+            Arc::clone(&inner.files)
         };
-        for file in files {
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
+            continue;
+        }
+        for (_fd, file) in files.lock().iter_files_snapshot() {
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 continue;
             };
@@ -784,19 +784,19 @@ pub fn remove_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
         map.values().cloned().collect::<Vec<_>>()
     };
     let mut seen = BTreeSet::new();
+    let mut seen_tables = BTreeSet::new();
     let mut removed = 0usize;
     for process in processes {
         let files = {
             let Some(inner) = process.try_borrow_mut() else {
                 continue;
             };
-            inner
-                .fd_table
-                .iter()
-                .filter_map(|f| f.as_ref().cloned())
-                .collect::<Vec<_>>()
+            Arc::clone(&inner.files)
         };
-        for file in files {
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
+            continue;
+        }
+        for (_fd, file) in files.lock().iter_files_snapshot() {
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 continue;
             };
@@ -821,29 +821,36 @@ fn log_pipe_end_owners(end: &Arc<Pipe>, label: &str) {
         return;
     }
     let end_ptr = Arc::as_ptr(end);
-    let map = PID2PCB.lock();
+    let processes = {
+        let map = PID2PCB.lock();
+        map.iter()
+            .map(|(pid, pcb)| (*pid, Arc::clone(pcb)))
+            .collect::<Vec<_>>()
+    };
     let mut owners = Vec::new();
     let mut total = 0usize;
-    for (pid, pcb) in map.iter() {
+    let mut seen_tables = BTreeSet::new();
+    for (pid, pcb) in processes {
         let Some(inner) = pcb.try_borrow_mut() else {
             continue;
         };
-        for (fd, file) in inner.fd_table.iter().enumerate() {
-            let Some(file) = file else {
-                continue;
-            };
+        let files = Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
+            continue;
+        }
+        for (fd, file) in files.lock().iter_files_snapshot() {
             let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
                 continue;
             };
             if (pipe as *const Pipe) == end_ptr {
                 total += 1;
                 if owners.len() < 8 {
-                    owners.push((*pid, fd));
+                    owners.push((pid, fd));
                 }
             }
         }
     }
-    drop(map);
     if total > 0 {
         crate::log_if!(
             DEBUG_UNIXBENCH,

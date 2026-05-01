@@ -16,23 +16,22 @@ use core::mem::size_of;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::mm::{
-    UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value,
-    try_write_user_value,
-};
-use crate::syscall::filesystem::normalize_path;
-use crate::task::manager::pid2process;
-use crate::task::processor::{
-    block_current_and_run_next, current_files_process, current_process, current_task,
-    suspend_current_and_run_next,
-};
-use crate::task::task_block::{TaskControlBlock, TaskStatus};
-use crate::trap::get_current_token;
-use crate::syscall::error::{SyscallError, err};
 use crate::fs::{
     File, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, ext4_lock, find_path_in_roots,
     make_socketpair, wake_tasks,
 };
+use crate::mm::{
+    UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
+};
+use crate::syscall::error::{SyscallError, err};
+use crate::syscall::filesystem::normalize_path;
+use crate::task::manager::pid2process;
+use crate::task::processor::{
+    block_current_and_run_next, current_files, current_process, current_task,
+    suspend_current_and_run_next,
+};
+use crate::task::task_block::{TaskControlBlock, TaskStatus};
+use crate::trap::get_current_token;
 
 pub(super) const AF_UNIX: u16 = 1;
 pub(super) const AF_INET: u16 = 2;
@@ -62,7 +61,6 @@ pub(super) const SO_RCVBUFFORCE: usize = 33;
 pub(super) const SO_ATTACH_BPF: usize = 50;
 pub(super) const MCAST_JOIN_GROUP: usize = 42;
 pub(super) const MCAST_LEAVE_GROUP: usize = 45;
-
 
 pub(super) const MSG_OOB: usize = 0x1;
 pub(super) const MSG_PEEK: usize = 0x2;
@@ -773,26 +771,26 @@ fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
 }
 
 pub(super) fn get_file(fd: usize) -> Result<FileArc, isize> {
-    let process = current_files_process();
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_table.len() {
+    let files = current_files();
+    let files = files.lock();
+    let Some((file, descriptor_flags)) = files.get_file_and_flags(fd) else {
+        return Err(err(SyscallError::EBADF));
+    };
+    if (descriptor_flags & O_PATH) != 0 {
         return Err(err(SyscallError::EBADF));
     }
-    if fd < inner.fd_flags.len() && (inner.fd_flags[fd] & O_PATH) != 0 {
-        return Err(err(SyscallError::EBADF));
-    }
-    inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
+    Ok(file)
 }
 
 fn get_file_from_process(pid: usize, fd: usize) -> Result<FileArc, isize> {
     let Some(process) = pid2process(pid) else {
         return Err(err(SyscallError::EBADF));
     };
-    let inner = process.borrow_mut();
-    if fd >= inner.fd_table.len() {
-        return Err(err(SyscallError::EBADF));
-    }
-    inner.fd_table[fd].clone().ok_or(err(SyscallError::EBADF))
+    process
+        .files()
+        .lock()
+        .get_file(fd)
+        .ok_or(err(SyscallError::EBADF))
 }
 
 pub(crate) fn mq_notify_validate_thread_sockfd(pid: usize, sockfd: usize) -> isize {
@@ -857,7 +855,10 @@ pub(super) fn queue_pending_more_chunk(key: usize, chunk: &[u8], udp_target: Opt
     put_pending_more(key, pending);
 }
 
-pub(super) fn consume_pending_more(key: usize, payload: Vec<u8>) -> (Vec<u8>, bool, Option<UdpTarget>) {
+pub(super) fn consume_pending_more(
+    key: usize,
+    payload: Vec<u8>,
+) -> (Vec<u8>, bool, Option<UdpTarget>) {
     if let Some(mut pending) = take_pending_more(key) {
         let pending_target = pending.udp_target;
         pending.data.extend_from_slice(&payload);
@@ -1058,7 +1059,12 @@ fn register_unix_bound_socket(addr: &UnixBoundAddr, file: &FileArc) -> isize {
     0
 }
 
-pub(super) fn bind_unix_socket(file: &FileArc, sock: &UnixSocketFile, addr: usize, addrlen: usize) -> isize {
+pub(super) fn bind_unix_socket(
+    file: &FileArc,
+    sock: &UnixSocketFile,
+    addr: usize,
+    addrlen: usize,
+) -> isize {
     if sock.bound_addr().is_some() {
         return err(SyscallError::EINVAL);
     }
@@ -1173,7 +1179,11 @@ pub(super) fn write_sockaddr_nl(user_ptr: usize, user_len_ptr: usize, sa: &SockA
     0
 }
 
-pub(super) fn write_sockaddr_un(user_ptr: usize, user_len_ptr: usize, addr: Option<&UnixBoundAddr>) -> isize {
+pub(super) fn write_sockaddr_un(
+    user_ptr: usize,
+    user_len_ptr: usize,
+    addr: Option<&UnixBoundAddr>,
+) -> isize {
     if user_ptr == 0 || user_len_ptr == 0 {
         return err(SyscallError::EFAULT);
     }
@@ -1305,7 +1315,11 @@ pub(super) fn write_msg_name_bytes(msg: &mut MsgHdr, value: &[u8]) -> isize {
     0
 }
 
-pub(super) fn write_msg_name_in(msg: &mut MsgHdr, ip: smoltcp::wire::Ipv4Address, port: u16) -> isize {
+pub(super) fn write_msg_name_in(
+    msg: &mut MsgHdr,
+    ip: smoltcp::wire::Ipv4Address,
+    port: u16,
+) -> isize {
     let sa = SockAddrIn {
         sin_family: AF_INET,
         sin_port: port.to_be(),
@@ -1411,4 +1425,3 @@ pub(super) fn write_mmsghdr(user_ptr: usize, idx: usize, mmsg: &MMsgHdr) -> isiz
     }
     0
 }
-

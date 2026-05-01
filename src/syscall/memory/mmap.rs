@@ -278,7 +278,11 @@ pub fn syscall_mmap(
         return err(SyscallError::ENOMEM);
     };
     if !user_range_valid(start, end) {
-        return if is_fixed { err(SyscallError::EINVAL) } else { err(SyscallError::ENOMEM) };
+        return if is_fixed {
+            err(SyscallError::EINVAL)
+        } else {
+            err(SyscallError::ENOMEM)
+        };
     }
     let map_start = start;
     let map_end = end;
@@ -561,6 +565,7 @@ pub fn syscall_mremap(
         return err(SyscallError::EFAULT);
     }
 
+    let files_snapshot = current_files().lock().iter_files_snapshot();
     let process = current_process();
     let mut inner = process.borrow_mut();
     if !inner
@@ -746,8 +751,8 @@ pub fn syscall_mremap(
             .get(&src_region.backing_id)
             .cloned()
             .or_else(|| {
-                find_inode_file_in_fd_table(
-                    &inner.fd_table,
+                find_inode_file_in_snapshot(
+                    &files_snapshot,
                     src_region.file_dev,
                     src_region.file_ino,
                 )

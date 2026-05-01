@@ -1,19 +1,19 @@
 use super::{
-    apply_umask, current_effective_uid_gid, current_files_process, current_fsuid_gid,
-    current_process, err, ext4_err_to_errno, ext4_lock, fd_file, fifo_pipe_state_for_inode,
-    file_lock_key, file_lock_key_from_inode, get_current_token, gid_for_created_inode,
-    inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
-    is_inode_currently_executed_locked, is_privileged_or_owner, lock_executing_inodes, make_pipe,
-    maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint,
-    open_existing_target_path, open_pseudo, path_is_nodev, path_is_nosymfollow, path_is_rofs,
-    proc_path_for_at, read_user_cstring, remove_owner_file_lease_for_key,
-    remove_process_record_locks_for_key, reopen_proc_link_file, resolve_abs_path, resolve_at_inode,
-    resolve_at_path, resolve_parent_and_name, secondary_root_inode, set_inode_all_times_now,
-    shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, try_write_user_value,
-    union_root_dir_entries, AtPath, BTreeSet, File, OSInode, Ordering, ProcMagicLinkFile,
-    PseudoDir, PseudoShmFile, SyscallError, FD_CLOEXEC, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT,
-    O_DIRECTORY, O_EXCL, O_NOATIME, O_NOFOLLOW, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_TMPFILE,
-    O_TRUNC, O_WRONLY, S_IFBLK, S_IFCHR, S_IFMT, TMPFILE_SEQ,
+    AtPath, BTreeSet, FD_CLOEXEC, File, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY,
+    O_EXCL, O_NOATIME, O_NOFOLLOW, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_TMPFILE, O_TRUNC,
+    O_WRONLY, OSInode, Ordering, ProcMagicLinkFile, PseudoDir, PseudoShmFile, S_IFBLK, S_IFCHR,
+    S_IFMT, SyscallError, TMPFILE_SEQ, apply_umask, current_effective_uid_gid, current_files,
+    current_files_and_nofile_limit, current_fsuid_gid, current_process, err, ext4_err_to_errno,
+    ext4_lock, fifo_pipe_state_for_inode, file_lock_key, file_lock_key_from_inode,
+    get_current_token, gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid,
+    install_open_file_fd, is_inode_currently_executed_locked, is_privileged_or_owner,
+    lock_executing_inodes, make_pipe, maybe_signal_lease_break, mode_for_created_file,
+    note_inode_path_hint, open_existing_target_path, open_pseudo, path_is_nodev,
+    path_is_nosymfollow, path_is_rofs, proc_path_for_at, read_user_cstring,
+    remove_owner_file_lease_for_key, remove_process_record_locks_for_key, reopen_proc_link_file,
+    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
+    secondary_root_inode, set_inode_all_times_now, shm_create, shm_get, shm_object_name,
+    touch_inode_mtime_ctime_now, try_write_user_value, union_root_dir_entries,
 };
 
 /// Opens or creates a filesystem object across ext4, proc, pseudo-fs, and tmpfile paths.
@@ -525,15 +525,14 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 
 /// Closes a single file descriptor and releases any lock or lease state tied to it.
 pub fn syscall_close(fd: usize) -> isize {
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    // EBADF if fd not open (POSIX close() semantics)
-    if !inner.is_fd_open(fd) {
+    let files = current_files();
+    let mut files = files.lock();
+    let Some(file) = files.get_file(fd) else {
         return err(SyscallError::EBADF);
-    }
-    let lock_key = inner.fd_table[fd].as_ref().and_then(file_lock_key);
-    let _ = inner.clear_fd(fd);
-    drop(inner);
+    };
+    let lock_key = file_lock_key(&file);
+    let _ = files.clear_fd(fd);
+    drop(files);
     if let Some(key) = lock_key {
         remove_process_record_locks_for_key(current_process().getpid(), key);
         remove_owner_file_lease_for_key(current_process().getpid(), key);
@@ -561,13 +560,12 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
     if (flags & CLOSE_RANGE_UNSHARE) != 0 {
         process.unshare_files();
     }
-    let files_process = process.files_owner_process();
-    let mut inner = files_process.borrow_mut();
-    inner.ensure_fd_flags_len();
-    if inner.fd_table.is_empty() {
+    let files = process.files();
+    let mut files = files.lock();
+    if files.is_empty() {
         return 0;
     }
-    let end = core::cmp::min(last, inner.fd_table.len() - 1);
+    let end = core::cmp::min(last, files.len() - 1);
     if first > end {
         return 0;
     }
@@ -575,19 +573,18 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
     let mut lock_keys = BTreeSet::new();
     for fd in first..=end {
         if set_cloexec {
-            if inner.is_fd_open(fd) {
-                inner.fd_flags[fd] |= FD_CLOEXEC;
+            if files.is_fd_open(fd) {
+                let descriptor_flags = files.get_flags(fd) | FD_CLOEXEC;
+                let _ = files.set_flags(fd, descriptor_flags);
             }
-        } else {
-            if let Some(file) = inner.fd_table[fd].as_ref() {
-                if let Some(key) = file_lock_key(file) {
-                    lock_keys.insert(key);
-                }
+        } else if let Some(file) = files.get_file(fd) {
+            if let Some(key) = file_lock_key(&file) {
+                lock_keys.insert(key);
             }
-            let _ = inner.clear_fd(fd);
+            let _ = files.clear_fd(fd);
         }
     }
-    drop(inner);
+    drop(files);
     if !set_cloexec {
         let owner_pid = current_process().getpid();
         for key in lock_keys {
@@ -600,32 +597,28 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
 
 /// Creates a pipe pair and installs both ends into the caller's fd table.
 pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
-    let process = current_files_process();
+    let (files, limit) = current_files_and_nofile_limit();
     let token = get_current_token();
     let (pipe_read, pipe_write) = make_pipe();
 
-    let mut inner = process.borrow_mut();
-    let Some(read_fd) = inner.alloc_fd() else {
-        return err(SyscallError::EMFILE);
-    };
-    inner.fd_table[read_fd] = Some(pipe_read);
-    let Some(write_fd) = inner.alloc_fd() else {
-        let _ = inner.clear_fd(read_fd);
-        return err(SyscallError::EMFILE);
-    };
-    inner.fd_table[write_fd] = Some(pipe_write);
-    let mut fd_flags = 0u32;
+    let mut descriptor_flags = 0u32;
     if (_flags & O_CLOEXEC) != 0 {
-        fd_flags |= FD_CLOEXEC;
+        descriptor_flags |= FD_CLOEXEC;
     }
     if (_flags & O_NONBLOCK) != 0 {
-        fd_flags |= O_NONBLOCK as u32;
+        descriptor_flags |= O_NONBLOCK as u32;
     }
-    inner.fd_flags[read_fd] = fd_flags;
-    inner.fd_flags[write_fd] = fd_flags;
+    let mut files_guard = files.lock();
+    let Some(read_fd) = files_guard.install_fd(pipe_read, descriptor_flags, limit) else {
+        return err(SyscallError::EMFILE);
+    };
+    let Some(write_fd) = files_guard.install_fd(pipe_write, descriptor_flags, limit) else {
+        let _ = files_guard.clear_fd(read_fd);
+        return err(SyscallError::EMFILE);
+    };
     // Drop PCB borrow before user-memory writes: uaccess may need to resolve
     // lazy/COW pages via `process.try_borrow_mut()`.
-    drop(inner);
+    drop(files_guard);
 
     // Linux ABI: pipefd points to `int pipefd[2]` (i32).
     if try_write_user_value(token, pipefd as *mut i32, &(read_fd as i32)).is_err()
@@ -636,9 +629,9 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
         )
         .is_err()
     {
-        let mut inner = process.borrow_mut();
-        let _ = inner.clear_fd(read_fd);
-        let _ = inner.clear_fd(write_fd);
+        let mut files_guard = files.lock();
+        let _ = files_guard.clear_fd(read_fd);
+        let _ = files_guard.clear_fd(write_fd);
         return err(SyscallError::EFAULT);
     }
     0
@@ -646,16 +639,14 @@ pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
 
 /// Duplicates a file descriptor into the lowest-numbered free slot.
 pub fn syscall_dup(oldfd: usize) -> isize {
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    let file = fd_file!(inner, oldfd);
-    inner.ensure_fd_flags_len();
-    let old_flags = inner.fd_flags[oldfd];
-    let Some(newfd) = inner.alloc_fd() else {
+    let (files, limit) = current_files_and_nofile_limit();
+    let mut files = files.lock();
+    let Some((file, old_flags)) = files.get_file_and_flags(oldfd) else {
+        return err(SyscallError::EBADF);
+    };
+    let Some(newfd) = files.install_fd(file, old_flags & !FD_CLOEXEC, limit) else {
         return err(SyscallError::EMFILE);
     };
-    inner.fd_table[newfd] = Some(file);
-    inner.fd_flags[newfd] = old_flags & !FD_CLOEXEC;
     newfd as isize
 }
 
@@ -667,35 +658,27 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     if oldfd == newfd {
         return err(SyscallError::EINVAL);
     }
-    let process = current_files_process();
-    let mut inner = process.borrow_mut();
-    if newfd >= inner.rlimits.rlimit_nofile_cur as usize {
+    let owner_pid = current_process().getpid();
+    let (files, limit) = current_files_and_nofile_limit();
+    if newfd >= limit {
         return err(SyscallError::EBADF);
     }
-    let file = fd_file!(inner, oldfd);
-    let owner_pid = current_process().getpid();
-    let mut replaced_lock_key = None;
-    if inner.is_fd_open(newfd) {
-        replaced_lock_key = inner.fd_table[newfd].as_ref().and_then(file_lock_key);
-        let _ = inner.clear_fd(newfd);
-    }
-    if let Some(key) = replaced_lock_key {
-        remove_process_record_locks_for_key(owner_pid, key);
-        remove_owner_file_lease_for_key(owner_pid, key);
-    }
-    inner.ensure_fd_flags_len();
-    let old_flags = inner.fd_flags[oldfd];
-    while inner.fd_table.len() <= newfd {
-        inner.fd_table.push(None);
-        inner.fd_flags.push(0);
-    }
-    inner.fd_table[newfd] = Some(file);
+    let mut files = files.lock();
+    let Some((file, old_flags)) = files.get_file_and_flags(oldfd) else {
+        return err(SyscallError::EBADF);
+    };
+    let replaced_lock_key = files.get_file(newfd).and_then(|file| file_lock_key(&file));
     let mut new_flags = old_flags;
     if (flags & O_CLOEXEC) != 0 {
         new_flags |= FD_CLOEXEC;
     } else {
         new_flags &= !FD_CLOEXEC;
     }
-    inner.fd_flags[newfd] = new_flags;
+    let _ = files.install_fd_at(newfd, file, new_flags, limit);
+    drop(files);
+    if let Some(key) = replaced_lock_key {
+        remove_process_record_locks_for_key(owner_pid, key);
+        remove_owner_file_lease_for_key(owner_pid, key);
+    }
     newfd as isize
 }

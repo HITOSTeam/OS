@@ -6,7 +6,7 @@ use crate::{
     println,
     syscall::futex::futex_wake_private_and_shared,
     task::{
-        INITPROC,
+        FilesStruct, INITPROC,
         id::{KernelStack, TaskUserRes},
         manager::{
             PID2PCB, TASK_MANAGER, add_task, fetch_task, has_ready_rt_at_or_above,
@@ -432,10 +432,18 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
         })
 }
 
-/// Resolve the process that owns the current task's file table.
-pub fn current_files_process() -> Arc<ProcessControlBlock> {
+pub(crate) fn current_files() -> Arc<spin::Mutex<FilesStruct>> {
     let process = current_process();
-    process.files_owner_process()
+    process.files()
+}
+
+pub(crate) fn current_files_and_nofile_limit() -> (Arc<spin::Mutex<FilesStruct>>, usize) {
+    let process = current_process();
+    let inner = process.borrow_mut();
+    (
+        Arc::clone(&inner.files),
+        inner.rlimits.rlimit_nofile_cur as usize,
+    )
 }
 
 // todo
@@ -550,7 +558,10 @@ pub fn should_preempt_current_on_tick() -> bool {
     };
     let (policy, rt_prio) = {
         let inner = process.borrow_mut();
-        (inner.scheduling.sched_policy, inner.scheduling.sched_priority)
+        (
+            inner.scheduling.sched_policy,
+            inner.scheduling.sched_priority,
+        )
     };
     match sched_class(policy) {
         Some(SchedClass::Fair) | None => {
@@ -1021,8 +1032,6 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // same exit-side futex/join cleanup as the current thread.
         let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
         recycle_res.clear();
-        process.handoff_files_owner_on_exit();
-
         let mut process_inner = process.borrow_mut();
         process_inner.children.clear();
         let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
@@ -1033,9 +1042,9 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         process_inner.memory_set = MemorySet::new_bare();
         crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
         crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-        // drop file descriptors
-        process_inner.fd_table.clear();
-        process_inner.fd_flags.clear();
+        // Replace the table Arc instead of clearing it: other CLONE_FILES users
+        // may still hold the old Arc and must keep their descriptors alive.
+        process_inner.files = Arc::new(spin::Mutex::new(FilesStruct::new()));
         // Keep zombie `tasks[]` until wait4() reaps the process so reaping has
         // a deterministic place to drop any lingering task Arcs.
     }
@@ -1137,8 +1146,6 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
 
     let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();
-    process.handoff_files_owner_on_exit();
-
     let mut process_inner = process.borrow_mut();
     process_inner.children.clear();
     let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
@@ -1148,8 +1155,9 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     process_inner.memory_set = MemorySet::new_bare();
     crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
     crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-    process_inner.fd_table.clear();
-    process_inner.fd_flags.clear();
+    // Replace the table Arc instead of clearing it: other CLONE_FILES users
+    // may still hold the old Arc and must keep their descriptors alive.
+    process_inner.files = Arc::new(spin::Mutex::new(FilesStruct::new()));
 
     // Same as `exit_current_and_run_next()`: keep zombie `tasks[]` until wait4().
 

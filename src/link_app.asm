@@ -212,9 +212,13 @@ app_52_name:
     .asciz "umount_once"
 .section .rodata
 .align 3
+app_53_name:
+    .asciz "dup3_lock_cleanup_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 53
+    .quad 54
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -268,3 +272,4 @@ num_user_apps:
     .quad app_50_name
     .quad app_51_name
     .quad app_52_name
+    .quad app_53_name

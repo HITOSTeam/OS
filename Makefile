@@ -1,4 +1,8 @@
 # arch related configurations 
+MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+ROOT_DIR := $(abspath $(MAKEFILE_DIR)/..)
+OS_DIR := $(ROOT_DIR)/os
+USER_DIR := $(ROOT_DIR)/user
 ARCH ?= riscv64
 ifeq ($(ARCH), riscv64)
 TARGET := riscv64gc-unknown-none-elf
@@ -8,7 +12,7 @@ QEMU_NET_DEV := virtio-net-device,netdev=net
 DISK_DEV := virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 QEMU_BIOS_ARGS := -bios default
 GDB_ARCH := riscv:rv64
-CARGO_CONFIG := ../cargo-config/config.toml
+CARGO_CONFIG := $(ROOT_DIR)/cargo-config/config.toml
 else ifeq ($(ARCH), loongarch64)
 TARGET := loongarch64-unknown-none
 QEMU_BIN := qemu-system-loongarch64
@@ -17,17 +21,19 @@ QEMU_NET_DEV := virtio-net-pci,netdev=net
 DISK_DEV := virtio-blk-pci,drive=x1
 QEMU_BIOS_ARGS :=
 GDB_ARCH := loongarch
-CARGO_CONFIG := ../cargo-config/config_loongarch64.toml
+CARGO_CONFIG := $(ROOT_DIR)/cargo-config/config_loongarch64.toml
 else
 $(error "Unsupported architecture: $(ARCH), Use riscv64 or loongarch64")
 endif
 # build configurations 
 MODE := release
 APP_DIR = ./results
-KERNEL_ELF := target/$(TARGET)/$(MODE)/os
+CARGO_TARGET_DIR := $(ROOT_DIR)/target
+KERNEL_ELF := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)/os
 KERNEL_BIN := kernel_$(MODE).bin
-DISASM_TMP := target/$(TARGET)/$(MODE)/asm
-FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
+DISASM_TMP := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)/asm
+USER_TARGET_DIR := $(USER_DIR)/target/$(TARGET)/$(MODE)
+FS_IMG := $(USER_TARGET_DIR)/fs.img
 KERNEL_ENTRY_PA = 0x80200000
 SMP ?= 4
 MEM ?= 512M
@@ -83,9 +89,9 @@ KERNEL: prepare-cargo USER_APPS
 
 # find all excutable in the user's target dir strip it and copy to the os_str
 USER_APPS: prepare-cargo
-	@cd ../user  && cargo build --$(MODE) $(USER_FEATURES) --target $(TARGET)
+	@cd ../user  && CARGO_TARGET_DIR=target cargo build --$(MODE) $(USER_FEATURES) --target $(TARGET)
 	@mkdir -p $(APP_DIR)
-	@for f in ../user/target/$(TARGET)/$(MODE)/*; do \
+	@for f in $(USER_TARGET_DIR)/*; do \
 		if [ -f "$$f" ] && [ -x "$$f" ]; then \
 			base=$$(basename $$f); \
 			dst=$(APP_DIR)/$$base.bin; \
