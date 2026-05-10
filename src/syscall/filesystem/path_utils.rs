@@ -243,10 +243,18 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
     } else {
         normalize_relative_path(path)
     };
+    let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
-    let Some(base) = find_path_in_roots(&translate_mount_abs(base_path)) else {
-        return Err(err(SyscallError::ENOENT));
-    };
+    let mut depth = 0usize;
+    let mut seen_symlinks = Vec::new();
+    let base = resolve_ext4_abs_path(
+        &translate_mount_abs(base_path),
+        fsuid,
+        fsgid,
+        true,
+        &mut depth,
+        &mut seen_symlinks,
+    )?;
     Ok(AtPath::Ext4Rel { base, rel })
 }
 
