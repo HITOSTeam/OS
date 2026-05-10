@@ -15,6 +15,7 @@ const FD_CLOEXEC: u32 = 1;
 pub struct FilesStruct {
     fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     fd_flags: Vec<u32>,
+    next_fd_hint: usize,
 }
 
 impl FilesStruct {
@@ -33,12 +34,18 @@ impl FilesStruct {
                 Some(Arc::new(Stdout)),
             ],
             fd_flags: vec![0; 3],
+            next_fd_hint: 3,
         }
     }
 
     pub fn clone_private(&self) -> Self {
         let (fd_table, fd_flags) = self.snapshot_fd_state();
-        Self { fd_table, fd_flags }
+        let next_fd_hint = self.next_fd_hint.min(fd_table.len());
+        Self {
+            fd_table,
+            fd_flags,
+            next_fd_hint,
+        }
     }
 
     fn effective_len(&self) -> usize {
@@ -59,6 +66,9 @@ impl FilesStruct {
         let len = self.effective_len();
         self.fd_table.truncate(len);
         self.fd_flags.truncate(len);
+        if self.next_fd_hint > len {
+            self.next_fd_hint = len;
+        }
     }
 
     fn ensure_flags_len(&mut self) {
@@ -116,12 +126,14 @@ impl FilesStruct {
     }
 
     pub fn alloc_fd(&mut self, limit: usize) -> Option<usize> {
-        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
+        let start = self.next_fd_hint.min(self.fd_table.len());
+        if let Some(fd) = (start..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
             if fd >= limit {
                 return None;
             }
             self.ensure_flags_len();
             self.fd_flags[fd] = 0;
+            self.next_fd_hint = fd + 1;
             Some(fd)
         } else {
             if self.fd_table.len() >= limit {
@@ -129,7 +141,9 @@ impl FilesStruct {
             }
             self.fd_table.push(None);
             self.fd_flags.push(0);
-            Some(self.fd_table.len() - 1)
+            let fd = self.fd_table.len() - 1;
+            self.next_fd_hint = fd + 1;
+            Some(fd)
         }
     }
 
@@ -163,6 +177,15 @@ impl FilesStruct {
         }
         self.fd_table[fd] = Some(file);
         self.fd_flags[fd] = flags;
+        if fd == self.next_fd_hint {
+            while self
+                .fd_table
+                .get(self.next_fd_hint)
+                .is_some_and(Option::is_some)
+            {
+                self.next_fd_hint += 1;
+            }
+        }
         true
     }
 
@@ -173,6 +196,9 @@ impl FilesStruct {
         let file = self.fd_table[fd].take();
         self.ensure_flags_len();
         self.fd_flags[fd] = 0;
+        if file.is_some() {
+            self.next_fd_hint = self.next_fd_hint.min(fd);
+        }
         self.trim();
         file
     }
@@ -198,6 +224,7 @@ impl FilesStruct {
                 // clearing the CLOEXEC bit in one pass keeps exec cleanup simple.
                 self.fd_table[idx] = None;
                 *flags = 0;
+                self.next_fd_hint = self.next_fd_hint.min(idx);
             }
         }
         self.trim();
@@ -209,6 +236,7 @@ impl Default for FilesStruct {
         Self {
             fd_table: Vec::new(),
             fd_flags: Vec::new(),
+            next_fd_hint: 0,
         }
     }
 }
