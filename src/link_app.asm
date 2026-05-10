@@ -5,220 +5,112 @@ app_0_name:
 .section .rodata
 .align 3
 app_1_name:
-    .asciz "02helloqiukaiyu"
-.section .rodata
-.align 3
-app_2_name:
-    .asciz "03syscall_test"
-.section .rodata
-.align 3
-app_3_name:
-    .asciz "04test"
-.section .rodata
-.align 3
-app_4_name:
-    .asciz "05"
-.section .rodata
-.align 3
-app_5_name:
-    .asciz "06"
-.section .rodata
-.align 3
-app_6_name:
-    .asciz "07"
-.section .rodata
-.align 3
-app_7_name:
-    .asciz "123"
-.section .rodata
-.align 3
-app_8_name:
-    .asciz "all_tests"
-.section .rodata
-.align 3
-app_9_name:
     .asciz "cat"
 .section .rodata
 .align 3
-app_10_name:
-    .asciz "condvar_basic"
-.section .rodata
-.align 3
-app_11_name:
-    .asciz "fork_no_wait"
-.section .rodata
-.align 3
-app_12_name:
-    .asciz "hart_id"
-.section .rodata
-.align 3
-app_13_name:
+app_2_name:
     .asciz "init_proc"
 .section .rodata
 .align 3
-app_14_name:
-    .asciz "multicore_test"
-.section .rodata
-.align 3
-app_15_name:
-    .asciz "mutex_block"
-.section .rodata
-.align 3
-app_16_name:
-    .asciz "mutex_spin"
-.section .rodata
-.align 3
-app_17_name:
-    .asciz "pipe_test"
-.section .rodata
-.align 3
-app_18_name:
-    .asciz "producer"
-.section .rodata
-.align 3
-app_19_name:
-    .asciz "semaphore_basic"
-.section .rodata
-.align 3
-app_20_name:
-    .asciz "semaphore_cond"
-.section .rodata
-.align 3
-app_21_name:
-    .asciz "sleep_debug"
-.section .rodata
-.align 3
-app_22_name:
-    .asciz "sleep_simple"
-.section .rodata
-.align 3
-app_23_name:
-    .asciz "sleep_stress"
-.section .rodata
-.align 3
-app_24_name:
-    .asciz "sleep_test"
-.section .rodata
-.align 3
-app_25_name:
-    .asciz "sync_abc_mutex"
-.section .rodata
-.align 3
-app_26_name:
-    .asciz "thread"
-.section .rodata
-.align 3
-app_27_name:
-    .asciz "thread_arg"
-.section .rodata
-.align 3
-app_28_name:
-    .asciz "thread_counter"
-.section .rodata
-.align 3
-app_29_name:
-    .asciz "thread_lock"
-.section .rodata
-.align 3
-app_30_name:
+app_3_name:
     .asciz "ls"
 .section .rodata
 .align 3
-app_31_name:
+app_4_name:
     .asciz "testcode_runner"
 .section .rodata
 .align 3
-app_32_name:
+app_5_name:
     .asciz "basename"
 .section .rodata
 .align 3
-app_33_name:
+app_6_name:
     .asciz "submit_script"
 .section .rodata
 .align 3
-app_34_name:
+app_7_name:
     .asciz "poweroff"
 .section .rodata
 .align 3
-app_35_name:
+app_8_name:
     .asciz "ifconfig"
 .section .rodata
 .align 3
-app_36_name:
+app_9_name:
     .asciz "ps"
 .section .rodata
 .align 3
-app_37_name:
+app_10_name:
     .asciz "nested_epoll_smoke"
 .section .rodata
 .align 3
-app_38_name:
+app_11_name:
     .asciz "epoll_ctl_wakeup_smoke"
 .section .rodata
 .align 3
-app_39_name:
+app_12_name:
     .asciz "eventfd_epoll_smoke"
 .section .rodata
 .align 3
-app_40_name:
+app_13_name:
     .asciz "timerfd_epoll_smoke"
 .section .rodata
 .align 3
-app_41_name:
+app_14_name:
     .asciz "mq_epoll_smoke"
 .section .rodata
 .align 3
-app_42_name:
+app_15_name:
     .asciz "mq_unlink_epoll_smoke"
 .section .rodata
 .align 3
-app_43_name:
+app_16_name:
     .asciz "mq_notify_signal_smoke"
 .section .rodata
 .align 3
-app_44_name:
+app_17_name:
     .asciz "nested_epoll_ctl_wakeup_smoke"
 .section .rodata
 .align 3
-app_45_name:
+app_18_name:
     .asciz "nested_epoll_oneshot_smoke"
 .section .rodata
 .align 3
-app_46_name:
+app_19_name:
     .asciz "nested_epoll_ctl_del_smoke"
 .section .rodata
 .align 3
-app_47_name:
+app_20_name:
     .asciz "nested_epoll_et_smoke"
 .section .rodata
 .align 3
-app_48_name:
+app_21_name:
     .asciz "nested_epoll_et_maxevents_smoke"
 .section .rodata
 .align 3
-app_49_name:
+app_22_name:
     .asciz "nested_epoll_parent_oneshot_smoke"
 .section .rodata
 .align 3
-app_50_name:
+app_23_name:
     .asciz "proc_magic_links_smoke"
 .section .rodata
 .align 3
-app_51_name:
+app_24_name:
     .asciz "mount_namespace_smoke"
 .section .rodata
 .align 3
-app_52_name:
+app_25_name:
     .asciz "umount_once"
 .section .rodata
 .align 3
-app_53_name:
+app_26_name:
     .asciz "dup3_lock_cleanup_smoke"
 .section .rodata
 .align 3
     .global num_user_apps
 num_user_apps:
-    .quad 54
+    .quad 27
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -246,30 +138,3 @@ num_user_apps:
     .quad app_24_name
     .quad app_25_name
     .quad app_26_name
-    .quad app_27_name
-    .quad app_28_name
-    .quad app_29_name
-    .quad app_30_name
-    .quad app_31_name
-    .quad app_32_name
-    .quad app_33_name
-    .quad app_34_name
-    .quad app_35_name
-    .quad app_36_name
-    .quad app_37_name
-    .quad app_38_name
-    .quad app_39_name
-    .quad app_40_name
-    .quad app_41_name
-    .quad app_42_name
-    .quad app_43_name
-    .quad app_44_name
-    .quad app_45_name
-    .quad app_46_name
-    .quad app_47_name
-    .quad app_48_name
-    .quad app_49_name
-    .quad app_50_name
-    .quad app_51_name
-    .quad app_52_name
-    .quad app_53_name
