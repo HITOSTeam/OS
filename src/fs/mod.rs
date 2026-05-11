@@ -71,12 +71,26 @@ pub trait File: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// `poll`/`epoll`/`select` I/O 就绪等待队列。
+///
+/// 当任务调用 `epoll_wait`/`select` 阻塞等待某个文件就绪时，通过
+/// `register_waiter` 将自身注册到对应文件的 `PollWaitQueue` 中。
+/// 文件状态发生变化（如 pipe 有数据写入、timer 到期）时，调用
+/// `take_wakeups` 取出所有等待者并交给调度器唤醒。
+///
+/// 与 `read_waiters`/`write_waiters` 的区别：后者阻塞的是 `read`/`write`
+/// 系统调用本身（等待数据），本队列阻塞的是 `epoll_wait` 等就绪通知机制。
+/// 对应 Linux 内核中 `poll_wait` + `wait_queue_head_t` 的用法。
 #[derive(Default)]
 pub(crate) struct PollWaitQueue {
+    /// 等待就绪通知的任务列表。使用弱引用，避免阻止任务被正常释放。
+    /// 在每次操作前通过 `retain_waitable` 清理已失效或已就绪的条目。
     waiters: VecDeque<Weak<TaskControlBlock>>,
 }
 
 impl PollWaitQueue {
+    /// 清理队列中已失效（task 已释放）或已不再需要等待（已有结果且非 Ready 状态）的条目。
+    /// 每次读写队列前调用，防止积累无效弱引用。
     fn retain_waitable(&mut self) {
         self.waiters.retain(|waiter| {
             let Some(task) = waiter.upgrade() else {
@@ -87,6 +101,8 @@ impl PollWaitQueue {
         });
     }
 
+    /// 将 `task` 加入等待队列（去重）。
+    /// 若 `task` 已在队列中则返回 `false`，否则加入并返回 `true`。
     pub(crate) fn add_waiter_once(&mut self, task: &Arc<TaskControlBlock>) -> bool {
         self.retain_waitable();
         if self
@@ -100,16 +116,20 @@ impl PollWaitQueue {
         true
     }
 
+    /// 注册等待者，忽略重复注册，始终返回 `true` 表示支持 poll。
     pub(crate) fn register_waiter(&mut self, task: &Arc<TaskControlBlock>) -> bool {
         let _ = self.add_waiter_once(task);
         true
     }
 
+    /// 返回当前是否有有效的等待者（清理无效条目后判断）。
     pub(crate) fn has_waiters(&mut self) -> bool {
         self.retain_waitable();
         !self.waiters.is_empty()
     }
 
+    /// 取出所有有效等待者并清空队列，供调用方调用 `wake_tasks` 唤醒。
+    /// 调用后队列为空；等待者需在文件就绪时重新注册。
     pub(crate) fn take_wakeups(&mut self) -> Vec<Arc<TaskControlBlock>> {
         self.retain_waitable();
         self.waiters
@@ -486,7 +506,10 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
                 dtype: 8,
             },
         ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys/block/root/queue", entries)));
+        return Some(Arc::new(pseudo::PseudoDir::new(
+            "/sys/block/root/queue",
+            entries,
+        )));
     }
     if path == "/sys/block/root/size" {
         return Some(Arc::new(pseudo::PseudoFile::new_static("2097152\n")));
@@ -574,7 +597,10 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
                 dtype: 8,
             },
         ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys/dev/block/1:0", entries)));
+        return Some(Arc::new(pseudo::PseudoDir::new(
+            "/sys/dev/block/1:0",
+            entries,
+        )));
     }
     if path == "/sys/dev/block/1:0/uevent" {
         return Some(Arc::new(pseudo::PseudoFile::new_static(
@@ -642,60 +668,57 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
 }
 
 pub use cgroupfs::{
-    CgroupFile, CgroupMountSpec, cgroup_attach_fork_child, cgroup_attach_thread,
-    cgroup_charge_anon_current, cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process,
-    cgroup_exit_thread, cgroup_fork_precheck, cgroup_logical_path_for_file,
-    cgroup_maybe_block_current, cgroup_mkdir, cgroup_mount, cgroup_proc_cgroups_content,
-    cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
-    legacy_cpu_fair_group,
+    cgroup_attach_fork_child, cgroup_attach_thread, cgroup_charge_anon_current,
+    cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process, cgroup_exit_thread,
+    cgroup_fork_precheck, cgroup_logical_path_for_file, cgroup_maybe_block_current, cgroup_mkdir,
+    cgroup_mount, cgroup_proc_cgroups_content, cgroup_proc_pid_content, cgroup_rename,
+    cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path, legacy_cpu_fair_group, CgroupFile,
+    CgroupMountSpec,
 };
 pub use dummy::DummyFile;
 pub use eventfd::EventFdFile;
-pub use namespace_file::{NamespaceFile, NamespaceKind};
-pub use pidfd::PidFdFile;
-pub use timerfd::TimerFdFile;
-pub use userfaultfd::UserfaultfdFile;
-pub(crate) use timerfd::{
-    cancel_realtime_timerfds_on_set, has_pending_timerfds, process_timerfd_expirations,
-};
-pub(crate) use pidfd::wake_pidfd_poll_waiters;
-#[allow(unused_imports)]
-pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
-    debug_track_iozone_inode, ext4_lock, find_path_in_roots, inode_path_hint,
-    inode_path_in_roots, note_inode_path_hint, path_resolves_to_inode,
-    register_deferred_unlink_cleanup, resolve_final_symlink_abs_path,
-    resolve_final_symlink_abs_path_locked, root_inode_for_path, secondary_root_inode,
+    debug_track_iozone_inode, ext4_lock, find_path_in_roots, inode_path_hint, inode_path_in_roots,
+    note_inode_path_hint, path_resolves_to_inode, register_deferred_unlink_cleanup,
+    resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked, root_inode_for_path,
+    secondary_root_inode,
 };
+#[allow(unused_imports)]
+pub use inode::{list_apps, open_file, OSInode, OpenFlags, EXT4_FS};
 pub(crate) use mountns::{
-    ClassifiedAbsPath, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
-    clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
+    clone_mount_namespace, initial_mount_namespace, mount_namespace_id, ClassifiedAbsPath,
+    MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
 };
+pub use namespace_file::{NamespaceFile, NamespaceKind};
 pub(crate) use net_socket::notify_net_poll_events;
 pub use net_socket::{NetSocketFile, NetSocketKind};
+pub(crate) use pidfd::wake_pidfd_poll_waiters;
+pub use pidfd::PidFdFile;
 pub(crate) use pipe::remove_task_waiters as remove_pipe_waiters_for_task;
 pub use pipe::{
-    Pipe, debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe,
-    pipe_max_size_limit_for_procfs, write_pipe_sysctl,
+    debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe,
+    pipe_max_size_limit_for_procfs, write_pipe_sysctl, Pipe,
 };
 pub(crate) use procfs::parse_proc_sys_usize;
-pub use procfs::{
-    ProcMagicLinkFile, ProcPseudoFile, is_proc_pseudo_path, normalize_proc_magic_path,
-    proc_fd_link_file, proc_magic_link_exists, proc_readlink, vm_commit_limit_bytes,
-    vm_committed_as_bytes, vm_overcommit_memory,
-};
 pub(crate) use procfs::resolve_proc_magic_intermediate_abs_path;
+pub use procfs::{
+    is_proc_pseudo_path, normalize_proc_magic_path, proc_fd_link_file, proc_magic_link_exists,
+    proc_readlink, vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory,
+    ProcMagicLinkFile, ProcPseudoFile,
+};
 pub use pseudo::PseudoBlock;
-pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub(crate) use pseudo::{
-    pseudo_block_is_read_only, pseudo_block_note_sync,
-    pseudo_block_read_ahead, pseudo_block_set_read_ahead, pseudo_block_set_read_only,
-    pseudo_dev_dir_exists,
+    pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_read_ahead,
+    pseudo_block_set_read_ahead, pseudo_block_set_read_only, pseudo_dev_dir_exists,
     pseudo_dev_dir_mkdir, pseudo_dev_dir_rmdir, shm_create, shm_create_anonymous, shm_get,
     shm_remove,
 };
-pub use socketpair::{SocketPairEnd, make_socketpair};
+pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
+pub use socketpair::{make_socketpair, SocketPairEnd};
 pub use stdio::{Stdin, Stdout};
-pub use tty::{
-    LinuxTermio, LinuxTermios, PtyMasterFile, PtySlaveFile, TtyFile,
+pub use timerfd::TimerFdFile;
+pub(crate) use timerfd::{
+    cancel_realtime_timerfds_on_set, has_pending_timerfds, process_timerfd_expirations,
 };
+pub use tty::{LinuxTermio, LinuxTermios, PtyMasterFile, PtySlaveFile, TtyFile};
+pub use userfaultfd::UserfaultfdFile;

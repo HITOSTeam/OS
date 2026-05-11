@@ -982,7 +982,9 @@ impl MemorySet {
                 unsafe {
                     asm!("sfence.vma");
                 }
-                crate::sbi::remote_sfence_vma_all(remote_hart_mask);
+                if remote_hart_mask != 0 {
+                    crate::sbi::remote_sfence_vma_all(remote_hart_mask);
+                }
             }
             // SAFETY: LoongArch64 currently runs single-core only (no SMP boot),
             // so a local full TLB flush is sufficient. When SMP is added, a
