@@ -3,33 +3,44 @@ use core::mem::size_of;
 
 use crate::fs::NetSocketFile;
 use crate::mm::{try_copy_to_user, try_read_user_value};
-use crate::syscall::error::{SyscallError, err};
+use crate::syscall::error::{err, SyscallError};
 use crate::task::processor::{current_files, current_files_and_nofile_limit, current_process};
 use crate::trap::get_current_token;
 
 use super::*;
 
+/// `socket(domain, type, protocol)` — 创建一个新 socket，返回文件描述符。
+///
+/// `socket_type` 低 8 位为实际类型（SOCK_STREAM / SOCK_DGRAM / …），
+/// 高位 flag 可叠加：`SOCK_CLOEXEC`（exec 时自动关闭）、`SOCK_NONBLOCK`（非阻塞模式）。
 pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
+    // 低 8 位是 socket 类型，高位是 SOCK_CLOEXEC / SOCK_NONBLOCK 等 flag。
     let st = socket_type & 0xff;
     let cloexec = (socket_type & SOCK_CLOEXEC) != 0;
     let nonblock = (socket_type & SOCK_NONBLOCK) != 0;
+
+    // 仅支持这四种类型，其他直接 EINVAL。
     if !matches!(st, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW | SOCK_SEQPACKET) {
         return err(SyscallError::EINVAL);
     }
+
     let file: FileArc = match domain as u16 {
         AF_INET => match st {
             SOCK_STREAM => {
+                // protocol=0 或 6（IPPROTO_TCP）均合法，其他拒绝。
                 if protocol != 0 && protocol != 6 {
                     return err(SyscallError::EPROTONOSUPPORT);
                 }
                 NetSocketFile::new_tcp()
             }
             SOCK_DGRAM => {
+                // protocol=0 或 17（IPPROTO_UDP）均合法，其他拒绝。
                 if protocol != 0 && protocol != 17 {
                     return err(SyscallError::EPROTONOSUPPORT);
                 }
                 NetSocketFile::new_udp()
             }
+            // AF_INET 的 RAW / SEQPACKET 暂不支持。
             SOCK_RAW | SOCK_SEQPACKET => return err(SyscallError::EPROTONOSUPPORT),
             _ => return err(SyscallError::EINVAL),
         },
@@ -40,9 +51,12 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
             if !matches!(st, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
                 return err(SyscallError::EINVAL);
             }
+            // AF_UNIX 由 UnixSocketFile 实现（内部队列，不经过 smoltcp）。
             Arc::new(UnixSocketFile::new(st))
         }
+        // NETLINK 是一种特殊协议。告诉外部网络接口状态。ip addr等工具用的就是这个
         AF_NETLINK => {
+            // NETLINK 仅支持 RAW / DGRAM，且 protocol 必须为 0（NETLINK_ROUTE stub）。
             if !matches!(st, SOCK_RAW | SOCK_DGRAM) {
                 return err(SyscallError::EPROTONOSUPPORT);
             }
@@ -51,10 +65,13 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
             }
             Arc::new(NetlinkSocketFile::new())
         }
+        // 其他协议族一律 EAFNOSUPPORT。
         _ => {
             return err(SyscallError::EAFNOSUPPORT);
         }
     };
+
+    // 将 SOCK_CLOEXEC / SOCK_NONBLOCK 转换为 fd 描述符 flag。
     let mut descriptor_flags = 0u32;
     if cloexec {
         descriptor_flags |= FD_CLOEXEC;
@@ -62,6 +79,8 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
     if nonblock {
         descriptor_flags |= O_NONBLOCK;
     }
+
+    // 安装到进程 fd 表，超出 nofile 限制时返回 EMFILE。
     let (files, limit) = current_files_and_nofile_limit();
     let Some(fd) = files.lock().install_fd(file, descriptor_flags, limit) else {
         return err(SyscallError::EMFILE);

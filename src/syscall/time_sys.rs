@@ -1,4 +1,5 @@
-use crate::syscall::error::{SyscallError, err};
+use crate::syscall::error::{err, SyscallError};
+use crate::task::task_block::TaskControlBlock;
 use crate::{
     config::clock_freq,
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
@@ -13,7 +14,7 @@ use crate::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
     },
-    task::signal::{SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
+    task::signal::{has_unmasked_pending, signal_bit, SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM},
     task::{
         manager::pid2process,
         processor::{current_files, current_process, current_task},
@@ -24,6 +25,7 @@ use crate::{
     time::{get_time, get_time_ns},
     trap::get_current_token,
 };
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use spin::Mutex;
 
@@ -74,15 +76,25 @@ const TIMEX_WRITE_MODES: u32 = ADJ_OFFSET
     | ADJ_OFFSET_SINGLESHOT;
 const TIMEX_ALLOWED_MODES: u32 = TIMEX_WRITE_MODES | ADJ_OFFSET_SS_READ;
 
+/// 内核维护的 `adjtimex` 时钟调整状态，对应 `struct timex` 的可写子集。
+/// 用于 NTP 风格的软件时钟校正（`clock_adjtime` / `adjtimex` 系统调用）。
 #[derive(Clone, Copy)]
 struct AdjtimexState {
+    /// 时钟偏移量（纳秒或微秒，取决于 status 中的 ADJ_NANO 位）
     offset: i64,
+    /// 频率误差，单位 ppm（scaled by 2^16）
     freq: i64,
+    /// 最大误差估计（微秒）
     maxerror: i64,
+    /// 估计误差（微秒）
     esterror: i64,
+    /// 时钟状态标志位（STA_PLL、STA_UNSYNC 等）
     status: i32,
+    /// PLL 时间常数（影响调整速度）
     constant: i64,
+    /// 每个 tick 的微秒数，通常为 10000（对应 HZ=100）
     tick: i64,
+    /// 国际原子时与 UTC 的秒差（TAI-UTC）
     tai: i32,
 }
 
@@ -175,9 +187,13 @@ fn ns_to_timespec(ns: u64) -> TimeSpec {
     }
 }
 
+/// 解码后的动态 CPU 时钟描述符。
+/// Linux 用负数 clock_id 编码进程/线程 CPU 时钟，该结构体保存解码结果。
 #[derive(Clone, Copy)]
 struct DynamicCpuClock {
+    /// 目标进程 PID 或线程 TID
     target_id: usize,
+    /// true 表示线程级 CPU 时钟，false 表示进程级
     per_thread: bool,
 }
 
@@ -226,98 +242,164 @@ fn dynamic_cpu_clock_time_ns(clk: DynamicCpuClock) -> Option<u64> {
     }
 }
 
+/// 对应 C `struct timeval`，精度到微秒。
+/// 用于 `gettimeofday` / `settimeofday`。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TimeVal {
+    /// 秒
     sec: u64,
+    /// 微秒（0 ~ 999_999）
     usec: u64,
 }
 
+/// 对应 C `struct timezone`，随 `gettimeofday` 一起传出。
+/// 现代系统已基本废弃，内核通常忽略写入并返回全零。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TimeZone {
+    /// UTC 偏移分钟数（西为正，如 UTC+8 为 -480）
     minuteswest: i32,
+    /// 夏令时类型（已废弃，始终为 0）
     dsttime: i32,
 }
 
+/// 对应 C `struct timespec`，精度到纳秒。
+/// 用于 `clock_gettime`、`nanosleep`、`pselect` 等高精度时间接口。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TimeSpec {
+    /// 秒
     sec: i64,
+    /// 纳秒（0 ~ 999_999_999）
     nsec: i64,
 }
 
+/// `pselect6` 第 6 个参数指向的结构体。
+///
+/// 由于 syscall 只有 6 个寄存器参数，而信号掩码需要同时传指针和大小，
+/// Linux 将两者打包成此结构体，通过指针间接传入。
+///
+/// 对应 C：`struct { const sigset_t *ss; size_t ss_len; }`
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PSelectSigmaskArg {
+    /// 指向用户空间 `sigset_t` 的指针（64 位信号位图）
     sigmask_ptr: usize,
+    /// `sigset_t` 的字节大小，现代 64 位系统固定为 8；
+    /// 保留此字段是为了兼容早期 32 位 sigset_t
     sigset_size: usize,
 }
 
+/// 对应 C `struct tms`，由 `times` 系统调用填充。
+/// 记录进程及其已回收子进程的 CPU 时间，单位为时钟滴答（clock tick）。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Tms {
+    /// 当前进程用户态 CPU 时间
     tms_utime: i64,
+    /// 当前进程内核态 CPU 时间
     tms_stime: i64,
+    /// 已 wait 的子进程用户态 CPU 时间之和
     tms_cutime: i64,
+    /// 已 wait 的子进程内核态 CPU 时间之和
     tms_cstime: i64,
 }
 
+/// 有符号版本的 `struct timeval`，用于 `adjtimex` / `Timex` 内部。
+/// 与 `TimeVal` 的区别：`sec` 为 `i64`（可表示负偏移）。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TimeVal64 {
+    /// 秒（有符号）
     sec: i64,
+    /// 微秒（0 ~ 999_999）
     usec: i64,
 }
 
+/// 对应 C `struct timex`，用于 `adjtimex` / `clock_adjtime` 系统调用。
+/// 是 NTP 时钟调整的用户空间接口，内核读写其中的字段来同步硬件时钟。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Timex {
+    /// 操作模式标志（ADJ_OFFSET、ADJ_FREQ 等），决定哪些字段有效
     modes: u32,
     _pad0: u32,
+    /// 时钟偏移（纳秒或微秒，由 status 中 ADJ_NANO 决定）
     offset: i64,
+    /// 频率误差，单位 scaled ppm（ppm × 2^16）
     freq: i64,
+    /// 最大误差估计（微秒）
     maxerror: i64,
+    /// 当前估计误差（微秒）
     esterror: i64,
+    /// 时钟状态标志（STA_PLL、STA_UNSYNC、STA_NANO 等）
     status: i32,
     _pad1: i32,
+    /// PLL 时间常数，影响频率调整的收敛速度
     constant: i64,
+    /// 时钟精度（只读，内核填充）
     precision: i64,
+    /// 频率容差（只读，内核填充）
     tolerance: i64,
+    /// 当前时间（只读，内核填充）
     time: TimeVal64,
+    /// 每 tick 微秒数（通常 10000，对应 HZ=100）
     tick: i64,
+    /// PPS 频率（只读）
     ppsfreq: i64,
+    /// PPS 抖动（只读）
     jitter: i64,
+    /// PPS 校准间隔的 log2 值
     shift: i32,
     _pad2: i32,
+    /// PPS 稳定性（只读）
     stabil: i64,
+    /// PPS 抖动超限计数（只读）
     jitcnt: i64,
+    /// PPS 校准次数（只读）
     calcnt: i64,
+    /// PPS 误差超限计数（只读）
     errcnt: i64,
+    /// PPS 稳定性超限计数（只读）
     stbcnt: i64,
+    /// TAI-UTC 秒差（只读）
     tai: i32,
     _pad3: [i32; 11],
 }
 
+/// 对应 C `struct itimerval`，用于 `getitimer` / `setitimer`。
+/// 描述一个基于 `ITIMER_REAL` / `ITIMER_VIRTUAL` / `ITIMER_PROF` 的间隔定时器。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ITimerVal {
+    /// 定时器到期后的重复间隔；为零表示单次触发
     it_interval: TimeVal64,
+    /// 距下次到期的剩余时间；为零表示定时器已停止
     it_value: TimeVal64,
 }
 
+/// 对应 C `struct sigevent`，用于 POSIX 定时器（`timer_create`）。
+/// 描述定时器到期时的通知方式。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SigEvent {
+    /// 传递给信号处理函数的附加值（`siginfo_t.si_value`）
     sigev_value: usize,
+    /// 到期时发送的信号编号（SIGEV_SIGNAL 模式下有效）
     sigev_signo: i32,
+    /// 通知方式：SIGEV_NONE / SIGEV_SIGNAL / SIGEV_THREAD 等
     sigev_notify: i32,
 }
 
+/// 对应 C `struct itimerspec`，用于 POSIX 定时器（`timer_settime` / `timer_gettime`）。
+/// 与 `ITimerVal` 类似，但时间精度为纳秒。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ITimerSpec {
+    /// 定时器到期后的重复间隔；为零表示单次触发
     it_interval: TimeSpec,
+    /// 距下次到期的剩余时间；为零表示定时器已停止
     it_value: TimeSpec,
 }
 
@@ -1081,11 +1163,25 @@ pub fn syscall_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize 
     0
 }
 
-/// Linux `pselect6` (syscall 72 on riscv64).
+/// Linux `pselect6`(riscv64 系统调用号 72)。
 ///
-/// Enough for iperf/netperf event loops:
-/// - When fdsets are provided, report readiness based on our fd table.
-/// - When `nfds==0` (or all fdsets are NULL), treat it as a sleep/yield primitive.
+/// 足以支撑 iperf / netperf / netserver 这类事件循环:
+/// - 提供 fdset 时,根据本进程 fd 表逐个 poll 出可读 / 可写 / 异常状态;
+/// - `nfds == 0`(或三个 fdset 全为 NULL)时,退化成"带信号唤醒的睡眠原语",
+///   musl 的 `usleep` / 部分 event loop 会这么用。
+///
+/// 返回约定(与 Linux 对齐):
+/// - `>= 0`:就绪 fd 数(超时为 0);
+/// - `-EINTR`:被未屏蔽信号打断(SIGCHLD 除外,见 has_unmasked_pending 调用处);
+/// - `-EBADF` / `-EINVAL` / `-EFAULT`:参数错误。
+// nfds 监听套接字。
+/// 各个参数的意思：
+/// nfds 从0-nfds遍历检查
+/// readfds 检查可读的
+/// 可写的
+/// 异常的
+/// 超时时间设置
+/// 信号掩码，select内部采用的掩码
 pub fn syscall_pselect6(
     _nfds: usize,
     _readfds: usize,
@@ -1094,7 +1190,15 @@ pub fn syscall_pselect6(
     timeout_ptr: usize,
     _sigmask: usize,
 ) -> isize {
+    fn recover_mask(now_task: Arc<TaskControlBlock>, restore_mask: Option<u64>) {
+        if let Some(old_mask) = restore_mask {
+            let mut inner = now_task.borrow_mut();
+            inner.signal_mask = old_mask;
+        }
+    }
+    // -------- 第 ① 段:参数边界检查 --------
     const EBADF: isize = -9;
+    // fdset 上限 256KB,对应 ~2M 个 fd,远超本内核 fd 表规模,主要防恶意巨值。
     const MAX_FDSET_BYTES: usize = 256 * 1024;
     if (_nfds as isize) < 0 {
         return err(SyscallError::EINVAL);
@@ -1107,17 +1211,25 @@ pub fn syscall_pselect6(
     let writefds = _writefds;
     let exceptfds = _exceptfds;
 
+    // 提前缓存当前任务的页表 token、fd 表、TCB 句柄,后续多次复用,避免反复加锁。
     let token = get_current_token();
     let files = current_files();
     let task = current_task().unwrap();
 
+    // -------- 第 ② 段:临时替换 signal_mask(pselect 区别于 select 的关键)--------
+    //
+    // pselect6 相比 select 多了"原子地切换信号屏蔽字"语义:进入等待前用 user 传入的
+    // mask 覆盖原 mask,返回前恢复。这避免了 select + sigprocmask 之间存在窗口、
+    // 信号丢失的经典竞态。restore_mask 在函数末尾负责恢复。
     let mut restore_mask = None;
     if _sigmask != 0 {
+        // user 传的是 { sigmask_ptr, sigset_size } 结构,而不是直接的位图指针。
         let Some(arg) =
             try_read_user_value::<PSelectSigmaskArg>(token, _sigmask as *const PSelectSigmaskArg)
         else {
             return err(SyscallError::EFAULT);
         };
+        // sigset_size 必须至少能装下我们用的 u64 位图,否则视为 ABI 不兼容。
         if arg.sigset_size < core::mem::size_of::<u64>() {
             return err(SyscallError::EINVAL);
         }
@@ -1129,9 +1241,12 @@ pub fn syscall_pselect6(
             };
             new_mask = mask;
         }
+        // SIGKILL / SIGSTOP 按 POSIX 永远不可屏蔽,即使 user 在 mask 里置位也要强制清掉,
+        // 否则会出现一个进程永远等不到 kill -9 的灾难场景。
         let sigkill_bit = signal_bit(SIGKILL_NUM).unwrap_or(0);
         let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
         new_mask &= !(sigkill_bit | sigstop_bit);
+        // 在 TCB 临界区里完成 "读旧值 + 写新值",保证替换原子。
         let old_mask = {
             let mut inner = task.borrow_mut();
             let old = inner.signal_mask;
@@ -1141,58 +1256,69 @@ pub fn syscall_pselect6(
         restore_mask = Some(old_mask);
     }
 
+    // -------- 第 ③ 段:把 user 的相对 timespec 换算成绝对截止时间(纳秒)--------
+    //
+    // - timeout_ptr == 0 → None,表示无限等待;
+    // - 否则把 user 的 (sec, nsec) 相对值与 now_ns() 相加,得到一个统一的绝对截止时间,
+    //   后续两个等待循环都用这个 deadline 直接比较,免去每次重算。
+    // - 注意:任意一条错误路径返回前都要恢复 signal_mask,否则上面 ② 段改的位不会复原。
     let deadline_ns = if timeout_ptr == 0 {
         None
     } else {
         let Some(ts) = try_read_user_value::<TimeSpec>(token, timeout_ptr as *const TimeSpec)
         else {
-            if let Some(old_mask) = restore_mask {
-                let mut inner = task.borrow_mut();
-                inner.signal_mask = old_mask;
-            }
+            recover_mask(task.clone(), restore_mask);
             return err(SyscallError::EFAULT);
         };
         let Some(delta_ns) = timespec_to_ns(ts) else {
-            if let Some(old_mask) = restore_mask {
-                let mut inner = task.borrow_mut();
-                inner.signal_mask = old_mask;
-            }
+            recover_mask(task.clone(), restore_mask);
             return err(SyscallError::EINVAL);
         };
+        // saturating_add 防止 user 传超大值时溢出回绕成"已经超时"。
         Some(now_ns().saturating_add(delta_ns))
     };
 
+    // -------- 第 ④ 段:nfds == 0 的"纯睡眠"快速路径 --------
+    //
+    // 没有任何 fd 要监听,等价于一个可被信号唤醒的 nanosleep。musl 部分实现会用这种
+    // 方式做毫秒级延时,所以我们必须支持,不能直接返回 EINVAL。
     if nfds == 0 {
         let ret = loop {
+            // 每轮重新读 pending / mask,因为 mask 可能在子线程里被改(虽然罕见),
+            // pending 则会被其它核 / 中断在任意时刻置位。
             let (pending, mask) = {
                 let inner = task.borrow_mut();
                 (inner.pending_signals, inner.signal_mask)
             };
-            if has_unmasked_pending(pending, mask, false) {
+            // 这里第三个参数 `ignore_sigchld = true` 是本分支修复 netperf 的核心:
+            // 忽略 SIGCHILD否则 服务器 直接错误退出
+            if has_unmasked_pending(pending, mask, true) {
                 break err(SyscallError::EINTR);
             }
             if let Some(deadline) = deadline_ns {
                 if now_ns() >= deadline {
                     break 0;
                 }
+                // 有 deadline → suspend(可被调度回来重新检查 deadline / 信号);
+                // 没 deadline → block(等显式唤醒,减少无谓 busy 唤醒)。
                 crate::task::processor::suspend_current_and_run_next();
             } else {
                 crate::task::processor::block_current_and_run_next();
             }
         };
-        if let Some(old_mask) = restore_mask {
-            let mut inner = task.borrow_mut();
-            inner.signal_mask = old_mask;
-        }
+        // 退出快速路径前同样要恢复 ② 段临时替换的 signal_mask。
+        recover_mask(task.clone(), restore_mask);
         return ret;
     }
 
+    // -------- 第 ⑤ 段:有 fdset 的真正 select 路径 --------
+    //
+    // 内存布局:fdset 是位图,每 8 个 fd 占 1 字节;in_* 持有 user 传入的输入位图,
+    // out_* 是本轮计算出的输出位图(只有 break 时才写回 user),双缓冲避免循环里
+    // 反复 copy_to_user。
     let bytes_len = (nfds + 7) / 8;
     if bytes_len > MAX_FDSET_BYTES {
-        if let Some(old_mask) = restore_mask {
-            let mut inner = task.borrow_mut();
-            inner.signal_mask = old_mask;
-        }
+        recover_mask(task.clone(), restore_mask);
         return err(SyscallError::EINVAL);
     }
 
@@ -1203,33 +1329,29 @@ pub fn syscall_pselect6(
     let mut out_w = alloc::vec![0u8; bytes_len];
     let mut out_e = alloc::vec![0u8; bytes_len];
 
+    // 把三个 user fdset 各自拷进内核(空指针即跳过)。任何一个拷贝失败都按
+    // EFAULT 退出,且退出前同样要恢复 signal_mask。
+    // 这里也就是所谓 Select需要拷贝 性能底下的地方
     if readfds != 0 && try_copy_from_user(token, readfds as *const u8, in_r.as_mut_slice()).is_err()
     {
-        if let Some(old_mask) = restore_mask {
-            let mut inner = task.borrow_mut();
-            inner.signal_mask = old_mask;
-        }
+        recover_mask(task.clone(), restore_mask);
         return err(SyscallError::EFAULT);
     }
     if writefds != 0
         && try_copy_from_user(token, writefds as *const u8, in_w.as_mut_slice()).is_err()
     {
-        if let Some(old_mask) = restore_mask {
-            let mut inner = task.borrow_mut();
-            inner.signal_mask = old_mask;
-        }
+        recover_mask(task.clone(), restore_mask);
         return err(SyscallError::EFAULT);
     }
     if exceptfds != 0
         && try_copy_from_user(token, exceptfds as *const u8, in_e.as_mut_slice()).is_err()
     {
-        if let Some(old_mask) = restore_mask {
-            let mut inner = task.borrow_mut();
-            inner.signal_mask = old_mask;
-        }
+        recover_mask(task.clone(), restore_mask);
         return err(SyscallError::EFAULT);
     }
 
+    // 把 out_* 回写到 user 三个 fdset。只在确认要返回(就绪 / 超时)时调用一次,
+    // 不放进循环里以节约 copy_to_user 开销。
     let write_sets = |r: &[u8], w: &[u8], e: &[u8]| -> isize {
         if readfds != 0 && try_copy_to_user(token, readfds as *mut u8, r).is_err() {
             return err(SyscallError::EFAULT);
@@ -1243,38 +1365,52 @@ pub fn syscall_pselect6(
         0
     };
 
+    // 主等待循环:每一轮 = "检查信号 → 扫一遍 fd → 命中就返回 / 超时就返回 / 都没命中就 yield"。
+    // 没有事件驱动唤醒机制,采用 busy poll + suspend 让出 CPU 的简化模型。
     let ret = loop {
+        // ① 信号检查:被未屏蔽信号打断要立刻 EINTR 返回(SIGCHLD 不算,理由见 ④ 段)。
         let (pending, mask) = {
             let inner = task.borrow_mut();
             (inner.pending_signals, inner.signal_mask)
         };
-        if has_unmasked_pending(pending, mask, false) {
+        if has_unmasked_pending(pending, mask, true) {
             break err(SyscallError::EINTR);
         }
 
+        // ② 每轮把 out_* 清空重算,避免上一轮残留位影响本轮结果。
         let mut ready = 0isize;
         out_r.fill(0);
         out_w.fill(0);
         out_e.fill(0);
 
+        // ③ 扫描 [0, nfds) 区间内所有被监听的 fd,统计就绪个数(ready)。
         let mut bad_fd = false;
         for fd in 0..nfds {
+            // fdset 位图寻址:fd 号 → (byte, bit)。
             let byte = fd / 8;
             let bit = fd % 8;
             let mask = 1u8 << bit;
             let want_r = readfds != 0 && (in_r[byte] & mask) != 0;
             let want_w = writefds != 0 && (in_w[byte] & mask) != 0;
             let want_e = exceptfds != 0 && (in_e[byte] & mask) != 0;
+            // 三类都不关心 → 跳过,避免无谓地 lock fd 表。
             if !want_r && !want_w && !want_e {
                 continue;
             }
+            // fd 表加锁后立刻 clone Arc 出来释放锁,避免在持锁状态下调用 poll_mask
+            // 触发递归锁或长持锁。
             let file = files.lock().get_file(fd);
             let Some(file) = file else {
+                // user 让我们监听一个不存在的 fd → 整次 select 返回 EBADF。
                 bad_fd = true;
                 break;
             };
 
+            // 统一通过 poll_mask() 拿到当前 fd 的可读 / 可写 / 错误位,把 select 的
+            // 三集合语义复用到 poll 的实现上。
             let mask_now = file.poll_mask();
+            // POLLHUP(对端关闭)在 select 语义里也算"可读",且要优先于普通 POLLIN
+            // 判断:这样 user 的 read() 才会拿到 EOF 而不是一直阻塞。
             if want_r && (mask_now & crate::fs::POLLHUP) != 0 {
                 out_r[byte] |= mask;
                 ready += 1;
@@ -1286,6 +1422,7 @@ pub fn syscall_pselect6(
                 out_w[byte] |= mask;
                 ready += 1;
             }
+            // exceptfds 在 Linux 里实际承载的是带外数据(POLLPRI),不是泛义"错误"。
             if want_e && (mask_now & POLLPRI) != 0 {
                 out_e[byte] |= mask;
                 ready += 1;
@@ -1296,6 +1433,7 @@ pub fn syscall_pselect6(
             break EBADF;
         }
 
+        // ④ 有 fd 就绪 → 写回三个 fdset,返回就绪计数。
         if ready != 0 {
             let wr = write_sets(&out_r, &out_w, &out_e);
             if wr != 0 {
@@ -1304,6 +1442,8 @@ pub fn syscall_pselect6(
             break ready;
         }
 
+        // ⑤ 没就绪 + 已到截止时间 → 返回 0,但仍要把(全 0 的)fdset 回写,
+        //    否则 user 端的 FD_ISSET 可能读到 stale 输入位。
         if let Some(deadline) = deadline_ns {
             if now_ns() >= deadline {
                 let wr = write_sets(&out_r, &out_w, &out_e);
@@ -1314,13 +1454,13 @@ pub fn syscall_pselect6(
             }
         }
 
+        // ⑥ 让出 CPU,等下次被调度回来再扫一遍。
         crate::task::processor::suspend_current_and_run_next();
     };
 
-    if let Some(old_mask) = restore_mask {
-        let mut inner = task.borrow_mut();
-        inner.signal_mask = old_mask;
-    }
+    // 函数唯一的统一出口:还原 ② 段临时替换的 signal_mask。pselect 区别于 select 的
+    // "原子还原 mask" 语义就靠这里兜底。
+    recover_mask(task.clone(), restore_mask);
 
     ret
 }

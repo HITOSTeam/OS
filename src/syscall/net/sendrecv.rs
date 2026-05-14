@@ -90,7 +90,11 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
         let (kbuf, had_pending, _) = consume_pending_more(key, kbuf);
         return visible_send_result(unix_sock.send_dgram(kbuf, target), user_len, had_pending);
     }
-    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
+    // sendmsg 的 netlink 分支:把 iovec 拼起来交给 handle_outbound,由它解析 nlmsghdr
+    // 并立刻构造好回复入队。msg_name 是 user 指定的"发给谁",但这里 kernel 是唯一
+    // 对端,只 parse 一遍校验合法性再丢弃。返回值按"全部成功发送"上报,因为我们已经
+    // 在 handle_outbound 里把整批字节处理完了。
+    if let Some(netlink_sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
         let send_flag_check = validate_send_flags(flags);
         if send_flag_check != 0 {
             return send_flag_check;
@@ -108,7 +112,7 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
                 Err(e) => return e,
             };
         }
-        // Outbound netlink is ignored in current kernel model.
+        netlink_sock.handle_outbound(&kbuf);
         return kbuf.len() as isize;
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
@@ -260,6 +264,9 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
         }
         return copied as isize;
     }
+    // recvmsg 的 netlink 分支:从队列拿一整条 reply,scatter 到 user 的 iovec 里;
+    // 若 user 提供了 msg_name,把 kernel netlink 地址(nl_pid = 0)填回去,这样 glibc
+    // 才会把这条 reply 认作"来自 kernel"。user 没要 msg_name 就把长度清零,避免脏值。
     if let Some(netlink_sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
         let packet = match netlink_sock.recv_packet(total_len, flags) {
             Ok(v) => v,
@@ -270,7 +277,7 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
             Err(e) => return e,
         };
         if msg.msg_name != 0 && msg.msg_namelen != 0 {
-            let sa = netlink_sock.local_addr();
+            let sa = netlink_sock.kernel_addr();
             // SAFETY: `sa` is a fully initialized stack local `SockAddrNl`, and we expose
             // exactly its in-memory bytes for the duration of this call. A wrong pointer or
             // length here would read invalid memory and copy garbage into userspace.
@@ -508,7 +515,7 @@ pub fn syscall_sendto(
         let (kbuf, had_pending, _) = consume_pending_more(key, kbuf);
         return visible_send_result(unix_sock.send_dgram(kbuf, target), user_len, had_pending);
     }
-    if file.as_any().downcast_ref::<NetlinkSocketFile>().is_some() {
+    if let Some(netlink_sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
         if len == 0 {
             return 0;
         }
@@ -516,10 +523,9 @@ pub fn syscall_sendto(
         if send_flag_check != 0 {
             return send_flag_check;
         }
-        // Minimal support for mq_notify helper sockets: outbound netlink is ignored.
         let token = get_current_token();
-        let mut probe = [0u8; 1];
-        if try_copy_from_user(token, buf_ptr as *const u8, &mut probe).is_err() {
+        let mut kbuf = alloc::vec![0u8; len];
+        if try_copy_from_user(token, buf_ptr as *const u8, kbuf.as_mut_slice()).is_err() {
             return err(SyscallError::EFAULT);
         }
         if addr != 0 && addrlen != 0 {
@@ -528,6 +534,7 @@ pub fn syscall_sendto(
                 Err(e) => return e,
             };
         }
+        netlink_sock.handle_outbound(&kbuf);
         return len as isize;
     }
     let sock = match file.as_any().downcast_ref::<NetSocketFile>() {
@@ -647,6 +654,10 @@ pub fn syscall_recvfrom(
         }
         return n as isize;
     }
+    // recvfrom 的 netlink 分支(与上面 recvmsg 分支语义一致,只是参数风格不同):
+    // user 给单个 buf 而不是 iovec,长度过短时直接截断(netlink 由 user 端按
+    // nlmsghdr.len 自己处理 MSG_TRUNC,我们这里不补 MSG_TRUNC 标记)。
+    // 同样在 addr 非空时回填 kernel netlink 地址(nl_pid = 0)。
     if let Some(netlink_sock) = file.as_any().downcast_ref::<NetlinkSocketFile>() {
         if len == 0 {
             return 0;
@@ -661,7 +672,7 @@ pub fn syscall_recvfrom(
             return err(SyscallError::EFAULT);
         }
         if addr != 0 && addrlen != 0 {
-            let sa = netlink_sock.local_addr();
+            let sa = netlink_sock.kernel_addr();
             let r = write_sockaddr_nl(addr, addrlen, &sa);
             if r != 0 {
                 return r;
