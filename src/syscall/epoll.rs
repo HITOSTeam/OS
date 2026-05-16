@@ -466,7 +466,7 @@ fn target_supports_epoll(file: &FileArc) -> bool {
     if file.as_any().downcast_ref::<EpollFile>().is_some() {
         return true;
     }
-    crate::syscall::net::file_supports_poll(file)
+    file.supports_poll()
 }
 
 fn now_ns() -> u64 {
