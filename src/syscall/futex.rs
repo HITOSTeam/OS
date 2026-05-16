@@ -18,7 +18,7 @@ use crate::{
     task::{
         manager::wakeup_task,
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::has_unmasked_pending,
+        signal::has_wait_interrupting_pending,
         task_block::TaskControlBlock,
     },
     time::get_time,
@@ -105,7 +105,7 @@ fn futex_wait_now_ns(cmd: usize, clock_realtime: bool) -> u64 {
 fn pending_unmasked_signal() -> bool {
     let task = current_task().unwrap();
     let inner = task.borrow_mut();
-    has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
+    has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
 }
 
 pub(crate) fn shared_futex_addr_key(token: usize, uaddr: usize) -> usize {

@@ -21,7 +21,7 @@ use crate::task::processor::{
     block_current_and_run_next, current_files, current_files_and_nofile_limit, current_process,
     current_task,
 };
-use crate::task::signal::{RT_SIG_MAX, has_unmasked_pending, signal_bit};
+use crate::task::signal::{RT_SIG_MAX, has_wait_interrupting_pending, signal_bit};
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::time::get_time;
 use crate::trap::get_current_token;
@@ -461,7 +461,7 @@ fn has_pending_unmasked_signal() -> bool {
         return false;
     };
     let inner = task.borrow_mut();
-    has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+    has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
 }
 
 fn current_ipc_namespace_id() -> usize {

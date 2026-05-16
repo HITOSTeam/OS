@@ -46,8 +46,8 @@ use crate::{
         },
         sched::{SchedClass, sched_class},
         signal::{
-            MAX_SIG, RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,
-            SignalFlags, pending_unmasked_bits, queue_process_signal,
+            RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,
+            pending_unmasked_bits, queue_process_signal, sig_default_interrupts_wait,
         },
         task_block::{TaskControlBlock, TaskStatus},
     },

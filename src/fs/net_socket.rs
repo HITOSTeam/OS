@@ -10,7 +10,7 @@ use spin::Mutex;
 use crate::fs::{wake_tasks, File, PollWaitQueue, POLLIN, POLLOUT, POLLRDHUP};
 use crate::mm::UserBuffer;
 use crate::task::processor::current_task;
-use crate::task::signal::has_unmasked_pending;
+use crate::task::signal::has_wait_interrupting_pending;
 use crate::task::task_block::TaskControlBlock;
 
 use smoltcp::iface::{SocketHandle, SocketSet};
@@ -40,7 +40,7 @@ fn pending_unmasked_signal() -> bool {
         return false;
     };
     let inner = task.borrow_mut();
-    has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
+    has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
 }
 
 // 判断 listener backlog 槽位上的 TCP socket 是否已经可以被 accept。

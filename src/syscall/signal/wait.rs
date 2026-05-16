@@ -1,40 +1,5 @@
 use super::*;
 
-fn has_deliverable_pending(pending: u64, mask: u64) -> bool {
-    let mut bits = pending_unmasked_bits(pending, mask, false);
-    if bits == 0 {
-        return false;
-    }
-    let process = current_process();
-    let inner = process.borrow_mut();
-    while bits != 0 {
-        let signum = bits.trailing_zeros() as usize + 1;
-        bits &= bits - 1;
-        let action = inner
-            .rt_sig_handlers
-            .get(signum)
-            .copied()
-            .unwrap_or_default();
-        if action.handler == SIG_IGN {
-            continue;
-        }
-        if action.handler == SIG_DFL {
-            if signum <= crate::task::signal::MAX_SIG {
-                if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
-                    if flag.check_error().is_some() {
-                        return true;
-                    }
-                }
-            } else {
-                return true;
-            }
-            continue;
-        }
-        return true;
-    }
-    false
-}
-
 /// Linux `rt_sigsuspend` (syscall 133).
 pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
     if !valid_sigset_size(sigsetsize) {
@@ -64,7 +29,7 @@ pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
             inner.signal_mask = new_mask;
             (inner.pending_signals, inner.signal_mask)
         };
-        if has_deliverable_pending(pending, mask) {
+        if has_wait_interrupting_pending(pending, mask) {
             return err(SyscallError::EINTR);
         }
         block_current_and_run_next();
@@ -211,9 +176,11 @@ fn take_pending_in_set(
 }
 
 fn has_nonwait_interrupt(task: &Arc<TaskControlBlock>, wait_mask: u64) -> bool {
-    let inner = task.borrow_mut();
-    let ready = pending_unmasked_bits(inner.pending_signals, inner.signal_mask, false);
-    (ready & !wait_mask) != 0
+    let (pending, mask) = {
+        let inner = task.borrow_mut();
+        (inner.pending_signals & !wait_mask, inner.signal_mask)
+    };
+    has_wait_interrupting_pending(pending, mask)
 }
 
 /// Linux `rt_sigtimedwait` (syscall 137).

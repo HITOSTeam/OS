@@ -16,7 +16,7 @@ use crate::{
         processor::{
             block_current_and_run_next, current_files, current_files_and_nofile_limit, current_task,
         },
-        signal::{SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
+        signal::{SIGKILL_NUM, SIGSTOP_NUM, has_wait_interrupting_pending, signal_bit},
         task_block::TaskControlBlock,
     },
     time::get_time,
@@ -544,7 +544,7 @@ fn epoll_wait_common(
             let inner = task.borrow_mut();
             (inner.pending_signals, inner.signal_mask)
         };
-        if has_unmasked_pending(pending, mask, true) {
+        if has_wait_interrupting_pending(pending, mask) {
             break err(SyscallError::EINTR);
         }
 
@@ -582,7 +582,7 @@ fn epoll_wait_common(
                     let inner = task.borrow_mut();
                     (inner.pending_signals, inner.signal_mask)
                 };
-                if has_unmasked_pending(pending, mask, true) {
+                if has_wait_interrupting_pending(pending, mask) {
                     break err(SyscallError::EINTR);
                 }
             }
@@ -598,7 +598,7 @@ fn epoll_wait_common(
                     let inner = task.borrow_mut();
                     (inner.pending_signals, inner.signal_mask)
                 };
-                if has_unmasked_pending(pending, mask, true) {
+                if has_wait_interrupting_pending(pending, mask) {
                     break err(SyscallError::EINTR);
                 }
             }

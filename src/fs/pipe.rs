@@ -17,7 +17,7 @@ use crate::{
     task::{
         manager::{wakeup_task, PID2PCB},
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::{has_unmasked_pending, queue_process_signal_info, signal_bit, SIGPIPE_NUM},
+        signal::{SIGPIPE_NUM, has_wait_interrupting_pending, queue_process_signal_info, signal_bit},
         task_block::TaskControlBlock,
     },
 };
@@ -287,7 +287,7 @@ impl Pipe {
         // 验证当前task 是否有未处理信号
         let has_pending_signal = || {
             let inner = task.borrow_mut();
-            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+            has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
         };
         loop {
             let mut ring_buffer = self.buffer.lock();
@@ -363,7 +363,7 @@ impl Pipe {
         let task = current_task().unwrap();
         let has_pending_signal = || {
             let inner = task.borrow_mut();
-            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+            has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
         };
         let mut written = 0usize;
         loop {
@@ -459,7 +459,7 @@ impl Pipe {
         let task = current_task().unwrap();
         let has_pending_signal = || {
             let inner = task.borrow_mut();
-            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+            has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
         };
         loop {
             let mut ring_buffer = self.buffer.lock();
@@ -1079,7 +1079,7 @@ impl File for Pipe {
         // 每次循环重新检查，确保信号在阻塞期间能及时中断 read。
         let has_pending_signal = || {
             let inner = task.borrow_mut();
-            has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+            has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
         };
         loop {
             // 每次循环重新加锁：被唤醒后需要重新观察缓冲区状态（spurious wakeup 也安全）

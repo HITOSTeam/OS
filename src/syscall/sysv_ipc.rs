@@ -11,7 +11,7 @@ use crate::fs::parse_proc_sys_usize;
 use crate::mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value};
 use crate::task::manager::wakeup_task;
 use crate::task::processor::{block_current_and_run_next, current_process, current_task};
-use crate::task::signal::has_unmasked_pending;
+use crate::task::signal::has_wait_interrupting_pending;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::trap::get_current_token;
 use crate::syscall::error::{SyscallError, err};
@@ -621,7 +621,7 @@ fn has_pending_unmasked_signal() -> bool {
         return false;
     };
     let inner = task.borrow_mut();
-    has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+    has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
 }
 
 fn msq_to_user(queue: &MsgQueue) -> MsqidDsUser {

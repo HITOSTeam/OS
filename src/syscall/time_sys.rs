@@ -1,4 +1,4 @@
-use crate::syscall::error::{err, SyscallError};
+use crate::syscall::error::{SyscallError, err};
 use crate::task::task_block::TaskControlBlock;
 use crate::{
     config::clock_freq,
@@ -14,7 +14,9 @@ use crate::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
     },
-    task::signal::{has_unmasked_pending, signal_bit, SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM},
+    task::signal::{
+        SIGALRM_NUM, SIGKILL_NUM, SIGSTOP_NUM, has_wait_interrupting_pending, signal_bit,
+    },
     task::{
         manager::pid2process,
         processor::{current_files, current_process, current_task},
@@ -1172,7 +1174,7 @@ pub fn syscall_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize 
 ///
 /// 返回约定(与 Linux 对齐):
 /// - `>= 0`:就绪 fd 数(超时为 0);
-/// - `-EINTR`:被未屏蔽信号打断(SIGCHLD 除外,见 has_unmasked_pending 调用处);
+/// - `-EINTR`:被未屏蔽且可递送的信号打断;
 /// - `-EBADF` / `-EINVAL` / `-EFAULT`:参数错误。
 // nfds 监听套接字。
 /// 各个参数的意思：
@@ -1290,9 +1292,9 @@ pub fn syscall_pselect6(
                 let inner = task.borrow_mut();
                 (inner.pending_signals, inner.signal_mask)
             };
-            // 这里第三个参数 `ignore_sigchld = true` 是本分支修复 netperf 的核心:
-            // 忽略 SIGCHILD否则 服务器 直接错误退出
-            if has_unmasked_pending(pending, mask, true) {
+            // SIGCHLD 只有在 disposition 为默认忽略或 SIG_IGN 时才跳过；
+            // 若用户安装了 handler，pselect 仍必须被 EINTR 打断。
+            if has_wait_interrupting_pending(pending, mask) {
                 break err(SyscallError::EINTR);
             }
             if let Some(deadline) = deadline_ns {
@@ -1368,12 +1370,12 @@ pub fn syscall_pselect6(
     // 主等待循环:每一轮 = "检查信号 → 扫一遍 fd → 命中就返回 / 超时就返回 / 都没命中就 yield"。
     // 没有事件驱动唤醒机制,采用 busy poll + suspend 让出 CPU 的简化模型。
     let ret = loop {
-        // ① 信号检查:被未屏蔽信号打断要立刻 EINTR 返回(SIGCHLD 不算,理由见 ④ 段)。
+        // ① 信号检查:被未屏蔽且可递送的信号打断要立刻 EINTR 返回。
         let (pending, mask) = {
             let inner = task.borrow_mut();
             (inner.pending_signals, inner.signal_mask)
         };
-        if has_unmasked_pending(pending, mask, true) {
+        if has_wait_interrupting_pending(pending, mask) {
             break err(SyscallError::EINTR);
         }
 

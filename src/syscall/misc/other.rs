@@ -10,7 +10,7 @@ use crate::{
     task::{
         manager::pid2process,
         processor::{block_current_and_run_next, current_files, current_process, current_task},
-        signal::{SIGKILL_NUM, SIGSTOP_NUM, has_unmasked_pending, signal_bit},
+        signal::{SIGKILL_NUM, SIGSTOP_NUM, has_wait_interrupting_pending, signal_bit},
     },
     time::get_time,
     trap::get_current_token,
@@ -287,7 +287,7 @@ pub fn syscall_ppoll(
         };
         // Keep poll-like waits aligned with epoll/pipe behavior: don't let
         // default SIGCHLD bookkeeping spuriously interrupt readiness waits.
-        if has_unmasked_pending(pending, mask, true) {
+        if has_wait_interrupting_pending(pending, mask) {
             break EINTR;
         }
 
@@ -334,7 +334,7 @@ pub fn syscall_ppoll(
                         let inner = task.borrow_mut();
                         (inner.pending_signals, inner.signal_mask)
                     };
-                    if has_unmasked_pending(pending, mask, true) {
+                    if has_wait_interrupting_pending(pending, mask) {
                         break EINTR;
                     }
                 }

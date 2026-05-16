@@ -13,6 +13,8 @@ pub const SIGXFSZ_NUM: usize = 25;
 pub const SIGTSTP_NUM: usize = 20;
 pub const SIGTTIN_NUM: usize = 21;
 pub const SIGTTOU_NUM: usize = 22;
+pub const SIGURG_NUM: usize = 23;
+pub const SIGWINCH_NUM: usize = 28;
 use bitflags::bitflags;
 
 use alloc::sync::Arc;
@@ -133,16 +135,12 @@ fn mark_pending_signal(
     }
 }
 
-pub fn pending_unmasked_bits(pending: u64, mask: u64, ignore_sigchld: bool) -> u64 {
+/// 检查当前是否有 pending 且 未被 mask的信号,其中 SIG KILL 与 SIGSTOP 无法被mask
+pub fn pending_unmasked_bits(pending: u64, mask: u64) -> u64 {
     let mut ready = pending & !mask;
     let sigkill_bit = 1u64 << (SIGKILL_NUM - 1);
     let sigstop_bit = 1u64 << (SIGSTOP_NUM - 1);
     ready |= pending & (sigkill_bit | sigstop_bit);
-    if ignore_sigchld {
-        if let Some(bit) = signal_bit(SIGCHLD_NUM) {
-            ready &= !bit;
-        }
-    }
     ready
 }
 
@@ -177,12 +175,49 @@ pub fn pick_task_for_signal(
     unmasked.or(fallback)
 }
 
-pub fn has_unmasked_pending(pending: u64, mask: u64, ignore_sigchld: bool) -> bool {
-    pending_unmasked_bits(pending, mask, ignore_sigchld) != 0
+/// process stop 当前进程是否被Stop. SIGCOUNT 可以恢复
+pub fn sig_default_interrupts_wait(signum: usize, process_stopped: bool) -> bool {
+    match signum {
+        SIGCHLD_NUM | SIGURG_NUM | SIGWINCH_NUM => false,
+        SIGCONT_NUM => process_stopped,
+        _ => true,
+    }
+}
+
+/// 检查当前爱你是否有 需要打断的信号
+pub fn has_wait_interrupting_pending(pending: u64, mask: u64) -> bool {
+    let mut ready = pending_unmasked_bits(pending, mask);
+    if ready == 0 {
+        return false;
+    }
+    let process = current_process();
+    let inner = process.borrow_mut();
+    while ready != 0 {
+        let signum = ready.trailing_zeros() as usize + 1;
+        ready &= ready - 1;
+        if signum == SIGKILL_NUM || signum == SIGSTOP_NUM {
+            return true;
+        }
+        let handler = inner
+            .rt_sig_handlers
+            .get(signum)
+            .map(|action| action.handler)
+            .unwrap_or(SIG_DFL);
+        //SIG IGN 忽略
+        if handler == SIG_IGN {
+            continue;
+        }
+        // SIG DFL 默认。 Linux 对于一些信号有默认处理,检查默认处理 是否是打断
+        if handler == SIG_DFL && !sig_default_interrupts_wait(signum, inner.stopped) {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 pub fn take_first_unmasked(pending: &mut u64, mask: u64) -> Option<usize> {
-    let ready = pending_unmasked_bits(*pending, mask, false);
+    let ready = pending_unmasked_bits(*pending, mask);
     if ready == 0 {
         return None;
     }
@@ -292,7 +327,7 @@ pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
         let inner = task.borrow_mut();
         (inner.pending_signals, inner.signal_mask)
     };
-    let mut ready = pending_unmasked_bits(pending, mask, false);
+    let mut ready = pending_unmasked_bits(pending, mask);
     if ready == 0 {
         return None;
     }
