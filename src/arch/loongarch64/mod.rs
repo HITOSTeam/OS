@@ -4,15 +4,13 @@ pub mod trap;
 
 use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
 use alloc::sync::Arc;
-use spin::MutexGuard;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
+use spin::MutexGuard;
 
 use csr_defs::{
-    CRMD_DA, CRMD_IE, CRMD_PG,
-    ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT,
-    TCFG_EN, TCFG_INITVAL_MASK,
+    CRMD_DA, CRMD_IE, CRMD_PG, ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT, TCFG_EN, TCFG_INITVAL_MASK,
 };
 
 global_asm!(include_str!("tlb_refill.S"));

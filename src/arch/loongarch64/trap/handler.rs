@@ -27,7 +27,9 @@ const ECODE_PAGE_PRIV: usize = 0x7;
 const ECODE_ADDR_ERROR: usize = 0x8;
 const ECODE_ADDR_ALIGN: usize = 0x9;
 
-use super::super::csr_defs::{ECFG_LIE_TI, ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, PRMD_USER_IE, PRMD_USER_IE_MASK};
+use super::super::csr_defs::{
+    ECFG_LIE_TI, ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, PRMD_USER_IE, PRMD_USER_IE_MASK,
+};
 
 const ESTAT_TIMER_BIT: usize = 11;
 

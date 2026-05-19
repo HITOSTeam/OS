@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use crate::syscall::error::{SyscallError, err};
+use alloc::vec::Vec;
 
 use crate::{
     mm::{try_copy_from_user, try_read_user_value},
@@ -132,7 +132,13 @@ where
         }
         offset = match offset.checked_add(n) {
             Some(v) => v,
-            None => return if total > 0 { total } else { err(SyscallError::EINVAL) },
+            None => {
+                return if total > 0 {
+                    total
+                } else {
+                    err(SyscallError::EINVAL)
+                };
+            }
         };
     }
     total

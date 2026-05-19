@@ -122,7 +122,9 @@ impl MountNamespaceState {
     }
 
     pub(crate) fn mount_flags_for_path(&self, abs: &str) -> usize {
-        self.mount_record_for_path(abs).map(|mount| mount.flags).unwrap_or(0)
+        self.mount_record_for_path(abs)
+            .map(|mount| mount.flags)
+            .unwrap_or(0)
     }
 
     pub(crate) fn classify_logical_abs_path(&self, abs: &str) -> ClassifiedAbsPath {
@@ -278,12 +280,14 @@ fn mount_path_join(root: &str, suffix: &str) -> String {
 
 fn mount_target_match_better(candidate: &MountRecord, current: &MountRecord) -> bool {
     candidate.target.len() > current.target.len()
-        || (candidate.target.len() == current.target.len() && candidate.stack_seq > current.stack_seq)
+        || (candidate.target.len() == current.target.len()
+            && candidate.stack_seq > current.stack_seq)
 }
 
 fn mount_source_match_better(candidate: &MountRecord, current: &MountRecord) -> bool {
     candidate.source.len() > current.source.len()
-        || (candidate.source.len() == current.source.len() && candidate.stack_seq > current.stack_seq)
+        || (candidate.source.len() == current.source.len()
+            && candidate.stack_seq > current.stack_seq)
 }
 
 fn path_under_mount(abs: &str, mount: &str) -> bool {

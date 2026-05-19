@@ -80,18 +80,18 @@ pub(crate) enum CgroupHierarchyKey {
     },
 }
 
-mod registry;
-mod node;
-mod mount_state;
-mod helpers;
 mod file;
+mod helpers;
+mod mount_state;
+mod node;
+mod registry;
 
-pub(crate) use registry::CgroupRegistry;
-pub(crate) use node::{CgroupNode, CgroupThreadId, LegacyFreezerState};
-pub(crate) use mount_state::CgroupMountState;
-pub(crate) use helpers::*;
-pub(crate) use file::{CgroupFileKind, build_dir_entries};
 pub use file::{CgroupFile, cgroup_maybe_block_current};
+pub(crate) use file::{CgroupFileKind, build_dir_entries};
+pub(crate) use helpers::*;
+pub(crate) use mount_state::CgroupMountState;
+pub(crate) use node::{CgroupNode, CgroupThreadId, LegacyFreezerState};
+pub(crate) use registry::CgroupRegistry;
 
 #[derive(Clone)]
 pub struct CgroupMountSpec {

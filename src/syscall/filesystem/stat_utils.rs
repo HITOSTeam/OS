@@ -1,11 +1,11 @@
 use super::{
-    current_fsuid_gid, err, ext4_lock, get_current_token, get_fd_file, get_inode_times,
-    inode_fs_flags, inode_rdev_for_mode, inode_visible_size, linux_dev_major, linux_dev_minor,
-    open_pseudo, resolve_at_inode, resolve_at_path, translated_mutref, try_read_user_value,
-    try_write_user_value, AtPath, CgroupFile, File, NamespaceFile, OSInode, Pipe,
-    ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
-    PtyMasterFile, PtySlaveFile, RtcFile, SyscallError, TtyFile, AT_FDCWD, FS_APPEND_FL,
-    FS_IMMUTABLE_FL, FS_NODUMP_FL,
+    AT_FDCWD, AtPath, CgroupFile, FS_APPEND_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, File, NamespaceFile,
+    OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile,
+    PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SyscallError, TtyFile, current_fsuid_gid,
+    err, ext4_lock, get_current_token, get_fd_file, get_inode_times, inode_fs_flags,
+    inode_rdev_for_mode, inode_visible_size, linux_dev_major, linux_dev_minor, open_pseudo,
+    resolve_at_inode, resolve_at_path, translated_mutref, try_read_user_value,
+    try_write_user_value,
 };
 
 #[repr(C)]

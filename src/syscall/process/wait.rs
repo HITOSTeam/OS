@@ -142,7 +142,7 @@ fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
         let inner = task.borrow_mut();
         (inner.pending_signals, inner.signal_mask)
     };
-    let mut bits = pending_unmasked_bits(pending, mask, true);
+    let mut bits = pending_unmasked_bits(pending, mask);
     if bits == 0 {
         return None;
     }
@@ -169,13 +169,9 @@ fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
             continue;
         }
         if action.handler == SIG_DFL {
-            if signum <= MAX_SIG {
-                if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
-                    if flag.check_error().is_none() {
-                        clear_bits |= bit;
-                        continue;
-                    }
-                }
+            if !sig_default_interrupts_wait(signum, inner.stopped) {
+                clear_bits |= bit;
+                continue;
             }
             saw_interrupt = true;
             break;

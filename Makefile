@@ -78,6 +78,15 @@ SUBMIT       ?= 0
 EXT4_REBUILD ?= 0
 EXT4_SIZE    ?= 1G
 
+# Native host triple for tools that must run on the build machine
+# (currently just ext4-fs-packer). Resolved once at Make parse time so we
+# don't fork rustc on every recipe line. Needed because the repo-root
+# `.cargo/config.toml` (untracked, used by nvim's rust-analyzer) sets a
+# riscv64 bare-metal `[build] target`, which would otherwise leak into
+# packer's `cargo run` and break the host build / leave a stale image.
+# Override on the command line if cross-building from an unusual host.
+HOST_TRIPLE  ?= $(shell rustc -vV | sed -n 's/^host: //p')
+
 # Forward `--features submit` to user apps when SUBMIT=1.
 USER_FEATURES := $(if $(filter 1,$(SUBMIT)),--features submit,)
 
@@ -208,7 +217,7 @@ ext4_img: user_apps $(EXT4_BASE_DEP)
 		echo "✅ Reusing existing ext4 image: $(EXT4_IMG)"; \
 	else \
 		echo "🔧 Building ext4 filesystem image..."; \
-		cd ../ext4-fs-packer && cargo run --release -- \
+		cd ../ext4-fs-packer && CARGO_BUILD_TARGET=$(HOST_TRIPLE) cargo run --release -- \
 			-u ../os/$(APP_DIR) -e extra $(EXT4_BASE_ARG) \
 			-t target -S $(EXT4_SIZE); \
 		echo "✅ Ext4 image created: $(EXT4_IMG)"; \

@@ -1,98 +1,124 @@
+/// 网络相关系统调用的公共基础层。
+///
+/// 本模块负责：
+/// - 汇聚并重导出各子模块的系统调用实现（socket / sendrecv / sockopt）
+/// - 定义与 Linux ABI 兼容的常量（地址族、套接字类型、选项名、消息标志）
+/// - 提供在内核态与用户态之间安全传递套接字地址、iovec、msghdr 的辅助函数
+/// - 为消息队列异步通知（mq_notify SIGEV_THREAD）提供跨进程套接字操作接口
+mod netlink;
 mod sendrecv;
 mod socket;
 mod sockopt;
+mod unix;
+
+use self::netlink::{NetlinkSocketFile, SockAddrNl, parse_sockaddr_nl, write_sockaddr_nl};
+use self::unix::{
+    SockAddrUn, UnixSocketFile, bind_unix_socket, parse_unix_bound_addr, write_msg_name_un,
+    write_sockaddr_un,
+};
 
 pub use sendrecv::*;
 pub use socket::*;
 pub use sockopt::*;
 
-use alloc::collections::{BTreeMap, VecDeque};
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::any::Any;
 use core::mem::size_of;
-use lazy_static::lazy_static;
-use spin::Mutex;
 
-use crate::fs::{
-    File, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, ext4_lock, find_path_in_roots,
-    make_socketpair, wake_tasks,
-};
+use crate::fs::File;
 use crate::mm::{
     UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
 };
 use crate::syscall::error::{SyscallError, err};
-use crate::syscall::filesystem::normalize_path;
 use crate::task::manager::pid2process;
-use crate::task::processor::{
-    block_current_and_run_next, current_files, current_process, current_task,
-    suspend_current_and_run_next,
-};
-use crate::task::task_block::{TaskControlBlock, TaskStatus};
+use crate::task::processor::current_files;
 use crate::trap::get_current_token;
 
+// ── 地址族（AF_*,Address family）常量，对应 Linux <bits/socket.h> ──────────────────────────
+/// unspecified
+pub(super) const AF_UNSPEC: u16 = 0;
+/// IPC 套接字
 pub(super) const AF_UNIX: u16 = 1;
+/// ipv4 地址族
 pub(super) const AF_INET: u16 = 2;
+// 特殊套接字 ,可以读取网络配置
 pub(super) const AF_NETLINK: u16 = 16;
-pub(super) const SOL_IP: usize = 0;
 
+// ── 套接字类型（SOCK_*）及创建标志 ───────────────────────────────────────────
 pub(super) const SOCK_STREAM: usize = 1;
 pub(super) const SOCK_DGRAM: usize = 2;
+/// 直接处理IP 包 标志
 pub(super) const SOCK_RAW: usize = 3;
+/// SCTP 特殊
 pub(super) const SOCK_SEQPACKET: usize = 5;
+/// 以下不是 纯粹的socket 而是 结合使用的标志位(SOCK是创建标志，O 是fcntl设置标志)
+/// 创建时即设置 O_NONBLOCK，避免额外的 fcntl 调用
+
 pub(super) const SOCK_NONBLOCK: usize = 0x800;
+/// 创建时即设置 FD_CLOEXEC，防止 fd 泄漏到子进程
 pub(super) const SOCK_CLOEXEC: usize = 0x80000;
 pub(super) const O_NONBLOCK: u32 = 0x800;
+/// O_PATH fd 只能用于路径操作，不能进行 I/O，因此对套接字无效
 pub(super) const O_PATH: u32 = 0x200000;
 pub(super) const FD_CLOEXEC: u32 = 1;
 
+// ── setsockopt/getsockopt 的协议层（level）标识 ──────────────────────────────
+pub(super) const SOL_IP: usize = 0;
+/// SOL_SOCKET = 1，作用于通用套接字层而非具体协议
 pub(super) const SOL_SOCKET: usize = 1;
 pub(super) const SOL_TCP: usize = 6;
 pub(super) const SOL_UDP: usize = 17;
+
+// ── SOL_SOCKET 层选项名 ───────────────────────────────────────────────────────
+/// 允许复用TIME_WAIT
+
 pub(super) const SO_REUSEADDR: usize = 2;
+/// 设置大小
 pub(super) const SO_SNDBUF: usize = 7;
 pub(super) const SO_RCVBUF: usize = 8;
+/// 带外数据内联到普通数据流，而非通过独立通道接收
 pub(super) const SO_OOBINLINE: usize = 10;
+/// 获取对端进程凭证（pid/uid/gid），仅 Unix 域套接字支持
 pub(super) const SO_PEERCRED: usize = 17;
+/// 与 SO_SNDBUF/SO_RCVBUF 的区别：FORCE 变体绕过系统上限，需要 CAP_NET_ADMIN
 pub(super) const SO_SNDBUFFORCE: usize = 32;
 pub(super) const SO_RCVBUFFORCE: usize = 33;
+/// 将 eBPF 程序附加到套接字，用于流量过滤
 pub(super) const SO_ATTACH_BPF: usize = 50;
+/// IP 组播组加入/离开选项，用于 setsockopt(SOL_IP, MCAST_JOIN_GROUP, ...)
 pub(super) const MCAST_JOIN_GROUP: usize = 42;
 pub(super) const MCAST_LEAVE_GROUP: usize = 45;
 
+// ── sendmsg/recvmsg flags ────────────────────────────────────────────────────
+/// 带外（紧急）数据标志
 pub(super) const MSG_OOB: usize = 0x1;
+/// 窥视缓冲区内容而不消耗数据
 pub(super) const MSG_PEEK: usize = 0x2;
 pub(super) const MSG_WAITALL: usize = 0x100;
+/// recvmsg 返回实际数据长度而非截断后的长度
 pub(super) const MSG_TRUNC: usize = 0x20;
 pub(super) const MSG_DONTWAIT: usize = 0x40;
+/// 读取错误队列中的异步错误（如 ICMP 不可达），而非正常数据
 pub(super) const MSG_ERRQUEUE: usize = 0x2000;
+/// 发送端请求不因对端未处理 SIGPIPE 而终止进程
 pub(super) const MSG_NOSIGNAL: usize = 0x4000;
+/// 提示内核后续还有更多数据，可与当前数据合并（类似 TCP_CORK）
 pub(super) const MSG_MORE: usize = 0x8000;
+/// recvmmsg 专用：收到第一条消息后立即返回，不再等待后续消息
 pub(super) const MSG_WAITFORONE: usize = 0x10000;
 
+/// scatter/gather I/O 的最大 iovec 数量上限，与 Linux 保持一致
 pub(super) const UIO_MAXIOV: usize = 1024;
+/// mq_notify SIGEV_THREAD 模式下，通知 cookie 的固定字节长度
 pub(super) const MQ_THREAD_NOTIFY_COOKIE_LEN: usize = 32;
 
+/// 内核内部传递文件对象的类型别名，要求可跨线程共享（Send + Sync）
 pub(super) type FileArc = Arc<dyn File + Send + Sync>;
-pub(super) type FileWeak = Weak<dyn File + Send + Sync>;
-pub(super) type UdpTarget = (smoltcp::wire::Ipv4Address, u16);
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
-pub(super) enum UnixBoundAddr {
-    Path(String),
-    Abstract(Vec<u8>),
-}
-
-lazy_static! {
-    static ref UNIX_BOUND_PATHS: Mutex<BTreeMap<String, FileWeak>> = Mutex::new(BTreeMap::new());
-    static ref UNIX_BOUND_ABSTRACT: Mutex<BTreeMap<Vec<u8>, FileWeak>> =
-        Mutex::new(BTreeMap::new());
-    static ref MSG_MORE_PENDING: Mutex<BTreeMap<usize, PendingMoreState>> =
-        Mutex::new(BTreeMap::new());
-}
-
+/// 与 Linux `struct iovec` ABI 兼容的 scatter/gather 缓冲区描述符。
+///
+/// `base` 为用户空间虚拟地址，`len` 为字节数。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct IoVec {
@@ -100,28 +126,42 @@ pub(super) struct IoVec {
     pub(super) len: usize,
 }
 
+/// 与 Linux `struct msghdr` ABI 兼容的消息头，用于 sendmsg/recvmsg。
+///
+/// 字段布局严格按照 64 位 Linux ABI，两处显式填充字段（`_pad0`、`_pad1`）
+/// 是为了匹配 C 编译器的对齐行为，不携带语义。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct MsgHdr {
+    /// 目标/来源套接字地址的用户空间指针（发送时为目标地址，接收时由内核填充来源地址）
     pub(super) msg_name: usize,
+    /// `msg_name` 所指缓冲区的字节长度；recvmsg 返回时内核将其更新为实际地址长度
     pub(super) msg_namelen: u32,
     pub(super) _pad0: u32,
+    /// 指向用户空间 `iovec` 数组的指针
     pub(super) msg_iov: usize,
     pub(super) msg_iovlen: usize,
+    /// 辅助数据（control message）缓冲区的用户空间指针
     pub(super) msg_control: usize,
     pub(super) msg_controllen: usize,
+    /// 接收时由内核填充的标志位（如 MSG_TRUNC、MSG_CTRUNC）
     pub(super) msg_flags: i32,
     pub(super) _pad1: i32,
 }
 
+/// 与 Linux `struct mmsghdr` ABI 兼容的批量消息头，用于 sendmmsg/recvmmsg。
+///
+/// `msg_len` 在 recvmmsg 返回时由内核填写，表示本条消息实际接收到的字节数。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct MMsgHdr {
     pub(super) msg_hdr: MsgHdr,
+    /// 本条消息实际传输的字节数（由内核在调用返回时写入）
     pub(super) msg_len: u32,
     pub(super) _pad: u32,
 }
 
+/// 与 Linux `struct timespec` ABI 兼容的用户空间时间戳，用于超时参数传递。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct UserTimespec {
@@ -129,618 +169,18 @@ pub(super) struct UserTimespec {
     pub(super) tv_nsec: i64,
 }
 
+/// 套接字对端进程凭证，对应 `SO_PEERCRED` 选项返回的 `struct ucred`。
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(super) struct UCred {
     pub(super) pid: u32,
     pub(super) uid: u32,
     pub(super) gid: u32,
 }
 
-struct PendingMoreState {
-    data: Vec<u8>,
-    udp_target: Option<UdpTarget>,
-}
-
-pub(super) struct UnixDatagram {
-    pub(super) from: Option<UnixBoundAddr>,
-    pub(super) payload: Vec<u8>,
-}
-
-pub(super) struct UnixSocketState {
-    bound: Option<UnixBoundAddr>,
-    listening: bool,
-    backlog: usize,
-    pending_accept: VecDeque<Arc<UnixSocketFile>>,
-    stream_end: Option<Arc<SocketPairEnd>>,
-    peer_addr: Option<UnixBoundAddr>,
-    peer_cred: Option<UCred>,
-    dgram_peer: Option<UnixBoundAddr>,
-    pub(super) dgram_queue: VecDeque<UnixDatagram>,
-    poll_waiters: PollWaitQueue,
-}
-
-impl UnixSocketState {
-    fn new() -> Self {
-        Self {
-            bound: None,
-            listening: false,
-            backlog: 1,
-            pending_accept: VecDeque::new(),
-            stream_end: None,
-            peer_addr: None,
-            peer_cred: None,
-            dgram_peer: None,
-            dgram_queue: VecDeque::new(),
-            poll_waiters: PollWaitQueue::default(),
-        }
-    }
-}
-
-pub(crate) struct UnixSocketFile {
-    sock_type: usize,
-    pub(super) state: Mutex<UnixSocketState>,
-}
-
-impl UnixSocketFile {
-    pub(super) fn new(sock_type: usize) -> Self {
-        Self {
-            sock_type,
-            state: Mutex::new(UnixSocketState::new()),
-        }
-    }
-
-    fn new_connected_stream(
-        sock_type: usize,
-        stream_end: Arc<SocketPairEnd>,
-        peer_addr: Option<UnixBoundAddr>,
-        peer_cred: Option<UCred>,
-    ) -> Self {
-        let mut state = UnixSocketState::new();
-        state.stream_end = Some(stream_end);
-        state.peer_addr = peer_addr;
-        state.peer_cred = peer_cred;
-        Self {
-            sock_type,
-            state: Mutex::new(state),
-        }
-    }
-
-    pub(super) fn is_stream_like(&self) -> bool {
-        matches!(self.sock_type, SOCK_STREAM | SOCK_SEQPACKET)
-    }
-
-    pub(super) fn is_dgram(&self) -> bool {
-        self.sock_type == SOCK_DGRAM
-    }
-
-    pub(super) fn bound_addr(&self) -> Option<UnixBoundAddr> {
-        self.state.lock().bound.clone()
-    }
-
-    fn set_bound_addr(&self, addr: UnixBoundAddr) {
-        self.state.lock().bound = Some(addr);
-    }
-
-    pub(super) fn peer_addr(&self) -> Option<UnixBoundAddr> {
-        let st = self.state.lock();
-        st.peer_addr.clone().or_else(|| st.dgram_peer.clone())
-    }
-
-    pub(super) fn peer_cred(&self) -> Option<UCred> {
-        self.state.lock().peer_cred
-    }
-
-    fn notify_poll_waiters(&self) {
-        let waiters = self.state.lock().poll_waiters.take_wakeups();
-        wake_tasks(waiters);
-    }
-
-    pub(super) fn set_listening(&self, backlog: usize) -> isize {
-        if !self.is_stream_like() {
-            return err(SyscallError::EOPNOTSUPP);
-        }
-        let mut st = self.state.lock();
-        if st.bound.is_none() {
-            return err(SyscallError::EINVAL);
-        }
-        st.listening = true;
-        st.backlog = backlog.max(1).min(32);
-        drop(st);
-        self.notify_poll_waiters();
-        0
-    }
-
-    pub(super) fn accept_stream(&self) -> Result<Arc<UnixSocketFile>, isize> {
-        if !self.is_stream_like() {
-            return Err(err(SyscallError::EOPNOTSUPP));
-        }
-        loop {
-            let mut st = self.state.lock();
-            if !st.listening {
-                return Err(err(SyscallError::EINVAL));
-            }
-            if let Some(conn) = st.pending_accept.pop_front() {
-                return Ok(conn);
-            }
-            drop(st);
-            suspend_current_and_run_next();
-        }
-    }
-
-    pub(super) fn connect_unix(&self, addr: UnixBoundAddr) -> isize {
-        if self.is_stream_like() {
-            {
-                let st = self.state.lock();
-                if st.stream_end.is_some() {
-                    return err(SyscallError::EISCONN);
-                }
-            }
-            let peer_file = match lookup_unix_bound_socket(&addr) {
-                Ok(f) => f,
-                Err(e) => return e,
-            };
-            let Some(peer) = peer_file.as_any().downcast_ref::<UnixSocketFile>() else {
-                return err(SyscallError::ECONNREFUSED);
-            };
-            if !peer.is_stream_like() {
-                return err(SyscallError::EPROTONOSUPPORT);
-            }
-            let (client_end, server_end) = make_socketpair();
-            let client_bound = self.bound_addr();
-            let client_cred = current_unix_ucred();
-            {
-                let mut peer_st = peer.state.lock();
-                if !peer_st.listening {
-                    return err(SyscallError::ECONNREFUSED);
-                }
-                if peer_st.pending_accept.len() >= peer_st.backlog {
-                    return err(SyscallError::ECONNREFUSED);
-                }
-                let accepted = Arc::new(UnixSocketFile::new_connected_stream(
-                    self.sock_type,
-                    server_end,
-                    client_bound,
-                    Some(client_cred),
-                ));
-                peer_st.pending_accept.push_back(accepted);
-                let wake = peer_st.poll_waiters.take_wakeups();
-                drop(peer_st);
-                wake_tasks(wake);
-            }
-            let mut st = self.state.lock();
-            if st.stream_end.is_some() {
-                return err(SyscallError::EISCONN);
-            }
-            st.stream_end = Some(client_end);
-            st.peer_addr = Some(addr);
-            drop(st);
-            self.notify_poll_waiters();
-            return 0;
-        }
-        if !self.is_dgram() {
-            return err(SyscallError::EPROTONOSUPPORT);
-        }
-        let peer_file = match lookup_unix_bound_socket(&addr) {
-            Ok(f) => f,
-            Err(e) => return e,
-        };
-        let Some(peer) = peer_file.as_any().downcast_ref::<UnixSocketFile>() else {
-            return err(SyscallError::ECONNREFUSED);
-        };
-        if !peer.is_dgram() {
-            return err(SyscallError::EPROTONOSUPPORT);
-        }
-        let mut st = self.state.lock();
-        st.dgram_peer = Some(addr.clone());
-        st.peer_addr = Some(addr);
-        0
-    }
-
-    pub(super) fn send_dgram(&self, payload: Vec<u8>, target: Option<UnixBoundAddr>) -> isize {
-        if !self.is_dgram() {
-            return err(SyscallError::EOPNOTSUPP);
-        }
-        let (to, from) = {
-            let st = self.state.lock();
-            let Some(to) = target.or_else(|| st.dgram_peer.clone()) else {
-                return err(SyscallError::EINVAL);
-            };
-            (to, st.bound.clone())
-        };
-        let peer_file = match lookup_unix_bound_socket(&to) {
-            Ok(f) => f,
-            Err(e) => return e,
-        };
-        let Some(peer) = peer_file.as_any().downcast_ref::<UnixSocketFile>() else {
-            return err(SyscallError::ECONNREFUSED);
-        };
-        if !peer.is_dgram() {
-            return err(SyscallError::EPROTONOSUPPORT);
-        }
-        let n = payload.len();
-        let wake = {
-            let mut peer_st = peer.state.lock();
-            peer_st
-                .dgram_queue
-                .push_back(UnixDatagram { from, payload });
-            peer_st.poll_waiters.take_wakeups()
-        };
-        wake_tasks(wake);
-        n as isize
-    }
-
-    pub(super) fn recv_dgram(&self) -> UnixDatagram {
-        loop {
-            let mut st = self.state.lock();
-            if let Some(msg) = st.dgram_queue.pop_front() {
-                return msg;
-            }
-            drop(st);
-            suspend_current_and_run_next();
-        }
-    }
-
-    pub(super) fn stream_end(&self) -> Option<Arc<SocketPairEnd>> {
-        self.state.lock().stream_end.clone()
-    }
-
-    pub(crate) fn poll_readable(&self) -> bool {
-        if self.is_stream_like() {
-            let (listening, pending_accept, stream_end) = {
-                let st = self.state.lock();
-                (
-                    st.listening,
-                    !st.pending_accept.is_empty(),
-                    st.stream_end.clone(),
-                )
-            };
-            if listening {
-                return pending_accept;
-            }
-            if let Some(end) = stream_end {
-                return end.poll_readable();
-            }
-            return false;
-        }
-        if self.is_dgram() {
-            return !self.state.lock().dgram_queue.is_empty();
-        }
-        false
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn poll_writable(&self) -> bool {
-        if self.is_stream_like() {
-            let (listening, stream_end) = {
-                let st = self.state.lock();
-                (st.listening, st.stream_end.clone())
-            };
-            if listening {
-                return false;
-            }
-            if let Some(end) = stream_end {
-                return end.poll_writable();
-            }
-            return false;
-        }
-        if self.is_dgram() {
-            return true;
-        }
-        false
-    }
-}
-
-impl Drop for UnixSocketFile {
-    fn drop(&mut self) {
-        if let Some(bound) = self.state.lock().bound.take() {
-            match bound {
-                UnixBoundAddr::Path(path) => {
-                    UNIX_BOUND_PATHS.lock().remove(&path);
-                }
-                UnixBoundAddr::Abstract(name) => {
-                    UNIX_BOUND_ABSTRACT.lock().remove(&name);
-                }
-            }
-        }
-    }
-}
-
-impl File for UnixSocketFile {
-    fn readable(&self) -> bool {
-        true
-    }
-
-    fn writable(&self) -> bool {
-        true
-    }
-
-    fn read(&self, buf: UserBuffer) -> usize {
-        if self.is_stream_like() {
-            if let Some(end) = self.stream_end() {
-                return end.read(buf);
-            }
-            return 0;
-        }
-        if !self.is_dgram() {
-            return 0;
-        }
-        let msg = self.recv_dgram();
-        copy_slice_to_user_buffer(buf, &msg.payload)
-    }
-
-    fn write(&self, buf: UserBuffer) -> usize {
-        if self.is_stream_like() {
-            if let Some(end) = self.stream_end() {
-                return end.write(buf);
-            }
-            return 0;
-        }
-        if !self.is_dgram() {
-            return 0;
-        }
-        let payload = copy_user_buffer_to_vec(buf);
-        if payload.is_empty() {
-            return 0;
-        }
-        let n = payload.len();
-        if self.send_dgram(payload, None) < 0 {
-            return 0;
-        }
-        n
-    }
-
-    fn poll_mask(&self) -> i16 {
-        if self.is_stream_like() {
-            let (listening, pending_accept, stream_end) = {
-                let st = self.state.lock();
-                (
-                    st.listening,
-                    !st.pending_accept.is_empty(),
-                    st.stream_end.clone(),
-                )
-            };
-            if listening {
-                return if pending_accept { POLLIN } else { 0 };
-            }
-            if let Some(end) = stream_end {
-                return end.poll_mask();
-            }
-            return 0;
-        }
-        if self.is_dgram() {
-            let mut mask = POLLOUT;
-            if !self.state.lock().dgram_queue.is_empty() {
-                mask |= POLLIN;
-            }
-            return mask;
-        }
-        0
-    }
-
-    fn supports_poll(&self) -> bool {
-        true
-    }
-
-    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
-        if self.is_stream_like() {
-            let mut st = self.state.lock();
-            let _ = st.poll_waiters.register_waiter(task);
-            if st.listening {
-                return true;
-            }
-            let end = st.stream_end.clone();
-            drop(st);
-            if let Some(end) = end.as_ref() {
-                let _ = end.register_poll_waiter(task);
-            }
-            return true;
-        }
-        if self.is_dgram() {
-            let mut st = self.state.lock();
-            let _ = st.poll_waiters.register_waiter(task);
-            return true;
-        }
-        false
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(super) struct SockAddrNl {
-    nl_family: u16,
-    nl_pad: u16,
-    nl_pid: u32,
-    nl_groups: u32,
-}
-
-struct NetlinkSocketState {
-    bound: Option<SockAddrNl>,
-    messages: VecDeque<[u8; MQ_THREAD_NOTIFY_COOKIE_LEN]>,
-    recv_waiters: VecDeque<Weak<TaskControlBlock>>,
-    poll_waiters: PollWaitQueue,
-}
-
-pub(crate) struct NetlinkSocketFile {
-    state: Mutex<NetlinkSocketState>,
-}
-
-impl NetlinkSocketFile {
-    pub(super) fn new() -> Self {
-        Self {
-            state: Mutex::new(NetlinkSocketState {
-                bound: None,
-                messages: VecDeque::new(),
-                recv_waiters: VecDeque::new(),
-                poll_waiters: PollWaitQueue::default(),
-            }),
-        }
-    }
-
-    fn retain_blocked_waiters(waiters: &mut VecDeque<Weak<TaskControlBlock>>) {
-        waiters.retain(|w| {
-            let Some(task) = w.upgrade() else {
-                return false;
-            };
-            task.borrow_mut().task_status == TaskStatus::Blocked
-        });
-    }
-
-    fn add_waiter_once(
-        waiters: &mut VecDeque<Weak<TaskControlBlock>>,
-        task: &Arc<TaskControlBlock>,
-    ) {
-        if waiters
-            .iter()
-            .any(|w| w.upgrade().is_some_and(|t| Arc::ptr_eq(&t, task)))
-        {
-            return;
-        }
-        waiters.push_back(Arc::downgrade(task));
-    }
-
-    pub(super) fn bind_local(&self, addr: SockAddrNl) -> isize {
-        if addr.nl_family != AF_NETLINK {
-            return err(SyscallError::EAFNOSUPPORT);
-        }
-        let mut st = self.state.lock();
-        if st.bound.is_some() {
-            return err(SyscallError::EINVAL);
-        }
-        st.bound = Some(SockAddrNl {
-            nl_family: AF_NETLINK,
-            nl_pad: 0,
-            nl_pid: if addr.nl_pid == 0 {
-                current_process().pid.0 as u32
-            } else {
-                addr.nl_pid
-            },
-            nl_groups: addr.nl_groups,
-        });
-        0
-    }
-
-    pub(super) fn local_addr(&self) -> SockAddrNl {
-        self.state.lock().bound.unwrap_or(SockAddrNl {
-            nl_family: AF_NETLINK,
-            nl_pad: 0,
-            nl_pid: 0,
-            nl_groups: 0,
-        })
-    }
-
-    pub(crate) fn enqueue_mq_notify(
-        &self,
-        mut cookie: [u8; MQ_THREAD_NOTIFY_COOKIE_LEN],
-        notify_kind: u8,
-    ) {
-        cookie[MQ_THREAD_NOTIFY_COOKIE_LEN - 1] = notify_kind;
-        let mut wake = Vec::new();
-        {
-            let mut st = self.state.lock();
-            st.messages.push_back(cookie);
-            Self::retain_blocked_waiters(&mut st.recv_waiters);
-            for waiter in st.recv_waiters.drain(..) {
-                if let Some(task) = waiter.upgrade() {
-                    wake.push(task);
-                }
-            }
-            wake.extend(st.poll_waiters.take_wakeups());
-        }
-        wake_tasks(wake);
-    }
-
-    pub(super) fn recv_packet(
-        &self,
-        _len: usize,
-        flags: usize,
-    ) -> Result<[u8; MQ_THREAD_NOTIFY_COOKIE_LEN], isize> {
-        let peek = (flags & MSG_PEEK) != 0;
-        let nonblock = (flags & MSG_DONTWAIT) != 0;
-        loop {
-            let mut st = self.state.lock();
-            let msg = if peek {
-                st.messages.front().copied()
-            } else {
-                st.messages.pop_front()
-            };
-            if let Some(msg) = msg {
-                drop(st);
-                return Ok(msg);
-            }
-            if nonblock {
-                return Err(err(SyscallError::EAGAIN));
-            }
-            let Some(task) = current_task() else {
-                return Err(err(SyscallError::EAGAIN));
-            };
-            Self::add_waiter_once(&mut st.recv_waiters, &task);
-            drop(st);
-            block_current_and_run_next();
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn poll_readable(&self) -> bool {
-        !self.state.lock().messages.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn poll_writable(&self) -> bool {
-        true
-    }
-}
-
-impl File for NetlinkSocketFile {
-    fn readable(&self) -> bool {
-        true
-    }
-
-    fn writable(&self) -> bool {
-        true
-    }
-
-    fn read(&self, buf: UserBuffer) -> usize {
-        let len = buf.len();
-        if len == 0 {
-            return 0;
-        }
-        match self.recv_packet(len, 0) {
-            Ok(msg) => copy_slice_to_user_buffer(buf, &msg[..len.min(msg.len())]),
-            Err(_) => 0,
-        }
-    }
-
-    fn write(&self, buf: UserBuffer) -> usize {
-        copy_user_buffer_to_vec(buf).len()
-    }
-
-    fn poll_mask(&self) -> i16 {
-        let mut mask = POLLOUT;
-        if !self.state.lock().messages.is_empty() {
-            mask |= POLLIN;
-        }
-        mask
-    }
-
-    fn supports_poll(&self) -> bool {
-        true
-    }
-
-    fn register_poll_waiter(&self, task: &Arc<TaskControlBlock>) -> bool {
-        let mut st = self.state.lock();
-        st.poll_waiters.register_waiter(task)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
+/// 与 Linux `struct sockaddr_in` ABI 兼容的 IPv4 套接字地址。
+///
+/// 注意：`sin_port` 和 `sin_addr` 均以**网络字节序**存储，读写时需做字节序转换。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct SockAddrIn {
@@ -750,26 +190,9 @@ pub(super) struct SockAddrIn {
     sin_zero: [u8; 8],
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct SockAddrUn {
-    sun_family: u16,
-    sun_path: [u8; 108],
-}
-
-fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "/" {
-        return None;
-    }
-    let (parent, name) = trimmed.rsplit_once('/')?;
-    let parent = if parent.is_empty() { "/" } else { parent };
-    if name.is_empty() {
-        return None;
-    }
-    Some((parent, name))
-}
-
+/// 从当前进程的文件描述符表中获取指定 fd 对应的文件对象。
+///
+/// O_PATH fd 在 Linux 语义下不能执行实际 I/O，因此视为无效套接字 fd 返回 EBADF。
 pub(super) fn get_file(fd: usize) -> Result<FileArc, isize> {
     let files = current_files();
     let files = files.lock();
@@ -782,6 +205,9 @@ pub(super) fn get_file(fd: usize) -> Result<FileArc, isize> {
     Ok(file)
 }
 
+/// 从指定 PID 进程的文件描述符表中获取文件对象。
+///
+/// 用于跨进程操作场景（如 mq_notify），调用者须确保目标进程在调用期间不会退出。
 fn get_file_from_process(pid: usize, fd: usize) -> Result<FileArc, isize> {
     let Some(process) = pid2process(pid) else {
         return Err(err(SyscallError::EBADF));
@@ -793,6 +219,10 @@ fn get_file_from_process(pid: usize, fd: usize) -> Result<FileArc, isize> {
         .ok_or(err(SyscallError::EBADF))
 }
 
+/// 验证指定进程的 fd 是否为有效的 Netlink 套接字，用于 mq_notify SIGEV_THREAD 模式的前置检查。
+///
+/// mq_notify 的 SIGEV_THREAD 实现需要将通知投递到用户指定的线程，该线程通过
+/// 一个 Netlink 套接字与内核通信，因此必须确认 fd 指向 NetlinkSocketFile。
 pub(crate) fn mq_notify_validate_thread_sockfd(pid: usize, sockfd: usize) -> isize {
     let file = match get_file_from_process(pid, sockfd) {
         Ok(f) => f,
@@ -804,6 +234,11 @@ pub(crate) fn mq_notify_validate_thread_sockfd(pid: usize, sockfd: usize) -> isi
     0
 }
 
+/// 向指定进程的 Netlink 套接字投递消息队列通知事件。
+///
+/// 在 mq_notify SIGEV_THREAD 路径上，由消息队列子系统在消息到达时调用此函数，
+/// 将 `cookie`（标识本次通知的上下文令牌）和 `notify_kind` 写入目标套接字的接收队列，
+/// 由用户态线程从套接字读取并触发相应的回调。
 pub(crate) fn mq_notify_send_thread_event(
     pid: usize,
     sockfd: usize,
@@ -821,73 +256,10 @@ pub(crate) fn mq_notify_send_thread_event(
     0
 }
 
-fn current_unix_ucred() -> UCred {
-    let proc = current_process();
-    let inner = proc.borrow_mut();
-    UCred {
-        pid: proc.pid.0 as u32,
-        uid: inner.euid as u32,
-        gid: inner.egid as u32,
-    }
-}
-
-pub(super) fn file_key(file: &FileArc) -> usize {
-    Arc::as_ptr(file) as *const () as usize
-}
-
-fn take_pending_more(key: usize) -> Option<PendingMoreState> {
-    MSG_MORE_PENDING.lock().remove(&key)
-}
-
-fn put_pending_more(key: usize, state: PendingMoreState) {
-    MSG_MORE_PENDING.lock().insert(key, state);
-}
-
-pub(super) fn queue_pending_more_chunk(key: usize, chunk: &[u8], udp_target: Option<UdpTarget>) {
-    let mut pending = take_pending_more(key).unwrap_or(PendingMoreState {
-        data: Vec::new(),
-        udp_target,
-    });
-    if pending.udp_target.is_none() {
-        pending.udp_target = udp_target;
-    }
-    pending.data.extend_from_slice(chunk);
-    put_pending_more(key, pending);
-}
-
-pub(super) fn consume_pending_more(
-    key: usize,
-    payload: Vec<u8>,
-) -> (Vec<u8>, bool, Option<UdpTarget>) {
-    if let Some(mut pending) = take_pending_more(key) {
-        let pending_target = pending.udp_target;
-        pending.data.extend_from_slice(&payload);
-        (pending.data, true, pending_target)
-    } else {
-        (payload, false, None)
-    }
-}
-
-pub(super) fn visible_send_len(sent: usize, user_len: usize, had_pending: bool) -> isize {
-    if had_pending {
-        user_len as isize
-    } else {
-        sent as isize
-    }
-}
-
-pub(super) fn visible_send_result(ret: isize, user_len: usize, had_pending: bool) -> isize {
-    if ret < 0 {
-        ret
-    } else {
-        visible_send_len(ret as usize, user_len, had_pending)
-    }
-}
-
-pub(crate) fn file_supports_poll(file: &Arc<dyn File + Send + Sync>) -> bool {
-    file.supports_poll()
-}
-
+/// 将内核侧切片 `src` 逐字节写入用户空间 `UserBuffer`，返回实际写入字节数。
+///
+/// 使用迭代器逐指针写入，而非 memcpy，是因为 UserBuffer 可能跨越不连续的物理页，
+/// 其迭代器负责处理页边界的跳转。
 fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {
     let mut it = buf.into_iter();
     let mut copied = 0usize;
@@ -902,6 +274,9 @@ fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {
     copied
 }
 
+/// 将用户空间 `UserBuffer` 的内容读取到内核堆分配的 `Vec<u8>` 中。
+///
+/// 同 `copy_slice_to_user_buffer`，以迭代器方式处理跨页缓冲区。
 fn copy_user_buffer_to_vec(buf: UserBuffer) -> Vec<u8> {
     let mut data = Vec::with_capacity(buf.len());
     for p in buf.into_iter() {
@@ -911,6 +286,10 @@ fn copy_user_buffer_to_vec(buf: UserBuffer) -> Vec<u8> {
     data
 }
 
+/// 从用户空间读取 `sockaddr_in` 并解析为内核使用的 IPv4 地址和端口。
+///
+/// `sin_family` 为 0 时按 AF_INET 静默处理，与 Linux 行为保持一致（部分旧程序不填写 family）。
+/// 端口和地址均以网络字节序存储，此处转换为主机字节序后再返回。
 pub(super) fn parse_sockaddr_in(
     user_ptr: usize,
     len: usize,
@@ -936,177 +315,12 @@ pub(super) fn parse_sockaddr_in(
     Ok((ip, port))
 }
 
-pub(super) fn parse_sockaddr_nl(user_ptr: usize, len: usize) -> Result<SockAddrNl, isize> {
-    if user_ptr == 0 || len < size_of::<SockAddrNl>() {
-        return Err(err(SyscallError::EINVAL));
-    }
-    if len > i32::MAX as usize {
-        return Err(err(SyscallError::EINVAL));
-    }
-    let token = get_current_token();
-    let Some(sa) = try_read_user_value(token, user_ptr as *const SockAddrNl) else {
-        return Err(err(SyscallError::EFAULT));
-    };
-    if sa.nl_family != AF_NETLINK {
-        if sa.nl_family != 0 {
-            return Err(err(SyscallError::EAFNOSUPPORT));
-        }
-    }
-    Ok(sa)
-}
-
-fn parse_sockaddr_un(user_ptr: usize, len: usize) -> Result<(bool, Vec<u8>), isize> {
-    if user_ptr == 0 || len < size_of::<u16>() {
-        return Err(err(SyscallError::EINVAL));
-    }
-    if len > i32::MAX as usize {
-        return Err(err(SyscallError::EINVAL));
-    }
-    let to_copy = len.min(size_of::<SockAddrUn>());
-    let token = get_current_token();
-    let mut raw = vec![0u8; to_copy];
-    if try_copy_from_user(token, user_ptr as *const u8, raw.as_mut_slice()).is_err() {
-        return Err(err(SyscallError::EFAULT));
-    }
-    let family = u16::from_ne_bytes([raw[0], raw[1]]);
-    if family != AF_UNIX {
-        return Err(err(SyscallError::EAFNOSUPPORT));
-    }
-    let path = &raw[size_of::<u16>()..];
-    if path.is_empty() {
-        return Err(err(SyscallError::EINVAL));
-    }
-    if path[0] == 0 {
-        let mut name = path[1..].to_vec();
-        while matches!(name.last(), Some(0)) {
-            name.pop();
-        }
-        if name.is_empty() {
-            return Err(err(SyscallError::EINVAL));
-        }
-        return Ok((true, name));
-    }
-    let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
-    if end == 0 {
-        return Err(err(SyscallError::EINVAL));
-    }
-    Ok((false, path[..end].to_vec()))
-}
-
-pub(super) fn parse_unix_bound_addr(addr: usize, addrlen: usize) -> Result<UnixBoundAddr, isize> {
-    let (is_abstract, raw_name) = parse_sockaddr_un(addr, addrlen)?;
-    if is_abstract {
-        return Ok(UnixBoundAddr::Abstract(raw_name));
-    }
-    let Ok(path_part) = core::str::from_utf8(&raw_name) else {
-        return Err(err(SyscallError::EINVAL));
-    };
-    let cwd = { current_process().borrow_mut().cwd.clone() };
-    let abs = normalize_path(&cwd, path_part);
-    Ok(UnixBoundAddr::Path(abs))
-}
-
-fn lookup_unix_bound_socket(addr: &UnixBoundAddr) -> Result<FileArc, isize> {
-    match addr {
-        UnixBoundAddr::Path(path) => {
-            let mut reg = UNIX_BOUND_PATHS.lock();
-            let Some(weak) = reg.get(path) else {
-                return Err(err(SyscallError::ENOENT));
-            };
-            if let Some(file) = weak.upgrade() {
-                return Ok(file);
-            }
-            reg.remove(path);
-            Err(err(SyscallError::ENOENT))
-        }
-        UnixBoundAddr::Abstract(name) => {
-            let mut reg = UNIX_BOUND_ABSTRACT.lock();
-            let Some(weak) = reg.get(name) else {
-                return Err(err(SyscallError::ENOENT));
-            };
-            if let Some(file) = weak.upgrade() {
-                return Ok(file);
-            }
-            reg.remove(name);
-            Err(err(SyscallError::ENOENT))
-        }
-    }
-}
-
-fn register_unix_bound_socket(addr: &UnixBoundAddr, file: &FileArc) -> isize {
-    match addr {
-        UnixBoundAddr::Path(path) => {
-            let mut reg = UNIX_BOUND_PATHS.lock();
-            if let Some(existing) = reg.get(path) {
-                if existing.upgrade().is_some() {
-                    return err(SyscallError::EADDRINUSE);
-                }
-                reg.remove(path);
-            }
-            reg.insert(path.clone(), Arc::downgrade(file));
-        }
-        UnixBoundAddr::Abstract(name) => {
-            let mut reg = UNIX_BOUND_ABSTRACT.lock();
-            if let Some(existing) = reg.get(name) {
-                if existing.upgrade().is_some() {
-                    return err(SyscallError::EADDRINUSE);
-                }
-                reg.remove(name);
-            }
-            reg.insert(name.clone(), Arc::downgrade(file));
-        }
-    }
-    0
-}
-
-pub(super) fn bind_unix_socket(
-    file: &FileArc,
-    sock: &UnixSocketFile,
-    addr: usize,
-    addrlen: usize,
-) -> isize {
-    if sock.bound_addr().is_some() {
-        return err(SyscallError::EINVAL);
-    }
-    let bound = match parse_unix_bound_addr(addr, addrlen) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if let UnixBoundAddr::Path(abs) = &bound {
-        let Some((parent_path, name)) = split_parent_and_name(abs) else {
-            return err(SyscallError::EINVAL);
-        };
-        let _fs_guard = ext4_lock();
-        let Some(parent) = find_path_in_roots(parent_path) else {
-            return err(SyscallError::ENOENT);
-        };
-        if !parent.is_dir() {
-            return err(SyscallError::ENOTDIR);
-        }
-        if parent.find(name).is_some() {
-            return err(SyscallError::EADDRINUSE);
-        }
-        if parent.create_file(name).is_err() {
-            if parent.find(name).is_some() {
-                return err(SyscallError::EADDRINUSE);
-            }
-            return err(SyscallError::EINVAL);
-        }
-        let reg_result = register_unix_bound_socket(&bound, file);
-        if reg_result != 0 {
-            let _ = parent.unlink(name);
-            return reg_result;
-        }
-    } else {
-        let reg_result = register_unix_bound_socket(&bound, file);
-        if reg_result != 0 {
-            return reg_result;
-        }
-    }
-    sock.set_bound_addr(bound);
-    0
-}
-
+/// 将内核侧的 IPv4 地址和端口序列化为 `sockaddr_in` 写回用户空间。
+///
+/// 遵循 POSIX getpeername/getsockname 语义：
+/// - 先读取用户提供的缓冲区长度，按实际可用空间截断写入；
+/// - 无论截断与否，都将 `*user_len_ptr` 更新为结构体的完整长度，
+///   让调用者知晓需要多大的缓冲区。
 pub(super) fn write_sockaddr_in(
     user_ptr: usize,
     user_len_ptr: usize,
@@ -1134,6 +348,7 @@ pub(super) fn write_sockaddr_in(
         sin_zero: [0; 8],
     };
     let required = size_of::<SockAddrIn>();
+    // 用户缓冲区可能小于结构体大小，只写入可容纳的部分
     let copy_len = core::cmp::min(len, required);
     if copy_len > 0 {
         // SAFETY: sa is a stack-local struct with known layout; copy_len <= size_of::<SockAddrIn>().
@@ -1150,86 +365,10 @@ pub(super) fn write_sockaddr_in(
     0
 }
 
-pub(super) fn write_sockaddr_nl(user_ptr: usize, user_len_ptr: usize, sa: &SockAddrNl) -> isize {
-    if user_ptr == 0 || user_len_ptr == 0 {
-        return err(SyscallError::EFAULT);
-    }
-    let token = get_current_token();
-    let Some(len_u32) = try_read_user_value::<u32>(token, user_len_ptr as *const u32) else {
-        return err(SyscallError::EFAULT);
-    };
-    let len = len_u32 as usize;
-    if len > i32::MAX as usize {
-        return err(SyscallError::EINVAL);
-    }
-    let required = size_of::<SockAddrNl>();
-    let copy_len = core::cmp::min(len, required);
-    if copy_len > 0 {
-        // SAFETY: sa is a reference to a valid SockAddrNl; copy_len <= size_of::<SockAddrNl>().
-        let bytes = unsafe {
-            core::slice::from_raw_parts((&*sa as *const SockAddrNl) as *const u8, copy_len)
-        };
-        if try_copy_to_user(token, user_ptr as *mut u8, bytes).is_err() {
-            return err(SyscallError::EFAULT);
-        }
-    }
-    if try_write_user_value(token, user_len_ptr as *mut u32, &(required as u32)).is_err() {
-        return err(SyscallError::EFAULT);
-    }
-    0
-}
-
-pub(super) fn write_sockaddr_un(
-    user_ptr: usize,
-    user_len_ptr: usize,
-    addr: Option<&UnixBoundAddr>,
-) -> isize {
-    if user_ptr == 0 || user_len_ptr == 0 {
-        return err(SyscallError::EFAULT);
-    }
-    let token = get_current_token();
-    let Some(len_u32) = try_read_user_value::<u32>(token, user_len_ptr as *const u32) else {
-        return err(SyscallError::EFAULT);
-    };
-    let len = len_u32 as usize;
-    if len > i32::MAX as usize {
-        return err(SyscallError::EINVAL);
-    }
-    let mut sa = SockAddrUn {
-        sun_family: AF_UNIX,
-        sun_path: [0; 108],
-    };
-    if let Some(bound) = addr {
-        match bound {
-            UnixBoundAddr::Path(path) => {
-                let raw = path.as_bytes();
-                let copy = raw.len().min(sa.sun_path.len().saturating_sub(1));
-                sa.sun_path[..copy].copy_from_slice(&raw[..copy]);
-            }
-            UnixBoundAddr::Abstract(name) => {
-                sa.sun_path[0] = 0;
-                let copy = name.len().min(sa.sun_path.len().saturating_sub(1));
-                sa.sun_path[1..1 + copy].copy_from_slice(&name[..copy]);
-            }
-        }
-    }
-    let required = size_of::<SockAddrUn>();
-    let copy_len = core::cmp::min(len, required);
-    if copy_len > 0 {
-        // SAFETY: sa is a stack-local struct with known layout; copy_len <= size_of::<SockAddrUn>().
-        let bytes = unsafe {
-            core::slice::from_raw_parts((&sa as *const SockAddrUn) as *const u8, copy_len)
-        };
-        if try_copy_to_user(token, user_ptr as *mut u8, bytes).is_err() {
-            return err(SyscallError::EFAULT);
-        }
-    }
-    if try_write_user_value(token, user_len_ptr as *mut u32, &(required as u32)).is_err() {
-        return err(SyscallError::EFAULT);
-    }
-    0
-}
-
+/// 从用户空间读取 `iovcnt` 个 `iovec` 结构体，返回内核侧副本。
+///
+/// 超出 `UIO_MAXIOV` 的请求返回 EMSGSIZE，与 Linux 行为一致。
+/// 全部读入后再处理，避免在散步复制过程中遭遇并发修改（TOCTOU）。
 pub(super) fn read_iovecs(iov_ptr: usize, iovcnt: usize) -> Result<Vec<IoVec>, isize> {
     if iovcnt == 0 {
         return Ok(Vec::new());
@@ -1252,6 +391,10 @@ pub(super) fn read_iovecs(iov_ptr: usize, iovcnt: usize) -> Result<Vec<IoVec>, i
     Ok(iovs)
 }
 
+/// 按 gather 语义将多个用户空间 iovec 缓冲区的内容合并到单个连续字节向量中。
+///
+/// 对应 sendmsg 发送路径：将分散的用户缓冲区聚合为一段连续数据后再交给协议栈。
+/// 先计算总长度以一次性分配内存，避免多次 realloc。
 pub(super) fn gather_iovecs_data(iovs: &[IoVec]) -> Result<Vec<u8>, isize> {
     let total = iovecs_total_len(iovs)?;
     let token = get_current_token();
@@ -1270,12 +413,17 @@ pub(super) fn gather_iovecs_data(iovs: &[IoVec]) -> Result<Vec<u8>, isize> {
     Ok(out)
 }
 
+/// 计算 iovec 数组的总字节数，使用 checked_add 防止整数溢出。
 pub(super) fn iovecs_total_len(iovs: &[IoVec]) -> Result<usize, isize> {
     iovs.iter()
         .try_fold(0usize, |acc, iv| acc.checked_add(iv.len))
         .ok_or(err(SyscallError::EINVAL))
 }
 
+/// 按 scatter 语义将连续数据 `data` 分发写入多个用户空间 iovec 缓冲区，返回实际写入字节数。
+///
+/// 对应 recvmsg 接收路径：协议栈返回连续数据后，再按 iovec 描述分散到用户缓冲区。
+/// 数据耗尽时提前退出，不会越界访问 `data`。
 pub(super) fn scatter_iovecs_data(iovs: &[IoVec], data: &[u8]) -> Result<usize, isize> {
     let token = get_current_token();
     let mut off = 0usize;
@@ -1295,6 +443,11 @@ pub(super) fn scatter_iovecs_data(iovs: &[IoVec], data: &[u8]) -> Result<usize, 
     Ok(off)
 }
 
+/// 将原始字节序列写入 `msghdr.msg_name` 所指向的用户空间地址缓冲区。
+///
+/// `msg_name` 为 NULL 时静默忽略（recvfrom 调用者不关心来源地址的合法情形）。
+/// 函数始终将 `msg_namelen` 更新为 `value` 的完整长度，即便因缓冲区过小发生截断，
+/// 调用者可据此判断地址是否被截断（POSIX 要求）。
 pub(super) fn write_msg_name_bytes(msg: &mut MsgHdr, value: &[u8]) -> isize {
     if msg.msg_name == 0 {
         msg.msg_namelen = 0;
@@ -1311,10 +464,14 @@ pub(super) fn write_msg_name_bytes(msg: &mut MsgHdr, value: &[u8]) -> isize {
             return err(SyscallError::EFAULT);
         }
     }
+    // 即使发生截断，也写回完整长度，让调用者感知到地址被截断
     msg.msg_namelen = value.len() as u32;
     0
 }
 
+/// 将 IPv4 地址和端口序列化为 `sockaddr_in` 后写入 `msghdr.msg_name`。
+///
+/// 封装 `write_msg_name_bytes`，避免调用方重复构造 `SockAddrIn` 的字节序转换逻辑。
 pub(super) fn write_msg_name_in(
     msg: &mut MsgHdr,
     ip: smoltcp::wire::Ipv4Address,
@@ -1339,46 +496,21 @@ pub(super) fn write_msg_name_in(
     write_msg_name_bytes(msg, bytes)
 }
 
-pub(super) fn write_msg_name_un(msg: &mut MsgHdr, addr: Option<&UnixBoundAddr>) -> isize {
-    let mut sa = SockAddrUn {
-        sun_family: AF_UNIX,
-        sun_path: [0; 108],
-    };
-    if let Some(bound) = addr {
-        match bound {
-            UnixBoundAddr::Path(path) => {
-                let raw = path.as_bytes();
-                let copy = raw.len().min(sa.sun_path.len().saturating_sub(1));
-                sa.sun_path[..copy].copy_from_slice(&raw[..copy]);
-            }
-            UnixBoundAddr::Abstract(name) => {
-                sa.sun_path[0] = 0;
-                let copy = name.len().min(sa.sun_path.len().saturating_sub(1));
-                sa.sun_path[1..1 + copy].copy_from_slice(&name[..copy]);
-            }
-        }
-    }
-    // SAFETY: sa is a stack-local struct with known layout; length equals size_of::<SockAddrUn>().
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&sa as *const SockAddrUn) as *const u8,
-            size_of::<SockAddrUn>(),
-        )
-    };
-    write_msg_name_bytes(msg, bytes)
-}
-
+/// 校验 sendmsg/sendto 的 flags 参数，拒绝内核尚未实现的标志位。
+///
+/// MSG_NOSIGNAL 在内核侧无需特殊处理（内核不会向自身发信号），此处仅做合法性检查。
 pub(super) fn validate_send_flags(flags: usize) -> isize {
-    let known = MSG_OOB | MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE;
-    if (flags & !known) != 0 {
-        return err(SyscallError::EOPNOTSUPP);
-    }
-    if (flags & MSG_OOB) != 0 {
+    let supported = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE;
+    if (flags & !supported) != 0 {
         return err(SyscallError::EOPNOTSUPP);
     }
     0
 }
 
+/// 校验 recvmsg/recvfrom 的 flags 参数，拒绝内核尚未实现的标志位。
+///
+/// MSG_OOB 返回 EINVAL 而非 EOPNOTSUPP，是因为该标志在语义上明确无效（内核不支持带外数据）。
+/// MSG_ERRQUEUE 返回 EAGAIN，向调用者表明错误队列为空（当前实现未维护错误队列）。
 pub(super) fn validate_recv_flags(flags: usize) -> isize {
     if (flags & MSG_OOB) != 0 {
         return err(SyscallError::EINVAL);
@@ -1399,6 +531,7 @@ pub(super) fn validate_recv_flags(flags: usize) -> isize {
     0
 }
 
+/// 从用户空间读取 `msghdr` 结构体，返回内核侧副本。
 pub(super) fn read_msghdr(user_ptr: usize) -> Result<MsgHdr, isize> {
     if user_ptr == 0 {
         return Err(err(SyscallError::EFAULT));
@@ -1407,9 +540,13 @@ pub(super) fn read_msghdr(user_ptr: usize) -> Result<MsgHdr, isize> {
     try_read_user_value::<MsgHdr>(token, user_ptr as *const MsgHdr).ok_or(err(SyscallError::EFAULT))
 }
 
+/// 仅更新 `mmsghdr` 数组第 `idx` 项的 `msg_len` 字段，用于 recvmmsg 逐条填写接收长度。
+///
+/// 跳过整个 `MMsgHdr` 的写回，减少不必要的用户空间写操作。
 pub(super) fn write_mmsghdr_msg_len(user_ptr: usize, idx: usize, msg_len: u32) -> isize {
     let token = get_current_token();
     let base = user_ptr + idx * size_of::<MMsgHdr>();
+    // msg_len 字段紧跟在 MsgHdr 之后，偏移量等于 size_of::<MsgHdr>()
     let ptr = (base + size_of::<MsgHdr>()) as *mut u32;
     if try_write_user_value(token, ptr, &msg_len).is_err() {
         return err(SyscallError::EFAULT);
@@ -1417,6 +554,7 @@ pub(super) fn write_mmsghdr_msg_len(user_ptr: usize, idx: usize, msg_len: u32) -
     0
 }
 
+/// 将完整的 `MMsgHdr` 写回用户空间 `mmsghdr` 数组的第 `idx` 项。
 pub(super) fn write_mmsghdr(user_ptr: usize, idx: usize, mmsg: &MMsgHdr) -> isize {
     let token = get_current_token();
     let ptr = (user_ptr + idx * size_of::<MMsgHdr>()) as *mut MMsgHdr;

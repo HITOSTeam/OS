@@ -1,7 +1,7 @@
 use super::{
     Arc, BTreeMap, BTreeSet, File, Mutex, OSInode, PID2PCB, ProcessControlBlock, SIGIO_NUM,
-    SyscallError, TaskControlBlock, Vec, VecDeque, current_task, err, has_unmasked_pending,
-    inode_visible_size, queue_process_signal, wakeup_task,
+    SyscallError, TaskControlBlock, Vec, VecDeque, current_task, err,
+    has_wait_interrupting_pending, inode_visible_size, queue_process_signal, wakeup_task,
 };
 use lazy_static::lazy_static;
 
@@ -598,7 +598,5 @@ pub(crate) fn has_pending_unmasked_signal() -> bool {
         return false;
     };
     let inner = task.borrow_mut();
-    // Keep lock waits aligned with Linux semantics: ignored/default SIGCHLD
-    // from helper children should not abort F_SETLKW with err(SyscallError::EINTR).
-    has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+    has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
 }

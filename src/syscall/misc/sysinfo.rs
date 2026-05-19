@@ -1,14 +1,9 @@
 use crate::{
     arch,
     config::{PAGE_SIZE, phys_mem_end, phys_mem_start},
-    mm::{
-        frame_available_pages, try_copy_from_user, try_write_user_value,
-    },
+    mm::{frame_available_pages, try_copy_from_user, try_write_user_value},
     syscall::error::{SyscallError, err},
-    task::{
-        manager::PID2PCB,
-        processor::current_process,
-    },
+    task::{manager::PID2PCB, processor::current_process},
     time::get_time_ms,
     trap::get_current_token,
 };

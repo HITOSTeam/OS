@@ -9,12 +9,12 @@ use spin::Mutex;
 
 use crate::fs::parse_proc_sys_usize;
 use crate::mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value};
+use crate::syscall::error::{SyscallError, err};
 use crate::task::manager::wakeup_task;
 use crate::task::processor::{block_current_and_run_next, current_process, current_task};
-use crate::task::signal::has_unmasked_pending;
+use crate::task::signal::has_wait_interrupting_pending;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use crate::trap::get_current_token;
-use crate::syscall::error::{SyscallError, err};
 
 const IPC_PRIVATE: usize = 0;
 const IPC_CREAT: usize = 0x200;
@@ -67,7 +67,6 @@ static RUNTIME_SEMMSL_LIMIT: AtomicUsize = AtomicUsize::new(SEMMSL);
 static RUNTIME_SEMMNS_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNS);
 static RUNTIME_SEMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNI);
 static RUNTIME_SEMOPM_LIMIT: AtomicUsize = AtomicUsize::new(SEMOPM);
-
 
 #[allow(dead_code)]
 pub fn msgmax_limit() -> usize {
@@ -621,7 +620,7 @@ fn has_pending_unmasked_signal() -> bool {
         return false;
     };
     let inner = task.borrow_mut();
-    has_unmasked_pending(inner.pending_signals, inner.signal_mask, true)
+    has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
 }
 
 fn msq_to_user(queue: &MsgQueue) -> MsqidDsUser {
@@ -828,7 +827,11 @@ pub fn syscall_msgsnd(msqid: usize, msgp: usize, msgsz: usize, msgflg: usize) ->
         let mut managers = MSG_MANAGERS.lock();
         let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(queue) = mgr.queues.get_mut(&msqid) else {
-            return if waited { err(SyscallError::EIDRM) } else { err(SyscallError::EINVAL) };
+            return if waited {
+                err(SyscallError::EIDRM)
+            } else {
+                err(SyscallError::EINVAL)
+            };
         };
         if !check_ipc_access(&queue.perm, MSG_W, &cred) {
             return err(SyscallError::EACCES);
@@ -891,7 +894,11 @@ pub fn syscall_msgrcv(
         let mut managers = MSG_MANAGERS.lock();
         let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(queue) = mgr.queues.get_mut(&msqid) else {
-            return if waited { err(SyscallError::EIDRM) } else { err(SyscallError::EINVAL) };
+            return if waited {
+                err(SyscallError::EIDRM)
+            } else {
+                err(SyscallError::EINVAL)
+            };
         };
         if !check_ipc_access(&queue.perm, MSG_R, &cred) {
             return err(SyscallError::EACCES);
@@ -1250,7 +1257,11 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
         let mut managers = SEM_MANAGERS.lock();
         let mgr = managers.entry(ipc_ns_id).or_default();
         let Some(set) = mgr.sets.get_mut(&semid) else {
-            return if waited { err(SyscallError::EIDRM) } else { err(SyscallError::EINVAL) };
+            return if waited {
+                err(SyscallError::EIDRM)
+            } else {
+                err(SyscallError::EINVAL)
+            };
         };
         let Some(sem) = set.sems.get_mut(op.sem_num as usize) else {
             return err(SyscallError::EFBIG);

@@ -116,7 +116,8 @@ mod virtio_mmio {
             let mut shared = vec![0u8; buffer.len()].into_boxed_slice();
             if let BufferDirection::DriverToDevice | BufferDirection::Both = direction {
                 unsafe {
-                    let src = core::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len());
+                    let src =
+                        core::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len());
                     core::ptr::copy_nonoverlapping(src.as_ptr(), shared.as_mut_ptr(), buffer.len());
                 }
             }
@@ -128,7 +129,8 @@ mod virtio_mmio {
             if let BufferDirection::DeviceToDriver | BufferDirection::Both = direction {
                 unsafe {
                     let src = core::slice::from_raw_parts(paddr as *const u8, buffer.len());
-                    let dst = core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
+                    let dst =
+                        core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
                     dst.copy_from_slice(src);
                 }
             }

@@ -5,9 +5,9 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::syscall::error::{SyscallError, err};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     config::clock_freq,
@@ -18,13 +18,12 @@ use crate::{
     task::{
         manager::wakeup_task,
         processor::{block_current_and_run_next, current_process, current_task},
-        signal::has_unmasked_pending,
+        signal::has_wait_interrupting_pending,
         task_block::TaskControlBlock,
     },
     time::get_time,
     trap::get_current_token,
 };
-
 
 const FUTEX_WAIT: usize = 0;
 const FUTEX_WAKE: usize = 1;
@@ -105,7 +104,7 @@ fn futex_wait_now_ns(cmd: usize, clock_realtime: bool) -> u64 {
 fn pending_unmasked_signal() -> bool {
     let task = current_task().unwrap();
     let inner = task.borrow_mut();
-    has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
+    has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
 }
 
 pub(crate) fn shared_futex_addr_key(token: usize, uaddr: usize) -> usize {

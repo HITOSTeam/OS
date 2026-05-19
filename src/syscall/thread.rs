@@ -13,7 +13,7 @@ use crate::{
         block_sleep::add_timer,
         manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_task},
-        signal::has_unmasked_pending,
+        signal::has_wait_interrupting_pending,
         task_block::TaskControlBlock,
     },
     time::get_time_ms,
@@ -22,8 +22,12 @@ use crate::{
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let task = current_task().expect("sys_thread_create: no current task");
-    let Some(process) = task.process.upgrade() else { return -1 };
-    let Some(ustack_base) = task.borrow_mut().res.as_ref().map(|r| r.ustack_base) else { return -1 };
+    let Some(process) = task.process.upgrade() else {
+        return -1;
+    };
+    let Some(ustack_base) = task.borrow_mut().res.as_ref().map(|r| r.ustack_base) else {
+        return -1;
+    };
     // create a new thread
     let new_task = match TaskControlBlock::try_new(Arc::clone(&process), ustack_base, true) {
         Ok(t) => Arc::new(t),
@@ -36,7 +40,9 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     // Otherwise, another hart might schedule it and jump to user with an uninitialized TrapContext.
     let new_task_tid = {
         let new_task_inner = new_task.borrow_mut();
-        let Some(new_task_res) = new_task_inner.res.as_ref() else { return -1 };
+        let Some(new_task_res) = new_task_inner.res.as_ref() else {
+            return -1;
+        };
         let new_task_tid = new_task_res.tid;
 
         // add new thread to current process
@@ -69,7 +75,9 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
 pub fn sys_gettid() -> isize {
     let task = current_task().expect("sys_gettid: no current task");
     let inner = task.borrow_mut();
-    let Some(res) = inner.res.as_ref() else { return -1 };
+    let Some(res) = inner.res.as_ref() else {
+        return -1;
+    };
     res.tid as isize
 }
 
@@ -78,12 +86,16 @@ pub fn sys_gettid() -> isize {
 /// otherwise, return thread's exit code
 pub fn sys_waittid(tid: usize) -> i32 {
     let task = current_task().expect("sys_waittid: no current task");
-    let Some(process) = task.process.upgrade() else { return -1 };
+    let Some(process) = task.process.upgrade() else {
+        return -1;
+    };
 
     // Get current tid without holding locks across other borrows.
     let self_tid = {
         let task_inner = task.borrow_mut();
-        let Some(res) = task_inner.res.as_ref() else { return -1 };
+        let Some(res) = task_inner.res.as_ref() else {
+            return -1;
+        };
         res.tid
     };
     // a thread cannot wait for itself
@@ -182,7 +194,7 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     const EINTR: isize = -4;
     let interrupted = {
         let inner = task.borrow_mut();
-        has_unmasked_pending(inner.pending_signals, inner.signal_mask, false)
+        has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
     };
     if interrupted {
         let (tid, pending, mask) = {

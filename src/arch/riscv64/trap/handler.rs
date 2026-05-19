@@ -125,7 +125,11 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             set_next_trigger();
             check_timer();
         }
+        //
         Trap::Interrupt(_) => {
+            // TODO: 这里是否有可能出现其他态的中断？ 查看其他OS 是如何处理
+            // 目前只是处理 内核间唤醒，有可能会出现需要处理其他
+            //
             // Clear possible software interrupt and ignore others
             // SAFETY: sip CSR write is valid in S-mode.
             unsafe { riscv::register::sip::clear_ssoft() };

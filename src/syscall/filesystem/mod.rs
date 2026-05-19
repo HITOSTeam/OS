@@ -34,7 +34,7 @@ use crate::{
     },
     task::{
         ProcessControlBlock,
-        signal::{SIGXFSZ_NUM, has_unmasked_pending, queue_process_signal},
+        signal::{SIGXFSZ_NUM, has_wait_interrupting_pending, queue_process_signal},
         task_block::TaskControlBlock,
     },
     time::get_time_ms,
