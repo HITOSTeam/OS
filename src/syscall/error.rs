@@ -7,63 +7,63 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum SyscallError {
-    EPERM           = 1,
-    ENOENT          = 2,
-    ESRCH           = 3,
-    EINTR           = 4,
-    EIO             = 5,
-    ENXIO           = 6,
-    E2BIG           = 7,
-    ENOEXEC         = 8,   // Exec format error
-    EBADF           = 9,
-    ECHILD          = 10,  // No child processes
-    ENOMEM          = 12,
-    EACCES          = 13,
-    EFAULT          = 14,
-    ENOTBLK         = 15,
-    EBUSY           = 16,
-    EEXIST          = 17,
-    EXDEV           = 18,
-    ENODEV          = 19,
-    ENOTDIR         = 20,
-    EISDIR          = 21,
-    EINVAL          = 22,
-    ENFILE          = 23,
-    EMFILE          = 24,
-    ENOTTY          = 25,  // Not a typewriter / inappropriate ioctl
-    ETXTBSY         = 26,
-    EFBIG           = 27,
-    ENOSPC          = 28,
-    ESPIPE          = 29,
-    EROFS           = 30,
-    EMLINK          = 31,
-    EPIPE           = 32,
-    ERANGE          = 34,
-    EDEADLK         = 35,
-    ENAMETOOLONG    = 36,
-    ENOLCK          = 37,
-    ENOSYS          = 38,
-    ENOTEMPTY       = 39,
-    ELOOP           = 40,
-    EAGAIN          = 11,
-    ENOMSG          = 42,
-    EIDRM           = 43,
-    ENODATA         = 61,
-    EOVERFLOW       = 75,
-    ENOTSOCK        = 88,
-    EDESTADDRREQ    = 89,  // Destination address required
-    EMSGSIZE        = 90,
-    ENOPROTOOPT     = 92,
+    EPERM = 1,
+    ENOENT = 2,
+    ESRCH = 3,
+    EINTR = 4,
+    EIO = 5,
+    ENXIO = 6,
+    E2BIG = 7,
+    ENOEXEC = 8, // Exec format error
+    EBADF = 9,
+    ECHILD = 10, // No child processes
+    ENOMEM = 12,
+    EACCES = 13,
+    EFAULT = 14,
+    ENOTBLK = 15,
+    EBUSY = 16,
+    EEXIST = 17,
+    EXDEV = 18,
+    ENODEV = 19,
+    ENOTDIR = 20,
+    EISDIR = 21,
+    EINVAL = 22,
+    ENFILE = 23,
+    EMFILE = 24,
+    ENOTTY = 25, // Not a typewriter / inappropriate ioctl
+    ETXTBSY = 26,
+    EFBIG = 27,
+    ENOSPC = 28,
+    ESPIPE = 29,
+    EROFS = 30,
+    EMLINK = 31,
+    EPIPE = 32,
+    ERANGE = 34,
+    EDEADLK = 35,
+    ENAMETOOLONG = 36,
+    ENOLCK = 37,
+    ENOSYS = 38,
+    ENOTEMPTY = 39,
+    ELOOP = 40,
+    EAGAIN = 11,
+    ENOMSG = 42,
+    EIDRM = 43,
+    ENODATA = 61,
+    EOVERFLOW = 75,
+    ENOTSOCK = 88,
+    EDESTADDRREQ = 89, // Destination address required
+    EMSGSIZE = 90,
+    ENOPROTOOPT = 92,
     EPROTONOSUPPORT = 93,
-    EOPNOTSUPP      = 95,
-    EAFNOSUPPORT    = 97,
-    EADDRINUSE      = 98,
-    EADDRNOTAVAIL   = 99,
-    EISCONN         = 106,
-    ENOTCONN        = 107,
-    ETIMEDOUT       = 110,
-    ECONNREFUSED    = 111,
-    ECANCELED       = 125,
+    EOPNOTSUPP = 95,
+    EAFNOSUPPORT = 97,
+    EADDRINUSE = 98,
+    EADDRNOTAVAIL = 99,
+    EISCONN = 106,
+    ENOTCONN = 107,
+    ETIMEDOUT = 110,
+    ECONNREFUSED = 111,
+    ECANCELED = 125,
 }
 
 impl From<SyscallError> for isize {
@@ -105,9 +105,9 @@ impl From<crate::task::ForkError> for SyscallError {
             | ForkError::RlimitNprocExceeded
             | ForkError::CgroupPidsMaxExceeded => SyscallError::EAGAIN,
 
-            ForkError::KernelStackOom
-            | ForkError::TrapCxAllocFailed
-            | ForkError::VmCloneOom => SyscallError::ENOMEM,
+            ForkError::KernelStackOom | ForkError::TrapCxAllocFailed | ForkError::VmCloneOom => {
+                SyscallError::ENOMEM
+            }
         }
     }
 }
@@ -116,8 +116,9 @@ impl From<crate::task::task_block::TaskAllocError> for SyscallError {
     fn from(e: crate::task::task_block::TaskAllocError) -> Self {
         use crate::task::task_block::TaskAllocError;
         match e {
-            TaskAllocError::TrapCxAllocFailed
-            | TaskAllocError::KernelStackOom => SyscallError::ENOMEM,
+            TaskAllocError::TrapCxAllocFailed | TaskAllocError::KernelStackOom => {
+                SyscallError::ENOMEM
+            }
         }
     }
 }

@@ -7,7 +7,7 @@ use core::cmp::min;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::fs::{wake_tasks, File, PollWaitQueue, POLLIN, POLLOUT, POLLRDHUP};
+use crate::fs::{File, POLLIN, POLLOUT, POLLRDHUP, PollWaitQueue, wake_tasks};
 use crate::mm::UserBuffer;
 use crate::task::processor::current_task;
 use crate::task::signal::has_wait_interrupting_pending;

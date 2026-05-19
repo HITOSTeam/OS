@@ -3,10 +3,7 @@ use core::any::Any;
 
 use crate::{
     mm::UserBuffer,
-    task::{
-        manager::pid2process,
-        task_block::TaskControlBlock,
-    },
+    task::{manager::pid2process, task_block::TaskControlBlock},
 };
 
 use super::{File, POLLIN, wake_tasks};

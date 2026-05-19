@@ -41,7 +41,11 @@ pub(super) struct ElfPhdr64 {
     pub p_memsz: u64,
 }
 
-pub(super) fn read_exact_with<F>(read_at: &mut F, offset: usize, buf: &mut [u8]) -> Result<(), isize>
+pub(super) fn read_exact_with<F>(
+    read_at: &mut F,
+    offset: usize,
+    buf: &mut [u8],
+) -> Result<(), isize>
 where
     F: FnMut(usize, &mut [u8]) -> usize,
 {

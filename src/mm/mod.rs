@@ -55,9 +55,8 @@ pub use memory_set::remap_test;
 pub use memory_set::{ElfAux, KERNEL_SPACE, LazyFaultResult, MapPermission, MemorySet};
 pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub use page_table::{
-    PageTableEntry, read_user_value, translated_byte_buffer,
-    translated_mutref, translated_single_address, try_translated_byte_buffer,
-    write_user_value,
+    PageTableEntry, read_user_value, translated_byte_buffer, translated_mutref,
+    translated_single_address, try_translated_byte_buffer, write_user_value,
 };
 pub use page_table::{
     try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,

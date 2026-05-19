@@ -417,6 +417,9 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize) -> isize {
             Ok(v) => v,
             Err(e) => return e,
         };
+        if copied < packet.len() {
+            msg.msg_flags |= MSG_TRUNC as i32;
+        }
         if msg.msg_name != 0 && msg.msg_namelen != 0 {
             let sa = netlink_sock.kernel_addr();
             // SAFETY: `sa` is a fully initialized stack local `SockAddrNl`, and we expose

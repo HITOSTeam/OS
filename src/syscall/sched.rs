@@ -1,5 +1,5 @@
-use alloc::sync::Arc;
 use crate::syscall::error::{SyscallError, err};
+use alloc::sync::Arc;
 
 use crate::{
     config::MAX_HARTS,
@@ -18,7 +18,6 @@ use crate::{
     },
     trap::get_current_token,
 };
-
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -141,7 +140,10 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
     }
     if param_ptr == 0 {
         if DEBUG_CYCLICTEST {
-            log::warn!("[sched_getparam] err(SyscallError::EINVAL) pid={} param_ptr=0", pid);
+            log::warn!(
+                "[sched_getparam] err(SyscallError::EINVAL) pid={} param_ptr=0",
+                pid
+            );
         }
         return err(SyscallError::EINVAL);
     }

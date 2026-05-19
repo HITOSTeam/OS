@@ -5,9 +5,9 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::syscall::error::{SyscallError, err};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use crate::syscall::error::{SyscallError, err};
 
 use crate::{
     config::clock_freq,
@@ -24,7 +24,6 @@ use crate::{
     time::get_time,
     trap::get_current_token,
 };
-
 
 const FUTEX_WAIT: usize = 0;
 const FUTEX_WAKE: usize = 1;

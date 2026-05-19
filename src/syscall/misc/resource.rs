@@ -188,7 +188,11 @@ pub fn syscall_setpriority(which: isize, who: isize, prio: isize) -> isize {
         if caller_euid != 0 && new_nice < cur_nice {
             // libc `nice()` is often emulated by getpriority()+setpriority().
             // Linux reports err(SyscallError::EPERM) for nice(-N), while plain setpriority() keeps err(SyscallError::EACCES).
-            return if from_nice_wrapper { err(SyscallError::EPERM) } else { err(SyscallError::EACCES) };
+            return if from_nice_wrapper {
+                err(SyscallError::EPERM)
+            } else {
+                err(SyscallError::EACCES)
+            };
         }
         {
             let mut inner = task.borrow_mut();
@@ -390,21 +394,51 @@ fn rlimit_for_resource(
     let inner = process.borrow_mut();
     match resource {
         RLIMIT_CPU => Some((inner.rlimits.rlimit_cpu_cur, inner.rlimits.rlimit_cpu_max)),
-        RLIMIT_FSIZE => Some((inner.rlimits.rlimit_fsize_cur, inner.rlimits.rlimit_fsize_max)),
+        RLIMIT_FSIZE => Some((
+            inner.rlimits.rlimit_fsize_cur,
+            inner.rlimits.rlimit_fsize_max,
+        )),
         RLIMIT_DATA => Some((inner.rlimits.rlimit_data_cur, inner.rlimits.rlimit_data_max)),
-        RLIMIT_STACK => Some((inner.rlimits.rlimit_stack_cur, inner.rlimits.rlimit_stack_max)),
+        RLIMIT_STACK => Some((
+            inner.rlimits.rlimit_stack_cur,
+            inner.rlimits.rlimit_stack_max,
+        )),
         RLIMIT_CORE => Some((inner.rlimits.rlimit_core_cur, inner.rlimits.rlimit_core_max)),
         RLIMIT_RSS => Some((inner.rlimits.rlimit_rss_cur, inner.rlimits.rlimit_rss_max)),
-        RLIMIT_NPROC => Some((inner.rlimits.rlimit_nproc_cur, inner.rlimits.rlimit_nproc_max)),
-        RLIMIT_NOFILE => Some((inner.rlimits.rlimit_nofile_cur, inner.rlimits.rlimit_nofile_max)),
-        RLIMIT_MEMLOCK => Some((inner.rlimits.rlimit_memlock_cur, inner.rlimits.rlimit_memlock_max)),
+        RLIMIT_NPROC => Some((
+            inner.rlimits.rlimit_nproc_cur,
+            inner.rlimits.rlimit_nproc_max,
+        )),
+        RLIMIT_NOFILE => Some((
+            inner.rlimits.rlimit_nofile_cur,
+            inner.rlimits.rlimit_nofile_max,
+        )),
+        RLIMIT_MEMLOCK => Some((
+            inner.rlimits.rlimit_memlock_cur,
+            inner.rlimits.rlimit_memlock_max,
+        )),
         RLIMIT_AS => Some((inner.rlimits.rlimit_as_cur, inner.rlimits.rlimit_as_max)),
-        RLIMIT_LOCKS => Some((inner.rlimits.rlimit_locks_cur, inner.rlimits.rlimit_locks_max)),
-        RLIMIT_SIGPENDING => Some((inner.rlimits.rlimit_sigpending_cur, inner.rlimits.rlimit_sigpending_max)),
-        RLIMIT_MSGQUEUE => Some((inner.rlimits.rlimit_msgqueue_cur, inner.rlimits.rlimit_msgqueue_max)),
+        RLIMIT_LOCKS => Some((
+            inner.rlimits.rlimit_locks_cur,
+            inner.rlimits.rlimit_locks_max,
+        )),
+        RLIMIT_SIGPENDING => Some((
+            inner.rlimits.rlimit_sigpending_cur,
+            inner.rlimits.rlimit_sigpending_max,
+        )),
+        RLIMIT_MSGQUEUE => Some((
+            inner.rlimits.rlimit_msgqueue_cur,
+            inner.rlimits.rlimit_msgqueue_max,
+        )),
         RLIMIT_NICE => Some((inner.rlimits.rlimit_nice_cur, inner.rlimits.rlimit_nice_max)),
-        RLIMIT_RTPRIO => Some((inner.rlimits.rlimit_rtprio_cur, inner.rlimits.rlimit_rtprio_max)),
-        RLIMIT_RTTIME => Some((inner.rlimits.rlimit_rttime_cur, inner.rlimits.rlimit_rttime_max)),
+        RLIMIT_RTPRIO => Some((
+            inner.rlimits.rlimit_rtprio_cur,
+            inner.rlimits.rlimit_rtprio_max,
+        )),
+        RLIMIT_RTTIME => Some((
+            inner.rlimits.rlimit_rttime_cur,
+            inner.rlimits.rlimit_rttime_max,
+        )),
         _ => None,
     }
 }

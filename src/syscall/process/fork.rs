@@ -328,8 +328,10 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     record_fork_diag(process.getpid(), child_pid, flags, fork_elapsed_us);
 
     if !is_thread_like && (flags & CLONE_VFORK) == 0 {
-        let parent_fair = sched_class(process.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
-        let child_fair = sched_class(child.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
+        let parent_fair =
+            sched_class(process.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
+        let child_fair =
+            sched_class(child.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
         if parent_fair && child_fair && child_same_hart {
             // Let a freshly forked fair child run promptly so it can finish
             // exec/signal setup before the parent races ahead in user space.

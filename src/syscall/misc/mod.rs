@@ -1,22 +1,22 @@
-mod identity;
-mod session;
 mod capability;
-mod namespace;
-mod sysinfo;
-mod resource;
-mod prctl;
+mod identity;
 mod ioctl;
+mod namespace;
 mod other;
+mod prctl;
+mod resource;
+mod session;
+mod sysinfo;
 
-pub use identity::*;
-pub use session::*;
-pub use capability::*;
-pub use namespace::*;
 pub use self::sysinfo::*;
-pub use resource::*;
-pub use prctl::*;
+pub use capability::*;
+pub use identity::*;
 pub use ioctl::*;
+pub use namespace::*;
 pub use other::*;
+pub use prctl::*;
+pub use resource::*;
+pub use session::*;
 
 // ---- Linux-like TID encoding ------------------------------------------------
 //

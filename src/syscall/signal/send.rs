@@ -148,7 +148,11 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
                     if !targets.iter().any(|t| Arc::ptr_eq(t, &member)) {
                         if can_signal_process(&member, signum) {
                             deliver_signal_to_process(
-                                &member, signum, legacy_flag, sender_pid, sender_uid,
+                                &member,
+                                signum,
+                                legacy_flag,
+                                sender_pid,
+                                sender_uid,
                             );
                         }
                     }

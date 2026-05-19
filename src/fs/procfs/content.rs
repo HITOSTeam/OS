@@ -634,9 +634,21 @@ fn proc_pid_maps(pid: u32) -> String {
         if end <= region.start {
             continue;
         }
-        let r = if (region.prot & PROT_READ) != 0 { 'r' } else { '-' };
-        let w = if (region.prot & PROT_WRITE) != 0 { 'w' } else { '-' };
-        let x = if (region.prot & PROT_EXEC) != 0 { 'x' } else { '-' };
+        let r = if (region.prot & PROT_READ) != 0 {
+            'r'
+        } else {
+            '-'
+        };
+        let w = if (region.prot & PROT_WRITE) != 0 {
+            'w'
+        } else {
+            '-'
+        };
+        let x = if (region.prot & PROT_EXEC) != 0 {
+            'x'
+        } else {
+            '-'
+        };
         let p = if region.shared { 's' } else { 'p' };
         out.push_str(&alloc::format!(
             "{:x}-{:x} {}{}{}{} 00000000 00:00 0 \n",
@@ -790,9 +802,21 @@ fn proc_pid_smaps(pid: u32) -> String {
         if end <= region.start {
             continue;
         }
-        let r = if (region.prot & PROT_READ) != 0 { 'r' } else { '-' };
-        let w = if (region.prot & PROT_WRITE) != 0 { 'w' } else { '-' };
-        let x = if (region.prot & PROT_EXEC) != 0 { 'x' } else { '-' };
+        let r = if (region.prot & PROT_READ) != 0 {
+            'r'
+        } else {
+            '-'
+        };
+        let w = if (region.prot & PROT_WRITE) != 0 {
+            'w'
+        } else {
+            '-'
+        };
+        let x = if (region.prot & PROT_EXEC) != 0 {
+            'x'
+        } else {
+            '-'
+        };
         let p = if region.shared { 's' } else { 'p' };
 
         let size_bytes = end - region.start;

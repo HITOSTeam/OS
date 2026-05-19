@@ -1,5 +1,9 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
+use super::elf_loader::{
+    ENOMEM, ET_DYN, ElfHeader64, ElfPhdr64, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR, parse_elf_headers,
+    read_exact_with,
+};
 use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
@@ -11,10 +15,6 @@ use crate::config::{
 use crate::fs::cgroup_charge_anon_current;
 use crate::println;
 use crate::task::processor::current_process;
-use super::elf_loader::{
-    ElfHeader64, ElfPhdr64, ENOMEM, ET_DYN, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
-    parse_elf_headers, read_exact_with,
-};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -719,8 +719,12 @@ impl MemorySet {
         let mut max_end_vpn = VirtPageNum(0);
         let (main_entry, main_aux) =
             Self::map_elf_segments_into(&mut memory_set, main_elf, main_bias, &mut max_end_vpn)?;
-        let (interp_entry, _interp_aux) =
-            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn)?;
+        let (interp_entry, _interp_aux) = Self::map_elf_segments_into(
+            &mut memory_set,
+            interp_elf,
+            interp_bias,
+            &mut max_end_vpn,
+        )?;
 
         // Map user stack with U flags, placed above all mapped ELF segments.
         let max_end_va: VirtAddr = max_end_vpn.into();
@@ -798,8 +802,12 @@ impl MemorySet {
             main_bias,
             &mut max_end_vpn,
         )?;
-        let (interp_entry, _interp_aux) =
-            Self::map_elf_segments_into(&mut memory_set, interp_elf, interp_bias, &mut max_end_vpn)?;
+        let (interp_entry, _interp_aux) = Self::map_elf_segments_into(
+            &mut memory_set,
+            interp_elf,
+            interp_bias,
+            &mut max_end_vpn,
+        )?;
 
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_bottom: usize = max_end_va.into();
@@ -977,8 +985,8 @@ impl MemorySet {
             // before it can resume, or it may keep writing shared pages behind COW.
             #[cfg(target_arch = "riscv64")]
             {
-                let remote_hart_mask = crate::task::manager::online_hart_mask()
-                    & !(1usize << crate::arch::hart_id());
+                let remote_hart_mask =
+                    crate::task::manager::online_hart_mask() & !(1usize << crate::arch::hart_id());
                 unsafe {
                     asm!("sfence.vma");
                 }

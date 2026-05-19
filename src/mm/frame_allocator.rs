@@ -2,10 +2,7 @@
 //! controls all the frames in the operating system.
 
 use super::{PhysAddr, PhysPageNum};
-use crate::{
-    config::phys_mem_end,
-    println,
-};
+use crate::{config::phys_mem_end, println};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::{

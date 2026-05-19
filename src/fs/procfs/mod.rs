@@ -15,10 +15,10 @@ pub(crate) mod magic_link;
 pub(crate) mod open;
 
 pub use content::{vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory};
+pub(crate) use magic_link::resolve_proc_magic_intermediate_abs_path;
 pub use magic_link::{
     normalize_proc_magic_path, proc_fd_link_file, proc_magic_link_exists, proc_readlink,
 };
-pub(crate) use magic_link::resolve_proc_magic_intermediate_abs_path;
 pub use open::open_proc_pseudo;
 
 #[derive(Clone, Copy, Debug)]
@@ -289,5 +289,7 @@ pub(crate) fn parse_proc_sys_usize(data: &[u8]) -> Result<usize, isize> {
     if trimmed.is_empty() {
         return Err(err(SyscallError::EINVAL));
     }
-    trimmed.parse::<usize>().map_err(|_| err(SyscallError::EINVAL))
+    trimmed
+        .parse::<usize>()
+        .map_err(|_| err(SyscallError::EINVAL))
 }

@@ -9,10 +9,10 @@ use crate::arch;
 use crate::config::MAX_HARTS;
 use crate::debug_config::DEBUG_SCHED;
 use crate::fs::legacy_cpu_fair_group;
-use crate::task::block_sleep::{TimeWrap, TIMERS};
+use crate::task::block_sleep::{TIMERS, TimeWrap};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::sched::{
-    rt_queue_index, sched_class, SchedClass, RT_PRIO_LEVELS, RT_PRIO_MAX, RT_PRIO_MIN,
+    RT_PRIO_LEVELS, RT_PRIO_MAX, RT_PRIO_MIN, SchedClass, rt_queue_index, sched_class,
 };
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use spin::Mutex;
@@ -29,11 +29,7 @@ pub fn mark_hart_online(hart_id: usize) {
 pub fn online_hart_mask() -> usize {
     let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
     // Fallback: at least hart0 exists.
-    if mask == 0 {
-        1
-    } else {
-        mask
-    }
+    if mask == 0 { 1 } else { mask }
 }
 
 fn pick_online_hart(start: usize) -> usize {
@@ -648,7 +644,10 @@ pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
 pub fn remove_from_pid2process(pid: usize) {
     let mut map = PID2PCB.lock();
     if map.remove(&pid).is_none() {
-        log::warn!("remove_from_pid2process: pid {} not found (already reaped?)", pid);
+        log::warn!(
+            "remove_from_pid2process: pid {} not found (already reaped?)",
+            pid
+        );
         return;
     }
     let len = map.len();

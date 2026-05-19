@@ -26,7 +26,14 @@ pub fn sys_condvar_create() -> isize {
 pub fn sys_condvar_signal(condvar_id: usize) -> isize {
     let process = current_process();
     let process_inner = process.borrow_mut();
-    let Some(condvar) = process_inner.condvar_list.get(condvar_id).and_then(|c| c.as_ref()).cloned() else { return -1 };
+    let Some(condvar) = process_inner
+        .condvar_list
+        .get(condvar_id)
+        .and_then(|c| c.as_ref())
+        .cloned()
+    else {
+        return -1;
+    };
     drop(process_inner);
     condvar.signal();
     0
@@ -35,8 +42,22 @@ pub fn sys_condvar_signal(condvar_id: usize) -> isize {
 pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
     let process = current_process();
     let process_inner = process.borrow_mut();
-    let Some(condvar) = process_inner.condvar_list.get(condvar_id).and_then(|c| c.as_ref()).cloned() else { return -1 };
-    let Some(mutex) = process_inner.mutex_list.get(mutex_id).and_then(|m| m.as_ref()).cloned() else { return -1 };
+    let Some(condvar) = process_inner
+        .condvar_list
+        .get(condvar_id)
+        .and_then(|c| c.as_ref())
+        .cloned()
+    else {
+        return -1;
+    };
+    let Some(mutex) = process_inner
+        .mutex_list
+        .get(mutex_id)
+        .and_then(|m| m.as_ref())
+        .cloned()
+    else {
+        return -1;
+    };
     drop(process_inner);
     condvar.wait(mutex);
     0

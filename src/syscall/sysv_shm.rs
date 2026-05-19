@@ -12,8 +12,8 @@ use crate::mm::{
     FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc, try_read_user_value,
     try_write_user_value,
 };
-use crate::task::processor::current_process;
 use crate::syscall::error::{SyscallError, err};
+use crate::task::processor::current_process;
 
 const IPC_PRIVATE: usize = 0;
 const IPC_CREAT: usize = 0x200;
@@ -48,7 +48,6 @@ const PROCFS_SHMALL: &str = "/proc/sys/kernel/shmall";
 static RUNTIME_SHMMAX_LIMIT: AtomicUsize = AtomicUsize::new(SHMMAX);
 static RUNTIME_SHMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SHMMNI);
 static RUNTIME_SHMALL_LIMIT: AtomicUsize = AtomicUsize::new(SHMALL);
-
 
 #[allow(dead_code)]
 pub fn shmmax_limit() -> usize {

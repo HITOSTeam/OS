@@ -668,53 +668,53 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
 }
 
 pub use cgroupfs::{
-    cgroup_attach_fork_child, cgroup_attach_thread, cgroup_charge_anon_current,
-    cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process, cgroup_exit_thread,
-    cgroup_fork_precheck, cgroup_logical_path_for_file, cgroup_maybe_block_current, cgroup_mkdir,
-    cgroup_mount, cgroup_proc_cgroups_content, cgroup_proc_pid_content, cgroup_rename,
-    cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path, legacy_cpu_fair_group, CgroupFile,
-    CgroupMountSpec,
+    CgroupFile, CgroupMountSpec, cgroup_attach_fork_child, cgroup_attach_thread,
+    cgroup_charge_anon_current, cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process,
+    cgroup_exit_thread, cgroup_fork_precheck, cgroup_logical_path_for_file,
+    cgroup_maybe_block_current, cgroup_mkdir, cgroup_mount, cgroup_proc_cgroups_content,
+    cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
+    legacy_cpu_fair_group,
 };
 pub use dummy::DummyFile;
 pub use eventfd::EventFdFile;
+#[allow(unused_imports)]
+pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
     debug_track_iozone_inode, ext4_lock, find_path_in_roots, inode_path_hint, inode_path_in_roots,
     note_inode_path_hint, path_resolves_to_inode, register_deferred_unlink_cleanup,
     resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked, root_inode_for_path,
     secondary_root_inode,
 };
-#[allow(unused_imports)]
-pub use inode::{list_apps, open_file, OSInode, OpenFlags, EXT4_FS};
 pub(crate) use mountns::{
-    clone_mount_namespace, initial_mount_namespace, mount_namespace_id, ClassifiedAbsPath,
-    MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
+    ClassifiedAbsPath, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
+    clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
 };
 pub use namespace_file::{NamespaceFile, NamespaceKind};
 pub(crate) use net_socket::notify_net_poll_events;
 pub use net_socket::{NetSocketFile, NetSocketKind};
-pub(crate) use pidfd::wake_pidfd_poll_waiters;
 pub use pidfd::PidFdFile;
+pub(crate) use pidfd::wake_pidfd_poll_waiters;
 pub(crate) use pipe::remove_task_waiters as remove_pipe_waiters_for_task;
 pub use pipe::{
-    debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe,
-    pipe_max_size_limit_for_procfs, write_pipe_sysctl, Pipe,
+    Pipe, debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe,
+    pipe_max_size_limit_for_procfs, write_pipe_sysctl,
 };
 pub(crate) use procfs::parse_proc_sys_usize;
 pub(crate) use procfs::resolve_proc_magic_intermediate_abs_path;
 pub use procfs::{
-    is_proc_pseudo_path, normalize_proc_magic_path, proc_fd_link_file, proc_magic_link_exists,
-    proc_readlink, vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory,
-    ProcMagicLinkFile, ProcPseudoFile,
+    ProcMagicLinkFile, ProcPseudoFile, is_proc_pseudo_path, normalize_proc_magic_path,
+    proc_fd_link_file, proc_magic_link_exists, proc_readlink, vm_commit_limit_bytes,
+    vm_committed_as_bytes, vm_overcommit_memory,
 };
 pub use pseudo::PseudoBlock;
+pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub(crate) use pseudo::{
     pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_read_ahead,
     pseudo_block_set_read_ahead, pseudo_block_set_read_only, pseudo_dev_dir_exists,
     pseudo_dev_dir_mkdir, pseudo_dev_dir_rmdir, shm_create, shm_create_anonymous, shm_get,
     shm_remove,
 };
-pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
-pub use socketpair::{make_socketpair, SocketPairEnd};
+pub use socketpair::{SocketPairEnd, make_socketpair};
 pub use stdio::{Stdin, Stdout};
 pub use timerfd::TimerFdFile;
 pub(crate) use timerfd::{
