@@ -121,6 +121,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
             "[kernel] bootstrap hart {} starting with dtb @ {:#x}",
             hart_id, dtb_pa
         );
+        arch::bootstrap_init(dtb_pa);
         mm::init_phys_mem_from_dtb(dtb_pa);
         mm::init();
         mm::remap_test();

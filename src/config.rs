@@ -52,28 +52,21 @@ pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
 
 #[cfg(target_arch = "loongarch64")]
 pub const DEFAULT_CLOCK_FREQ: usize = 100_000_000;
-#[cfg(not(target_arch = "loongarch64"))]
-pub const CLOCK_FREQ: usize = 12_500_000;
+#[cfg(target_arch = "riscv64")]
+pub const DEFAULT_CLOCK_FREQ: usize = 10_000_000;
 
-#[cfg(target_arch = "loongarch64")]
 static CLOCK_FREQ: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(target_arch = "loongarch64")]
+#[allow(dead_code)]
 pub fn set_clock_freq(freq: usize) {
     if freq != 0 {
         CLOCK_FREQ.store(freq, Ordering::Relaxed);
     }
 }
 
-#[cfg(target_arch = "loongarch64")]
 pub fn clock_freq() -> usize {
     let freq = CLOCK_FREQ.load(Ordering::Relaxed);
     if freq == 0 { DEFAULT_CLOCK_FREQ } else { freq }
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-pub fn clock_freq() -> usize {
-    CLOCK_FREQ
 }
 
 // QEMU virt RAM starts at 0x8000_0000. Default to 512MiB to match common `-m 512M`.
