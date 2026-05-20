@@ -1,0 +1,19 @@
+repos:
+  - repo: local
+    hooks:
+      - id: text-format
+        name: text format rules
+        entry: python3 tools/check_format.py
+        language: system
+        types: [text]
+        exclude: >
+          (?x)^(
+            target/|
+            results/
+          )
+
+      - id: rustfmt
+        name: rustfmt
+        entry: rustfmt --check --edition 2024
+        language: system
+        files: \.rs$
