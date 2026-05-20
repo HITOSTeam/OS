@@ -15,8 +15,10 @@ def check_file(path: Path) -> list[str]:
         return []
 
     data = path.read_bytes()
-    if not data or b"\0" in data:
+    if not data:
         return []
+    if b"\0" in data:
+        return [f"{path}: contains NUL bytes; expected UTF-8 text"]
 
     try:
         text = data.decode("utf-8")
