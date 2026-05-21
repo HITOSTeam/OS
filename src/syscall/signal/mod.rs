@@ -29,8 +29,8 @@ use crate::{
         manager::{PID2PCB, pid2process, wakeup_task},
         process_visible_in_pid_namespace,
         processor::{
-            block_current_and_run_next, current_process, current_task, exit_current_and_run_next,
-            exit_group_and_run_next,
+            block_current_and_run_next, current_files, current_process, current_task,
+            exit_current_and_run_next, exit_group_and_run_next,
         },
         signal::{
             RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGKILL_NUM,

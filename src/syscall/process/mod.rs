@@ -23,8 +23,8 @@ use crate::{
         root_inode_for_path, secondary_root_inode,
     },
     mm::{
-        MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
-        write_user_value,
+        MapPermission, MemorySet, kernel_token, try_copy_from_user, try_read_user_value,
+        try_write_user_value, write_user_value,
     },
     println,
     syscall::{
@@ -41,8 +41,8 @@ use crate::{
             wakeup_task,
         },
         processor::{
-            block_current_and_run_next, current_files, current_process, current_task, hart_id,
-            suspend_current_and_run_next,
+            block_current_and_run_next, current_files, current_files_and_nofile_limit,
+            current_process, current_task, hart_id, suspend_current_and_run_next,
         },
         sched::{SchedClass, sched_class},
         signal::{

@@ -37,6 +37,15 @@ fn record_fork_diag(parent_pid: usize, child_pid: usize, flags: usize, fork_elap
 }
 
 pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
+    // LoongArch syscall ABI uses a different argument order:
+    // clone(flags, stack, ptid, ctid, tls). Swap tls/ctid here.
+    #[cfg(target_arch = "loongarch64")]
+    let (_tls, _ctid) = (_ctid, _tls);
+
+    clone_from_parts(flags, stack, _ptid, _tls, _ctid)
+}
+
+fn clone_from_parts(flags: usize, stack: usize, _ptid: usize, _tls: usize, _ctid: usize) -> isize {
     const CLONE_VM: usize = 0x0000_0100;
     const CLONE_FS: usize = 0x0000_0200;
     const CLONE_FILES: usize = 0x0000_0400;
@@ -54,11 +63,6 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
     const CLONE_NEWPID: usize = 0x2000_0000;
     const CLONE_NEWNET: usize = 0x4000_0000;
-
-    // LoongArch syscall ABI uses a different argument order:
-    // clone(flags, stack, ptid, ctid, tls). Swap tls/ctid here.
-    #[cfg(target_arch = "loongarch64")]
-    let (_tls, _ctid) = (_ctid, _tls);
 
     // Network namespace is not implemented yet.
     if (flags & CLONE_NEWNET) != 0 {
@@ -260,6 +264,10 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         0
     };
     let child_pid = child.getpid();
+    {
+        let mut child_inner = child.borrow_mut();
+        child_inner.exit_signal = (flags & 0xff) as i32;
+    }
 
     {
         let mut task_inner = task.borrow_mut();
@@ -371,6 +379,139 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
         stack
     );
     child_pid as isize
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Clone3Args {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+fn read_clone3_args(args_ptr: usize, size: usize) -> Result<Clone3Args, SyscallError> {
+    const CLONE_ARGS_MIN_SIZE: usize = 64;
+    const CLONE_ARGS_MAX_COPY: usize = 4096;
+
+    if size == 0 || size < CLONE_ARGS_MIN_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+    if size > CLONE_ARGS_MAX_COPY {
+        return Err(SyscallError::E2BIG);
+    }
+    if args_ptr == 0 {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let token = get_current_token();
+    let mut raw = Vec::new();
+    raw.resize(size, 0);
+    if try_copy_from_user(token, args_ptr as *const u8, raw.as_mut_slice()).is_err() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let mut args = Clone3Args::default();
+    let copy_len = core::cmp::min(size, size_of::<Clone3Args>());
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            raw.as_ptr(),
+            &mut args as *mut Clone3Args as *mut u8,
+            copy_len,
+        );
+    }
+    if size > size_of::<Clone3Args>()
+        && raw[size_of::<Clone3Args>()..].iter().any(|byte| *byte != 0)
+    {
+        return Err(SyscallError::E2BIG);
+    }
+    Ok(args)
+}
+
+fn alloc_pidfd_for(pid: usize) -> Result<i32, SyscallError> {
+    const FD_CLOEXEC: u32 = 1;
+
+    let (files, limit) = current_files_and_nofile_limit();
+    files
+        .lock()
+        .install_fd(Arc::new(PidFdFile::new(pid)), FD_CLOEXEC, limit)
+        .map(|fd| fd as i32)
+        .ok_or(SyscallError::EMFILE)
+}
+
+/// Linux `clone3(2)` compatibility.
+///
+/// This reuses the existing clone implementation after translating the
+/// extensible `struct clone_args` ABI into canonical clone arguments.
+pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
+    const CLONE_PIDFD: usize = 0x0000_1000;
+    const CLONE_INTO_CGROUP: usize = 0x0000_0002_0000_0000;
+
+    let args = match read_clone3_args(args_ptr, size) {
+        Ok(args) => args,
+        Err(e) => return err(e),
+    };
+
+    let flags = args.flags as usize;
+    let exit_signal = args.exit_signal as usize;
+    if (flags & 0xff) != 0 || exit_signal > RT_SIG_MAX {
+        return err(SyscallError::EINVAL);
+    }
+    if (args.stack == 0) != (args.stack_size == 0) {
+        return err(SyscallError::EINVAL);
+    }
+    if args.set_tid != 0 || args.set_tid_size != 0 || (flags & CLONE_INTO_CGROUP) != 0 {
+        return err(SyscallError::EINVAL);
+    }
+
+    let token = get_current_token();
+    if (flags & CLONE_PIDFD) != 0 {
+        if args.pidfd == 0 {
+            return err(SyscallError::EFAULT);
+        }
+        if try_write_user_value(token, args.pidfd as usize as *mut i32, &0).is_err() {
+            return err(SyscallError::EFAULT);
+        }
+    }
+
+    let child_stack = if args.stack == 0 {
+        0
+    } else {
+        match (args.stack as usize).checked_add(args.stack_size as usize) {
+            Some(sp) => sp,
+            None => return err(SyscallError::EINVAL),
+        }
+    };
+    let clone_flags = flags | exit_signal;
+    let child_pid = clone_from_parts(
+        clone_flags,
+        child_stack,
+        args.parent_tid as usize,
+        args.tls as usize,
+        args.child_tid as usize,
+    );
+    if child_pid < 0 {
+        return child_pid;
+    }
+
+    if (flags & CLONE_PIDFD) != 0 {
+        let pidfd = match alloc_pidfd_for(child_pid as usize) {
+            Ok(fd) => fd,
+            Err(e) => return err(e),
+        };
+        if try_write_user_value(token, args.pidfd as usize as *mut i32, &pidfd).is_err() {
+            return err(SyscallError::EFAULT);
+        }
+    }
+
+    child_pid
 }
 
 /// Linux `vfork(2)` compatibility.

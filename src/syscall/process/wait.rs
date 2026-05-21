@@ -282,8 +282,11 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
     const WNOHANG: usize = 0x00000001;
     const WUNTRACED: usize = 0x00000002;
     const WCONTINUED: usize = 0x00000008;
+    const __WCLONE: usize = 0x80000000;
+    const __WALL: usize = 0x40000000;
+    const __WNOTHREAD: usize = 0x20000000;
     const ECHILD: isize = -10;
-    let allowed = WNOHANG | WUNTRACED | WCONTINUED;
+    let allowed = WNOHANG | WUNTRACED | WCONTINUED | __WCLONE | __WALL | __WNOTHREAD;
     if (options & !allowed) != 0 {
         return err(SyscallError::EINVAL);
     }
@@ -297,12 +300,6 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
     loop {
         let cur_process = current_process();
         let task = current_task().unwrap();
-        if let Some(action) = wait4_pending_action(&task) {
-            let mut process_inner = cur_process.borrow_mut();
-            remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
-            drop(process_inner);
-            return action;
-        }
         let mut process_inner = cur_process.borrow_mut();
         remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
         let parent_pgid = process_inner.pgid;
@@ -507,13 +504,19 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             return ECHILD;
         }
 
+        drop(process_inner);
+
+        if let Some(action) = wait4_pending_action(&task) {
+            return action;
+        }
+
         // Non-blocking wait: return immediately if no child has exited yet.
         if (options & WNOHANG) != 0 {
-            drop(process_inner);
             return 0;
         }
 
         // Block until a child exits or changes state.
+        let mut process_inner = cur_process.borrow_mut();
         let inserted = enqueue_waiter_once(&mut process_inner.wait_queue, &task);
         if inserted {
             let qlen = process_inner.wait_queue.len();
