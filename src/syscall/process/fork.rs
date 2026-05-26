@@ -426,7 +426,7 @@ fn clone_from_parts(
     }
     if let Some(pidfd_user_ptr) = pidfd_user_ptr {
         let token = get_current_token();
-        if let Err(e) = install_child_pidfd(child_pid, token, pidfd_user_ptr) {
+        if let Err(e) = install_child_pidfd(&child, token, pidfd_user_ptr) {
             rollback_unstarted_child(&child);
             return err(e);
         }
@@ -559,11 +559,18 @@ fn read_clone3_args(args_ptr: usize, size: usize) -> Result<Clone3Args, SyscallE
     Ok(args)
 }
 
-fn install_child_pidfd(pid: usize, token: usize, user_ptr: usize) -> Result<i32, SyscallError> {
+fn install_child_pidfd(
+    child: &Arc<ProcessControlBlock>,
+    token: usize,
+    user_ptr: usize,
+) -> Result<i32, SyscallError> {
     const FD_CLOEXEC: u32 = 1;
 
     let (files, limit) = current_files_and_nofile_limit();
-    let pidfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(PidFdFile::new(pid));
+    // 通过 Arc 构造 pidfd，使其内部持有 Weak<ProcessControlBlock>：
+    // 即便 PID 数值未来被复用，本 pidfd 也只解析到这一次 fork 的子进程，
+    // 不会误投递到无关进程。
+    let pidfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(PidFdFile::new(child));
     let fd = files
         .lock()
         .install_fd(Arc::clone(&pidfd), FD_CLOEXEC, limit)
@@ -630,6 +637,7 @@ fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>) {
 ///   >0 子进程 PID；<0 -errno。
 pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     const CLONE_PIDFD: usize = 0x0000_1000; // 创建后回写一个 pidfd 给父
+    const CLONE_PARENT: usize = 0x0000_8000; // 子进程父亲指向调用者的父亲（兄弟关系）
     const CLONE_THREAD: usize = 0x0001_0000; // 创建同线程组线程
     const CLONE_INTO_CGROUP: usize = 0x0000_0002_0000_0000; // 原子性加入目标 cgroup
 
@@ -645,6 +653,12 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     // clone3 的 flags 低 8 位必须为 0（exit_signal 已独立成字段）；
     // 同时退出信号编号不能超过实时信号上限
     if (flags & 0xff) != 0 || exit_signal > RT_SIG_MAX {
+        return err(SyscallError::EINVAL);
+    }
+    // Linux clone3_args_valid 要求：CLONE_THREAD/CLONE_PARENT 与非零 exit_signal 互斥。
+    // CLONE_THREAD 共享线程组，由 thread leader 退出时统一通知父进程，禁止设置独立的 exit_signal；
+    // CLONE_PARENT 使新子的父亲指向调用者的父亲，与"由本调用者接收 exit_signal"的语义冲突。
+    if (flags & (CLONE_THREAD | CLONE_PARENT)) != 0 && exit_signal != 0 {
         return err(SyscallError::EINVAL);
     }
     // stack 与 stack_size 必须成对出现：要么都为 0，要么都非 0

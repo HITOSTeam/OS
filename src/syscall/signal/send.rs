@@ -189,7 +189,10 @@ pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags:
     let Some(pidfd_file) = file.as_any().downcast_ref::<crate::fs::PidFdFile>() else {
         return err(SyscallError::EBADF);
     };
-    let Some(process) = pid2process(pidfd_file.target_pid()) else {
+    // identity-safe 解析：通过 pidfd 内部的 Weak<ProcessControlBlock> 升级，
+    // 原 target 已被释放（即便 PID 数值被新进程复用）时也只会返回 None，
+    // 不会把信号错投递到无关进程。
+    let Some(process) = pidfd_file.target_process() else {
         return err(SyscallError::ESRCH);
     };
 

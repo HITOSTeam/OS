@@ -293,16 +293,16 @@ pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {
     if pid == 0 || (pid as isize) < 0 {
         return err(SyscallError::EINVAL);
     }
-    if pid2process(pid).is_none() {
+    let Some(process) = pid2process(pid) else {
         return err(SyscallError::ESRCH);
-    }
+    };
     let mut descriptor_flags = 0u32;
     // Linux pidfds are always close-on-exec.
     descriptor_flags |= FD_CLOEXEC;
     if (flags & PIDFD_NONBLOCK) != 0 {
         descriptor_flags |= O_NONBLOCK;
     }
-    alloc_fd(Arc::new(PidFdFile::new(pid)), descriptor_flags)
+    alloc_fd(Arc::new(PidFdFile::new(&process)), descriptor_flags)
 }
 
 pub fn syscall_fanotify_init(_flags: usize, _event_f_flags: usize) -> isize {

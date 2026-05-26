@@ -1,29 +1,40 @@
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::any::Any;
 
 use crate::{
     mm::UserBuffer,
-    task::{manager::pid2process, task_block::TaskControlBlock},
+    task::{ProcessControlBlock, task_block::TaskControlBlock},
 };
 
 use super::{File, POLLIN, wake_tasks};
 
-/// pidfd object used by `pidfd_open(2)` and `waitid(P_PIDFD, ...)`.
+/// `pidfd_open(2)` / `clone3(CLONE_PIDFD)` / `waitid(P_PIDFD, ...)` 用到的 pidfd 对象。
+///
+/// 持有 `Weak<ProcessControlBlock>` 而不是裸 PID。Linux pidfd 语义要求绑定的是
+/// "那一次创建的进程"本身，而不是 PID 数值——目标退出并被回收后，即便分配器
+/// 在某次 wrap 回环里把同一个 PID 重新分给新进程，stale pidfd 也必须返回
+/// `ESRCH`，绝不能误投递到无关进程。`Weak` 升级失败这一事实正好对应
+/// "原 target 的 `ProcessControlBlock` 已被 drop"，与 `PidHandle::drop` 触发
+/// PID 释放的时刻一致，因此可作为 identity 判据。
 pub struct PidFdFile {
-    target_pid: usize,
+    target: Weak<ProcessControlBlock>,
 }
 
 impl PidFdFile {
-    pub fn new(target_pid: usize) -> Self {
-        Self { target_pid }
+    pub fn new(process: &Arc<ProcessControlBlock>) -> Self {
+        Self {
+            target: Arc::downgrade(process),
+        }
     }
 
-    pub fn target_pid(&self) -> usize {
-        self.target_pid
+    /// identity-safe 的目标进程解析。返回 `None` 表示创建时绑定的那个
+    /// `ProcessControlBlock` 已被完全释放，此时调用方应返回 `ESRCH`。
+    pub fn target_process(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.target.upgrade()
     }
 
     fn poll_readable(&self) -> bool {
-        match pid2process(self.target_pid()) {
+        match self.target_process() {
             Some(proc) => proc.borrow_mut().is_zombie,
             None => true,
         }
@@ -59,7 +70,7 @@ impl File for PidFdFile {
         if self.poll_readable() {
             return true;
         }
-        if let Some(process) = pid2process(self.target_pid()) {
+        if let Some(process) = self.target_process() {
             let mut inner = process.borrow_mut();
             if inner.is_zombie {
                 return true;
@@ -75,7 +86,7 @@ impl File for PidFdFile {
 }
 
 pub(crate) fn wake_pidfd_poll_waiters(pid: usize) {
-    let Some(process) = pid2process(pid) else {
+    let Some(process) = crate::task::manager::pid2process(pid) else {
         return;
     };
     let waiters = {
