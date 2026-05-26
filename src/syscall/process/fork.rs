@@ -111,6 +111,22 @@ fn clone_from_parts(
     if (flags & CLONE_THREAD) != 0 && (flags & CLONE_SIGHAND) == 0 {
         return err(SyscallError::EINVAL);
     }
+    // PID namespace boundaries are process-scoped. Linux rejects requests that
+    // would make a thread the init task of a fresh PID namespace, and CLONE_PARENT
+    // would move that namespace-init child under the caller's parent.
+    // PID 命名空间以进程为边界：线程不能成为新 PID namespace 的 init；
+    // CLONE_PARENT 也不能和 CLONE_NEWPID 组合，否则新 init 会被重挂到调用者父进程下。
+    if (flags & CLONE_NEWPID) != 0 && (flags & (CLONE_THREAD | CLONE_PARENT)) != 0 {
+        return err(SyscallError::EINVAL);
+    }
+    // Namespace init must stay the root reaper of its namespace. Linux returns
+    // EINVAL for CLONE_PARENT from any PID namespace init, even if it has an
+    // outside parent in the ancestor namespace.
+    // PID namespace 的 init 必须保持该 namespace 的根回收者；即使它在上层 namespace
+    // 里有父进程，也不能用 CLONE_PARENT 把新子进程交给外层父进程回收。
+    if (flags & CLONE_PARENT) != 0 && current_process().is_pid_namespace_init() {
+        return err(SyscallError::EINVAL);
+    }
     // 线程不能拥有独立的 IPC 命名空间：同进程线程必须共享 IPC 资源视图
     if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
         return err(SyscallError::EINVAL);
