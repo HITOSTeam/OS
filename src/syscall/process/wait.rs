@@ -1,7 +1,7 @@
 //! 子进程状态等待系统调用实现。
 //!
 //! 本模块实现以下系统调用：
-//! - `wait4`：等待子进程退出或状态变更，支持 `__WCLONE`/`__WALL`/`__WNOTHREAD` 语义
+//! - `wait4`：等待子进程退出或状态变更，支持 `__WCLONE`/`__WALL` 语义
 //! - `waitid`：POSIX 扩展等待，支持 pidfd、`WNOWAIT` 非破坏性查询
 //! - `ptrace`：进程追踪控制（`PTRACE_TRACEME`/`ATTACH`/`DETACH`/`CONT`/`KILL`）
 //!
@@ -12,9 +12,11 @@
 //!
 //! # 设计说明
 //!
-//! **锁顺序**：持有 `process_inner` 锁期间不可再获取其他进程的 `inner` 锁，
-//! 更不能调用 `wait4_pending_action`（后者需要以无锁方式读取信号掩码）。
-//! 因此循环中的信号检查必须在 `drop(process_inner)` 之后进行。
+//! **锁顺序**：持有 `process_inner` 锁期间不可再调用 `wait4_pending_action`
+//! （后者需要重新读取当前进程信号动作），否则会反向获取同一 PCB 锁。
+//! wait4 因此先持锁扫描已就绪的子状态；若准备阻塞，再释放锁检查待处理信号，
+//! 然后重新持锁扫描并入队。第二次扫描与入队处于同一个父 PCB 临界区，
+//! 避免子进程退出事件落在扫描和入队之间。
 //!
 //! **睡眠路径**：`enqueue_waiter_once` + `block_current_and_run_next` 组成等待对，
 //! 前者保证同一 task 不重复入队，后者让出 CPU；唤醒由 `wake_parent_waiters_for`
@@ -376,14 +378,18 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
     // Linux-internal flags required by clone3 callers that set a non-SIGCHLD exit_signal:
     // __WCLONE  — wait for children that do NOT deliver SIGCHLD on exit (clone children)
     // __WALL    — wait for any child regardless of exit signal
-    // __WNOTHREAD — ignore thread-group semantics, treat as process wait
+    // __WNOTHREAD — Linux 用它限制只等待调用线程自己的子进程；本实现当前
+    // children 仍按进程保存，没有记录 creator thread，因此先拒绝而非假装支持。
     // Unless __WALL is set, wait4 separates normal SIGCHLD children from clone
     // children whose exit_signal is 0 or a non-SIGCHLD signal.
     const __WCLONE: usize = 0x80000000;
     const __WALL: usize = 0x40000000;
     const __WNOTHREAD: usize = 0x20000000;
     const ECHILD: isize = -10;
-    let allowed = WNOHANG | WUNTRACED | WCONTINUED | __WCLONE | __WALL | __WNOTHREAD;
+    if (options & __WNOTHREAD) != 0 {
+        return err(SyscallError::EINVAL);
+    }
+    let allowed = WNOHANG | WUNTRACED | WCONTINUED | __WCLONE | __WALL;
     if (options & !allowed) != 0 {
         return err(SyscallError::EINVAL);
     }
@@ -394,6 +400,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
     let mut temp_exit_code: i32 = 0;
     let mut temp_signal: Option<i32> = None;
     let mut temp_coredump = false;
+    let mut checked_pending_signal = false;
     loop {
         let cur_process = current_process();
         let task = current_task().unwrap();
@@ -624,24 +631,30 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             return ECHILD;
         }
 
-        drop(process_inner);
-
-        // Check pending signals/actions only after releasing process_inner to
-        // avoid lock inversion: signal delivery may need to re-acquire the lock.
-        if let Some(action) = wait4_pending_action(&task) {
-            return action;
-        }
-
         // Non-blocking wait: return immediately if no child has exited yet.
         if (options & WNOHANG) != 0 {
+            drop(process_inner);
             return 0;
         }
 
+        if !checked_pending_signal {
+            drop(process_inner);
+            // 不能在持有 process_inner 时检查信号动作；但检查信号期间子进程
+            // 可能刚好退出，所以检查后必须重新进入循环复扫，而不是直接入队。
+            if let Some(action) = wait4_pending_action(&task) {
+                let mut process_inner = cur_process.borrow_mut();
+                remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
+                drop(process_inner);
+                return action;
+            }
+            checked_pending_signal = true;
+            continue;
+        }
+
         // --- 阶段六：将自身入队并让出 CPU，等待子进程状态变更唤醒 ---
-        // 必须持有 process_inner 锁后再入队，以防入队与唤醒之间的竞态：
-        // 若子进程在此期间退出，wake_parent_waiters_for 会遍历队列——我们还没入队，
-        // 就会错过本次唤醒，导致永久阻塞。
-        let mut process_inner = cur_process.borrow_mut();
+        // 这里沿用复扫时持有的 process_inner 锁，不在 scan 和 enqueue 之间释放。
+        // 否则 exit_signal=0 的 clone child 可能在空队列上完成唤醒，父线程随后
+        // 才入队并永久睡眠。
         let inserted = enqueue_waiter_once(&mut process_inner.wait_queue, &task);
         if inserted {
             let qlen = process_inner.wait_queue.len();
@@ -658,6 +671,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             }
         }
         drop(process_inner);
+        checked_pending_signal = false;
         block_current_and_run_next();
     }
 }
