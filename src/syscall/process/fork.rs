@@ -650,10 +650,44 @@ fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>) {
 /// 返回：
 ///   >0 子进程 PID；<0 -errno。
 pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
+    const CLONE_VM: usize = 0x0000_0100; // 与父进程共享地址空间
+    const CLONE_FS: usize = 0x0000_0200; // 共享文件系统信息
+    const CLONE_FILES: usize = 0x0000_0400; // 共享文件描述符表
+    const CLONE_SIGHAND: usize = 0x0000_0800; // 共享信号处理表
     const CLONE_PIDFD: usize = 0x0000_1000; // 创建后回写一个 pidfd 给父
+    const CLONE_VFORK: usize = 0x0000_4000; // 父进程阻塞直到子进程 exec/exit
     const CLONE_PARENT: usize = 0x0000_8000; // 子进程父亲指向调用者的父亲（兄弟关系）
     const CLONE_THREAD: usize = 0x0001_0000; // 创建同线程组线程
+    const CLONE_NEWNS: usize = 0x0002_0000; // 新建 mount namespace
+    const CLONE_SETTLS: usize = 0x0008_0000; // 设置子进程 TLS
+    const CLONE_PARENT_SETTID: usize = 0x0010_0000; // 将子 TID 写回父进程指针
+    const CLONE_CHILD_CLEARTID: usize = 0x0020_0000; // 子线程退出时清零并 futex 唤醒
+    const CLONE_DETACHED: usize = 0x0040_0000; // clone3 禁止的历史遗留标志
+    const CLONE_CHILD_SETTID: usize = 0x0100_0000; // 将子 TID 写到子地址空间
+    const CLONE_NEWCGROUP: usize = 0x0200_0000; // 新建 cgroup namespace
+    const CLONE_NEWUTS: usize = 0x0400_0000; // 新建 UTS namespace
+    const CLONE_NEWIPC: usize = 0x0800_0000; // 新建 IPC namespace
+    const CLONE_NEWPID: usize = 0x2000_0000; // 新建 PID namespace
     const CLONE_INTO_CGROUP: usize = 0x0000_0002_0000_0000; // 原子性加入目标 cgroup
+    const CLONE_ARGS_CGROUP_SIZE: usize = size_of::<Clone3Args>();
+    const SUPPORTED_CLONE3_FLAGS: usize = CLONE_VM
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_PIDFD
+        | CLONE_VFORK
+        | CLONE_PARENT
+        | CLONE_THREAD
+        | CLONE_NEWNS
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_CHILD_SETTID
+        | CLONE_NEWCGROUP
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | CLONE_NEWPID
+        | CLONE_INTO_CGROUP;
 
     // 从用户空间安全读取 clone_args；按 size 兼容更短/更长版本，
     // 末尾若有非零字节会返回 E2BIG（说明内核还不识别这些扩展字段）
@@ -669,6 +703,11 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     if (flags & 0xff) != 0 || exit_signal > RT_SIG_MAX {
         return err(SyscallError::EINVAL);
     }
+    // clone3_args_valid 语义：未知 flags 和 CLONE_DETACHED 这类禁用历史位必须
+    // 在 fork 前拒绝，不能把不支持的语义静默忽略后仍创建子进程。
+    if (flags & CLONE_DETACHED) != 0 || (flags & !SUPPORTED_CLONE3_FLAGS) != 0 {
+        return err(SyscallError::EINVAL);
+    }
     // Linux clone3_args_valid 要求：CLONE_THREAD/CLONE_PARENT 与非零 exit_signal 互斥。
     // CLONE_THREAD 共享线程组，由 thread leader 退出时统一通知父进程，禁止设置独立的 exit_signal；
     // CLONE_PARENT 使新子的父亲指向调用者的父亲，与"由本调用者接收 exit_signal"的语义冲突。
@@ -681,6 +720,13 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     }
     // set_tid（指定子 PID 列表）暂未实现，传入即拒绝
     if args.set_tid != 0 || args.set_tid_size != 0 {
+        return err(SyscallError::EINVAL);
+    }
+    // pidfd 和 parent_tid 都是父进程地址空间的输出槽，Linux 禁止两者别名，
+    // 否则同一个地址会先后写入 pid 和 fd，成功返回却丢失其中一个结果。
+    if (flags & (CLONE_PIDFD | CLONE_PARENT_SETTID)) == (CLONE_PIDFD | CLONE_PARENT_SETTID)
+        && args.pidfd == args.parent_tid
+    {
         return err(SyscallError::EINVAL);
     }
     let pidfd_user_ptr = if (flags & CLONE_PIDFD) != 0 {
@@ -698,6 +744,11 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     // CLONE_INTO_CGROUP：根据 cgroup fd 解析出附挂目标，传给底层 clone 路径
     // 让 fork 与 cgroup 附挂保持原子，消除"先 fork 再 attach"的竞态窗口
     let clone_into_cgroup = if (flags & CLONE_INTO_CGROUP) != 0 {
+        // cgroup 字段是 clone_args 的 5.7 扩展；旧 size 未覆盖该字段时，
+        // 不能使用默认初始化出来的 fd 0，必须按无效 ABI 布局返回 EINVAL。
+        if size < CLONE_ARGS_CGROUP_SIZE {
+            return err(SyscallError::EINVAL);
+        }
         // 从当前进程的 fd 表里取出对应的 cgroup 目录文件
         let file = {
             let files = current_files();
