@@ -1009,6 +1009,8 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
         // ...then wake parent waiters (waitpid) without holding the child PCB lock.
         if let Some(parent) = parent {
+            // clone(2) allows exit_signal=0 to suppress parent notification entirely.
+            // Only send the signal when the caller explicitly requested one.
             if exit_signal > 0 {
                 crate::task::signal::queue_process_signal(parent.getpid(), exit_signal as usize);
             }
@@ -1127,6 +1129,8 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
     if let Some(parent) = parent {
+        // clone(2) allows exit_signal=0 to suppress parent notification entirely.
+        // Only send the signal when the caller explicitly requested one.
         if exit_signal > 0 {
             crate::task::signal::queue_process_signal(parent.getpid(), exit_signal as usize);
         }
