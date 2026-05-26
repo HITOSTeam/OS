@@ -42,7 +42,7 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
     #[cfg(target_arch = "loongarch64")]
     let (_tls, _ctid) = (_ctid, _tls);
 
-    clone_from_parts(flags, stack, _ptid, _tls, _ctid, None, None)
+    clone_from_parts(flags, stack, _ptid, _tls, _ctid, None, None, false)
 }
 
 // 封装 clone3(2) 系统调用，支持将子进程原子性地加入 cgroup。
@@ -57,6 +57,8 @@ pub fn syscall_clone(flags: usize, stack: usize, _ptid: usize, _tls: usize, _cti
 //                          对应关系，当前测试场景不使用，后续扩展可直接启用
 //   clone_into_cgroup — Some(target) 时原子性将子进程加入目标 cgroup；
 //                       None 时退回不指定 cgroup 的普通 clone3 行为
+//   allow_detached_null_stack — clone3 允许 exit_signal=0 的 fork-like 进程
+//                               使用 NULL stack；clone(2) 仍按旧规则拒绝
 //
 // 返回值：
 //   > 0  子进程 PID（父进程视角）
@@ -70,6 +72,7 @@ fn clone_from_parts(
     _ctid: usize,
     clone_into_cgroup: Option<CgroupAttachTarget>,
     pidfd_user_ptr: Option<usize>,
+    allow_detached_null_stack: bool,
 ) -> isize {
     // 本地重新声明标准 Linux 常量，避免引入 libc 依赖——此函数直接走裸 syscall
     const CLONE_VM: usize = 0x0000_0100; // 与父进程共享地址空间
@@ -123,18 +126,18 @@ fn clone_from_parts(
         return err(SyscallError::EPERM);
     }
     if stack == 0 {
-        // Linux permits fork-like clone(SIGCHLD, NULL, ...) but rejects NULL
-        // stack for plain clone(0, ...) and thread-like clone variants.
-        // Linux 允许 fork 形式的 clone(SIGCHLD, NULL, ...)，但拒绝
-        // 纯 clone(0, ...) 以及任何线程型 clone 在 stack 为 NULL 时调用：
-        // 线程必须显式提供子栈，否则父子共享 VM 会立刻栈冲突
-
-        // 最后两位标记我们推出的时候发给父进程的信号,是否有 CHLD HANDLER  如果没有，不是fork
+        // Linux clone(2) permits fork-like clone(SIGCHLD, NULL, ...) but rejects
+        // clone(0, NULL, ...). clone3 split exit_signal out of flags and allows
+        // exit_signal=0 with NULL stack for fork-like, non-CLONE_VM processes.
+        // Linux clone(2) 允许 fork 形式的 clone(SIGCHLD, NULL, ...)，但拒绝
+        // clone(0, NULL, ...)。clone3 将 exit_signal 独立成字段后，允许
+        // exit_signal=0 的非 CLONE_VM 进程 clone 使用 NULL stack 来禁止父进程通知。
         let exit_signal = flags & 0xff;
         // 这些强制要求栈
         let requires_child_stack =
             (flags & (CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS)) != 0;
-        if exit_signal == 0 || requires_child_stack {
+        let detached_fork_like_clone3 = allow_detached_null_stack && exit_signal == 0;
+        if requires_child_stack || (exit_signal == 0 && !detached_fork_like_clone3) {
             return err(SyscallError::EINVAL);
         }
     }
@@ -787,6 +790,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
         args.child_tid as usize,
         clone_into_cgroup,
         pidfd_user_ptr,
+        true,
     );
     // clone_from_parts 返回负数即 -errno，原样回传
     if child_pid < 0 {
