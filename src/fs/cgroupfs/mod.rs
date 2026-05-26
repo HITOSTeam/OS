@@ -626,15 +626,74 @@ pub fn cgroup_attach_fork_child(parent_pid: usize, child_pid: usize) {
     }
 }
 
-/// 将新创建的线程关联到其进程所在的 cgroup 路径
-pub fn cgroup_attach_thread(process_pid: usize, parent_tid_index: usize, child_tid_index: usize) {
+fn cgroup_thread_destination_path(
+    state: &CgroupMountState,
+    hierarchy_key: &CgroupHierarchyKey,
+    parent_thread_id: CgroupThreadId,
+    clone_into_target: Option<&CgroupAttachTarget>,
+) -> Result<(String, bool), isize> {
+    if let Some(target) = clone_into_target {
+        if hierarchy_key == &target.hierarchy_key {
+            if !state.is_unified() {
+                return Err(EINVAL);
+            }
+            if !state.nodes.contains_key(&target.rel_path) {
+                return Err(ENOENT);
+            }
+            return Ok((target.rel_path.clone(), true));
+        }
+    }
+    Ok((state.path_for_thread(parent_thread_id), false))
+}
+
+/// 将新创建的线程关联到 cgroup 路径。
+///
+/// 普通线程继承父线程所在路径；clone3(CLONE_INTO_CGROUP) 只覆盖 fd 对应的
+/// unified hierarchy，其他 hierarchy 仍继承父线程路径。
+pub fn cgroup_attach_thread(
+    process_pid: usize,
+    parent_tid_index: usize,
+    child_tid_index: usize,
+    clone_into_target: Option<&CgroupAttachTarget>,
+) -> Result<(), isize> {
     let mut registry = CGROUP_REGISTRY.lock();
     let parent_thread_id = CgroupThreadId::new(process_pid, parent_tid_index);
     let child_thread_id = CgroupThreadId::new(process_pid, child_tid_index);
-    for state in registry.hierarchies.values_mut() {
-        let path = state.path_for_thread(parent_thread_id);
+
+    let mut saw_target = clone_into_target.is_none();
+    for (hierarchy_key, state) in registry.hierarchies.iter() {
+        let (path, used_target) = cgroup_thread_destination_path(
+            state,
+            hierarchy_key,
+            parent_thread_id,
+            clone_into_target,
+        )?;
+        saw_target |= used_target;
+        for ancestor in CgroupMountState::ancestor_paths(&path) {
+            let Some(node) = state.nodes.get(&ancestor) else {
+                continue;
+            };
+            if let Some(limit) = node.pids_max {
+                if state.subtree_pid_count(&ancestor).saturating_add(1) > limit {
+                    return Err(EAGAIN);
+                }
+            }
+        }
+    }
+    if !saw_target {
+        return Err(ENOENT);
+    }
+
+    for (hierarchy_key, state) in registry.hierarchies.iter_mut() {
+        let (path, _) = cgroup_thread_destination_path(
+            state,
+            hierarchy_key,
+            parent_thread_id,
+            clone_into_target,
+        )?;
         state.attach_thread(child_thread_id, &path);
     }
+    Ok(())
 }
 
 /// 线程退出时清理其 cgroup 关联，并刷新 CPU 使用统计

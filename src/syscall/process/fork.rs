@@ -145,8 +145,9 @@ fn clone_from_parts(
     // 仍会创建独立子进程，wait()/getppid() 必须能看到它
     let is_thread_like = (flags & CLONE_THREAD) != 0 && (flags & CLONE_VM) != 0;
     if is_thread_like {
-        // clone3 才允许 CLONE_INTO_CGROUP，但仅限进程；线程必须继承所在 cgroup
-        if clone_into_cgroup.is_some() || pidfd_user_ptr.is_some() {
+        // pidfd 语义绑定进程对象，本实现暂不为线程型 clone3 返回 pidfd。
+        // CLONE_INTO_CGROUP 可用于线程：目标 hierarchy 进入指定 cgroup，其余 hierarchy 继承父线程。
+        if pidfd_user_ptr.is_some() {
             return err(SyscallError::EINVAL);
         }
         let task = current_task().unwrap();
@@ -166,10 +167,6 @@ fn clone_from_parts(
             *inner.get_trap_cx()
         };
         let process = current_process();
-        // 先做 cgroup 配额/状态校验，避免分配 TCB 后才发现无法附挂
-        if let Err(e) = cgroup_fork_precheck(process.getpid()) {
-            return e;
-        }
         // 在当前进程下新建一个 Linux 风格线程的 TCB（共享地址空间/文件等）
         let new_task = match TaskControlBlock::try_new_linux_thread(Arc::clone(&process)) {
             Ok(t) => Arc::new(t),
@@ -218,8 +215,25 @@ fn clone_from_parts(
             if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
                 new_inner.clear_child_tid = Some(_ctid);
             }
-            // 将新线程挂入父线程所在的 cgroup（线程语义下与父保持一致）
-            cgroup_attach_thread(process.getpid(), parent_tid_index, tid_index);
+            // 将新线程挂入 cgroup。普通线程继承父线程路径；clone3(CLONE_INTO_CGROUP)
+            // 仅覆盖目标 unified hierarchy，其他 hierarchy 仍继承父线程。
+            if let Err(e) = cgroup_attach_thread(
+                process.getpid(),
+                parent_tid_index,
+                tid_index,
+                clone_into_cgroup.as_ref(),
+            ) {
+                let mut process_inner = process.borrow_mut();
+                if process_inner
+                    .tasks
+                    .get(tid_index)
+                    .and_then(|slot| slot.as_ref())
+                    .is_some_and(|task| Arc::ptr_eq(task, &new_task))
+                {
+                    process_inner.tasks[tid_index] = None;
+                }
+                return e;
+            }
             (tid_index, linux_tid)
         };
 
