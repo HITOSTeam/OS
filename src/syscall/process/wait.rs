@@ -286,7 +286,8 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
     // __WCLONE  — wait for children that do NOT deliver SIGCHLD on exit (clone children)
     // __WALL    — wait for any child regardless of exit signal
     // __WNOTHREAD — ignore thread-group semantics, treat as process wait
-    // We accept but do not distinguish them — child matching already covers the intent.
+    // Unless __WALL is set, wait4 separates normal SIGCHLD children from clone
+    // children whose exit_signal is 0 or a non-SIGCHLD signal.
     const __WCLONE: usize = 0x80000000;
     const __WALL: usize = 0x40000000;
     const __WNOTHREAD: usize = 0x20000000;
@@ -318,12 +319,18 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             let mut has_match = false;
             for (index, child) in process_inner.children.iter().enumerate() {
                 let child_inner = child.borrow_mut();
-                let matches = match pid {
+                let pid_matches = match pid {
                     -1 => true, // any child
                     0 => child_inner.pgid == parent_pgid,
                     p if p > 0 => child.pid.0 == p as usize,
                     p => child_inner.pgid == (-p) as usize,
                 };
+                let is_clone_child = child_inner.exit_signal != SIGCHLD_NUM as i32;
+                // Linux wait4 默认只匹配退出时向父进程发送 SIGCHLD 的子进程；
+                // clone 子进程需要 __WCLONE，__WALL 则跳过这层 exit_signal 过滤。
+                let signal_matches =
+                    (options & __WALL) != 0 || ((options & __WCLONE) != 0) == is_clone_child;
+                let matches = pid_matches && signal_matches;
                 if matches {
                     has_match = true;
                 }

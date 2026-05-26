@@ -561,18 +561,33 @@ pub(crate) fn cgroup_attach_process_to_target(
     if !state.nodes.contains_key(&target.rel_path) {
         return Err(ENOENT);
     }
+    // clone3(CLONE_INTO_CGROUP) 到这里时，子进程已先挂到父进程所在 cgroup。
+    // 先保存旧路径，后面的 pids.max 只统计真正新增进入目标祖先节点的线程，
+    // 避免共享祖先已计数的线程在 limit 边界被重复计算。
+    let live_threads = live_thread_ids_for_process(pid)
+        .into_iter()
+        .map(|thread_id| {
+            let old_path = state.path_for_thread(thread_id);
+            (thread_id, old_path)
+        })
+        .collect::<Vec<_>>();
     for ancestor in CgroupMountState::ancestor_paths(&target.rel_path) {
         let Some(node) = state.nodes.get(&ancestor) else {
             continue;
         };
         if let Some(limit) = node.pids_max {
-            if state.subtree_pid_count(&ancestor) >= limit {
+            let incoming = live_threads
+                .iter()
+                .filter(|(_, old_path)| {
+                    !CgroupMountState::is_descendant_or_self(old_path, &ancestor)
+                })
+                .count();
+            if state.subtree_pid_count(&ancestor).saturating_add(incoming) > limit {
                 return Err(EAGAIN);
             }
         }
     }
-    for thread_id in live_thread_ids_for_process(pid) {
-        let old_path = state.path_for_thread(thread_id);
+    for (thread_id, old_path) in live_threads {
         state.flush_thread_cpu_usage(thread_id, &old_path);
     }
     state.attach_process(pid, &target.rel_path);
