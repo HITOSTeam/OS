@@ -196,6 +196,8 @@ pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags:
     if !can_signal_process(&process, sig) {
         return err(SyscallError::EPERM);
     }
+    // sig=0 is a Linux convention: probe whether the process exists and is
+    // reachable without actually delivering any signal.
     if sig == 0 {
         return 0;
     }
@@ -220,6 +222,8 @@ pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags:
         if info.si_signo != sig {
             return err(SyscallError::EINVAL);
         }
+        // field[2]/field[3] map to si_value.sival_ptr in the kernel ABI layout.
+        // Reconstruct the 64-bit value from two consecutive 32-bit words.
         let lo = info.field[2] as u32 as usize;
         let hi = info.field[3] as u32 as usize;
         (info.si_code, lo | (hi << 32))

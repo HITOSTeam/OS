@@ -282,6 +282,11 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
     const WNOHANG: usize = 0x00000001;
     const WUNTRACED: usize = 0x00000002;
     const WCONTINUED: usize = 0x00000008;
+    // Linux-internal flags required by clone3 callers that set a non-SIGCHLD exit_signal:
+    // __WCLONE  — wait for children that do NOT deliver SIGCHLD on exit (clone children)
+    // __WALL    — wait for any child regardless of exit signal
+    // __WNOTHREAD — ignore thread-group semantics, treat as process wait
+    // We accept but do not distinguish them — child matching already covers the intent.
     const __WCLONE: usize = 0x80000000;
     const __WALL: usize = 0x40000000;
     const __WNOTHREAD: usize = 0x20000000;
@@ -506,6 +511,8 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
 
         drop(process_inner);
 
+        // Check pending signals/actions only after releasing process_inner to
+        // avoid lock inversion: signal delivery may need to re-acquire the lock.
         if let Some(action) = wait4_pending_action(&task) {
             return action;
         }
