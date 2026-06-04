@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,9 +11,16 @@ use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
 use crate::mm::{FrameTracker, UserBuffer, frame_alloc};
+use crate::task::ProcessControlBlock;
 
 use super::File;
 
+/// 伪文件的内容类型。
+///
+/// - `Static`：固定字节内容，支持按 offset 顺序读取。
+/// - `Urandom`：用 xorshift64* 生成的伪随机字节流，`u64` 为当前种子。
+/// - `Null`：读取返回 0 字节，写入静默丢弃（对应 `/dev/null`）。
+/// - `Zero`：读取填充全零，写入静默丢弃（对应 `/dev/zero`）。
 pub enum PseudoKind {
     Static(Vec<u8>),
     Urandom(u64),
@@ -21,6 +28,7 @@ pub enum PseudoKind {
     Zero,
 }
 
+/// `PseudoKind` 的无数据标签，供外部代码通过 `kind_tag()` 判断类型而不持有锁。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PseudoKindTag {
     Static,
@@ -29,6 +37,10 @@ pub enum PseudoKindTag {
     Zero,
 }
 
+/// 对应 `/dev/null`、`/dev/zero`、`/dev/urandom` 等字符设备的伪文件。
+///
+/// 每个实例持有独立的读写 offset（在 `PseudoInner` 内），适合被多个 fd
+/// 各自 wrap 而不共享位置。内容类型由 [`PseudoKind`] 决定。
 pub struct PseudoFile {
     readable: bool,
     writable: bool,
@@ -36,6 +48,7 @@ pub struct PseudoFile {
 }
 
 struct PseudoInner {
+    /// 当前读写位置（字节偏移）。
     offset: usize,
     kind: PseudoKind,
 }
@@ -46,17 +59,29 @@ struct PseudoInner {
 pub struct PseudoDir {
     path: String,
     entries: Vec<PseudoDirent>,
+    pidfd_target: Option<Weak<ProcessControlBlock>>,
     inner: Mutex<PseudoDirInner>,
 }
 
+/// 伪目录的一条目录项，对应 `getdents64` 返回给用户态的单条记录。
+///
+/// `dtype` 使用 Linux `DT_*` 常量：
+/// - `4` = `DT_DIR`（目录）
+/// - `8` = `DT_REG`（普通文件）
+/// - `2` = `DT_CHR`（字符设备）
+/// - `6` = `DT_BLK`（块设备）
 #[derive(Clone)]
 pub struct PseudoDirent {
+    /// 文件名（不含路径）。
     pub name: alloc::string::String,
+    /// inode 编号，由各伪路径的静态映射表分配。
     pub ino: u64,
-    pub dtype: u8, // Linux DT_* values (e.g. 4=DIR, 8=REG)
+    /// 文件类型（Linux `DT_*` 值）。
+    pub dtype: u8,
 }
 
 struct PseudoDirInner {
+    /// `getdents64` 下一次读取的起始条目下标。
     index: usize,
 }
 
@@ -75,12 +100,31 @@ impl PseudoDir {
         Self {
             path: p,
             entries,
+            pidfd_target: None,
             inner: Mutex::new(PseudoDirInner { index: 0 }),
         }
     }
 
+    pub fn new_proc_pid(
+        path: &str,
+        entries: Vec<PseudoDirent>,
+        process: &Arc<ProcessControlBlock>,
+    ) -> Self {
+        let mut dir = Self::new(path, entries);
+        dir.pidfd_target = Some(Arc::downgrade(process));
+        dir
+    }
+
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    pub fn is_pidfd_target_dir(&self) -> bool {
+        self.pidfd_target.is_some()
+    }
+
+    pub fn pidfd_target_process(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.pidfd_target.as_ref()?.upgrade()
     }
 
     pub fn entries(&self) -> &[PseudoDirent] {
@@ -151,11 +195,20 @@ impl File for RtcFile {
     }
 }
 
+/// 共享内存对象的实际数据，由 [`PseudoShmFile`] 通过 `Arc<Mutex<_>>` 共享。
+///
+/// 支持 POSIX shm（`shm_open`）和匿名 memfd（`memfd_create`）两种模式。
+/// 物理页通过 [`FrameTracker`] 按需分配，`ensure_len` 负责扩缩容。
 pub(crate) struct ShmDataInner {
+    /// 全局唯一 ID，供 `/proc/self/maps` 等显示 memfd 身份。
     id: u64,
+    /// true 时为 memfd，否则为 POSIX shm。
     is_memfd: bool,
+    /// memfd 的密封标志位（`F_SEAL_*`）；POSIX shm 固定为 0。
     seals: u32,
+    /// 当前有效长度（字节），可能小于已分配页的总大小。
     len: usize,
+    /// 按页顺序排列的物理帧，drop 时自动释放。
     frames: Vec<FrameTracker>,
 }
 
@@ -209,7 +262,9 @@ impl ShmDataInner {
 pub(crate) type ShmData = Arc<Mutex<ShmDataInner>>;
 
 lazy_static! {
+    /// 全局 POSIX 共享内存对象表，键为 `/dev/shm/<name>` 的 `<name>` 部分。
     static ref SHM_OBJECTS: Mutex<BTreeMap<String, ShmData>> = Mutex::new(BTreeMap::new());
+    /// 通过 `mkdir /dev/<name>` 动态创建的伪目录，键为目录名，值为分配的 inode 号。
     static ref PSEUDO_DEV_DIRS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 }
 
@@ -229,6 +284,8 @@ const PSEUDO_DEV_DIR_RESERVED: &[&str] = &[
     "root", "ptmx", "tty", "pts", "shm", "cgroup", "null", "zero", "urandom", "random", "misc",
 ];
 
+/// 从绝对路径中提取 `/dev/<name>` 的 `<name>` 部分。
+/// 路径必须是单层子目录（不含 `/`），且不为 `.` 或 `..`。
 fn pseudo_dev_dir_name(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/dev/")?;
     if rest.is_empty() || rest.contains('/') || matches!(rest, "." | "..") {
@@ -237,6 +294,7 @@ fn pseudo_dev_dir_name(path: &str) -> Option<&str> {
     Some(rest)
 }
 
+/// 返回所有动态 `/dev/<name>` 目录的目录项列表，供 `/dev` 目录枚举使用。
 pub(crate) fn pseudo_dev_dir_entries() -> Vec<PseudoDirent> {
     PSEUDO_DEV_DIRS
         .lock()
@@ -249,6 +307,7 @@ pub(crate) fn pseudo_dev_dir_entries() -> Vec<PseudoDirent> {
         .collect()
 }
 
+/// 判断动态 `/dev/<name>` 目录是否存在。
 pub(crate) fn pseudo_dev_dir_exists(path: &str) -> bool {
     let Some(name) = pseudo_dev_dir_name(path) else {
         return false;
@@ -256,6 +315,7 @@ pub(crate) fn pseudo_dev_dir_exists(path: &str) -> bool {
     PSEUDO_DEV_DIRS.lock().contains_key(name)
 }
 
+/// 打开一个动态 `/dev/<name>` 目录，返回仅含 `.` 和 `..` 的 [`PseudoDir`]。
 pub(crate) fn open_pseudo_dev_dir(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     let name = pseudo_dev_dir_name(path)?;
     let ino = *PSEUDO_DEV_DIRS.lock().get(name)?;
@@ -274,6 +334,10 @@ pub(crate) fn open_pseudo_dev_dir(path: &str) -> Option<Arc<dyn File + Send + Sy
     Some(Arc::new(PseudoDir::new(path, entries)))
 }
 
+/// 在 `/dev/<name>` 下创建新的伪目录。
+///
+/// - 保留名称（`root`、`null` 等）返回 `EEXIST`。
+/// - 路径不合法（多层或空）返回 `EROFS`。
 pub(crate) fn pseudo_dev_dir_mkdir(path: &str) -> isize {
     let Some(name) = pseudo_dev_dir_name(path) else {
         return EROFS;
@@ -290,6 +354,7 @@ pub(crate) fn pseudo_dev_dir_mkdir(path: &str) -> isize {
     0
 }
 
+/// 删除一个动态 `/dev/<name>` 伪目录；不存在时返回 `ENOENT`。
 pub(crate) fn pseudo_dev_dir_rmdir(path: &str) -> isize {
     let Some(name) = pseudo_dev_dir_name(path) else {
         return EROFS;

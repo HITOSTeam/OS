@@ -592,6 +592,18 @@ fn read_clone3_args(args_ptr: usize, size: usize) -> Result<Clone3Args, SyscallE
     Ok(args)
 }
 
+/// `clone3(CLONE_PIDFD)` 的收尾步骤：为刚创建的子进程构造 pidfd 并安装到父进程的 fd 表，
+/// 再将 fd 编号回写到用户态指针 `user_ptr`。
+///
+/// 关键设计：直接传入 `&Arc<ProcessControlBlock>` 而非裸 PID，
+/// 使 [`PidFdFile`] 内部持有 `Weak<ProcessControlBlock>`。
+/// 这样即便 PID 数值在子进程退出后被重新分配，
+/// 外部通过此 pidfd 做 `waitid(P_PIDFD)` / `pidfd_send_signal` 时
+/// `target_process()` 升级会返回 `None`（`ECHILD`/`ESRCH`），不会错误地作用于无关进程。
+///
+/// 若 fd 安装成功但用户态回写失败（`EFAULT`），则立即撤销已分配的 fd，
+/// 保证不泄露 fd 资源；随后 `clone_from_parts` 调用 `rollback_unstarted_child`
+/// 回滚整个 clone 操作。
 fn install_child_pidfd(
     child: &Arc<ProcessControlBlock>,
     token: usize,
