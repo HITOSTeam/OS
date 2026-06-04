@@ -667,6 +667,9 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     None
 }
 
+pub(crate) use cgroupfs::{
+    CgroupAttachTarget, cgroup_attach_process_to_target, cgroup_clone_into_target_from_file,
+};
 pub use cgroupfs::{
     CgroupFile, CgroupMountSpec, cgroup_attach_fork_child, cgroup_attach_thread,
     cgroup_charge_anon_current, cgroup_charge_file_write, cgroup_current_path, cgroup_exit_process,

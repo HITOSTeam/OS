@@ -27,7 +27,7 @@ use crate::task::manager::{
 use crate::task::processor::current_task;
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
-    RT_SIG_MAX, RtSigAction, SIG_IGN, SignalAction, SignalActions, SignalFlags,
+    RT_SIG_MAX, RtSigAction, SIG_IGN, SIGCHLD_NUM, SignalAction, SignalActions, SignalFlags,
 };
 use crate::task::task_block::{TaskAllocError, TaskControlBlock};
 use crate::trap::context::TrapContext;
@@ -948,6 +948,8 @@ pub struct ProcessControlBlockInner {
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
+    /// Signal delivered to the parent when this child becomes waitable.
+    pub exit_signal: i32,
     /// Linux-like argv for `/proc/<pid>/cmdline` and ps.
     pub argv: Vec<String>,
     /// Thread-group command name shown in /proc/*/{stat,status,comm}.
@@ -1192,6 +1194,7 @@ impl ProcessControlBlock {
                 parent: None,
                 children: Vec::new(),
                 exit_code: 0,
+                exit_signal: SIGCHLD_NUM as i32,
                 argv: args.clone(),
                 comm: process_comm_from_argv(&args),
                 pdeath_signal: 0,
@@ -1736,6 +1739,7 @@ impl ProcessControlBlock {
                 parent: Some(Arc::downgrade(self)),
                 children: Vec::new(),
                 exit_code: 0,
+                exit_signal: SIGCHLD_NUM as i32,
                 argv,
                 comm,
                 pdeath_signal: 0,

@@ -1,15 +1,46 @@
+//! 子进程状态等待系统调用实现。
+//!
+//! 本模块实现以下系统调用：
+//! - `wait4`：等待子进程退出或状态变更，支持 `__WCLONE`/`__WALL` 语义
+//! - `waitid`：POSIX 扩展等待，支持 pidfd、`WNOWAIT` 非破坏性查询
+//! - `ptrace`：进程追踪控制（`PTRACE_TRACEME`/`ATTACH`/`DETACH`/`CONT`/`KILL`）
+//!
+//! 以及以下辅助函数：
+//! - `reap_zombie_child`：回收僵尸进程资源，含 Arc 残留引用诊断
+//! - `wake_parent_waiters_for`：同时唤醒亲父进程和 tracer 的 wait 队列
+//! - `enter_ptrace_stop`：将进程置入 ptrace-stop 状态并挂起所有线程
+//!
+//! # 设计说明
+//!
+//! **锁顺序**：持有 `process_inner` 锁期间不可再调用 `wait4_pending_action`
+//! （后者需要重新读取当前进程信号动作），否则会反向获取同一 PCB 锁。
+//! wait4 因此先持锁扫描已就绪的子状态；若准备阻塞，再释放锁检查待处理信号，
+//! 然后重新持锁扫描并入队。第二次扫描与入队处于同一个父 PCB 临界区，
+//! 避免子进程退出事件落在扫描和入队之间。
+//!
+//! **睡眠路径**：`enqueue_waiter_once` + `block_current_and_run_next` 组成等待对，
+//! 前者保证同一 task 不重复入队，后者让出 CPU；唤醒由 `wake_parent_waiters_for`
+//! 在子进程状态变更时触发。
+
 use super::*;
 use alloc::sync::Arc;
 
+// 诊断计数器：分别统计 task Arc 残留和 child Arc 残留的累计触发次数，
+// 用于控制诊断日志打印频率（见 reap_zombie_child）。
 static REAP_LINGER_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static REAP_CHILD_ARC_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// ptrace request 编号，与 Linux uapi/linux/ptrace.h 保持一致。
 const PTRACE_TRACEME: usize = 0;
 const PTRACE_CONT: usize = 7;
 const PTRACE_KILL: usize = 8;
 const PTRACE_ATTACH: usize = 16;
 const PTRACE_DETACH: usize = 17;
 
+/// 向用户态 `waitid` 返回的子进程状态信息结构，对应 Linux `siginfo_t` 的 wait 子集。
+///
+/// 只使用了 wait 相关字段（`si_signo`=`SIGCHLD`、`si_code`、`si_pid`、`si_uid`、`si_status`）；
+/// 其余字节清零，以满足 `waitid` 调用约定——内核保证整个结构体归零后再填写有效字段。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SigInfo {
@@ -19,6 +50,7 @@ struct SigInfo {
     _pad0: i32,
     si_pid: i32,
     si_uid: u32,
+    /// 对 `CLD_EXITED` 为退出码，对 `CLD_KILLED`/`CLD_DUMPED` 为终止信号号。
     si_status: i32,
     _pad1: i32,
     si_utime: i64,
@@ -44,6 +76,10 @@ impl Default for SigInfo {
     }
 }
 
+/// 从等待队列中删除指定 task 的条目。
+///
+/// 每次 wait 循环重新入睡前都需要先调用本函数清理上一轮留下的条目，
+/// 防止同一 task 在队列中堆积多份（否则单次唤醒会消耗多个槽位而漏掉真正的等待者）。
 pub(super) fn remove_wait_queue_entry(
     queue: &mut alloc::collections::VecDeque<Arc<TaskControlBlock>>,
     task: &Arc<TaskControlBlock>,
@@ -51,6 +87,10 @@ pub(super) fn remove_wait_queue_entry(
     queue.retain(|t| !Arc::ptr_eq(t, task));
 }
 
+/// 幂等地将 task 加入等待队列，若已存在则不重复插入。
+///
+/// 返回 `true` 表示本次确实插入了新条目，可用于触发队列长度诊断日志。
+/// 防重复是为了避免单次信号唤醒后 task 被调度多次的错误。
 pub(super) fn enqueue_waiter_once(
     queue: &mut alloc::collections::VecDeque<Arc<TaskControlBlock>>,
     task: &Arc<TaskControlBlock>,
@@ -62,6 +102,16 @@ pub(super) fn enqueue_waiter_once(
     true
 }
 
+/// 回收僵尸子进程占用的内核资源，并返回其累计 CPU 时间（纳秒）。
+///
+/// exit 路径已将主线程资源解绑，但 task Arc 可能仍被调度器运行队列、
+/// futex 等待列表、管道等处持有。本函数对每个 task 执行两次 `remove_inactive_task`
+/// 以尽量清除残余引用；若 Arc 引用计数仍 >1，则触发诊断日志（见下方说明）。
+///
+/// 诊断日志策略（`REAP_LINGER_DIAG_COUNT`）：
+/// - 前 16 次每次打印，之后仅在计数为 2 的幂时打印，避免日志在大量 fork/exit 场景下爆炸。
+/// - `debug_task_ref_breakdown` 分解各子系统的引用计数，帮助定位哪个子系统未正常释放引用。
+/// - `unknown_refs` = 总引用数 − 1（本函数自持） − 已知子系统之和，非零说明存在未被追踪的持有者。
 fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     // Main-thread resources are already detached in exit path; this aggressively
     // drops lingering task Arcs so kernel stacks are reclaimed on reap.
@@ -81,6 +131,7 @@ fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
             // Retry once so duplicate stale queue entries are aggressively dropped.
             remove_inactive_task(task.clone());
             let count = REAP_LINGER_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            // 前 16 次全打印，之后仅在 2 的幂次时打印，节流日志量。
             if count <= 16 || (count & (count - 1)) == 0 {
                 let tid = task
                     .borrow_mut()
@@ -110,6 +161,7 @@ fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
                     .saturating_add(join_waiter_refs)
                     .saturating_add(sync_waiter_refs)
                     .saturating_add(pipe_waiter_refs);
+                // 扣除本函数自持的 1 个引用后，剩余无法归因的引用即为 unknown。
                 let unknown_refs = strong.saturating_sub(1 + known_refs);
                 crate::println!(
                     "[reap-debug] child_pid={} tid={} lingering_refs={} seq={} rq={} proc={} timer={} futex={} rec_lock={} task_slot={} waitq={} join={} sync={} pipe={} unknown={}",
@@ -136,6 +188,18 @@ fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     cpu_ns
 }
 
+/// 检查当前 task 是否有未屏蔽的待处理信号，并决定 wait 系列调用应如何响应。
+///
+/// Linux 对 wait 系列可中断行为的语义：
+/// - `SIG_IGN`：被显式忽略的信号，wait 可以清除该 pending 位并继续睡眠，
+///   因为用户态不会看到此信号，无需中断 wait。
+/// - `SIG_DFL`：默认动作为"忽略或与当前 stopped 状态无关"的信号同上；
+///   若默认动作会实际中断进程（如 `SIGTERM`），则 wait 需返回 `EINTR`。
+/// - 用户安装的处理函数设置了 `SA_RESTART`：内核在信号处理返回后重新执行 wait，
+///   返回 `ERESTARTSYS` 通知调度层重启该系统调用。
+/// - 用户安装的处理函数未设置 `SA_RESTART`：返回 `EINTR`，让用户态感知中断。
+///
+/// 返回 `None` 表示没有需要响应的信号，wait 可继续阻塞。
 fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
     const EINTR: isize = -4;
     let (pending, mask) = {
@@ -165,10 +229,13 @@ fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
             .copied()
             .unwrap_or_default();
         if action.handler == SIG_IGN {
+            // 被忽略的信号：清除 pending 位，wait 继续睡眠，不返回错误。
             clear_bits |= bit;
             continue;
         }
         if action.handler == SIG_DFL {
+            // 默认动作不中断 wait（如 SIGCHLD 默认忽略）时，同样清除并继续。
+            // 若默认动作确实需要打断（如 SIGTERM），则设置 interrupt 标志后立即退出遍历。
             if !sig_default_interrupts_wait(signum, inner.stopped) {
                 clear_bits |= bit;
                 continue;
@@ -176,6 +243,7 @@ fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
             saw_interrupt = true;
             break;
         }
+        // 用户安装的处理函数：SA_RESTART 决定是重启系统调用还是返回 EINTR。
         if (action.flags & SA_RESTART) != 0 {
             saw_restart = true;
         } else {
@@ -217,10 +285,14 @@ fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
     }
 }
 
+/// 向目标进程的 wait 队列投递 `SIGCHLD` 并唤醒所有等待者。
+///
+/// 仅供 `wake_parent_waiters_for` 调用，封装了"发信号 + 排队唤醒"两步操作。
 fn wake_waiters_on(process: &Arc<ProcessControlBlock>) {
     queue_process_signal(process.getpid(), SIGCHLD_NUM);
     let waiters = {
         let mut inner = process.borrow_mut();
+        // 一次性 drain 清空队列：避免唤醒风暴，每次状态变更只唤醒一轮等待者。
         inner.wait_queue.drain(..).collect::<Vec<_>>()
     };
     for waiter in waiters {
@@ -228,6 +300,11 @@ fn wake_waiters_on(process: &Arc<ProcessControlBlock>) {
     }
 }
 
+/// 唤醒子进程状态变更应通知的所有相关方：亲父进程和 tracer（若不同）。
+///
+/// ptrace 语义下，tracer 也是子进程状态事件的接收者，它的 wait 调用同样需要被唤醒。
+/// 如果 tracer 和亲父进程是同一进程（常见于 `PTRACE_TRACEME` 后父进程调试子进程的场景），
+/// 则只唤醒一次，避免重复发送 `SIGCHLD`。
 pub(super) fn wake_parent_waiters_for(process: &Arc<ProcessControlBlock>) {
     let (parent, tracer_pid) = {
         let inner = process.borrow_mut();
@@ -242,6 +319,7 @@ pub(super) fn wake_parent_waiters_for(process: &Arc<ProcessControlBlock>) {
         parent_pid = Some(parent.getpid());
         wake_waiters_on(&parent);
     }
+    // 仅当 tracer 与亲父进程不同时才额外唤醒，防止对同一进程重复投递 SIGCHLD。
     if let Some(tracer_pid) = tracer_pid {
         if parent_pid != Some(tracer_pid) {
             if let Some(tracer) = pid2process(tracer_pid) {
@@ -251,6 +329,12 @@ pub(super) fn wake_parent_waiters_for(process: &Arc<ProcessControlBlock>) {
     }
 }
 
+/// 将进程置入 ptrace-stop 状态，挂起其所有线程，并通知 tracer。
+///
+/// 仅当进程已有 tracer 时才执行；否则直接返回，避免无意义地挂起进程。
+/// 所有线程均被设为 `Blocked + stopped_by_signal = true`，
+/// 以便 `PTRACE_CONT`/`PTRACE_DETACH` 通过 `stopped_by_signal` 标志精确地反向唤醒它们。
+/// 最后调用 `block_current_and_run_next` 挂起当前线程，等待 tracer 的下一次 continue。
 pub(super) fn enter_ptrace_stop(process: &Arc<ProcessControlBlock>, signum: i32) {
     let tasks = {
         let mut inner = process.borrow_mut();
@@ -274,16 +358,38 @@ pub(super) fn enter_ptrace_stop(process: &Arc<ProcessControlBlock>, signum: i32)
             task_inner.stopped_by_signal = true;
         }
     }
+    // 通知 tracer（和亲父进程）后再挂起自身；顺序不能颠倒，否则唤醒会丢失。
     wake_parent_waiters_for(process);
     block_current_and_run_next();
 }
 
+/// 实现 `wait4` 系统调用：等待匹配的子进程退出或状态变更。
+///
+/// 本实现的整体结构是一个重试循环（loop）：每次迭代先扫描子进程列表，
+/// 若找到可消费的事件则立即返回；否则将自身加入 wait 队列后让出 CPU，
+/// 等被 `wake_parent_waiters_for` 唤醒后再次扫描。
+///
+/// 扫描顺序和优先级：zombie > stop_event > cont_event，与 Linux 保持一致。
+/// ptrace 被追踪进程的 stop/cont 事件在子进程列表扫描之后补充扫描。
 pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: usize) -> isize {
     const WNOHANG: usize = 0x00000001;
     const WUNTRACED: usize = 0x00000002;
     const WCONTINUED: usize = 0x00000008;
+    // Linux-internal flags required by clone3 callers that set a non-SIGCHLD exit_signal:
+    // __WCLONE  — wait for children that do NOT deliver SIGCHLD on exit (clone children)
+    // __WALL    — wait for any child regardless of exit signal
+    // __WNOTHREAD — Linux 用它限制只等待调用线程自己的子进程；本实现当前
+    // children 仍按进程保存，没有记录 creator thread，因此先拒绝而非假装支持。
+    // Unless __WALL is set, wait4 separates normal SIGCHLD children from clone
+    // children whose exit_signal is 0 or a non-SIGCHLD signal.
+    const __WCLONE: usize = 0x80000000;
+    const __WALL: usize = 0x40000000;
+    const __WNOTHREAD: usize = 0x20000000;
     const ECHILD: isize = -10;
-    let allowed = WNOHANG | WUNTRACED | WCONTINUED;
+    if (options & __WNOTHREAD) != 0 {
+        return err(SyscallError::EINVAL);
+    }
+    let allowed = WNOHANG | WUNTRACED | WCONTINUED | __WCLONE | __WALL;
     if (options & !allowed) != 0 {
         return err(SyscallError::EINVAL);
     }
@@ -294,21 +400,18 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
     let mut temp_exit_code: i32 = 0;
     let mut temp_signal: Option<i32> = None;
     let mut temp_coredump = false;
+    let mut checked_pending_signal = false;
     loop {
         let cur_process = current_process();
         let task = current_task().unwrap();
-        if let Some(action) = wait4_pending_action(&task) {
-            let mut process_inner = cur_process.borrow_mut();
-            remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
-            drop(process_inner);
-            return action;
-        }
         let mut process_inner = cur_process.borrow_mut();
+        // 每轮开始时先清理自身的 wait 队列条目，防止重复入队导致引用计数膨胀。
         remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
         let parent_pgid = process_inner.pgid;
         let parent_pid = cur_process.getpid();
         let mut stop_event: Option<(Arc<ProcessControlBlock>, i32)> = None;
         let mut cont_event: Option<Arc<ProcessControlBlock>> = None;
+        // --- 阶段一：扫描亲子进程列表，按 zombie > stop > cont 优先级查找事件 ---
         let (has_matching_child, zombie_child) = if process_inner.children.is_empty() {
             (false, None)
         } else {
@@ -316,12 +419,18 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             let mut has_match = false;
             for (index, child) in process_inner.children.iter().enumerate() {
                 let child_inner = child.borrow_mut();
-                let matches = match pid {
+                let pid_matches = match pid {
                     -1 => true, // any child
                     0 => child_inner.pgid == parent_pgid,
                     p if p > 0 => child.pid.0 == p as usize,
                     p => child_inner.pgid == (-p) as usize,
                 };
+                let is_clone_child = child_inner.exit_signal != SIGCHLD_NUM as i32;
+                // Linux wait4 默认只匹配退出时向父进程发送 SIGCHLD 的子进程；
+                // clone 子进程需要 __WCLONE，__WALL 则跳过这层 exit_signal 过滤。
+                let signal_matches =
+                    (options & __WALL) != 0 || ((options & __WCLONE) != 0) == is_clone_child;
+                let matches = pid_matches && signal_matches;
                 if matches {
                     has_match = true;
                 }
@@ -336,6 +445,8 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                     found = Some(index);
                     break;
                 }
+                // stop 事件：WUNTRACED 允许普通父进程看到 stopped 子进程；
+                // ptrace tracer 则无条件可见自己所追踪子进程的 stop_pending。
                 let ptrace_stop_visible = child_inner.ptrace_tracer_pid == Some(parent_pid);
                 if matches
                     && child_inner.stopped
@@ -363,6 +474,8 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             }
         };
 
+        // --- 阶段二：若阶段一未找到 stop/zombie 事件，补充扫描 ptrace 被追踪进程 ---
+        // 被追踪进程不一定是当前进程的亲子，因此需要扫描全局 PID 表。
         let mut has_matching_ptrace = false;
         if stop_event.is_none() && zombie_child.is_none() {
             let traced_processes = {
@@ -381,6 +494,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                 let matches = match pid {
                     -1 => true,
                     p if p > 0 => traced_pid == p as usize,
+                    // 按进程组过滤对 ptrace 被追踪进程没有明确 Linux 语义，暂不支持。
                     _ => false,
                 };
                 if !matches {
@@ -403,6 +517,8 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             }
         }
 
+        // --- 阶段三：消费并返回 stop 事件 ---
+        // 清除 stop_pending 以防同一 stop 被重复消费（Linux 语义：每次 ptrace-stop 只报告一次）。
         if let Some((target, sig)) = stop_event {
             let pid = target.getpid();
             let mut target_inner = target.borrow_mut();
@@ -411,11 +527,13 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             drop(target_inner);
             drop(process_inner);
             if wstatus_ptr != 0 {
+                // Linux wait status encoding for stopped: ((sig & 0xff) << 8) | 0x7f
                 let status = ((sig & 0xff) << 8) | 0x7f;
                 write_user_value(token, wstatus_ptr as *mut i32, &status);
             }
             return pid as isize;
         }
+        // --- 阶段三（续）：消费并返回 cont 事件 ---
         if let Some(target) = cont_event {
             let pid = target.getpid();
             let mut target_inner = target.borrow_mut();
@@ -423,12 +541,14 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             drop(target_inner);
             drop(process_inner);
             if wstatus_ptr != 0 {
+                // Linux wait status encoding for continued: 0xffff
                 let status = 0xffff;
                 write_user_value(token, wstatus_ptr as *mut i32, &status);
             }
             return pid as isize;
         }
 
+        // --- 阶段四：消费并回收 zombie 子进程 ---
         if let Some(child) = zombie_child {
             let pid = child.getpid();
             drop(process_inner);
@@ -437,6 +557,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             // Reaping is complete now; remove it from the global PID table.
             crate::task::manager::remove_from_pid2process(pid);
             let child_refs = Arc::strong_count(&child);
+            // 若 PID 表删除后 child Arc 仍有多个持有者，说明存在子系统未释放引用。
             if child_refs > 1 {
                 let seq = REAP_CHILD_ARC_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if seq <= 16 || (seq & (seq - 1)) == 0 {
@@ -450,6 +571,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             }
             {
                 let mut parent_inner = cur_process.borrow_mut();
+                // 将子进程的 CPU 时间累计到父进程，以正确响应 getrusage(RUSAGE_CHILDREN)。
                 parent_inner.child_cpu_time_ns =
                     parent_inner.child_cpu_time_ns.saturating_add(child_cpu_ns);
             }
@@ -472,7 +594,9 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             return pid as isize;
         }
 
+        // --- 阶段五：无任何匹配子进程，或所有匹配子进程均处于无事件状态 ---
         if !has_matching_child && !has_matching_ptrace {
+            // 没有任何符合 pid 参数的子进程存在，按 Linux 约定返回 ECHILD。
             if DEBUG_PTHREAD {
                 let child_pids = process_inner
                     .children
@@ -513,10 +637,28 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             return 0;
         }
 
-        // Block until a child exits or changes state.
+        if !checked_pending_signal {
+            drop(process_inner);
+            // 不能在持有 process_inner 时检查信号动作；但检查信号期间子进程
+            // 可能刚好退出，所以检查后必须重新进入循环复扫，而不是直接入队。
+            if let Some(action) = wait4_pending_action(&task) {
+                let mut process_inner = cur_process.borrow_mut();
+                remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
+                drop(process_inner);
+                return action;
+            }
+            checked_pending_signal = true;
+            continue;
+        }
+
+        // --- 阶段六：将自身入队并让出 CPU，等待子进程状态变更唤醒 ---
+        // 这里沿用复扫时持有的 process_inner 锁，不在 scan 和 enqueue 之间释放。
+        // 否则 exit_signal=0 的 clone child 可能在空队列上完成唤醒，父线程随后
+        // 才入队并永久睡眠。
         let inserted = enqueue_waiter_once(&mut process_inner.wait_queue, &task);
         if inserted {
             let qlen = process_inner.wait_queue.len();
+            // 队列长度达到 64 的 2 的幂时打印诊断，定位可能的父进程多线程 wait 竞争问题。
             if qlen >= 64 && (qlen & (qlen - 1)) == 0 {
                 crate::println!(
                     "[wait4-debug] pid={} wait_queue_len={} children={} wait_pid={} options=0x{:x}",
@@ -529,21 +671,32 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             }
         }
         drop(process_inner);
+        checked_pending_signal = false;
         block_current_and_run_next();
     }
 }
 
+/// 实现 `waitid` 系统调用：以结构化 `siginfo_t` 方式等待子进程状态变更。
+///
+/// 与 `wait4` 的主要区别：
+/// - 结果通过 `SigInfo` 结构体写回，包含 `si_code`（区分正常退出/信号终止/stop/cont）
+/// - `WNOWAIT` 允许"窥看"事件而不消费（子进程不被从 children 列表移除、stop_pending 不清除），
+///   从而支持多次查询同一事件
+/// - 支持 `P_PIDFD`：通过文件描述符而非 PID 定位子进程，`O_NONBLOCK` 的 pidfd 对应 `EAGAIN`
 pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     const P_ALL: usize = 0;
     const P_PID: usize = 1;
     const P_PGID: usize = 2;
+    // P_PIDFD 通过文件描述符引用目标进程，解耦了进程生命周期与 PID 复用问题。
     const P_PIDFD: usize = 3;
     const WNOHANG: usize = 0x00000001;
     const WSTOPPED: usize = 0x00000002;
     const WEXITED: usize = 0x00000004;
     const WCONTINUED: usize = 0x00000008;
+    // WNOWAIT：报告事件但不回收，后续 wait 仍可重新匹配同一子进程。
     const WNOWAIT: usize = 0x01000000;
     const SIGCHLD: i32 = 17;
+    // CLD_* 常量对应 si_code 字段，区分子进程退出原因，供用户态区分处理。
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
     const CLD_DUMPED: i32 = 3;
@@ -551,6 +704,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     const CLD_CONTINUED: i32 = 6;
     const ECHILD: isize = -10;
     const EBADF: isize = -9;
+    // pidfd 以 O_NONBLOCK 打开时，若无可消费事件则返回 EAGAIN 而非阻塞。
     const EAGAIN: isize = -11;
     const O_NONBLOCK: u32 = 0x800;
 
@@ -558,6 +712,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     if (options & !allowed) != 0 {
         return err(SyscallError::EINVAL);
     }
+    // 至少需要指定一个感兴趣的事件类型，否则 wait 永远不会返回有效数据。
     if (options & (WEXITED | WSTOPPED | WCONTINUED)) == 0 {
         return err(SyscallError::EINVAL);
     }
@@ -567,9 +722,13 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     if matches!(idtype, P_PID) && id == 0 {
         return err(SyscallError::EINVAL);
     }
-    let mut pidfd_target_pid = 0usize;
+    // P_PIDFD 用 Arc identity 而非 PID 数值匹配子进程：
+    // 防止原 target 退出 + PID 被复用后误命中无关进程。target_process 升级
+    // 失败说明原 target 已彻底释放（已被 reap 并 drop），按 Linux 语义返回 ECHILD。
+    let mut pidfd_target: Option<Arc<ProcessControlBlock>> = None;
     let mut pidfd_nonblock = false;
     if idtype == P_PIDFD {
+        // descriptor_flags 来自 open() 时的 fd flags，与 file status flags 不同。
         let (file, descriptor_flags) = {
             let files = current_files();
             let files = files.lock();
@@ -581,7 +740,10 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
         let Some(pidfd) = file.as_any().downcast_ref::<PidFdFile>() else {
             return EBADF;
         };
-        pidfd_target_pid = pidfd.target_pid();
+        let Some(target) = pidfd.target_process() else {
+            return ECHILD;
+        };
+        pidfd_target = Some(target);
         pidfd_nonblock = (descriptor_flags & O_NONBLOCK) != 0;
     }
 
@@ -589,6 +751,8 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
     loop {
         let cur_process = current_process();
         let task = current_task().unwrap();
+        // waitid 在循环开头就检查信号，与 wait4 不同；这样可以尽早响应 SIGCHLD
+        // 被忽略（父进程设置 SIG_IGN）时的异常路径，与 Linux glibc 行为对齐。
         if let Some(action) = wait4_pending_action(&task) {
             let mut process_inner = cur_process.borrow_mut();
             remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
@@ -600,6 +764,8 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
         remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
         let parent_pgid = process_inner.pgid;
         let mut has_match = false;
+        // 使用 Option 而非直接返回，是为了在同一持锁区间内完成匹配和（可选的）消费，
+        // 避免先释放锁再重新加锁带来的 TOCTOU 问题。
         let mut found_zombie: Option<(usize, i32, Option<i32>, bool, u32)> = None;
         let mut found_stop: Option<(usize, i32, u32)> = None;
         let mut found_cont: Option<(usize, u32)> = None;
@@ -610,10 +776,13 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
                 P_ALL => true,
                 P_PID => child.pid.0 == id,
                 P_PGID => {
+                    // id == 0 表示等待与调用者同进程组的子进程，与 wait4(0) 语义一致。
                     let target = if id == 0 { parent_pgid } else { id };
                     child_inner.pgid == target
                 }
-                P_PIDFD => child.pid.0 == pidfd_target_pid,
+                P_PIDFD => pidfd_target
+                    .as_ref()
+                    .is_some_and(|target| Arc::ptr_eq(child, target)),
                 _ => return err(SyscallError::EINVAL),
             };
             if !matches {
@@ -648,6 +817,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
 
         if let Some((index, exit_code, signal, coredump, uid)) = found_zombie {
             let child_pid = process_inner.children[index].pid.0;
+            // WNOWAIT：不从 children 列表移除，保留僵尸以供后续 wait 重复查询。
             let child = if (options & WNOWAIT) == 0 {
                 Some(process_inner.children.remove(index))
             } else {
@@ -666,6 +836,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             let (si_status, si_code) = if let Some(sig) = signal {
                 (sig, if coredump { CLD_DUMPED } else { CLD_KILLED })
             } else {
+                // 正常退出时 si_status 存放退出码低 8 位，与 wait4 的 wstatus 编码不同。
                 (exit_code & 0xff, CLD_EXITED)
             };
             let mut info = SigInfo::default();
@@ -679,6 +850,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
         }
 
         if let Some((pid, sig, uid)) = found_stop {
+            // WNOWAIT：不清除 stop_pending，允许同一 stop 事件被再次 wait 消费。
             if (options & WNOWAIT) == 0 {
                 if let Some(child) = process_inner.children.iter().find(|c| c.getpid() == pid) {
                     let mut child_inner = child.borrow_mut();
@@ -697,6 +869,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
         }
 
         if let Some((pid, uid)) = found_cont {
+            // WNOWAIT：不清除 continued 标志，与 stop_pending 的处理逻辑对称。
             if (options & WNOWAIT) == 0 {
                 if let Some(child) = process_inner.children.iter().find(|c| c.getpid() == pid) {
                     let mut child_inner = child.borrow_mut();
@@ -719,6 +892,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             return ECHILD;
         }
 
+        // WNOHANG：有匹配子进程但当前无事件，写入全零 SigInfo 并立即返回 0（非 ECHILD）。
         if (options & WNOHANG) != 0 {
             drop(process_inner);
             let info = SigInfo::default();
@@ -726,11 +900,13 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             return 0;
         }
 
+        // pidfd 以 O_NONBLOCK 打开时，有匹配进程但无就绪事件应返回 EAGAIN 而非阻塞。
         if idtype == P_PIDFD && pidfd_nonblock {
             drop(process_inner);
             return EAGAIN;
         }
 
+        // 有匹配子进程但尚无事件，入队睡眠等待唤醒，逻辑与 wait4 相同。
         let inserted = enqueue_waiter_once(&mut process_inner.wait_queue, &task);
         if inserted {
             let qlen = process_inner.wait_queue.len();
@@ -760,6 +936,10 @@ pub fn syscall_getpid() -> isize {
         .visible_pid() as isize
 }
 
+/// 查找并验证当前进程是否正在追踪指定 PID 的进程。
+///
+/// ptrace 操作（DETACH/CONT/KILL 等）都需要确认调用者确实是目标进程的 tracer，
+/// 否则一个进程可以任意干扰它不应控制的进程。
 fn ptrace_target_for_current(pid: usize) -> Result<Arc<ProcessControlBlock>, isize> {
     if pid == 0 {
         return Err(err(SyscallError::ESRCH));
@@ -781,9 +961,21 @@ fn ptrace_target_for_current(pid: usize) -> Result<Arc<ProcessControlBlock>, isi
     Ok(target)
 }
 
+/// 实现 `ptrace` 系统调用，支持基础的追踪控制操作。
+///
+/// 当前实现覆盖：
+/// - `PTRACE_TRACEME`：被追踪方主动声明愿意接受父进程的追踪
+/// - `PTRACE_ATTACH`：追踪方强制附加到目标进程并发送 `SIGSTOP`
+/// - `PTRACE_DETACH`：解除追踪关系并恢复目标进程运行
+/// - `PTRACE_CONT`：继续被停止的被追踪进程，可同时投递信号
+/// - `PTRACE_KILL`：强制终止被追踪进程（先唤醒后发 `SIGKILL`）
+/// - 其余 request：验证 tracer 身份后返回 `EIO`，兼容 LTP 对内存/寄存器访问的预期错误码
 pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> isize {
     match request {
         PTRACE_TRACEME => {
+            // 语义：当前进程自愿成为父进程的 ptrace 被追踪者。
+            // 前置条件：当前进程尚未被任何 tracer 附加（否则重复 TRACEME 返回 EPERM）。
+            // 父进程不存在（如 init 进程）时同样失败，因为没有合法的 tracer 承接事件。
             let process = current_process();
             let mut inner = process.borrow_mut();
             if inner.ptrace_tracer_pid.is_some() {
@@ -801,6 +993,10 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
             0
         }
         PTRACE_ATTACH => {
+            // 语义：追踪方强制附加到目标进程，等效于目标进程执行了 PTRACE_TRACEME 并收到 SIGSTOP。
+            // 前置条件：目标进程未被其他 tracer 持有；调用者对目标有信号投递权限（与 kill 权限相同）。
+            // 附加后立即将所有线程置为 Blocked，并唤醒 tracer 的 wait 队列，
+            // 这样 tracer 的下一次 wait 调用就能立刻收到 stop 事件。
             let tracer_pid = current_process().getpid();
             if pid == tracer_pid {
                 return err(SyscallError::EPERM);
@@ -830,6 +1026,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                     .filter_map(|t| t.as_ref().cloned())
                     .collect::<Vec<_>>()
             };
+            // 将目标进程的所有线程标记为因信号停止，以便 DETACH/CONT 能精确恢复它们。
             for task in tasks {
                 let mut task_inner = task.borrow_mut();
                 if task_inner.task_status != TaskStatus::Blocked {
@@ -841,6 +1038,9 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
             0
         }
         PTRACE_DETACH => {
+            // 语义：解除追踪关系，目标进程恢复运行，可附带投递一个信号（data 为信号号，0 表示不投递）。
+            // 清除 ptrace_tracer_pid 后目标进程不再受 tracer 控制；
+            // 设置 continued=true 以便父进程的 WCONTINUED wait 能感知此次恢复。
             let sig = data as isize;
             if sig < 0 || sig as usize > RT_SIG_MAX {
                 return err(SyscallError::EINVAL);
@@ -862,6 +1062,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                     .filter_map(|t| t.as_ref().cloned())
                     .collect::<Vec<_>>()
             };
+            // 只恢复因 ptrace stop 而 Blocked 的线程，避免错误唤醒因其他原因（如 futex）阻塞的线程。
             for task in tasks {
                 let mut task_inner = task.borrow_mut();
                 if !task_inner.stopped_by_signal {
@@ -874,10 +1075,13 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
             if sig != 0 {
                 queue_process_signal(pid, sig as usize);
             }
+            // 唤醒父进程 wait 队列，使其能通过 WCONTINUED 感知目标进程已被恢复。
             wake_parent_waiters_for(&target);
             0
         }
         PTRACE_CONT => {
+            // 语义：继续被 ptrace stop 的进程，tracer 关系保持不变（与 DETACH 的区别）。
+            // 可同时投递信号（data != 0），允许 tracer 在 continue 时注入信号。
             let sig = data as isize;
             if sig < 0 || sig as usize > RT_SIG_MAX {
                 return err(SyscallError::EINVAL);
@@ -914,6 +1118,9 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
             0
         }
         PTRACE_KILL => {
+            // 语义：强制终止被追踪进程。
+            // 必须先唤醒所有因 ptrace stop 而 Blocked 的线程，再投递 SIGKILL——
+            // 若线程仍处于 Blocked 状态，SIGKILL 的递送可能永远等不到调度机会。
             let target = match ptrace_target_for_current(pid) {
                 Ok(t) => t,
                 Err(e) => return e,
@@ -930,6 +1137,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                     .filter_map(|t| t.as_ref().cloned())
                     .collect::<Vec<_>>()
             };
+            // 先投递 SIGKILL，再唤醒线程，确保线程恢复运行后第一时间处理致命信号。
             queue_process_signal(pid, SIGKILL_NUM);
             for task in tasks {
                 let mut task_inner = task.borrow_mut();

@@ -169,6 +169,89 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
     }
 }
 
+/// Linux `pidfd_send_signal(2)` for pidfds created by `pidfd_open` or
+/// `clone3(CLONE_PIDFD)`.
+pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags: usize) -> isize {
+    if flags != 0 {
+        return err(SyscallError::EINVAL);
+    }
+    if sig < 0 || sig as usize > RT_SIG_MAX {
+        return err(SyscallError::EINVAL);
+    }
+
+    let file = {
+        let files = current_files();
+        files.lock().get_file(pidfd)
+    };
+    let Some(file) = file else {
+        return err(SyscallError::EBADF);
+    };
+    let Some(pidfd_file) = file.as_any().downcast_ref::<crate::fs::PidFdFile>() else {
+        return err(SyscallError::EBADF);
+    };
+    // identity-safe 解析：通过 pidfd 内部的 Weak<ProcessControlBlock> 升级，
+    // 原 target 已被释放（即便 PID 数值被新进程复用）时也只会返回 None，
+    // 不会把信号错投递到无关进程。
+    let Some(process) = pidfd_file.target_process() else {
+        return err(SyscallError::ESRCH);
+    };
+
+    if !can_signal_process(&process, sig) {
+        return err(SyscallError::EPERM);
+    }
+    // sig=0 is a Linux convention: probe whether the process exists and is
+    // reachable without actually delivering any signal.
+    if sig == 0 {
+        return 0;
+    }
+    let signum = sig as usize;
+    if rt_sigpending_limit_reached(&process, signum) {
+        return err(SyscallError::EAGAIN);
+    }
+
+    let sender = current_process();
+    let sender_pid = sender.getpid() as i32;
+    let sender_uid = {
+        let inner = sender.borrow_mut();
+        inner.uid
+    };
+    let (si_code, sig_value) = if info_ptr != 0 {
+        let Some(info) = try_read_user_value::<LinuxSigInfo>(
+            get_current_token(),
+            info_ptr as *const LinuxSigInfo,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        if info.si_signo != sig {
+            return err(SyscallError::EINVAL);
+        }
+        // field[2]/field[3] map to si_value.sival_ptr in the kernel ABI layout.
+        // Reconstruct the 64-bit value from two consecutive 32-bit words.
+        let lo = info.field[2] as u32 as usize;
+        let hi = info.field[3] as u32 as usize;
+        (info.si_code, lo | (hi << 32))
+    } else {
+        (0, 0)
+    };
+
+    let Some(bit) = signal_bit(signum) else {
+        return err(SyscallError::EINVAL);
+    };
+    let tasks = {
+        let inner = process.borrow_mut();
+        inner
+            .tasks
+            .iter()
+            .filter_map(|t| t.as_ref().cloned())
+            .collect::<Vec<_>>()
+    };
+    let Some(task) = crate::task::signal::pick_task_for_signal(&tasks, bit) else {
+        return err(SyscallError::ESRCH);
+    };
+    queue_signal_to_task(task, signum, sender_pid, sender_uid, si_code, sig_value);
+    0
+}
+
 /// Linux `tgkill` (syscall 131).
 ///
 /// Delivers a signal to a specific thread (Linux-style tid encoding).

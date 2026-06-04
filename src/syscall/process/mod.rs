@@ -19,12 +19,13 @@ use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
     debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_PTHREAD, DEBUG_SIGNAL},
     fs::{
-        PidFdFile, cgroup_attach_thread, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
+        CgroupAttachTarget, PidFdFile, cgroup_attach_process_to_target, cgroup_attach_thread,
+        cgroup_clone_into_target_from_file, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
         root_inode_for_path, secondary_root_inode,
     },
     mm::{
-        MapPermission, MemorySet, kernel_token, try_read_user_value, try_write_user_value,
-        write_user_value,
+        MapPermission, MemorySet, kernel_token, try_copy_from_user, try_read_user_value,
+        try_write_user_value, write_user_value,
     },
     println,
     syscall::{
@@ -41,8 +42,8 @@ use crate::{
             wakeup_task,
         },
         processor::{
-            block_current_and_run_next, current_files, current_process, current_task, hart_id,
-            suspend_current_and_run_next,
+            block_current_and_run_next, current_files, current_files_and_nofile_limit,
+            current_process, current_task, hart_id, suspend_current_and_run_next,
         },
         sched::{SchedClass, sched_class},
         signal::{

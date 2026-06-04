@@ -306,6 +306,7 @@ const SYSCALL_BPF: usize = 280;
 const SYSCALL_COPY_FILE_RANGE: usize = 285;
 const SYSCALL_USERFAULTFD: usize = 282;
 const SYSCALL_PERF_EVENT_OPEN: usize = 241;
+const SYSCALL_PIDFD_SEND_SIGNAL: usize = 424;
 const SYSCALL_FANOTIFY_INIT: usize = 262;
 const SYSCALL_IO_URING_SETUP: usize = 425;
 const SYSCALL_OPEN_TREE: usize = 428;
@@ -316,6 +317,7 @@ const SYSCALL_FSMOUNT: usize = 432;
 const SYSCALL_FSPICK: usize = 433;
 const SYSCALL_MOUNT_SETATTR: usize = 442;
 const SYSCALL_PIDFD_OPEN: usize = 434;
+const SYSCALL_CLONE3: usize = 435;
 const SYSCALL_MEMFD_SECRET: usize = 447;
 const SYSCALL_SIGACTION: usize = 134; // rt_sigaction
 const SYSCALL_SIGPROCMASK: usize = 135; // rt_sigprocmask
@@ -704,6 +706,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             process::syscall_execveat(args[0] as isize, args[1], args[2], args[3], args[4])
         }
         SYSCALL_CLONE => process::syscall_clone(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_CLONE3 => process::syscall_clone3(args[0], args[1]),
         SYSCALL_GETPID => process::syscall_getpid(),
         SYSCALL_GETPPID => misc::syscall_getppid(),
         SYSCALL_GETUID => misc::syscall_getuid(),
@@ -792,6 +795,9 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRANDOM => misc::syscall_getrandom(args[0], args[1], args[2] as u32),
         SYSCALL_MEMFD_CREATE => dummy::syscall_memfd_create(args[0], args[1]),
         SYSCALL_BPF => dummy::syscall_bpf(args[0], args[1], args[2]),
+        SYSCALL_PIDFD_SEND_SIGNAL => {
+            signal::syscall_pidfd_send_signal(args[0], args[1] as i32, args[2], args[3])
+        }
         SYSCALL_COPY_FILE_RANGE => filesystem::syscall_copy_file_range(
             args[0], args[1], args[2], args[3], args[4], args[5],
         ),

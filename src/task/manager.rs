@@ -17,21 +17,26 @@ use crate::task::sched::{
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use spin::Mutex;
 
+/// 轮询分配的下一个 hart 计数器，用于新任务在不同 hart 间实现简单负载均衡
 static NEXT_HART: AtomicUsize = AtomicUsize::new(0);
+/// 是否已经启用当前 Hart 的mask
 static ONLINE_HART_MASK: AtomicUsize = AtomicUsize::new(0);
 
+/// 让hart 上线
 pub fn mark_hart_online(hart_id: usize) {
     if hart_id < usize::BITS as usize {
         ONLINE_HART_MASK.fetch_or(1usize << hart_id, Ordering::SeqCst);
     }
 }
 
+/// hart_mask 的全局包装
 pub fn online_hart_mask() -> usize {
     let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
     // Fallback: at least hart0 exists.
     if mask == 0 { 1 } else { mask }
 }
 
+/// 从 start hart 开始轮询，返回第一个在线（已上线）的 hart ID
 fn pick_online_hart(start: usize) -> usize {
     let mask = online_hart_mask();
     for i in 0..MAX_HARTS {
@@ -43,11 +48,13 @@ fn pick_online_hart(start: usize) -> usize {
     0
 }
 
+/// 为新任务选择一个负载最轻的在线 hart，返回其 hart_id
 pub fn select_hart_for_new_task() -> usize {
     let start = NEXT_HART.fetch_add(1, Ordering::Relaxed) % MAX_HARTS;
     pick_online_hart(start)
 }
 
+/// 看门狗（watchdog）系统状态转储：打印所有 hart 的就绪队列长度、每个进程的线程/信号量/互斥锁状态
 pub fn dump_system_state() {
     log::warn!("==== [watchdog] system state dump ====");
     // Disable interrupts to prevent deadlock with timer-driven wakeup_task().
@@ -131,15 +138,16 @@ pub fn dump_system_state() {
 
 #[derive(Default)]
 struct FairGroupQueue {
-    shares: u64,
-    vruntime: u128,
-    tasks: VecDeque<Arc<TaskControlBlock>>,
+    shares: u64,                            // 该 group 的 CPU 时间权重
+    vruntime: u128,                         // 虚拟运行时间，用于 CFS 调度决策（值越小越优先）
+    tasks: VecDeque<Arc<TaskControlBlock>>, // 属于该 group 的就绪任务队列
 }
 
+/// 每个hart 拥有的 运行队列
 #[derive(Default)]
 struct HartRunQueue {
-    rt_queues: alloc::vec::Vec<VecDeque<Arc<TaskControlBlock>>>,
-    fair_groups: BTreeMap<u64, FairGroupQueue>,
+    rt_queues: alloc::vec::Vec<VecDeque<Arc<TaskControlBlock>>>, // 实时优先级队列（RT FIFO/RR），按优先级分桶
+    fair_groups: BTreeMap<u64, FairGroupQueue>, // CFS fair group 集合，key 为 group_id
 }
 
 impl HartRunQueue {
@@ -150,6 +158,7 @@ impl HartRunQueue {
         }
     }
 
+    /// 返回该 hart 就绪队列中所有任务的总数（RT + Fair）
     fn len(&self) -> usize {
         self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
             + self
@@ -160,13 +169,14 @@ impl HartRunQueue {
     }
 }
 
+/// 任务入队时的目标槽位：RT 队列（按优先级索引）或 CFS Fair 队列
 enum ReadyQueueSlot {
     Rt(usize),
     Fair,
 }
 
-/// get where the task should be
-///
+/// 根据任务的调度策略和优先级，确定其应放入的就绪队列槽位（RT 或 Fair）
+
 fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
     // if getting processblock fails,we set this to fair
     let Some(process) = task.process.upgrade() else {
@@ -180,6 +190,8 @@ fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
         )
     };
     // according to the policy number,decide the target position
+    // FIFO RR 都加入到 RT
+    // 其余 FAIR
     match sched_class(policy) {
         Some(SchedClass::Fifo) | Some(SchedClass::Rr) => {
             ReadyQueueSlot::Rt(rt_queue_index(rt_priority))
@@ -188,6 +200,7 @@ fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
     }
 }
 
+/// 获取任务所属的 fair group ID 及其权重（shares），用于 CFS 调度决策
 fn fair_group_id_and_shares(task: &Arc<TaskControlBlock>) -> Option<(u64, u64)> {
     let process = task.process.upgrade()?;
     let tgid = process.getpid();
@@ -195,6 +208,8 @@ fn fair_group_id_and_shares(task: &Arc<TaskControlBlock>) -> Option<(u64, u64)> 
     Some(legacy_cpu_fair_group(tgid, tid_index))
 }
 
+/// 任务重新入队时根据已消耗的 CPU 时间累加 group 的 vruntime，实现 CFS 的 CPU 时间记账
+/// vrntime 更新函数
 fn account_fair_task_enqueue(group: &mut FairGroupQueue, task: &Arc<TaskControlBlock>) {
     const DEFAULT_SHARES: u128 = 1024;
     let mut inner = task.borrow_mut();
@@ -202,16 +217,19 @@ fn account_fair_task_enqueue(group: &mut FairGroupQueue, task: &Arc<TaskControlB
     let delta_ns = current_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
     if delta_ns > 0 {
         let shares = u128::from(group.shares.max(1));
+        // vruntime += delta_ns * 1024 / shares，即权重越大 vruntime 增长越慢，从而获得更多 CPU
         let scaled = ((u128::from(delta_ns) * DEFAULT_SHARES) / shares).max(1);
         group.vruntime = group.vruntime.saturating_add(scaled);
     }
     inner.fair_runtime_checkpoint_ns = current_ns;
 }
 
+/// 全局任务管理器，每个 Hart 维护一个独立就绪队列（包含 RT 和 CFS Fair 两个调度类）
 pub struct TaskManager {
     ready_queues: alloc::vec::Vec<HartRunQueue>,
 }
 
+/// 决定任务应放入哪个 hart 的就绪队列：优先 affinity 指定的 hart，否则用当前 hart，最后 fallback 到任意在线 hart
 fn resolve_enqueue_hart(task: &Arc<TaskControlBlock>, current_hart: usize, mask: usize) -> usize {
     let desired = task.get_cpu_id() % MAX_HARTS;
     if (mask & (1usize << desired)) != 0 {
@@ -228,11 +246,15 @@ fn resolve_enqueue_hart(task: &Arc<TaskControlBlock>, current_hart: usize, mask:
 
 /// A Linux-like split runqueue: RT queues + a fair queue.
 impl TaskManager {
+    /// 为每个 hart 创建一个空就绪队列
     pub fn new() -> Self {
         Self {
             ready_queues: (0..MAX_HARTS).map(|_| HartRunQueue::new()).collect(),
         }
     }
+    /// 关键函数
+    /// 将任务加入指定 hart 的就绪队列。返回 `true` 表示入队前该队列为空。
+    /// 使用 `in_ready_queue` 标志防止 SMP 下同一任务被重复入队。
     pub fn add(&mut self, task: Arc<TaskControlBlock>, hart_id: usize) -> bool {
         // Avoid enqueueing the same task multiple times under SMP.
         if task
@@ -277,6 +299,7 @@ impl TaskManager {
         was_empty
     }
 
+    /// 从 RT 队列头部弹出第一个状态为 Ready 的任务，跳过并清理状态已过期的任务
     fn pop_ready_candidate(
         queue: &mut VecDeque<Arc<TaskControlBlock>>,
         hart_id: usize,
@@ -308,6 +331,7 @@ impl TaskManager {
         None
     }
 
+    /// 检查 fair group 队列头部的任务状态，跳过并清理状态已过期的条目（不弹出，仅清理脏头部）
     fn prune_fair_group_front(
         queue: &mut VecDeque<Arc<TaskControlBlock>>,
         hart_id: usize,
@@ -340,6 +364,7 @@ impl TaskManager {
         None
     }
 
+    /// 从指定 hart 取走下一个可运行的任务：RT 优先级队列优先，CFS Fair group 选 vruntime 最小的 group
     pub fn fetch(&mut self, hart_id: usize) -> Option<Arc<TaskControlBlock>> {
         // Skip stale entries: under SMP, bugs or races can temporarily leave
         // non-ready tasks (Blocked/Running) in the ready queue. Never schedule them.
@@ -371,6 +396,7 @@ impl TaskManager {
                         }
                         continue;
                     }
+                    // 选择 vruntime 最小的 group（即获得 CPU 时间最少的 group），实现 CFS 公平调度
                     if group.vruntime < best_vruntime {
                         best_vruntime = group.vruntime;
                         best_group = Some(group_id);
@@ -416,6 +442,7 @@ impl TaskManager {
         }
         t
     }
+    /// 从所有 hart 的就绪队列中移除指定任务（同时清理 RT 和 Fair 队列中可能存在的重复条目）
     pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
         let mut removed = 0usize;
         for rq in self.ready_queues.iter_mut() {
@@ -455,10 +482,12 @@ impl TaskManager {
             .store(false, core::sync::atomic::Ordering::Release);
     }
 
+    /// 返回每个 hart 的就绪队列长度（用于调试和负载均衡）
     pub fn ready_queue_lengths(&self) -> alloc::vec::Vec<usize> {
         self.ready_queues.iter().map(HartRunQueue::len).collect()
     }
 
+    /// 调试用：统计指定任务在所有就绪队列中出现的引用次数（用于检测重复入队等异常）
     fn debug_count_task_refs(&self, task: &Arc<TaskControlBlock>) -> usize {
         self.ready_queues
             .iter()
@@ -475,6 +504,7 @@ impl TaskManager {
             .sum()
     }
 
+    /// 检查指定 hart 上是否有比给定优先级更高的 RT 任务就绪（用于 RT 抢占判断）
     fn has_ready_rt_higher_than(&self, hart_id: usize, priority: i32) -> bool {
         let rq = &self.ready_queues[hart_id];
         let prio = priority.clamp(RT_PRIO_MIN, RT_PRIO_MAX);
@@ -482,6 +512,7 @@ impl TaskManager {
         rq.rt_queues[..idx].iter().any(|q| !q.is_empty())
     }
 
+    /// 检查指定 hart 上是否有不低于给定优先级的 RT 任务就绪
     fn has_ready_rt_at_or_above(&self, hart_id: usize, priority: i32) -> bool {
         let rq = &self.ready_queues[hart_id];
         let prio = priority.clamp(RT_PRIO_MIN, RT_PRIO_MAX);
@@ -491,11 +522,15 @@ impl TaskManager {
 }
 
 lazy_static! {
+    /// 全局任务管理器（受 spin::Mutex 保护，中断安全的加锁）
     pub static ref TASK_MANAGER: Mutex<TaskManager> = Mutex::new(TaskManager::new());
+    /// PID 到 PCB 的全局映射表（受 spin::Mutex 保护）
     pub static ref PID2PCB: Mutex<BTreeMap<usize, Arc<ProcessControlBlock>>> =
         Mutex::new(BTreeMap::new());
 }
 
+/// 将任务加入某个在线 hart 的就绪队列。目标 hart 空闲时（wfi）发送 IPI 唤醒之。
+/// 类似 Linux wake_up_process：优先使用 task->cpu 指定的 hart，否则放当前 hart。
 pub fn add_task(task: Arc<TaskControlBlock>) {
     // Protect the ready queue from timer interrupt re-entrancy, but restore the previous SIE state.
     let prev_sie = arch::disable_interrupts();
@@ -512,7 +547,7 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     arch::restore_interrupts(prev_sie);
 }
 
-/// Requeue runnable threads after policy/priority/nice changes.
+/// 在进程调度策略/优先级/nice 值变更后，重新将其所有可运行线程入队到正确的位置
 pub fn refresh_process_runqueues(process: &Arc<ProcessControlBlock>) {
     let tasks = {
         let inner = process.borrow_mut();
@@ -543,7 +578,9 @@ pub fn refresh_process_runqueues(process: &Arc<ProcessControlBlock>) {
     arch::restore_interrupts(prev_sie);
 }
 
+/// 唤醒一个阻塞中的任务。SMP 安全：如果任务还在其他 hart 上执行，则标记 wakeup_pending 让其自行处理。
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
+    // 尝试将阻塞任务转为 Ready 并加入就绪队列（cgroup 冻结时推迟唤醒）
     fn wake_if_blocked(task: Arc<TaskControlBlock>) {
         let mut task_inner = task.borrow_mut();
         if task_inner.res.is_none() {
@@ -574,6 +611,10 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     // sets `wakeup_pending`, but the task clears `on_cpu` and checks `wakeup_pending`
     // just before this store becomes visible. To avoid losing the wakeup, re-check
     // `on_cpu` after setting the flag and enqueue immediately if it is already off-cpu.
+    //
+    // 中文说明：SMP 下如果目标任务仍在其他核上执行，直接入队会导致内核栈竞争。
+    // 因此设置 wakeup_pending 标志，让那个核上正在退出的任务自行入队。
+    // 但存在竞态窗口：设置标志前任务刚好离开 CPU，所以设置后要再检查一次 on_cpu。
     if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
         task.wakeup_pending
             .store(true, core::sync::atomic::Ordering::Release);
@@ -586,12 +627,14 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     wake_if_blocked(task);
 }
 
+/// 将任务从全局就绪队列中移除（关中断，防止与定时器中断路径竞争）
 pub fn remove_task(task: Arc<TaskControlBlock>) {
     let prev_sie = arch::disable_interrupts();
     TASK_MANAGER.lock().remove(task);
     arch::restore_interrupts(prev_sie);
 }
 
+/// 调试用：返回指定任务在所有就绪队列中的引用计数（检测重复入队）
 pub fn debug_count_task_refs_in_runqueues(task: &Arc<TaskControlBlock>) -> usize {
     let prev_sie = arch::disable_interrupts();
     let count = TASK_MANAGER.lock().debug_count_task_refs(task);
@@ -599,6 +642,7 @@ pub fn debug_count_task_refs_in_runqueues(task: &Arc<TaskControlBlock>) -> usize
     count
 }
 
+/// 从当前 hart 的就绪队列中取走下一个可运行的任务（RT 优先，其次 CFS fair group 中选 vruntime 最小的）
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     let prev_sie = arch::disable_interrupts();
     let hart_id = crate::task::processor::hart_id();
@@ -607,6 +651,7 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     t
 }
 
+/// 检查当前 hart 上是否有比给定优先级更高的 RT 任务就绪（用于 RT 抢占判断）
 pub fn has_ready_rt_higher_than(priority: i32) -> bool {
     let prev_sie = arch::disable_interrupts();
     let hart_id = crate::task::processor::hart_id();
@@ -617,6 +662,7 @@ pub fn has_ready_rt_higher_than(priority: i32) -> bool {
     ready
 }
 
+/// 检查当前 hart 上是否有不低于给定优先级的 RT 任务就绪
 pub fn has_ready_rt_at_or_above(priority: i32) -> bool {
     let prev_sie = arch::disable_interrupts();
     let hart_id = crate::task::processor::hart_id();
@@ -627,11 +673,13 @@ pub fn has_ready_rt_at_or_above(priority: i32) -> bool {
     ready
 }
 
+/// 根据 PID 从全局映射表中查询对应的进程控制块
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     let map = PID2PCB.lock();
     map.get(&pid).map(Arc::clone)
 }
 
+/// 将进程插入全局 PID->PCB 映射表，当 map 大小达到 2 的幂时输出调试日志
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
     let mut map = PID2PCB.lock();
     map.insert(pid, process);
@@ -641,6 +689,7 @@ pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
     }
 }
 
+/// 从全局 PID->PCB 映射表中移除指定 PID，找不到时输出警告
 pub fn remove_from_pid2process(pid: usize) {
     let mut map = PID2PCB.lock();
     if map.remove(&pid).is_none() {
@@ -656,6 +705,7 @@ pub fn remove_from_pid2process(pid: usize) {
     }
 }
 
+/// 从全局定时器堆中移除所有属于指定任务的定时器（任务退出时清理）
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
     let mut timers = TIMERS.lock();
     let mut temp = BinaryHeap::<TimeWrap>::new();
@@ -668,6 +718,7 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
     timers.append(&mut temp);
 }
 
+/// 完整清理一个不再活跃的任务：从 futex 等待队列、条件变量等待队列、定时器堆和就绪队列中移除
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     // 这里可能会加入 todo
     crate::syscall::futex::remove_futex_waiters(&task);

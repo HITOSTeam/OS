@@ -988,7 +988,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             }
         }
         // Mark zombie and capture parent pointer first...
-        let parent = {
+        let (parent, exit_signal) = {
             let mut process_inner = process.borrow_mut();
             crate::syscall::process::unregister_executing_inode(
                 process_inner.exec_inode_dev,
@@ -997,7 +997,10 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             process_inner.is_zombie = true;
             process_inner.dumped_core = dumped_core;
             process_inner.exit_code = exit_code;
-            process_inner.parent.as_ref().and_then(|p| p.upgrade())
+            (
+                process_inner.parent.as_ref().and_then(|p| p.upgrade()),
+                process_inner.exit_signal,
+            )
         }; // drop child PCB lock before touching parent to avoid lock inversion
         crate::fs::wake_pidfd_poll_waiters(pid);
         kill_pid_namespace_members_on_init_exit(&process);
@@ -1006,10 +1009,11 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
         // ...then wake parent waiters (waitpid) without holding the child PCB lock.
         if let Some(parent) = parent {
-            crate::task::signal::queue_process_signal(
-                parent.getpid(),
-                crate::task::signal::SIGCHLD_NUM,
-            );
+            // clone(2) allows exit_signal=0 to suppress parent notification entirely.
+            // Only send the signal when the caller explicitly requested one.
+            if exit_signal > 0 {
+                crate::task::signal::queue_process_signal(parent.getpid(), exit_signal as usize);
+            }
             let waiters = {
                 let mut parent_inner = parent.borrow_mut();
                 parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
@@ -1106,7 +1110,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         }
     }
 
-    let parent = {
+    let (parent, exit_signal) = {
         let mut process_inner = process.borrow_mut();
         crate::syscall::process::unregister_executing_inode(
             process_inner.exec_inode_dev,
@@ -1115,17 +1119,21 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         process_inner.is_zombie = true;
         process_inner.dumped_core = dumped_core;
         process_inner.exit_code = exit_code;
-        process_inner.parent.as_ref().and_then(|p| p.upgrade())
+        (
+            process_inner.parent.as_ref().and_then(|p| p.upgrade()),
+            process_inner.exit_signal,
+        )
     };
     crate::fs::wake_pidfd_poll_waiters(pid);
     cgroup_exit_process(pid);
     crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
     if let Some(parent) = parent {
-        crate::task::signal::queue_process_signal(
-            parent.getpid(),
-            crate::task::signal::SIGCHLD_NUM,
-        );
+        // clone(2) allows exit_signal=0 to suppress parent notification entirely.
+        // Only send the signal when the caller explicitly requested one.
+        if exit_signal > 0 {
+            crate::task::signal::queue_process_signal(parent.getpid(), exit_signal as usize);
+        }
         let waiters = {
             let mut parent_inner = parent.borrow_mut();
             parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
