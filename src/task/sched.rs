@@ -26,6 +26,10 @@ pub const SCHED_BATCH: i32 = 3;
 pub const SCHED_IDLE: i32 = 5;
 /// SCHED_DEADLINE — 实时 deadline 调度策略（目前仅做参数校验，未实际调度）。
 pub const SCHED_DEADLINE: i32 = 6;
+/// Linux policy flag: reset privileged scheduling state in children after fork.
+pub const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+/// `sched_setattr(2)` flag corresponding to SCHED_RESET_ON_FORK.
+pub const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 
 /// POSIX nice 值下限：-20（最高优先级）。
 pub const NICE_MIN: i32 = -20;

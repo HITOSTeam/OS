@@ -11,9 +11,9 @@ use crate::{
         manager::{pid2process, refresh_process_runqueues},
         processor::{current_process, hart_id, suspend_current_and_run_next},
         sched::{
-            RR_TIMESLICE_MS, SCHED_BATCH, SCHED_DEADLINE, SCHED_IDLE, SCHED_OTHER, SchedClass,
-            check_policy, clamp_nice, policy_priority_max, policy_priority_min, sched_class,
-            valid_priority_for_policy,
+            RR_TIMESLICE_MS, SCHED_BATCH, SCHED_DEADLINE, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE,
+            SCHED_OTHER, SCHED_RESET_ON_FORK, SchedClass, check_policy, clamp_nice,
+            policy_priority_max, policy_priority_min, sched_class, valid_priority_for_policy,
         },
     },
     trap::get_current_token,
@@ -126,9 +126,20 @@ pub fn syscall_sched_getscheduler(pid: usize) -> isize {
     let Some(process) = resolve_process(pid) else {
         return err(SyscallError::ESRCH);
     };
-    let policy = process.borrow_mut().scheduling.sched_policy;
+    let (policy, reset_on_fork) = {
+        let inner = process.borrow_mut();
+        (
+            inner.scheduling.sched_policy,
+            inner.scheduling.reset_on_fork,
+        )
+    };
     if check_policy(policy) {
-        policy as isize
+        let reset_flag = if reset_on_fork {
+            SCHED_RESET_ON_FORK
+        } else {
+            0
+        };
+        (policy | reset_flag) as isize
     } else {
         0
     }
@@ -229,7 +240,12 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
     let Some(process) = resolve_process(pid) else {
         return err(SyscallError::ESRCH);
     };
-    let policy = policy as i32;
+    let reset_on_fork = (policy & SCHED_RESET_ON_FORK as usize) != 0;
+    let policy_bits = policy & !(SCHED_RESET_ON_FORK as usize);
+    if policy_bits > i32::MAX as usize {
+        return err(SyscallError::EINVAL);
+    }
+    let policy = policy_bits as i32;
     if !check_policy(policy) {
         return err(SyscallError::EINVAL);
     }
@@ -250,6 +266,7 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
     let mut inner = process.borrow_mut();
     inner.scheduling.sched_policy = policy;
     inner.scheduling.sched_priority = prio;
+    inner.scheduling.reset_on_fork = reset_on_fork;
     if policy != SCHED_DEADLINE {
         inner.scheduling.sched_runtime = 0;
         inner.scheduling.sched_deadline = 0;
@@ -416,11 +433,16 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     let Some(process) = resolve_process(pid) else {
         return err(SyscallError::ESRCH);
     };
-    let (policy, prio, nice, runtime, deadline, period) = {
+    let (policy, prio, flags, nice, runtime, deadline, period) = {
         let inner = process.borrow_mut();
         (
             inner.scheduling.sched_policy as u32,
             inner.scheduling.sched_priority as u32,
+            if inner.scheduling.reset_on_fork {
+                SCHED_FLAG_RESET_ON_FORK
+            } else {
+                0
+            },
             inner.scheduling.nice,
             inner.scheduling.sched_runtime,
             inner.scheduling.sched_deadline,
@@ -432,6 +454,7 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     let copy_len = core::cmp::min(size, struct_size);
     attr.size = copy_len as u32;
     attr.sched_policy = policy;
+    attr.sched_flags = flags;
     attr.sched_priority = prio;
     attr.sched_nice = nice;
     attr.sched_runtime = runtime;
@@ -464,18 +487,27 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
         return err(SyscallError::EPERM);
     }
     let token = get_current_token();
+    let Some(user_size) = try_read_user_value(token, attr_ptr as *const u32) else {
+        return err(SyscallError::EFAULT);
+    };
+    if user_size < SCHED_ATTR_SIZE_V0 as u32 {
+        return err(SyscallError::EINVAL);
+    }
+
     let mut attr = SchedAttr::default();
-    // SAFETY: attr is a stack-local struct with known layout; length equals size_of::<SchedAttr>().
+    let struct_size = core::mem::size_of::<SchedAttr>();
+    let copy_len = core::cmp::min(user_size as usize, struct_size);
+    // SAFETY: attr is a stack-local struct with known layout; copy_len is bounded by size_of::<SchedAttr>().
     let dst_bytes = unsafe {
-        core::slice::from_raw_parts_mut(
-            &mut attr as *mut SchedAttr as *mut u8,
-            core::mem::size_of::<SchedAttr>(),
-        )
+        core::slice::from_raw_parts_mut(&mut attr as *mut SchedAttr as *mut u8, copy_len)
     };
     if try_copy_from_user(token, attr_ptr as *const u8, dst_bytes).is_err() {
         return err(SyscallError::EFAULT);
     }
     if attr.size < SCHED_ATTR_SIZE_V0 as u32 {
+        return err(SyscallError::EINVAL);
+    }
+    if (attr.sched_flags & !SCHED_FLAG_RESET_ON_FORK) != 0 {
         return err(SyscallError::EINVAL);
     }
     let policy = attr.sched_policy as i32;
@@ -503,6 +535,7 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
     inner.scheduling.sched_policy = policy;
     inner.scheduling.sched_priority = prio;
     inner.scheduling.nice = nice;
+    inner.scheduling.reset_on_fork = (attr.sched_flags & SCHED_FLAG_RESET_ON_FORK) != 0;
     if policy == SCHED_DEADLINE {
         inner.scheduling.sched_runtime = attr.sched_runtime;
         inner.scheduling.sched_deadline = attr.sched_deadline;

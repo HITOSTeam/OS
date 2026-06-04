@@ -25,6 +25,7 @@ use crate::task::manager::{
     wakeup_task,
 };
 use crate::task::processor::current_task;
+use crate::task::sched::{SCHED_DEADLINE, SCHED_FIFO, SCHED_OTHER, SCHED_RR};
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
     RT_SIG_MAX, RtSigAction, SIG_IGN, SIGCHLD_NUM, SignalAction, SignalActions, SignalFlags,
@@ -912,6 +913,8 @@ pub struct ProcessScheduling {
     pub sched_period: u64,
     /// POSIX nice value used by getpriority/setpriority.
     pub nice: i32,
+    /// Linux SCHED_RESET_ON_FORK / SCHED_FLAG_RESET_ON_FORK state.
+    pub reset_on_fork: bool,
 }
 
 // TODO(credentials): ProcessCredentials (uid/euid/suid/fsuid, gid/egid/sgid/fsgid,
@@ -1293,6 +1296,7 @@ impl ProcessControlBlock {
                     sched_deadline: 0,
                     sched_period: 0,
                     nice: 0,
+                    reset_on_fork: false,
                 },
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
@@ -1435,6 +1439,7 @@ impl ProcessControlBlock {
             inner.mmap_areas.clear();
             inner.mlocked_ranges.clear();
             inner.mlockall_future = false;
+            inner.scheduling.reset_on_fork = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
             let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
@@ -1519,6 +1524,7 @@ impl ProcessControlBlock {
             inner.mmap_areas.clear();
             inner.mlocked_ranges.clear();
             inner.mlockall_future = false;
+            inner.scheduling.reset_on_fork = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
             let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
@@ -1602,6 +1608,36 @@ impl ProcessControlBlock {
         let sched_deadline = parent.scheduling.sched_deadline;
         let sched_period = parent.scheduling.sched_period;
         let nice = parent.scheduling.nice;
+        let reset_on_fork = parent.scheduling.reset_on_fork;
+        let (
+            child_sched_policy,
+            child_sched_priority,
+            child_sched_runtime,
+            child_sched_deadline,
+            child_sched_period,
+            child_nice,
+        ) = if reset_on_fork {
+            let (policy, priority, runtime, deadline, period) = match sched_policy {
+                SCHED_FIFO | SCHED_RR | SCHED_DEADLINE => (SCHED_OTHER, 0, 0, 0, 0),
+                _ => (
+                    sched_policy,
+                    sched_priority,
+                    sched_runtime,
+                    sched_deadline,
+                    sched_period,
+                ),
+            };
+            (policy, priority, runtime, deadline, period, nice.max(0))
+        } else {
+            (
+                sched_policy,
+                sched_priority,
+                sched_runtime,
+                sched_deadline,
+                sched_period,
+                nice,
+            )
+        };
         let cpu_affinity_mask = parent.scheduling.cpu_affinity_mask;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
@@ -1793,13 +1829,14 @@ impl ProcessControlBlock {
                 handling_signal: -1,
                 rt_sig_handlers,
                 scheduling: ProcessScheduling {
-                    sched_policy,
+                    sched_policy: child_sched_policy,
                     cpu_affinity_mask,
-                    sched_priority,
-                    sched_runtime,
-                    sched_deadline,
-                    sched_period,
-                    nice,
+                    sched_priority: child_sched_priority,
+                    sched_runtime: child_sched_runtime,
+                    sched_deadline: child_sched_deadline,
+                    sched_period: child_sched_period,
+                    nice: child_nice,
+                    reset_on_fork: false,
                 },
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
