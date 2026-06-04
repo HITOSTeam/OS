@@ -219,6 +219,15 @@ pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags:
     // Resolve through the fd-held Weak<ProcessControlBlock>, so a stale proc
     // pidfd cannot accidentally signal an unrelated process after PID reuse.
 
+    if !can_signal_process(&process, sig) {
+        return err(SyscallError::EPERM);
+    }
+    // sig=0 is a Linux convention: probe whether the process exists and is
+    // reachable without actually delivering any signal or touching siginfo.
+    if sig == 0 {
+        return 0;
+    }
+
     let sender = current_process();
     let sender_pid = sender.getpid() as i32;
     let sender_uid = {
@@ -244,14 +253,6 @@ pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags:
         (0, 0)
     };
 
-    if !can_signal_process(&process, sig) {
-        return err(SyscallError::EPERM);
-    }
-    // sig=0 is a Linux convention: probe whether the process exists and is
-    // reachable without actually delivering any signal.
-    if sig == 0 {
-        return 0;
-    }
     let signum = sig as usize;
     if rt_sigpending_limit_reached(&process, signum) {
         return err(SyscallError::EAGAIN);
