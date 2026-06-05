@@ -4,7 +4,6 @@
 .equ CSR_CPUID, 0x20
 .equ CSR_DMW0, 0x180
 .equ CSR_DMW1, 0x181
-.equ UART_THR,  0x1fe001e0
 
 _start:
     csrrd $a0, CSR_CPUID
@@ -31,9 +30,7 @@ _start:
     csrwr       $t2,    CSR_DMW1
     csrwr       $t1,    CSR_DMW0
 
-    li.d        $t0,    UART_THR
-    li.w        $t1,    0x41
-    st.b        $t1,    $t0,    0
+
 
     bl rust_main
 

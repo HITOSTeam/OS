@@ -296,19 +296,19 @@ pub fn trap_return() -> ! {
     //         trap_cx_user_va
     //     );
     // }
-    // {
-    //     let cx = get_trap_context();
-    //     if trace_first_return {
-    //         println!(
-    //             "[trap_return] stage2 trap_cx_ptr={:#x} era={:#x} kernel_sp={:#x} kernel_tp={:#x}",
-    //             (cx as *mut TrapContext) as usize,
-    //             cx.sepc,
-    //             cx.kernel_sp,
-    //             cx.kernel_tp
-    //         );
-    //     }
-    //     cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
-    // }
+    {
+        let cx = get_trap_context();
+        // if trace_first_return {
+        //     println!(
+        //         "[trap_return] stage2 trap_cx_ptr={:#x} era={:#x} kernel_sp={:#x} kernel_tp={:#x}",
+        //         (cx as *mut TrapContext) as usize,
+        //         cx.sepc,
+        //         cx.kernel_sp,
+        //         cx.kernel_tp
+        //     );
+        // }
+        cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
+    }
     // IMPORTANT: `trap_return()` diverges, so keep Arc owners in a short scope.
     let (trap_cx_ptr, user_token) = {
         let task = crate::task::processor::current_task().unwrap();
