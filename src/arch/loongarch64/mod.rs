@@ -125,6 +125,14 @@ pub fn disable_direct_map_windows() {
     }
 }
 
+pub fn disable_direct_map_window0() {
+    // SAFETY: DMW0 (CSR 0x180) write and invtlb are valid in kernel mode.
+    unsafe {
+        asm!("csrwr {}, 0x180", in(reg) 0usize);
+        asm!("invtlb 0x0, $r0, $r0");
+    }
+}
+
 pub fn hart_id() -> usize {
     let mut id: usize;
     // SAFETY: CPUID (CSR 0x20) read is valid in kernel mode on LoongArch.

@@ -66,7 +66,8 @@ fn write_pgdl(base: usize) {
     // SAFETY: `base` is a kernel-constructed page-table root physical address, and writing PGDL
     // is only valid in kernel mode. A bogus base would redirect low-half translations incorrectly.
     unsafe {
-        asm!("csrwr {}, 0x19", in(reg) base);
+        let mut csr = base;
+        asm!("csrwr {}, 0x19", inout(reg) csr);
     }
 }
 
@@ -75,7 +76,8 @@ fn write_pgdh(base: usize) {
     // SAFETY: `base` is the current root page-table base and this privileged CSR write updates
     // the high-half walker state. An invalid base would break kernel address translation.
     unsafe {
-        asm!("csrwr {}, 0x1a", in(reg) base);
+        let mut csr = base;
+        asm!("csrwr {}, 0x1a", inout(reg) csr);
     }
 }
 
@@ -394,6 +396,7 @@ impl PageTable {
         let base = self.root_ppn.0 << 12;
         let kernel_token = crate::mm::cached_kernel_token();
         if kernel_token == 0 || self.root_ppn.0 == kernel_token {
+            //内核使用 pgdh ,用户都是在低半区
             write_pgdh(base);
         }
         write_pgdl(base);

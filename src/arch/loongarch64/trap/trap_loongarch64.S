@@ -51,7 +51,11 @@ restore:
     # a0: TrapContext pointer, a1: user page table token
     # Set EENTRY first so any interrupt during page-table switch still
     # vectors to the trampoline handler (which is mapped in both page tables).
-    la $t0, alltraps
+    # Reconstruct the trampoline page base from the current PC so we stay
+    # entirely within the trampoline mapping and avoid a GOT/literal-pool load.
+    pcaddi $t0, 0
+    srli.d $t0, $t0, 12
+    slli.d $t0, $t0, 12
     csrwr $t0, 0xc
     # Now switch PGDL to user page table.
     slli.d $t0, $a1, 12

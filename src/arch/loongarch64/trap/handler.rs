@@ -268,19 +268,47 @@ pub fn trap_handler() {
 }
 
 pub fn trap_return() -> ! {
-    if DEBUG_TRAP && !TRAP_RETURN_ENTER_LOGGED.swap(true, Ordering::SeqCst) {
-        println!(
-            "[trap_return] enter hart={} trap_return_va={:#x}",
-            super::super::hart_id(),
-            trap_return as usize
-        );
-    }
+    // let trace_first_return =  !TRAP_RETURN_ENTER_LOGGED.swap(true, Ordering::SeqCst);
+    // if trace_first_return {
+    //     println!(
+    //         "[trap_return] enter hart={} trap_return_va={:#x}",
+    //         super::super::hart_id(),
+    //         trap_return as usize
+    //     );
+    // }
     // Keep kernel trap entry active while we are still running in kernel mode.
     set_kernel_trap_entry();
-    {
-        let cx = get_trap_context();
-        cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
-    }
+    // if trace_first_return {
+    //     let task = crate::task::processor::current_task().unwrap();
+    //     let (trap_cx_ppn, trap_cx_user_va) = {
+    //         let task_inner = task.borrow_mut();
+    //         let trap_cx_user_va = task_inner
+    //             .res
+    //             .as_ref()
+    //             .map(|res| res.trap_cx_user_va())
+    //             .unwrap_or(0);
+    //         (task_inner.trap_cx_ppn, trap_cx_user_va)
+    //     };
+    //     println!(
+    //         "[trap_return] stage1 task_ptr={:#x} trap_cx_ppn={:#x} trap_cx_user_va={:#x}",
+    //         (&*task as *const _) as usize,
+    //         trap_cx_ppn.0,
+    //         trap_cx_user_va
+    //     );
+    // }
+    // {
+    //     let cx = get_trap_context();
+    //     if trace_first_return {
+    //         println!(
+    //             "[trap_return] stage2 trap_cx_ptr={:#x} era={:#x} kernel_sp={:#x} kernel_tp={:#x}",
+    //             (cx as *mut TrapContext) as usize,
+    //             cx.sepc,
+    //             cx.kernel_sp,
+    //             cx.kernel_tp
+    //         );
+    //     }
+    //     cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
+    // }
     // IMPORTANT: `trap_return()` diverges, so keep Arc owners in a short scope.
     let (trap_cx_ptr, user_token) = {
         let task = crate::task::processor::current_task().unwrap();
@@ -344,6 +372,7 @@ pub fn trap_return() -> ! {
         fn alltraps();
         fn restore();
     }
+    //这两个函数都在TRAMPOLINE那个地址处,然后alltraps对应地址0 相减计算出对应的汇编地址
     let restore_va = restore as usize - alltraps as usize + TRAMPOLINE;
     // SAFETY: `restore_va` points at the trampoline restore stub, and the argument registers are
     // loaded with the trap context pointer and user token expected by that stub. Jumping to the

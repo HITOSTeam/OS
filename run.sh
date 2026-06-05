@@ -1,6 +1,6 @@
 set -e
-cp testsuits-for-oskernel/sdcard/sdcard-rv.img ./sdcard-rv.img
-cp loongarch_img_info/sdcard-la.img ./sdcard-la.img
+# cp testsuits-for-oskernel/sdcard/sdcard-rv.img ./sdcard-rv.img
+# cp loongarch_img_info/sdcard-la.img ./sdcard-la.img
 
 # rm if possible
 if [ -f output.md ]; then

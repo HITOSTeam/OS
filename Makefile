@@ -57,7 +57,7 @@ else ifeq ($(ARCH),loongarch64)
     QEMU_BLK_DEV1    := virtio-blk-pci,drive=x1
     QEMU_NET_DEV     := virtio-net-pci,netdev=net
     QEMU_BIOS_ARGS   :=
-    GDB_ARCH         := loongarch
+    GDB_ARCH         := Loongarch64
     CARGO_CONFIG     := $(ROOT_DIR)/cargo-config/config_loongarch64.toml
     DISK_IMG         ?= ../sdcard-la.img
     EXT4_BASE_IMG    ?= ../img/disk-la.img
@@ -74,6 +74,8 @@ MODE         ?= release
 SMP          ?= 4
 MEM          ?= 1G
 QEMU_TIMEOUT ?= 0
+# 为了编译debug模式额外添加的命令参数
+QEMU_EXTRA_ARGS ?=
 SUBMIT       ?= 0
 EXT4_REBUILD ?= 0
 EXT4_SIZE    ?= 1G
@@ -89,11 +91,14 @@ HOST_TRIPLE  ?= $(shell rustc -vV | sed -n 's/^host: //p')
 
 # Forward `--features submit` to user apps when SUBMIT=1.
 USER_FEATURES := $(if $(filter 1,$(SUBMIT)),--features submit,)
+# Cargo's debug profile is the default; only release needs an explicit flag.
+CARGO_MODE_ARGS := $(if $(filter release,$(MODE)),--release,)
 
 # ----------------------------------------------------------------------
 # Derived paths
 # ----------------------------------------------------------------------
 KERNEL_ELF      := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)/os
+KERNEL_LOAD_ELF := kernel_$(MODE).load.elf
 KERNEL_BIN      := kernel_$(MODE).bin
 KERNEL_DBG_ELF  := kernel_$(MODE).elf
 USER_TARGET_DIR := $(USER_DIR)/target/$(TARGET)/$(MODE)
@@ -113,7 +118,7 @@ endif
 # ----------------------------------------------------------------------
 # QEMU command-line fragments
 # ----------------------------------------------------------------------
-QEMU_BASE_ARGS  := -machine virt -kernel $(KERNEL_ELF) -m $(MEM) -smp $(SMP) \
+QEMU_BASE_ARGS  := -machine virt -kernel $(KERNEL_LOAD_ELF) -m $(MEM) -smp $(SMP) \
                    -nographic -rtc base=utc -no-reboot
 QEMU_DISK0_ARGS := -drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
                    -device $(QEMU_BLK_DEV0)
@@ -159,13 +164,16 @@ prepare-cargo:
 # `rust-objcopy` is optional: QEMU boots the ELF directly when the raw
 # binary cannot be produced.
 kernel: prepare-cargo user_apps
-	@cargo build --$(MODE) --target $(TARGET)
+	@cargo build $(CARGO_MODE_ARGS) --target $(TARGET)
 	@OBJCOPY=$$(command -v rust-objcopy || command -v llvm-objcopy || true); \
 	if [ -n "$$OBJCOPY" ]; then \
 		$$OBJCOPY --strip-all $(KERNEL_ELF) -O binary $(KERNEL_BIN); \
 		echo "Build $(KERNEL_BIN) successfully."; \
+		$$OBJCOPY --strip-debug $(KERNEL_ELF) $(KERNEL_LOAD_ELF); \
+		echo "Build $(KERNEL_LOAD_ELF) successfully."; \
 	else \
 		echo "⚠️  No objcopy found; skip $(KERNEL_BIN) (QEMU uses ELF)."; \
+		cp $(KERNEL_ELF) $(KERNEL_LOAD_ELF); \
 	fi
 	@cp $(KERNEL_ELF) $(KERNEL_DBG_ELF)
 
@@ -174,7 +182,7 @@ kernel: prepare-cargo user_apps
 # the log quiet when a binary has not actually changed.
 user_apps: prepare-cargo
 	@cd $(USER_DIR) && CARGO_TARGET_DIR=target \
-	    cargo build --$(MODE) $(USER_FEATURES) --target $(TARGET)
+	    cargo build $(CARGO_MODE_ARGS) $(USER_FEATURES) --target $(TARGET)
 	@mkdir -p $(APP_DIR)
 	@for f in $(USER_TARGET_DIR)/*; do \
 		[ -f "$$f" ] && [ -x "$$f" ] || continue; \
@@ -249,7 +257,7 @@ ext4_base_img:
 run run_ext4: kernel ext4_img
 	@echo "🔍 Running QEMU with VirtIO block device..."
 	@echo "   ➜ File System Image: $(EXT4_IMG)"
-	$(QEMU_RUN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) \
+	$(QEMU_RUN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_EXTRA_ARGS) \
 	    $(QEMU_DISK0_ARGS) $(QEMU_NET_ARGS) $(QEMU_DISK1_ARGS)
 
 # QEMU halts at reset and listens for a GDB client on :1234. The
@@ -257,16 +265,44 @@ run run_ext4: kernel ext4_img
 # are not killed mid-debug.
 debug debug_ext4: kernel ext4_img
 	@echo "🐛 Starting QEMU in debug mode (gdb target: localhost:1234)..."
-	@$(QEMU_BIN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_DISK0_ARGS) -s -S
+	@$(QEMU_BIN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_EXTRA_ARGS) $(QEMU_DISK0_ARGS) -s -S
 
 # Companion to `debug` / `debug_ext4`: attach the bundled GDB client.
 client_gdb:
 	@./elf-gdb \
 		-ex 'file $(KERNEL_ELF)' \
 		-ex 'set arch $(GDB_ARCH)' \
-		-ex 'target remote localhost:1234' \
+		-ex 'target remote 127.0.0.1:1234' \
 		-ex 'display/10i $$pc'
-
+		
+#我本地没有elf-gdb,所以改成使用这个
+client_gdb_xcy:
+	@GDB_CMD=""; \
+	if [ "$(ARCH)" = "riscv64" ]; then \
+		GDB_CMD="../bin/riscv64-unknown-elf-gdb"; \
+	elif [ "$(ARCH)" = "loongarch64" ]; then \
+		GDB_CMD="../bin/loongarch64-linux-gnu-gdb"; \
+	else \
+		echo "❌ Unsupported ARCH=$(ARCH) for client_gdb"; \
+		exit 2; \
+	fi; \
+	if [ ! -x "$$GDB_CMD" ]; then \
+		echo "❌ GDB not found or not executable: $$GDB_CMD"; \
+		exit 127; \
+	fi; \
+	echo "🔗 Using GDB: $$GDB_CMD"; \
+	if [ "$(ARCH)" = "loongarch64" ]; then \
+		GDB_VER=$$($$GDB_CMD --version | head -n1); \
+		echo "ℹ️  $$GDB_VER"; \
+		echo "ℹ️  If you see 'Architecture rejected target-supplied description' or"; \
+		echo "   'Remote g packet reply is too long', this is a GDB<->QEMU version mismatch,"; \
+		echo "   not a kernel runtime bug. Use a newer loongarch gdb."; \
+	fi; \
+	$$GDB_CMD \
+		-ex 'file $(KERNEL_ELF)' \
+		-ex 'set arch $(GDB_ARCH)' \
+		-ex 'target remote 127.0.0.1:1234' \
+		-ex 'display/10i $$pc'
 # ======================================================================
 # Housekeeping
 # ======================================================================

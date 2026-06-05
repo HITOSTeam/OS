@@ -232,6 +232,7 @@ impl TaskControlBlock {
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
+                //创建应用的时候把他设置为trap_return,这样第一次switch的时候就会从trap_return进入
                 task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
                 task_status: TaskStatus::Ready,
                 exit_code: None,
