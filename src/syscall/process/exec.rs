@@ -179,8 +179,18 @@ fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static st
     }
 }
 
+///eg 如果是#!/bin/sh
+/// interp_name = "sh" opt_arg = None
+/// 就是busybox sh {脚本路径}
+/// 
+/// #!/usr/bin/env sh
+/// interp_name = "env" opt_arg = Some("sh")
+/// 这个时候不能返回opt_arg 也应该是none,不然执行lua测试的时候会报错
+
 fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> Option<&'a str> {
     if interp_name == "env" && matches!(opt_arg, Some("sh") | Some("bash")) {
+        None
+    } else if interp_name == "busybox" && matches!(opt_arg, Some("sh") | Some("bash")) {
         None
     } else {
         opt_arg

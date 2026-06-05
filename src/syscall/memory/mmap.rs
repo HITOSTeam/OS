@@ -286,22 +286,22 @@ pub fn syscall_mmap(
     }
     let map_start = start;
     let map_end = end;
-    if is_anon && len >= LARGE_ANON_MMAP {
-        let pid = process.getpid();
-        crate::println!(
-            "[mmap] pid={} anon len={} map_len={} addr_hint={:#x} start={:#x} prot={:#x} flags={:#x} stack={} fd={} off={:#x}",
-            pid,
-            len,
-            map_len,
-            addr,
-            map_start,
-            prot,
-            flags,
-            (flags & MAP_STACK) != 0,
-            fd,
-            off
-        );
-    }
+    // if is_anon && len >= LARGE_ANON_MMAP {
+    //     let pid = process.getpid();
+    //     crate::println!(
+    //         "[mmap] pid={} anon len={} map_len={} addr_hint={:#x} start={:#x} prot={:#x} flags={:#x} stack={} fd={} off={:#x}",
+    //         pid,
+    //         len,
+    //         map_len,
+    //         addr,
+    //         map_start,
+    //         prot,
+    //         flags,
+    //         (flags & MAP_STACK) != 0,
+    //         fd,
+    //         off
+    //     );
+    // }
 
     let mut perm = MapPermission::U;
     if (prot & PROT_READ) != 0 {

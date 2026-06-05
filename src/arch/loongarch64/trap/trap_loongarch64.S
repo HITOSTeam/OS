@@ -53,6 +53,7 @@ restore:
     # vectors to the trampoline handler (which is mapped in both page tables).
     # Reconstruct the trampoline page base from the current PC so we stay
     # entirely within the trampoline mapping and avoid a GOT/literal-pool load.
+    # 就是取当前pc,并清零低12位,从rocket
     pcaddi $t0, 0
     srli.d $t0, $t0, 12
     slli.d $t0, $t0, 12
