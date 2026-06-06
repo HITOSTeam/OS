@@ -207,6 +207,11 @@ fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask
         let mut woke = 0usize;
         let mut remain = VecDeque::new();
         while let Some(waiter) = queue.pop_front() {
+            // 跳过已被其它路径（超时/信号/已被唤醒）标记出队的陈旧条目：in_queue
+            // 为 false 说明它逻辑上已不在队列，不能再次计入唤醒。
+            if !waiter.in_queue.load(Ordering::Acquire) {
+                continue;
+            }
             if woke < nr_wake && (waiter.bitset & bitset_mask) != 0 {
                 waiter.in_queue.store(false, Ordering::Release);
                 wake_list.push(waiter.task);
@@ -601,6 +606,10 @@ pub fn syscall_futex(
                     let Some(waiter) = queue1.pop_front() else {
                         break;
                     };
+                    // 同上：陈旧条目（in_queue=false）不计入本次唤醒。
+                    if !waiter.in_queue.load(Ordering::Acquire) {
+                        continue;
+                    }
                     waiter.in_queue.store(false, Ordering::Release);
                     wake_list.push(waiter.task);
                     woke += 1;
@@ -612,10 +621,16 @@ pub fn syscall_futex(
                         let Some(waiter) = queue1.pop_front() else {
                             break;
                         };
+                        // 搬移到 key2 时同样跳过陈旧条目，避免迁移已出队的 waiter。
+                        if !waiter.in_queue.load(Ordering::Acquire) {
+                            continue;
+                        }
                         target.push_back(waiter);
                         moved += 1;
                     }
                 }
+                // 回写 key1 队列前清掉残留的陈旧条目，保持队列只含仍在等待的 waiter。
+                queue1.retain(|waiter| waiter.in_queue.load(Ordering::Acquire));
                 if !queue1.is_empty() {
                     map.insert(key1, queue1);
                 }

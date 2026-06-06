@@ -472,7 +472,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     let mut inner = process.borrow_mut();
 
     let start = if shmaddr == 0 {
-        align_up(inner.mmap_next, PAGE_SIZE)
+        align_up(inner.memory_set.mmap_next(), PAGE_SIZE)
     } else {
         align_down(shmaddr, PAGE_SIZE)
     };
@@ -518,9 +518,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     seg.nattch += 1;
     seg.atime = now_secs();
     seg.lpid = pid;
-    if end > inner.mmap_next {
-        inner.mmap_next = end;
-    }
+    inner.memory_set.note_mmap_end(end);
     inner.sysv_shm_attaches.push(ShmAttach {
         addr: start,
         shmid,

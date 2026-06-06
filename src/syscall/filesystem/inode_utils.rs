@@ -668,36 +668,12 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
         let _ext4_guard = ext4_lock();
         (inode.device_id(), inode.inode_num())
     };
-    let write_end = write_off.saturating_add(len);
     let copies: Vec<(usize, usize, usize)> = {
         let process = current_process();
         let inner = process.borrow_mut();
-        let mut pending = Vec::new();
-        for region in inner.mmap_areas.iter() {
-            if !region.file_backed || region.file_dev != dev || region.file_ino != ino {
-                continue;
-            }
-            let Some(region_file_end) = region.file_offset.checked_add(region.len) else {
-                continue;
-            };
-            let overlap_start = core::cmp::max(write_off, region.file_offset);
-            let mut overlap_end = core::cmp::min(write_end, region_file_end);
-            let region_valid_len = region
-                .sigbus_start
-                .saturating_sub(region.start)
-                .min(region.len);
-            let region_valid_end = region.file_offset.saturating_add(region_valid_len);
-            overlap_end = core::cmp::min(overlap_end, region_valid_end);
-            if overlap_end <= overlap_start {
-                continue;
-            }
-            pending.push((
-                region.start + (overlap_start - region.file_offset),
-                overlap_start - write_off,
-                overlap_end - overlap_start,
-            ));
-        }
-        pending
+        inner
+            .memory_set
+            .file_vm_copy_targets(dev, ino, write_off, len)
     };
     if copies.is_empty() {
         return;

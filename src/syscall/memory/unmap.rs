@@ -20,18 +20,12 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
     }
 
     let overlaps = inner
-        .mmap_areas
-        .iter()
-        .copied()
-        .filter(|region| {
-            region.shared && region.file_backed && end > region.start && start < region.end()
-        })
-        .collect::<Vec<_>>();
+        .memory_set
+        .shared_file_vm_regions_overlapping(start, end);
     for region in overlaps {
         let Some(file) = inner
-            .mmap_backings
-            .get(&region.backing_id)
-            .cloned()
+            .memory_set
+            .mmap_backing_file(region.backing_id)
             .or_else(|| {
                 find_inode_file_in_snapshot(&files_snapshot, region.file_dev, region.file_ino)
                     .or_else(|| find_open_inode_file(region.file_dev, region.file_ino))
@@ -76,9 +70,9 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
     }
     inner.memory_set.unmap_user_range(start.into(), end.into());
 
-    // Update `mmap_areas` bookkeeping: remove/split any overlapping entries.
-    trim_mmap_regions(&mut inner.mmap_areas, start, end);
-    trim_ranges(&mut inner.mlocked_ranges, start, end);
+    // Update `vm_regions` bookkeeping: remove/split any overlapping entries.
+    inner.memory_set.trim_vm_regions(start, end);
+    inner.memory_set.trim_locked_ranges(start, end);
     0
 }
 
@@ -116,23 +110,17 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
     {
         return err(SyscallError::ENOMEM);
     }
-    if (flags & MS_INVALIDATE) != 0 && ranges_overlap(&inner.mlocked_ranges, addr, end) {
+    if (flags & MS_INVALIDATE) != 0 && inner.memory_set.locked_ranges_overlap(addr, end) {
         return err(SyscallError::EBUSY);
     }
     let overlaps = inner
-        .mmap_areas
-        .iter()
-        .copied()
-        .filter(|region| {
-            region.shared && region.file_backed && end > region.start && addr < region.end()
-        })
-        .collect::<Vec<_>>();
+        .memory_set
+        .shared_file_vm_regions_overlapping(addr, end);
     let mut cleared_dirty = false;
     for region in overlaps {
         let Some(file) = inner
-            .mmap_backings
-            .get(&region.backing_id)
-            .cloned()
+            .memory_set
+            .mmap_backing_file(region.backing_id)
             .or_else(|| {
                 find_inode_file_in_snapshot(&files_snapshot, region.file_dev, region.file_ino)
                     .or_else(|| find_open_inode_file(region.file_dev, region.file_ino))
@@ -144,7 +132,13 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
             continue;
         };
         let seg_start = core::cmp::max(addr, region.start);
-        let seg_end = core::cmp::min(end, region.end());
+        let valid_end = region
+            .start
+            .saturating_add(region.file_valid_len.min(region.len));
+        let seg_end = core::cmp::min(core::cmp::min(end, region.end()), valid_end);
+        if seg_end <= seg_start {
+            continue;
+        }
         let mut cur = align_down(seg_start, PAGE_SIZE);
         while cur < seg_end {
             let vpn = crate::mm::VirtAddr::from(cur).floor();
@@ -223,21 +217,11 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
 
-    let mut perm = MapPermission::U;
-    if (prot & PROT_READ) != 0 {
-        perm |= MapPermission::R;
-    }
-    if (prot & PROT_WRITE) != 0 {
-        perm |= MapPermission::W;
-    }
-    if (prot & PROT_EXEC) != 0 {
-        perm |= MapPermission::X;
-    }
+    let perm = VmRegion::permission_from_prot(prot);
 
     let process = current_process();
     let mut inner = process.borrow_mut();
-    let mut next_regions = inner.mmap_areas.clone();
-    if apply_mprotect_to_mmap_regions(&mut next_regions, addr, end, prot).is_err() {
+    if !inner.memory_set.can_mprotect_vm_regions(addr, end, prot) {
         return err(SyscallError::EACCES);
     }
     if !inner
@@ -246,7 +230,9 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     {
         return err(SyscallError::ENOMEM);
     }
-    inner.mmap_areas = next_regions;
+    let _ = inner
+        .memory_set
+        .apply_mprotect_to_vm_regions(addr, end, prot);
     // Ensure permission changes take effect immediately.
     #[cfg(target_arch = "riscv64")]
     // SAFETY: sfence.vma is a privileged instruction valid in S-mode; flushes TLB.

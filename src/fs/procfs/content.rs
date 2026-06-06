@@ -11,7 +11,7 @@ use crate::task::task_block::TaskStatus;
 
 use super::ProcFileKind;
 use super::entries::{decode_proc_linux_tid, proc_pid_task_alive, proc_simple_text_content};
-use super::parse_proc_sys_usize;
+use super::{parse_proc_sys_i64, parse_proc_sys_usize};
 use crate::syscall::error::{SyscallError, err};
 
 const VM_OVERCOMMIT_MEMORY_DEFAULT: usize = 0;
@@ -134,6 +134,15 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
             "{}\n",
             crate::syscall::sysv_shm::runtime_shmall_for_procfs()
         ),
+        ProcFileKind::KernelSchedRtPeriodUs => {
+            alloc::format!("{}\n", crate::task::sched::rt_period_us())
+        }
+        ProcFileKind::KernelSchedRtRuntimeUs => {
+            alloc::format!("{}\n", crate::task::sched::rt_runtime_us())
+        }
+        ProcFileKind::KernelSchedRrTimesliceMs => {
+            alloc::format!("{}\n", crate::task::sched::rr_timeslice_ms())
+        }
         ProcFileKind::SimpleText(path) => proc_simple_text_content(path),
         ProcFileKind::PidStat(pid) => proc_pid_stat(*pid),
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
@@ -183,6 +192,29 @@ pub(super) fn write_fs_file_max_sysctl(data: &[u8]) -> Result<Vec<u8>, isize> {
     Ok(alloc::format!("{}\n", value).into_bytes())
 }
 
+/// 处理对三个 `/proc/sys/kernel/sched_*` 文件的写入：解析 i64 后路由到
+/// `task::sched` 的对应 setter；setter 拒绝（越界/违反约束）则返回 EINVAL，
+/// 成功则回显实际生效值（与 Linux procfs 行为一致）。
+pub(super) fn write_sched_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let value = parse_proc_sys_i64(data)?;
+    let applied = match path {
+        "/proc/sys/kernel/sched_rt_period_us" => {
+            crate::task::sched::set_rt_period_us_from_procfs(value)
+        }
+        "/proc/sys/kernel/sched_rt_runtime_us" => {
+            crate::task::sched::set_rt_runtime_us_from_procfs(value)
+        }
+        "/proc/sys/kernel/sched_rr_timeslice_ms" => {
+            crate::task::sched::set_rr_timeslice_ms_from_procfs(value).map(|v| v as i64)
+        }
+        _ => None,
+    };
+    let Some(applied) = applied else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    Ok(alloc::format!("{}\n", applied).into_bytes())
+}
+
 pub fn vm_overcommit_memory() -> usize {
     VM_OVERCOMMIT_MEMORY.load(Ordering::Relaxed)
 }
@@ -211,14 +243,8 @@ pub fn vm_committed_as_bytes() -> usize {
         let Some(inner) = process.try_borrow_mut() else {
             return acc;
         };
-        let heap = inner.brk.saturating_sub(inner.heap_start);
-        let anon_private = inner.mmap_areas.iter().fold(0usize, |sum, region| {
-            if !region.shared && !region.file_backed && (region.prot & 0x2) != 0 {
-                sum.saturating_add(region.len)
-            } else {
-                sum
-            }
-        });
+        let heap = inner.memory_set.heap_size();
+        let anon_private = inner.memory_set.anon_private_writable_vm_bytes();
         acc.saturating_add(heap).saturating_add(anon_private)
     })
 }
@@ -336,13 +362,9 @@ fn proc_pid_status(pid: u32) -> String {
                 .map(|ti| (ti.task_status, ti.cgroup_frozen))
         })
         .unwrap_or((TaskStatus::Ready, false));
-    let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-    let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
-    let vmlck_bytes: usize = inner
-        .mlocked_ranges
-        .iter()
-        .map(|(start, end)| end.saturating_sub(*start))
-        .sum();
+    let heap_bytes = inner.memory_set.heap_size();
+    let mmap_bytes = inner.memory_set.vm_regions_total_len();
+    let vmlck_bytes = inner.memory_set.locked_bytes();
     let vsize_kb: usize = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
     let vmlck_kb: usize = (vmlck_bytes + 1023) / 1024;
     let uid = inner.uid;
@@ -431,8 +453,8 @@ fn proc_pid_stat(pid: u32) -> String {
                 .map(|ti| (ti.task_status, ti.cgroup_frozen))
         })
         .unwrap_or((TaskStatus::Ready, false));
-    let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-    let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
+    let heap_bytes = inner.memory_set.heap_size();
+    let mmap_bytes = inner.memory_set.vm_regions_total_len();
     let vsize: u64 = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
 
     let comm = if inner.comm.is_empty() {
@@ -624,7 +646,7 @@ fn proc_pid_maps(pid: u32) -> String {
         }
         return String::new();
     };
-    let mut regions = inner.mmap_areas.clone();
+    let mut regions = inner.memory_set.vm_regions_snapshot();
     drop(inner);
     regions.sort_by_key(|r| r.start);
 
@@ -712,8 +734,10 @@ fn proc_kpageflags_entry(pfn: usize) -> u64 {
 }
 
 pub(super) fn proc_kpageflags_len() -> usize {
-    let phys_bytes = config::phys_mem_end().saturating_sub(config::phys_mem_start());
-    let page_count = phys_bytes / config::PAGE_SIZE;
+    // /proc/kpageflags is indexed by absolute PFN, matching the PFN exposed by
+    // /proc/*/pagemap.  RISC-V physical memory starts at a high address, so a
+    // span-only length makes valid PFN offsets look like EOF.
+    let page_count = config::phys_mem_end() / config::PAGE_SIZE;
     page_count.saturating_mul(8)
 }
 
@@ -771,12 +795,6 @@ pub(super) fn proc_pid_pagemap_read(pid: u32, offset: &mut usize, buf: &mut User
     total
 }
 
-fn range_overlap_len(start: usize, end: usize, lock_start: usize, lock_end: usize) -> usize {
-    let left = core::cmp::max(start, lock_start);
-    let right = core::cmp::min(end, lock_end);
-    right.saturating_sub(left)
-}
-
 fn proc_pid_smaps(pid: u32) -> String {
     const PROT_READ: usize = 1;
     const PROT_WRITE: usize = 2;
@@ -791,13 +809,21 @@ fn proc_pid_smaps(pid: u32) -> String {
         }
         return String::new();
     };
-    let mut regions = inner.mmap_areas.clone();
-    let mlocked = inner.mlocked_ranges.clone();
-    drop(inner);
+    let mut regions = inner.memory_set.vm_regions_snapshot();
     regions.sort_by_key(|r| r.start);
+    let regions = regions
+        .into_iter()
+        .map(|region| {
+            let locked_bytes = inner
+                .memory_set
+                .locked_overlap_bytes(region.start, region.end());
+            (region, locked_bytes)
+        })
+        .collect::<Vec<_>>();
+    drop(inner);
 
     let mut out = String::new();
-    for region in regions {
+    for (region, locked_bytes) in regions {
         let end = region.end();
         if end <= region.start {
             continue;
@@ -821,10 +847,6 @@ fn proc_pid_smaps(pid: u32) -> String {
 
         let size_bytes = end - region.start;
         let size_kb = (size_bytes + 1023) / 1024;
-        let locked_bytes: usize = mlocked
-            .iter()
-            .map(|(ls, le)| range_overlap_len(region.start, end, *ls, *le))
-            .sum();
         let locked_kb = (locked_bytes + 1023) / 1024;
         // LTP mlock05 only validates that Rss/Locked reflect mlock'ed mappings.
         let rss_kb = if locked_bytes > 0 { size_kb } else { 0 };

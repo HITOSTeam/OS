@@ -9,12 +9,12 @@ use crate::{
         FilesStruct, INITPROC,
         id::{KernelStack, TaskUserRes},
         manager::{
-            PID2PCB, TASK_MANAGER, add_task, fetch_task, has_ready_rt_at_or_above,
-            has_ready_rt_higher_than, remove_inactive_task, wakeup_task,
+            PID2PCB, TASK_MANAGER, add_task, fair_ready_task_count, fetch_task,
+            has_ready_rt_at_or_above, has_ready_rt_higher_than, remove_inactive_task, wakeup_task,
         },
         process_block::ProcessControlBlock,
         runtime::{charge_running_task, monotonic_time_ns, start_task_runtime_slice},
-        sched::{RR_TIMESLICE_TICKS, RT_PRIO_MIN, SchedClass, sched_class},
+        sched::{RT_PRIO_MIN, SchedClass, rr_timeslice_ticks, sched_class},
         switch,
         task_block::{TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
@@ -324,17 +324,18 @@ fn cleanup_process_threads_for_group_exit(
     recycle_res
 }
 
-fn fair_timeslice_ticks(nice: i32) -> usize {
-    // A very short fair slice causes excessive context-switch churn under
-    // fork-heavy workloads (e.g. LTP msgstress) where many sleepers wake up
-    // briefly and can starve the task that is still constructing the workload.
-    // Keep a coarser minimum granularity while preserving longer quanta for
-    // higher-priority (negative nice) threads.
-    const FAIR_BASE_SLICE_TICKS: usize = 12;
+fn fair_timeslice_ticks(nice: i32, runnable_fair_tasks: usize) -> usize {
+    // Keep a coarse slice when a task runs mostly alone, but shrink it toward
+    // Linux CFS' target-latency behavior when many fair tasks are runnable.
+    // This prevents bulk wakeups (e.g. pthread checkpoint barriers) from
+    // pinning the waker behind a long FIFO of CPU-heavy peers.
+    const FAIR_TARGET_LATENCY_TICKS: usize = 12;
+    let nr_running = runnable_fair_tasks.max(1);
+    let base = (FAIR_TARGET_LATENCY_TICKS / nr_running).max(1);
     if nice < 0 {
-        (FAIR_BASE_SLICE_TICKS + (-nice as usize)).min(20)
+        (base + (-nice as usize)).min(20)
     } else {
-        FAIR_BASE_SLICE_TICKS
+        base
     }
 }
 
@@ -421,6 +422,14 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     drop(processor);
     task
 }
+
+/// 唤醒路径专用：用 `try_lock` 获取当前任务，拿不到锁就放弃抢占判断，
+/// 避免在持有就绪队列锁时再去抢 processor 锁而死锁。
+fn current_task_for_wakeup_preempt() -> Option<Arc<TaskControlBlock>> {
+    let processor = local_processor().try_lock()?;
+    processor.current()
+}
+
 pub fn current_process() -> Arc<ProcessControlBlock> {
     current_task()
         .and_then(|task| task.process.upgrade())
@@ -430,6 +439,83 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
             }
             INITPROC.clone()
         })
+}
+
+/// 读取任务所属进程的调度类与实时优先级，供唤醒抢占比较使用。
+fn task_sched_class_and_priority(task: &Arc<TaskControlBlock>) -> Option<(SchedClass, i32)> {
+    let process = task.process.upgrade()?;
+    let inner = process.borrow_mut();
+    let class = sched_class(inner.scheduling.sched_policy).unwrap_or(SchedClass::Fair);
+    Some((class, inner.scheduling.sched_priority))
+}
+
+/// 两个 fair(CFS) 任务之间的唤醒抢占判定：被唤醒者 nice 更小（优先级更高）
+/// 时抢占；nice 相同时仅当二者不属于同一进程才抢占，避免同进程线程之间
+/// 频繁互相抢占带来的额外上下文切换。
+fn fair_wakeup_should_preempt_current(
+    current: &Arc<TaskControlBlock>,
+    woken: &Arc<TaskControlBlock>,
+) -> bool {
+    let current_nice = current.borrow_mut().nice;
+    let woken_nice = woken.borrow_mut().nice;
+    if woken_nice < current_nice {
+        return true;
+    }
+    let (Some(current_process), Some(woken_process)) =
+        (current.process.upgrade(), woken.process.upgrade())
+    else {
+        return false;
+    };
+    !Arc::ptr_eq(&current_process, &woken_process)
+}
+
+/// 判断刚被唤醒的任务是否应抢占本 hart 当前运行的任务，按调度类分派：
+/// 唤醒的 RT 抢占当前 fair；RT 之间比较优先级；fair 之间走 CFS 规则；
+/// 当前为 RT 而唤醒的是 fair 时不抢占。
+fn wakeup_should_preempt_current(woken: &Arc<TaskControlBlock>) -> bool {
+    let Some(current) = current_task_for_wakeup_preempt() else {
+        return false;
+    };
+    if Arc::ptr_eq(&current, woken) {
+        return false;
+    }
+    let Some((current_class, current_priority)) = task_sched_class_and_priority(&current) else {
+        return false;
+    };
+    let Some((woken_class, woken_priority)) = task_sched_class_and_priority(woken) else {
+        return false;
+    };
+    match (woken_class, current_class) {
+        (SchedClass::Fifo | SchedClass::Rr, SchedClass::Fair) => true,
+        (SchedClass::Fifo | SchedClass::Rr, SchedClass::Fifo | SchedClass::Rr) => {
+            woken_priority > current_priority
+        }
+        (SchedClass::Fair, SchedClass::Fair) => fair_wakeup_should_preempt_current(&current, woken),
+        (SchedClass::Fair, SchedClass::Fifo | SchedClass::Rr) => false,
+    }
+}
+
+/// 唤醒任务入队到本 hart 后调用：若它应抢占当前任务，则置位本 hart 的
+/// `NEED_RESCHED`，推迟到返回用户态前再真正切换，避免在唤醒路径内直接重调度。
+pub fn request_reschedule_for_wakeup(woken: &Arc<TaskControlBlock>, target_hart: usize) {
+    let local_hart = hart_id() % MAX_HARTS;
+    if target_hart != local_hart || !wakeup_should_preempt_current(woken) {
+        return;
+    }
+    NEED_RESCHED[local_hart].store(true, Ordering::Release);
+}
+
+/// trap 返回用户态前的抢占点：本 hart 若被标记 `NEED_RESCHED` 就让出当前任务，
+/// 使刚唤醒的高优先级任务尽快得到运行，缓解 starvation。仿 Linux 的
+/// `TIF_NEED_RESCHED` 检查点。
+pub fn reschedule_before_user_return_if_needed() {
+    let local_hart = hart_id() % MAX_HARTS;
+    if !NEED_RESCHED[local_hart].swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if current_task().is_some() {
+        suspend_current_and_run_next();
+    }
 }
 
 pub(crate) fn current_files() -> Arc<spin::Mutex<FilesStruct>> {
@@ -568,9 +654,11 @@ pub fn should_preempt_current_on_tick() -> bool {
             if has_ready_rt_at_or_above(RT_PRIO_MIN) {
                 return true;
             }
+            // 算上当前正在运行的任务（+1），按本 hart 可运行 fair 任务数收缩时间片。
+            let runnable_fair_tasks = fair_ready_task_count().saturating_add(1);
             let mut task_inner = task.borrow_mut();
             task_inner.rr_ticks = task_inner.rr_ticks.saturating_add(1);
-            let slice = fair_timeslice_ticks(task_inner.nice);
+            let slice = fair_timeslice_ticks(task_inner.nice, runnable_fair_tasks);
             if task_inner.rr_ticks < slice {
                 return false;
             }
@@ -584,7 +672,7 @@ pub fn should_preempt_current_on_tick() -> bool {
             }
             let mut task_inner = task.borrow_mut();
             task_inner.rr_ticks = task_inner.rr_ticks.saturating_add(1);
-            if task_inner.rr_ticks < RR_TIMESLICE_TICKS.max(1) {
+            if task_inner.rr_ticks < rr_timeslice_ticks() {
                 return false;
             }
             task_inner.rr_ticks = 0;
@@ -817,6 +905,11 @@ lazy_static! {
         .map(|_| Mutex::new(Processor::new()))
         .collect();
 }
+
+/// 每 hart 的“需要重新调度”标志，仿 Linux 的 `TIF_NEED_RESCHED`：
+/// 唤醒路径里由 `request_reschedule_for_wakeup` 置位，返回用户态前由
+/// `reschedule_before_user_return_if_needed` 消费。
+static NEED_RESCHED: [AtomicBool; MAX_HARTS] = [const { AtomicBool::new(false) }; MAX_HARTS];
 
 pub fn go_to_first_task() -> ! {
     idle_task();

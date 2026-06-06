@@ -52,7 +52,9 @@ pub fn activate_kernel_space() {
 pub(crate) use elf_loader::elf_interp_path_from_reader;
 #[allow(unused_imports)]
 pub use memory_set::remap_test;
-pub use memory_set::{ElfAux, KERNEL_SPACE, LazyFaultResult, MapPermission, MemorySet};
+pub use memory_set::{
+    ElfAux, KERNEL_SPACE, LazyFaultResult, MapPermission, MapType, MemorySet, VmRegion,
+};
 pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub use page_table::{
     PageTableEntry, read_user_value, translated_byte_buffer, translated_mutref,

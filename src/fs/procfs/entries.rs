@@ -122,6 +122,9 @@ pub(crate) fn proc_sys_kernel_entries() -> Vec<PseudoDirent> {
         ("msgmnb", 8),
         ("msgmni", 8),
         ("sem", 8),
+        ("sched_rt_period_us", 8),
+        ("sched_rt_runtime_us", 8),
+        ("sched_rr_timeslice_ms", 8),
     ])
 }
 
@@ -350,6 +353,9 @@ pub(crate) fn managed_proc_sys_file_kind(path: &str) -> Option<ProcFileKind> {
         "/proc/sys/kernel/shmmax" => Some(ProcFileKind::KernelShmmax),
         "/proc/sys/kernel/shmmni" => Some(ProcFileKind::KernelShmmni),
         "/proc/sys/kernel/shmall" => Some(ProcFileKind::KernelShmall),
+        "/proc/sys/kernel/sched_rt_period_us" => Some(ProcFileKind::KernelSchedRtPeriodUs),
+        "/proc/sys/kernel/sched_rt_runtime_us" => Some(ProcFileKind::KernelSchedRtRuntimeUs),
+        "/proc/sys/kernel/sched_rr_timeslice_ms" => Some(ProcFileKind::KernelSchedRrTimesliceMs),
         _ => proc_simple_text_path(path).map(ProcFileKind::SimpleText),
     }
 }

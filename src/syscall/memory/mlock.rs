@@ -46,19 +46,13 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                 return 0;
             }
             if advice == MADV_DONTNEED {
-                let shared_overlap = inner
-                    .mmap_areas
-                    .iter()
-                    .any(|region| end > region.start && addr < region.end() && region.shared);
-                if shared_overlap || ranges_overlap(&inner.mlocked_ranges, addr, end) {
+                let shared_overlap = inner.memory_set.shared_vm_region_overlaps(addr, end);
+                if shared_overlap || inner.memory_set.locked_ranges_overlap(addr, end) {
                     return err(SyscallError::EINVAL);
                 }
             }
             if advice == MADV_FREE {
-                let shared_overlap = inner
-                    .mmap_areas
-                    .iter()
-                    .any(|region| end > region.start && addr < region.end() && region.shared);
+                let shared_overlap = inner.memory_set.shared_vm_region_overlaps(addr, end);
                 if shared_overlap {
                     return err(SyscallError::EINVAL);
                 }
@@ -110,19 +104,17 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
         }
         cur += PAGE_SIZE;
     }
-    let mut next = inner.mlocked_ranges.clone();
-    next.push((start, end));
-    normalize_ranges(&mut next);
+    let next_locked_bytes = inner.memory_set.locked_bytes_after_add(start, end);
     if inner.euid != 0 {
         let limit = inner.rlimits.rlimit_memlock_cur as usize;
         if limit == 0 {
             return err(SyscallError::EPERM);
         }
-        if ranges_total_len(&next) > limit {
+        if next_locked_bytes > limit {
             return err(SyscallError::ENOMEM);
         }
     }
-    inner.mlocked_ranges = next;
+    inner.memory_set.add_locked_range(start, end);
     0
 }
 
@@ -147,7 +139,7 @@ pub fn syscall_munlock(addr: usize, len: usize) -> isize {
     {
         return err(SyscallError::ENOMEM);
     }
-    trim_ranges(&mut inner.mlocked_ranges, start, end);
+    inner.memory_set.trim_locked_ranges(start, end);
     0
 }
 
@@ -164,27 +156,26 @@ pub fn syscall_mlockall(flags: usize) -> isize {
     }
     let process = current_process();
     let mut inner = process.borrow_mut();
-    let mut next = inner.mlocked_ranges.clone();
-    if (flags & MCL_CURRENT) != 0 {
-        for (start, end) in inner.memory_set.user_mapped_ranges() {
-            next.push((start, end));
-        }
-        if next.is_empty() {
-            next.push((inner.heap_start, inner.heap_start + PAGE_SIZE));
-        }
-    }
-    normalize_ranges(&mut next);
+    let next_locked_bytes = if (flags & MCL_CURRENT) != 0 {
+        inner.memory_set.locked_bytes_after_mlockall_current()
+    } else {
+        inner.memory_set.locked_bytes()
+    };
     if inner.euid != 0 {
         let limit = inner.rlimits.rlimit_memlock_cur as usize;
         if limit == 0 {
             return err(SyscallError::EPERM);
         }
-        if ranges_total_len(&next) > limit {
+        if next_locked_bytes > limit {
             return err(SyscallError::ENOMEM);
         }
     }
-    inner.mlocked_ranges = next;
-    inner.mlockall_future = (flags & MCL_FUTURE) != 0;
+    if (flags & MCL_CURRENT) != 0 {
+        inner.memory_set.lock_current_mappings();
+    }
+    inner
+        .memory_set
+        .set_mlockall_future((flags & MCL_FUTURE) != 0);
     0
 }
 
@@ -192,8 +183,7 @@ pub fn syscall_mlockall(flags: usize) -> isize {
 pub fn syscall_munlockall() -> isize {
     let process = current_process();
     let mut inner = process.borrow_mut();
-    inner.mlocked_ranges.clear();
-    inner.mlockall_future = false;
+    inner.memory_set.clear_mlock_state();
     0
 }
 

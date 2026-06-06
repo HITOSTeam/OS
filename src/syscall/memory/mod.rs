@@ -13,9 +13,11 @@ pub(super) use crate::{
         File, OSInode, PseudoShmFile, ext4_lock, vm_commit_limit_bytes, vm_committed_as_bytes,
         vm_overcommit_memory,
     },
-    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked},
+    mm::{
+        MapPermission, MapType, PTEFlags, VmRegion, frame_alloc, try_copy_to_user,
+        try_copy_to_user_unchecked,
+    },
     task::{
-        MmapRegion,
         manager::PID2PCB,
         processor::{current_files, current_process},
     },
@@ -123,118 +125,51 @@ pub(super) fn find_free_user_range(
     user_range_valid(cursor, end).then_some(cursor)
 }
 
+/// Find a free user VA range of `len` at or above `min_start`, skipping the
+/// already-occupied `ranges`. Unlike [`find_free_user_range`], every candidate
+/// is additionally confirmed through the `is_free` callback, letting callers
+/// cross-check page-table VMAs and mm-owned `vm_regions` before committing.
+pub(super) fn find_free_user_range_checked(
+    ranges: &[(usize, usize)],
+    min_start: usize,
+    len: usize,
+    is_free: impl Fn(usize, usize) -> bool,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let mut cursor = align_up(min_start, PAGE_SIZE);
+    for (range_start, range_end) in ranges.iter().copied() {
+        if range_end <= cursor {
+            continue;
+        }
+        while cursor < range_start {
+            let end = cursor.checked_add(len)?;
+            if end <= range_start {
+                if user_range_valid(cursor, end) && is_free(cursor, end) {
+                    return Some(cursor);
+                }
+                cursor = cursor.checked_add(PAGE_SIZE)?;
+            } else {
+                break;
+            }
+        }
+        cursor = align_up(range_end, PAGE_SIZE);
+    }
+    loop {
+        let end = cursor.checked_add(len)?;
+        if !user_range_valid(cursor, end) {
+            return None;
+        }
+        if is_free(cursor, end) {
+            return Some(cursor);
+        }
+        cursor = cursor.checked_add(PAGE_SIZE)?;
+    }
+}
+
 pub(super) fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
     current_files().lock().get_file(fd)
-}
-
-pub(super) fn push_mmap_region_merged(
-    regions: &mut alloc::vec::Vec<MmapRegion>,
-    region: MmapRegion,
-) {
-    if region.len == 0 {
-        return;
-    }
-    if let Some(last) = regions.last_mut() {
-        if last.end() == region.start
-            && last.prot == region.prot
-            && last.shared == region.shared
-            && last.may_write_upgrade == region.may_write_upgrade
-            && last.file_backed == region.file_backed
-            && last.file_dev == region.file_dev
-            && last.file_ino == region.file_ino
-            && last.file_offset + last.len == region.file_offset
-            && last.growsdown == region.growsdown
-            && last.sigbus_start == region.sigbus_start
-        {
-            last.len += region.len;
-            return;
-        }
-    }
-    regions.push(region);
-}
-
-pub(super) fn slice_mmap_region(region: MmapRegion, start: usize, len: usize) -> MmapRegion {
-    let end = start.saturating_add(len);
-    let file_delta = start.saturating_sub(region.start);
-    MmapRegion {
-        start,
-        len,
-        file_offset: region.file_offset.saturating_add(file_delta),
-        sigbus_start: region.sigbus_start.clamp(start, end),
-        ..region
-    }
-}
-
-pub(super) fn move_mmap_region(region: MmapRegion, new_start: usize) -> MmapRegion {
-    let sigbus_delta = region
-        .sigbus_start
-        .saturating_sub(region.start)
-        .min(region.len);
-    MmapRegion {
-        start: new_start,
-        sigbus_start: new_start.saturating_add(sigbus_delta),
-        ..region
-    }
-}
-
-pub(super) fn trim_mmap_regions(
-    regions: &mut alloc::vec::Vec<MmapRegion>,
-    start: usize,
-    end: usize,
-) {
-    let mut next = alloc::vec::Vec::new();
-    for region in regions.drain(..) {
-        let r_end = region.end();
-        if end <= region.start || start >= r_end {
-            push_mmap_region_merged(&mut next, region);
-            continue;
-        }
-        if start > region.start {
-            push_mmap_region_merged(
-                &mut next,
-                slice_mmap_region(region, region.start, start - region.start),
-            );
-        }
-        if end < r_end {
-            push_mmap_region_merged(&mut next, slice_mmap_region(region, end, r_end - end));
-        }
-    }
-    *regions = next;
-}
-
-pub(super) fn apply_mprotect_to_mmap_regions(
-    regions: &mut alloc::vec::Vec<MmapRegion>,
-    start: usize,
-    end: usize,
-    new_prot: usize,
-) -> Result<(), ()> {
-    let mut next = alloc::vec::Vec::new();
-    for region in regions.iter().copied() {
-        let r_end = region.end();
-        if end <= region.start || start >= r_end {
-            push_mmap_region_merged(&mut next, region);
-            continue;
-        }
-        if start > region.start {
-            push_mmap_region_merged(
-                &mut next,
-                slice_mmap_region(region, region.start, start - region.start),
-            );
-        }
-        let ov_start = core::cmp::max(start, region.start);
-        let ov_end = core::cmp::min(end, r_end);
-        let mut mid = slice_mmap_region(region, ov_start, ov_end - ov_start);
-        if (new_prot & PROT_WRITE) != 0 && (mid.prot & PROT_WRITE) == 0 && !mid.may_write_upgrade {
-            return Err(());
-        }
-        mid.prot = new_prot;
-        push_mmap_region_merged(&mut next, mid);
-        if end < r_end {
-            push_mmap_region_merged(&mut next, slice_mmap_region(region, end, r_end - end));
-        }
-    }
-    *regions = next;
-    Ok(())
 }
 
 pub(super) fn find_inode_file_in_snapshot(
@@ -297,15 +232,6 @@ pub(super) fn push_range_merged(
     ranges.push((start, end));
 }
 
-pub(super) fn normalize_ranges(ranges: &mut alloc::vec::Vec<(usize, usize)>) {
-    ranges.sort_unstable_by_key(|(start, _)| *start);
-    let mut merged = alloc::vec::Vec::new();
-    for (start, end) in ranges.drain(..) {
-        push_range_merged(&mut merged, start, end);
-    }
-    *ranges = merged;
-}
-
 pub(super) fn trim_ranges(ranges: &mut alloc::vec::Vec<(usize, usize)>, start: usize, end: usize) {
     if end <= start {
         return;
@@ -324,26 +250,6 @@ pub(super) fn trim_ranges(ranges: &mut alloc::vec::Vec<(usize, usize)>, start: u
         }
     }
     *ranges = next;
-}
-
-pub(super) fn ranges_total_len(ranges: &[(usize, usize)]) -> usize {
-    ranges
-        .iter()
-        .map(|(start, end)| end.saturating_sub(*start))
-        .sum()
-}
-
-pub(super) fn ranges_overlap(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
-    ranges
-        .iter()
-        .any(|(r_start, r_end)| end > *r_start && start < *r_end)
-}
-
-pub(super) fn page_overlaps_mmap_regions(page_start: usize, regions: &[MmapRegion]) -> bool {
-    let page_end = page_start.saturating_add(PAGE_SIZE);
-    regions
-        .iter()
-        .any(|region| page_end > region.start && page_start < region.end())
 }
 
 pub(super) fn page_overlaps_sysv_shm_regions(

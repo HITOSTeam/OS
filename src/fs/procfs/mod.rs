@@ -51,6 +51,9 @@ pub enum ProcFileKind {
     KernelShmmax,
     KernelShmmni,
     KernelShmall,
+    KernelSchedRtPeriodUs,
+    KernelSchedRtRuntimeUs,
+    KernelSchedRrTimesliceMs,
     SimpleText(&'static str),
     PidStat(u32),
     PidCmdline(u32),
@@ -151,6 +154,15 @@ impl ProcPseudoFile {
             ProcFileKind::KernelShmall => {
                 crate::syscall::sysv_shm::write_shm_sysctl("/proc/sys/kernel/shmall", data)?
             }
+            ProcFileKind::KernelSchedRtPeriodUs => {
+                content::write_sched_sysctl("/proc/sys/kernel/sched_rt_period_us", data)?
+            }
+            ProcFileKind::KernelSchedRtRuntimeUs => {
+                content::write_sched_sysctl("/proc/sys/kernel/sched_rt_runtime_us", data)?
+            }
+            ProcFileKind::KernelSchedRrTimesliceMs => {
+                content::write_sched_sysctl("/proc/sys/kernel/sched_rr_timeslice_ms", data)?
+            }
             ProcFileKind::SimpleText(path) => entries::write_proc_simple_text(path, data)?,
             _ => return Err(err(SyscallError::EINVAL)),
         };
@@ -203,7 +215,10 @@ impl File for ProcPseudoFile {
             | ProcFileKind::KernelSem
             | ProcFileKind::KernelShmmax
             | ProcFileKind::KernelShmmni
-            | ProcFileKind::KernelShmall => true,
+            | ProcFileKind::KernelShmall
+            | ProcFileKind::KernelSchedRtPeriodUs
+            | ProcFileKind::KernelSchedRtRuntimeUs
+            | ProcFileKind::KernelSchedRrTimesliceMs => true,
             ProcFileKind::SimpleText(path) => entries::proc_simple_text_is_writable(path),
             _ => false,
         }
@@ -291,5 +306,20 @@ pub(crate) fn parse_proc_sys_usize(data: &[u8]) -> Result<usize, isize> {
     }
     trimmed
         .parse::<usize>()
+        .map_err(|_| err(SyscallError::EINVAL))
+}
+
+/// 解析 procfs 写入的有符号整数（与 `parse_proc_sys_usize` 对应，但允许负数，
+/// 例如 `-1` 这类“复位 / 不限制”语义）。空或非法返回 EINVAL。
+pub(crate) fn parse_proc_sys_i64(data: &[u8]) -> Result<i64, isize> {
+    let Ok(raw) = core::str::from_utf8(data) else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(err(SyscallError::EINVAL));
+    }
+    trimmed
+        .parse::<i64>()
         .map_err(|_| err(SyscallError::EINVAL))
 }

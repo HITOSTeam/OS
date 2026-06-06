@@ -7,10 +7,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
-use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
+use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{
-    File, MountNamespace, PollWaitQueue, cgroup_attach_fork_child, clone_mount_namespace,
+    MountNamespace, PollWaitQueue, cgroup_attach_fork_child, clone_mount_namespace,
     initial_mount_namespace, mount_namespace_id,
 };
 use crate::mm::{
@@ -37,7 +37,6 @@ use crate::utils::RecycleAllocator;
 use lazy_static::lazy_static;
 use spin::{Mutex as SpinMutex, MutexGuard, RwLock};
 
-const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
 static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FORK_PRE_COW_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -259,36 +258,6 @@ fn process_comm_from_argv(argv: &[String]) -> String {
         String::from("CongCore")
     } else {
         out
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MmapRegion {
-    pub start: usize,
-    pub len: usize,
-    pub prot: usize,
-    pub shared: bool,
-    /// False for shared file mappings on descriptors without write access.
-    pub may_write_upgrade: bool,
-    /// File-backed mapping identity for write/mmap coherence.
-    pub file_backed: bool,
-    pub file_dev: usize,
-    pub file_ino: u32,
-    pub file_offset: usize,
-    /// Stable backing entry for file-backed mmap writeback after close(fd).
-    pub backing_id: usize,
-    /// Non-zero for `PseudoShmFile`/memfd-backed mappings.
-    pub memfd_id: u64,
-    /// Whether this region should expand downward on guard-page faults.
-    pub growsdown: bool,
-    /// Start address (inclusive) of the SIGBUS tail for file mappings.
-    /// `>= end()` means no SIGBUS tail.
-    pub sigbus_start: usize,
-}
-
-impl MmapRegion {
-    pub fn end(&self) -> usize {
-        self.start.saturating_add(self.len)
     }
 }
 
@@ -1002,16 +971,6 @@ pub struct ProcessControlBlockInner {
     /// Process root directory (host-absolute path), used for `chroot`.
     pub root: String,
     pub cwd: String,
-    pub heap_start: usize,
-    pub brk: usize,
-    pub mmap_next: usize,
-    pub mmap_areas: Vec<MmapRegion>,
-    pub mmap_backings: BTreeMap<usize, Arc<dyn File + Send + Sync>>,
-    pub next_mmap_backing_id: usize,
-    /// Virtual ranges currently locked by mlock/mlockall.
-    pub mlocked_ranges: Vec<(usize, usize)>,
-    /// Whether MCL_FUTURE is currently enabled.
-    pub mlockall_future: bool,
     /// IPC namespace id used by SysV IPC / POSIX MQ isolation.
     pub ipc_ns_id: usize,
     /// Shared UTS namespace state (hostname/domainname).
@@ -1164,7 +1123,6 @@ impl ProcessControlBlock {
         let (memory_set, ustack_base, entry_point, elf_aux) =
             MemorySet::from_elf(elf_data).expect("failed to parse init_proc ELF");
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         // allocate a pid
         let pid_handle =
             pid_alloc().expect("failed to allocate PID for init process (PID exhausted)");
@@ -1262,15 +1220,6 @@ impl ProcessControlBlock {
                 },
                 root: String::from("/"),
                 cwd: String::from("/user"),
-                heap_start,
-                brk: heap_start,
-                // Keep anonymous/file mmaps high to avoid colliding with ELF segments.
-                mmap_next: DEFAULT_MMAP_BASE,
-                mmap_areas: Vec::new(),
-                mmap_backings: BTreeMap::new(),
-                next_mmap_backing_id: 1,
-                mlocked_ranges: Vec::new(),
-                mlockall_future: false,
                 ipc_ns_id: 0,
                 uts_ns: Arc::new(SpinMutex::new(UtsNamespaceState::new())),
                 mnt_ns: initial_mount_namespace(),
@@ -1426,19 +1375,12 @@ impl ProcessControlBlock {
         }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         {
             let mut inner = self.borrow_mut();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
             crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
             reset_signal_handlers_on_exec(&mut inner);
             inner.memory_set = memory_set;
-            inner.heap_start = heap_start;
-            inner.brk = heap_start;
-            inner.mmap_next = DEFAULT_MMAP_BASE;
-            inner.mmap_areas.clear();
-            inner.mlocked_ranges.clear();
-            inner.mlockall_future = false;
             inner.scheduling.reset_on_fork = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
@@ -1511,19 +1453,12 @@ impl ProcessControlBlock {
         }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         {
             let mut inner = self.borrow_mut();
             let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
             crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
             reset_signal_handlers_on_exec(&mut inner);
             inner.memory_set = memory_set;
-            inner.heap_start = heap_start;
-            inner.brk = heap_start;
-            inner.mmap_next = DEFAULT_MMAP_BASE;
-            inner.mmap_areas.clear();
-            inner.mlocked_ranges.clear();
-            inner.mlockall_future = false;
             inner.scheduling.reset_on_fork = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
@@ -1721,12 +1656,6 @@ impl ProcessControlBlock {
         let rlimits = parent.rlimits.clone();
         let root = parent.root.clone();
         let cwd = parent.cwd.clone();
-        let heap_start = parent.heap_start;
-        let brk = parent.brk;
-        let mmap_next = parent.mmap_next;
-        let mmap_areas = parent.mmap_areas.clone();
-        let mmap_backings = parent.mmap_backings.clone();
-        let next_mmap_backing_id = parent.next_mmap_backing_id;
         let ipc_ns_id = parent.ipc_ns_id;
         let uts_ns = Arc::clone(&parent.uts_ns);
         let mnt_ns = Arc::clone(&parent.mnt_ns);
@@ -1803,15 +1732,6 @@ impl ProcessControlBlock {
                 rlimits,
                 root,
                 cwd,
-                heap_start,
-                brk,
-                mmap_next,
-                mmap_areas,
-                mmap_backings,
-                next_mmap_backing_id,
-                // Linux does not inherit mlock/mlockall locks across fork.
-                mlocked_ranges: Vec::new(),
-                mlockall_future: false,
                 ipc_ns_id,
                 uts_ns,
                 mnt_ns,

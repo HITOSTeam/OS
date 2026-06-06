@@ -12,10 +12,11 @@ use crate::config::{
     MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
     USER_STACK_SIZE, phys_mem_end,
 };
-use crate::fs::cgroup_charge_anon_current;
+use crate::fs::{File, cgroup_charge_anon_current};
 use crate::println;
 use crate::task::processor::current_process;
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::*;
 use core::arch::asm;
@@ -38,6 +39,7 @@ unsafe extern "C" {
 }
 
 static COW_CLONE_DIAG_SEQ: AtomicUsize = AtomicUsize::new(0);
+const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 
 lazy_static! {
     /// a memory set instance through lazy_static! managing kernel space
@@ -48,6 +50,221 @@ lazy_static! {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    /// Linux mm_struct-style mmap metadata.  Keep syscall-level VMA identity
+    /// with the address space instead of duplicating it in the process block.
+    vm_regions: Vec<VmRegion>,
+    mmap_backings: BTreeMap<usize, Arc<dyn File + Send + Sync>>,
+    next_mmap_backing_id: usize,
+    heap_start: usize,
+    brk: usize,
+    mmap_next: usize,
+    /// Virtual ranges currently locked by mlock/mlockall.
+    mlocked_ranges: Vec<(usize, usize)>,
+    /// Whether MCL_FUTURE is enabled for this address space.
+    mlockall_future: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VmRegion {
+    pub start: usize,
+    pub len: usize,
+    /// User-visible protection bits kept for procfs/stat-style reporting.
+    pub prot: usize,
+    /// Core mapping strategy for this VMA.  `MapArea` still owns the concrete
+    /// frames/page-table state; this field keeps syscall-visible VMA metadata
+    /// in the same object so later fault handling can stop re-deriving it.
+    pub map_type: MapType,
+    /// Stored as raw bits so `VmRegion` remains a plain copyable descriptor.
+    pub map_perm_bits: u8,
+    pub shared: bool,
+    /// False for shared file mappings on descriptors without write access.
+    pub may_write_upgrade: bool,
+    /// File-backed mapping identity for write/mmap coherence.
+    pub file_backed: bool,
+    pub file_dev: usize,
+    pub file_ino: u32,
+    pub file_offset: usize,
+    /// Number of bytes from `start` that correspond to current file contents.
+    /// Bytes in the last mapped page beyond this length are zero-fill tail and
+    /// must not be written back by msync.
+    pub file_valid_len: usize,
+    /// Stable backing entry for file-backed mmap writeback after close(fd).
+    pub backing_id: usize,
+    /// Non-zero for `PseudoShmFile`/memfd-backed mappings.
+    pub memfd_id: u64,
+    /// Whether this region should expand downward on guard-page faults.
+    pub growsdown: bool,
+    /// Start address (inclusive) of the SIGBUS tail for file mappings.
+    /// `>= end()` means no SIGBUS tail.
+    pub sigbus_start: usize,
+}
+
+impl VmRegion {
+    const PROT_READ: usize = 1;
+    const PROT_WRITE: usize = 2;
+    const PROT_EXEC: usize = 4;
+
+    pub fn end(&self) -> usize {
+        self.start.saturating_add(self.len)
+    }
+
+    pub fn permission_from_prot(prot: usize) -> MapPermission {
+        let mut perm = MapPermission::U;
+        if (prot & Self::PROT_READ) != 0 {
+            perm |= MapPermission::R;
+        }
+        if (prot & Self::PROT_WRITE) != 0 {
+            perm |= MapPermission::W;
+        }
+        if (prot & Self::PROT_EXEC) != 0 {
+            perm |= MapPermission::X;
+        }
+        perm
+    }
+
+    pub fn map_permission(&self) -> MapPermission {
+        MapPermission::from_bits_truncate(self.map_perm_bits)
+    }
+
+    pub fn set_prot(&mut self, prot: usize) {
+        self.prot = prot;
+        self.map_perm_bits = Self::permission_from_prot(prot).bits();
+    }
+}
+
+fn push_range_merged(ranges: &mut Vec<(usize, usize)>, start: usize, end: usize) {
+    if end <= start {
+        return;
+    }
+    if let Some(last) = ranges.last_mut() {
+        if start <= last.1 {
+            last.1 = last.1.max(end);
+            return;
+        }
+    }
+    ranges.push((start, end));
+}
+
+fn normalize_ranges(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut merged = Vec::new();
+    for (start, end) in ranges.drain(..) {
+        push_range_merged(&mut merged, start, end);
+    }
+    *ranges = merged;
+}
+
+fn trim_ranges(ranges: &mut Vec<(usize, usize)>, start: usize, end: usize) {
+    if end <= start {
+        return;
+    }
+    let mut next = Vec::new();
+    for (r_start, r_end) in ranges.drain(..) {
+        if end <= r_start || start >= r_end {
+            next.push((r_start, r_end));
+            continue;
+        }
+        if start > r_start {
+            next.push((r_start, start));
+        }
+        if end < r_end {
+            next.push((end, r_end));
+        }
+    }
+    normalize_ranges(&mut next);
+    *ranges = next;
+}
+
+fn ranges_total_len(ranges: &[(usize, usize)]) -> usize {
+    ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .sum()
+}
+
+fn ranges_overlap(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    ranges
+        .iter()
+        .any(|(r_start, r_end)| end > *r_start && start < *r_end)
+}
+
+fn range_overlap_len(start: usize, end: usize, other_start: usize, other_end: usize) -> usize {
+    let overlap_start = core::cmp::max(start, other_start);
+    let overlap_end = core::cmp::min(end, other_end);
+    overlap_end.saturating_sub(overlap_start)
+}
+
+fn sort_map_areas(areas: &mut [MapArea]) {
+    areas.sort_unstable_by_key(|area| area.vpn_range.get_start().0);
+}
+
+fn normalize_vm_region_list(regions: &mut Vec<VmRegion>) {
+    regions.sort_unstable_by_key(|region| region.start);
+    let mut merged = Vec::new();
+    for region in regions.drain(..) {
+        push_vm_region_merged(&mut merged, region);
+    }
+    *regions = merged;
+}
+
+fn push_vm_region_merged(regions: &mut Vec<VmRegion>, region: VmRegion) {
+    if region.len == 0 {
+        return;
+    }
+    if let Some(last) = regions.last_mut() {
+        if last.end() == region.start
+            && last.prot == region.prot
+            && last.map_type == region.map_type
+            && last.map_perm_bits == region.map_perm_bits
+            && last.shared == region.shared
+            && last.may_write_upgrade == region.may_write_upgrade
+            && last.file_backed == region.file_backed
+            && last.file_dev == region.file_dev
+            && last.file_ino == region.file_ino
+            && last.file_offset + last.len == region.file_offset
+            && last.file_valid_len == last.len
+            && last.backing_id == region.backing_id
+            && last.memfd_id == region.memfd_id
+            && last.growsdown == region.growsdown
+            && last.sigbus_start == region.sigbus_start
+        {
+            last.file_valid_len = last
+                .file_valid_len
+                .saturating_add(region.file_valid_len)
+                .min(last.len.saturating_add(region.len));
+            last.len += region.len;
+            return;
+        }
+    }
+    regions.push(region);
+}
+
+fn slice_vm_region(region: VmRegion, start: usize, len: usize) -> VmRegion {
+    let end = start.saturating_add(len);
+    let file_delta = start.saturating_sub(region.start);
+    let valid_end = region
+        .start
+        .saturating_add(region.file_valid_len.min(region.len));
+    VmRegion {
+        start,
+        len,
+        file_offset: region.file_offset.saturating_add(file_delta),
+        file_valid_len: valid_end.saturating_sub(start).min(len),
+        sigbus_start: region.sigbus_start.clamp(start, end),
+        ..region
+    }
+}
+
+fn move_vm_region(region: VmRegion, new_start: usize) -> VmRegion {
+    let sigbus_delta = region
+        .sigbus_start
+        .saturating_sub(region.start)
+        .min(region.len);
+    VmRegion {
+        start: new_start,
+        sigbus_start: new_start.saturating_add(sigbus_delta),
+        ..region
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,10 +279,557 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            vm_regions: Vec::new(),
+            mmap_backings: BTreeMap::new(),
+            next_mmap_backing_id: 1,
+            heap_start: 0,
+            brk: 0,
+            mmap_next: DEFAULT_MMAP_BASE,
+            mlocked_ranges: Vec::new(),
+            mlockall_future: false,
         }
     }
     pub fn token(&self) -> usize {
         self.page_table.token()
+    }
+
+    fn inherit_user_vm_metadata_from(&mut self, parent: &MemorySet) {
+        self.vm_regions = parent.vm_regions.clone();
+        self.normalize_vm_regions();
+        self.mmap_backings = parent.mmap_backings.clone();
+        self.next_mmap_backing_id = parent.next_mmap_backing_id;
+        self.heap_start = parent.heap_start;
+        self.brk = parent.brk;
+        self.mmap_next = parent.mmap_next;
+        // Do not inherit mlock/mlockall state across fork-style address-space
+        // cloning; Linux clears memory locks in the child.
+        self.debug_assert_user_vm_invariants();
+    }
+
+    fn sort_user_areas(&mut self) {
+        sort_map_areas(&mut self.areas);
+    }
+
+    fn normalize_vm_regions(&mut self) {
+        normalize_vm_region_list(&mut self.vm_regions);
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_user_vm_invariants(&self) {
+        let mut prev_area_end = VirtPageNum(0);
+        for area in self.areas.iter() {
+            let start = area.vpn_range.get_start();
+            let end = area.vpn_range.get_end();
+            debug_assert!(
+                start >= prev_area_end,
+                "MapArea list is not sorted or overlaps: prev_end={:#x}, start={:#x}, end={:#x}",
+                prev_area_end.0.saturating_mul(PAGE_SIZE),
+                start.0.saturating_mul(PAGE_SIZE),
+                end.0.saturating_mul(PAGE_SIZE)
+            );
+            debug_assert!(start <= end, "MapArea has inverted VPN range");
+            if area.map_type == MapType::Identical {
+                debug_assert!(
+                    area.data_frames.is_empty(),
+                    "Identical MapArea must not own frame trackers"
+                );
+            }
+            for vpn in area.data_frames.keys() {
+                debug_assert!(
+                    *vpn >= start && *vpn < end,
+                    "MapArea frame tracker outside owning range"
+                );
+            }
+            prev_area_end = end;
+        }
+
+        let allowed_perm_bits = MapPermission::all().bits();
+        let mut prev_region_end = 0usize;
+        for region in self.vm_regions.iter() {
+            let end = region.end();
+            debug_assert!(region.len > 0, "VmRegion must not be empty");
+            debug_assert!(end > region.start, "VmRegion end wrapped");
+            debug_assert!(
+                region.start >= prev_region_end,
+                "VmRegion list is not sorted or overlaps: prev_end={:#x}, start={:#x}, end={:#x}",
+                prev_region_end,
+                region.start,
+                end
+            );
+            debug_assert!(
+                region.map_perm_bits & !allowed_perm_bits == 0,
+                "VmRegion has unknown MapPermission bits"
+            );
+            debug_assert!(
+                region.map_permission().contains(MapPermission::U),
+                "VmRegion must describe a user mapping"
+            );
+            debug_assert!(
+                region.file_valid_len <= region.len,
+                "VmRegion file_valid_len exceeds mapping length"
+            );
+            debug_assert!(
+                region.sigbus_start >= region.start && region.sigbus_start <= end,
+                "VmRegion SIGBUS tail marker outside mapping"
+            );
+            if region.file_backed {
+                debug_assert!(
+                    region.backing_id != 0,
+                    "file-backed VmRegion must keep a backing id"
+                );
+            } else {
+                debug_assert!(
+                    region.file_valid_len == 0 || region.file_valid_len == region.len,
+                    "anonymous VmRegion should not carry a partial file_valid_len"
+                );
+            }
+            prev_region_end = end;
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_user_vm_invariants(&self) {}
+
+    pub fn reset_user_layout(&mut self, ustack_base: usize) {
+        let heap_start = ustack_base
+            .saturating_add(USER_STACK_SIZE)
+            .saturating_add(USER_HEAP_GAP);
+        self.heap_start = heap_start;
+        self.brk = heap_start;
+        self.mmap_next = DEFAULT_MMAP_BASE;
+        self.clear_mlock_state();
+    }
+
+    pub fn heap_start(&self) -> usize {
+        self.heap_start
+    }
+
+    pub fn brk(&self) -> usize {
+        self.brk
+    }
+
+    pub fn set_brk(&mut self, brk: usize) {
+        self.brk = brk;
+    }
+
+    pub fn heap_size(&self) -> usize {
+        self.brk.saturating_sub(self.heap_start)
+    }
+
+    pub fn mmap_next(&self) -> usize {
+        self.mmap_next
+    }
+
+    pub fn note_mmap_end(&mut self, end: usize) {
+        if end > self.mmap_next {
+            self.mmap_next = end;
+        }
+    }
+
+    pub fn mlockall_future(&self) -> bool {
+        self.mlockall_future
+    }
+
+    pub fn set_mlockall_future(&mut self, enabled: bool) {
+        self.mlockall_future = enabled;
+    }
+
+    pub fn locked_bytes(&self) -> usize {
+        ranges_total_len(&self.mlocked_ranges)
+    }
+
+    pub fn locked_overlap_bytes(&self, start: usize, end: usize) -> usize {
+        self.mlocked_ranges
+            .iter()
+            .map(|(lock_start, lock_end)| range_overlap_len(start, end, *lock_start, *lock_end))
+            .sum()
+    }
+
+    pub fn locked_ranges_overlap(&self, start: usize, end: usize) -> bool {
+        ranges_overlap(&self.mlocked_ranges, start, end)
+    }
+
+    pub fn locked_bytes_after_add(&self, start: usize, end: usize) -> usize {
+        let mut next = self.mlocked_ranges.clone();
+        next.push((start, end));
+        normalize_ranges(&mut next);
+        ranges_total_len(&next)
+    }
+
+    pub fn add_locked_range(&mut self, start: usize, end: usize) {
+        self.mlocked_ranges.push((start, end));
+        normalize_ranges(&mut self.mlocked_ranges);
+    }
+
+    pub fn trim_locked_ranges(&mut self, start: usize, end: usize) {
+        trim_ranges(&mut self.mlocked_ranges, start, end);
+    }
+
+    pub fn move_locked_ranges(&mut self, old_addr: usize, old_len: usize, new_start: usize) {
+        let old_end = old_addr.saturating_add(old_len);
+        if old_end <= old_addr {
+            return;
+        }
+        let mut next = Vec::new();
+        for (lock_start, lock_end) in self.mlocked_ranges.drain(..) {
+            if old_end <= lock_start || old_addr >= lock_end {
+                next.push((lock_start, lock_end));
+                continue;
+            }
+            if old_addr > lock_start {
+                next.push((lock_start, old_addr));
+            }
+            let overlap_start = core::cmp::max(lock_start, old_addr);
+            let overlap_end = core::cmp::min(lock_end, old_end);
+            let moved_start = new_start.saturating_add(overlap_start.saturating_sub(old_addr));
+            let moved_end = new_start.saturating_add(overlap_end.saturating_sub(old_addr));
+            next.push((moved_start, moved_end));
+            if old_end < lock_end {
+                next.push((old_end, lock_end));
+            }
+        }
+        normalize_ranges(&mut next);
+        self.mlocked_ranges = next;
+    }
+
+    fn locked_ranges_with_current_mappings(&self) -> Vec<(usize, usize)> {
+        let mut next = self.mlocked_ranges.clone();
+        for (start, end) in self.user_mapped_ranges() {
+            next.push((start, end));
+        }
+        if next.is_empty() {
+            next.push((self.heap_start, self.heap_start.saturating_add(PAGE_SIZE)));
+        }
+        normalize_ranges(&mut next);
+        next
+    }
+
+    pub fn locked_bytes_after_mlockall_current(&self) -> usize {
+        let next = self.locked_ranges_with_current_mappings();
+        ranges_total_len(&next)
+    }
+
+    pub fn lock_current_mappings(&mut self) {
+        self.mlocked_ranges = self.locked_ranges_with_current_mappings();
+    }
+
+    pub fn clear_mlock_state(&mut self) {
+        self.mlocked_ranges.clear();
+        self.mlockall_future = false;
+    }
+
+    pub fn vm_regions_snapshot(&self) -> Vec<VmRegion> {
+        self.vm_regions.clone()
+    }
+
+    pub fn vm_regions_total_len(&self) -> usize {
+        self.vm_regions.iter().map(|region| region.len).sum()
+    }
+
+    pub fn anon_private_writable_vm_bytes(&self) -> usize {
+        self.vm_regions.iter().fold(0usize, |sum, region| {
+            if !region.shared
+                && !region.file_backed
+                && region.map_permission().contains(MapPermission::W)
+            {
+                sum.saturating_add(region.len)
+            } else {
+                sum
+            }
+        })
+    }
+
+    pub fn vm_regions_overlap(&self, start: usize, end: usize) -> bool {
+        self.vm_regions.iter().any(|region| {
+            let r_end = region.end();
+            end > region.start && start < r_end
+        })
+    }
+
+    pub fn shared_vm_region_overlaps(&self, start: usize, end: usize) -> bool {
+        self.vm_regions
+            .iter()
+            .any(|region| end > region.start && start < region.end() && region.shared)
+    }
+
+    pub fn shared_file_vm_regions_overlapping(&self, start: usize, end: usize) -> Vec<VmRegion> {
+        self.vm_regions
+            .iter()
+            .copied()
+            .filter(|region| {
+                region.shared && region.file_backed && end > region.start && start < region.end()
+            })
+            .collect()
+    }
+
+    pub fn has_writable_shared_memfd_mapping(&self, memfd_id: u64) -> bool {
+        self.vm_regions.iter().any(|region| {
+            region.memfd_id == memfd_id
+                && region.shared
+                && region.map_permission().contains(MapPermission::W)
+        })
+    }
+
+    pub fn file_vm_copy_targets(
+        &self,
+        dev: usize,
+        ino: u32,
+        write_off: usize,
+        len: usize,
+    ) -> Vec<(usize, usize, usize)> {
+        let write_end = write_off.saturating_add(len);
+        let mut pending = Vec::new();
+        for region in self.vm_regions.iter() {
+            if !region.file_backed || region.file_dev != dev || region.file_ino != ino {
+                continue;
+            }
+            let Some(region_file_end) = region.file_offset.checked_add(region.len) else {
+                continue;
+            };
+            let overlap_start = core::cmp::max(write_off, region.file_offset);
+            let mut overlap_end = core::cmp::min(write_end, region_file_end);
+            let region_valid_len = region.file_valid_len.min(region.len);
+            let region_valid_end = region.file_offset.saturating_add(region_valid_len);
+            overlap_end = core::cmp::min(overlap_end, region_valid_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            pending.push((
+                region.start + (overlap_start - region.file_offset),
+                overlap_start - write_off,
+                overlap_end - overlap_start,
+            ));
+        }
+        pending
+    }
+
+    pub fn mmap_backing_file(&self, backing_id: usize) -> Option<Arc<dyn File + Send + Sync>> {
+        self.mmap_backings.get(&backing_id).cloned()
+    }
+
+    pub fn allocate_mmap_backing(&mut self, file: Option<&Arc<dyn File + Send + Sync>>) -> usize {
+        let Some(file) = file else {
+            return 0;
+        };
+        let id = self.next_mmap_backing_id;
+        self.next_mmap_backing_id = self.next_mmap_backing_id.saturating_add(1);
+        self.mmap_backings.insert(id, Arc::clone(file));
+        id
+    }
+
+    pub fn push_vm_region(&mut self, region: VmRegion) {
+        push_vm_region_merged(&mut self.vm_regions, region);
+        self.normalize_vm_regions();
+        self.debug_assert_user_vm_invariants();
+    }
+
+    pub fn trim_vm_regions(&mut self, start: usize, end: usize) {
+        let mut next = Vec::new();
+        for region in self.vm_regions.drain(..) {
+            let r_end = region.end();
+            if end <= region.start || start >= r_end {
+                push_vm_region_merged(&mut next, region);
+                continue;
+            }
+            if start > region.start {
+                push_vm_region_merged(
+                    &mut next,
+                    slice_vm_region(region, region.start, start - region.start),
+                );
+            }
+            if end < r_end {
+                push_vm_region_merged(&mut next, slice_vm_region(region, end, r_end - end));
+            }
+        }
+        self.vm_regions = next;
+        self.normalize_vm_regions();
+        self.debug_assert_user_vm_invariants();
+    }
+
+    pub fn apply_mprotect_to_vm_regions(
+        &mut self,
+        start: usize,
+        end: usize,
+        new_prot: usize,
+    ) -> Result<(), ()> {
+        let mut next = Vec::new();
+        for region in self.vm_regions.iter().copied() {
+            let r_end = region.end();
+            if end <= region.start || start >= r_end {
+                push_vm_region_merged(&mut next, region);
+                continue;
+            }
+            if start > region.start {
+                push_vm_region_merged(
+                    &mut next,
+                    slice_vm_region(region, region.start, start - region.start),
+                );
+            }
+            let ov_start = core::cmp::max(start, region.start);
+            let ov_end = core::cmp::min(end, r_end);
+            let mut mid = slice_vm_region(region, ov_start, ov_end - ov_start);
+            if VmRegion::permission_from_prot(new_prot).contains(MapPermission::W)
+                && !mid.map_permission().contains(MapPermission::W)
+                && !mid.may_write_upgrade
+            {
+                return Err(());
+            }
+            mid.set_prot(new_prot);
+            push_vm_region_merged(&mut next, mid);
+            if end < r_end {
+                push_vm_region_merged(&mut next, slice_vm_region(region, end, r_end - end));
+            }
+        }
+        self.vm_regions = next;
+        self.normalize_vm_regions();
+        self.debug_assert_user_vm_invariants();
+        Ok(())
+    }
+
+    pub fn can_mprotect_vm_regions(&self, start: usize, end: usize, new_prot: usize) -> bool {
+        let asks_write = VmRegion::permission_from_prot(new_prot).contains(MapPermission::W);
+
+        self.vm_regions.iter().all(|region| {
+            let r_end = region.end();
+            if end <= region.start || start >= r_end {
+                return true;
+            }
+            !asks_write
+                || region.map_permission().contains(MapPermission::W)
+                || region.may_write_upgrade
+        })
+    }
+
+    pub fn move_vm_region_metadata(&mut self, old_addr: usize, old_len: usize, new_start: usize) {
+        let old_end = old_addr.saturating_add(old_len);
+        let mut next = Vec::new();
+        for region in self.vm_regions.drain(..) {
+            let r_end = region.end();
+            if old_end <= region.start || old_addr >= r_end {
+                push_vm_region_merged(&mut next, region);
+                continue;
+            }
+            if old_addr > region.start {
+                push_vm_region_merged(
+                    &mut next,
+                    slice_vm_region(region, region.start, old_addr - region.start),
+                );
+            }
+            let moved = move_vm_region(slice_vm_region(region, old_addr, old_len), new_start);
+            push_vm_region_merged(&mut next, moved);
+            if old_end < r_end {
+                push_vm_region_merged(&mut next, slice_vm_region(region, old_end, r_end - old_end));
+            }
+        }
+        self.vm_regions = next;
+        self.normalize_vm_regions();
+        self.debug_assert_user_vm_invariants();
+    }
+
+    pub fn set_vm_region_len_by_start(&mut self, start: usize, len: usize) -> bool {
+        if let Some(region) = self
+            .vm_regions
+            .iter_mut()
+            .find(|region| region.start == start)
+        {
+            if !region.file_backed || region.file_valid_len == region.len {
+                region.file_valid_len = len;
+            } else {
+                region.file_valid_len = region.file_valid_len.min(len);
+            }
+            region.len = len;
+            self.normalize_vm_regions();
+            self.debug_assert_user_vm_invariants();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn vm_region_containing(&self, start: usize, end: usize) -> Option<VmRegion> {
+        self.vm_regions
+            .iter()
+            .copied()
+            .find(|region| start >= region.start && end <= region.end())
+    }
+
+    pub fn occupied_user_ranges_with_metadata(&self) -> Vec<(usize, usize)> {
+        let mut ranges = self.user_mapped_ranges();
+        ranges.extend(self.vm_regions.iter().filter_map(|region| {
+            let end = region.end();
+            (end > region.start).then_some((region.start, end))
+        }));
+        normalize_ranges(&mut ranges);
+        ranges
+    }
+
+    pub fn page_overlaps_vm_region(&self, page_start: usize) -> bool {
+        let page_end = page_start.saturating_add(PAGE_SIZE);
+        self.vm_regions
+            .iter()
+            .any(|region| page_end > region.start && page_start < region.end())
+    }
+
+    pub fn page_overlaps_vm_region_started_before(&self, page_start: usize, limit: usize) -> bool {
+        let page_end = page_start.saturating_add(PAGE_SIZE);
+        self.vm_regions.iter().any(|region| {
+            region.start < limit && page_end > region.start && page_start < region.end()
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn fault_hits_mmap_sigbus_tail(&self, addr: usize) -> bool {
+        self.vm_regions.iter().any(|region| {
+            addr >= region.start && addr < region.end() && addr >= region.sigbus_start
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn try_expand_growsdown(
+        &mut self,
+        fault_va: usize,
+        access: MapPermission,
+    ) -> LazyFaultResult {
+        let fault_page = fault_va & !(PAGE_SIZE - 1);
+
+        for idx in 0..self.vm_regions.len() {
+            let region = self.vm_regions[idx];
+            if !region.growsdown {
+                continue;
+            }
+            let Some(expected) = region.start.checked_sub(PAGE_SIZE) else {
+                continue;
+            };
+            if fault_page != expected {
+                continue;
+            }
+
+            let perm = region.map_permission();
+            if !perm.contains(access) {
+                return LazyFaultResult::Invalid;
+            }
+            if self.range_overlaps(fault_page.into(), region.start.into()) {
+                return LazyFaultResult::Invalid;
+            }
+            // Keep one-page guard below the expanded stack segment.
+            let Some(next_guard_start) = fault_page.checked_sub(PAGE_SIZE) else {
+                return LazyFaultResult::Invalid;
+            };
+            if self.range_overlaps(next_guard_start.into(), fault_page.into()) {
+                return LazyFaultResult::Invalid;
+            }
+            if !self.try_insert_lazy_area(fault_page.into(), region.start.into(), perm) {
+                return LazyFaultResult::Invalid;
+            }
+
+            let grown = region.start - fault_page;
+            self.vm_regions[idx].start = fault_page;
+            self.vm_regions[idx].len += grown;
+            self.normalize_vm_regions();
+            self.debug_assert_user_vm_invariants();
+            return self.resolve_lazy_fault(fault_va, access);
+        }
+        LazyFaultResult::Invalid
     }
 
     /// Lightweight summary used to diagnose fork/COW memory pressure.
@@ -138,16 +902,27 @@ impl MemorySet {
         if start_vpn >= end_vpn {
             return true;
         }
+        // Refuse to insert over an existing VMA. brk()/mmap() already pre-scan
+        // for free space, but this is the last-resort guard that stops a racing
+        // or mis-computed range from silently overlapping a live mapping.
+        if self.range_overlaps(start_va, end_va) {
+            return false;
+        }
 
         // Linux merges adjacent anonymous VMAs with identical attributes.
-        // Do the same so repeated mmap() doesn't explode VMA count.
-        if let Some(last) = self.areas.last_mut() {
-            if last.map_type == MapType::Lazy
-                && last.map_perm == permission
-                && last.vpn_range.get_end() == start_vpn
-            {
-                return last.append_to(&mut self.page_table, end_vpn);
+        // Keep this independent of Vec ordering so brk-style growth can still
+        // coalesce after the area list is normalized by address.
+        if let Some(idx) = self.areas.iter().position(|area| {
+            area.map_type == MapType::Lazy
+                && area.map_perm == permission
+                && area.vpn_range.get_end() == start_vpn
+        }) {
+            let appended = self.areas[idx].append_to(&mut self.page_table, end_vpn);
+            if appended {
+                self.sort_user_areas();
+                self.debug_assert_user_vm_invariants();
             }
+            return appended;
         }
 
         self.try_push(
@@ -205,6 +980,14 @@ impl MemorySet {
     }
 
     fn try_push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) -> bool {
+        // Common choke point for every area insertion: bail out instead of
+        // mapping a range that overlaps an existing VMA, which would corrupt the
+        // page table and the `areas` bookkeeping.
+        let start_va = VirtAddr::from(map_area.vpn_range.get_start());
+        let end_va = VirtAddr::from(map_area.vpn_range.get_end());
+        if self.range_overlaps(start_va, end_va) {
+            return false;
+        }
         if !map_area.map(&mut self.page_table) {
             return false;
         }
@@ -212,12 +995,16 @@ impl MemorySet {
             map_area.copy_data(&self.page_table, data);
         }
         self.areas.push(map_area);
+        self.sort_user_areas();
+        self.debug_assert_user_vm_invariants();
         true
     }
 
     /// Push an already-mapped `MapArea` into this address space (used by COW fork).
     fn push_mapped(&mut self, map_area: MapArea) {
         self.areas.push(map_area);
+        self.sort_user_areas();
+        self.debug_assert_user_vm_invariants();
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
@@ -435,6 +1222,7 @@ impl MemorySet {
             ),
             None,
         );
+        memory_set.reset_user_layout(user_stack_bottom);
         // map TrapContext
         memory_set.push(
             MapArea::new(
@@ -508,6 +1296,7 @@ impl MemorySet {
         ) {
             return Err(ENOMEM);
         }
+        memory_set.reset_user_layout(user_stack_bottom);
         if !memory_set.try_push(
             MapArea::new(
                 TRAP_CONTEXT.into(),
@@ -753,6 +1542,7 @@ impl MemorySet {
             ),
             None,
         );
+        memory_set.reset_user_layout(user_stack_bottom);
         // map TrapContext
         memory_set.push(
             MapArea::new(
@@ -837,6 +1627,7 @@ impl MemorySet {
         ) {
             return Err(ENOMEM);
         }
+        memory_set.reset_user_layout(user_stack_bottom);
         if !memory_set.try_push(
             MapArea::new(
                 TRAP_CONTEXT.into(),
@@ -1033,6 +1824,7 @@ impl MemorySet {
             }
         }
 
+        memory_set.inherit_user_vm_metadata_from(user_space);
         memory_set
     }
 
@@ -1121,6 +1913,7 @@ impl MemorySet {
             memory_set.push_mapped(new_area);
         }
 
+        memory_set.inherit_user_vm_metadata_from(user_space);
         memory_set
     }
 
@@ -1198,6 +1991,7 @@ impl MemorySet {
             memory_set.push_mapped(new_area);
         }
 
+        memory_set.inherit_user_vm_metadata_from(user_space);
         memory_set
     }
 
@@ -1366,6 +2160,8 @@ impl MemorySet {
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
             area.shrink_to(&mut self.page_table, new_end.ceil());
+            self.sort_user_areas();
+            self.debug_assert_user_vm_invariants();
             true
         } else {
             false
@@ -1378,7 +2174,12 @@ impl MemorySet {
             .iter_mut()
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
-            area.append_to(&mut self.page_table, new_end.ceil())
+            let appended = area.append_to(&mut self.page_table, new_end.ceil());
+            if appended {
+                self.sort_user_areas();
+                self.debug_assert_user_vm_invariants();
+            }
+            appended
         } else {
             false
         }
@@ -1391,6 +2192,7 @@ impl MemorySet {
         }) {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
+            self.debug_assert_user_vm_invariants();
         };
     }
 
@@ -1498,6 +2300,8 @@ impl MemorySet {
 
         if !found {
             self.areas = new_areas;
+            self.sort_user_areas();
+            self.debug_assert_user_vm_invariants();
             return false;
         }
 
@@ -1506,8 +2310,8 @@ impl MemorySet {
             self.page_table.map(vpn, ppn, flags);
         }
         self.areas.extend(moved_areas);
-        self.areas
-            .sort_unstable_by_key(|area| area.vpn_range.get_start().0);
+        self.sort_user_areas();
+        self.debug_assert_user_vm_invariants();
         true
     }
 
@@ -1531,6 +2335,7 @@ impl MemorySet {
         }) {
             let mut area = self.areas.remove(idx);
             area.unmap(&mut self.page_table);
+            self.debug_assert_user_vm_invariants();
             return;
         }
 
@@ -1581,6 +2386,8 @@ impl MemorySet {
             }
         }
         self.areas = new_areas;
+        self.sort_user_areas();
+        self.debug_assert_user_vm_invariants();
     }
 
     /// Update user mapping permissions in `[start_va, end_va)`.
@@ -1704,6 +2511,8 @@ impl MemorySet {
             }
         }
         self.areas = new_areas;
+        self.sort_user_areas();
+        self.debug_assert_user_vm_invariants();
         true
     }
 
@@ -1735,6 +2544,7 @@ impl MemorySet {
                 area.unmap_one_maybe(&mut self.page_table, vpn);
             }
         }
+        self.debug_assert_user_vm_invariants();
     }
 
     /// Returns true if any existing mapping overlaps the range.
@@ -1818,6 +2628,7 @@ impl MemorySet {
         {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
+            self.debug_assert_user_vm_invariants();
         };
     }
 
@@ -1875,12 +2686,14 @@ impl MemorySet {
             }
         }
 
+        new_memory_set.inherit_user_vm_metadata_from(self);
         new_memory_set
     }
     #[allow(dead_code)]
     pub fn recycle_data_pages(&mut self) {
         //*self = Self::new_bare();
         self.areas.clear();
+        self.debug_assert_user_vm_invariants();
     }
 }
 
@@ -2055,7 +2868,7 @@ impl LazyFaultResult {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 /// map type for memory set: identical, framed, or lazy (on-demand)
 pub enum MapType {
     Identical,

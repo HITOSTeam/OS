@@ -158,14 +158,17 @@ impl HartRunQueue {
         }
     }
 
+    /// 该 hart 就绪队列中 fair(CFS) 任务的总数（不含 RT 队列）。
+    fn fair_len(&self) -> usize {
+        self.fair_groups
+            .values()
+            .map(|group| group.tasks.len())
+            .sum()
+    }
+
     /// 返回该 hart 就绪队列中所有任务的总数（RT + Fair）
     fn len(&self) -> usize {
-        self.rt_queues.iter().map(VecDeque::len).sum::<usize>()
-            + self
-                .fair_groups
-                .values()
-                .map(|group| group.tasks.len())
-                .sum::<usize>()
+        self.rt_queues.iter().map(VecDeque::len).sum::<usize>() + self.fair_len()
     }
 }
 
@@ -253,15 +256,16 @@ impl TaskManager {
         }
     }
     /// 关键函数
-    /// 将任务加入指定 hart 的就绪队列。返回 `true` 表示入队前该队列为空。
+    /// 将任务加入指定 hart 的就绪队列。返回 `Some(true)` 表示入队前该队列为空；
+    /// 返回 `None` 表示任务已在就绪队列中，本次没有重复入队。
     /// 使用 `in_ready_queue` 标志防止 SMP 下同一任务被重复入队。
-    pub fn add(&mut self, task: Arc<TaskControlBlock>, hart_id: usize) -> bool {
+    pub fn add(&mut self, task: Arc<TaskControlBlock>, hart_id: usize) -> Option<bool> {
         // Avoid enqueueing the same task multiple times under SMP.
         if task
             .in_ready_queue
             .swap(true, core::sync::atomic::Ordering::AcqRel)
         {
-            return false;
+            return None;
         }
         let hart_rq = &mut self.ready_queues[hart_id];
         let was_empty = hart_rq.len() == 0;
@@ -296,7 +300,7 @@ impl TaskManager {
                 hart_rq.len()
             );
         }
-        was_empty
+        Some(was_empty)
     }
 
     /// 从 RT 队列头部弹出第一个状态为 Ready 的任务，跳过并清理状态已过期的任务
@@ -487,6 +491,14 @@ impl TaskManager {
         self.ready_queues.iter().map(HartRunQueue::len).collect()
     }
 
+    /// 返回指定 hart 上等待运行的 fair-class 任务数。
+    fn ready_fair_task_count(&self, hart_id: usize) -> usize {
+        self.ready_queues
+            .get(hart_id)
+            .map(HartRunQueue::fair_len)
+            .unwrap_or(0)
+    }
+
     /// 调试用：统计指定任务在所有就绪队列中出现的引用次数（用于检测重复入队等异常）
     fn debug_count_task_refs(&self, task: &Arc<TaskControlBlock>) -> usize {
         self.ready_queues
@@ -531,20 +543,23 @@ lazy_static! {
 
 /// 将任务加入某个在线 hart 的就绪队列。目标 hart 空闲时（wfi）发送 IPI 唤醒之。
 /// 类似 Linux wake_up_process：优先使用 task->cpu 指定的 hart，否则放当前 hart。
-pub fn add_task(task: Arc<TaskControlBlock>) {
+/// 返回 `Some(hart_id)` 表示本次实际入队的目标 hart；`None` 表示任务已在就绪
+/// 队列中、未重复入队（调用方据此决定是否触发唤醒抢占）。
+pub fn add_task(task: Arc<TaskControlBlock>) -> Option<usize> {
     // Protect the ready queue from timer interrupt re-entrancy, but restore the previous SIE state.
     let prev_sie = arch::disable_interrupts();
     let mask = online_hart_mask();
     let cur = crate::task::processor::hart_id() % MAX_HARTS;
     let hart_id = resolve_enqueue_hart(&task, cur, mask);
-    let was_empty = TASK_MANAGER.lock().add(task, hart_id);
+    let queued = TASK_MANAGER.lock().add(Arc::clone(&task), hart_id);
     // Linux-style: if we queued to a remote hart, kick it out of `wfi` via IPI.
     // For fork storms this avoids flooding remote harts with redundant IPIs when
     // their runqueue is already non-empty.
-    if cur < MAX_HARTS && cur != hart_id && was_empty {
+    if cur < MAX_HARTS && cur != hart_id && queued == Some(true) {
         arch::send_ipi(hart_id);
     }
     arch::restore_interrupts(prev_sie);
+    queued.map(|_| hart_id)
 }
 
 /// 在进程调度策略/优先级/nice 值变更后，重新将其所有可运行线程入队到正确的位置
@@ -599,7 +614,11 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
             task.wakeup_pending
                 .store(false, core::sync::atomic::Ordering::Release);
             drop(task_inner);
-            add_task(task);
+            // 入队成功后，若被唤醒任务应抢占目标 hart 的当前任务，则请求一次
+            // 返回用户态前的重调度（仅当 add_task 返回 Some、即确实入队时）。
+            if let Some(hart_id) = add_task(Arc::clone(&task)) {
+                crate::task::processor::request_reschedule_for_wakeup(&task, hart_id);
+            }
         }
     }
 
@@ -649,6 +668,15 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     let t = TASK_MANAGER.lock().fetch(hart_id);
     arch::restore_interrupts(prev_sie);
     t
+}
+
+/// 当前 hart 上等待运行的 fair-class 任务数，不包含当前正在运行的任务。
+pub fn fair_ready_task_count() -> usize {
+    let prev_sie = arch::disable_interrupts();
+    let hart_id = crate::task::processor::hart_id() % MAX_HARTS;
+    let count = TASK_MANAGER.lock().ready_fair_task_count(hart_id);
+    arch::restore_interrupts(prev_sie);
+    count
 }
 
 /// 检查当前 hart 上是否有比给定优先级更高的 RT 任务就绪（用于 RT 抢占判断）

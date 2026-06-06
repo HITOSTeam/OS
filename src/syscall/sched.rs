@@ -11,9 +11,9 @@ use crate::{
         manager::{pid2process, refresh_process_runqueues},
         processor::{current_process, hart_id, suspend_current_and_run_next},
         sched::{
-            RR_TIMESLICE_MS, SCHED_BATCH, SCHED_DEADLINE, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE,
-            SCHED_OTHER, SCHED_RESET_ON_FORK, SchedClass, check_policy, clamp_nice,
-            policy_priority_max, policy_priority_min, sched_class, valid_priority_for_policy,
+            SCHED_BATCH, SCHED_DEADLINE, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_OTHER,
+            SCHED_RESET_ON_FORK, SchedClass, check_policy, clamp_nice, policy_priority_max,
+            policy_priority_min, rr_timeslice_ms, sched_class, valid_priority_for_policy,
         },
     },
     trap::get_current_token,
@@ -409,7 +409,7 @@ pub fn syscall_sched_rr_get_interval(pid: usize, interval_ptr: usize) -> isize {
     };
     let policy = process.borrow_mut().scheduling.sched_policy;
     let interval_ms = match sched_class(policy) {
-        Some(SchedClass::Rr) => RR_TIMESLICE_MS,
+        Some(SchedClass::Rr) => rr_timeslice_ms(),
         _ => 0,
     };
     let token = get_current_token();
