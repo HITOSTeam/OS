@@ -153,6 +153,7 @@ pub fn syscall_mmap(
     } else {
         (false, 0, 0, 0)
     };
+    let shared_inode_backed = is_shared && file_backed;
     let map_len = align_up(len, PAGE_SIZE);
     let commit_charge = anon_private_commit_charge(map_len, prot, is_anon, is_shared);
     if exceeds_overcommit_limit(commit_charge) {
@@ -268,16 +269,35 @@ pub fn syscall_mmap(
 
     let mut vma_areas = Vec::new();
     if is_shared {
-        let frames = if let Some(file) = &file {
-            if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-                let file_mapped_len = sigbus_start.saturating_sub(map_start);
-                let Some(frames) = shm.shared_frames_existing(off, file_mapped_len) else {
-                    return err(SyscallError::ENOMEM);
-                };
-                frames
+        if shared_inode_backed {
+            if map_start < sigbus_start {
+                vma_areas.push(VmaInsertArea::Lazy {
+                    start: map_start,
+                    end: sigbus_start,
+                });
+            }
+        } else {
+            let frames = if let Some(file) = &file {
+                if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+                    let file_mapped_len = sigbus_start.saturating_sub(map_start);
+                    let Some(frames) = shm.shared_frames_existing(off, file_mapped_len) else {
+                        return err(SyscallError::ENOMEM);
+                    };
+                    frames
+                } else {
+                    let file_mapped_len = sigbus_start.saturating_sub(map_start);
+                    let pages = file_mapped_len / PAGE_SIZE;
+                    let mut frames = alloc::vec::Vec::with_capacity(pages);
+                    for _ in 0..pages {
+                        let Some(frame) = frame_alloc() else {
+                            return err(SyscallError::ENOMEM);
+                        };
+                        frames.push(frame);
+                    }
+                    frames
+                }
             } else {
-                let file_mapped_len = sigbus_start.saturating_sub(map_start);
-                let pages = file_mapped_len / PAGE_SIZE;
+                let pages = map_len / PAGE_SIZE;
                 let mut frames = alloc::vec::Vec::with_capacity(pages);
                 for _ in 0..pages {
                     let Some(frame) = frame_alloc() else {
@@ -286,26 +306,16 @@ pub fn syscall_mmap(
                     frames.push(frame);
                 }
                 frames
+            };
+            if map_start < sigbus_start {
+                vma_areas.push(VmaInsertArea::SharedFrames {
+                    start: map_start,
+                    end: sigbus_start,
+                    frames,
+                });
+            } else if !frames.is_empty() {
+                return err(SyscallError::ENOMEM);
             }
-        } else {
-            let pages = map_len / PAGE_SIZE;
-            let mut frames = alloc::vec::Vec::with_capacity(pages);
-            for _ in 0..pages {
-                let Some(frame) = frame_alloc() else {
-                    return err(SyscallError::ENOMEM);
-                };
-                frames.push(frame);
-            }
-            frames
-        };
-        if map_start < sigbus_start {
-            vma_areas.push(VmaInsertArea::SharedFrames {
-                start: map_start,
-                end: sigbus_start,
-                frames,
-            });
-        } else if !frames.is_empty() {
-            return err(SyscallError::ENOMEM);
         }
         if sigbus_start < map_end {
             vma_areas.push(VmaInsertArea::Lazy {
@@ -358,7 +368,9 @@ pub fn syscall_mmap(
         start,
         len: map_len,
         prot: prot & (PROT_READ | PROT_WRITE | PROT_EXEC),
-        map_type: if is_shared || !is_anon {
+        map_type: if shared_inode_backed {
+            MapType::Lazy
+        } else if is_shared || !is_anon {
             MapType::Framed
         } else {
             MapType::Lazy
@@ -377,7 +389,7 @@ pub fn syscall_mmap(
         sysv_shmid: 0,
         growsdown: (flags & MAP_GROWSDOWN) != 0,
     };
-    let should_populate_file = !is_anon && fd >= 0;
+    let should_populate_file = !is_anon && fd >= 0 && !shared_inode_backed;
     let backing_file = file.as_ref();
     let detached_shmids = {
         let mut memory_set = inner.memory_set.lock();
@@ -825,10 +837,18 @@ pub fn syscall_mremap(
 
         let mut grow_areas = Vec::new();
         if grow_start < final_sigbus_start {
-            grow_areas.push(VmaInsertArea::Framed {
-                start: grow_start,
-                end: min(final_sigbus_start, target_new_end),
-            });
+            let grow_valid_end = min(final_sigbus_start, target_new_end);
+            if src_region.shared {
+                grow_areas.push(VmaInsertArea::Lazy {
+                    start: grow_start,
+                    end: grow_valid_end,
+                });
+            } else {
+                grow_areas.push(VmaInsertArea::Framed {
+                    start: grow_start,
+                    end: grow_valid_end,
+                });
+            }
         }
         if final_sigbus_start < target_new_end {
             grow_areas.push(VmaInsertArea::Lazy {
@@ -857,6 +877,9 @@ pub fn syscall_mremap(
                 grow_areas,
                 final_file_valid_len,
                 |memory_set| {
+                    if src_region.shared {
+                        return true;
+                    }
                     let token = memory_set.token();
                     let mut pos = 0usize;
                     let mut tmp = [0u8; 512];

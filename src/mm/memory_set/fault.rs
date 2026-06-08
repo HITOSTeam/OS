@@ -1,3 +1,4 @@
+use super::backing::{shared_file_page_cache_get, shared_file_page_cache_insert_or_get};
 use super::{
     LazyFaultResult, MapPermission, MapType, MemorySet, vm_region_map_area_type_compatible,
 };
@@ -161,6 +162,22 @@ impl MemorySet {
             .file_backed
             .then(|| self.mmap_backing_file(region.backing_id))
             .flatten();
+        let page_start = vpn.0.saturating_mul(PAGE_SIZE);
+        let file_page = (region.backing_id != 0).then(|| {
+            region
+                .file_offset
+                .saturating_add(page_start.saturating_sub(region.start))
+                / PAGE_SIZE
+        });
+        let shared_inode_backed = region.shared && region.file_backed && region.memfd_id == 0;
+        let mut cached_shared_frame = if shared_inode_backed {
+            file_page.and_then(|file_page| {
+                shared_file_page_cache_get(region.file_dev, region.file_ino, file_page)
+                    .or_else(|| self.mmap_backing_resident_frame(region.backing_id, file_page))
+            })
+        } else {
+            None
+        };
         for area in self.areas.iter_mut() {
             if !area.is_lazy() {
                 continue;
@@ -189,14 +206,18 @@ impl MemorySet {
             let total_pages = area.page_count();
             let accounted_pages = area.charged_or_tracked_pages();
             let new_charge_pages = total_pages.saturating_sub(accounted_pages);
-            let Some(frame) = frame_alloc() else {
-                crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
-                return LazyFaultResult::Oom;
+            let (frame, reused_cached_frame) = if let Some(frame) = cached_shared_frame.take() {
+                (frame, true)
+            } else {
+                let Some(frame) = frame_alloc() else {
+                    crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
+                    return LazyFaultResult::Oom;
+                };
+                (frame, false)
             };
-            if let Some(file) = file_backing.as_ref() {
+            if !reused_cached_frame && let Some(file) = file_backing.as_ref() {
                 if region.file_backed {
                     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-                        let page_start = vpn.0.saturating_mul(PAGE_SIZE);
                         let region_delta = page_start.saturating_sub(region.start);
                         let file_off = region.file_offset.saturating_add(region_delta);
                         let valid_len = region.file_valid_len();
@@ -208,9 +229,20 @@ impl MemorySet {
                     }
                 }
             }
+            let frame = if shared_inode_backed && let Some(file_page) = file_page {
+                shared_file_page_cache_insert_or_get(
+                    region.file_dev,
+                    region.file_ino,
+                    file_page,
+                    frame,
+                )
+            } else {
+                frame
+            };
             // Allocate before charging so OOM in frame_alloc() cannot leak cgroup accounting;
             // if charging fails, the uninstalled frame is dropped immediately.
             if new_charge_pages > 0
+                && region.is_private_anonymous()
                 && perm.contains(MapPermission::U)
                 && perm.contains(MapPermission::W)
             {
@@ -222,17 +254,22 @@ impl MemorySet {
             }
             self.page_table.map(vpn, frame.ppn, pte_flags);
             area.insert_tracked_frame(vpn, frame);
-            if region.backing_id != 0 {
-                let page_start = vpn.0.saturating_mul(PAGE_SIZE);
-                let file_page = region
-                    .file_offset
-                    .saturating_add(page_start.saturating_sub(region.start))
-                    / PAGE_SIZE;
-                self.mark_mmap_backing_resident_page(
-                    region.backing_id,
-                    file_page,
-                    pte_flags.contains(PTEFlags::D),
-                );
+            if region.backing_id != 0
+                && let Some(file_page) = file_page
+            {
+                let backing_frame = area
+                    .tracked_frame(vpn)
+                    .expect("lazy fault inserted frame")
+                    .clone();
+                if let Some(backing) = self.mmap_backings.get_mut(&region.backing_id) {
+                    let cache_frame =
+                        (region.shared && region.file_backed).then_some(&backing_frame);
+                    backing.add_resident_page_ref(
+                        file_page,
+                        cache_frame,
+                        pte_flags.contains(PTEFlags::D),
+                    );
+                }
             }
             #[cfg(target_arch = "riscv64")]
             // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.

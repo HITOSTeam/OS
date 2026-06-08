@@ -51,6 +51,17 @@ impl MmRef {
         self.lock().update_file_vm_size(dev, ino, file_size)
     }
 
+    pub fn mirror_shared_file_write_to_resident_mmaps(
+        &self,
+        dev: usize,
+        ino: u32,
+        write_off: usize,
+        data: &[u8],
+    ) {
+        self.lock()
+            .mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
+    }
+
     pub fn try_insert_stack_framed_range(
         &self,
         start: usize,

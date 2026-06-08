@@ -67,6 +67,14 @@ lazy_static! {
     pub static ref KERNEL_SPACE: Mutex<MemorySet> = Mutex::new(MemorySet::new_kernel());
 }
 
+pub(crate) fn update_shared_file_page_cache(dev: usize, ino: u32, write_off: usize, data: &[u8]) {
+    backing::shared_file_page_cache_write(dev, ino, write_off, data);
+}
+
+pub(crate) fn resize_shared_file_page_cache(dev: usize, ino: u32, file_size: usize) {
+    backing::shared_file_page_cache_resize(dev, ino, file_size);
+}
+
 /// memory set structure, controls virtual-memory space
 pub struct MemorySet {
     page_table: PageTable,
@@ -440,8 +448,34 @@ impl MemorySet {
                 backing_id
             );
         }
+        let backing_identities = self
+            .mmap_backings
+            .iter()
+            .map(|(&backing_id, backing)| (backing_id, backing.kind))
+            .collect::<Vec<_>>();
+        for (idx, (left_id, left_kind)) in backing_identities.iter().enumerate() {
+            for (right_id, right_kind) in backing_identities.iter().skip(idx + 1) {
+                debug_assert_ne!(
+                    left_kind, right_kind,
+                    "duplicate mmap backing identity: ids {} and {} both {:?}",
+                    left_id, right_id, left_kind
+                );
+            }
+        }
         for (backing_id, backing) in self.mmap_backings.iter() {
-            for file_page in backing.resident_pages.keys().copied() {
+            let expected_vm_state = self.collect_mmap_backing_vm_state(*backing_id);
+            debug_assert_eq!(
+                backing.vm_state, expected_vm_state,
+                "mmap backing id {} has stale VmRegion lifecycle state",
+                backing_id
+            );
+            for (&file_page, state) in backing.resident_pages.iter() {
+                debug_assert!(
+                    state.ref_count > 0,
+                    "mmap backing id {} has zero resident refcount for file page {}",
+                    backing_id,
+                    file_page
+                );
                 let file_page_start = file_page.saturating_mul(PAGE_SIZE);
                 let file_page_end = file_page_start.saturating_add(PAGE_SIZE);
                 debug_assert!(
@@ -763,7 +797,11 @@ impl MemorySet {
     }
 
     pub fn push_vm_region(&mut self, region: VmRegion) {
+        let backing_id = region.backing_id;
         self.vm_regions.push_merged(region);
+        if backing_id != 0 {
+            self.refresh_mmap_backing_state(backing_id);
+        }
         self.debug_assert_user_vm_invariants();
     }
 
@@ -958,7 +996,7 @@ impl MemorySet {
         let backing_id = region.backing_id;
         self.push_vm_region(region);
         if backing_id != 0 {
-            self.refresh_mmap_backing_resident_pages(backing_id);
+            self.refresh_mmap_backing_state(backing_id);
         }
         if lock_range {
             self.add_locked_range(start, end);
@@ -1248,6 +1286,8 @@ impl MemorySet {
                 return Err(MprotectError::Unmapped);
             }
         }
+        let backing_ids = self.backing_ids_for_vma_range(start, end);
+        self.refresh_mmap_backing_states(backing_ids);
         self.debug_assert_user_vm_invariants();
         Ok(())
     }
@@ -1273,8 +1313,15 @@ impl MemorySet {
         if !self.move_user_range_raw(old_addr.into(), old_end.into(), new_start.into()) {
             return false;
         }
+        let mut backing_ids = self.backing_ids_for_vma_range(old_addr, old_end);
         self.move_vm_region_metadata_raw(old_addr, old_len, new_start);
         self.move_locked_ranges(old_addr, old_len, new_start);
+        if let Some(new_end) = new_start.checked_add(old_len) {
+            for backing_id in self.backing_ids_for_vma_range(new_start, new_end) {
+                Self::push_unique_backing_id(&mut backing_ids, backing_id);
+            }
+        }
+        self.refresh_mmap_backing_states(backing_ids);
         self.debug_assert_user_vm_invariants();
         true
     }
@@ -1449,7 +1496,7 @@ impl MemorySet {
         }
         if let Some(region) = self.vm_region_containing_addr(target_start) {
             if region.backing_id != 0 {
-                self.refresh_mmap_backing_resident_pages(region.backing_id);
+                self.refresh_mmap_backing_state(region.backing_id);
             }
         }
         self.debug_assert_user_vm_invariants();
@@ -1522,6 +1569,11 @@ impl MemorySet {
 
     pub fn set_vm_region_len_by_start(&mut self, start: usize, len: usize) -> bool {
         if self.vm_regions.set_len_by_start(start, len) {
+            if let Some(region) = self.vm_region_containing_addr(start) {
+                if region.backing_id != 0 {
+                    self.refresh_mmap_backing_state(region.backing_id);
+                }
+            }
             self.debug_assert_user_vm_invariants();
             true
         } else {
@@ -1539,6 +1591,11 @@ impl MemorySet {
             .vm_regions
             .set_len_and_file_valid_by_start(start, len, file_valid_len)
         {
+            if let Some(region) = self.vm_region_containing_addr(start) {
+                if region.backing_id != 0 {
+                    self.refresh_mmap_backing_state(region.backing_id);
+                }
+            }
             self.debug_assert_user_vm_invariants();
             true
         } else {

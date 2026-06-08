@@ -1,11 +1,11 @@
 use super::MemorySet;
-use super::backing::{MmapBacking, MmapBackingPageState, MmapWritebackChunk};
+use super::backing::{MmapBacking, MmapBackingPageState, MmapBackingVmState, MmapWritebackChunk};
 use super::map_area::{MapArea, MapPermission};
-use super::range::{align_down_to_page, align_up_to_page};
+use super::range::{align_down_to_page, align_up_to_page, normalize_ranges};
 use super::vma::VmRegion;
 use crate::config::PAGE_SIZE;
 use crate::fs::{File, OSInode};
-use crate::mm::{PTEFlags, PhysAddr, PhysPageNum, VPNRange, VirtAddr, VirtPageNum};
+use crate::mm::{FrameTracker, PTEFlags, PhysAddr, VPNRange, VirtAddr, VirtPageNum};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -20,15 +20,21 @@ impl MemorySet {
         &self,
         area: &MapArea,
         vpn: VirtPageNum,
-    ) -> Option<(PhysPageNum, PTEFlags, bool)> {
+    ) -> Option<(FrameTracker, PTEFlags, bool)> {
+        let frame = area.tracked_frame(vpn)?;
         if let Some(pte) = self.page_table.translate(vpn) {
             if pte.is_valid() {
-                return Some((pte.ppn(), pte.flags(), true));
+                debug_assert_eq!(
+                    pte.ppn(),
+                    frame.ppn,
+                    "resident PTE ppn drifted from tracked frame for vpn {:?}",
+                    vpn
+                );
+                return Some((frame.clone(), pte.flags(), true));
             }
         }
-        let frame = area.tracked_frame(vpn)?;
         let flags = area.saved_pte_flags(vpn)?;
-        Some((frame.ppn, flags, false))
+        Some((frame.clone(), flags, false))
     }
 
     fn collect_mmap_backing_resident_pages(
@@ -61,7 +67,8 @@ impl MemorySet {
                     if page_start < scan_start || page_start >= scan_end {
                         continue;
                     }
-                    let Some((_ppn, flags, _has_valid_pte)) = self.resident_page_for_vpn(area, vpn)
+                    let Some((frame, flags, _has_valid_pte)) =
+                        self.resident_page_for_vpn(area, vpn)
                     else {
                         continue;
                     };
@@ -72,36 +79,93 @@ impl MemorySet {
                     let state = pages
                         .entry(file_page)
                         .or_insert_with(MmapBackingPageState::default);
+                    state.ref_count = state.ref_count.saturating_add(1);
                     state.dirty |= flags.contains(PTEFlags::D);
+                    if region.shared && region.file_backed {
+                        if let Some(existing) = state.frame.as_ref() {
+                            debug_assert_eq!(
+                                existing.ppn, frame.ppn,
+                                "mmap backing file page {} points at multiple shared frames",
+                                file_page
+                            );
+                        } else {
+                            state.frame = Some(frame);
+                        }
+                    }
                 }
             }
         }
         pages
     }
 
-    pub(super) fn refresh_mmap_backing_resident_pages(&mut self, backing_id: usize) {
+    pub(super) fn collect_mmap_backing_vm_state(&self, backing_id: usize) -> MmapBackingVmState {
+        let mut vm_state = MmapBackingVmState::default();
+        for region in self
+            .vm_regions
+            .iter()
+            .filter(|region| region.backing_id == backing_id)
+        {
+            vm_state.vma_count = vm_state.vma_count.saturating_add(1);
+
+            let mapped_start = region.file_offset;
+            let mapped_end = region.file_offset.saturating_add(region.len);
+            if mapped_start < mapped_end {
+                vm_state.mapped_file_ranges.push((mapped_start, mapped_end));
+            }
+
+            let valid_start = region.file_offset;
+            let valid_end = region.file_offset.saturating_add(region.file_valid_len());
+            if valid_start < valid_end {
+                vm_state.valid_file_ranges.push((valid_start, valid_end));
+            }
+        }
+        normalize_ranges(&mut vm_state.mapped_file_ranges);
+        normalize_ranges(&mut vm_state.valid_file_ranges);
+        vm_state
+    }
+
+    pub(super) fn push_unique_backing_id(backing_ids: &mut Vec<usize>, backing_id: usize) {
+        if backing_id != 0 && !backing_ids.contains(&backing_id) {
+            backing_ids.push(backing_id);
+        }
+    }
+
+    pub(super) fn backing_ids_for_vma_range(&self, start: usize, end: usize) -> Vec<usize> {
+        let mut backing_ids = Vec::new();
+        for region in self.vm_regions.snapshot_range(start, end) {
+            Self::push_unique_backing_id(&mut backing_ids, region.backing_id);
+        }
+        backing_ids
+    }
+
+    pub(super) fn refresh_mmap_backing_state(&mut self, backing_id: usize) {
         let pages = self.collect_mmap_backing_resident_pages(backing_id);
+        let vm_state = self.collect_mmap_backing_vm_state(backing_id);
         if let Some(backing) = self.mmap_backings.get_mut(&backing_id) {
+            backing.replace_vm_state(vm_state);
             backing.replace_resident_pages(pages);
         }
     }
 
-    fn refresh_all_mmap_backing_resident_pages(&mut self) {
-        let backing_ids = self.mmap_backings.keys().copied().collect::<Vec<_>>();
+    pub(super) fn refresh_mmap_backing_states(&mut self, backing_ids: Vec<usize>) {
         for backing_id in backing_ids {
-            self.refresh_mmap_backing_resident_pages(backing_id);
+            self.refresh_mmap_backing_state(backing_id);
         }
     }
 
-    pub(super) fn mark_mmap_backing_resident_page(
-        &mut self,
+    fn refresh_all_mmap_backing_states(&mut self) {
+        let backing_ids = self.mmap_backings.keys().copied().collect::<Vec<_>>();
+        self.refresh_mmap_backing_states(backing_ids);
+    }
+
+    pub(super) fn mmap_backing_resident_frame(
+        &self,
         backing_id: usize,
         file_page: usize,
-        dirty: bool,
-    ) {
-        if let Some(backing) = self.mmap_backings.get_mut(&backing_id) {
-            backing.mark_resident_page(file_page, dirty);
-        }
+    ) -> Option<FrameTracker> {
+        self.mmap_backings
+            .get(&backing_id)
+            .and_then(|backing| backing.resident_frame(file_page))
     }
 
     fn clear_mmap_backing_dirty_page(&mut self, backing_id: usize, file_page: usize) {
@@ -157,7 +221,7 @@ impl MemorySet {
                     if copy_end <= copy_start {
                         continue;
                     }
-                    let Some((ppn, flags, has_valid_pte)) = self.resident_page_for_vpn(area, vpn)
+                    let Some((frame, flags, has_valid_pte)) = self.resident_page_for_vpn(area, vpn)
                     else {
                         continue;
                     };
@@ -168,7 +232,8 @@ impl MemorySet {
                     let file_page = file_offset / PAGE_SIZE;
                     let mut data = Vec::new();
                     data.extend_from_slice(
-                        &ppn.get_bytes_array()[off_in_page..off_in_page + (copy_end - copy_start)],
+                        &frame.ppn.get_bytes_array()
+                            [off_in_page..off_in_page + (copy_end - copy_start)],
                     );
                     chunks.push(MmapWritebackChunk {
                         file: Arc::clone(&file),
@@ -183,13 +248,6 @@ impl MemorySet {
                 }
             }
         }
-        for chunk in chunks.iter() {
-            self.mark_mmap_backing_resident_page(
-                chunk.backing_id,
-                chunk.file_page,
-                chunk.flags.contains(PTEFlags::D),
-            );
-        }
         chunks
     }
 
@@ -200,6 +258,10 @@ impl MemorySet {
         clear_dirty: bool,
     ) -> Result<bool, ()> {
         let chunks = self.collect_shared_file_mmap_writeback_chunks(start, end);
+        let mut refreshed_backings = Vec::new();
+        for chunk in chunks.iter() {
+            Self::push_unique_backing_id(&mut refreshed_backings, chunk.backing_id);
+        }
         let mut cleared_dirty = false;
         for chunk in chunks {
             let Some(os_inode) = chunk.file.as_any().downcast_ref::<OSInode>() else {
@@ -229,6 +291,7 @@ impl MemorySet {
                 }
             }
         }
+        self.refresh_mmap_backing_states(refreshed_backings);
         self.debug_assert_user_vm_invariants();
         Ok(cleared_dirty)
     }
@@ -253,6 +316,86 @@ impl MemorySet {
         pending
     }
 
+    fn copy_to_resident_user_bytes(&self, start: usize, data: &[u8]) {
+        let mut copied = 0usize;
+        while copied < data.len() {
+            let va = start.saturating_add(copied);
+            let vpn = VirtAddr::from(va).floor();
+            let page_off = va & (PAGE_SIZE - 1);
+            let len = core::cmp::min(PAGE_SIZE - page_off, data.len() - copied);
+            for area in self.areas.iter() {
+                if !area.contains_perm(MapPermission::U) || !area.contains_vpn(vpn) {
+                    continue;
+                }
+                let Some((frame, flags, _has_valid_pte)) = self.resident_page_for_vpn(area, vpn)
+                else {
+                    continue;
+                };
+                if !flags.contains(PTEFlags::U) {
+                    break;
+                }
+                frame.ppn.get_bytes_array()[page_off..page_off + len]
+                    .copy_from_slice(&data[copied..copied + len]);
+                break;
+            }
+            copied += len;
+        }
+    }
+
+    pub fn mirror_shared_file_write_to_resident_mmaps(
+        &mut self,
+        dev: usize,
+        ino: u32,
+        write_off: usize,
+        data: &[u8],
+    ) {
+        if data.is_empty() {
+            return;
+        }
+        let write_end = write_off.saturating_add(data.len());
+        let regions = self
+            .vm_regions
+            .iter()
+            .filter(|region| {
+                region.shared
+                    && region.file_backed
+                    && region.file_dev == dev
+                    && region.file_ino == ino
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if regions.is_empty() {
+            return;
+        }
+
+        let mut refreshed_backings = Vec::new();
+        for region in regions {
+            let mapped_len = region.file_mapped_len();
+            let Some(region_file_end) = region.file_offset.checked_add(region.len) else {
+                continue;
+            };
+            let Some(mapped_file_end) = region.file_offset.checked_add(mapped_len) else {
+                continue;
+            };
+            let overlap_start = core::cmp::max(write_off, region.file_offset);
+            let overlap_end =
+                core::cmp::min(core::cmp::min(write_end, region_file_end), mapped_file_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+
+            let dst = region
+                .start
+                .saturating_add(overlap_start.saturating_sub(region.file_offset));
+            let src_off = overlap_start.saturating_sub(write_off);
+            let len = overlap_end - overlap_start;
+            self.copy_to_resident_user_bytes(dst, &data[src_off..src_off + len]);
+            Self::push_unique_backing_id(&mut refreshed_backings, region.backing_id);
+        }
+        self.refresh_mmap_backing_states(refreshed_backings);
+        self.debug_assert_user_vm_invariants();
+    }
+
     fn zero_mapped_user_bytes(&mut self, start: usize, end: usize) {
         let mut cur = start;
         while cur < end {
@@ -275,7 +418,16 @@ impl MemorySet {
     }
 
     pub fn update_file_vm_size(&mut self, dev: usize, ino: u32, file_size: usize) -> bool {
-        let updates: Vec<(usize, usize, usize, usize, usize, usize, MapPermission)> = self
+        let updates: Vec<(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            MapPermission,
+            usize,
+        )> = self
             .vm_regions
             .iter()
             .filter_map(|region| {
@@ -294,6 +446,7 @@ impl MemorySet {
                     region.sigbus_start(),
                     new_sigbus,
                     region.map_permission(),
+                    region.backing_id,
                 ))
             })
             .collect();
@@ -303,8 +456,16 @@ impl MemorySet {
 
         let mut ok = true;
 
-        for (start, _end, old_valid_len, new_valid_len, old_sigbus, new_sigbus, _perm) in
-            updates.iter().copied()
+        for (
+            start,
+            _end,
+            old_valid_len,
+            new_valid_len,
+            old_sigbus,
+            new_sigbus,
+            _perm,
+            _backing_id,
+        ) in updates.iter().copied()
         {
             if new_sigbus <= old_sigbus {
                 self.vm_regions.set_file_valid_by_identity(
@@ -329,7 +490,7 @@ impl MemorySet {
             }
         }
 
-        for (_start, end, _old_valid, _new_valid, old_sigbus, new_sigbus, _perm) in
+        for (_start, end, _old_valid, _new_valid, old_sigbus, new_sigbus, _perm, _backing_id) in
             updates.iter().copied()
         {
             if new_sigbus < old_sigbus {
@@ -346,7 +507,7 @@ impl MemorySet {
             }
         }
 
-        for (start, _end, _old_valid, new_valid_len, old_sigbus, new_sigbus, perm) in
+        for (start, _end, _old_valid, new_valid_len, old_sigbus, new_sigbus, perm, _backing_id) in
             updates.iter().copied()
         {
             if new_sigbus > old_sigbus {
@@ -369,6 +530,14 @@ impl MemorySet {
             }
         }
 
+        let mut refreshed_backings = Vec::new();
+        for (_start, _end, _old_valid, _new_valid, _old_sigbus, _new_sigbus, _perm, backing_id) in
+            updates.iter().copied()
+        {
+            Self::push_unique_backing_id(&mut refreshed_backings, backing_id);
+        }
+        self.refresh_mmap_backing_states(refreshed_backings);
+
         self.debug_assert_user_vm_invariants();
         ok
     }
@@ -388,6 +557,13 @@ impl MemorySet {
         let Some(backing) = MmapBacking::new(region, file) else {
             return 0;
         };
+        if let Some((&id, _existing)) = self
+            .mmap_backings
+            .iter()
+            .find(|(_id, existing)| existing.matches_region(region))
+        {
+            return id;
+        }
         let id = self.next_mmap_backing_id;
         self.next_mmap_backing_id = self.next_mmap_backing_id.saturating_add(1);
         self.mmap_backings.insert(id, backing);
@@ -402,6 +578,6 @@ impl MemorySet {
                     && backing.kind.matches_region(region)
             })
         });
-        self.refresh_all_mmap_backing_resident_pages();
+        self.refresh_all_mmap_backing_states();
     }
 }

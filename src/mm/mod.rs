@@ -56,6 +56,7 @@ pub use memory_set::{
     BrkUpdate, ElfAux, KERNEL_SPACE, LazyFaultResult, MapPermission, MapType, MemorySet, MmRef,
     MprotectError, ShmAttach, ShmAttachRef, VmRegion, VmRegionKind, VmaInsertArea,
 };
+pub(crate) use memory_set::{resize_shared_file_page_cache, update_shared_file_page_cache};
 pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub use page_table::{
     PageTableEntry, read_user_value, translated_byte_buffer, translated_mutref,

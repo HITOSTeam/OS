@@ -678,7 +678,13 @@ impl VmRegion {
             return None;
         }
         let perm = self.map_permission();
-        perm.contains(access).then(|| (perm, PTEFlags::from(perm)))
+        perm.contains(access).then(|| {
+            let mut pte_flags = PTEFlags::from(perm);
+            if self.shared {
+                pte_flags.insert(PTEFlags::SHARED);
+            }
+            (perm, pte_flags)
+        })
     }
 
     pub(super) fn allows_cow_fault(&self, fault_va: usize) -> bool {
