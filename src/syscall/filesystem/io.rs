@@ -5,11 +5,12 @@ use super::{
     UserBuffer, Vec, cgroup_charge_file_write, current_process, err, ext4_err_to_errno, ext4_lock,
     fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe,
     file_is_seekable_for_preadwrite, get_current_token, maybe_update_inode_atime,
-    mirror_inode_write_to_current_mmaps, pipe_read_to_kernel, pipe_write_from_kernel,
-    queue_process_signal, read_optional_offset, read_vm_iovec, require_fd_file,
-    socketpair_write_from_kernel, touch_inode_mtime_ctime_now, try_copy_from_user,
-    try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_proc_pseudo_file,
-    try_write_user_value, validate_direct_io_request, write_optional_offset,
+    mirror_inode_kernel_write_to_shared_mmaps, mirror_inode_write_to_current_mmaps,
+    pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal, read_optional_offset,
+    read_vm_iovec, require_fd_file, socketpair_write_from_kernel, touch_inode_mtime_ctime_now,
+    try_copy_from_user, try_copy_to_user, try_read_user_value, try_translated_byte_buffer,
+    try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
+    write_optional_offset,
 };
 use alloc::vec;
 
@@ -513,6 +514,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             }
             match os_inode.pwrite_at(off, &kbuf[..want]) {
                 Ok(n) => {
+                    mirror_inode_kernel_write_to_shared_mmaps(os_inode, off, &kbuf[..n]);
                     total += n;
                     off += n;
                     user_ptr += n;
@@ -688,7 +690,10 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
         }
         let wrote = if let Some(out_inode) = out_inode_opt {
             match out_inode.pwrite_at(out_pos, &buf[..read]) {
-                Ok(n) => n,
+                Ok(n) => {
+                    mirror_inode_kernel_write_to_shared_mmaps(out_inode, out_pos, &buf[..n]);
+                    n
+                }
                 Err(_) => {
                     return if total > 0 {
                         total as isize
@@ -911,7 +916,10 @@ pub fn syscall_splice(
                 };
             }
             match out_inode.pwrite_at(out_pos, &buf[..read]) {
-                Ok(n) => n,
+                Ok(n) => {
+                    mirror_inode_kernel_write_to_shared_mmaps(out_inode, out_pos, &buf[..n]);
+                    n
+                }
                 Err(_) => {
                     return if moved > 0 {
                         moved as isize
@@ -1240,7 +1248,10 @@ pub fn syscall_copy_file_range(
             break;
         }
         let written = match out_os_inode.pwrite_at(out_pos, &buf[..read]) {
-            Ok(v) => v,
+            Ok(v) => {
+                mirror_inode_kernel_write_to_shared_mmaps(out_os_inode, out_pos, &buf[..v]);
+                v
+            }
             Err(_) => return err(SyscallError::EIO),
         };
         if written == 0 {

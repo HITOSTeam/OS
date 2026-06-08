@@ -13,6 +13,7 @@ use super::{
     resolve_parent_and_name, rofs_for_path, syscall_fchmod, try_copy_from_user,
     try_copy_to_user_unchecked,
 };
+use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
 use alloc::vec;
 use lazy_static::lazy_static;
 
@@ -682,34 +683,111 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
             .memory_set
             .file_vm_copy_targets(dev, ino, write_off, len)
     };
-    if copies.is_empty() {
+    if !copies.is_empty() {
+        let token = get_current_token();
+        let mut tmp = [0u8; 1024];
+        for (dst, src_off, total) in copies {
+            let mut done = 0usize;
+            while done < total {
+                let chunk = core::cmp::min(tmp.len(), total - done);
+                if try_copy_from_user(
+                    token,
+                    (user_src + src_off + done) as *const u8,
+                    &mut tmp[..chunk],
+                )
+                .is_err()
+                {
+                    return;
+                }
+                if try_copy_to_user_unchecked(token, (dst + done) as *mut u8, &tmp[..chunk])
+                    .is_err()
+                {
+                    return;
+                }
+                done += chunk;
+            }
+        }
+    }
+    mirror_inode_write_to_shared_mmaps_all_processes(dev, ino, write_off, user_src, len);
+}
+
+fn mirror_inode_write_to_shared_mmaps_all_processes(
+    dev: usize,
+    ino: u32,
+    write_off: usize,
+    user_src: usize,
+    len: usize,
+) {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    if processes.is_empty() {
         return;
     }
 
     let token = get_current_token();
     let mut tmp = [0u8; 1024];
-    for (dst, src_off, total) in copies {
-        let mut done = 0usize;
-        while done < total {
-            let chunk = core::cmp::min(tmp.len(), total - done);
-            if try_copy_from_user(
-                token,
-                (user_src + src_off + done) as *const u8,
-                &mut tmp[..chunk],
-            )
-            .is_err()
-            {
-                return;
-            }
-            if try_copy_to_user_unchecked(token, (dst + done) as *mut u8, &tmp[..chunk]).is_err() {
-                return;
-            }
-            done += chunk;
+    let mut done = 0usize;
+    while done < len {
+        let chunk = core::cmp::min(tmp.len(), len - done);
+        if try_copy_from_user(token, (user_src + done) as *const u8, &mut tmp[..chunk]).is_err() {
+            return;
         }
+        update_shared_file_page_cache(dev, ino, write_off + done, &tmp[..chunk]);
+        for process in processes.iter() {
+            let Some(inner) = process.try_borrow_mut() else {
+                continue;
+            };
+            inner.memory_set.mirror_shared_file_write_to_resident_mmaps(
+                dev,
+                ino,
+                write_off + done,
+                &tmp[..chunk],
+            );
+        }
+        done += chunk;
+    }
+}
+
+pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
+    os_inode: &OSInode,
+    write_off: usize,
+    data: &[u8],
+) {
+    if data.is_empty() {
+        return;
+    }
+
+    let inode = os_inode.ext4_inode();
+    let pending_end = os_inode.pending_write_end();
+    let (dev, ino, file_size) = {
+        let _ext4_guard = ext4_lock();
+        (
+            inode.device_id(),
+            inode.inode_num(),
+            (inode.size() as usize).max(pending_end),
+        )
+    };
+    update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    update_shared_file_page_cache(dev, ino, write_off, data);
+
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes.iter() {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        inner
+            .memory_set
+            .mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
     }
 }
 
 fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize) {
+    resize_shared_file_page_cache(dev, ino, file_size);
     let processes = {
         let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
