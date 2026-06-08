@@ -243,8 +243,9 @@ pub fn vm_committed_as_bytes() -> usize {
         let Some(inner) = process.try_borrow_mut() else {
             return acc;
         };
-        let heap = inner.memory_set.heap_size();
-        let anon_private = inner.memory_set.anon_private_writable_vm_bytes();
+        let memory_set = inner.memory_set.lock();
+        let heap = memory_set.heap_size();
+        let anon_private = memory_set.anon_private_writable_vm_bytes();
         acc.saturating_add(heap).saturating_add(anon_private)
     })
 }
@@ -362,9 +363,14 @@ fn proc_pid_status(pid: u32) -> String {
                 .map(|ti| (ti.task_status, ti.cgroup_frozen))
         })
         .unwrap_or((TaskStatus::Ready, false));
-    let heap_bytes = inner.memory_set.heap_size();
-    let mmap_bytes = inner.memory_set.vm_regions_total_len();
-    let vmlck_bytes = inner.memory_set.locked_bytes();
+    let (heap_bytes, mmap_bytes, vmlck_bytes) = {
+        let memory_set = inner.memory_set.lock();
+        (
+            memory_set.heap_size(),
+            memory_set.vm_regions_total_len(),
+            memory_set.locked_bytes(),
+        )
+    };
     let vsize_kb: usize = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
     let vmlck_kb: usize = (vmlck_bytes + 1023) / 1024;
     let uid = inner.uid;
@@ -453,8 +459,10 @@ fn proc_pid_stat(pid: u32) -> String {
                 .map(|ti| (ti.task_status, ti.cgroup_frozen))
         })
         .unwrap_or((TaskStatus::Ready, false));
-    let heap_bytes = inner.memory_set.heap_size();
-    let mmap_bytes = inner.memory_set.vm_regions_total_len();
+    let (heap_bytes, mmap_bytes) = {
+        let memory_set = inner.memory_set.lock();
+        (memory_set.heap_size(), memory_set.vm_regions_total_len())
+    };
     let vsize: u64 = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
 
     let comm = if inner.comm.is_empty() {
@@ -646,7 +654,10 @@ fn proc_pid_maps(pid: u32) -> String {
         }
         return String::new();
     };
-    let mut regions = inner.memory_set.vm_regions_snapshot();
+    let mut regions = {
+        let memory_set = inner.memory_set.lock();
+        memory_set.vm_regions_snapshot()
+    };
     drop(inner);
     regions.sort_by_key(|r| r.start);
 
@@ -704,7 +715,8 @@ fn proc_pid_pagemap_entry(pid: u32, entry: usize) -> u64 {
         return 0;
     };
     let vpn = VirtAddr::from(vaddr).floor();
-    if let Some(pte) = inner.memory_set.translate(vpn) {
+    let memory_set = inner.memory_set.lock();
+    if let Some(pte) = memory_set.translate(vpn) {
         if pte.is_valid() {
             return (1u64 << 63) | (pte.ppn().0 as u64 & ((1u64 << 55) - 1));
         }
@@ -721,11 +733,12 @@ fn proc_kpageflags_entry(pfn: usize) -> u64 {
         let Some(inner) = process.try_borrow_mut() else {
             continue;
         };
-        for (start, end) in inner.memory_set.user_mapped_ranges() {
+        let memory_set = inner.memory_set.lock();
+        for (start, end) in memory_set.user_mapped_ranges() {
             let mut cur = start;
             while cur < end {
                 let vpn = VirtAddr::from(cur).floor();
-                if let Some(pte) = inner.memory_set.translate(vpn) {
+                if let Some(pte) = memory_set.translate(vpn) {
                     if pte.is_valid() && pte.ppn().0 == pfn {
                         let mut flags = 0u64;
                         if pte.flags().contains(PTEFlags::D) {
@@ -756,7 +769,10 @@ pub(super) fn proc_pid_pagemap_len(pid: u32) -> usize {
     let Some(inner) = proc.try_borrow_mut() else {
         return 0;
     };
-    let max_end = inner.memory_set.max_user_mapped_end();
+    let max_end = {
+        let memory_set = inner.memory_set.lock();
+        memory_set.max_user_mapped_end()
+    };
     let page_count = max_end.saturating_add(config::PAGE_SIZE - 1) / config::PAGE_SIZE;
     page_count.saturating_mul(8)
 }
@@ -817,17 +833,18 @@ fn proc_pid_smaps(pid: u32) -> String {
         }
         return String::new();
     };
-    let mut regions = inner.memory_set.vm_regions_snapshot();
-    regions.sort_by_key(|r| r.start);
-    let regions = regions
-        .into_iter()
-        .map(|region| {
-            let locked_bytes = inner
-                .memory_set
-                .locked_overlap_bytes(region.start, region.end());
-            (region, locked_bytes)
-        })
-        .collect::<Vec<_>>();
+    let regions = {
+        let memory_set = inner.memory_set.lock();
+        let mut regions = memory_set.vm_regions_snapshot();
+        regions.sort_by_key(|r| r.start);
+        regions
+            .into_iter()
+            .map(|region| {
+                let locked_bytes = memory_set.locked_overlap_bytes(region.start, region.end());
+                (region, locked_bytes)
+            })
+            .collect::<Vec<_>>()
+    };
     drop(inner);
 
     let mut out = String::new();

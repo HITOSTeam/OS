@@ -31,10 +31,8 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
         | MADV_DONTDUMP | MADV_DODUMP => {
             let process = current_process();
             let inner = process.borrow_mut();
-            if !inner
-                .memory_set
-                .user_range_fully_mapped(addr.into(), end.into())
-            {
+            let mut memory_set = inner.memory_set.lock();
+            if !memory_set.user_range_fully_mapped(addr.into(), end.into()) {
                 return err(SyscallError::ENOMEM);
             }
             if advice == MADV_WILLNEED || advice == MADV_NORMAL {
@@ -46,13 +44,13 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                 return 0;
             }
             if advice == MADV_DONTNEED {
-                let shared_overlap = inner.memory_set.shared_vm_region_overlaps(addr, end);
-                if shared_overlap || inner.memory_set.locked_ranges_overlap(addr, end) {
+                let shared_overlap = memory_set.shared_vm_region_overlaps(addr, end);
+                if shared_overlap || memory_set.locked_ranges_overlap(addr, end) {
                     return err(SyscallError::EINVAL);
                 }
             }
             if advice == MADV_FREE {
-                if !inner.memory_set.vm_range_is_private_anonymous(addr, end) {
+                if !memory_set.vm_range_is_private_anonymous(addr, end) {
                     return err(SyscallError::EINVAL);
                 }
                 // Linux MADV_FREE is lazy: pages must remain readable until
@@ -61,9 +59,7 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                 // immediately discarding pages like MADV_DONTNEED.
                 return 0;
             }
-            inner
-                .memory_set
-                .discard_madvise_dontneed_range(addr.into(), end.into());
+            memory_set.discard_madvise_dontneed_range(addr.into(), end.into());
             0
         }
         _ => err(SyscallError::EINVAL),
@@ -85,22 +81,21 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
     }
     let process = current_process();
     let inner = process.borrow_mut();
-    if !inner
-        .memory_set
-        .user_range_fully_mapped(start.into(), end.into())
-    {
+    let euid = inner.euid;
+    let memlock_limit = inner.rlimits.rlimit_memlock_cur as usize;
+    let mut memory_set = inner.memory_set.lock();
+    if !memory_set.user_range_fully_mapped(start.into(), end.into()) {
         return err(SyscallError::ENOMEM);
     }
     let mut cur = start;
     while cur < end {
         let vpn = crate::mm::VirtAddr::from(cur).floor();
-        let present = inner
-            .memory_set
+        let present = memory_set
             .translate(vpn)
             .map(|pte| pte.is_valid())
             .unwrap_or(false);
         if !present {
-            match inner.memory_set.resolve_lazy_fault(cur, MapPermission::R) {
+            match memory_set.resolve_lazy_fault(cur, MapPermission::R) {
                 crate::mm::LazyFaultResult::Resolved => {}
                 crate::mm::LazyFaultResult::Oom => return err(SyscallError::ENOMEM),
                 crate::mm::LazyFaultResult::Invalid => return err(SyscallError::ENOMEM),
@@ -108,17 +103,16 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
         }
         cur += PAGE_SIZE;
     }
-    let next_locked_bytes = inner.memory_set.locked_bytes_after_add(start, end);
-    if inner.euid != 0 {
-        let limit = inner.rlimits.rlimit_memlock_cur as usize;
-        if limit == 0 {
+    let next_locked_bytes = memory_set.locked_bytes_after_add(start, end);
+    if euid != 0 {
+        if memlock_limit == 0 {
             return err(SyscallError::EPERM);
         }
-        if next_locked_bytes > limit {
+        if next_locked_bytes > memlock_limit {
             return err(SyscallError::ENOMEM);
         }
     }
-    inner.memory_set.add_locked_range(start, end);
+    memory_set.add_locked_range(start, end);
     0
 }
 
@@ -137,13 +131,11 @@ pub fn syscall_munlock(addr: usize, len: usize) -> isize {
     }
     let process = current_process();
     let inner = process.borrow_mut();
-    if !inner
-        .memory_set
-        .user_range_fully_mapped(start.into(), end.into())
-    {
+    let mut memory_set = inner.memory_set.lock();
+    if !memory_set.user_range_fully_mapped(start.into(), end.into()) {
         return err(SyscallError::ENOMEM);
     }
-    inner.memory_set.trim_locked_ranges(start, end);
+    memory_set.trim_locked_ranges(start, end);
     0
 }
 
@@ -160,26 +152,26 @@ pub fn syscall_mlockall(flags: usize) -> isize {
     }
     let process = current_process();
     let inner = process.borrow_mut();
+    let euid = inner.euid;
+    let memlock_limit = inner.rlimits.rlimit_memlock_cur as usize;
+    let mut memory_set = inner.memory_set.lock();
     let next_locked_bytes = if (flags & MCL_CURRENT) != 0 {
-        inner.memory_set.locked_bytes_after_mlockall_current()
+        memory_set.locked_bytes_after_mlockall_current()
     } else {
-        inner.memory_set.locked_bytes()
+        memory_set.locked_bytes()
     };
-    if inner.euid != 0 {
-        let limit = inner.rlimits.rlimit_memlock_cur as usize;
-        if limit == 0 {
+    if euid != 0 {
+        if memlock_limit == 0 {
             return err(SyscallError::EPERM);
         }
-        if next_locked_bytes > limit {
+        if next_locked_bytes > memlock_limit {
             return err(SyscallError::ENOMEM);
         }
     }
     if (flags & MCL_CURRENT) != 0 {
-        inner.memory_set.lock_current_mappings();
+        memory_set.lock_current_mappings();
     }
-    inner
-        .memory_set
-        .set_mlockall_future((flags & MCL_FUTURE) != 0);
+    memory_set.set_mlockall_future((flags & MCL_FUTURE) != 0);
     0
 }
 
@@ -187,7 +179,8 @@ pub fn syscall_mlockall(flags: usize) -> isize {
 pub fn syscall_munlockall() -> isize {
     let process = current_process();
     let inner = process.borrow_mut();
-    inner.memory_set.clear_mlock_state();
+    let mut memory_set = inner.memory_set.lock();
+    memory_set.clear_mlock_state();
     0
 }
 
@@ -209,10 +202,8 @@ pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
 
     let process = current_process();
     let inner = process.borrow_mut();
-    if !inner
-        .memory_set
-        .user_range_fully_mapped(addr.into(), end.into())
-    {
+    let memory_set = inner.memory_set.lock();
+    if !memory_set.user_range_fully_mapped(addr.into(), end.into()) {
         return err(SyscallError::ENOMEM);
     }
 
@@ -220,8 +211,7 @@ pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
     let mut residency = alloc::vec![0u8; pages];
     for (idx, byte) in residency.iter_mut().enumerate() {
         let vpn = crate::mm::VirtAddr::from(addr + idx * PAGE_SIZE).floor();
-        if inner
-            .memory_set
+        if memory_set
             .translate(vpn)
             .map(|pte| pte.is_valid())
             .unwrap_or(false)
@@ -229,6 +219,7 @@ pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
             *byte = 1;
         }
     }
+    drop(memory_set);
     drop(inner);
 
     if try_copy_to_user(get_current_token(), vec as *mut u8, &residency).is_err() {

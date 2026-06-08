@@ -18,16 +18,14 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
 
-    if inner
-        .memory_set
+    let mut memory_set = inner.memory_set.lock();
+    if memory_set
         .writeback_shared_file_mmap_range(start, end, false)
         .is_err()
     {
         return err(SyscallError::EIO);
     }
-    inner
-        .memory_set
-        .unmap_user_vma_range(start.into(), end.into());
+    memory_set.unmap_user_vma_range(start.into(), end.into());
     0
 }
 
@@ -58,21 +56,18 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
     }
     let process = current_process();
     let inner = process.borrow_mut();
-    if !inner
-        .memory_set
-        .user_range_fully_mapped(addr.into(), end.into())
-    {
-        return err(SyscallError::ENOMEM);
-    }
-    if (flags & MS_INVALIDATE) != 0 && inner.memory_set.locked_ranges_overlap(addr, end) {
-        return err(SyscallError::EBUSY);
-    }
-    let cleared_dirty = match inner
-        .memory_set
-        .writeback_shared_file_mmap_range(addr, end, true)
-    {
-        Ok(cleared_dirty) => cleared_dirty,
-        Err(()) => return err(SyscallError::EIO),
+    let cleared_dirty = {
+        let mut memory_set = inner.memory_set.lock();
+        if !memory_set.user_range_fully_mapped(addr.into(), end.into()) {
+            return err(SyscallError::ENOMEM);
+        }
+        if (flags & MS_INVALIDATE) != 0 && memory_set.locked_ranges_overlap(addr, end) {
+            return err(SyscallError::EBUSY);
+        }
+        match memory_set.writeback_shared_file_mmap_range(addr, end, true) {
+            Ok(cleared_dirty) => cleared_dirty,
+            Err(()) => return err(SyscallError::EIO),
+        }
     };
     if cleared_dirty {
         #[cfg(target_arch = "riscv64")]
@@ -110,13 +105,13 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 
     let process = current_process();
     let inner = process.borrow_mut();
-    match inner
-        .memory_set
-        .mprotect_user_vma_range(addr.into(), end.into(), prot)
     {
-        Ok(()) => {}
-        Err(MprotectError::AccessDenied) => return err(SyscallError::EACCES),
-        Err(MprotectError::Unmapped) => return err(SyscallError::ENOMEM),
+        let mut memory_set = inner.memory_set.lock();
+        match memory_set.mprotect_user_vma_range(addr.into(), end.into(), prot) {
+            Ok(()) => {}
+            Err(MprotectError::AccessDenied) => return err(SyscallError::EACCES),
+            Err(MprotectError::Unmapped) => return err(SyscallError::ENOMEM),
+        }
     }
     // Ensure permission changes take effect immediately.
     #[cfg(target_arch = "riscv64")]

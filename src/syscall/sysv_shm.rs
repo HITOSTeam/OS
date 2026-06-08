@@ -687,10 +687,8 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     let inner = process.borrow_mut();
 
     let start = if shmaddr == 0 {
-        let Some(start) = inner
-            .memory_set
-            .find_free_mmap_range(None, map_len, USER_VA_TOP)
-        else {
+        let memory_set = inner.memory_set.lock();
+        let Some(start) = memory_set.find_free_mmap_range(None, map_len, USER_VA_TOP) else {
             return err(SyscallError::ENOMEM);
         };
         start
@@ -708,10 +706,11 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     // If the caller asks for a fixed address, follow SHM_REMAP by replacing
     // existing user mappings. Otherwise, reject overlaps.
     if shmaddr != 0 {
+        let memory_set = inner.memory_set.lock();
         let mut cur = start;
         while cur < end {
             let vpn = VirtAddr::from(cur).floor();
-            if let Some(pte) = inner.memory_set.translate(vpn) {
+            if let Some(pte) = memory_set.translate(vpn) {
                 if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
                     return err(SyscallError::ENOMEM);
                 }
@@ -721,25 +720,11 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
             }
             cur += PAGE_SIZE;
         }
-        if inner
-            .memory_set
-            .concrete_range_overlaps(start.into(), end.into())
-            && (shmflg & SHM_REMAP) == 0
+        if memory_set.concrete_range_overlaps(start.into(), end.into()) && (shmflg & SHM_REMAP) == 0
         {
             return err(SyscallError::EINVAL);
         }
     }
-    let remap_attach_update = if (shmflg & SHM_REMAP) != 0 {
-        let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
-        let Some(release_shmids) =
-            detach_attaches_overlapping(&mut updated_attaches, start, map_len)
-        else {
-            return err(SyscallError::ENOMEM);
-        };
-        Some((updated_attaches, release_shmids))
-    } else {
-        None
-    };
 
     let mut perm = MapPermission::U | MapPermission::R;
     if (shmflg & SHM_RDONLY) == 0 {
@@ -768,37 +753,50 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
         growsdown: false,
     };
     let areas = Vec::from([VmaInsertArea::SharedFrames { start, end, frames }]);
-    let inserted = if (shmflg & SHM_REMAP) != 0 {
-        inner
-            .memory_set
-            .try_replace_user_vma(region, areas, false, None)
-    } else {
-        inner
-            .memory_set
-            .try_insert_user_vma(region, areas, false, None)
-    };
-    if !inserted {
-        return err(SyscallError::ENOMEM);
-    }
+    let detached_shmids = {
+        let mut memory_set = inner.memory_set.lock();
+        let remap_attach_update = if (shmflg & SHM_REMAP) != 0 {
+            let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
+            let Some(release_shmids) =
+                detach_attaches_overlapping(&mut updated_attaches, start, map_len)
+            else {
+                return err(SyscallError::ENOMEM);
+            };
+            Some((updated_attaches, release_shmids))
+        } else {
+            None
+        };
+        let inserted = if (shmflg & SHM_REMAP) != 0 {
+            memory_set.try_replace_user_vma(region, areas, false, None)
+        } else {
+            memory_set.try_insert_user_vma(region, areas, false, None)
+        };
+        if !inserted {
+            return err(SyscallError::ENOMEM);
+        }
 
-    let detached_shmids = if let Some((updated_attaches, release_shmids)) = remap_attach_update {
-        inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
-        release_shmids
-    } else {
-        Vec::new()
+        if let Some((updated_attaches, release_shmids)) = remap_attach_update {
+            memory_set.replace_sysv_shm_attaches(updated_attaches);
+            release_shmids
+        } else {
+            Vec::new()
+        }
     };
     seg.nattch += 1;
     seg.atime = now_secs();
     seg.lpid = pid;
-    inner.memory_set.note_mmap_end(end);
-    inner.memory_set.push_sysv_shm_attach(ShmAttach {
-        ipc_ns_id,
-        addr: start,
-        shmid,
-        len: map_len,
-        attach_id: alloc_attach_id(),
-        accounted: true,
-    });
+    {
+        let mut memory_set = inner.memory_set.lock();
+        memory_set.note_mmap_end(end);
+        memory_set.push_sysv_shm_attach(ShmAttach {
+            ipc_ns_id,
+            addr: start,
+            shmid,
+            len: map_len,
+            attach_id: alloc_attach_id(),
+            accounted: true,
+        });
+    }
     drop(inner);
     drop(managers);
     release_detached_attach_refs(pid, detached_shmids.as_slice());

@@ -23,9 +23,8 @@ pub fn syscall_brk(addr: usize) -> isize {
         }
         return brk as isize;
     }
-    let memory_set = inner.memory_set.clone();
-    let shm_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
-    let mut memory_set = memory_set.lock();
+    let mut memory_set = inner.memory_set.lock();
+    let shm_attaches = memory_set.sysv_shm_attaches_snapshot();
     let update: BrkUpdate = memory_set.try_update_brk_with_holes(
         addr,
         USER_VA_TOP,
@@ -172,11 +171,10 @@ pub fn syscall_mmap(
         }
         align_down(addr, PAGE_SIZE)
     } else {
-        let Some(start) = inner.memory_set.find_free_mmap_range(
-            (addr != 0).then_some(addr),
-            map_len,
-            USER_VA_TOP,
-        ) else {
+        let memory_set = inner.memory_set.lock();
+        let Some(start) =
+            memory_set.find_free_mmap_range((addr != 0).then_some(addr), map_len, USER_VA_TOP)
+        else {
             return err(SyscallError::ENOMEM);
         };
         start
@@ -193,16 +191,37 @@ pub fn syscall_mmap(
     }
     let map_start = start;
     let map_end = end;
-    // For a kernel-chosen (non-MAP_FIXED) placement the range must be genuinely
-    // free in both bookkeeping structures; fail with ENOMEM rather than letting
-    // the new mapping clobber an existing one.
-    if !is_fixed
-        && !inner
-            .memory_set
-            .user_range_is_free(map_start, map_end, USER_VA_TOP)
-    {
-        return err(SyscallError::ENOMEM);
-    }
+    let perm = VmRegion::permission_from_prot(prot);
+    let lock_range = {
+        let memory_set = inner.memory_set.lock();
+        // For a kernel-chosen (non-MAP_FIXED) placement the range must be genuinely
+        // free in both bookkeeping structures; fail with ENOMEM rather than letting
+        // the new mapping clobber an existing one.
+        if !is_fixed && !memory_set.user_range_is_free(map_start, map_end, USER_VA_TOP) {
+            return err(SyscallError::ENOMEM);
+        }
+        if (flags & MAP_FIXED_NOREPLACE) != 0 {
+            // MAP_FIXED_NOREPLACE must fail with EEXIST instead of relocating when
+            // the fixed target collides with anything in either structure.
+            if !memory_set.user_range_is_free(map_start, map_end, USER_VA_TOP) {
+                return err(SyscallError::EEXIST);
+            }
+        }
+        if (flags & MAP_FIXED) != 0 {
+            // Refuse to map over kernel-only pages (e.g. TrapContext/trampoline).
+            let mut cur = start;
+            while cur < end {
+                let vpn = crate::mm::VirtAddr::from(cur).floor();
+                if let Some(pte) = memory_set.translate(vpn) {
+                    if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
+                        return err(SyscallError::ENOMEM);
+                    }
+                }
+                cur += PAGE_SIZE;
+            }
+        }
+        memory_set.mlockall_future() || (flags & MAP_LOCKED) != 0
+    };
     if crate::debug_config::DEBUG_SYSCALL && is_anon && len >= LARGE_ANON_MMAP {
         let pid = process.getpid();
         crate::println!(
@@ -218,19 +237,6 @@ pub fn syscall_mmap(
             fd,
             off
         );
-    }
-
-    let perm = VmRegion::permission_from_prot(prot);
-
-    if (flags & MAP_FIXED_NOREPLACE) != 0 {
-        // MAP_FIXED_NOREPLACE must fail with EEXIST instead of relocating when
-        // the fixed target collides with anything in either structure.
-        if !inner
-            .memory_set
-            .user_range_is_free(map_start, map_end, USER_VA_TOP)
-        {
-            return err(SyscallError::EEXIST);
-        }
     }
 
     let file_valid_len = if let Some(file) = &file {
@@ -259,20 +265,6 @@ pub fn syscall_mmap(
     } else {
         map_end
     };
-
-    if (flags & MAP_FIXED) != 0 {
-        // Refuse to map over kernel-only pages (e.g. TrapContext/trampoline).
-        let mut cur = start;
-        while cur < end {
-            let vpn = crate::mm::VirtAddr::from(cur).floor();
-            if let Some(pte) = inner.memory_set.translate(vpn) {
-                if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
-                    return err(SyscallError::ENOMEM);
-                }
-            }
-            cur += PAGE_SIZE;
-        }
-    }
 
     let mut vma_areas = Vec::new();
     if is_shared {
@@ -361,7 +353,6 @@ pub fn syscall_mmap(
     } else {
         true
     };
-    let lock_range = inner.memory_set.mlockall_future() || (flags & MAP_LOCKED) != 0;
     let region = VmRegion {
         kind: VmRegionKind::Mmap,
         start,
@@ -388,71 +379,72 @@ pub fn syscall_mmap(
     };
     let should_populate_file = !is_anon && fd >= 0;
     let backing_file = file.as_ref();
-    let fixed_attach_update = if (flags & MAP_FIXED) != 0 {
-        let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
-        let Some(release_shmids) =
-            detach_attaches_overlapping(&mut updated_attaches, map_start, map_len)
-        else {
-            return err(SyscallError::ENOMEM);
+    let detached_shmids = {
+        let mut memory_set = inner.memory_set.lock();
+        let fixed_attach_update = if (flags & MAP_FIXED) != 0 {
+            let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
+            let Some(release_shmids) =
+                detach_attaches_overlapping(&mut updated_attaches, map_start, map_len)
+            else {
+                return err(SyscallError::ENOMEM);
+            };
+            Some((updated_attaches, release_shmids))
+        } else {
+            None
         };
-        Some((updated_attaches, release_shmids))
-    } else {
-        None
-    };
-    let inserted = if (flags & MAP_FIXED) != 0 {
-        if should_populate_file {
-            if let Some(populate_file) = backing_file {
-                inner.memory_set.try_replace_user_vma_with(
-                    region,
-                    vma_areas,
-                    lock_range,
-                    backing_file,
-                    |memory_set| populate_file_mapping(memory_set, populate_file, start, len, off),
-                )
+        let inserted = if (flags & MAP_FIXED) != 0 {
+            if should_populate_file {
+                if let Some(populate_file) = backing_file {
+                    memory_set.try_replace_user_vma_with(
+                        region,
+                        vma_areas,
+                        lock_range,
+                        backing_file,
+                        |memory_set| {
+                            populate_file_mapping(memory_set, populate_file, start, len, off)
+                        },
+                    )
+                } else {
+                    memory_set.try_replace_user_vma(region, vma_areas, lock_range, backing_file)
+                }
             } else {
-                inner
-                    .memory_set
-                    .try_replace_user_vma(region, vma_areas, lock_range, backing_file)
+                memory_set.try_replace_user_vma(region, vma_areas, lock_range, backing_file)
             }
         } else {
-            inner
-                .memory_set
-                .try_replace_user_vma(region, vma_areas, lock_range, backing_file)
-        }
-    } else {
-        if should_populate_file {
-            if let Some(populate_file) = backing_file {
-                inner.memory_set.try_insert_user_vma_with(
-                    region,
-                    vma_areas,
-                    lock_range,
-                    backing_file,
-                    |memory_set| populate_file_mapping(memory_set, populate_file, start, len, off),
-                )
+            if should_populate_file {
+                if let Some(populate_file) = backing_file {
+                    memory_set.try_insert_user_vma_with(
+                        region,
+                        vma_areas,
+                        lock_range,
+                        backing_file,
+                        |memory_set| {
+                            populate_file_mapping(memory_set, populate_file, start, len, off)
+                        },
+                    )
+                } else {
+                    memory_set.try_insert_user_vma(region, vma_areas, lock_range, backing_file)
+                }
             } else {
-                inner
-                    .memory_set
-                    .try_insert_user_vma(region, vma_areas, lock_range, backing_file)
+                memory_set.try_insert_user_vma(region, vma_areas, lock_range, backing_file)
             }
-        } else {
-            inner
-                .memory_set
-                .try_insert_user_vma(region, vma_areas, lock_range, backing_file)
+        };
+        if !inserted {
+            return err(SyscallError::ENOMEM);
         }
-    };
-    if !inserted {
-        return err(SyscallError::ENOMEM);
-    }
 
-    let detached_shmids = if let Some((updated_attaches, release_shmids)) = fixed_attach_update {
-        inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
-        release_shmids
-    } else {
-        Vec::new()
+        let detached_shmids = if let Some((updated_attaches, release_shmids)) = fixed_attach_update
+        {
+            memory_set.replace_sysv_shm_attaches(updated_attaches);
+            release_shmids
+        } else {
+            Vec::new()
+        };
+        if !is_fixed {
+            memory_set.note_mmap_end(end);
+        }
+        detached_shmids
     };
-    if !is_fixed {
-        inner.memory_set.note_mmap_end(end);
-    }
     let pid = process.getpid() as u32;
     drop(inner);
     release_detached_attach_refs(pid, detached_shmids.as_slice());
@@ -490,24 +482,26 @@ pub fn syscall_mremap(
     let files_snapshot = current_files().lock().iter_files_snapshot();
     let process = current_process();
     let inner = process.borrow_mut();
-    let Some(src_region) = inner.memory_set.vm_region_containing(old_addr, old_end) else {
-        return err(SyscallError::EFAULT);
-    };
-    if !inner
-        .memory_set
-        .user_range_fully_mapped(old_addr.into(), old_end.into())
-    {
-        return err(SyscallError::EFAULT);
-    }
-    let sysv_attach = if src_region.sysv_shmid != 0 {
-        let attaches = inner.memory_set.sysv_shm_attaches_snapshot();
-        let Some(idx) = find_attach_containing(&attaches, src_region.sysv_shmid, old_addr, old_len)
-        else {
-            return err(SyscallError::EINVAL);
+    let (src_region, sysv_attach) = {
+        let memory_set = inner.memory_set.lock();
+        let Some(src_region) = memory_set.vm_region_containing(old_addr, old_end) else {
+            return err(SyscallError::EFAULT);
         };
-        Some(attaches[idx])
-    } else {
-        None
+        if !memory_set.user_range_fully_mapped(old_addr.into(), old_end.into()) {
+            return err(SyscallError::EFAULT);
+        }
+        let sysv_attach = if src_region.sysv_shmid != 0 {
+            let attaches = memory_set.sysv_shm_attaches_snapshot();
+            let Some(idx) =
+                find_attach_containing(&attaches, src_region.sysv_shmid, old_addr, old_len)
+            else {
+                return err(SyscallError::EINVAL);
+            };
+            Some(attaches[idx])
+        } else {
+            None
+        };
+        (src_region, sysv_attach)
     };
 
     if (flags & MREMAP_FIXED) != 0 {
@@ -526,46 +520,51 @@ pub fn syscall_mremap(
         if !(new_end <= old_addr || new_addr >= old_end) {
             return err(SyscallError::EINVAL);
         }
-        let mut cur = new_addr;
-        while cur < new_end {
-            let vpn = crate::mm::VirtAddr::from(cur).floor();
-            if let Some(pte) = inner.memory_set.translate(vpn) {
-                if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
+        let detached_shmids = {
+            let mut memory_set = inner.memory_set.lock();
+            let mut cur = new_addr;
+            while cur < new_end {
+                let vpn = crate::mm::VirtAddr::from(cur).floor();
+                if let Some(pte) = memory_set.translate(vpn) {
+                    if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
+                        return err(SyscallError::ENOMEM);
+                    }
+                }
+                cur += PAGE_SIZE;
+            }
+
+            let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
+            let Some(detached_shmids) =
+                detach_attaches_overlapping(&mut updated_attaches, new_addr, new_len)
+            else {
+                return err(SyscallError::ENOMEM);
+            };
+            if src_region.sysv_shmid != 0 {
+                let Some(src_attach_idx) = find_attach_containing(
+                    &updated_attaches,
+                    src_region.sysv_shmid,
+                    old_addr,
+                    old_len,
+                ) else {
+                    return err(SyscallError::EINVAL);
+                };
+                if !split_mremap_attach(
+                    &mut updated_attaches,
+                    src_attach_idx,
+                    old_addr,
+                    old_len,
+                    new_addr,
+                    new_len,
+                ) {
                     return err(SyscallError::ENOMEM);
                 }
             }
-            cur += PAGE_SIZE;
-        }
-        let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
-        let Some(detached_shmids) =
-            detach_attaches_overlapping(&mut updated_attaches, new_addr, new_len)
-        else {
-            return err(SyscallError::ENOMEM);
-        };
-        if src_region.sysv_shmid != 0 {
-            let Some(src_attach_idx) =
-                find_attach_containing(&updated_attaches, src_region.sysv_shmid, old_addr, old_len)
-            else {
-                return err(SyscallError::EINVAL);
-            };
-            if !split_mremap_attach(
-                &mut updated_attaches,
-                src_attach_idx,
-                old_addr,
-                old_len,
-                new_addr,
-                new_len,
-            ) {
+            if !memory_set.move_user_vma_range_replacing(old_addr, old_len, new_addr) {
                 return err(SyscallError::ENOMEM);
             }
-        }
-        if !inner
-            .memory_set
-            .move_user_vma_range_replacing(old_addr, old_len, new_addr)
-        {
-            return err(SyscallError::ENOMEM);
-        }
-        inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
+            memory_set.replace_sysv_shm_attaches(updated_attaches);
+            detached_shmids
+        };
         let pid = process.getpid() as u32;
         drop(inner);
         release_detached_attach_refs(pid, detached_shmids.as_slice());
@@ -573,35 +572,39 @@ pub fn syscall_mremap(
     }
 
     if new_len <= old_len {
-        let updated_attaches = if sysv_attach.is_some() {
-            let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
-            let Some(idx) =
-                find_attach_containing(&updated_attaches, src_region.sysv_shmid, old_addr, old_len)
-            else {
-                return err(SyscallError::EINVAL);
+        {
+            let mut memory_set = inner.memory_set.lock();
+            let updated_attaches = if sysv_attach.is_some() {
+                let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
+                let Some(idx) = find_attach_containing(
+                    &updated_attaches,
+                    src_region.sysv_shmid,
+                    old_addr,
+                    old_len,
+                ) else {
+                    return err(SyscallError::EINVAL);
+                };
+                if !split_mremap_attach(
+                    &mut updated_attaches,
+                    idx,
+                    old_addr,
+                    old_len,
+                    old_addr,
+                    new_len,
+                ) {
+                    return err(SyscallError::ENOMEM);
+                }
+                Some(updated_attaches)
+            } else {
+                None
             };
-            if !split_mremap_attach(
-                &mut updated_attaches,
-                idx,
-                old_addr,
-                old_len,
-                old_addr,
-                new_len,
-            ) {
-                return err(SyscallError::ENOMEM);
+            let shrink_start = old_addr + new_len;
+            if shrink_start < old_end {
+                memory_set.unmap_user_vma_range(shrink_start.into(), old_end.into());
             }
-            Some(updated_attaches)
-        } else {
-            None
-        };
-        let shrink_start = old_addr + new_len;
-        if shrink_start < old_end {
-            inner
-                .memory_set
-                .unmap_user_vma_range(shrink_start.into(), old_end.into());
-        }
-        if let Some(updated_attaches) = updated_attaches {
-            inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
+            if let Some(updated_attaches) = updated_attaches {
+                memory_set.replace_sysv_shm_attaches(updated_attaches);
+            }
         }
         return old_addr as isize;
     }
@@ -614,19 +617,18 @@ pub fn syscall_mremap(
     // original mapping sits at the top of a top-down mmap layout, MAYMOVE must
     // still get a chance to relocate instead of failing on the invalid in-place
     // end address.
-    let in_place_grow_ok = target_new_end != 0
-        && user_range_valid(target_start, target_new_end)
-        && inner
-            .memory_set
-            .user_range_is_free(old_end, target_new_end, USER_VA_TOP);
+    let in_place_grow_ok = {
+        let memory_set = inner.memory_set.lock();
+        target_new_end != 0
+            && user_range_valid(target_start, target_new_end)
+            && memory_set.user_range_is_free(old_end, target_new_end, USER_VA_TOP)
+    };
     if !in_place_grow_ok {
         if (flags & MREMAP_MAYMOVE) == 0 {
             return err(SyscallError::ENOMEM);
         }
-        let Some(free_start) = inner
-            .memory_set
-            .find_free_mmap_range(None, new_len, USER_VA_TOP)
-        else {
+        let memory_set = inner.memory_set.lock();
+        let Some(free_start) = memory_set.find_free_mmap_range(None, new_len, USER_VA_TOP) else {
             return err(SyscallError::ENOMEM);
         };
         let Some(free_old_end) = free_start.checked_add(old_len) else {
@@ -650,7 +652,8 @@ pub fn syscall_mremap(
     };
 
     let updated_attaches = if sysv_attach.is_some() {
-        let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
+        let memory_set = inner.memory_set.lock();
+        let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
         let Some(idx) =
             find_attach_containing(&updated_attaches, src_region.sysv_shmid, old_addr, old_len)
         else {
@@ -716,19 +719,24 @@ pub fn syscall_mremap(
                 end: target_new_end,
             });
         }
-        inner.memory_set.try_grow_user_vma_range_with_file_len(
-            old_addr,
-            old_len,
-            target_start,
-            new_len,
-            grow_areas,
-            final_file_valid_len,
-            |_| true,
-        )
+        {
+            let mut memory_set = inner.memory_set.lock();
+            memory_set.try_grow_user_vma_range_with_file_len(
+                old_addr,
+                old_len,
+                target_start,
+                new_len,
+                grow_areas,
+                final_file_valid_len,
+                |_| true,
+            )
+        }
     } else if src_region.shared && src_region.memfd_id != 0 {
-        let Some(file) = inner
-            .memory_set
-            .mmap_backing_file(src_region.backing_id)
+        let backing_file = {
+            let memory_set = inner.memory_set.lock();
+            memory_set.mmap_backing_file(src_region.backing_id)
+        };
+        let Some(file) = backing_file
             .or_else(|| find_shm_file_in_snapshot(&files_snapshot, src_region.memfd_id))
             .or_else(|| find_open_shm_file(src_region.memfd_id))
         else {
@@ -771,28 +779,27 @@ pub fn syscall_mremap(
                 end: target_new_end,
             });
         }
-        inner.memory_set.try_grow_user_vma_range_with_file_len(
-            old_addr,
-            old_len,
-            target_start,
-            new_len,
-            grow_areas,
-            final_file_valid_len,
-            |_| true,
-        )
+        {
+            let mut memory_set = inner.memory_set.lock();
+            memory_set.try_grow_user_vma_range_with_file_len(
+                old_addr,
+                old_len,
+                target_start,
+                new_len,
+                grow_areas,
+                final_file_valid_len,
+                |_| true,
+            )
+        }
     } else if src_region.file_backed {
-        let Some(file) = inner
-            .memory_set
-            .mmap_backing_file(src_region.backing_id)
-            .or_else(|| {
-                find_inode_file_in_snapshot(
-                    &files_snapshot,
-                    src_region.file_dev,
-                    src_region.file_ino,
-                )
+        let backing_file = {
+            let memory_set = inner.memory_set.lock();
+            memory_set.mmap_backing_file(src_region.backing_id)
+        };
+        let Some(file) = backing_file.or_else(|| {
+            find_inode_file_in_snapshot(&files_snapshot, src_region.file_dev, src_region.file_ino)
                 .or_else(|| find_open_inode_file(src_region.file_dev, src_region.file_ino))
-            })
-        else {
+        }) else {
             return err(SyscallError::ENOMEM);
         };
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
@@ -840,58 +847,67 @@ pub fn syscall_mremap(
             return err(SyscallError::ENOMEM);
         }
 
-        inner.memory_set.try_grow_user_vma_range_with_file_len(
-            old_addr,
-            old_len,
-            target_start,
-            new_len,
-            grow_areas,
-            final_file_valid_len,
-            |memory_set| {
-                let token = memory_set.token();
-                let mut pos = 0usize;
-                let mut tmp = [0u8; 512];
-                while pos < file_mapped_grow_len {
-                    let to_read = min(tmp.len(), file_mapped_grow_len - pos);
-                    let read = os_inode.pread_at(grow_file_offset + pos, &mut tmp[..to_read]);
-                    if read == 0 {
-                        break;
+        {
+            let mut memory_set = inner.memory_set.lock();
+            memory_set.try_grow_user_vma_range_with_file_len(
+                old_addr,
+                old_len,
+                target_start,
+                new_len,
+                grow_areas,
+                final_file_valid_len,
+                |memory_set| {
+                    let token = memory_set.token();
+                    let mut pos = 0usize;
+                    let mut tmp = [0u8; 512];
+                    while pos < file_mapped_grow_len {
+                        let to_read = min(tmp.len(), file_mapped_grow_len - pos);
+                        let read = os_inode.pread_at(grow_file_offset + pos, &mut tmp[..to_read]);
+                        if read == 0 {
+                            break;
+                        }
+                        if try_copy_to_user_unchecked(
+                            token,
+                            (grow_start + pos) as *mut u8,
+                            &tmp[..read],
+                        )
+                        .is_err()
+                        {
+                            return false;
+                        }
+                        pos += read;
                     }
-                    if try_copy_to_user_unchecked(
-                        token,
-                        (grow_start + pos) as *mut u8,
-                        &tmp[..read],
-                    )
-                    .is_err()
-                    {
-                        return false;
-                    }
-                    pos += read;
-                }
-                true
-            },
-        )
+                    true
+                },
+            )
+        }
     } else {
         let grow_area = VmaInsertArea::Lazy {
             start: grow_start,
             end: target_new_end,
         };
-        inner.memory_set.try_grow_user_vma_range(
-            old_addr,
-            old_len,
-            target_start,
-            new_len,
-            grow_area,
-            |_| true,
-        )
+        {
+            let mut memory_set = inner.memory_set.lock();
+            memory_set.try_grow_user_vma_range(
+                old_addr,
+                old_len,
+                target_start,
+                new_len,
+                grow_area,
+                |_| true,
+            )
+        }
     };
     if !grow_ok {
         return err(SyscallError::ENOMEM);
     }
 
-    if let Some(updated_attaches) = updated_attaches {
-        inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
+    {
+        let mut memory_set = inner.memory_set.lock();
+        if let Some(updated_attaches) = updated_attaches {
+            memory_set.replace_sysv_shm_attaches(updated_attaches);
+        }
+        memory_set.note_mmap_end(target_new_end);
     }
-    inner.memory_set.note_mmap_end(target_new_end);
     target_start as isize
 }
