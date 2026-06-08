@@ -152,9 +152,29 @@ app_37_name:
     .asciz "private_file_madvise_dontneed_smoke"
 .section .rodata
 .align 3
+app_38_name:
+    .asciz "shared_file_alias_smoke"
+.section .rodata
+.align 3
+app_39_name:
+    .asciz "shared_file_cross_mm_smoke"
+.section .rodata
+.align 3
+app_40_name:
+    .asciz "shared_file_kernel_write_smoke"
+.section .rodata
+.align 3
+app_41_name:
+    .asciz "shared_file_fault_cache_smoke"
+.section .rodata
+.align 3
+app_42_name:
+    .asciz "shared_file_truncate_cache_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 38
+    .quad 43
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -193,3 +213,8 @@ num_user_apps:
     .quad app_35_name
     .quad app_36_name
     .quad app_37_name
+    .quad app_38_name
+    .quad app_39_name
+    .quad app_40_name
+    .quad app_41_name
+    .quad app_42_name
