@@ -14,7 +14,7 @@ use crate::fs::{
     initial_mount_namespace, mount_namespace_id,
 };
 use crate::mm::{
-    ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
+    ElfAux, KERNEL_SPACE, MemorySet, MmRef, read_user_value, translated_mutref, write_user_value,
 };
 use crate::println;
 use crate::task::FilesStruct;
@@ -916,7 +916,7 @@ pub struct ProcessControlBlockInner {
     pub continued: bool,
     /// Tracer pid for basic ptrace support (`PTRACE_TRACEME`).
     pub ptrace_tracer_pid: Option<usize>,
-    pub memory_set: MemorySet,
+    pub memory_set: MmRef,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
@@ -985,8 +985,6 @@ pub struct ProcessControlBlockInner {
     pub pid_ns_vpid: usize,
     /// Whether this process is PID 1 inside its PID namespace.
     pub pid_ns_init: bool,
-    /// System V shared memory attachments (shmat/shmdt).
-    pub sysv_shm_attaches: Vec<crate::syscall::sysv_shm::ShmAttach>,
     pub signals: SignalFlags,
     pub signals_actions: SignalActions,
     pub signals_masks: SignalFlags,
@@ -1151,7 +1149,7 @@ impl ProcessControlBlock {
                 stop_pending: false,
                 continued: false,
                 ptrace_tracer_pid: None,
-                memory_set,
+                memory_set: MmRef::new(memory_set),
                 parent: None,
                 children: Vec::new(),
                 exit_code: 0,
@@ -1227,7 +1225,6 @@ impl ProcessControlBlock {
                 pid_ns_id: 0,
                 pid_ns_vpid: pid,
                 pid_ns_init: false,
-                sysv_shm_attaches: Vec::new(),
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
@@ -1375,12 +1372,23 @@ impl ProcessControlBlock {
         }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
-        {
+        let task = self.borrow_mut().get_task(0);
+        let old_trap_cx_slot = {
+            let task_inner = task.borrow_mut();
+            task_inner.res.as_ref().map(|res| res.trap_cx_slot())
+        };
+        let old_shm_cleanup = {
             let mut inner = self.borrow_mut();
-            let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
-            crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
+            if let Some(slot) = old_trap_cx_slot {
+                let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
+                inner
+                    .memory_set
+                    .remove_area_with_start_vpn(trap_cx_bottom.into());
+                inner.memory_set.dealloc_trap_context_slot(slot);
+            }
+            let old_shm_cleanup = inner.memory_set.take_sysv_shm_attaches_for_cleanup();
             reset_signal_handlers_on_exec(&mut inner);
-            inner.memory_set = memory_set;
+            inner.memory_set = MmRef::new(memory_set);
             inner.scheduling.reset_on_fork = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
@@ -1398,11 +1406,14 @@ impl ProcessControlBlock {
                 exec_inode.1,
             );
             inner.did_exec = true;
+            old_shm_cleanup
+        };
+        if let Some(old_shm) = old_shm_cleanup {
+            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
-        let task = self.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
         let res = task_inner.res.as_mut().unwrap();
-        res.ustack_base = ustack_base;
+        res.reset_for_exec(ustack_base);
         task_inner.trap_cx_ppn = res.trap_cx_ppn();
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
             new_token,
@@ -1453,12 +1464,23 @@ impl ProcessControlBlock {
         }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
-        {
+        let task = self.borrow_mut().get_task(0);
+        let old_trap_cx_slot = {
+            let task_inner = task.borrow_mut();
+            task_inner.res.as_ref().map(|res| res.trap_cx_slot())
+        };
+        let old_shm_cleanup = {
             let mut inner = self.borrow_mut();
-            let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
-            crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
+            if let Some(slot) = old_trap_cx_slot {
+                let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
+                inner
+                    .memory_set
+                    .remove_area_with_start_vpn(trap_cx_bottom.into());
+                inner.memory_set.dealloc_trap_context_slot(slot);
+            }
+            let old_shm_cleanup = inner.memory_set.take_sysv_shm_attaches_for_cleanup();
             reset_signal_handlers_on_exec(&mut inner);
-            inner.memory_set = memory_set;
+            inner.memory_set = MmRef::new(memory_set);
             inner.scheduling.reset_on_fork = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
@@ -1476,16 +1498,19 @@ impl ProcessControlBlock {
                 exec_inode.1,
             );
             inner.did_exec = true;
+            old_shm_cleanup
+        };
+        if let Some(old_shm) = old_shm_cleanup {
+            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
 
         // Workaround glibc ld-linux early crash by seeding an internal cached
         // DT_SYMTAB dynamic-entry pointer before entering the interpreter.
         patch_glibc_ld_linux_symtab_dyn(new_token, interp_base, interp_data);
 
-        let task = self.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
         let res = task_inner.res.as_mut().unwrap();
-        res.ustack_base = ustack_base;
+        res.reset_for_exec(ustack_base);
         task_inner.trap_cx_ppn = res.trap_cx_ppn();
 
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
@@ -1518,6 +1543,11 @@ impl ProcessControlBlock {
         share_files: bool,
         share_vm: bool,
     ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
+        let caller_task_res = crate::task::processor::current_task().and_then(|t| {
+            let inner = t.borrow_mut();
+            inner.res.as_ref().map(|r| (r.tid, r.ustack_base()))
+        });
+        let caller_tid = caller_task_res.map(|(tid, _)| tid).unwrap_or(0);
         let diag_enabled = DEBUG_FUTEX;
         let fork_start_cycles = if diag_enabled {
             crate::arch::read_time()
@@ -1576,7 +1606,7 @@ impl ProcessControlBlock {
         let cpu_affinity_mask = parent.scheduling.cpu_affinity_mask;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
-        let inherited_shm = parent.sysv_shm_attaches.clone();
+        let inherited_shm = parent.memory_set.sysv_shm_attaches_snapshot();
         if crate::debug_config::DEBUG_PID_MAP {
             let seq = FORK_PRE_COW_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if seq <= 8 || (seq & (seq - 1)) == 0 {
@@ -1596,24 +1626,22 @@ impl ProcessControlBlock {
             }
         }
         // Fork address space (COW by default, full copy on LoongArch).
-        let caller_tid = crate::task::processor::current_task()
-            .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.tid))
-            .unwrap_or(0);
         #[cfg(target_arch = "loongarch64")]
-        let mut memory_set = if DEBUG_LOONGARCH_FULL_COPY_FORK {
-            MemorySet::from_existed_user(&parent.memory_set)
+        let memory_set = if DEBUG_LOONGARCH_FULL_COPY_FORK {
+            MmRef::from_existed_user_deep(&parent.memory_set)
         } else if share_vm {
-            MemorySet::from_existed_user_shared(&parent.memory_set)
+            parent.memory_set.clone()
         } else {
-            MemorySet::from_existed_user_cow(&mut parent.memory_set)
+            MmRef::from_existed_user_cow(&parent.memory_set)
         };
         #[cfg(not(target_arch = "loongarch64"))]
-        let mut memory_set = if share_vm {
-            MemorySet::from_existed_user_shared(&parent.memory_set)
+        let memory_set = if share_vm {
+            parent.memory_set.clone()
         } else {
-            MemorySet::from_existed_user_cow(&mut parent.memory_set)
+            MmRef::from_existed_user_cow(&parent.memory_set)
         };
-        if thread_count > 1 {
+        if thread_count > 1 && !share_vm {
+            let mut child_mm = memory_set.lock();
             for task in parent.tasks.iter().filter_map(|t| t.as_ref()) {
                 let mut task_inner = task.borrow_mut();
                 let Some(res) = task_inner.res.as_ref() else {
@@ -1622,8 +1650,10 @@ impl ProcessControlBlock {
                 if res.tid == 0 {
                     continue;
                 }
-                let trap_cx_bottom = TRAP_CONTEXT_BASE - res.tid * PAGE_SIZE;
-                memory_set.remove_area_with_start_vpn(trap_cx_bottom.into());
+                let trap_cx_slot = res.trap_cx_slot();
+                let trap_cx_bottom = TRAP_CONTEXT_BASE - trap_cx_slot * PAGE_SIZE;
+                child_mm.remove_area_with_start_vpn(trap_cx_bottom.into());
+                child_mm.dealloc_trap_context_slot(trap_cx_slot);
             }
         }
         if diag_enabled {
@@ -1664,17 +1694,15 @@ impl ProcessControlBlock {
         let exec_inode_dev = parent.exec_inode_dev;
         let exec_inode_num = parent.exec_inode_num;
         // Remember parent's user-stack base for the calling thread.
-        let parent_ustack_base = crate::task::processor::current_task()
-            .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.ustack_base()))
-            .unwrap_or_else(|| {
-                parent
-                    .get_task(0)
-                    .borrow_mut()
-                    .res
-                    .as_ref()
-                    .unwrap()
-                    .ustack_base()
-            });
+        let parent_ustack_base = caller_task_res.map(|(_, base)| base).unwrap_or_else(|| {
+            parent
+                .get_task(0)
+                .borrow_mut()
+                .res
+                .as_ref()
+                .unwrap()
+                .ustack_base()
+        });
         // Fork state is not a single atomic snapshot across all PCB fields and
         // the descriptor table.  Linux allows those domains to move separately;
         // here that choice also keeps the PCB lock from nesting with the files
@@ -1739,7 +1767,6 @@ impl ProcessControlBlock {
                 pid_ns_id,
                 pid_ns_vpid: pid_value,
                 pid_ns_init: false,
-                sysv_shm_attaches: inherited_shm.clone(),
                 exec_inode_dev,
                 exec_inode_num,
                 // Pending signals are not inherited across fork.
@@ -1767,19 +1794,28 @@ impl ProcessControlBlock {
                 pidfd_poll_waiters: PollWaitQueue::default(),
             }),
         });
-        crate::syscall::sysv_shm::fork_inherit(ipc_ns_id, &inherited_shm);
         if diag_enabled {
             after_pcb_cycles = crate::arch::read_time();
         }
 
         // create main thread of child process (allocates a fresh kernel stack)
-        let task = Arc::new(TaskControlBlock::try_new(
-            Arc::clone(&child),
-            parent_ustack_base,
-            // here we do not allocate trap_cx or ustack again
-            // but mention that we allocate a new kstack here
-            false,
-        )?);
+        let task = Arc::new(if share_vm {
+            // Process-style CLONE_VM shares the mm but is not a thread-group
+            // member. Its user stack is supplied by clone(2), so only allocate
+            // a distinct trap-context slot in the shared mm.
+            TaskControlBlock::try_new_linux_thread(Arc::clone(&child))?
+        } else {
+            TaskControlBlock::try_new(
+                Arc::clone(&child),
+                parent_ustack_base,
+                // here we do not allocate trap_cx or ustack again
+                // but mention that we allocate a new kstack here
+                false,
+            )?
+        });
+        if !share_vm {
+            crate::syscall::sysv_shm::fork_inherit(&inherited_shm);
+        }
         // Distribute child processes across harts.
         task.set_cpu_id(select_hart_for_new_task());
         // attach task to child process
@@ -1802,7 +1838,7 @@ impl ProcessControlBlock {
         trap_cx.kernel_sp = task.kstack_top();
         // set return value for child process
         trap_cx.x[REG_A0] = 0;
-        if caller_tid != 0 {
+        if !share_vm && caller_tid != 0 {
             if let Some(res) = task_inner.res.as_mut() {
                 let caller_stack_bottom =
                     parent_ustack_base + caller_tid * (PAGE_SIZE + USER_STACK_SIZE);

@@ -108,9 +108,53 @@ app_26_name:
     .asciz "dup3_lock_cleanup_smoke"
 .section .rodata
 .align 3
+app_27_name:
+    .asciz "file_mmap_lazy_fault_smoke"
+.section .rodata
+.align 3
+app_28_name:
+    .asciz "proc_maps_stack_smoke"
+.section .rodata
+.align 3
+app_29_name:
+    .asciz "clone_vm_mmap_smoke"
+.section .rodata
+.align 3
+app_30_name:
+    .asciz "memfd_mremap_shared_smoke"
+.section .rodata
+.align 3
+app_31_name:
+    .asciz "sysv_shm_mremap_smoke"
+.section .rodata
+.align 3
+app_32_name:
+    .asciz "cow_mprotect_smoke"
+.section .rodata
+.align 3
+app_33_name:
+    .asciz "mmap_placement_smoke"
+.section .rodata
+.align 3
+app_34_name:
+    .asciz "growsdown_guard_smoke"
+.section .rodata
+.align 3
+app_35_name:
+    .asciz "clone_vm_sysv_shm_smoke"
+.section .rodata
+.align 3
+app_36_name:
+    .asciz "stack_madvise_dontneed_smoke"
+.section .rodata
+.align 3
+app_37_name:
+    .asciz "private_file_madvise_dontneed_smoke"
+.section .rodata
+.align 3
     .global num_user_apps
 num_user_apps:
-    .quad 27
+    .quad 38
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -138,3 +182,14 @@ num_user_apps:
     .quad app_24_name
     .quad app_25_name
     .quad app_26_name
+    .quad app_27_name
+    .quad app_28_name
+    .quad app_29_name
+    .quad app_30_name
+    .quad app_31_name
+    .quad app_32_name
+    .quad app_33_name
+    .quad app_34_name
+    .quad app_35_name
+    .quad app_36_name
+    .quad app_37_name

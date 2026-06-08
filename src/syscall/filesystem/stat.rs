@@ -13,7 +13,8 @@ use super::{
     read_user_cstring, read_user_value, require_fd_file, resolve_abs_path, resolve_at_inode,
     resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, statfs_mount_flags_for_abs,
     statx_from_kstat, sync_all, touch_inode_mtime_ctime_now, truncate_regular_inode,
-    try_copy_to_user, try_write_user_value, write_zeros_range,
+    try_copy_to_user, try_write_user_value, update_current_inode_mmaps_size,
+    update_current_os_inode_mmaps_size, write_zeros_range,
 };
 
 /// Preallocates file space or punches holes on supported file types.
@@ -178,6 +179,7 @@ pub fn syscall_ftruncate(fd: usize, length: usize) -> isize {
         let ret = truncate_regular_inode(&inode, length);
         if ret == 0 {
             touch_inode_mtime_ctime_now(&inode);
+            update_current_os_inode_mmaps_size(os_inode);
         }
         return ret;
     }
@@ -240,6 +242,7 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
     let ret = truncate_regular_inode(&inode, length);
     if ret == 0 {
         touch_inode_mtime_ctime_now(&inode);
+        update_current_inode_mmaps_size(&inode);
     }
     ret
 }

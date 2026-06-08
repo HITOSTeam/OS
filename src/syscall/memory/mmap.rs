@@ -1,13 +1,18 @@
 use super::*;
+use crate::syscall::sysv_shm::{
+    detach_attaches_overlapping, find_attach_containing, release_detached_attach_refs,
+    segment_shared_frames_existing, segment_size, split_mremap_attach,
+};
 
 pub fn syscall_brk(addr: usize) -> isize {
     const BRK_RELATIVE_COMPAT_MAX: usize = 64 * 1024;
     let process = current_process();
     let pid = process.getpid();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
     if addr == 0 {
-        let brk = inner.memory_set.brk();
-        let heap_start = inner.memory_set.heap_start();
+        let memory_set = inner.memory_set.lock();
+        let brk = memory_set.brk();
+        let heap_start = memory_set.heap_start();
         if crate::debug_config::DEBUG_SYSCALL {
             crate::println!(
                 "[brk] pid={} query brk={:#x} heap_start={:#x}",
@@ -18,165 +23,66 @@ pub fn syscall_brk(addr: usize) -> isize {
         }
         return brk as isize;
     }
-    let mut new_brk = addr;
-    let heap_start = inner.memory_set.heap_start();
-    let old_brk = inner.memory_set.brk();
-    if new_brk < heap_start && new_brk <= BRK_RELATIVE_COMPAT_MAX {
-        // Some libc builds issue `brk()` with a small positive increment
-        // (relative form) instead of an absolute break address.
-        // Treat such low values as relative grows from current break.
-        if let Some(candidate) = old_brk.checked_add(new_brk) {
-            if candidate > old_brk {
-                new_brk = candidate;
-            }
-        }
-    }
-    if new_brk < heap_start {
-        if crate::debug_config::DEBUG_SYSCALL {
-            crate::println!(
-                "[brk] pid={} reject addr={:#x} heap_start={:#x} brk={:#x}",
-                pid,
-                new_brk,
-                heap_start,
-                old_brk
-            );
-        }
-        return old_brk as isize;
-    }
-    if new_brk > USER_VA_TOP || align_up(new_brk, PAGE_SIZE) > USER_VA_TOP {
-        if crate::debug_config::DEBUG_SYSCALL {
-            crate::println!(
-                "[brk] pid={} reject addr={:#x} above user top={:#x}",
-                pid,
-                new_brk,
-                USER_VA_TOP
-            );
-        }
-        return old_brk as isize;
-    }
-
-    let old_end = align_up(old_brk, PAGE_SIZE);
-    let new_end = align_up(new_brk, PAGE_SIZE);
-    if new_end > old_end && exceeds_overcommit_limit(new_end.saturating_sub(old_end)) {
-        return old_brk as isize;
-    }
+    let memory_set = inner.memory_set.clone();
+    let shm_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
+    let mut memory_set = memory_set.lock();
+    let update: BrkUpdate = memory_set.try_update_brk_with_holes(
+        addr,
+        USER_VA_TOP,
+        BRK_RELATIVE_COMPAT_MAX,
+        |page| page_overlaps_sysv_shm_regions(page, &shm_attaches),
+        exceeds_overcommit_limit,
+    );
     if crate::debug_config::DEBUG_SYSCALL {
         crate::println!(
             "[brk] pid={} heap_start={:#x} old_brk={:#x} new_brk={:#x} old_end={:#x} new_end={:#x}",
             pid,
-            heap_start,
-            old_brk,
-            new_brk,
-            old_end,
-            new_end
+            update.heap_start,
+            update.old_brk,
+            update.new_brk,
+            update.old_end,
+            update.new_end
         );
     }
-    let ok = if new_end > old_end {
-        // Keep the legacy split-brk behavior used by mmapstress03: if the
-        // process has shrunk brk below a MAP_FIXED segment that was already
-        // inside the old brk range, growing back may skip that mmap-backed
-        // hole. Do not let brk grow into unrelated mmap reservations placed
-        // above the old break.
-        let perm = MapPermission::R | MapPermission::W | MapPermission::U;
-        let mut cur = old_end;
-        let mut pending_ranges = Vec::new();
-        let mut ok = true;
-        while cur < new_end {
-            if page_overlaps_sysv_shm_regions(cur, &inner.sysv_shm_attaches) {
-                if crate::debug_config::DEBUG_SYSCALL {
-                    crate::println!("[brk] pid={} grow blocked by sysv_shm page={:#x}", pid, cur);
-                }
-                ok = false;
-                break;
-            }
-            if inner
-                .memory_set
-                .page_overlaps_vm_region_started_before(cur, old_end)
-            {
-                cur += PAGE_SIZE;
-                continue;
-            }
-            if inner.memory_set.page_overlaps_vm_region(cur)
-                || inner
-                    .memory_set
-                    .user_range_fully_mapped(cur.into(), (cur + PAGE_SIZE).into())
-            {
-                if crate::debug_config::DEBUG_SYSCALL {
-                    crate::println!("[brk] pid={} grow blocked by mapped page={:#x}", pid, cur);
-                }
-                ok = false;
-                break;
-            }
-            let run_start = cur;
-            cur += PAGE_SIZE;
-            while cur < new_end
-                && !page_overlaps_sysv_shm_regions(cur, &inner.sysv_shm_attaches)
-                && !inner
-                    .memory_set
-                    .page_overlaps_vm_region_started_before(cur, old_end)
-                && !inner.memory_set.page_overlaps_vm_region(cur)
-                && !inner
-                    .memory_set
-                    .user_range_fully_mapped(cur.into(), (cur + PAGE_SIZE).into())
-            {
-                cur += PAGE_SIZE;
-            }
-            pending_ranges.push((run_start, cur));
-        }
-        // Two-phase commit: only after the whole grow range scans clean do we
-        // insert the lazy areas. If any insertion fails, roll back the ones we
-        // already added so a failed brk() never leaves a half-grown heap VMA.
-        if ok {
-            let mut inserted_ranges = Vec::new();
-            for (run_start, run_end) in pending_ranges {
-                if inner
-                    .memory_set
-                    .try_insert_lazy_area(run_start.into(), run_end.into(), perm)
-                {
-                    inserted_ranges.push((run_start, run_end));
-                } else {
-                    for (inserted_start, inserted_end) in inserted_ranges {
-                        inner
-                            .memory_set
-                            .unmap_user_range(inserted_start.into(), inserted_end.into());
-                    }
-                    ok = false;
-                    break;
-                }
-            }
-        }
+    if !update.success {
         if crate::debug_config::DEBUG_SYSCALL {
-            crate::println!("[brk] pid={} grow_with_holes ok={}", pid, ok);
+            crate::println!("[brk] pid={} failed, brk stays {:#x}", pid, update.old_brk);
         }
-        ok
-    } else if new_end < old_end {
-        let mut cur = new_end;
-        while cur < old_end {
-            if !inner.memory_set.page_overlaps_vm_region(cur) {
-                inner
-                    .memory_set
-                    .unmap_user_range(cur.into(), (cur + PAGE_SIZE).into());
-            }
-            cur += PAGE_SIZE;
-        }
-        if crate::debug_config::DEBUG_SYSCALL {
-            crate::println!("[brk] pid={} shrink_with_holes done", pid);
-        }
-        true
-    } else {
-        true
-    };
-    if !ok {
-        if crate::debug_config::DEBUG_SYSCALL {
-            crate::println!("[brk] pid={} failed, brk stays {:#x}", pid, old_brk);
-        }
-        return old_brk as isize;
+        return update.old_brk as isize;
     }
-    inner.memory_set.set_brk(new_brk);
     if crate::debug_config::DEBUG_SYSCALL {
-        crate::println!("[brk] pid={} updated brk={:#x}", pid, new_brk);
+        crate::println!("[brk] pid={} updated brk={:#x}", pid, update.new_brk);
     }
-    new_brk as isize
+    update.result_brk() as isize
+}
+
+fn populate_file_mapping(
+    memory_set: &mut MemorySet,
+    file: &Arc<dyn File + Send + Sync>,
+    start: usize,
+    len: usize,
+    off: usize,
+) -> bool {
+    let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() else {
+        return true;
+    };
+    // Ensure buffered writes are reflected in file-backed mappings.
+    let _ = inode_file.flush();
+    let token = memory_set.token();
+    let mut pos = 0usize;
+    let mut tmp = [0u8; 512];
+    while pos < len {
+        let to_read = min(tmp.len(), len - pos);
+        let read = inode_file.pread_at(off + pos, &mut tmp[..to_read]);
+        if read == 0 {
+            break;
+        }
+        if try_copy_to_user_unchecked(token, (start + pos) as *mut u8, &tmp[..read]).is_err() {
+            return false;
+        }
+        pos += read;
+    }
+    true
 }
 
 pub fn syscall_mmap(
@@ -243,7 +149,7 @@ pub fn syscall_mmap(
             };
             (true, dev, ino, off)
         } else {
-            (false, 0, 0, 0)
+            (false, 0, 0, off)
         }
     } else {
         (false, 0, 0, 0)
@@ -255,12 +161,10 @@ pub fn syscall_mmap(
     }
 
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
 
-    // A very small `mmap` implementation:
-    // - only honor `addr` when `MAP_FIXED` is set;
-    // - otherwise treat `addr` as a hint and allocate from `mmap_next`;
-    // - never move `mmap_next` backwards (important for glibc/ld.so).
+    // Non-fixed mmap treats addr as a hint; otherwise MemorySet picks a
+    // Linux-like top-down hole with a low-address fallback near brk.
     let is_fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     let start = if is_fixed {
         if addr == 0 {
@@ -268,48 +172,14 @@ pub fn syscall_mmap(
         }
         align_down(addr, PAGE_SIZE)
     } else {
-        let preferred = align_up(inner.memory_set.mmap_next(), PAGE_SIZE);
-        let fallback = align_up(
-            inner.memory_set.brk().saturating_add(USER_HEAP_GAP),
-            PAGE_SIZE,
-        );
-        // Placement must dodge both page-table VMAs and syscall metadata VMAs.
-        let occupied = inner.memory_set.occupied_user_ranges_with_metadata();
-        let find_free = |min_start| {
-            find_free_user_range_checked(occupied.as_slice(), min_start, map_len, |start, end| {
-                !inner.memory_set.range_overlaps(start.into(), end.into())
-                    && !inner.memory_set.vm_regions_overlap(start, end)
-            })
+        let Some(start) = inner.memory_set.find_free_mmap_range(
+            (addr != 0).then_some(addr),
+            map_len,
+            USER_VA_TOP,
+        ) else {
+            return err(SyscallError::ENOMEM);
         };
-        let fallback_start = || {
-            find_free(preferred)
-                .or_else(|| {
-                    (fallback < preferred)
-                        .then(|| find_free(fallback))
-                        .flatten()
-                })
-                .unwrap_or(USER_VA_TOP)
-        };
-        if addr != 0 {
-            let hinted = align_down(addr, PAGE_SIZE);
-            let hinted_end = hinted.checked_add(map_len);
-            if let Some(hinted_end) = hinted_end {
-                if user_range_valid(hinted, hinted_end)
-                    && !inner
-                        .memory_set
-                        .range_overlaps(hinted.into(), hinted_end.into())
-                    && !inner.memory_set.vm_regions_overlap(hinted, hinted_end)
-                {
-                    hinted
-                } else {
-                    fallback_start()
-                }
-            } else {
-                fallback_start()
-            }
-        } else {
-            fallback_start()
-        }
+        start
     };
     let Some(end) = start.checked_add(map_len) else {
         return err(SyscallError::ENOMEM);
@@ -327,14 +197,13 @@ pub fn syscall_mmap(
     // free in both bookkeeping structures; fail with ENOMEM rather than letting
     // the new mapping clobber an existing one.
     if !is_fixed
-        && (inner
+        && !inner
             .memory_set
-            .range_overlaps(map_start.into(), map_end.into())
-            || inner.memory_set.vm_regions_overlap(map_start, map_end))
+            .user_range_is_free(map_start, map_end, USER_VA_TOP)
     {
         return err(SyscallError::ENOMEM);
     }
-    if is_anon && len >= LARGE_ANON_MMAP {
+    if crate::debug_config::DEBUG_SYSCALL && is_anon && len >= LARGE_ANON_MMAP {
         let pid = process.getpid();
         crate::println!(
             "[mmap] pid={} anon len={} map_len={} addr_hint={:#x} start={:#x} prot={:#x} flags={:#x} stack={} fd={} off={:#x}",
@@ -356,10 +225,9 @@ pub fn syscall_mmap(
     if (flags & MAP_FIXED_NOREPLACE) != 0 {
         // MAP_FIXED_NOREPLACE must fail with EEXIST instead of relocating when
         // the fixed target collides with anything in either structure.
-        if inner
+        if !inner
             .memory_set
-            .range_overlaps(map_start.into(), map_end.into())
-            || inner.memory_set.vm_regions_overlap(map_start, map_end)
+            .user_range_is_free(map_start, map_end, USER_VA_TOP)
         {
             return err(SyscallError::EEXIST);
         }
@@ -375,6 +243,8 @@ pub fn syscall_mmap(
             }
             .max(pending_end);
             file_size.saturating_sub(off).min(map_len)
+        } else if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+            shm.len().saturating_sub(off).min(map_len)
         } else {
             map_len
         }
@@ -383,7 +253,7 @@ pub fn syscall_mmap(
     };
     // Linux delivers SIGBUS for file-backed accesses that go beyond EOF,
     // starting from the first full page after the file-backed byte range.
-    let sigbus_enabled = !is_anon && is_shared;
+    let sigbus_enabled = !is_anon;
     let sigbus_start = if sigbus_enabled {
         map_start + align_up(file_valid_len, PAGE_SIZE).min(map_len)
     } else {
@@ -402,19 +272,14 @@ pub fn syscall_mmap(
             }
             cur += PAGE_SIZE;
         }
-
-        // Linux MAP_FIXED replaces any existing mappings in the range.
-        inner.memory_set.unmap_user_range(start.into(), end.into());
-
-        // Keep `vm_regions` bookkeeping consistent (split/trim overlaps).
-        inner.memory_set.trim_vm_regions(start, end);
-        inner.memory_set.trim_locked_ranges(start, end);
     }
 
+    let mut vma_areas = Vec::new();
     if is_shared {
         let frames = if let Some(file) = &file {
             if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-                let Some(frames) = shm.shared_frames(off, map_len) else {
+                let file_mapped_len = sigbus_start.saturating_sub(map_start);
+                let Some(frames) = shm.shared_frames_existing(off, file_mapped_len) else {
                     return err(SyscallError::ENOMEM);
                 };
                 frames
@@ -442,63 +307,39 @@ pub fn syscall_mmap(
             frames
         };
         if map_start < sigbus_start {
-            inner.memory_set.insert_shared_frames_area(
-                map_start.into(),
-                sigbus_start.into(),
-                perm,
+            vma_areas.push(VmaInsertArea::SharedFrames {
+                start: map_start,
+                end: sigbus_start,
                 frames,
-            );
-        }
-        if sigbus_start < map_end
-            && !inner.memory_set.try_insert_lazy_area(
-                sigbus_start.into(),
-                map_end.into(),
-                MapPermission::U,
-            )
-        {
-            inner
-                .memory_set
-                .unmap_user_range(map_start.into(), map_end.into());
+            });
+        } else if !frames.is_empty() {
             return err(SyscallError::ENOMEM);
         }
+        if sigbus_start < map_end {
+            vma_areas.push(VmaInsertArea::Lazy {
+                start: sigbus_start,
+                end: map_end,
+            });
+        }
+    } else if is_anon {
+        vma_areas.push(VmaInsertArea::Lazy {
+            start: map_start,
+            end: map_end,
+        });
     } else {
-        let map_ok = if is_anon {
-            inner
-                .memory_set
-                .try_insert_lazy_area(map_start.into(), map_end.into(), perm)
-        } else {
-            let mut ok = true;
-            if map_start < sigbus_start {
-                ok &= inner.memory_set.try_insert_framed_area(
-                    map_start.into(),
-                    sigbus_start.into(),
-                    perm,
-                );
-            }
-            if ok && sigbus_start < map_end {
-                ok &= inner.memory_set.try_insert_lazy_area(
-                    sigbus_start.into(),
-                    map_end.into(),
-                    MapPermission::U,
-                );
-            }
-            ok
-        };
-        if !map_ok {
-            inner
-                .memory_set
-                .unmap_user_range(map_start.into(), map_end.into());
-            return err(SyscallError::ENOMEM);
+        if map_start < sigbus_start {
+            vma_areas.push(VmaInsertArea::Framed {
+                start: map_start,
+                end: sigbus_start,
+            });
+        }
+        if sigbus_start < map_end {
+            vma_areas.push(VmaInsertArea::Lazy {
+                start: sigbus_start,
+                end: map_end,
+            });
         }
     }
-    if !is_fixed {
-        inner.memory_set.note_mmap_end(end);
-    }
-    let backing_id = if file_backed {
-        inner.memory_set.allocate_mmap_backing(file.as_ref())
-    } else {
-        0
-    };
     let (memfd_id, sealed_write) = if let Some(file) = &file {
         if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
             (
@@ -520,7 +361,9 @@ pub fn syscall_mmap(
     } else {
         true
     };
-    inner.memory_set.push_vm_region(VmRegion {
+    let lock_range = inner.memory_set.mlockall_future() || (flags & MAP_LOCKED) != 0;
+    let region = VmRegion {
+        kind: VmRegionKind::Mmap,
         start,
         len: map_len,
         prot: prot & (PROT_READ | PROT_WRITE | PROT_EXEC),
@@ -529,49 +372,90 @@ pub fn syscall_mmap(
         } else {
             MapType::Lazy
         },
-        map_perm_bits: perm.bits(),
+        map_perm: perm,
+        file_valid_len,
+        sigbus_start,
         shared: is_shared,
         may_write_upgrade,
         file_backed,
         file_dev,
         file_ino,
         file_offset,
-        file_valid_len,
-        backing_id,
+        backing_id: 0,
         memfd_id,
+        sysv_shmid: 0,
         growsdown: (flags & MAP_GROWSDOWN) != 0,
-        sigbus_start,
-    });
-    if inner.memory_set.mlockall_future() || (flags & MAP_LOCKED) != 0 {
-        inner.memory_set.add_locked_range(start, end);
-    }
-    drop(inner);
-
-    // Best-effort: file-backed initial population.
-    if !is_anon && fd >= 0 {
-        if let Some(file) = &file {
-            if let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() {
-                // Ensure buffered writes are reflected in file-backed mappings.
-                let _ = inode_file.flush();
-                let token = get_current_token();
-                let mut pos = 0usize;
-                let mut tmp = [0u8; 512];
-                while pos < len {
-                    let to_read = min(tmp.len(), len - pos);
-                    let read = inode_file.pread_at(off + pos, &mut tmp[..to_read]);
-                    if read == 0 {
-                        break;
-                    }
-                    if try_copy_to_user_unchecked(token, (start + pos) as *mut u8, &tmp[..read])
-                        .is_err()
-                    {
-                        return err(SyscallError::ENOMEM);
-                    }
-                    pos += read;
-                }
+    };
+    let should_populate_file = !is_anon && fd >= 0;
+    let backing_file = file.as_ref();
+    let fixed_attach_update = if (flags & MAP_FIXED) != 0 {
+        let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
+        let Some(release_shmids) =
+            detach_attaches_overlapping(&mut updated_attaches, map_start, map_len)
+        else {
+            return err(SyscallError::ENOMEM);
+        };
+        Some((updated_attaches, release_shmids))
+    } else {
+        None
+    };
+    let inserted = if (flags & MAP_FIXED) != 0 {
+        if should_populate_file {
+            if let Some(populate_file) = backing_file {
+                inner.memory_set.try_replace_user_vma_with(
+                    region,
+                    vma_areas,
+                    lock_range,
+                    backing_file,
+                    |memory_set| populate_file_mapping(memory_set, populate_file, start, len, off),
+                )
+            } else {
+                inner
+                    .memory_set
+                    .try_replace_user_vma(region, vma_areas, lock_range, backing_file)
             }
+        } else {
+            inner
+                .memory_set
+                .try_replace_user_vma(region, vma_areas, lock_range, backing_file)
         }
+    } else {
+        if should_populate_file {
+            if let Some(populate_file) = backing_file {
+                inner.memory_set.try_insert_user_vma_with(
+                    region,
+                    vma_areas,
+                    lock_range,
+                    backing_file,
+                    |memory_set| populate_file_mapping(memory_set, populate_file, start, len, off),
+                )
+            } else {
+                inner
+                    .memory_set
+                    .try_insert_user_vma(region, vma_areas, lock_range, backing_file)
+            }
+        } else {
+            inner
+                .memory_set
+                .try_insert_user_vma(region, vma_areas, lock_range, backing_file)
+        }
+    };
+    if !inserted {
+        return err(SyscallError::ENOMEM);
     }
+
+    let detached_shmids = if let Some((updated_attaches, release_shmids)) = fixed_attach_update {
+        inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
+        release_shmids
+    } else {
+        Vec::new()
+    };
+    if !is_fixed {
+        inner.memory_set.note_mmap_end(end);
+    }
+    let pid = process.getpid() as u32;
+    drop(inner);
+    release_detached_attach_refs(pid, detached_shmids.as_slice());
 
     start as isize
 }
@@ -605,20 +489,25 @@ pub fn syscall_mremap(
 
     let files_snapshot = current_files().lock().iter_files_snapshot();
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
+    let Some(src_region) = inner.memory_set.vm_region_containing(old_addr, old_end) else {
+        return err(SyscallError::EFAULT);
+    };
     if !inner
         .memory_set
         .user_range_fully_mapped(old_addr.into(), old_end.into())
     {
         return err(SyscallError::EFAULT);
     }
-
-    let Some(src_region) = inner.memory_set.vm_region_containing(old_addr, old_end) else {
-        return if (flags & MREMAP_MAYMOVE) == 0 && new_len > old_len {
-            err(SyscallError::ENOMEM)
-        } else {
-            err(SyscallError::EFAULT)
+    let sysv_attach = if src_region.sysv_shmid != 0 {
+        let attaches = inner.memory_set.sysv_shm_attaches_snapshot();
+        let Some(idx) = find_attach_containing(&attaches, src_region.sysv_shmid, old_addr, old_len)
+        else {
+            return err(SyscallError::EINVAL);
         };
+        Some(attaches[idx])
+    } else {
+        None
     };
 
     if (flags & MREMAP_FIXED) != 0 {
@@ -647,68 +536,96 @@ pub fn syscall_mremap(
             }
             cur += PAGE_SIZE;
         }
-        inner
-            .memory_set
-            .unmap_user_range(new_addr.into(), new_end.into());
-        inner.memory_set.trim_vm_regions(new_addr, new_end);
-        inner.memory_set.trim_locked_ranges(new_addr, new_end);
+        let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
+        let Some(detached_shmids) =
+            detach_attaches_overlapping(&mut updated_attaches, new_addr, new_len)
+        else {
+            return err(SyscallError::ENOMEM);
+        };
+        if src_region.sysv_shmid != 0 {
+            let Some(src_attach_idx) =
+                find_attach_containing(&updated_attaches, src_region.sysv_shmid, old_addr, old_len)
+            else {
+                return err(SyscallError::EINVAL);
+            };
+            if !split_mremap_attach(
+                &mut updated_attaches,
+                src_attach_idx,
+                old_addr,
+                old_len,
+                new_addr,
+                new_len,
+            ) {
+                return err(SyscallError::ENOMEM);
+            }
+        }
         if !inner
             .memory_set
-            .move_user_range(old_addr.into(), old_end.into(), new_addr.into())
+            .move_user_vma_range_replacing(old_addr, old_len, new_addr)
         {
             return err(SyscallError::ENOMEM);
         }
-        inner
-            .memory_set
-            .move_vm_region_metadata(old_addr, old_len, new_addr);
-        inner
-            .memory_set
-            .move_locked_ranges(old_addr, old_len, new_addr);
+        inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
+        let pid = process.getpid() as u32;
+        drop(inner);
+        release_detached_attach_refs(pid, detached_shmids.as_slice());
         return new_addr as isize;
     }
 
     if new_len <= old_len {
+        let updated_attaches = if sysv_attach.is_some() {
+            let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
+            let Some(idx) =
+                find_attach_containing(&updated_attaches, src_region.sysv_shmid, old_addr, old_len)
+            else {
+                return err(SyscallError::EINVAL);
+            };
+            if !split_mremap_attach(
+                &mut updated_attaches,
+                idx,
+                old_addr,
+                old_len,
+                old_addr,
+                new_len,
+            ) {
+                return err(SyscallError::ENOMEM);
+            }
+            Some(updated_attaches)
+        } else {
+            None
+        };
         let shrink_start = old_addr + new_len;
         if shrink_start < old_end {
             inner
                 .memory_set
-                .unmap_user_range(shrink_start.into(), old_end.into());
-            inner.memory_set.trim_vm_regions(shrink_start, old_end);
-            inner.memory_set.trim_locked_ranges(shrink_start, old_end);
+                .unmap_user_vma_range(shrink_start.into(), old_end.into());
+        }
+        if let Some(updated_attaches) = updated_attaches {
+            inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
         }
         return old_addr as isize;
     }
 
     let mut target_start = old_addr;
     let mut target_old_end = old_end;
-    let mut target_new_end = match old_addr.checked_add(new_len) {
-        Some(v) => v,
-        None => return err(SyscallError::ENOMEM),
-    };
-    if !user_range_valid(target_start, target_new_end) {
-        return err(SyscallError::ENOMEM);
-    }
+    let mut target_new_end = old_addr.checked_add(new_len).unwrap_or(0);
     // In-place grow only works if the bytes just past the old end are free in
-    // both structures; otherwise fall back to relocating (when MREMAP_MAYMOVE).
-    if inner
-        .memory_set
-        .range_overlaps(old_end.into(), target_new_end.into())
-        || inner.memory_set.vm_regions_overlap(old_end, target_new_end)
-    {
+    // both structures and the expanded range stays inside user VA. If the
+    // original mapping sits at the top of a top-down mmap layout, MAYMOVE must
+    // still get a chance to relocate instead of failing on the invalid in-place
+    // end address.
+    let in_place_grow_ok = target_new_end != 0
+        && user_range_valid(target_start, target_new_end)
+        && inner
+            .memory_set
+            .user_range_is_free(old_end, target_new_end, USER_VA_TOP);
+    if !in_place_grow_ok {
         if (flags & MREMAP_MAYMOVE) == 0 {
             return err(SyscallError::ENOMEM);
         }
-        let preferred = align_up(inner.memory_set.mmap_next(), PAGE_SIZE);
-        let fallback = align_up(
-            inner.memory_set.brk().saturating_add(USER_HEAP_GAP),
-            PAGE_SIZE,
-        );
-        // Search across both structures, but trim out the source range itself
-        // so the about-to-be-moved mapping doesn't block its own relocation.
-        let mut occupied = inner.memory_set.occupied_user_ranges_with_metadata();
-        trim_ranges(&mut occupied, old_addr, old_end);
-        let Some(free_start) = find_free_user_range(occupied.as_slice(), preferred, new_len)
-            .or_else(|| find_free_user_range(occupied.as_slice(), fallback, new_len))
+        let Some(free_start) = inner
+            .memory_set
+            .find_free_mmap_range(None, new_len, USER_VA_TOP)
         else {
             return err(SyscallError::ENOMEM);
         };
@@ -718,32 +635,152 @@ pub fn syscall_mremap(
         let Some(free_new_end) = free_start.checked_add(new_len) else {
             return err(SyscallError::ENOMEM);
         };
-        if !inner
-            .memory_set
-            .move_user_range(old_addr.into(), old_end.into(), free_start.into())
-        {
-            return err(SyscallError::ENOMEM);
-        }
-        inner
-            .memory_set
-            .move_vm_region_metadata(old_addr, old_len, free_start);
-        inner
-            .memory_set
-            .move_locked_ranges(old_addr, old_len, free_start);
         target_start = free_start;
         target_old_end = free_old_end;
         target_new_end = free_new_end;
     }
 
     let grow_start = target_old_end;
-    let grow_len = new_len - old_len;
-    let perm = src_region.map_permission();
+    let src_file_offset = match src_region
+        .file_offset
+        .checked_add(old_addr.saturating_sub(src_region.start))
+    {
+        Some(offset) => offset,
+        None => return err(SyscallError::ENOMEM),
+    };
 
-    let grow_ok = if !src_region.file_backed {
-        inner
+    let updated_attaches = if sysv_attach.is_some() {
+        let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
+        let Some(idx) =
+            find_attach_containing(&updated_attaches, src_region.sysv_shmid, old_addr, old_len)
+        else {
+            return err(SyscallError::EINVAL);
+        };
+        if !split_mremap_attach(
+            &mut updated_attaches,
+            idx,
+            old_addr,
+            old_len,
+            target_start,
+            new_len,
+        ) {
+            return err(SyscallError::ENOMEM);
+        }
+        Some(updated_attaches)
+    } else {
+        None
+    };
+
+    let grow_ok = if src_region.sysv_shmid != 0 {
+        let sysv_ipc_ns_id = sysv_attach
+            .map(|attach| attach.ipc_ns_id)
+            .unwrap_or(inner.ipc_ns_id);
+        let Some(seg_size) = segment_size(sysv_ipc_ns_id, src_region.sysv_shmid) else {
+            return err(SyscallError::ENOMEM);
+        };
+        let old_slice_file_valid_len = src_region
+            .file_valid_end()
+            .saturating_sub(old_addr)
+            .min(old_len);
+        let current_file_valid_len = seg_size.saturating_sub(src_file_offset).min(new_len);
+        let final_file_valid_len = old_slice_file_valid_len
+            .max(current_file_valid_len)
+            .min(new_len);
+        let final_sigbus_start =
+            target_start.saturating_add(align_up(final_file_valid_len, PAGE_SIZE).min(new_len));
+
+        let mut grow_areas = Vec::new();
+        let Some(grow_file_offset) = src_file_offset.checked_add(old_len) else {
+            return err(SyscallError::ENOMEM);
+        };
+        if grow_start < final_sigbus_start {
+            let shared_end = min(final_sigbus_start, target_new_end);
+            let shared_len = shared_end.saturating_sub(grow_start);
+            let Some(frames) = segment_shared_frames_existing(
+                sysv_ipc_ns_id,
+                src_region.sysv_shmid,
+                grow_file_offset,
+                shared_len,
+            ) else {
+                return err(SyscallError::ENOMEM);
+            };
+            grow_areas.push(VmaInsertArea::SharedFrames {
+                start: grow_start,
+                end: shared_end,
+                frames,
+            });
+        }
+        if final_sigbus_start < target_new_end {
+            grow_areas.push(VmaInsertArea::Lazy {
+                start: final_sigbus_start.max(grow_start),
+                end: target_new_end,
+            });
+        }
+        inner.memory_set.try_grow_user_vma_range_with_file_len(
+            old_addr,
+            old_len,
+            target_start,
+            new_len,
+            grow_areas,
+            final_file_valid_len,
+            |_| true,
+        )
+    } else if src_region.shared && src_region.memfd_id != 0 {
+        let Some(file) = inner
             .memory_set
-            .try_insert_lazy_area(grow_start.into(), target_new_end.into(), perm)
-    } else if src_region.shared {
+            .mmap_backing_file(src_region.backing_id)
+            .or_else(|| find_shm_file_in_snapshot(&files_snapshot, src_region.memfd_id))
+            .or_else(|| find_open_shm_file(src_region.memfd_id))
+        else {
+            return err(SyscallError::ENOMEM);
+        };
+        let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
+            return err(SyscallError::ENOMEM);
+        };
+        let file_size = shm.len();
+        let old_slice_file_valid_len = src_region
+            .file_valid_end()
+            .saturating_sub(old_addr)
+            .min(old_len);
+        let current_file_valid_len = file_size.saturating_sub(src_file_offset).min(new_len);
+        let final_file_valid_len = old_slice_file_valid_len
+            .max(current_file_valid_len)
+            .min(new_len);
+        let final_sigbus_start =
+            target_start.saturating_add(align_up(final_file_valid_len, PAGE_SIZE).min(new_len));
+
+        let mut grow_areas = Vec::new();
+        let Some(grow_file_offset) = src_file_offset.checked_add(old_len) else {
+            return err(SyscallError::ENOMEM);
+        };
+        if grow_start < final_sigbus_start {
+            let shared_end = min(final_sigbus_start, target_new_end);
+            let shared_len = shared_end.saturating_sub(grow_start);
+            let Some(frames) = shm.shared_frames_existing(grow_file_offset, shared_len) else {
+                return err(SyscallError::ENOMEM);
+            };
+            grow_areas.push(VmaInsertArea::SharedFrames {
+                start: grow_start,
+                end: shared_end,
+                frames,
+            });
+        }
+        if final_sigbus_start < target_new_end {
+            grow_areas.push(VmaInsertArea::Lazy {
+                start: final_sigbus_start.max(grow_start),
+                end: target_new_end,
+            });
+        }
+        inner.memory_set.try_grow_user_vma_range_with_file_len(
+            old_addr,
+            old_len,
+            target_start,
+            new_len,
+            grow_areas,
+            final_file_valid_len,
+            |_| true,
+        )
+    } else if src_region.file_backed {
         let Some(file) = inner
             .memory_set
             .mmap_backing_file(src_region.backing_id)
@@ -761,42 +798,100 @@ pub fn syscall_mremap(
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
             return err(SyscallError::ENOMEM);
         };
-        if !inner
-            .memory_set
-            .try_insert_framed_area(grow_start.into(), target_new_end.into(), perm)
-        {
+        let pending_end = os_inode.pending_write_end();
+        let inode = os_inode.ext4_inode();
+        let file_size = {
+            let _ext4_guard = ext4_lock();
+            inode.size() as usize
+        }
+        .max(pending_end);
+        let old_slice_file_valid_len = src_region
+            .file_valid_end()
+            .saturating_sub(old_addr)
+            .min(old_len);
+        let current_file_valid_len = file_size.saturating_sub(src_file_offset).min(new_len);
+        let final_file_valid_len = old_slice_file_valid_len
+            .max(current_file_valid_len)
+            .min(new_len);
+        let final_sigbus_start =
+            target_start.saturating_add(align_up(final_file_valid_len, PAGE_SIZE).min(new_len));
+
+        let mut grow_areas = Vec::new();
+        if grow_start < final_sigbus_start {
+            grow_areas.push(VmaInsertArea::Framed {
+                start: grow_start,
+                end: min(final_sigbus_start, target_new_end),
+            });
+        }
+        if final_sigbus_start < target_new_end {
+            grow_areas.push(VmaInsertArea::Lazy {
+                start: final_sigbus_start.max(grow_start),
+                end: target_new_end,
+            });
+        }
+        let Some(grow_file_offset) = src_file_offset.checked_add(old_len) else {
+            return err(SyscallError::ENOMEM);
+        };
+        let file_mapped_grow_len = min(
+            target_new_end.saturating_sub(grow_start),
+            final_sigbus_start.saturating_sub(grow_start),
+        );
+        if grow_file_offset.checked_add(file_mapped_grow_len).is_none() {
             return err(SyscallError::ENOMEM);
         }
-        let token = inner.memory_set.token();
-        let mut pos = 0usize;
-        let mut tmp = [0u8; 512];
-        while pos < grow_len {
-            let to_read = min(tmp.len(), grow_len - pos);
-            let read =
-                os_inode.pread_at(src_region.file_offset + old_len + pos, &mut tmp[..to_read]);
-            if read == 0 {
-                break;
-            }
-            if try_copy_to_user_unchecked(token, (grow_start + pos) as *mut u8, &tmp[..read])
-                .is_err()
-            {
-                return err(SyscallError::ENOMEM);
-            }
-            pos += read;
-        }
-        true
+
+        inner.memory_set.try_grow_user_vma_range_with_file_len(
+            old_addr,
+            old_len,
+            target_start,
+            new_len,
+            grow_areas,
+            final_file_valid_len,
+            |memory_set| {
+                let token = memory_set.token();
+                let mut pos = 0usize;
+                let mut tmp = [0u8; 512];
+                while pos < file_mapped_grow_len {
+                    let to_read = min(tmp.len(), file_mapped_grow_len - pos);
+                    let read = os_inode.pread_at(grow_file_offset + pos, &mut tmp[..to_read]);
+                    if read == 0 {
+                        break;
+                    }
+                    if try_copy_to_user_unchecked(
+                        token,
+                        (grow_start + pos) as *mut u8,
+                        &tmp[..read],
+                    )
+                    .is_err()
+                    {
+                        return false;
+                    }
+                    pos += read;
+                }
+                true
+            },
+        )
     } else {
-        inner
-            .memory_set
-            .try_insert_framed_area(grow_start.into(), target_new_end.into(), perm)
+        let grow_area = VmaInsertArea::Lazy {
+            start: grow_start,
+            end: target_new_end,
+        };
+        inner.memory_set.try_grow_user_vma_range(
+            old_addr,
+            old_len,
+            target_start,
+            new_len,
+            grow_area,
+            |_| true,
+        )
     };
     if !grow_ok {
         return err(SyscallError::ENOMEM);
     }
 
-    inner
-        .memory_set
-        .set_vm_region_len_by_start(target_start, new_len);
+    if let Some(updated_attaches) = updated_attaches {
+        inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
+    }
     inner.memory_set.note_mmap_end(target_new_end);
     target_start as isize
 }

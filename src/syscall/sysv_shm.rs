@@ -9,11 +9,14 @@ use spin::Mutex;
 use crate::config::PAGE_SIZE;
 use crate::fs::parse_proc_sys_usize;
 use crate::mm::{
-    FrameTracker, MapPermission, PTEFlags, VirtAddr, frame_alloc, try_read_user_value,
-    try_write_user_value,
+    FrameTracker, MapPermission, MapType, PTEFlags, VirtAddr, VmRegion, VmRegionKind,
+    VmaInsertArea, frame_alloc, try_read_user_value, try_write_user_value,
 };
 use crate::syscall::error::{SyscallError, err};
+use crate::syscall::memory::USER_VA_TOP;
 use crate::task::processor::current_process;
+
+pub use crate::mm::{ShmAttach, ShmAttachRef};
 
 const IPC_PRIVATE: usize = 0;
 const IPC_CREAT: usize = 0x200;
@@ -48,6 +51,7 @@ const PROCFS_SHMALL: &str = "/proc/sys/kernel/shmall";
 static RUNTIME_SHMMAX_LIMIT: AtomicUsize = AtomicUsize::new(SHMMAX);
 static RUNTIME_SHMMNI_LIMIT: AtomicUsize = AtomicUsize::new(SHMMNI);
 static RUNTIME_SHMALL_LIMIT: AtomicUsize = AtomicUsize::new(SHMALL);
+static NEXT_SHM_ATTACH_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[allow(dead_code)]
 pub fn shmmax_limit() -> usize {
@@ -146,11 +150,8 @@ fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ShmAttach {
-    pub addr: usize,
-    pub shmid: usize,
-    pub len: usize,
+fn alloc_attach_id() -> usize {
+    NEXT_SHM_ATTACH_ID.fetch_add(1, Ordering::Relaxed).max(1)
 }
 
 #[derive(Debug)]
@@ -315,46 +316,260 @@ fn check_perm(
     (allow & need) == need
 }
 
-pub fn fork_inherit(ipc_ns_id: usize, attaches: &[ShmAttach]) {
+pub fn fork_inherit(attaches: &[ShmAttach]) {
     let mut managers = SHM_MANAGERS.lock();
-    let mgr = managers.entry(ipc_ns_id).or_default();
     for a in attaches {
+        if !a.accounted {
+            continue;
+        }
+        let mgr = managers.entry(a.ipc_ns_id).or_default();
         if let Some(seg) = mgr.segments.get_mut(&a.shmid) {
             seg.nattch += 1;
         }
     }
 }
 
-pub fn rollback_fork_inherit(ipc_ns_id: usize, attaches: &[ShmAttach]) {
+pub fn rollback_fork_inherit(attaches: &[ShmAttach]) {
     let mut managers = SHM_MANAGERS.lock();
-    let Some(mgr) = managers.get_mut(&ipc_ns_id) else {
-        return;
-    };
+    let mut to_remove = Vec::new();
     for a in attaches {
+        if !a.accounted {
+            continue;
+        }
+        let Some(mgr) = managers.get_mut(&a.ipc_ns_id) else {
+            continue;
+        };
         if let Some(seg) = mgr.segments.get_mut(&a.shmid) {
             if seg.nattch > 0 {
                 seg.nattch -= 1;
             }
+            if seg.marked_for_deletion && seg.nattch == 0 {
+                to_remove.push(ShmAttachRef {
+                    ipc_ns_id: a.ipc_ns_id,
+                    shmid: a.shmid,
+                });
+            }
         }
     }
-    let to_remove: Vec<usize> = mgr
-        .segments
-        .iter()
-        .filter_map(|(id, seg)| {
-            if seg.marked_for_deletion && seg.nattch == 0 {
-                Some(*id)
-            } else {
-                None
-            }
-        })
-        .collect();
-    for id in to_remove {
-        mgr.remove_segment(id);
+    for attach_ref in to_remove {
+        if let Some(mgr) = managers.get_mut(&attach_ref.ipc_ns_id) {
+            mgr.remove_segment(attach_ref.shmid);
+        }
     }
 }
 
-pub fn exit_cleanup(ipc_ns_id: usize, attaches: &[ShmAttach]) {
-    rollback_fork_inherit(ipc_ns_id, attaches);
+pub fn exit_cleanup(attaches: &[ShmAttach]) {
+    rollback_fork_inherit(attaches);
+}
+
+pub fn segment_size(ipc_ns_id: usize, shmid: usize) -> Option<usize> {
+    let managers = SHM_MANAGERS.lock();
+    managers
+        .get(&ipc_ns_id)
+        .and_then(|mgr| mgr.segments.get(&shmid))
+        .map(|seg| seg.size)
+}
+
+pub fn segment_shared_frames_existing(
+    ipc_ns_id: usize,
+    shmid: usize,
+    offset: usize,
+    len: usize,
+) -> Option<Vec<FrameTracker>> {
+    let end = offset.checked_add(len)?;
+    let managers = SHM_MANAGERS.lock();
+    let seg = managers.get(&ipc_ns_id)?.segments.get(&shmid)?;
+    let mapped_len = align_up(seg.size, PAGE_SIZE);
+    if end > mapped_len {
+        return None;
+    }
+    let start_page = offset / PAGE_SIZE;
+    let end_page = end.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
+    if end_page < start_page || end_page > seg.frames.len() {
+        return None;
+    }
+    Some(seg.frames[start_page..end_page].iter().cloned().collect())
+}
+
+pub fn find_attach_containing(
+    attaches: &[ShmAttach],
+    shmid: usize,
+    start: usize,
+    len: usize,
+) -> Option<usize> {
+    attaches
+        .iter()
+        .position(|attach| attach.shmid == shmid && attach.contains_range(start, len))
+}
+
+pub fn split_mremap_attach(
+    attaches: &mut Vec<ShmAttach>,
+    idx: usize,
+    old_addr: usize,
+    old_len: usize,
+    new_addr: usize,
+    new_len: usize,
+) -> bool {
+    if idx >= attaches.len() || new_len == 0 {
+        return false;
+    }
+    let Some(old_end) = old_addr.checked_add(old_len) else {
+        return false;
+    };
+    let Some(new_end) = new_addr.checked_add(new_len) else {
+        return false;
+    };
+    if old_end <= old_addr || new_end <= new_addr {
+        return false;
+    }
+
+    let attach = attaches.remove(idx);
+    let attach_end = attach.end();
+    if old_addr < attach.addr || old_end > attach_end {
+        attaches.push(attach);
+        return false;
+    }
+
+    let mut fragments = Vec::new();
+    if old_addr > attach.addr {
+        fragments.push(ShmAttach {
+            ipc_ns_id: attach.ipc_ns_id,
+            addr: attach.addr,
+            shmid: attach.shmid,
+            len: old_addr - attach.addr,
+            attach_id: attach.attach_id,
+            accounted: false,
+        });
+    }
+    fragments.push(ShmAttach {
+        ipc_ns_id: attach.ipc_ns_id,
+        addr: new_addr,
+        shmid: attach.shmid,
+        len: new_len,
+        attach_id: attach.attach_id,
+        accounted: attach.accounted,
+    });
+    if old_end < attach_end {
+        fragments.push(ShmAttach {
+            ipc_ns_id: attach.ipc_ns_id,
+            addr: old_end,
+            shmid: attach.shmid,
+            len: attach_end - old_end,
+            attach_id: attach.attach_id,
+            accounted: false,
+        });
+    }
+    attaches.extend(fragments);
+    attaches.sort_unstable_by(|left, right| {
+        left.addr
+            .cmp(&right.addr)
+            .then(left.attach_id.cmp(&right.attach_id))
+            .then(left.shmid.cmp(&right.shmid))
+    });
+    true
+}
+
+pub fn detach_attaches_overlapping(
+    attaches: &mut Vec<ShmAttach>,
+    start: usize,
+    len: usize,
+) -> Option<Vec<ShmAttachRef>> {
+    let end = start.checked_add(len)?;
+    if end <= start {
+        return Some(Vec::new());
+    }
+
+    let mut next = Vec::with_capacity(attaches.len());
+    let mut removed_accounted = Vec::new();
+    for attach in attaches.drain(..) {
+        let attach_end = attach.end();
+        if end <= attach.addr || start >= attach_end {
+            next.push(attach);
+            continue;
+        }
+        if attach.accounted {
+            removed_accounted.push((
+                attach.attach_id,
+                ShmAttachRef {
+                    ipc_ns_id: attach.ipc_ns_id,
+                    shmid: attach.shmid,
+                },
+            ));
+        }
+        if start > attach.addr {
+            next.push(ShmAttach {
+                ipc_ns_id: attach.ipc_ns_id,
+                addr: attach.addr,
+                shmid: attach.shmid,
+                len: start - attach.addr,
+                attach_id: attach.attach_id,
+                accounted: false,
+            });
+        }
+        if end < attach_end {
+            next.push(ShmAttach {
+                ipc_ns_id: attach.ipc_ns_id,
+                addr: end,
+                shmid: attach.shmid,
+                len: attach_end - end,
+                attach_id: attach.attach_id,
+                accounted: false,
+            });
+        }
+    }
+    *attaches = next;
+    attaches.sort_unstable_by(|left, right| {
+        left.addr
+            .cmp(&right.addr)
+            .then(left.attach_id.cmp(&right.attach_id))
+            .then(left.shmid.cmp(&right.shmid))
+    });
+
+    let mut release_shmids = Vec::new();
+    for (attach_id, attach_ref) in removed_accounted {
+        if let Some(survivor) = attaches
+            .iter_mut()
+            .find(|attach| attach.attach_id == attach_id)
+        {
+            survivor.accounted = true;
+        } else {
+            release_shmids.push(attach_ref);
+        }
+    }
+    Some(release_shmids)
+}
+
+fn release_detached_attach_ref_in_manager(mgr: &mut ShmManager, pid: u32, shmid: usize) -> bool {
+    let Some(seg) = mgr.segments.get_mut(&shmid) else {
+        return false;
+    };
+    if seg.nattch > 0 {
+        seg.nattch -= 1;
+    }
+    seg.dtime = now_secs();
+    seg.lpid = pid;
+    seg.marked_for_deletion && seg.nattch == 0
+}
+
+pub fn release_detached_attach_refs(pid: u32, refs: &[ShmAttachRef]) {
+    if refs.is_empty() {
+        return;
+    }
+    let mut managers = SHM_MANAGERS.lock();
+    let mut to_remove = Vec::new();
+    for attach_ref in refs {
+        let Some(mgr) = managers.get_mut(&attach_ref.ipc_ns_id) else {
+            continue;
+        };
+        if release_detached_attach_ref_in_manager(mgr, pid, attach_ref.shmid) {
+            to_remove.push(*attach_ref);
+        }
+    }
+    for attach_ref in to_remove {
+        if let Some(mgr) = managers.get_mut(&attach_ref.ipc_ns_id) {
+            mgr.remove_segment(attach_ref.shmid);
+        }
+    }
 }
 
 pub fn syscall_shmget(key: usize, size: usize, shmflg: usize) -> isize {
@@ -469,10 +684,16 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
 
     let map_len = align_up(seg.size, PAGE_SIZE);
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
 
     let start = if shmaddr == 0 {
-        align_up(inner.memory_set.mmap_next(), PAGE_SIZE)
+        let Some(start) = inner
+            .memory_set
+            .find_free_mmap_range(None, map_len, USER_VA_TOP)
+        else {
+            return err(SyscallError::ENOMEM);
+        };
+        start
     } else {
         align_down(shmaddr, PAGE_SIZE)
     };
@@ -500,10 +721,25 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
             }
             cur += PAGE_SIZE;
         }
-        if (shmflg & SHM_REMAP) != 0 {
-            inner.memory_set.unmap_user_range(start.into(), end.into());
+        if inner
+            .memory_set
+            .concrete_range_overlaps(start.into(), end.into())
+            && (shmflg & SHM_REMAP) == 0
+        {
+            return err(SyscallError::EINVAL);
         }
     }
+    let remap_attach_update = if (shmflg & SHM_REMAP) != 0 {
+        let mut updated_attaches = inner.memory_set.sysv_shm_attaches_snapshot();
+        let Some(release_shmids) =
+            detach_attaches_overlapping(&mut updated_attaches, start, map_len)
+        else {
+            return err(SyscallError::ENOMEM);
+        };
+        Some((updated_attaches, release_shmids))
+    } else {
+        None
+    };
 
     let mut perm = MapPermission::U | MapPermission::R;
     if (shmflg & SHM_RDONLY) == 0 {
@@ -511,19 +747,61 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     }
 
     let frames: Vec<FrameTracker> = seg.frames.iter().cloned().collect();
-    inner
-        .memory_set
-        .insert_shared_frames_area(start.into(), end.into(), perm, frames);
+    let region = VmRegion {
+        kind: VmRegionKind::Mmap,
+        start,
+        len: map_len,
+        prot: VmRegion::prot_from_permission(perm),
+        map_type: MapType::Framed,
+        map_perm: perm,
+        file_valid_len: seg.size.min(map_len),
+        sigbus_start: end,
+        shared: true,
+        may_write_upgrade: (shmflg & SHM_RDONLY) == 0,
+        file_backed: false,
+        file_dev: 0,
+        file_ino: 0,
+        file_offset: 0,
+        backing_id: 0,
+        memfd_id: 0,
+        sysv_shmid: shmid,
+        growsdown: false,
+    };
+    let areas = Vec::from([VmaInsertArea::SharedFrames { start, end, frames }]);
+    let inserted = if (shmflg & SHM_REMAP) != 0 {
+        inner
+            .memory_set
+            .try_replace_user_vma(region, areas, false, None)
+    } else {
+        inner
+            .memory_set
+            .try_insert_user_vma(region, areas, false, None)
+    };
+    if !inserted {
+        return err(SyscallError::ENOMEM);
+    }
 
+    let detached_shmids = if let Some((updated_attaches, release_shmids)) = remap_attach_update {
+        inner.memory_set.replace_sysv_shm_attaches(updated_attaches);
+        release_shmids
+    } else {
+        Vec::new()
+    };
     seg.nattch += 1;
     seg.atime = now_secs();
     seg.lpid = pid;
     inner.memory_set.note_mmap_end(end);
-    inner.sysv_shm_attaches.push(ShmAttach {
+    inner.memory_set.push_sysv_shm_attach(ShmAttach {
+        ipc_ns_id,
         addr: start,
         shmid,
         len: map_len,
+        attach_id: alloc_attach_id(),
+        accounted: true,
     });
+    drop(inner);
+    drop(managers);
+    release_detached_attach_refs(pid, detached_shmids.as_slice());
     start as isize
 }
 
@@ -532,28 +810,25 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
     let process = current_process();
-    let mut inner = process.borrow_mut();
-    let Some((idx, a)) = inner
-        .sysv_shm_attaches
-        .iter()
-        .enumerate()
-        .find(|(_i, a)| a.addr == shmaddr)
-        .map(|(i, a)| (i, *a))
-    else {
+    let inner = process.borrow_mut();
+    let Some((a, transferred_account)) = ({
+        let mut memory_set = inner.memory_set.lock();
+        let result = memory_set.remove_sysv_shm_attach(shmaddr);
+        if let Some((a, _)) = result {
+            let end = a.addr + a.len;
+            memory_set.unmap_user_vma_range(a.addr.into(), end.into());
+        }
+        result
+    }) else {
         return err(SyscallError::EINVAL);
     };
-
-    let end = a.addr + a.len;
-    inner.memory_set.unmap_user_range(a.addr.into(), end.into());
-    inner.sysv_shm_attaches.remove(idx);
     drop(inner);
 
     let (_, _, pid, _) = current_ids();
-    let ipc_ns_id = current_ipc_namespace_id();
     let mut managers = SHM_MANAGERS.lock();
-    let mgr = managers.entry(ipc_ns_id).or_default();
+    let mgr = managers.entry(a.ipc_ns_id).or_default();
     if let Some(seg) = mgr.segments.get_mut(&a.shmid) {
-        if seg.nattch > 0 {
+        if a.accounted && !transferred_account && seg.nattch > 0 {
             seg.nattch -= 1;
         }
         seg.dtime = now_secs();

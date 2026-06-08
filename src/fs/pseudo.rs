@@ -604,14 +604,14 @@ impl PseudoShmFile {
         Ok(data.seals)
     }
 
-    pub fn shared_frames(&self, offset: usize, len: usize) -> Option<Vec<FrameTracker>> {
-        let end = offset.checked_add(len)?;
-        let mut data = self.data.lock();
-        if !data.ensure_len(end) {
-            return None;
+    pub fn shared_frames_existing(&self, offset: usize, len: usize) -> Option<Vec<FrameTracker>> {
+        if len == 0 {
+            return Some(Vec::new());
         }
+        let end = offset.checked_add(len)?;
+        let data = self.data.lock();
         let start_page = offset / PAGE_SIZE;
-        let end_page = (end + PAGE_SIZE - 1) / PAGE_SIZE;
+        let end_page = end.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
         if end_page < start_page || end_page > data.frames.len() {
             return None;
         }

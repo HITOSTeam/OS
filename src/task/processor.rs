@@ -2,7 +2,7 @@ use crate::{
     arch,
     config::MAX_HARTS,
     fs::{cgroup_exit_process, cgroup_exit_thread},
-    mm::{MemorySet, try_write_user_value},
+    mm::{MemorySet, MmRef, try_write_user_value},
     println,
     syscall::futex::futex_wake_private_and_shared,
     task::{
@@ -1129,19 +1129,26 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // same exit-side futex/join cleanup as the current thread.
         let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
         recycle_res.clear();
-        let mut process_inner = process.borrow_mut();
-        process_inner.children.clear();
-        let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
-        crate::syscall::sysv_shm::exit_cleanup(process_inner.ipc_ns_id, &old_shm);
-        // Linux releases `mm_struct` at exit and keeps only zombie metadata.
-        // Drop the full user address space here so unreaped zombies do not pin
-        // page-table pages (and COW refs) during fork-heavy workloads.
-        process_inner.memory_set = MemorySet::new_bare();
-        crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
-        crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-        // Replace the table Arc instead of clearing it: other CLONE_FILES users
-        // may still hold the old Arc and must keep their descriptors alive.
-        process_inner.files = Arc::new(spin::Mutex::new(FilesStruct::new()));
+        let old_shm_cleanup = {
+            let mut process_inner = process.borrow_mut();
+            process_inner.children.clear();
+            let old_shm_cleanup = process_inner
+                .memory_set
+                .take_sysv_shm_attaches_for_cleanup();
+            // Linux releases `mm_struct` at exit and keeps only zombie metadata.
+            // Drop the full user address space here so unreaped zombies do not pin
+            // page-table pages (and COW refs) during fork-heavy workloads.
+            process_inner.memory_set = MmRef::new(MemorySet::new_bare());
+            crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
+            crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
+            // Replace the table Arc instead of clearing it: other CLONE_FILES users
+            // may still hold the old Arc and must keep their descriptors alive.
+            process_inner.files = Arc::new(spin::Mutex::new(FilesStruct::new()));
+            old_shm_cleanup
+        };
+        if let Some(old_shm) = old_shm_cleanup {
+            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+        }
         // Keep zombie `tasks[]` until wait4() reaps the process so reaping has
         // a deterministic place to drop any lingering task Arcs.
     }
@@ -1247,22 +1254,28 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
 
     let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();
-    let mut process_inner = process.borrow_mut();
-    process_inner.children.clear();
-    let old_shm = core::mem::take(&mut process_inner.sysv_shm_attaches);
-    crate::syscall::sysv_shm::exit_cleanup(process_inner.ipc_ns_id, &old_shm);
-    // Same as exit_current_and_run_next(): release the whole user address
-    // space eagerly and keep only zombie bookkeeping in the PCB.
-    process_inner.memory_set = MemorySet::new_bare();
-    crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
-    crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-    // Replace the table Arc instead of clearing it: other CLONE_FILES users
-    // may still hold the old Arc and must keep their descriptors alive.
-    process_inner.files = Arc::new(spin::Mutex::new(FilesStruct::new()));
+    let old_shm_cleanup = {
+        let mut process_inner = process.borrow_mut();
+        process_inner.children.clear();
+        let old_shm_cleanup = process_inner
+            .memory_set
+            .take_sysv_shm_attaches_for_cleanup();
+        // Same as exit_current_and_run_next(): release the whole user address
+        // space eagerly and keep only zombie bookkeeping in the PCB.
+        process_inner.memory_set = MmRef::new(MemorySet::new_bare());
+        crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
+        crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
+        // Replace the table Arc instead of clearing it: other CLONE_FILES users
+        // may still hold the old Arc and must keep their descriptors alive.
+        process_inner.files = Arc::new(spin::Mutex::new(FilesStruct::new()));
+        old_shm_cleanup
+    };
+    if let Some(old_shm) = old_shm_cleanup {
+        crate::syscall::sysv_shm::exit_cleanup(&old_shm);
+    }
 
     // Same as `exit_current_and_run_next()`: keep zombie `tasks[]` until wait4().
 
-    drop(process_inner);
     // Same as exit_current_and_run_next(): defer drop until we are on idle stack.
     queue_exiting_task_drop(task);
     drop(process);

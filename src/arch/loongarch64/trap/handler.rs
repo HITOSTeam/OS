@@ -129,7 +129,7 @@ fn handle_user_exception(ecode: usize, badv: usize) {
     }
     if matches!(ecode, ECODE_PAGE_INVALID_STORE | ECODE_PAGE_MODIFY) {
         let process = crate::task::processor::current_process();
-        let mut inner = process.borrow_mut();
+        let inner = process.borrow_mut();
         if inner.memory_set.resolve_cow_fault(badv) {
             return;
         }
@@ -145,13 +145,39 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             | ECODE_PAGE_PRIV
     ) {
         let process = crate::task::processor::current_process();
-        let mut inner = process.borrow_mut();
+        let inner = process.borrow_mut();
         let access = match ecode {
             ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
             ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
             _ => MapPermission::W,
         };
         match inner.memory_set.resolve_lazy_fault(badv, access) {
+            LazyFaultResult::Resolved => return,
+            LazyFaultResult::Oom => {
+                drop(inner);
+                exit_group_and_run_next(-9);
+            }
+            LazyFaultResult::Invalid => {}
+        }
+    }
+    if matches!(
+        ecode,
+        ECODE_PAGE_INVALID_LOAD
+            | ECODE_PAGE_INVALID_STORE
+            | ECODE_PAGE_INVALID_FETCH
+            | ECODE_PAGE_MODIFY
+            | ECODE_PAGE_NON_READ
+            | ECODE_PAGE_NON_EXEC
+            | ECODE_PAGE_PRIV
+    ) {
+        let process = crate::task::processor::current_process();
+        let inner = process.borrow_mut();
+        let access = match ecode {
+            ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
+            ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
+            _ => MapPermission::W,
+        };
+        match inner.memory_set.try_expand_growsdown(badv, access) {
             LazyFaultResult::Resolved => return,
             LazyFaultResult::Oom => {
                 drop(inner);

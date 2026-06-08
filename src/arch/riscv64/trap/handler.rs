@@ -192,7 +192,7 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(mut inner) = process.try_borrow_mut() else {
+    let Some(inner) = process.try_borrow_mut() else {
         return false;
     };
     if matches!(cause, Trap::Exception(STORE_PAGE_FAULT))
@@ -366,7 +366,7 @@ fn exception_name(code: usize) -> &'static str {
 
 fn try_expand_mmap_growsdown(fault_va: usize, access: MapPermission) -> bool {
     let process = crate::task::processor::current_process();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
     match inner.memory_set.try_expand_growsdown(fault_va, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => {
@@ -439,7 +439,7 @@ fn handle_user_exception(code: usize, stval: usize) {
     // 2. Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
     if code == STORE_PAGE_FAULT {
         let process = crate::task::processor::current_process();
-        let mut inner = process.borrow_mut();
+        let inner = process.borrow_mut();
         if inner.memory_set.resolve_cow_fault(stval) {
             return;
         }
@@ -459,7 +459,7 @@ fn handle_user_exception(code: usize, stval: usize) {
     //    `Invalid` falls through to the stages below.
     if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {
         let process = crate::task::processor::current_process();
-        let mut inner = process.borrow_mut();
+        let inner = process.borrow_mut();
         let access = match code {
             LOAD_PAGE_FAULT => MapPermission::R,
             STORE_PAGE_FAULT => MapPermission::W,

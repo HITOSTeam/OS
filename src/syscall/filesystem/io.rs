@@ -504,6 +504,8 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             let want = core::cmp::min(write_len - total, buf_cap);
             if try_copy_from_user(token, user_ptr as *const u8, &mut kbuf[..want]).is_err() {
                 return if total > 0 {
+                    mirror_inode_write_to_current_mmaps(os_inode, effective_pos, buffer, total);
+                    cgroup_charge_file_write(current_process().getpid(), total);
                     total as isize
                 } else {
                     err(SyscallError::EFAULT)
@@ -521,6 +523,8 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
                 Err(_) => {
                     crate::println!("[ext4] Warning: pwrite failed");
                     return if total > 0 {
+                        mirror_inode_write_to_current_mmaps(os_inode, effective_pos, buffer, total);
+                        cgroup_charge_file_write(current_process().getpid(), total);
                         total as isize
                     } else {
                         err(SyscallError::EIO)
@@ -533,6 +537,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
             queue_process_signal(pid, SIGXFSZ_NUM);
         }
         if total > 0 {
+            mirror_inode_write_to_current_mmaps(os_inode, effective_pos, buffer, total);
             cgroup_charge_file_write(current_process().getpid(), total);
         }
         return total as isize;

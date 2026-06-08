@@ -672,14 +672,22 @@ fn proc_pid_maps(pid: u32) -> String {
             '-'
         };
         let p = if region.shared { 's' } else { 'p' };
+        let path = if region.is_heap() {
+            " [heap]"
+        } else if region.is_stack() {
+            " [stack]"
+        } else {
+            " "
+        };
         out.push_str(&alloc::format!(
-            "{:x}-{:x} {}{}{}{} 00000000 00:00 0 \n",
+            "{:x}-{:x} {}{}{}{} 00000000 00:00 0{}\n",
             region.start,
             end,
             r,
             w,
             x,
-            p
+            p,
+            path
         ));
     }
     out
@@ -844,6 +852,13 @@ fn proc_pid_smaps(pid: u32) -> String {
             '-'
         };
         let p = if region.shared { 's' } else { 'p' };
+        let path = if region.is_heap() {
+            " [heap]"
+        } else if region.is_stack() {
+            " [stack]"
+        } else {
+            " "
+        };
 
         let size_bytes = end - region.start;
         let size_kb = (size_bytes + 1023) / 1024;
@@ -852,13 +867,14 @@ fn proc_pid_smaps(pid: u32) -> String {
         let rss_kb = if locked_bytes > 0 { size_kb } else { 0 };
 
         out.push_str(&alloc::format!(
-            "{:x}-{:x} {}{}{}{} 00000000 00:00 0 \n",
+            "{:x}-{:x} {}{}{}{} 00000000 00:00 0{}\n",
             region.start,
             end,
             r,
             w,
             x,
-            p
+            p,
+            path
         ));
         out.push_str(&alloc::format!("Size:\t\t{} kB\n", size_kb));
         out.push_str(&alloc::format!("Rss:\t\t{} kB\n", rss_kb));

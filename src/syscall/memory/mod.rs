@@ -8,14 +8,14 @@ pub use unmap::*;
 
 pub(super) use crate::syscall::error::{SyscallError, err};
 pub(super) use crate::{
-    config::{PAGE_SIZE, USER_HEAP_GAP},
+    config::PAGE_SIZE,
     fs::{
         File, OSInode, PseudoShmFile, ext4_lock, vm_commit_limit_bytes, vm_committed_as_bytes,
         vm_overcommit_memory,
     },
     mm::{
-        MapPermission, MapType, PTEFlags, VmRegion, frame_alloc, try_copy_to_user,
-        try_copy_to_user_unchecked,
+        BrkUpdate, MapPermission, MapType, MemorySet, MprotectError, PTEFlags, VmRegion,
+        VmRegionKind, VmaInsertArea, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked,
     },
     task::{
         manager::PID2PCB,
@@ -102,72 +102,6 @@ pub(super) fn exceeds_overcommit_limit(additional_bytes: usize) -> bool {
     vm_committed_as_bytes().saturating_add(additional_bytes) > limit
 }
 
-pub(super) fn find_free_user_range(
-    ranges: &[(usize, usize)],
-    min_start: usize,
-    len: usize,
-) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    let mut cursor = align_up(min_start, PAGE_SIZE);
-    for (range_start, range_end) in ranges.iter().copied() {
-        if range_end <= cursor {
-            continue;
-        }
-        let end = cursor.checked_add(len)?;
-        if end <= range_start {
-            return user_range_valid(cursor, end).then_some(cursor);
-        }
-        cursor = align_up(range_end, PAGE_SIZE);
-    }
-    let end = cursor.checked_add(len)?;
-    user_range_valid(cursor, end).then_some(cursor)
-}
-
-/// Find a free user VA range of `len` at or above `min_start`, skipping the
-/// already-occupied `ranges`. Unlike [`find_free_user_range`], every candidate
-/// is additionally confirmed through the `is_free` callback, letting callers
-/// cross-check page-table VMAs and mm-owned `vm_regions` before committing.
-pub(super) fn find_free_user_range_checked(
-    ranges: &[(usize, usize)],
-    min_start: usize,
-    len: usize,
-    is_free: impl Fn(usize, usize) -> bool,
-) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    let mut cursor = align_up(min_start, PAGE_SIZE);
-    for (range_start, range_end) in ranges.iter().copied() {
-        if range_end <= cursor {
-            continue;
-        }
-        while cursor < range_start {
-            let end = cursor.checked_add(len)?;
-            if end <= range_start {
-                if user_range_valid(cursor, end) && is_free(cursor, end) {
-                    return Some(cursor);
-                }
-                cursor = cursor.checked_add(PAGE_SIZE)?;
-            } else {
-                break;
-            }
-        }
-        cursor = align_up(range_end, PAGE_SIZE);
-    }
-    loop {
-        let end = cursor.checked_add(len)?;
-        if !user_range_valid(cursor, end) {
-            return None;
-        }
-        if is_free(cursor, end) {
-            return Some(cursor);
-        }
-        cursor = cursor.checked_add(PAGE_SIZE)?;
-    }
-}
-
 pub(super) fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
     current_files().lock().get_file(fd)
 }
@@ -215,41 +149,48 @@ pub(super) fn find_open_inode_file(
     None
 }
 
-pub(super) fn push_range_merged(
-    ranges: &mut alloc::vec::Vec<(usize, usize)>,
-    start: usize,
-    end: usize,
-) {
-    if end <= start {
-        return;
+pub(super) fn find_shm_file_in_snapshot(
+    files: &[(usize, Arc<dyn File + Send + Sync>)],
+    memfd_id: u64,
+) -> Option<Arc<dyn File + Send + Sync>> {
+    if memfd_id == 0 {
+        return None;
     }
-    if let Some(last) = ranges.last_mut() {
-        if start <= last.1 {
-            last.1 = last.1.max(end);
-            return;
+    for (_fd, file) in files {
+        let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
+            continue;
+        };
+        if shm.memfd_id() == memfd_id {
+            return Some(Arc::clone(file));
         }
     }
-    ranges.push((start, end));
+    None
 }
 
-pub(super) fn trim_ranges(ranges: &mut alloc::vec::Vec<(usize, usize)>, start: usize, end: usize) {
-    if end <= start {
-        return;
+pub(super) fn find_open_shm_file(memfd_id: u64) -> Option<Arc<dyn File + Send + Sync>> {
+    if memfd_id == 0 {
+        return None;
     }
-    let mut next = alloc::vec::Vec::new();
-    for (r_start, r_end) in ranges.drain(..) {
-        if end <= r_start || start >= r_end {
-            push_range_merged(&mut next, r_start, r_end);
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    let mut seen_tables = BTreeSet::new();
+    for process in processes {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        let files = Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }
-        if start > r_start {
-            push_range_merged(&mut next, r_start, start);
-        }
-        if end < r_end {
-            push_range_merged(&mut next, end, r_end);
+        let snapshot = files.lock().iter_files_snapshot();
+        if let Some(file) = find_shm_file_in_snapshot(&snapshot, memfd_id) {
+            return Some(file);
         }
     }
-    *ranges = next;
+    None
 }
 
 pub(super) fn page_overlaps_sysv_shm_regions(

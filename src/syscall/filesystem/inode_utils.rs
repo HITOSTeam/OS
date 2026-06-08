@@ -664,13 +664,20 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
     }
 
     let inode = os_inode.ext4_inode();
-    let (dev, ino) = {
+    let pending_end = os_inode.pending_write_end();
+    let (dev, ino, file_size) = {
         let _ext4_guard = ext4_lock();
-        (inode.device_id(), inode.inode_num())
+        (
+            inode.device_id(),
+            inode.inode_num(),
+            (inode.size() as usize).max(pending_end),
+        )
     };
+    update_inode_mmaps_size_all_processes(dev, ino, file_size);
     let copies: Vec<(usize, usize, usize)> = {
         let process = current_process();
         let inner = process.borrow_mut();
+        inner.memory_set.update_file_vm_size(dev, ino, file_size);
         inner
             .memory_set
             .file_vm_copy_targets(dev, ino, write_off, len)
@@ -700,6 +707,47 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
             done += chunk;
         }
     }
+}
+
+fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize) {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        inner.memory_set.update_file_vm_size(dev, ino, file_size);
+    }
+}
+
+pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
+    let (dev, ino, file_size) = {
+        let _ext4_guard = ext4_lock();
+        (inode.device_id(), inode.inode_num(), inode.size() as usize)
+    };
+    update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    let process = current_process();
+    let inner = process.borrow_mut();
+    inner.memory_set.update_file_vm_size(dev, ino, file_size);
+}
+
+pub(crate) fn update_current_os_inode_mmaps_size(os_inode: &OSInode) {
+    let pending_end = os_inode.pending_write_end();
+    let inode = os_inode.ext4_inode();
+    let (dev, ino, file_size) = {
+        let _ext4_guard = ext4_lock();
+        (
+            inode.device_id(),
+            inode.inode_num(),
+            (inode.size() as usize).max(pending_end),
+        )
+    };
+    update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    let process = current_process();
+    let inner = process.borrow_mut();
+    inner.memory_set.update_file_vm_size(dev, ino, file_size);
 }
 
 /// Linux `pread64(2)` (syscall 67 on riscv64).

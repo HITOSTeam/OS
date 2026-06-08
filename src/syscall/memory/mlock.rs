@@ -30,7 +30,7 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
         | MADV_DONTDUMP | MADV_DODUMP => {
             let process = current_process();
-            let mut inner = process.borrow_mut();
+            let inner = process.borrow_mut();
             if !inner
                 .memory_set
                 .user_range_fully_mapped(addr.into(), end.into())
@@ -52,14 +52,18 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
                 }
             }
             if advice == MADV_FREE {
-                let shared_overlap = inner.memory_set.shared_vm_region_overlaps(addr, end);
-                if shared_overlap {
+                if !inner.memory_set.vm_range_is_private_anonymous(addr, end) {
                     return err(SyscallError::EINVAL);
                 }
+                // Linux MADV_FREE is lazy: pages must remain readable until
+                // memory pressure reclaims them. We do not have lazy-free
+                // reclaim yet, so accepting it as a no-op is closer than
+                // immediately discarding pages like MADV_DONTNEED.
+                return 0;
             }
             inner
                 .memory_set
-                .discard_lazy_user_range(addr.into(), end.into());
+                .discard_madvise_dontneed_range(addr.into(), end.into());
             0
         }
         _ => err(SyscallError::EINVAL),
@@ -80,7 +84,7 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
         return err(SyscallError::ENOMEM);
     }
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
     if !inner
         .memory_set
         .user_range_fully_mapped(start.into(), end.into())
@@ -132,7 +136,7 @@ pub fn syscall_munlock(addr: usize, len: usize) -> isize {
         return err(SyscallError::ENOMEM);
     }
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
     if !inner
         .memory_set
         .user_range_fully_mapped(start.into(), end.into())
@@ -155,7 +159,7 @@ pub fn syscall_mlockall(flags: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
     let next_locked_bytes = if (flags & MCL_CURRENT) != 0 {
         inner.memory_set.locked_bytes_after_mlockall_current()
     } else {
@@ -182,7 +186,7 @@ pub fn syscall_mlockall(flags: usize) -> isize {
 /// Linux `munlockall` (syscall 231).
 pub fn syscall_munlockall() -> isize {
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    let inner = process.borrow_mut();
     inner.memory_set.clear_mlock_state();
     0
 }

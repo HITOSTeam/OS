@@ -131,6 +131,12 @@ fn clone_from_parts(
     if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
         return err(SyscallError::EINVAL);
     }
+    // SysV shm attachments are mm-local in this kernel.  Sharing the mm while
+    // moving only the child into a new IPC namespace would leave shared VMAs
+    // owned by the old namespace with no unambiguous cleanup owner.
+    if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_VM) != 0 {
+        return err(SyscallError::EINVAL);
+    }
     // 新建 mount 命名空间时不能再共享 fs（cwd/root/umask），否则两个 ns 会互相污染挂载点
     if (flags & CLONE_NEWNS) != 0 && (flags & CLONE_FS) != 0 {
         return err(SyscallError::EINVAL);
@@ -332,15 +338,15 @@ fn clone_from_parts(
     // 父进程继承下来的 System V 共享内存挂载需要回滚（新 ns 内不应可见），
     // 然后再分配一个独立的 ipc_ns_id
     if (flags & CLONE_NEWIPC) != 0 {
-        let (parent_ipc_ns_id, inherited_attaches) = {
+        let inherited_attaches = {
             let child_inner = child.borrow_mut();
-            (child_inner.ipc_ns_id, child_inner.sysv_shm_attaches.clone())
+            child_inner.memory_set.sysv_shm_attaches_snapshot()
         };
-        if !inherited_attaches.is_empty() {
-            crate::syscall::sysv_shm::rollback_fork_inherit(parent_ipc_ns_id, &inherited_attaches);
+        if !share_vm && !inherited_attaches.is_empty() {
+            crate::syscall::sysv_shm::rollback_fork_inherit(&inherited_attaches);
         }
         let mut child_inner = child.borrow_mut();
-        child_inner.sysv_shm_attaches.clear();
+        child_inner.memory_set.replace_sysv_shm_attaches(Vec::new());
         child_inner.ipc_ns_id = crate::task::alloc_ipc_namespace_id();
     }
     // CLONE_NEWUTS：拆出独立的 UTS（hostname/domain）命名空间
@@ -447,7 +453,7 @@ fn clone_from_parts(
     // 子的页表与父不同（除非 CLONE_VM），写入前需先处理 COW/lazy 缺页
     if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
         let child_token = {
-            let mut inner = child.borrow_mut();
+            let inner = child.borrow_mut();
             let _ = inner.memory_set.resolve_cow_fault(_ctid);
             let _ = inner.memory_set.resolve_lazy_fault(_ctid, MapPermission::W);
             inner.memory_set.token()
@@ -636,19 +642,20 @@ fn install_child_pidfd(
 fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>) {
     let child_pid = child.getpid();
     crate::fs::cgroup_exit_process(child_pid);
-    let (exec_dev, exec_ino, ipc_ns_id, shm_attaches, parent) = {
+    let (exec_dev, exec_ino, shm_attaches, parent) = {
         let mut child_inner = child.borrow_mut();
-        let shm_attaches = core::mem::take(&mut child_inner.sysv_shm_attaches);
+        let shm_attaches = child_inner.memory_set.take_sysv_shm_attaches_for_cleanup();
         (
             child_inner.exec_inode_dev,
             child_inner.exec_inode_num,
-            child_inner.ipc_ns_id,
             shm_attaches,
             child_inner.parent.as_ref().and_then(|p| p.upgrade()),
         )
     };
-    if !shm_attaches.is_empty() {
-        crate::syscall::sysv_shm::rollback_fork_inherit(ipc_ns_id, &shm_attaches);
+    if let Some(shm_attaches) = shm_attaches {
+        if !shm_attaches.is_empty() {
+            crate::syscall::sysv_shm::rollback_fork_inherit(&shm_attaches);
+        }
     }
     unregister_executing_inode(exec_dev, exec_ino);
     if let Some(parent) = parent {
