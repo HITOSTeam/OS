@@ -1,4 +1,14 @@
-use super::*;
+use super::MemorySet;
+use super::backing::{MmapBacking, MmapBackingPageState, MmapWritebackChunk};
+use super::map_area::{MapArea, MapPermission};
+use super::range::{align_down_to_page, align_up_to_page};
+use super::vma::VmRegion;
+use crate::config::PAGE_SIZE;
+use crate::fs::{File, OSInode};
+use crate::mm::{PTEFlags, PhysAddr, PhysPageNum, VPNRange, VirtAddr, VirtPageNum};
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 impl MemorySet {
     pub fn shared_file_vm_regions_overlapping(&self, start: usize, end: usize) -> Vec<VmRegion> {

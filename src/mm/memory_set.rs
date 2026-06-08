@@ -12,7 +12,7 @@ use crate::config::{
     MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
     USER_STACK_SIZE, phys_mem_end,
 };
-use crate::fs::{File, OSInode};
+use crate::fs::File;
 use crate::println;
 use crate::utils::RecycleAllocator;
 use alloc::collections::BTreeMap;
@@ -47,7 +47,7 @@ mod range;
 mod rollback;
 mod vma;
 
-use backing::{MmapBacking, MmapBackingPageState, MmapWritebackChunk};
+use backing::MmapBacking;
 pub use layout::BrkUpdate;
 pub use map_area::{LazyFaultResult, MapPermission, MapType};
 use map_area::{MapArea, pte_flags_for_mprotect, shift_vpn_by_delta};
