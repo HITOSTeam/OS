@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) struct UserRangeSnapshot {
+    /// 失败回滚需要同时恢复 MapArea、VmRegion、PTE、mlock 和 mmap backing。
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) areas: Vec<MapArea>,
@@ -16,6 +17,7 @@ pub(super) struct UserRangeRollback {
 }
 impl UserRangeRollback {
     pub(super) fn capture(memory_set: &MemorySet, ranges: &[(usize, usize)]) -> Self {
+        // 在会覆盖/移动用户区间前拍快照，失败时保证原映射不动。
         let mut ranges: Vec<(usize, usize)> = ranges
             .iter()
             .copied()

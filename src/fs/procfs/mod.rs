@@ -15,6 +15,7 @@ pub(crate) mod magic_link;
 pub(crate) mod open;
 
 pub use content::{vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory};
+pub(crate) use entries::vm_max_map_count;
 pub(crate) use magic_link::resolve_proc_magic_intermediate_abs_path;
 pub use magic_link::{
     normalize_proc_magic_path, proc_fd_link_file, proc_magic_link_exists, proc_readlink,
@@ -32,10 +33,12 @@ pub enum ProcFileKind {
     Uptime,
     Stat,
     Perf,
+    Kallsyms,
     Kpageflags,
     SysvipcMsg,
     SysvipcSem,
     SysvipcShm,
+    VmMinFreeKbytes,
     VmOvercommitMemory,
     VmOvercommitRatio,
     VmDropCaches,
@@ -71,6 +74,7 @@ pub enum ProcFileKind {
 
 struct ProcPseudoInner {
     offset: usize,
+    cache: Option<String>,
 }
 
 pub struct ProcPseudoFile {
@@ -87,7 +91,10 @@ impl ProcPseudoFile {
     pub fn new(kind: ProcFileKind) -> Arc<Self> {
         Arc::new(Self {
             kind,
-            inner: Mutex::new(ProcPseudoInner { offset: 0 }),
+            inner: Mutex::new(ProcPseudoInner {
+                offset: 0,
+                cache: None,
+            }),
         })
     }
 
@@ -96,7 +103,9 @@ impl ProcPseudoFile {
     }
 
     pub fn set_offset(&self, offset: usize) {
-        self.inner.lock().offset = offset;
+        let mut inner = self.inner.lock();
+        inner.offset = offset;
+        inner.cache = None;
     }
 
     pub fn seek_end(&self) -> isize {
@@ -112,6 +121,9 @@ impl ProcPseudoFile {
             return Err(err(SyscallError::EINVAL));
         }
         let _normalized = match self.kind {
+            ProcFileKind::VmMinFreeKbytes => {
+                content::write_vm_sysctl("/proc/sys/vm/min_free_kbytes", data)?
+            }
             ProcFileKind::VmOvercommitMemory => {
                 content::write_vm_sysctl("/proc/sys/vm/overcommit_memory", data)?
             }
@@ -166,6 +178,7 @@ impl ProcPseudoFile {
             ProcFileKind::SimpleText(path) => entries::write_proc_simple_text(path, data)?,
             _ => return Err(err(SyscallError::EINVAL)),
         };
+        self.inner.lock().cache = None;
         Ok(data.len())
     }
 }
@@ -202,6 +215,7 @@ impl File for ProcPseudoFile {
     fn writable(&self) -> bool {
         match self.kind {
             ProcFileKind::VmOvercommitMemory
+            | ProcFileKind::VmMinFreeKbytes
             | ProcFileKind::VmOvercommitRatio
             | ProcFileKind::VmDropCaches
             | ProcFileKind::VmCompactMemory
@@ -232,24 +246,32 @@ impl File for ProcPseudoFile {
         if let ProcFileKind::Kpageflags = self.kind {
             return content::proc_kpageflags_read(&mut inner.offset, &mut buf);
         }
-        let data = content::proc_file_content(&self.kind);
-        let bytes = data.as_bytes();
-        if inner.offset >= bytes.len() {
+        if inner.cache.is_none() {
+            inner.cache = Some(content::proc_file_content(&self.kind));
+        }
+        let mut offset = inner.offset;
+        let bytes = inner
+            .cache
+            .as_ref()
+            .expect("proc cache populated")
+            .as_bytes();
+        if offset >= bytes.len() {
             return 0;
         }
         let mut total = 0usize;
         for slice in buf.buffers.iter_mut() {
-            if inner.offset >= bytes.len() {
+            if offset >= bytes.len() {
                 break;
             }
-            let n = core::cmp::min(slice.len(), bytes.len() - inner.offset);
-            slice[..n].copy_from_slice(&bytes[inner.offset..inner.offset + n]);
-            inner.offset += n;
+            let n = core::cmp::min(slice.len(), bytes.len() - offset);
+            slice[..n].copy_from_slice(&bytes[offset..offset + n]);
+            offset += n;
             total += n;
             if n < slice.len() {
                 break;
             }
         }
+        inner.offset = offset;
         total
     }
 

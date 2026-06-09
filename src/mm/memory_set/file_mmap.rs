@@ -11,16 +11,20 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 impl MemorySet {
+    /// 收集 [start, end) 内所有共享文件映射的 VmRegion。
     pub fn shared_file_vm_regions_overlapping(&self, start: usize, end: usize) -> Vec<VmRegion> {
         self.vm_regions
             .collect_overlaps_where(start, end, |region| region.shared && region.file_backed)
     }
 
+    /// 返回指定 vpn 的驻留 frame、PTE flags 及 PTE 是否有效。
+    /// PROT_NONE 后 frame 仍保存在 MapArea，flags 从 saved_pte_flags 取。
     fn resident_page_for_vpn(
         &self,
         area: &MapArea,
         vpn: VirtPageNum,
     ) -> Option<(FrameTracker, PTEFlags, bool)> {
+        // PROT_NONE 后 frame 仍保存在 MapArea，PTE flags 可能在 saved_pte_flags。
         let frame = area.tracked_frame(vpn)?;
         if let Some(pte) = self.page_table.translate(vpn) {
             if pte.is_valid() {
@@ -37,10 +41,13 @@ impl MemorySet {
         Some((frame.clone(), flags, false))
     }
 
+    /// 从当前 MapArea/PTE 扫描，重建指定 backing 的 resident 页状态快照。
+    /// 用于 VMA 或物理页变化后刷新 MmapBacking.resident_pages。
     fn collect_mmap_backing_resident_pages(
         &self,
         backing_id: usize,
     ) -> BTreeMap<usize, MmapBackingPageState> {
+        // 从当前 VMA + MapArea/PTE 重新生成 resident 页状态，避免手写更新漂移。
         let mut pages = BTreeMap::new();
         for region in self
             .vm_regions
@@ -98,7 +105,9 @@ impl MemorySet {
         pages
     }
 
+    /// 从 VmRegionSet 派生指定 backing 的 VMA 统计状态（vma_count、mapped/valid 文件范围）。
     pub(super) fn collect_mmap_backing_vm_state(&self, backing_id: usize) -> MmapBackingVmState {
+        // backing 生命周期状态只从权威 VMA 集合派生。
         let mut vm_state = MmapBackingVmState::default();
         for region in self
             .vm_regions
@@ -124,12 +133,14 @@ impl MemorySet {
         vm_state
     }
 
+    /// 将非零且未重复的 backing_id 追加到列表。
     pub(super) fn push_unique_backing_id(backing_ids: &mut Vec<usize>, backing_id: usize) {
         if backing_id != 0 && !backing_ids.contains(&backing_id) {
             backing_ids.push(backing_id);
         }
     }
 
+    /// 收集 [start, end) 内所有 VmRegion 关联的 backing_id（去重）。
     pub(super) fn backing_ids_for_vma_range(&self, start: usize, end: usize) -> Vec<usize> {
         let mut backing_ids = Vec::new();
         for region in self.vm_regions.snapshot_range(start, end) {
@@ -138,7 +149,9 @@ impl MemorySet {
         backing_ids
     }
 
+    /// VMA 或驻留页变化后，重建指定 backing 的 resident_pages 和 vm_state。
     pub(super) fn refresh_mmap_backing_state(&mut self, backing_id: usize) {
+        // VMA 或 resident 页变化后统一刷新 backing 派生状态。
         let pages = self.collect_mmap_backing_resident_pages(backing_id);
         let vm_state = self.collect_mmap_backing_vm_state(backing_id);
         if let Some(backing) = self.mmap_backings.get_mut(&backing_id) {
@@ -147,17 +160,20 @@ impl MemorySet {
         }
     }
 
+    /// 批量刷新多个 backing 的状态。
     pub(super) fn refresh_mmap_backing_states(&mut self, backing_ids: Vec<usize>) {
         for backing_id in backing_ids {
             self.refresh_mmap_backing_state(backing_id);
         }
     }
 
+    /// 刷新所有 backing 的状态（munmap/exec 等全量变更后使用）。
     fn refresh_all_mmap_backing_states(&mut self) {
         let backing_ids = self.mmap_backings.keys().copied().collect::<Vec<_>>();
         self.refresh_mmap_backing_states(backing_ids);
     }
 
+    /// 返回指定 backing 中 file_page 对应的驻留共享 frame。
     pub(super) fn mmap_backing_resident_frame(
         &self,
         backing_id: usize,
@@ -168,12 +184,14 @@ impl MemorySet {
             .and_then(|backing| backing.resident_frame(file_page))
     }
 
+    /// 清除指定 backing 中 file_page 的 dirty 标记（msync 写回后调用）。
     fn clear_mmap_backing_dirty_page(&mut self, backing_id: usize, file_page: usize) {
         if let Some(backing) = self.mmap_backings.get_mut(&backing_id) {
             backing.clear_dirty_page(file_page);
         }
     }
 
+    /// 更新 vpn 在 MapArea 中的 saved_pte_flags（PTE 无效时用于保存 dirty 等标志）。
     fn set_saved_pte_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
         for area in self.areas.iter_mut() {
             if !area.contains_vpn(vpn) {
@@ -186,11 +204,14 @@ impl MemorySet {
         false
     }
 
+    /// 收集 [start, end) 内所有需要写回的共享文件页数据块。
+    /// 只收集 file_valid_end() 以内的真实文件字节，SIGBUS tail 不参与。
     fn collect_shared_file_mmap_writeback_chunks(
         &mut self,
         start: usize,
         end: usize,
     ) -> Vec<MmapWritebackChunk> {
+        // 只回写 file_valid_end() 内的真实文件字节，避免把 EOF 零填充写回文件。
         let mut chunks = Vec::new();
         let regions = self.shared_file_vm_regions_overlapping(start, end);
         for region in regions {
@@ -251,12 +272,15 @@ impl MemorySet {
         chunks
     }
 
+    /// msync/munmap 写回路径：将 [start, end) 内共享文件映射的脏页写回文件。
+    /// clear_dirty=true 时同步清除 PTE dirty 位；返回是否实际清除了 dirty。
     pub fn writeback_shared_file_mmap_range(
         &mut self,
         start: usize,
         end: usize,
         clear_dirty: bool,
     ) -> Result<bool, ()> {
+        // msync/munmap 走同一收集路径；clear_dirty 只负责清 PTE/saved dirty 位。
         let chunks = self.collect_shared_file_mmap_writeback_chunks(start, end);
         let mut refreshed_backings = Vec::new();
         for chunk in chunks.iter() {
@@ -296,6 +320,7 @@ impl MemorySet {
         Ok(cleared_dirty)
     }
 
+    /// 检查本 MemorySet 内是否存在对指定 memfd 的可写共享映射（用于 F_SEAL_WRITE 检查）。
     pub fn has_writable_shared_memfd_mapping(&self, memfd_id: u64) -> bool {
         self.vm_regions.iter().any(|region| {
             region.memfd_id == memfd_id
@@ -304,6 +329,8 @@ impl MemorySet {
         })
     }
 
+    /// 返回需要将 fd write 数据镜像到用户内存的 (va, src_offset, len) 列表，
+    /// 并同步更新对应 VmRegion 的 file_valid_len。
     pub fn file_vm_copy_targets(
         &mut self,
         dev: usize,
@@ -316,7 +343,9 @@ impl MemorySet {
         pending
     }
 
+    /// 将 data 写入已驻留的用户页（仅覆盖已 fault 的页，未 fault 页由后续 lazy fault 从文件读）。
     fn copy_to_resident_user_bytes(&self, start: usize, data: &[u8]) {
+        // fd 写入只镜像已经 resident 的 mmap 页；未 fault 页由后续 lazy fault 读文件/cache。
         let mut copied = 0usize;
         while copied < data.len() {
             let va = start.saturating_add(copied);
@@ -342,6 +371,7 @@ impl MemorySet {
         }
     }
 
+    /// fd write 后将数据镜像到所有共享文件映射的驻留页，保持 mmap 与文件内容一致。
     pub fn mirror_shared_file_write_to_resident_mmaps(
         &mut self,
         dev: usize,
@@ -370,6 +400,7 @@ impl MemorySet {
 
         let mut refreshed_backings = Vec::new();
         for region in regions {
+            // 只更新 VMA 中当前文件有效范围，SIGBUS tail 不参与镜像。
             let mapped_len = region.file_mapped_len();
             let Some(region_file_end) = region.file_offset.checked_add(region.len) else {
                 continue;
@@ -396,6 +427,7 @@ impl MemorySet {
         self.debug_assert_user_vm_invariants();
     }
 
+    /// 将 [start, end) 内已驻留的用户页清零（truncate 缩短文件后清理 EOF 残留数据）。
     fn zero_mapped_user_bytes(&mut self, start: usize, end: usize) {
         let mut cur = start;
         while cur < end {
@@ -417,7 +449,10 @@ impl MemorySet {
         }
     }
 
+    /// 文件大小变化（truncate/write 扩展）后同步所有映射了该文件的 VMA：
+    /// 更新 file_valid_len/sigbus_start，清零 EOF 残留，修正 SIGBUS tail 映射。
     pub fn update_file_vm_size(&mut self, dev: usize, ino: u32, file_size: usize) -> bool {
+        // inode size 变化会移动 file_valid_len/SIGBUS tail，并修正 concrete MapArea。
         let updates: Vec<(
             usize,
             usize,
@@ -478,6 +513,7 @@ impl MemorySet {
             }
 
             if new_valid_len < old_valid_len {
+                // shrink 后 EOF 页尾不能暴露旧数据。
                 let zero_start = start.saturating_add(new_valid_len);
                 let zero_end = start.saturating_add(
                     align_up_to_page(new_valid_len)
@@ -494,6 +530,7 @@ impl MemorySet {
             updates.iter().copied()
         {
             if new_sigbus < old_sigbus {
+                // 新 SIGBUS tail 改回 lazy + U，占位但不允许有效访问。
                 self.unmap_user_range(new_sigbus.into(), end.into());
                 if new_sigbus < end
                     && !self.try_insert_lazy_area_raw(
@@ -512,8 +549,7 @@ impl MemorySet {
         {
             if new_sigbus > old_sigbus {
                 self.unmap_user_range(old_sigbus.into(), new_sigbus.into());
-                // Newly valid file-backed pages are populated by the file
-                // fault path, not by allocating zero-filled resident pages.
+                // 新变有效的页保持 lazy，实际内容由 fault 从文件/cache 装入。
                 let inserted =
                     self.try_insert_lazy_area_raw(old_sigbus.into(), new_sigbus.into(), perm);
                 if !inserted {
@@ -542,10 +578,13 @@ impl MemorySet {
         ok
     }
 
+    /// 返回指定 backing_id 对应的文件 Arc。
     pub fn mmap_backing_file(&self, backing_id: usize) -> Option<Arc<dyn File + Send + Sync>> {
         self.mmap_backings.get(&backing_id).map(MmapBacking::file)
     }
 
+    /// 为 region 分配或复用 mmap backing 条目，返回 backing_id（0 表示无需 backing）。
+    /// 同一 mm 内相同文件身份的 region 共用同一 backing，统一管理 writeback 状态。
     pub(super) fn allocate_mmap_backing(
         &mut self,
         region: &VmRegion,
@@ -557,6 +596,7 @@ impl MemorySet {
         let Some(backing) = MmapBacking::new(region, file) else {
             return 0;
         };
+        // 同一 mm 内相同 file identity 共用 backing，便于统一 size/writeback 状态。
         if let Some((&id, _existing)) = self
             .mmap_backings
             .iter()
@@ -570,6 +610,7 @@ impl MemorySet {
         id
     }
 
+    /// 清理不再被任何 VmRegion 引用的 backing 条目，并刷新剩余 backing 状态。
     pub(super) fn prune_unused_mmap_backings(&mut self) {
         self.mmap_backings.retain(|backing_id, backing| {
             self.vm_regions.iter().any(|region| {

@@ -748,12 +748,8 @@ fn alloc_fd(file: Arc<dyn File + Send + Sync>) -> isize {
         .unwrap_or(EMFILE)
 }
 
-fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
-    current_files().lock().get_file(fd)
-}
-
 fn with_map<R>(fd: usize, f: impl FnOnce(&BpfMapFile) -> R) -> Option<R> {
-    let file = get_fd_file(fd)?;
+    let file = current_files().lock().get_file(fd)?;
     let map = file.as_any().downcast_ref::<BpfMapFile>()?;
     Some(f(map))
 }
@@ -783,7 +779,7 @@ fn write_verifier_log(attr: &BpfProgLoadAttr, msg: &str) {
 }
 
 pub fn get_prog_clone(fd: usize) -> Option<Arc<BpfProgFile>> {
-    let file = get_fd_file(fd)?;
+    let file = current_files().lock().get_file(fd)?;
     let prog = file.as_any().downcast_ref::<BpfProgFile>()?;
     Some(Arc::new(prog.clone()))
 }
@@ -824,7 +820,7 @@ fn syscall_bpf_map_lookup_elem(attr: usize, size: usize) -> isize {
     let Ok(attr) = copy_user_struct::<BpfMapElemAttr>(attr) else {
         return EFAULT;
     };
-    let Some(file) = get_fd_file(attr.map_fd as usize) else {
+    let Some(file) = current_files().lock().get_file(attr.map_fd as usize) else {
         return EBADF;
     };
     let Some(map) = file.as_any().downcast_ref::<BpfMapFile>() else {
@@ -851,7 +847,7 @@ fn syscall_bpf_map_update_elem(attr: usize, size: usize) -> isize {
     let Ok(attr) = copy_user_struct::<BpfMapElemAttr>(attr) else {
         return EFAULT;
     };
-    let Some(file) = get_fd_file(attr.map_fd as usize) else {
+    let Some(file) = current_files().lock().get_file(attr.map_fd as usize) else {
         return EBADF;
     };
     let Some(map) = file.as_any().downcast_ref::<BpfMapFile>() else {

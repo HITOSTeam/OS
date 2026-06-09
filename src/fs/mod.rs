@@ -704,6 +704,7 @@ pub use pipe::{
 };
 pub(crate) use procfs::parse_proc_sys_usize;
 pub(crate) use procfs::resolve_proc_magic_intermediate_abs_path;
+pub(crate) use procfs::vm_max_map_count;
 pub use procfs::{
     ProcMagicLinkFile, ProcPseudoFile, is_proc_pseudo_path, normalize_proc_magic_path,
     proc_fd_link_file, proc_magic_link_exists, proc_readlink, vm_commit_limit_bytes,

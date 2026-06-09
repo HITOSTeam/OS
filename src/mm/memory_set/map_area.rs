@@ -27,11 +27,15 @@ pub(super) fn pte_flags_for_mprotect(
     pte_flags
 }
 
-/// map area structure, controls a contiguous piece of virtual memory
+/// 已经物化的页范围。
+///
+/// `MapArea` 不决定 mmap 语义；它只保存 resident frame 和页表相关状态。
 #[derive(Clone)]
 pub(super) struct MapArea {
     vpn_range: VPNRange,
+    /// 已经分配或共享到本地址空间的物理页。
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    /// mprotect(PROT_NONE) 等场景下暂存被拿掉的 PTE 标志。
     saved_pte_flags: BTreeMap<VirtPageNum, PTEFlags>,
     charged_pages: usize,
     map_type: MapType,
@@ -208,6 +212,9 @@ impl MapArea {
         area
     }
 
+    /// 将 MapArea 按 [start, end) 切成三段：左残段、中间段、右残段。
+    /// 左/右段若为空则返回 None；中间段始终存在。
+    /// data_frames 和 saved_pte_flags 按 VPN 归属分配到对应段。
     pub(super) fn split_around(
         mut self,
         start: VirtPageNum,
@@ -221,16 +228,20 @@ impl MapArea {
         let mut mid_frames = BTreeMap::new();
         let mut right_frames = BTreeMap::new();
         if !self.is_identical() {
+            // Framed 映射才有独立 frame，按切割点拆分 BTreeMap。
+            // split_off(key) 返回 >= key 的部分，原 map 保留 < key 的部分。
             let mut remaining = core::mem::take(&mut self.data_frames);
-            right_frames = remaining.split_off(&end);
-            mid_frames = remaining.split_off(&start);
-            left_frames = remaining;
+            right_frames = remaining.split_off(&end); // [end, ...)
+            mid_frames = remaining.split_off(&start); // [start, end)
+            left_frames = remaining; // [area_start, start)
         }
+        // saved_pte_flags（mprotect 暂存的 PTE 标志）同样按 VPN 三分。
         let mut remaining_flags = core::mem::take(&mut self.saved_pte_flags);
         let right_flags = remaining_flags.split_off(&end);
         let mid_flags = remaining_flags.split_off(&start);
         let left_flags = remaining_flags;
 
+        // 仅当左/右实际有页范围时才构造对应段。
         let left = (area_start < start)
             .then(|| self.descriptor_with_state(area_start, start, left_frames, left_flags));
         let mid = self.descriptor_with_state(start, end, mid_frames, mid_flags);

@@ -2,10 +2,11 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config;
-use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages};
+use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages, frame_managed_pages};
 use crate::task::manager::{PID2PCB, pid2process};
 use crate::task::task_block::TaskStatus;
 
@@ -18,10 +19,13 @@ const VM_OVERCOMMIT_MEMORY_DEFAULT: usize = 0;
 const VM_OVERCOMMIT_MEMORY_MAX: usize = 2;
 const VM_OVERCOMMIT_RATIO_DEFAULT: usize = 50;
 const VM_OVERCOMMIT_RATIO_MAX: usize = 100;
+const VM_MIN_FREE_KBYTES_DEFAULT: usize = 1024;
+const VM_MIN_FREE_KBYTES_MAX: usize = usize::MAX / 1024;
 const FS_FILE_MAX_DEFAULT: usize = 8192;
 const FS_FILE_MAX_MAX: usize = isize::MAX as usize;
 static VM_OVERCOMMIT_MEMORY: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_MEMORY_DEFAULT);
 static VM_OVERCOMMIT_RATIO: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_RATIO_DEFAULT);
+static VM_MIN_FREE_KBYTES: AtomicUsize = AtomicUsize::new(VM_MIN_FREE_KBYTES_DEFAULT);
 static FS_FILE_MAX: AtomicUsize = AtomicUsize::new(FS_FILE_MAX_DEFAULT);
 static PROC_PID_STAT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PROC_PID_STAT_STATE_S: AtomicUsize = AtomicUsize::new(0);
@@ -88,10 +92,12 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
         ProcFileKind::Perf => proc_perf(),
+        ProcFileKind::Kallsyms => proc_kallsyms(),
         ProcFileKind::Kpageflags => String::new(),
         ProcFileKind::SysvipcMsg => crate::syscall::sysv_ipc::proc_sysvipc_msg(),
         ProcFileKind::SysvipcSem => crate::syscall::sysv_ipc::proc_sysvipc_sem(),
         ProcFileKind::SysvipcShm => crate::syscall::sysv_shm::proc_sysvipc_shm(),
+        ProcFileKind::VmMinFreeKbytes => alloc::format!("{}\n", vm_min_free_kbytes()),
         ProcFileKind::VmOvercommitMemory => alloc::format!("{}\n", vm_overcommit_memory()),
         ProcFileKind::VmOvercommitRatio => alloc::format!("{}\n", vm_overcommit_ratio()),
         ProcFileKind::VmDropCaches => String::from("0\n"),
@@ -158,6 +164,14 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
     }
 }
 
+fn proc_kallsyms() -> String {
+    String::from(
+        "ffffffff80200000 T _stext\n\
+         ffffffff80201000 T kernel_start\n\
+         ffffffff80202000 T trap_handler\n",
+    )
+}
+
 fn proc_mounts_current() -> String {
     crate::syscall::filesystem::proc_mounts_snapshot()
 }
@@ -171,6 +185,7 @@ fn proc_mounts_for_pid(pid: u32) -> String {
 
 pub(super) fn write_vm_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
     let (slot, max) = match path {
+        "/proc/sys/vm/min_free_kbytes" => (&VM_MIN_FREE_KBYTES, VM_MIN_FREE_KBYTES_MAX),
         "/proc/sys/vm/overcommit_memory" => (&VM_OVERCOMMIT_MEMORY, VM_OVERCOMMIT_MEMORY_MAX),
         "/proc/sys/vm/overcommit_ratio" => (&VM_OVERCOMMIT_RATIO, VM_OVERCOMMIT_RATIO_MAX),
         _ => return Err(err(SyscallError::EINVAL)),
@@ -219,6 +234,10 @@ pub fn vm_overcommit_memory() -> usize {
     VM_OVERCOMMIT_MEMORY.load(Ordering::Relaxed)
 }
 
+pub fn vm_min_free_kbytes() -> usize {
+    VM_MIN_FREE_KBYTES.load(Ordering::Relaxed)
+}
+
 fn vm_overcommit_ratio() -> usize {
     VM_OVERCOMMIT_RATIO.load(Ordering::Relaxed)
 }
@@ -228,10 +247,11 @@ fn fs_file_max() -> usize {
 }
 
 pub fn vm_commit_limit_bytes() -> usize {
-    let totalram = config::phys_mem_end().saturating_sub(config::phys_mem_start());
-    totalram
+    let managed_ram = frame_managed_pages().saturating_mul(config::PAGE_SIZE);
+    let strict_limit = managed_ram
         .saturating_mul(vm_overcommit_ratio())
-        .saturating_div(100)
+        .saturating_div(100);
+    strict_limit.saturating_sub(vm_min_free_kbytes().saturating_mul(1024))
 }
 
 pub fn vm_committed_as_bytes() -> usize {
@@ -251,7 +271,7 @@ pub fn vm_committed_as_bytes() -> usize {
 }
 
 fn proc_meminfo() -> String {
-    let totalram = config::phys_mem_end().saturating_sub(config::phys_mem_start());
+    let totalram = frame_managed_pages().saturating_mul(config::PAGE_SIZE);
     let mem_total_kb = (totalram / 1024) as u64;
     let mem_free_kb =
         ((frame_available_pages().saturating_mul(config::PAGE_SIZE)).min(totalram) / 1024) as u64;
@@ -648,20 +668,14 @@ fn proc_pid_maps(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        if crate::debug_config::DEBUG_PROCFS {
-            crate::println!("[procfs] maps pid={} lock busy", pid);
-        }
-        return String::new();
-    };
-    let mut regions = {
+    let inner = proc.borrow_mut();
+    let regions = {
         let memory_set = inner.memory_set.lock();
         memory_set.vm_regions_snapshot()
     };
     drop(inner);
-    regions.sort_by_key(|r| r.start);
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(regions.len().saturating_mul(48));
     for region in regions {
         let end = region.end();
         if end <= region.start {
@@ -690,16 +704,11 @@ fn proc_pid_maps(pid: u32) -> String {
         } else {
             " "
         };
-        out.push_str(&alloc::format!(
-            "{:x}-{:x} {}{}{}{} 00000000 00:00 0{}\n",
-            region.start,
-            end,
-            r,
-            w,
-            x,
-            p,
-            path
-        ));
+        let _ = writeln!(
+            out,
+            "{:x}-{:x} {}{}{}{} 00000000 00:00 0{}",
+            region.start, end, r, w, x, p, path
+        );
     }
     out
 }
@@ -827,12 +836,7 @@ fn proc_pid_smaps(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        if crate::debug_config::DEBUG_PROCFS {
-            crate::println!("[procfs] smaps pid={} lock busy", pid);
-        }
-        return String::new();
-    };
+    let inner = proc.borrow_mut();
     let regions = {
         let memory_set = inner.memory_set.lock();
         let mut regions = memory_set.vm_regions_snapshot();

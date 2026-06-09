@@ -14,6 +14,7 @@ use crate::syscall::error::{SyscallError, err};
 
 const PROC_LINUX_TID_PID_SHIFT: usize = 15;
 static PROC_SIMPLE_TEXT_FILES: Mutex<BTreeMap<&'static str, Vec<u8>>> = Mutex::new(BTreeMap::new());
+const VM_MAX_MAP_COUNT_DEFAULT: usize = 65530;
 
 pub(crate) fn collect_pids() -> Vec<usize> {
     let mut pids: Vec<usize> = {
@@ -66,6 +67,7 @@ pub(crate) fn proc_root_entries() -> Vec<PseudoDirent> {
         "uptime",
         "stat",
         "perf",
+        "kallsyms",
         "kpageflags",
         "config.gz",
     ] {
@@ -248,13 +250,14 @@ fn proc_simple_text_default(path: &'static str) -> Vec<u8> {
         "/proc/sys/fs/pipe-user-pages-hard" => b"0\n".to_vec(),
         "/proc/sys/fs/lease-break-time" => b"45\n".to_vec(),
         "/proc/sys/vm/vfs_cache_pressure" => b"100\n".to_vec(),
-        "/proc/sys/vm/min_free_kbytes" => b"1024\n".to_vec(),
         "/proc/sys/vm/nr_hugepages" => b"0\n".to_vec(),
         "/proc/sys/vm/nr_overcommit_hugepages" => b"0\n".to_vec(),
         "/proc/sys/vm/nr_hugepages_mempolicy" => b"0\n".to_vec(),
         "/proc/sys/vm/mmap_min_addr" => b"65536\n".to_vec(),
         "/proc/sys/vm/panic_on_oom" => b"0\n".to_vec(),
-        "/proc/sys/vm/max_map_count" => b"65530\n".to_vec(),
+        "/proc/sys/vm/max_map_count" => {
+            alloc::format!("{}\n", VM_MAX_MAP_COUNT_DEFAULT).into_bytes()
+        }
         "/proc/sys/vm/swappiness" => b"60\n".to_vec(),
         "/proc/sys/vm/stat_refresh" => b"0\n".to_vec(),
         "/proc/sys/vm/dirty_background_ratio" => b"10\n".to_vec(),
@@ -291,6 +294,11 @@ pub(crate) fn proc_simple_text_content(path: &'static str) -> String {
         .cloned()
         .unwrap_or_else(|| proc_simple_text_default(path));
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+pub(crate) fn vm_max_map_count() -> usize {
+    let text = proc_simple_text_content("/proc/sys/vm/max_map_count");
+    text.trim().parse().unwrap_or(VM_MAX_MAP_COUNT_DEFAULT)
 }
 
 pub(super) fn write_proc_simple_text(path: &'static str, data: &[u8]) -> Result<Vec<u8>, isize> {
@@ -340,6 +348,7 @@ pub(crate) fn managed_proc_sys_file_kind(path: &str) -> Option<ProcFileKind> {
     match path {
         "/proc/sys/vm/drop_caches" => Some(ProcFileKind::VmDropCaches),
         "/proc/sys/vm/compact_memory" => Some(ProcFileKind::VmCompactMemory),
+        "/proc/sys/vm/min_free_kbytes" => Some(ProcFileKind::VmMinFreeKbytes),
         "/proc/sys/vm/overcommit_memory" => Some(ProcFileKind::VmOvercommitMemory),
         "/proc/sys/vm/overcommit_ratio" => Some(ProcFileKind::VmOvercommitRatio),
         "/proc/sys/fs/file-max" => Some(ProcFileKind::FsFileMax),

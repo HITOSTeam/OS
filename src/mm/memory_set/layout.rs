@@ -12,6 +12,7 @@ pub struct BrkUpdate {
 }
 
 impl BrkUpdate {
+    /// 返回本次 brk 操作后的实际 brk 值：成功则为 new_brk，失败则保持 old_brk。
     pub fn result_brk(&self) -> usize {
         if self.success {
             self.new_brk
@@ -22,6 +23,7 @@ impl BrkUpdate {
 }
 
 impl MemorySet {
+    /// exec 后重置用户地址空间布局：设置堆起始位置、brk、mmap 基址及 ASLR 偏移。
     pub fn reset_user_layout(&mut self, ustack_base: usize) {
         let heap_start = ustack_base
             .saturating_add(USER_STACK_SIZE)
@@ -29,18 +31,23 @@ impl MemorySet {
         self.heap_start = heap_start;
         self.brk = heap_start;
         self.mmap_next = DEFAULT_MMAP_BASE;
+        self.mmap_topdown_cursor = 0;
         self.mmap_aslr_offset = next_mmap_aslr_offset();
         self.clear_mlock_state();
     }
 
+    /// 返回堆区起始地址（heap_start，exec 后固定不变）。
     pub fn heap_start(&self) -> usize {
         self.heap_start
     }
 
+    /// 返回当前 brk 指针（堆顶，随 sys_brk 移动）。
     pub fn brk(&self) -> usize {
         self.brk
     }
 
+    /// sys_brk 的核心实现：将 brk 移动到 new_brk，跳过被 SysV shm 占用的页，
+    /// 并在扩展时检查 overcommit 限制。返回 BrkUpdate 描述本次变更结果。
     pub fn try_update_brk_with_holes<ShmBlocked, OvercommitRejects>(
         &mut self,
         mut new_brk: usize,
@@ -103,6 +110,8 @@ impl MemorySet {
         result
     }
 
+    /// 向上扩展堆：将 [old_end, new_end) 中不被 mmap/shm 占用的连续段逐段插入为 lazy heap VMA。
+    /// 若任意段插入失败则回滚已插入内容并返回 false。
     fn try_grow_brk_with_holes<ShmBlocked>(
         &mut self,
         old_end: usize,
@@ -152,6 +161,7 @@ impl MemorySet {
         true
     }
 
+    /// 向下收缩堆：逐页解除 [new_end, old_end) 中不属于 mmap 区域的堆映射。
     fn shrink_brk_with_holes(&mut self, new_end: usize, old_end: usize) {
         let mut cur = new_end;
         while cur < old_end {
@@ -162,16 +172,19 @@ impl MemorySet {
         }
     }
 
+    /// 返回当前堆大小（字节），即 brk - heap_start。
     pub fn heap_size(&self) -> usize {
         self.brk.saturating_sub(self.heap_start)
     }
 
+    /// 记录一次 mmap 结束地址，用于维护 mmap_next 水位线（top-down 搜索的下界参考）。
     pub fn note_mmap_end(&mut self, end: usize) {
         if end > self.mmap_next {
             self.mmap_next = end;
         }
     }
 
+    /// 检查 [start, end) 是否与已有的 area（页表映射段）存在重叠，可通过 exclude 排除一个区间。
     pub(super) fn map_area_range_overlaps_except(
         &self,
         start: usize,
@@ -188,6 +201,7 @@ impl MemorySet {
         })
     }
 
+    /// 检查 [start, end) 是否与 vm_regions（VMA 账簿）存在重叠，可排除一个区间。
     pub(super) fn vm_region_range_overlaps_except(
         &self,
         start: usize,
@@ -197,6 +211,7 @@ impl MemorySet {
         self.vm_regions.any_overlap_except(start, end, exclude)
     }
 
+    /// 检查 [start, end) 是否与任意 growsdown VMA 的保护间隙（guard gap）重叠，可排除一个区间。
     fn growdown_guard_range_overlaps_except(
         &self,
         start: usize,
@@ -217,6 +232,7 @@ impl MemorySet {
         })
     }
 
+    /// [start, end) 在用户地址空间中完全空闲（不与 area 或 vm_region 重叠），可排除一个区间。
     fn user_range_is_free_except(
         &self,
         start: usize,
@@ -224,16 +240,23 @@ impl MemorySet {
         user_va_top: usize,
         exclude: Option<(usize, usize)>,
     ) -> bool {
+        let concrete_overlap = if cfg!(debug_assertions) {
+            self.map_area_range_overlaps_except(start, end, exclude)
+        } else {
+            false
+        };
         start < end
             && end <= user_va_top
-            && !self.map_area_range_overlaps_except(start, end, exclude)
+            && !concrete_overlap
             && !self.vm_region_range_overlaps_except(start, end, exclude)
     }
 
+    /// [start, end) 在用户地址空间中完全空闲（公开接口，无排除区间）。
     pub fn user_range_is_free(&self, start: usize, end: usize, user_va_top: usize) -> bool {
         self.user_range_is_free_except(start, end, user_va_top, None)
     }
 
+    /// [start, end) 空闲且不落入任何 growsdown VMA 的 guard gap，即可安全放置新 mmap。
     fn user_range_is_mmap_placeable_except(
         &self,
         start: usize,
@@ -245,11 +268,13 @@ impl MemorySet {
             && !self.growdown_guard_range_overlaps_except(start, end, exclude)
     }
 
+    /// 将 VmRegion 转换为 (start, end) 用户地址对；若区间为空则返回 None。
     pub(super) fn vm_region_user_range(region: VmRegion) -> Option<(usize, usize)> {
         let end = region.end();
         (end > region.start).then_some((region.start, end))
     }
 
+    /// 按地址升序遍历所有 vm_region 的用户地址范围，回调返回 false 时提前终止。
     fn for_each_occupied_user_range_ascending<F>(&self, mut f: F) -> bool
     where
         F: FnMut(usize, usize) -> bool,
@@ -264,6 +289,7 @@ impl MemorySet {
         true
     }
 
+    /// 按地址降序遍历所有 vm_region 的用户地址范围，回调返回 false 时提前终止。
     fn for_each_occupied_user_range_descending<F>(&self, mut f: F) -> bool
     where
         F: FnMut(usize, usize) -> bool,
@@ -278,6 +304,7 @@ impl MemorySet {
         true
     }
 
+    /// 从 min_start 开始向上扫描，找到第一个可放置 len 字节映射的空闲页对齐区间（低地址优先）。
     fn find_free_user_range_from_occupied(
         &self,
         min_start: usize,
@@ -332,6 +359,7 @@ impl MemorySet {
         }
     }
 
+    /// 在 [hole_start, hole_end) 内从高地址向低地址扫描，找到可放置 len 字节的起始地址。
     fn find_placeable_user_range_in_hole_down(
         &self,
         hole_start: usize,
@@ -359,6 +387,7 @@ impl MemorySet {
         }
     }
 
+    /// 在 [min_start, max_end) 内从高地址向低地址扫描各空洞，找到可放置 len 字节的起始地址（top-down）。
     fn find_free_user_range_below_from_occupied(
         &self,
         min_start: usize,
@@ -411,8 +440,10 @@ impl MemorySet {
         )
     }
 
+    /// 为非 MAP_FIXED 的 mmap 找一个合适的起始地址：
+    /// 优先尝试 hint（若非空且空闲），否则 top-down 搜索，再回退到 brk 以上的低地址区间。
     pub fn find_free_mmap_range(
-        &self,
+        &mut self,
         hint: Option<usize>,
         len: usize,
         user_va_top: usize,
@@ -434,13 +465,38 @@ impl MemorySet {
             .mmap_aslr_offset
             .min(user_va_top.saturating_sub(topdown_floor));
         let topdown_ceiling = align_down_to_page(user_va_top.saturating_sub(aslr_offset));
-        self.find_free_user_range_below_from_occupied(
+
+        let cursor_ceiling = if self.mmap_topdown_cursor > topdown_floor
+            && self.mmap_topdown_cursor <= topdown_ceiling
+        {
+            self.mmap_topdown_cursor
+        } else {
+            topdown_ceiling
+        };
+        if let Some(start) = cursor_ceiling
+            .checked_sub(len)
+            .map(align_down_to_page)
+            .filter(|start| *start >= topdown_floor)
+        {
+            let end = start.checked_add(len)?;
+            if self.user_range_is_mmap_placeable_except(start, end, user_va_top, None) {
+                self.mmap_topdown_cursor = start;
+                return Some(start);
+            }
+        }
+
+        if let Some(start) = self.find_free_user_range_below_from_occupied(
             topdown_floor,
             topdown_ceiling,
             len,
             user_va_top,
             None,
-        )
-        .or_else(|| self.find_free_user_range_from_occupied(fallback, len, user_va_top, None))
+        ) {
+            self.mmap_topdown_cursor = start;
+            return Some(start);
+        }
+        let start = self.find_free_user_range_from_occupied(fallback, len, user_va_top, None)?;
+        self.mmap_topdown_cursor = start;
+        Some(start)
     }
 }
