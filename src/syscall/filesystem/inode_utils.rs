@@ -675,6 +675,7 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
         )
     };
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    // 当前进程的 user-buffer write 可以直接按用户地址做旧路径镜像。
     let copies: Vec<(usize, usize, usize)> = {
         let process = current_process();
         let inner = process.borrow_mut();
@@ -708,6 +709,7 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
             }
         }
     }
+    // 其他 mm 不能使用当前 token 写用户地址，只能先拷贝到内核缓冲再广播。
     mirror_inode_write_to_shared_mmaps_all_processes(dev, ino, write_off, user_src, len);
 }
 
@@ -734,6 +736,7 @@ fn mirror_inode_write_to_shared_mmaps_all_processes(
         if try_copy_from_user(token, (user_src + done) as *const u8, &mut tmp[..chunk]).is_err() {
             return;
         }
+        // 同步全局 cache 和所有已 resident 的 MAP_SHARED 页。
         update_shared_file_page_cache(dev, ino, write_off + done, &tmp[..chunk]);
         for process in processes.iter() {
             let Some(inner) = process.try_borrow_mut() else {
@@ -770,6 +773,7 @@ pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
         )
     };
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    // sendfile/splice/copy_file_range 等 kernel-buffer 写入也要同步 mmap 视图。
     update_shared_file_page_cache(dev, ino, write_off, data);
 
     let processes = {
@@ -787,6 +791,7 @@ pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
 }
 
 fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize) {
+    // inode size 是全局事实，所有 mm 的 file_valid_len/SIGBUS tail 都要更新。
     resize_shared_file_page_cache(dev, ino, file_size);
     let processes = {
         let map = PID2PCB.lock();

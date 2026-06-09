@@ -1,4 +1,7 @@
-//! Implementation of [`MapArea`] and [`MemorySet`].
+//! 用户地址空间管理。
+//!
+//! `VmRegion` 记录 mmap/brk/ELF 的语义，
+//! `MapArea` 记录已经物化的页，`PageTable` 是硬件最终看到的映射。
 
 use super::elf_loader::{
     ENOMEM, ET_DYN, ElfHeader64, ElfPhdr64, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR, parse_elf_headers,
@@ -75,12 +78,21 @@ pub(crate) fn resize_shared_file_page_cache(dev: usize, ino: u32, file_size: usi
     backing::shared_file_page_cache_resize(dev, ino, file_size);
 }
 
+pub(crate) fn reclaim_shared_file_page_cache() -> usize {
+    backing::shared_file_page_cache_reclaim_unreferenced()
+}
+
+pub(crate) fn allocate_shared_anon_id() -> u64 {
+    backing::allocate_shared_anon_id()
+}
+
 /// memory set structure, controls virtual-memory space
 pub struct MemorySet {
+    /// 页表是真正给硬件使用的映射结果。
     page_table: PageTable,
+    /// 已物化页的跟踪表，包括 frame、COW 和 PROT_NONE 保存的 PTE 标志。
     areas: Vec<MapArea>,
-    /// Linux mm_struct-style mmap metadata.  Keep syscall-level VMA identity
-    /// with the address space instead of duplicating it in the process block.
+    /// 用户态 VMA 的权威元数据，类似 Linux mm_struct 里的 VMA 集合。
     vm_regions: VmRegionSet,
     /// System V shared memory attachments owned by this address space.
     sysv_shm_attaches: Vec<ShmAttach>,
@@ -89,6 +101,7 @@ pub struct MemorySet {
     heap_start: usize,
     brk: usize,
     mmap_next: usize,
+    mmap_topdown_cursor: usize,
     mmap_aslr_offset: usize,
     /// Virtual ranges currently locked by mlock/mlockall.
     mlocked_ranges: Vec<(usize, usize)>,
@@ -242,6 +255,7 @@ impl MemorySet {
             heap_start: 0,
             brk: 0,
             mmap_next: DEFAULT_MMAP_BASE,
+            mmap_topdown_cursor: 0,
             mmap_aslr_offset: next_mmap_aslr_offset(),
             mlocked_ranges: Vec::new(),
             mlockall_future: false,
@@ -254,12 +268,14 @@ impl MemorySet {
 
     fn inherit_user_vm_metadata_from(&mut self, parent: &MemorySet) {
         self.vm_regions = parent.vm_regions.clone();
+        self.vm_regions.mark_fork_inherited_anonymous_mmap();
         self.sysv_shm_attaches = parent.sysv_shm_attaches.clone();
         self.mmap_backings = parent.mmap_backings.clone();
         self.next_mmap_backing_id = parent.next_mmap_backing_id;
         self.heap_start = parent.heap_start;
         self.brk = parent.brk;
         self.mmap_next = parent.mmap_next;
+        self.mmap_topdown_cursor = parent.mmap_topdown_cursor;
         self.mmap_aslr_offset = parent.mmap_aslr_offset;
         self.trap_context_slots = parent.trap_context_slots.clone();
         // Do not inherit mlock/mlockall state across fork-style address-space
@@ -343,6 +359,7 @@ impl MemorySet {
         sort_map_areas(&mut self.areas);
     }
 
+    /// 简单的测试函数
     #[cfg(debug_assertions)]
     fn debug_assert_user_vm_invariants(&self) {
         let mut prev_area_end = VirtPageNum(0);
@@ -428,6 +445,17 @@ impl MemorySet {
                     );
                 }
             } else if !has_external_backing {
+                if region.shared {
+                    debug_assert_ne!(
+                        region.anon_shared_id, 0,
+                        "shared anonymous VmRegion must keep an anon_shared_id"
+                    );
+                } else {
+                    debug_assert_eq!(
+                        region.anon_shared_id, 0,
+                        "private anonymous VmRegion must not keep an anon_shared_id"
+                    );
+                }
                 debug_assert_eq!(
                     region.sigbus_start, end,
                     "anonymous VmRegion should not carry a SIGBUS tail"
@@ -797,6 +825,7 @@ impl MemorySet {
     }
 
     pub fn push_vm_region(&mut self, region: VmRegion) {
+        // VMA 新增后统一合并，并刷新 file backing 的派生状态。
         let backing_id = region.backing_id;
         self.vm_regions.push_merged(region);
         if backing_id != 0 {
@@ -838,8 +867,10 @@ impl MemorySet {
             file_offset: 0,
             backing_id: 0,
             memfd_id: 0,
+            anon_shared_id: 0,
             sysv_shmid: 0,
             growsdown: false,
+            fork_inherited_anon: false,
         })
     }
 
@@ -868,6 +899,8 @@ impl MemorySet {
         Some(end_vpn)
     }
 
+    /// 在空闲范围内插入一个新 VMA（VmRegion + MapArea）。
+    /// 若目标范围与任何已有映射重叠则返回 false，不做任何修改。
     pub fn try_insert_user_vma(
         &mut self,
         region: VmRegion,
@@ -878,6 +911,8 @@ impl MemorySet {
         self.try_insert_user_vma_with(region, areas, lock_range, backing_file, |_| true)
     }
 
+    /// 同 try_insert_user_vma，但插入成功后额外执行 post_insert 回调（如预填充文件内容）。
+    /// 回调返回 false 时回滚整个插入。
     pub fn try_insert_user_vma_with<F>(
         &mut self,
         region: VmRegion,
@@ -889,14 +924,28 @@ impl MemorySet {
     where
         F: FnOnce(&mut Self) -> bool,
     {
+        // syscall 层只描述 VMA；这里负责同时建立 VMA 元数据和具体 MapArea。
         let start = region.start;
         let end = region.end();
-        if end <= start
-            || self.concrete_range_overlaps(start.into(), end.into())
-            || self.vm_regions_overlap(start, end)
-            || !areas
-                .iter()
-                .all(|area| area.compatible_with_region(&region))
+        // 重叠 （包括 已有 area + vma ) 以及 合法性检查
+        let invalid = end <= start;
+        let concrete_overlap = if cfg!(debug_assertions) {
+            self.concrete_range_overlaps(start.into(), end.into())
+        } else {
+            false
+        };
+        let vma_overlap = self.vm_regions_overlap(start, end);
+        let count_after = self.vm_regions.count_after_insert_merged(region);
+        let max_map_count = crate::fs::vm_max_map_count();
+        let compatible = areas
+            .iter()
+            .all(|area| area.compatible_with_region(&region));
+        let max_count_failure_point = max_map_count.saturating_add(1);
+        if invalid
+            || concrete_overlap
+            || vma_overlap
+            || count_after > max_count_failure_point
+            || !compatible
         {
             return false;
         }
@@ -905,6 +954,9 @@ impl MemorySet {
             return false;
         }
 
+        // 回滚机制，用来 在
+        // 1. 插入vma 失败 恢复
+        // 2. post 函数处理 失败恢复
         let rollback = UserRangeRollback::capture(self, &[(start, end)]);
         if !self.try_insert_user_vma_raw(region, areas, lock_range, backing_file) {
             rollback.restore(self);
@@ -1004,12 +1056,19 @@ impl MemorySet {
         true
     }
 
+    /// 对 [start, end) 范围内的用户映射拍快照，供回滚使用。
+    /// 快照内容包括：
+    /// - 与该范围重叠的 MapArea（裁剪到范围边界）及其 PTE；
+    /// - 与该范围重叠的 VmRegion；
+    /// - 这些 VmRegion 对应的 mmap backing 条目；
+    /// - 与该范围重叠的 mlock 区段。
     fn snapshot_user_range(&self, start: usize, end: usize) -> UserRangeSnapshot {
         let start_vpn = VirtAddr::from(start).floor();
         let end_vpn = VirtAddr::from(end).ceil();
         let mut areas = Vec::new();
         let mut ptes = Vec::new();
 
+        // 提取重合的 MapArea
         for area in self.areas.iter() {
             if !area.contains_perm(MapPermission::U) {
                 continue;
@@ -1102,6 +1161,8 @@ impl MemorySet {
         self.debug_assert_user_vm_invariants();
     }
 
+    /// MAP_FIXED 路径：先拆除目标范围内的所有已有映射，再插入新 VMA。
+    /// 插入失败时恢复原有映射（回滚）。
     pub fn try_replace_user_vma(
         &mut self,
         region: VmRegion,
@@ -1112,6 +1173,8 @@ impl MemorySet {
         self.try_replace_user_vma_with(region, areas, lock_range, backing_file, |_| true)
     }
 
+    /// 同 try_replace_user_vma，但插入成功后额外执行 post_insert 回调。
+    /// 回调返回 false 时恢复被拆除的原有映射。
     pub fn try_replace_user_vma_with<F>(
         &mut self,
         region: VmRegion,
@@ -1164,8 +1227,10 @@ impl MemorySet {
             file_offset: start.saturating_sub(self.heap_start),
             backing_id: 0,
             memfd_id: 0,
+            anon_shared_id: 0,
             sysv_shmid: 0,
             growsdown: false,
+            fork_inherited_anon: false,
         };
         self.try_insert_user_vma(
             region,
@@ -1202,8 +1267,10 @@ impl MemorySet {
             file_offset: 0,
             backing_id: 0,
             memfd_id: 0,
+            anon_shared_id: 0,
             sysv_shmid: 0,
             growsdown: false,
+            fork_inherited_anon: false,
         };
         self.try_insert_user_vma(
             region,
@@ -3159,6 +3226,7 @@ impl MemorySet {
     ///
     /// This is a page-table/bookkeeping guard, not a syscall-visible VMA
     /// coverage test. Use `VmRegionSet`-backed helpers for policy decisions.
+    /// 逐一 检查 已有 area  是否 与 给定的 重叠
     pub fn concrete_range_overlaps(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();

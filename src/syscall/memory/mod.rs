@@ -15,7 +15,8 @@ pub(super) use crate::{
     },
     mm::{
         BrkUpdate, MapPermission, MapType, MemorySet, MprotectError, PTEFlags, VmRegion,
-        VmRegionKind, VmaInsertArea, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked,
+        VmRegionKind, VmaInsertArea, frame_available_pages, reclaim_shared_file_page_cache,
+        try_copy_to_user, try_copy_to_user_unchecked,
     },
     task::{
         manager::PID2PCB,
@@ -65,27 +66,21 @@ pub(super) fn align_down(x: usize, align: usize) -> usize {
 pub(super) fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
-
+/// 用户地址区间检查，不要覆盖trap 跳板代码就行
 pub(super) fn user_range_valid(start: usize, end: usize) -> bool {
     start < end && end <= USER_VA_TOP
 }
 
-pub(super) fn anon_private_commit_charge(
-    map_len: usize,
-    prot: usize,
-    is_anon: bool,
-    is_shared: bool,
-) -> usize {
-    if is_anon && !is_shared && (prot & PROT_WRITE) != 0 {
-        map_len
-    } else {
-        0
-    }
-}
-
 pub(super) fn overcommit_limit_bytes() -> Option<usize> {
     match vm_overcommit_memory() {
-        0 => None,
+        // 模式 0 是 Linux 的启发式 overcommit。当前内核还没有 swap/reclaim，
+        // 因此给匿名私有可写 commit 留出有限裕量，但仍拒绝明显超过
+        // 物理内存两倍的大额请求。
+        0 => {
+            let total = crate::mm::frame_managed_pages().saturating_mul(PAGE_SIZE);
+            Some(total.saturating_add(total / 2))
+        }
+        // 不设限
         1 => None,
         2 => Some(vm_commit_limit_bytes()),
         _ => None,
@@ -100,10 +95,6 @@ pub(super) fn exceeds_overcommit_limit(additional_bytes: usize) -> bool {
         return false;
     };
     vm_committed_as_bytes().saturating_add(additional_bytes) > limit
-}
-
-pub(super) fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
-    current_files().lock().get_file(fd)
 }
 
 pub(super) fn find_inode_file_in_snapshot(

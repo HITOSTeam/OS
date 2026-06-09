@@ -26,8 +26,9 @@ pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
 #[allow(unused_imports)]
 pub use dtb::init_phys_mem_from_dtb;
+pub(crate) use frame_allocator::frame_refcount;
 pub use frame_allocator::{
-    FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages,
+    FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages, frame_managed_pages,
     frame_refcount_entries,
 };
 pub use memory_set::kernel_token;
@@ -56,7 +57,10 @@ pub use memory_set::{
     BrkUpdate, ElfAux, KERNEL_SPACE, LazyFaultResult, MapPermission, MapType, MemorySet, MmRef,
     MprotectError, ShmAttach, ShmAttachRef, VmRegion, VmRegionKind, VmaInsertArea,
 };
-pub(crate) use memory_set::{resize_shared_file_page_cache, update_shared_file_page_cache};
+pub(crate) use memory_set::{
+    allocate_shared_anon_id, reclaim_shared_file_page_cache, resize_shared_file_page_cache,
+    update_shared_file_page_cache,
+};
 pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub use page_table::{
     PageTableEntry, read_user_value, translated_byte_buffer, translated_mutref,

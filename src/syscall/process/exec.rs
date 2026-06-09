@@ -188,6 +188,9 @@ fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> O
 }
 
 fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) -> isize {
+    if let Err(e) = validate_exec_payload(&args, &envs) {
+        return e;
+    }
     let process = current_process();
     if let Some(interp_interp) = elf_interp_path(&interp_data) {
         let interp_interp_data = match load_interp_data(&interp_interp) {
@@ -204,6 +207,41 @@ fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) 
     }
     maybe_stop_after_ptrace_exec();
     0
+}
+
+fn validate_exec_payload(args: &[String], envs: &[String]) -> Result<(), isize> {
+    const MAX_ARG_STRINGS: usize = 4096;
+    const MAX_ARG_STRLEN: usize = crate::config::PAGE_SIZE * 32;
+    const EXEC_STACK_SLOP: usize = crate::config::PAGE_SIZE;
+    const AUXV_SLOP: usize = 512;
+
+    if args.len() > MAX_ARG_STRINGS || envs.len() > MAX_ARG_STRINGS {
+        return Err(err(SyscallError::E2BIG));
+    }
+
+    let mut bytes = AUXV_SLOP;
+    for s in args.iter().chain(envs.iter()) {
+        let len = s.len().checked_add(1).ok_or(err(SyscallError::E2BIG))?;
+        if len > MAX_ARG_STRLEN {
+            return Err(err(SyscallError::E2BIG));
+        }
+        bytes = bytes.checked_add(len).ok_or(err(SyscallError::E2BIG))?;
+    }
+
+    let pointer_words = args
+        .len()
+        .checked_add(envs.len())
+        .and_then(|n| n.checked_add(4))
+        .ok_or(err(SyscallError::E2BIG))?;
+    bytes = bytes
+        .checked_add(pointer_words * core::mem::size_of::<usize>())
+        .ok_or(err(SyscallError::E2BIG))?;
+
+    let limit = crate::config::USER_STACK_SIZE.saturating_sub(EXEC_STACK_SLOP);
+    if bytes > limit {
+        return Err(err(SyscallError::E2BIG));
+    }
+    Ok(())
 }
 
 fn load_interp_data(interp: &str) -> Result<Vec<u8>, isize> {
@@ -353,6 +391,9 @@ fn execve_with_inode(
     inode: Arc<ext4_fs::Inode>,
 ) -> isize {
     const ENOEXEC: isize = -8;
+    if let Err(e) = validate_exec_payload(&args_vec, &envs_vec) {
+        return e;
+    }
     // Try lazy ELF loading to avoid reading large binaries into kernel heap.
     let interp = {
         let inode = Arc::clone(&inode);
@@ -547,24 +588,7 @@ fn execve_with_inode(
             for a in args_vec.iter().skip(1) {
                 new_args.push(a.clone());
             }
-            let process = current_process();
-            if let Some(interp_interp) = elf_interp_path(&interp_data) {
-                let interp_interp_data = match load_interp_data(&interp_interp) {
-                    Ok(data) => data,
-                    Err(e) => return e,
-                };
-                if let Err(e) =
-                    process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec)
-                {
-                    return e;
-                }
-            } else {
-                if let Err(e) = process.exec(&interp_data, new_args, envs_vec) {
-                    return e;
-                }
-            }
-            maybe_stop_after_ptrace_exec();
-            return 0;
+            return exec_interpreter(interp_data, new_args, envs_vec);
         }
         return ENOEXEC;
     }
@@ -592,23 +616,7 @@ fn execve_with_inode(
         for a in args_vec.iter().skip(1) {
             new_args.push(a.clone());
         }
-        let process = current_process();
-        if let Some(interp_interp) = elf_interp_path(&interp_data) {
-            let interp_interp_data = match load_interp_data(&interp_interp) {
-                Ok(data) => data,
-                Err(e) => return e,
-            };
-            if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec)
-            {
-                return e;
-            }
-        } else {
-            if let Err(e) = process.exec(&interp_data, new_args, envs_vec) {
-                return e;
-            }
-        }
-        maybe_stop_after_ptrace_exec();
-        return 0;
+        return exec_interpreter(interp_data, new_args, envs_vec);
     }
 
     // Non-ELF without shebang: let shells interpret it.

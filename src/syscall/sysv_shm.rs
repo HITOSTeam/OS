@@ -687,7 +687,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     let inner = process.borrow_mut();
 
     let start = if shmaddr == 0 {
-        let memory_set = inner.memory_set.lock();
+        let mut memory_set = inner.memory_set.lock();
         let Some(start) = memory_set.find_free_mmap_range(None, map_len, USER_VA_TOP) else {
             return err(SyscallError::ENOMEM);
         };
@@ -749,8 +749,10 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
         file_offset: 0,
         backing_id: 0,
         memfd_id: 0,
+        anon_shared_id: 0,
         sysv_shmid: shmid,
         growsdown: false,
+        fork_inherited_anon: false,
     };
     let areas = Vec::from([VmaInsertArea::SharedFrames { start, end, frames }]);
     let detached_shmids = {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::fs::{PseudoFile, PseudoKindTag};
 use crate::syscall::sysv_shm::{
     detach_attaches_overlapping, find_attach_containing, release_detached_attach_refs,
     segment_shared_frames_existing, segment_size, split_mremap_attach,
@@ -55,6 +56,7 @@ pub fn syscall_brk(addr: usize) -> isize {
     update.result_brk() as isize
 }
 
+/// 使用 文件 填充 mmap 地方的内容
 fn populate_file_mapping(
     memory_set: &mut MemorySet,
     file: &Arc<dyn File + Send + Sync>,
@@ -84,6 +86,153 @@ fn populate_file_mapping(
     true
 }
 
+#[derive(Clone, Copy)]
+enum MmapSource<'a> {
+    Anonymous,
+    RegularFile {
+        inode_file: &'a OSInode,
+        dev: usize,
+        ino: u32,
+    },
+    Shm {
+        shm: &'a PseudoShmFile,
+        memfd_id: u64,
+        sealed_write: bool,
+    },
+    DevZero,
+}
+
+impl MmapSource<'_> {
+    // 对于不同文件类型，进行长度的转换
+    fn file_valid_len(self, off: usize, map_len: usize) -> usize {
+        match self {
+            Self::Anonymous | Self::DevZero => map_len,
+            Self::RegularFile { inode_file, .. } => {
+                let pending_end = inode_file.pending_write_end();
+                let inode = inode_file.ext4_inode();
+                let file_size = {
+                    let _ext4_guard = ext4_lock();
+                    inode.size() as usize
+                }
+                .max(pending_end);
+                file_size.saturating_sub(off).min(map_len)
+            }
+            Self::Shm { shm, .. } => shm.len().saturating_sub(off).min(map_len),
+        }
+    }
+
+    // 文件长度 是否有超出 的可能性
+    fn has_sigbus_tail(self) -> bool {
+        matches!(self, Self::RegularFile { .. } | Self::Shm { .. })
+    }
+}
+
+// 根据 mmap source 和共享属性构造需要插入的 VMA 。
+// 返回vec的原因是私有文件映射 超出部分 也需要
+fn build_vma_areas(
+    source: MmapSource<'_>,
+    is_shared: bool,
+    map_start: usize,
+    map_end: usize,
+    sigbus_start: usize,
+    off: usize,
+) -> Result<Vec<VmaInsertArea>, isize> {
+    let mut areas = Vec::new();
+    match (is_shared, source) {
+        (true, MmapSource::RegularFile { .. }) => {
+            // 普通文件 MAP_SHARED 走 lazy fault + shared file cache。
+            if map_start < sigbus_start {
+                areas.push(VmaInsertArea::Lazy {
+                    start: map_start,
+                    end: sigbus_start,
+                });
+            }
+        }
+        (true, MmapSource::Shm { shm, .. }) => {
+            let file_mapped_len = sigbus_start.saturating_sub(map_start);
+            let Some(frames) = shm.shared_frames_existing(off, file_mapped_len) else {
+                return Err(err(SyscallError::ENOMEM));
+            };
+            if map_start < sigbus_start {
+                areas.push(VmaInsertArea::SharedFrames {
+                    start: map_start,
+                    end: sigbus_start,
+                    frames,
+                });
+            } else if !frames.is_empty() {
+                return Err(err(SyscallError::ENOMEM));
+            }
+        }
+        (true, MmapSource::Anonymous | MmapSource::DevZero) => {
+            // Linux 的共享匿名 mmap 只建立 VMA；页在 fault 时分配并按 VMA 身份共享。
+            areas.push(VmaInsertArea::Lazy {
+                start: map_start,
+                end: map_end,
+            });
+        }
+        (false, MmapSource::Anonymous | MmapSource::DevZero) => {
+            areas.push(VmaInsertArea::Lazy {
+                start: map_start,
+                end: map_end,
+            });
+        }
+        (false, MmapSource::RegularFile { .. } | MmapSource::Shm { .. }) => {
+            if map_start < sigbus_start {
+                areas.push(VmaInsertArea::Framed {
+                    start: map_start,
+                    end: sigbus_start,
+                });
+            }
+            if sigbus_start < map_end {
+                areas.push(VmaInsertArea::Lazy {
+                    start: sigbus_start,
+                    end: map_end,
+                });
+            }
+        }
+    }
+    if is_shared && sigbus_start < map_end {
+        areas.push(VmaInsertArea::Lazy {
+            start: sigbus_start,
+            end: map_end,
+        });
+    }
+    Ok(areas)
+}
+
+// 执行 VMA 记录 的插入 或者 替换
+fn commit_mmap_vma(
+    memory_set: &mut MemorySet,
+    replace: bool,
+    region: VmRegion,
+    areas: Vec<VmaInsertArea>,
+    lock_range: bool,
+    backing_file: Option<&Arc<dyn File + Send + Sync>>,
+    populate_file: Option<&Arc<dyn File + Send + Sync>>,
+    start: usize,
+    len: usize,
+    off: usize,
+) -> bool {
+    match (replace, populate_file) {
+        (true, Some(file)) => memory_set.try_replace_user_vma_with(
+            region,
+            areas,
+            lock_range,
+            backing_file,
+            |memory_set| populate_file_mapping(memory_set, file, start, len, off),
+        ),
+        (true, None) => memory_set.try_replace_user_vma(region, areas, lock_range, backing_file),
+        (false, Some(file)) => memory_set.try_insert_user_vma_with(
+            region,
+            areas,
+            lock_range,
+            backing_file,
+            |memory_set| populate_file_mapping(memory_set, file, start, len, off),
+        ),
+        (false, None) => memory_set.try_insert_user_vma(region, areas, lock_range, backing_file),
+    }
+}
+
 pub fn syscall_mmap(
     addr: usize,
     len: usize,
@@ -92,6 +241,10 @@ pub fn syscall_mmap(
     fd: isize,
     off: usize,
 ) -> isize {
+    // mmap 入口只解析用户参数并构造 VmRegion/VmaInsertArea。
+    // 真正的插入、替换、回滚交给 MemorySet 统一处理。
+    //
+    // 1.flags检查,flags必须是以下可知类型
     const MAP_KNOWN_MASK: usize = MAP_TYPE_MASK
         | MAP_FIXED
         | MAP_ANONYMOUS
@@ -106,6 +259,7 @@ pub fn syscall_mmap(
     if map_type == MAP_SHARED_VALIDATE && (flags & !MAP_KNOWN_MASK) != 0 {
         return err(SyscallError::EOPNOTSUPP);
     }
+    // 是否为共享 mmap
     let is_shared = map_type == MAP_SHARED || map_type == MAP_SHARED_VALIDATE;
     let is_anon = (flags & MAP_ANONYMOUS) != 0;
     if !is_anon && fd < 0 {
@@ -118,44 +272,85 @@ pub fn syscall_mmap(
         return err(SyscallError::EINVAL);
     }
 
+    // 非匿名映射，那么读取对应的文件
     let file = if !is_anon {
-        let Some(file) = get_fd_file(fd as usize) else {
+        let Some(file) = current_files().lock().get_file(fd as usize) else {
             return err(SyscallError::EBADF);
         };
         if !file.readable() {
             return err(SyscallError::EACCES);
         }
         if is_shared && (prot & PROT_WRITE) != 0 {
+            // 文件可写性检查
+            // 普通文件 与 shmfile
             if !file.writable() {
                 return err(SyscallError::EACCES);
-            }
-            if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-                if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
-                    return err(SyscallError::EPERM);
-                }
             }
         }
         Some(file)
     } else {
         None
     };
-    let (file_backed, file_dev, file_ino, file_offset) = if let Some(file) = &file {
+    // 像 Linux can_mmap_file() 一样先显式确认 fd 类型；未知文件不能 fallback 成零页。
+    let source = if is_anon {
+        MmapSource::Anonymous
+    } else {
+        let file = file.as_ref().expect("non-anonymous mmap has file");
         if let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() {
             let inode = inode_file.ext4_inode();
             let (dev, ino) = {
                 let _ext4_guard = ext4_lock();
                 (inode.device_id(), inode.inode_num())
             };
-            (true, dev, ino, off)
+            MmapSource::RegularFile {
+                inode_file,
+                dev,
+                ino,
+            }
+        } else if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+            MmapSource::Shm {
+                shm,
+                memfd_id: shm.memfd_id(),
+                sealed_write: shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE),
+            }
+        } else if file
+            .as_any()
+            .downcast_ref::<PseudoFile>()
+            .is_some_and(|pseudo| pseudo.kind_tag() == PseudoKindTag::Zero)
+        {
+            MmapSource::DevZero
         } else {
-            (false, 0, 0, off)
+            return err(SyscallError::ENODEV);
         }
-    } else {
-        (false, 0, 0, 0)
     };
-    let shared_inode_backed = is_shared && file_backed;
+    let (file_backed, file_dev, file_ino) = match source {
+        MmapSource::RegularFile { dev, ino, .. } => (true, dev, ino),
+        _ => (false, 0, 0),
+    };
+    let file_offset = match source {
+        MmapSource::Anonymous => 0,
+        _ => off,
+    };
+    if is_shared && (prot & PROT_WRITE) != 0 {
+        if let MmapSource::Shm { sealed_write, .. } = source {
+            if sealed_write {
+                return err(SyscallError::EPERM);
+            }
+        }
+    }
+    let shared_inode_backed = is_shared && matches!(source, MmapSource::RegularFile { .. });
+    let shared_anon_backed =
+        is_shared && matches!(source, MmapSource::Anonymous | MmapSource::DevZero);
+    // 对齐len
     let map_len = align_up(len, PAGE_SIZE);
-    let commit_charge = anon_private_commit_charge(map_len, prot, is_anon, is_shared);
+    // 私有匿名和 /dev/zero 私有映射都可能在写 fault 时分配私有页。
+    let private_zero_source = is_anon || matches!(source, MmapSource::DevZero);
+    let commit_charge = if private_zero_source && !is_shared && (prot & PROT_WRITE) != 0 {
+        map_len
+    } else {
+        0
+    };
+    // 检查是否超出限制
     if exceeds_overcommit_limit(commit_charge) {
         return err(SyscallError::ENOMEM);
     }
@@ -163,8 +358,8 @@ pub fn syscall_mmap(
     let process = current_process();
     let inner = process.borrow_mut();
 
-    // Non-fixed mmap treats addr as a hint; otherwise MemorySet picks a
-    // Linux-like top-down hole with a low-address fallback near brk.
+    // 非 MAP_FIXED 时 addr 仅作为地址建议；MemorySet 会从高地址向下找空闲区间，
+    // 找不到时回退到 brk 附近的低地址（与 Linux 行为一致）。
     let is_fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     let start = if is_fixed {
         if addr == 0 {
@@ -172,7 +367,7 @@ pub fn syscall_mmap(
         }
         align_down(addr, PAGE_SIZE)
     } else {
-        let memory_set = inner.memory_set.lock();
+        let mut memory_set = inner.memory_set.lock();
         let Some(start) =
             memory_set.find_free_mmap_range((addr != 0).then_some(addr), map_len, USER_VA_TOP)
         else {
@@ -193,23 +388,22 @@ pub fn syscall_mmap(
     let map_start = start;
     let map_end = end;
     let perm = VmRegion::permission_from_prot(prot);
+    // 是否锁定 对应区间,目前还没有swap 实现(TODO)
     let lock_range = {
         let memory_set = inner.memory_set.lock();
-        // For a kernel-chosen (non-MAP_FIXED) placement the range must be genuinely
-        // free in both bookkeeping structures; fail with ENOMEM rather than letting
-        // the new mapping clobber an existing one.
+        // 非 MAP_FIXED 时目标区间必须在两套数据结构中均空闲，vma 以及 真实数据映射
         if !is_fixed && !memory_set.user_range_is_free(map_start, map_end, USER_VA_TOP) {
             return err(SyscallError::ENOMEM);
         }
         if (flags & MAP_FIXED_NOREPLACE) != 0 {
-            // MAP_FIXED_NOREPLACE must fail with EEXIST instead of relocating when
-            // the fixed target collides with anything in either structure.
+            // MAP_FIXED_NOREPLACE：目标区间与任何已有映射冲突时必须返回 EEXIST，而不是重新选址。
             if !memory_set.user_range_is_free(map_start, map_end, USER_VA_TOP) {
                 return err(SyscallError::EEXIST);
             }
         }
+        // FIXED允许覆盖,但
+        // 禁止覆盖内核专用页（如 TrapContext/trampoline），这些页的 PTE 不含 U 位。
         if (flags & MAP_FIXED) != 0 {
-            // Refuse to map over kernel-only pages (e.g. TrapContext/trampoline).
             let mut cur = start;
             while cur < end {
                 let vpn = crate::mm::VirtAddr::from(cur).floor();
@@ -240,122 +434,37 @@ pub fn syscall_mmap(
         );
     }
 
-    let file_valid_len = if let Some(file) = &file {
-        if let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() {
-            let pending_end = inode_file.pending_write_end();
-            let inode = inode_file.ext4_inode();
-            let file_size = {
-                let _ext4_guard = ext4_lock();
-                inode.size() as usize
-            }
-            .max(pending_end);
-            file_size.saturating_sub(off).min(map_len)
-        } else if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-            shm.len().saturating_sub(off).min(map_len)
-        } else {
-            map_len
-        }
-    } else {
-        map_len
-    };
-    // Linux delivers SIGBUS for file-backed accesses that go beyond EOF,
-    // starting from the first full page after the file-backed byte range.
-    let sigbus_enabled = !is_anon;
-    let sigbus_start = if sigbus_enabled {
+    // 文件长度由显式 source 决定；/dev/zero 按无限零源处理，不产生 SIGBUS 尾区。
+    let file_valid_len = source.file_valid_len(off, map_len);
+    // 文件映射中超出文件末尾的访问会触发 SIGBUS，从文件有效范围之后的第一个完整页开始。
+    let sigbus_start = if source.has_sigbus_tail() {
         map_start + align_up(file_valid_len, PAGE_SIZE).min(map_len)
     } else {
         map_end
     };
 
-    let mut vma_areas = Vec::new();
-    if is_shared {
-        if shared_inode_backed {
-            if map_start < sigbus_start {
-                vma_areas.push(VmaInsertArea::Lazy {
-                    start: map_start,
-                    end: sigbus_start,
-                });
-            }
-        } else {
-            let frames = if let Some(file) = &file {
-                if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-                    let file_mapped_len = sigbus_start.saturating_sub(map_start);
-                    let Some(frames) = shm.shared_frames_existing(off, file_mapped_len) else {
-                        return err(SyscallError::ENOMEM);
-                    };
-                    frames
-                } else {
-                    let file_mapped_len = sigbus_start.saturating_sub(map_start);
-                    let pages = file_mapped_len / PAGE_SIZE;
-                    let mut frames = alloc::vec::Vec::with_capacity(pages);
-                    for _ in 0..pages {
-                        let Some(frame) = frame_alloc() else {
-                            return err(SyscallError::ENOMEM);
-                        };
-                        frames.push(frame);
-                    }
-                    frames
-                }
-            } else {
-                let pages = map_len / PAGE_SIZE;
-                let mut frames = alloc::vec::Vec::with_capacity(pages);
-                for _ in 0..pages {
-                    let Some(frame) = frame_alloc() else {
-                        return err(SyscallError::ENOMEM);
-                    };
-                    frames.push(frame);
-                }
-                frames
-            };
-            if map_start < sigbus_start {
-                vma_areas.push(VmaInsertArea::SharedFrames {
-                    start: map_start,
-                    end: sigbus_start,
-                    frames,
-                });
-            } else if !frames.is_empty() {
-                return err(SyscallError::ENOMEM);
-            }
-        }
-        if sigbus_start < map_end {
-            vma_areas.push(VmaInsertArea::Lazy {
-                start: sigbus_start,
-                end: map_end,
-            });
-        }
-    } else if is_anon {
-        vma_areas.push(VmaInsertArea::Lazy {
-            start: map_start,
-            end: map_end,
-        });
+    let vma_areas = match build_vma_areas(source, is_shared, map_start, map_end, sigbus_start, off)
+    {
+        Ok(areas) => areas,
+        Err(e) => return e,
+    };
+    let (memfd_id, sealed_write) = match source {
+        MmapSource::Shm {
+            memfd_id,
+            sealed_write,
+            ..
+        } => (memfd_id, sealed_write),
+        _ => (0, false),
+    };
+    let anon_shared_id = if shared_anon_backed {
+        crate::mm::allocate_shared_anon_id()
     } else {
-        if map_start < sigbus_start {
-            vma_areas.push(VmaInsertArea::Framed {
-                start: map_start,
-                end: sigbus_start,
-            });
-        }
-        if sigbus_start < map_end {
-            vma_areas.push(VmaInsertArea::Lazy {
-                start: sigbus_start,
-                end: map_end,
-            });
-        }
-    }
-    let (memfd_id, sealed_write) = if let Some(file) = &file {
-        if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-            (
-                shm.memfd_id(),
-                shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE),
-            )
-        } else {
-            (0, false)
-        }
-    } else {
-        (0, false)
+        0
     };
     let may_write_upgrade = if is_anon {
         true
+    } else if matches!(source, MmapSource::DevZero) {
+        !is_shared || file.as_ref().is_some_and(|f| f.writable())
     } else if is_shared {
         file.as_ref()
             .map(|f| f.writable() && !sealed_write)
@@ -363,17 +472,19 @@ pub fn syscall_mmap(
     } else {
         true
     };
+    // VmRegion 是 syscall 可见语义的权威记录，fault/mprotect/msync 都应回到这里取策略。
     let region = VmRegion {
         kind: VmRegionKind::Mmap,
         start,
         len: map_len,
         prot: prot & (PROT_READ | PROT_WRITE | PROT_EXEC),
-        map_type: if shared_inode_backed {
-            MapType::Lazy
-        } else if is_shared || !is_anon {
-            MapType::Framed
-        } else {
-            MapType::Lazy
+        map_type: match (is_shared, source) {
+            (true, MmapSource::RegularFile { .. })
+            | (true, MmapSource::Anonymous | MmapSource::DevZero)
+            | (false, MmapSource::Anonymous | MmapSource::DevZero) => MapType::Lazy,
+            (true, MmapSource::Shm { .. })
+            | (false, MmapSource::RegularFile { .. })
+            | (false, MmapSource::Shm { .. }) => MapType::Framed,
         },
         map_perm: perm,
         file_valid_len,
@@ -386,14 +497,23 @@ pub fn syscall_mmap(
         file_offset,
         backing_id: 0,
         memfd_id,
+        anon_shared_id,
         sysv_shmid: 0,
         growsdown: (flags & MAP_GROWSDOWN) != 0,
+        fork_inherited_anon: false,
     };
-    let should_populate_file = !is_anon && fd >= 0 && !shared_inode_backed;
-    let backing_file = file.as_ref();
+    // shared OSInode 页由 fault 从文件/cache 装入；private/file framed 映射仍可预填充。
+    let should_populate_file =
+        matches!(source, MmapSource::RegularFile { .. }) && !shared_inode_backed;
+    let backing_file = match source {
+        MmapSource::RegularFile { .. } | MmapSource::Shm { .. } => file.as_ref(),
+        _ => None,
+    };
+    let populate_file = should_populate_file.then_some(backing_file).flatten();
+    let replace_existing = (flags & MAP_FIXED) != 0;
     let detached_shmids = {
         let mut memory_set = inner.memory_set.lock();
-        let fixed_attach_update = if (flags & MAP_FIXED) != 0 {
+        let fixed_attach_update = if replace_existing {
             let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
             let Some(release_shmids) =
                 detach_attaches_overlapping(&mut updated_attaches, map_start, map_len)
@@ -404,43 +524,18 @@ pub fn syscall_mmap(
         } else {
             None
         };
-        let inserted = if (flags & MAP_FIXED) != 0 {
-            if should_populate_file {
-                if let Some(populate_file) = backing_file {
-                    memory_set.try_replace_user_vma_with(
-                        region,
-                        vma_areas,
-                        lock_range,
-                        backing_file,
-                        |memory_set| {
-                            populate_file_mapping(memory_set, populate_file, start, len, off)
-                        },
-                    )
-                } else {
-                    memory_set.try_replace_user_vma(region, vma_areas, lock_range, backing_file)
-                }
-            } else {
-                memory_set.try_replace_user_vma(region, vma_areas, lock_range, backing_file)
-            }
-        } else {
-            if should_populate_file {
-                if let Some(populate_file) = backing_file {
-                    memory_set.try_insert_user_vma_with(
-                        region,
-                        vma_areas,
-                        lock_range,
-                        backing_file,
-                        |memory_set| {
-                            populate_file_mapping(memory_set, populate_file, start, len, off)
-                        },
-                    )
-                } else {
-                    memory_set.try_insert_user_vma(region, vma_areas, lock_range, backing_file)
-                }
-            } else {
-                memory_set.try_insert_user_vma(region, vma_areas, lock_range, backing_file)
-            }
-        };
+        let inserted = commit_mmap_vma(
+            &mut memory_set,
+            replace_existing,
+            region,
+            vma_areas,
+            lock_range,
+            backing_file,
+            populate_file,
+            start,
+            len,
+            off,
+        );
         if !inserted {
             return err(SyscallError::ENOMEM);
         }
@@ -452,7 +547,7 @@ pub fn syscall_mmap(
         } else {
             Vec::new()
         };
-        if !is_fixed {
+        if !replace_existing {
             memory_set.note_mmap_end(end);
         }
         detached_shmids
@@ -639,7 +734,7 @@ pub fn syscall_mremap(
         if (flags & MREMAP_MAYMOVE) == 0 {
             return err(SyscallError::ENOMEM);
         }
-        let memory_set = inner.memory_set.lock();
+        let mut memory_set = inner.memory_set.lock();
         let Some(free_start) = memory_set.find_free_mmap_range(None, new_len, USER_VA_TOP) else {
             return err(SyscallError::ENOMEM);
         };
@@ -839,6 +934,7 @@ pub fn syscall_mremap(
         if grow_start < final_sigbus_start {
             let grow_valid_end = min(final_sigbus_start, target_new_end);
             if src_region.shared {
+                // shared grow 的新有效页保持 lazy，避免和全局 shared cache 分裂。
                 grow_areas.push(VmaInsertArea::Lazy {
                     start: grow_start,
                     end: grow_valid_end,
@@ -878,6 +974,7 @@ pub fn syscall_mremap(
                 final_file_valid_len,
                 |memory_set| {
                     if src_region.shared {
+                        // shared file 新页不在 mremap 时拷贝，后续 fault 统一走 cache/file。
                         return true;
                     }
                     let token = memory_set.token();
