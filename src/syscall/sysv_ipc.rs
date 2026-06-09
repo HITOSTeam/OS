@@ -10,10 +10,12 @@ use spin::Mutex;
 use crate::fs::parse_proc_sys_usize;
 use crate::mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value};
 use crate::syscall::error::{SyscallError, err};
+use crate::task::block_sleep::add_timer;
 use crate::task::manager::wakeup_task;
 use crate::task::processor::{block_current_and_run_next, current_process, current_task};
 use crate::task::signal::has_wait_interrupting_pending;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
+use crate::time::get_time_ms;
 use crate::trap::get_current_token;
 
 const IPC_PRIVATE: usize = 0;
@@ -30,6 +32,7 @@ const MSG_INFO: usize = 12;
 const MSG_STAT_ANY: usize = 13;
 const SEM_STAT: usize = 18;
 const SEM_INFO: usize = 19;
+const SEM_STAT_ANY: usize = 20;
 
 const MSG_NOERROR: usize = 0x1000;
 const MSG_EXCEPT: usize = 0x2000;
@@ -56,6 +59,14 @@ const SEMOPM: usize = 500;
 const MSGMNB: usize = 16384;
 const MSGMNI: usize = 4096;
 const MSGMAX: usize = 8192;
+const MSGSSZ: i32 = 16;
+const MSGPOOL: i32 = (MSGMNI * MSGMNB / 1024) as i32;
+const MSGTQL: i32 = MSGMNB as i32;
+const MSGMAP: i32 = MSGMNB as i32;
+const MSGSEG: i32 = {
+    let seg = MSGPOOL * 1024 / MSGSSZ;
+    if seg <= 0xffff { seg } else { 0xffff }
+};
 const PROCFS_MSGMAX: &str = "/proc/sys/kernel/msgmax";
 const PROCFS_MSGMNB: &str = "/proc/sys/kernel/msgmnb";
 const PROCFS_MSGMNI: &str = "/proc/sys/kernel/msgmni";
@@ -335,6 +346,13 @@ struct SemBuf {
     sem_num: u16,
     sem_op: i16,
     sem_flg: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SemTimeSpecUser {
+    tv_sec: i64,
+    tv_nsec: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -722,13 +740,32 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
 
     if cmd == IPC_INFO || cmd == MSG_INFO {
         let highest_index = mgr.queues.keys().next_back().copied().unwrap_or(0);
+        let (msgpool, msgmap, msgtql) = if cmd == MSG_INFO {
+            let total_messages = mgr
+                .queues
+                .values()
+                .fold(0usize, |acc, queue| acc.saturating_add(queue.msgs.len()));
+            let total_bytes = mgr
+                .queues
+                .values()
+                .fold(0usize, |acc, queue| acc.saturating_add(queue.cbytes));
+            (
+                mgr.queues.len().min(i32::MAX as usize) as i32,
+                total_messages.min(i32::MAX as usize) as i32,
+                total_bytes.min(i32::MAX as usize) as i32,
+            )
+        } else {
+            (MSGPOOL, MSGMAP, MSGTQL)
+        };
         let info = MsgInfoUser {
+            msgpool,
+            msgmap,
             msgmax: runtime_msgmax_limit() as i32,
             msgmnb: runtime_msgmnb_limit() as i32,
             msgmni: runtime_msgmni_limit() as i32,
-            msgssz: 16,
-            msgseg: 1024,
-            msgtql: mgr.queues.len() as i32,
+            msgssz: MSGSSZ,
+            msgtql,
+            msgseg: MSGSEG,
             ..MsgInfoUser::default()
         };
         if try_write_user_value(token, buf as *mut MsgInfoUser, &info).is_err() {
@@ -738,7 +775,7 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
     }
 
     if cmd == MSG_STAT || cmd == MSG_STAT_ANY {
-        let Some((&queue_id, queue)) = mgr.queues.iter().nth(msqid) else {
+        let Some(queue) = mgr.queues.get(&msqid) else {
             return err(SyscallError::EINVAL);
         };
         if cmd == MSG_STAT_ANY || check_ipc_access(&queue.perm, MSG_R, &cred) {
@@ -746,7 +783,7 @@ pub fn syscall_msgctl(msqid: usize, cmd: usize, buf: usize) -> isize {
             if try_write_user_value(token, buf as *mut MsqidDsUser, &ds).is_err() {
                 return err(SyscallError::EFAULT);
             }
-            return queue_id as isize;
+            return msqid as isize;
         }
         return err(SyscallError::EACCES);
     }
@@ -1070,12 +1107,21 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             let mgr = managers.entry(ipc_ns_id).or_default();
             let highest_index = mgr.sets.keys().next_back().copied().unwrap_or(0);
             let (semmsl, semmns, semopm, semmni) = runtime_sem_limits();
+            let total_sems = mgr
+                .sets
+                .values()
+                .fold(0usize, |acc, set| acc.saturating_add(set.sems.len()));
             let info = SemInfoUser {
                 semmni: semmni as i32,
                 semmns: semmns as i32,
                 semmsl: semmsl as i32,
                 semopm: semopm as i32,
                 semusz: mgr.sets.len() as i32,
+                semaem: if cmd == SEM_INFO {
+                    total_sems as i32
+                } else {
+                    SEMVMX
+                },
                 semvmx: SEMVMX,
                 ..SemInfoUser::default()
             };
@@ -1089,21 +1135,18 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
 
     let mut managers = SEM_MANAGERS.lock();
     let mgr = managers.entry(ipc_ns_id).or_default();
-    if cmd == SEM_STAT {
-        let Some((&set_id, _)) = mgr.sets.iter().nth(semid) else {
+    if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
+        let Some(set) = mgr.sets.get(&semid) else {
             return err(SyscallError::EINVAL);
         };
-        let Some(set) = mgr.sets.get(&set_id) else {
-            return err(SyscallError::EINVAL);
-        };
-        if !check_ipc_access(&set.perm, SEM_R, &cred) {
+        if cmd == SEM_STAT && !check_ipc_access(&set.perm, SEM_R, &cred) {
             return err(SyscallError::EACCES);
         }
         let ds = sem_to_user(set);
         if try_write_user_value(token, arg as *mut SemidDsUser, &ds).is_err() {
             return err(SyscallError::EFAULT);
         }
-        return set_id as isize;
+        return semid as isize;
     }
 
     let Some(set) = mgr.sets.get_mut(&semid) else {
@@ -1238,20 +1281,97 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
     }
 }
 
-fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
+#[derive(Clone, Copy)]
+enum SemBlockKind {
+    WaitForZero,
+    WaitForIncrease,
+}
+
+#[derive(Clone, Copy)]
+enum SemTimeout {
+    None,
+    Expired,
+    DeadlineMs(usize),
+}
+
+impl SemTimeout {
+    fn from_user(token: usize, timeout_ptr: usize) -> Result<Self, isize> {
+        if timeout_ptr == 0 {
+            return Ok(Self::None);
+        }
+        let Some(ts) = try_read_user_value(token, timeout_ptr as *const SemTimeSpecUser) else {
+            return Err(err(SyscallError::EFAULT));
+        };
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return Err(err(SyscallError::EINVAL));
+        }
+        if ts.tv_sec == 0 && ts.tv_nsec == 0 {
+            return Ok(Self::Expired);
+        }
+        let sec_ms = (ts.tv_sec as usize).saturating_mul(1000);
+        let nsec_ms = ((ts.tv_nsec as usize).saturating_add(999_999)) / 1_000_000;
+        let wait_ms = sec_ms.saturating_add(nsec_ms).max(1);
+        Ok(Self::DeadlineMs(get_time_ms().saturating_add(wait_ms)))
+    }
+
+    fn expired(self) -> bool {
+        match self {
+            Self::Expired => true,
+            Self::DeadlineMs(deadline_ms) => get_time_ms() >= deadline_ms,
+            Self::None => false,
+        }
+    }
+
+    fn remaining_ms(self) -> Option<usize> {
+        match self {
+            Self::DeadlineMs(deadline_ms) => Some(deadline_ms.saturating_sub(get_time_ms()).max(1)),
+            Self::None | Self::Expired => None,
+        }
+    }
+}
+
+fn read_sem_ops(token: usize, sops: usize, nsops: usize) -> Result<Vec<SemBuf>, isize> {
+    let mut ops = vec![
+        SemBuf {
+            sem_num: 0,
+            sem_op: 0,
+            sem_flg: 0,
+        };
+        nsops
+    ];
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            ops.as_mut_ptr() as *mut u8,
+            ops.len() * core::mem::size_of::<SemBuf>(),
+        )
+    };
+    if try_copy_from_user(token, sops as *const u8, bytes).is_err() {
+        return Err(err(SyscallError::EFAULT));
+    }
+    Ok(ops)
+}
+
+fn do_semop(semid: usize, sops: usize, nsops: usize, timeout: SemTimeout) -> isize {
     if nsops == 0 {
         return err(SyscallError::EINVAL);
     }
-    if nsops > 1 {
+    let (_semmsl, _semmns, semopm, _semmni) = runtime_sem_limits();
+    if nsops > semopm {
         return err(SyscallError::E2BIG);
     }
     let token = get_current_token();
-    let Some(op) = try_read_user_value(token, sops as *const SemBuf) else {
-        return err(SyscallError::EFAULT);
+    let ops = match read_sem_ops(token, sops, nsops) {
+        Ok(ops) => ops,
+        Err(e) => return e,
     };
+    do_semop_locked(semid, ops, timeout)
+}
+
+fn do_semop_locked(semid: usize, ops: Vec<SemBuf>, timeout: SemTimeout) -> isize {
     let cred = current_cred();
     let ipc_ns_id = current_ipc_namespace_id();
     let mut waited = false;
+    let alter = ops.iter().any(|op| op.sem_op != 0);
 
     loop {
         let mut managers = SEM_MANAGERS.lock();
@@ -1263,55 +1383,68 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
                 err(SyscallError::EINVAL)
             };
         };
-        let Some(sem) = set.sems.get_mut(op.sem_num as usize) else {
-            return err(SyscallError::EFBIG);
-        };
-        let req = if op.sem_op == 0 { SEM_R } else { SEM_A };
+        for op in ops.iter().copied() {
+            if op.sem_num as usize >= set.sems.len() {
+                return err(SyscallError::EFBIG);
+            }
+        }
+        let req = if alter { SEM_A } else { SEM_R };
         if !check_ipc_access(&set.perm, req, &cred) {
             return err(SyscallError::EACCES);
         }
-        if op.sem_op > 0 {
-            let next = sem.val.saturating_add(op.sem_op as i32);
-            if next > SEMVMX {
-                return err(SyscallError::ERANGE);
+        let mut values = set.sems.iter().map(|sem| sem.val).collect::<Vec<_>>();
+        let mut operated = vec![false; set.sems.len()];
+        let mut touched = vec![false; set.sems.len()];
+        let mut would_block: Option<(usize, SemBlockKind, i16)> = None;
+
+        for op in ops.iter().copied() {
+            let idx = op.sem_num as usize;
+            operated[idx] = true;
+
+            if op.sem_op > 0 {
+                let next = values[idx].saturating_add(op.sem_op as i32);
+                if next > SEMVMX {
+                    return err(SyscallError::ERANGE);
+                }
+                values[idx] = next;
+                touched[idx] = true;
+                continue;
             }
-            sem.val = next;
-            sem.last_pid = cred.pid;
+
+            if op.sem_op == 0 {
+                if values[idx] == 0 {
+                    continue;
+                }
+                would_block = Some((idx, SemBlockKind::WaitForZero, op.sem_flg));
+                break;
+            }
+
+            let need = (-(op.sem_op as i32)) as i32;
+            if values[idx] >= need {
+                values[idx] -= need;
+                touched[idx] = true;
+                continue;
+            }
+            would_block = Some((idx, SemBlockKind::WaitForIncrease, op.sem_flg));
+            break;
+        }
+
+        if would_block.is_none() {
+            for (idx, sem) in set.sems.iter_mut().enumerate() {
+                if operated[idx] {
+                    sem.val = values[idx];
+                    sem.last_pid = cred.pid;
+                }
+                if touched[idx] {
+                    wake_sem_waiters(sem);
+                }
+            }
             set.otime = now_secs();
-            wake_sem_waiters(sem);
             return 0;
         }
-        if op.sem_op == 0 {
-            if sem.val == 0 {
-                return 0;
-            }
-            if (op.sem_flg as usize & IPC_NOWAIT) != 0 {
-                return err(SyscallError::EAGAIN);
-            }
-            if has_pending_unmasked_signal() {
-                return err(SyscallError::EINTR);
-            }
-            let Some(task) = current_task() else {
-                return err(SyscallError::EINVAL);
-            };
-            add_waiter_once(&mut sem.zcnt_waiters, &task);
-            drop(managers);
-            block_current_and_run_next();
-            waited = true;
-            if has_pending_unmasked_signal() {
-                return err(SyscallError::EINTR);
-            }
-            continue;
-        }
-        let need = (-op.sem_op) as i32;
-        if sem.val >= need {
-            sem.val -= need;
-            sem.last_pid = cred.pid;
-            set.otime = now_secs();
-            wake_sem_waiters(sem);
-            return 0;
-        }
-        if (op.sem_flg as usize & IPC_NOWAIT) != 0 {
+
+        let (idx, kind, sem_flg) = would_block.unwrap();
+        if (sem_flg as usize & IPC_NOWAIT) != 0 || timeout.expired() {
             return err(SyscallError::EAGAIN);
         }
         if has_pending_unmasked_signal() {
@@ -1320,20 +1453,36 @@ fn do_semop(semid: usize, sops: usize, nsops: usize) -> isize {
         let Some(task) = current_task() else {
             return err(SyscallError::EINVAL);
         };
-        add_waiter_once(&mut sem.ncnt_waiters, &task);
+        let Some(sem) = set.sems.get_mut(idx) else {
+            return err(SyscallError::EFBIG);
+        };
+        match kind {
+            SemBlockKind::WaitForZero => add_waiter_once(&mut sem.zcnt_waiters, &task),
+            SemBlockKind::WaitForIncrease => add_waiter_once(&mut sem.ncnt_waiters, &task),
+        }
+        if let Some(wait_ms) = timeout.remaining_ms() {
+            add_timer(Arc::clone(&task), wait_ms);
+        }
         drop(managers);
         block_current_and_run_next();
         waited = true;
         if has_pending_unmasked_signal() {
             return err(SyscallError::EINTR);
         }
+        if timeout.expired() {
+            return err(SyscallError::EAGAIN);
+        }
     }
 }
 
 pub fn syscall_semop(semid: usize, sops: usize, nsops: usize) -> isize {
-    do_semop(semid, sops, nsops)
+    do_semop(semid, sops, nsops, SemTimeout::None)
 }
 
-pub fn syscall_semtimedop(semid: usize, sops: usize, nsops: usize, _timeout: usize) -> isize {
-    do_semop(semid, sops, nsops)
+pub fn syscall_semtimedop(semid: usize, sops: usize, nsops: usize, timeout: usize) -> isize {
+    let sem_timeout = match SemTimeout::from_user(get_current_token(), timeout) {
+        Ok(timeout) => timeout,
+        Err(e) => return e,
+    };
+    do_semop(semid, sops, nsops, sem_timeout)
 }
