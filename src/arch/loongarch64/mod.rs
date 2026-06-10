@@ -1,5 +1,6 @@
 pub mod csr_defs;
 pub mod mm;
+pub mod task;
 pub mod trap;
 
 use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
