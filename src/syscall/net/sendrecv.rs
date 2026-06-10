@@ -127,6 +127,35 @@ fn visible_send_result(ret: isize, user_len: usize, had_pending: bool) -> isize 
     }
 }
 
+fn validate_sendmsg_control(msg: &MsgHdr) -> isize {
+    const CONTROL_COPY_CHUNK: usize = 256;
+
+    if msg.msg_controllen == 0 {
+        return 0;
+    }
+    if msg.msg_control == 0 {
+        return err(SyscallError::EFAULT);
+    }
+    if msg.msg_controllen > i32::MAX as usize {
+        return err(SyscallError::ENOBUFS);
+    }
+
+    let token = get_current_token();
+    let mut scratch = [0u8; CONTROL_COPY_CHUNK];
+    let mut copied = 0usize;
+    while copied < msg.msg_controllen {
+        let Some(ptr) = msg.msg_control.checked_add(copied) else {
+            return err(SyscallError::EFAULT);
+        };
+        let n = core::cmp::min(CONTROL_COPY_CHUNK, msg.msg_controllen - copied);
+        if try_copy_from_user(token, ptr as *const u8, &mut scratch[..n]).is_err() {
+            return err(SyscallError::EFAULT);
+        }
+        copied += n;
+    }
+    0
+}
+
 /// `sendmsg` / `sendmmsg` 的核心实现，支持三类 socket。
 ///
 /// 按以下顺序尝试 downcast：
@@ -145,15 +174,9 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if msg.msg_controllen > 0 {
-        if msg.msg_control == 0 {
-            return err(SyscallError::EFAULT);
-        }
-        let token = get_current_token();
-        let mut probe = [0u8; 1];
-        if try_copy_from_user(token, msg.msg_control as *const u8, &mut probe).is_err() {
-            return err(SyscallError::EFAULT);
-        }
+    let control_check = validate_sendmsg_control(msg);
+    if control_check != 0 {
+        return control_check;
     }
     let file = match get_file(fd) {
         Ok(f) => f,
