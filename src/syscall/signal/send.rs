@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::fs::{PidFdFile, PseudoDir};
+
 /// Deliver a signal to a process and all its live tasks.
 fn deliver_signal_to_process(
     target: &Arc<ProcessControlBlock>,
@@ -169,8 +171,32 @@ pub fn syscall_kill(pid: usize, signum: i32) -> isize {
     }
 }
 
-/// Linux `pidfd_send_signal(2)` for pidfds created by `pidfd_open` or
-/// `clone3(CLONE_PIDFD)`.
+/// 从任意文件对象中提取 `pidfd_send_signal` 的目标进程。
+///
+/// 支持两种 fd 类型：
+/// - [`PidFdFile`]：`pidfd_open` / `clone3(CLONE_PIDFD)` 产生的 pidfd，
+///   通过内部 `Weak<ProcessControlBlock>` 升级——若原进程已退出且 PCB 被释放，
+///   升级失败返回 `ESRCH`，确保 PID 复用后不误投递。
+/// - [`PseudoDir`]：`/proc/<pid>` 目录 fd，通过 `pidfd_target_process()` 解析，
+///   同样以 `Weak` 绑定进程身份。
+///
+/// 其他文件类型一律返回 `EBADF`。
+fn pidfd_send_signal_target(
+    file: &(dyn crate::fs::File + Send + Sync),
+) -> Result<Arc<ProcessControlBlock>, SyscallError> {
+    if let Some(pidfd_file) = file.as_any().downcast_ref::<PidFdFile>() {
+        return pidfd_file.target_process().ok_or(SyscallError::ESRCH);
+    }
+    if let Some(proc_dir) = file.as_any().downcast_ref::<PseudoDir>() {
+        if proc_dir.is_pidfd_target_dir() {
+            return proc_dir.pidfd_target_process().ok_or(SyscallError::ESRCH);
+        }
+    }
+    Err(SyscallError::EBADF)
+}
+
+/// Linux `pidfd_send_signal(2)` for pidfds created by `pidfd_open` /
+/// `clone3(CLONE_PIDFD)` and for `/proc/<pid>` directory fds.
 pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags: usize) -> isize {
     if flags != 0 {
         return err(SyscallError::EINVAL);
@@ -186,27 +212,20 @@ pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags:
     let Some(file) = file else {
         return err(SyscallError::EBADF);
     };
-    let Some(pidfd_file) = file.as_any().downcast_ref::<crate::fs::PidFdFile>() else {
-        return err(SyscallError::EBADF);
+    let process = match pidfd_send_signal_target(file.as_ref()) {
+        Ok(process) => process,
+        Err(e) => return err(e),
     };
-    // identity-safe 解析：通过 pidfd 内部的 Weak<ProcessControlBlock> 升级，
-    // 原 target 已被释放（即便 PID 数值被新进程复用）时也只会返回 None，
-    // 不会把信号错投递到无关进程。
-    let Some(process) = pidfd_file.target_process() else {
-        return err(SyscallError::ESRCH);
-    };
+    // Resolve through the fd-held Weak<ProcessControlBlock>, so a stale proc
+    // pidfd cannot accidentally signal an unrelated process after PID reuse.
 
     if !can_signal_process(&process, sig) {
         return err(SyscallError::EPERM);
     }
     // sig=0 is a Linux convention: probe whether the process exists and is
-    // reachable without actually delivering any signal.
+    // reachable without actually delivering any signal or touching siginfo.
     if sig == 0 {
         return 0;
-    }
-    let signum = sig as usize;
-    if rt_sigpending_limit_reached(&process, signum) {
-        return err(SyscallError::EAGAIN);
     }
 
     let sender = current_process();
@@ -233,6 +252,11 @@ pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags:
     } else {
         (0, 0)
     };
+
+    let signum = sig as usize;
+    if rt_sigpending_limit_reached(&process, signum) {
+        return err(SyscallError::EAGAIN);
+    }
 
     let Some(bit) = signal_bit(signum) else {
         return err(SyscallError::EINVAL);

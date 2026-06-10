@@ -27,6 +27,19 @@ const PROC_CONFIG_GZ: &[u8] = &[
     25, 236, 28, 226, 3, 228, 3, 0, 190, 82, 59, 223, 136, 0, 0, 0,
 ];
 
+/// procfs 的统一入口：将绝对路径映射到对应的伪文件或伪目录对象。
+///
+/// 匹配顺序：
+/// 1. `/proc` 根目录及 `/proc/sys/**` 静态目录树
+/// 2. `/proc/sysvipc` 目录
+/// 3. 固定内容的 `/proc/<name>` 文件（`meminfo`、`cpuinfo` 等）
+/// 4. 由 `managed_proc_sys_file_kind` 管理的可读写 `/proc/sys/**` 文件
+/// 5. `/proc/<pid>[/…]` per-process 条目，包括：
+///    - `/proc/<pid>`：绑定进程身份的 `PseudoDir`，供 `pidfd_send_signal` 使用
+///    - `fd`、`task`、`ns`、`task/<tid>/**`：各子目录
+///    - `stat`、`status`、`maps`、`cgroup` 等文本文件
+///
+/// 路径经 `normalize_proc_magic_path` 规范化后再匹配，路径格式不合法或进程不存在时返回 `None`。
 pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     let normalized = normalize_proc_magic_path(path);
     let trimmed = normalized.as_ref();
@@ -162,6 +175,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),
         "/proc/perf" => return Some(ProcPseudoFile::new(ProcFileKind::Perf)),
+        "/proc/kallsyms" => return Some(ProcPseudoFile::new(ProcFileKind::Kallsyms)),
         "/proc/kpageflags" => return Some(ProcPseudoFile::new(ProcFileKind::Kpageflags)),
         "/proc/sysvipc/msg" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcMsg)),
         "/proc/sysvipc/sem" => return Some(ProcPseudoFile::new(ProcFileKind::SysvipcSem)),
@@ -175,13 +189,16 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     }
 
     let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
+    let process = crate::task::manager::pid2process(pid as usize);
     if !proc_pid_exists(pid) {
         return None;
     }
     if rest.is_empty() {
-        return Some(Arc::new(PseudoDir::new(
+        let process = process?;
+        return Some(Arc::new(PseudoDir::new_proc_pid(
             &alloc::format!("/proc/{pid}"),
             proc_pid_entries(pid),
+            &process,
         )));
     }
     if rest == "fd" {

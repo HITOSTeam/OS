@@ -43,7 +43,7 @@ use crate::{
         },
         processor::{
             block_current_and_run_next, current_files, current_files_and_nofile_limit,
-            current_process, current_task, hart_id, suspend_current_and_run_next,
+            current_process, current_task, suspend_current_and_run_next,
         },
         sched::{SchedClass, sched_class},
         signal::{
@@ -226,14 +226,33 @@ pub(crate) fn unregister_executing_inode_locked(
     }
 }
 
+/// 从用户地址空间读取一个 `usize` 指针/整数。
+///
+/// `token` 指定要读取的用户页表；地址无效或不可读时返回 `EFAULT`。
 pub(super) fn try_read_usize_user(token: usize, ptr: usize) -> Result<usize, isize> {
     try_read_user_value(token, ptr as *const usize).ok_or(err(SyscallError::EFAULT))
 }
 
-pub(super) fn try_read_user_cstr(token: usize, ptr: usize) -> Result<String, isize> {
-    const MAX_USER_CSTR: usize = 256 * 1024;
+// exec 参数/环境指针数组的最大项数。上限按用户栈能容纳的指针数量估算。
+pub(super) const EXEC_ARG_PTR_LIMIT: usize =
+    crate::config::USER_STACK_SIZE / core::mem::size_of::<usize>();
+// 单个 argv/env 字符串最大长度，参考 Linux 的 MAX_ARG_STRLEN（32 pages）。
+pub(super) const EXEC_MAX_ARG_STRLEN: usize = crate::config::PAGE_SIZE * 32;
+
+/// 从用户地址读取以 NUL 结尾的 C 字符串，并限制最大扫描长度。
+///
+/// 这个函数同时服务普通路径字符串和 exec argv/env 字符串：
+/// - 读到 NUL 时返回当前字符串；
+/// - 用户地址不可读时返回 `EFAULT`；
+/// - 超过 `max_len` 仍未遇到 NUL 时返回调用方指定的错误。
+fn try_read_user_cstr_limited(
+    token: usize,
+    ptr: usize,
+    max_len: usize,
+    too_long: SyscallError,
+) -> Result<String, isize> {
     let mut s = String::new();
-    for i in 0..MAX_USER_CSTR {
+    for i in 0..max_len {
         let ch =
             try_read_user_value(token, (ptr + i) as *const u8).ok_or(err(SyscallError::EFAULT))?;
         if ch == 0 {
@@ -241,20 +260,39 @@ pub(super) fn try_read_user_cstr(token: usize, ptr: usize) -> Result<String, isi
         }
         s.push(ch as char);
     }
-    Err(err(SyscallError::ENAMETOOLONG))
+    Err(err(too_long))
 }
 
-pub(super) fn read_user_str_array(token: usize, vec_ptr: usize) -> Result<Vec<String>, isize> {
+/// 读取普通 syscall 路径/字符串参数。
+///
+/// 长度超过当前兼容上限时按路径类错误返回 `ENAMETOOLONG`。
+pub(super) fn try_read_user_cstr(token: usize, ptr: usize) -> Result<String, isize> {
+    try_read_user_cstr_limited(token, ptr, 256 * 1024, SyscallError::ENAMETOOLONG)
+}
+
+/// 读取 exec 专用的 argv/env 字符串。
+///
+/// Linux 对单个 argv/env 字符串使用 `MAX_ARG_STRLEN` 限制，超限应返回
+/// `E2BIG`，区别于普通路径字符串的 `ENAMETOOLONG`。
+pub(super) fn try_read_user_exec_cstr(token: usize, ptr: usize) -> Result<String, isize> {
+    try_read_user_cstr_limited(token, ptr, EXEC_MAX_ARG_STRLEN, SyscallError::E2BIG)
+}
+
+/// 读取用户传入的指针数组，直到遇到 NULL 结束项。
+///
+/// 用于 `argv`/`envp` 这类 `char **` 参数。空指针表示空数组；数组项过多
+/// 时返回 `E2BIG`，避免内核无限扫描用户内存。
+pub(super) fn read_user_ptr_array(token: usize, vec_ptr: usize) -> Result<Vec<usize>, isize> {
     let mut out = Vec::new();
     if vec_ptr == 0 {
         return Ok(out);
     }
-    for i in 0..4096usize {
+    for i in 0..EXEC_ARG_PTR_LIMIT {
         let p = try_read_usize_user(token, vec_ptr + i * size_of::<usize>())?;
         if p == 0 {
             return Ok(out);
         }
-        out.push(try_read_user_cstr(token, p)?);
+        out.push(p);
     }
     Err(err(SyscallError::E2BIG))
 }

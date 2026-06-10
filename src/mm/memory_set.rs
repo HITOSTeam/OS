@@ -1,8 +1,12 @@
-//! Implementation of [`MapArea`] and [`MemorySet`].
+//! 用户地址空间管理。
+//!
+//! `VmRegion` 记录 mmap/brk/ELF 的语义，
+//! `MapArea` 记录已经物化的页，`PageTable` 是硬件最终看到的映射。
 
 use super::elf_loader::{
-    ENOMEM, ET_DYN, ElfHeader64, ElfPhdr64, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR, parse_elf_headers,
-    read_exact_with,
+    ENOMEM, ET_DYN, ElfHeader64, ElfPhdr64, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
+    elf_arch_abi_from_bytes, parse_elf_headers, read_exact_with, validate_elf_arch_abi,
+    validate_elf_interp_abi,
 };
 use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
@@ -12,12 +16,12 @@ use crate::config::{
     MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
     USER_STACK_SIZE, phys_mem_end,
 };
-use crate::fs::cgroup_charge_anon_current;
+use crate::fs::File;
 use crate::println;
-use crate::task::processor::current_process;
+use crate::utils::RecycleAllocator;
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use bitflags::*;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
@@ -37,17 +41,171 @@ unsafe extern "C" {
     safe fn strampoline();
 }
 
+mod backing;
+mod fault;
+mod file_mmap;
+mod layout;
+mod map_area;
+mod mm_ref;
+mod range;
+mod rollback;
+mod vma;
+
+use backing::MmapBacking;
+pub use layout::BrkUpdate;
+pub use map_area::{LazyFaultResult, MapPermission, MapType};
+use map_area::{MapArea, pte_flags_for_mprotect, shift_vpn_by_delta};
+pub use mm_ref::MmRef;
+use range::*;
+use rollback::{UserRangeRollback, UserRangeSnapshot};
+use vma::VmRegionSet;
+pub use vma::{VmRegion, VmRegionKind, VmaInsertArea};
+
 static COW_CLONE_DIAG_SEQ: AtomicUsize = AtomicUsize::new(0);
+static MMAP_ASLR_SEQ: AtomicUsize = AtomicUsize::new(0);
+const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
+const MMAP_ASLR_RANGE: usize = 256 * 1024 * 1024;
 
 lazy_static! {
     /// a memory set instance through lazy_static! managing kernel space
     pub static ref KERNEL_SPACE: Mutex<MemorySet> = Mutex::new(MemorySet::new_kernel());
 }
 
+pub(crate) fn update_shared_file_page_cache(dev: usize, ino: u32, write_off: usize, data: &[u8]) {
+    backing::shared_file_page_cache_write(dev, ino, write_off, data);
+}
+
+pub(crate) fn resize_shared_file_page_cache(dev: usize, ino: u32, file_size: usize) {
+    backing::shared_file_page_cache_resize(dev, ino, file_size);
+}
+
+pub(crate) fn reclaim_shared_file_page_cache() -> usize {
+    backing::shared_file_page_cache_reclaim_unreferenced()
+}
+
+pub(crate) fn allocate_shared_anon_id() -> u64 {
+    backing::allocate_shared_anon_id()
+}
+
 /// memory set structure, controls virtual-memory space
 pub struct MemorySet {
+    /// 页表是真正给硬件使用的映射结果。
     page_table: PageTable,
+    /// 已物化页的跟踪表，包括 frame、COW 和 PROT_NONE 保存的 PTE 标志。
     areas: Vec<MapArea>,
+    /// 用户态 VMA 的权威元数据，类似 Linux mm_struct 里的 VMA 集合。
+    vm_regions: VmRegionSet,
+    /// System V shared memory attachments owned by this address space.
+    sysv_shm_attaches: Vec<ShmAttach>,
+    mmap_backings: BTreeMap<usize, MmapBacking>,
+    next_mmap_backing_id: usize,
+    heap_start: usize,
+    brk: usize,
+    mmap_next: usize,
+    mmap_topdown_cursor: usize,
+    mmap_aslr_offset: usize,
+    /// Virtual ranges currently locked by mlock/mlockall.
+    mlocked_ranges: Vec<(usize, usize)>,
+    /// Whether MCL_FUTURE is enabled for this address space.
+    mlockall_future: bool,
+    /// Mm-local trap-context VA slot allocator. Linux-style CLONE_VM needs this
+    /// to be tied to the address space rather than to per-PCB thread indexes.
+    trap_context_slots: RecycleAllocator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MprotectError {
+    AccessDenied,
+    Unmapped,
+}
+
+fn sort_map_areas(areas: &mut [MapArea]) {
+    areas.sort_unstable_by_key(|area| area.start_vpn().0);
+}
+
+fn vm_region_map_area_type_compatible(region: &VmRegion, area: &MapArea) -> bool {
+    area.map_type() == region.map_type
+        || (region.can_have_lazy_concrete() && area.map_type() == MapType::Lazy)
+}
+
+#[cfg(debug_assertions)]
+fn pte_flags_executable(flags: PTEFlags) -> bool {
+    #[cfg(target_arch = "riscv64")]
+    {
+        flags.contains(PTEFlags::X)
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        !flags.contains(PTEFlags::NX)
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_resident_pte_matches_region(region: &VmRegion, va: usize, flags: PTEFlags) {
+    debug_assert!(
+        va < region.sigbus_start(),
+        "resident PTE exists in VmRegion SIGBUS tail: va={:#x}, region={:#x}..{:#x}, sigbus={:#x}",
+        va,
+        region.start,
+        region.end(),
+        region.sigbus_start()
+    );
+    debug_assert!(
+        flags.contains(PTEFlags::U),
+        "resident user frame has non-user PTE at {:#x}",
+        va
+    );
+    if !region.map_permission().contains(MapPermission::W) {
+        debug_assert!(
+            !flags.contains(PTEFlags::W),
+            "non-writable VmRegion has writable resident PTE at {:#x}",
+            va
+        );
+    }
+    if !region.map_permission().contains(MapPermission::X) {
+        debug_assert!(
+            !pte_flags_executable(flags),
+            "non-executable VmRegion has executable resident PTE at {:#x}",
+            va
+        );
+    }
+    if flags.contains(PTEFlags::COW) {
+        debug_assert!(
+            !flags.contains(PTEFlags::W),
+            "COW PTE is still writable at {:#x}",
+            va
+        );
+        debug_assert!(
+            !flags.contains(PTEFlags::SHARED),
+            "PTE is both COW and SHARED at {:#x}",
+            va
+        );
+    }
+    if flags.contains(PTEFlags::SHARED) {
+        debug_assert!(
+            region.shared,
+            "SHARED PTE is not covered by a shared VmRegion at {:#x}",
+            va
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_saved_pte_flags_match_region(region: &VmRegion, va: usize, flags: PTEFlags) {
+    if flags.contains(PTEFlags::COW) {
+        debug_assert!(
+            !flags.contains(PTEFlags::SHARED),
+            "saved PTE flags are both COW and SHARED at {:#x}",
+            va
+        );
+    }
+    if flags.contains(PTEFlags::SHARED) {
+        debug_assert!(
+            region.shared,
+            "saved SHARED PTE flags are not covered by a shared VmRegion at {:#x}",
+            va
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,46 +215,1485 @@ pub struct ElfAux {
     pub phnum: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ShmAttach {
+    pub ipc_ns_id: usize,
+    pub addr: usize,
+    pub shmid: usize,
+    pub len: usize,
+    pub attach_id: usize,
+    pub accounted: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ShmAttachRef {
+    pub ipc_ns_id: usize,
+    pub shmid: usize,
+}
+
+impl ShmAttach {
+    pub fn end(&self) -> usize {
+        self.addr.saturating_add(self.len)
+    }
+
+    pub fn contains_range(&self, start: usize, len: usize) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        start >= self.addr && end <= self.end()
+    }
+}
+
 impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            vm_regions: VmRegionSet::new(),
+            sysv_shm_attaches: Vec::new(),
+            mmap_backings: BTreeMap::new(),
+            next_mmap_backing_id: 1,
+            heap_start: 0,
+            brk: 0,
+            mmap_next: DEFAULT_MMAP_BASE,
+            mmap_topdown_cursor: 0,
+            mmap_aslr_offset: next_mmap_aslr_offset(),
+            mlocked_ranges: Vec::new(),
+            mlockall_future: false,
+            trap_context_slots: RecycleAllocator::new(),
         }
     }
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
 
-    /// Lightweight summary used to diagnose fork/COW memory pressure.
-    pub fn cow_diag_stats(&self) -> (usize, usize, usize, usize, usize, usize) {
-        let mut total_data_frames = 0usize;
-        let mut identical_vpns = 0usize;
-        let mut lazy_areas = 0usize;
-        let mut framed_areas = 0usize;
-        let mut identical_areas = 0usize;
+    fn inherit_user_vm_metadata_from(&mut self, parent: &MemorySet) {
+        self.vm_regions = parent.vm_regions.clone();
+        self.vm_regions.mark_fork_inherited_anonymous_mmap();
+        self.sysv_shm_attaches = parent.sysv_shm_attaches.clone();
+        self.mmap_backings = parent.mmap_backings.clone();
+        self.next_mmap_backing_id = parent.next_mmap_backing_id;
+        self.heap_start = parent.heap_start;
+        self.brk = parent.brk;
+        self.mmap_next = parent.mmap_next;
+        self.mmap_topdown_cursor = parent.mmap_topdown_cursor;
+        self.mmap_aslr_offset = parent.mmap_aslr_offset;
+        self.trap_context_slots = parent.trap_context_slots.clone();
+        // Do not inherit mlock/mlockall state across fork-style address-space
+        // cloning; Linux clears memory locks in the child.
+        self.debug_assert_user_vm_invariants();
+    }
+
+    pub fn sysv_shm_attaches_snapshot(&self) -> Vec<ShmAttach> {
+        self.sysv_shm_attaches.clone()
+    }
+
+    pub fn replace_sysv_shm_attaches(&mut self, attaches: Vec<ShmAttach>) {
+        self.sysv_shm_attaches = attaches;
+    }
+
+    pub fn push_sysv_shm_attach(&mut self, attach: ShmAttach) {
+        self.sysv_shm_attaches.push(attach);
+    }
+
+    pub fn take_sysv_shm_attaches(&mut self) -> Vec<ShmAttach> {
+        core::mem::take(&mut self.sysv_shm_attaches)
+    }
+
+    pub fn remove_sysv_shm_attach(&mut self, shmaddr: usize) -> Option<(ShmAttach, bool)> {
+        let (idx, attach) = self
+            .sysv_shm_attaches
+            .iter()
+            .enumerate()
+            .find(|(_i, attach)| attach.addr == shmaddr)
+            .map(|(i, attach)| (i, *attach))?;
+
+        self.sysv_shm_attaches.remove(idx);
+        let transferred_account = if attach.accounted {
+            if let Some(next) = self
+                .sysv_shm_attaches
+                .iter_mut()
+                .find(|next| next.attach_id == attach.attach_id)
+            {
+                next.accounted = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        Some((attach, transferred_account))
+    }
+
+    pub fn alloc_trap_context_slot(&mut self) -> usize {
+        self.trap_context_slots.alloc()
+    }
+
+    pub fn reserve_trap_context_slot(&mut self, slot: usize) {
+        self.trap_context_slots.reserve(slot);
+    }
+
+    pub fn dealloc_trap_context_slot(&mut self, slot: usize) {
+        self.trap_context_slots.dealloc(slot);
+    }
+
+    fn try_insert_initial_trap_context(&mut self) -> bool {
+        let slot = self.alloc_trap_context_slot();
+        debug_assert_eq!(slot, 0, "initial TrapContext must use mm slot 0");
+        let ok = self.try_push(
+            MapArea::new(
+                TRAP_CONTEXT.into(),
+                SIGRETURN_TRAMPOLINE.into(),
+                MapType::Framed,
+                MapPermission::R | MapPermission::W,
+            ),
+            None,
+        );
+        if !ok {
+            self.dealloc_trap_context_slot(slot);
+        }
+        ok
+    }
+
+    fn sort_user_areas(&mut self) {
+        sort_map_areas(&mut self.areas);
+    }
+
+    /// 简单的测试函数
+    #[cfg(debug_assertions)]
+    fn debug_assert_user_vm_invariants(&self) {
+        let mut prev_area_end = VirtPageNum(0);
         for area in self.areas.iter() {
-            total_data_frames = total_data_frames.saturating_add(area.data_frames.len());
-            match area.map_type {
-                MapType::Lazy => lazy_areas = lazy_areas.saturating_add(1),
-                MapType::Framed => framed_areas = framed_areas.saturating_add(1),
-                MapType::Identical => {
-                    identical_areas = identical_areas.saturating_add(1);
-                    let start = area.vpn_range.get_start().0;
-                    let end = area.vpn_range.get_end().0;
-                    identical_vpns = identical_vpns.saturating_add(end.saturating_sub(start));
+            let start = area.start_vpn();
+            let end = area.end_vpn();
+            debug_assert!(
+                start >= prev_area_end,
+                "MapArea list is not sorted or overlaps: prev_end={:#x}, start={:#x}, end={:#x}",
+                prev_area_end.0.saturating_mul(PAGE_SIZE),
+                start.0.saturating_mul(PAGE_SIZE),
+                end.0.saturating_mul(PAGE_SIZE)
+            );
+            debug_assert!(start <= end, "MapArea has inverted VPN range");
+            if area.is_identical() {
+                debug_assert!(
+                    area.tracked_frame_count() == 0,
+                    "Identical MapArea must not own frame trackers"
+                );
+            }
+            for vpn in area.tracked_vpns() {
+                debug_assert!(
+                    vpn >= start && vpn < end,
+                    "MapArea frame tracker outside owning range"
+                );
+            }
+            for vpn in area.saved_flag_vpns() {
+                debug_assert!(
+                    vpn >= start && vpn < end,
+                    "MapArea saved PTE flags outside owning range"
+                );
+            }
+            prev_area_end = end;
+        }
+
+        let allowed_perm_bits = MapPermission::all().bits();
+        let mut prev_region_end = 0usize;
+        for region in self.vm_regions.iter() {
+            let end = region.end();
+            debug_assert!(region.len > 0, "VmRegion must not be empty");
+            debug_assert!(end > region.start, "VmRegion end wrapped");
+            debug_assert!(
+                region.start >= prev_region_end,
+                "VmRegion list is not sorted or overlaps: prev_end={:#x}, start={:#x}, end={:#x}",
+                prev_region_end,
+                region.start,
+                end
+            );
+            debug_assert!(
+                region.map_perm.bits() & !allowed_perm_bits == 0,
+                "VmRegion has unknown MapPermission bits"
+            );
+            debug_assert!(
+                region.map_permission().contains(MapPermission::U),
+                "VmRegion must describe a user mapping"
+            );
+            debug_assert!(
+                region.file_valid_len <= region.len,
+                "VmRegion file_valid_len exceeds mapping length"
+            );
+            debug_assert!(
+                region.sigbus_start >= region.start && region.sigbus_start <= end,
+                "VmRegion SIGBUS tail marker outside mapping"
+            );
+            let has_external_backing =
+                region.file_backed || region.memfd_id != 0 || region.sysv_shmid != 0;
+            if region.file_backed || region.memfd_id != 0 {
+                debug_assert!(
+                    region.backing_id != 0,
+                    "file-backed or shared-object VmRegion must keep a backing id"
+                );
+                let backing = self.mmap_backings.get(&region.backing_id);
+                debug_assert!(
+                    backing.is_some(),
+                    "VmRegion references missing mmap backing id {}",
+                    region.backing_id
+                );
+                if let Some(backing) = backing {
+                    debug_assert!(
+                        backing.kind.matches_region(region),
+                        "VmRegion backing id {} points at mismatched backing identity",
+                        region.backing_id
+                    );
+                }
+            } else if !has_external_backing {
+                if region.shared {
+                    debug_assert_ne!(
+                        region.anon_shared_id, 0,
+                        "shared anonymous VmRegion must keep an anon_shared_id"
+                    );
+                } else {
+                    debug_assert_eq!(
+                        region.anon_shared_id, 0,
+                        "private anonymous VmRegion must not keep an anon_shared_id"
+                    );
+                }
+                debug_assert_eq!(
+                    region.sigbus_start, end,
+                    "anonymous VmRegion should not carry a SIGBUS tail"
+                );
+                debug_assert!(
+                    region.file_valid_len == 0 || region.file_valid_len == region.len,
+                    "anonymous VmRegion should not carry a partial file_valid_len"
+                );
+            }
+            prev_region_end = end;
+        }
+        for backing_id in self.mmap_backings.keys().copied() {
+            debug_assert!(
+                self.vm_regions.iter().any(|region| {
+                    (region.file_backed || region.memfd_id != 0) && region.backing_id == backing_id
+                }),
+                "mmap backing id {} is not referenced by any VmRegion",
+                backing_id
+            );
+        }
+        let backing_identities = self
+            .mmap_backings
+            .iter()
+            .map(|(&backing_id, backing)| (backing_id, backing.kind))
+            .collect::<Vec<_>>();
+        for (idx, (left_id, left_kind)) in backing_identities.iter().enumerate() {
+            for (right_id, right_kind) in backing_identities.iter().skip(idx + 1) {
+                debug_assert_ne!(
+                    left_kind, right_kind,
+                    "duplicate mmap backing identity: ids {} and {} both {:?}",
+                    left_id, right_id, left_kind
+                );
+            }
+        }
+        for (backing_id, backing) in self.mmap_backings.iter() {
+            let expected_vm_state = self.collect_mmap_backing_vm_state(*backing_id);
+            debug_assert_eq!(
+                backing.vm_state, expected_vm_state,
+                "mmap backing id {} has stale VmRegion lifecycle state",
+                backing_id
+            );
+            for (&file_page, state) in backing.resident_pages.iter() {
+                debug_assert!(
+                    state.ref_count > 0,
+                    "mmap backing id {} has zero resident refcount for file page {}",
+                    backing_id,
+                    file_page
+                );
+                let file_page_start = file_page.saturating_mul(PAGE_SIZE);
+                let file_page_end = file_page_start.saturating_add(PAGE_SIZE);
+                debug_assert!(
+                    self.vm_regions.iter().any(|region| {
+                        if region.backing_id != *backing_id {
+                            return false;
+                        }
+                        let valid_start = region.file_offset;
+                        let valid_end = region.file_offset.saturating_add(region.file_valid_len());
+                        file_page_start < valid_end && file_page_end > valid_start
+                    }),
+                    "mmap backing id {} has resident file page {} without VMA coverage",
+                    backing_id,
+                    file_page
+                );
+            }
+        }
+
+        for region in self.vm_regions.iter() {
+            let checked_start = region.start;
+            let checked_end = core::cmp::min(region.end(), region.sigbus_start());
+            if checked_start >= checked_end {
+                continue;
+            }
+
+            let mut cursor = checked_start;
+            for area in self.areas.iter() {
+                if !area.contains_perm(MapPermission::U) {
+                    continue;
+                }
+                let area_start = area.start_vpn().0.saturating_mul(PAGE_SIZE);
+                let area_end = area.end_vpn().0.saturating_mul(PAGE_SIZE);
+                if area_end <= cursor {
+                    continue;
+                }
+                if area_start >= checked_end {
+                    break;
+                }
+                debug_assert!(
+                    area_start <= cursor,
+                    "VmRegion has a gap in MapArea coverage: region={:#x}..{:#x}, cursor={:#x}, area={:#x}..{:#x}",
+                    checked_start,
+                    checked_end,
+                    cursor,
+                    area_start,
+                    area_end
+                );
+                if cursor < region.sigbus_start() {
+                    debug_assert_eq!(
+                        area.map_perm(),
+                        region.map_permission(),
+                        "VmRegion/MapArea permission drift at {:#x}",
+                        cursor
+                    );
+                    debug_assert!(
+                        vm_region_map_area_type_compatible(region, area),
+                        "VmRegion/MapArea mapping type drift at {:#x}: area={:?}, region={:?}",
+                        cursor,
+                        area.map_type(),
+                        region.map_type
+                    );
+                }
+                cursor = core::cmp::min(area_end, checked_end);
+                if cursor >= checked_end {
+                    break;
+                }
+            }
+            debug_assert!(
+                cursor >= checked_end,
+                "VmRegion tail is missing MapArea coverage: region={:#x}..{:#x}, cursor={:#x}",
+                checked_start,
+                checked_end,
+                cursor
+            );
+        }
+
+        for area in self.areas.iter() {
+            if !area.contains_perm(MapPermission::U) {
+                continue;
+            }
+            let checked_start = area.start_vpn().0.saturating_mul(PAGE_SIZE);
+            let checked_end = area.end_vpn().0.saturating_mul(PAGE_SIZE);
+            if checked_start >= checked_end {
+                continue;
+            }
+
+            let mut cursor = checked_start;
+            for region in self.vm_regions.iter() {
+                let region_end = region.end();
+                if region_end <= cursor {
+                    continue;
+                }
+                if region.start >= checked_end {
+                    break;
+                }
+                debug_assert!(
+                    region.start <= cursor,
+                    "User MapArea has a gap in VmRegion coverage: area={:#x}..{:#x}, cursor={:#x}, region={:#x}..{:#x}",
+                    checked_start,
+                    checked_end,
+                    cursor,
+                    region.start,
+                    region_end
+                );
+                if cursor < region.sigbus_start() {
+                    debug_assert_eq!(
+                        area.map_perm(),
+                        region.map_permission(),
+                        "MapArea/VmRegion permission drift at {:#x}",
+                        cursor
+                    );
+                    debug_assert!(
+                        vm_region_map_area_type_compatible(region, area),
+                        "MapArea/VmRegion mapping type drift at {:#x}: area={:?}, region={:?}",
+                        cursor,
+                        area.map_type(),
+                        region.map_type
+                    );
+                }
+                cursor = core::cmp::min(region_end, checked_end);
+                if cursor >= checked_end {
+                    break;
+                }
+            }
+            debug_assert!(
+                cursor >= checked_end,
+                "User MapArea is missing VmRegion coverage: area={:#x}..{:#x}, cursor={:#x}",
+                checked_start,
+                checked_end,
+                cursor
+            );
+        }
+
+        for area in self.areas.iter() {
+            if !area.contains_perm(MapPermission::U) {
+                continue;
+            }
+            for (vpn, _) in area.tracked_frames() {
+                let va = vpn.0.saturating_mul(PAGE_SIZE);
+                let Some(region) = self.vm_region_containing_addr(va) else {
+                    debug_assert!(false, "tracked user frame is missing VmRegion coverage");
+                    continue;
+                };
+                if let Some(pte) = self.page_table.translate(vpn) {
+                    if pte.is_valid() {
+                        debug_assert_resident_pte_matches_region(&region, va, pte.flags());
+                        continue;
+                    }
+                }
+                debug_assert!(
+                    area.has_saved_pte_flags(vpn),
+                    "tracked user frame has neither a resident PTE nor saved PROT_NONE flags at {:#x}",
+                    va
+                );
+            }
+            for (vpn, flags) in area.saved_flag_entries() {
+                let va = vpn.0.saturating_mul(PAGE_SIZE);
+                if let Some(pte) = self.page_table.translate(vpn) {
+                    debug_assert!(
+                        !pte.is_valid(),
+                        "saved PROT_NONE flags coexist with a valid PTE at {:#x}",
+                        va
+                    );
+                }
+                let Some(region) = self.vm_region_containing_addr(va) else {
+                    debug_assert!(false, "saved PROT_NONE flags are missing VmRegion coverage");
+                    continue;
+                };
+                debug_assert_saved_pte_flags_match_region(&region, va, flags);
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_user_vm_invariants(&self) {}
+
+    pub fn mlockall_future(&self) -> bool {
+        self.mlockall_future
+    }
+
+    pub fn set_mlockall_future(&mut self, enabled: bool) {
+        self.mlockall_future = enabled;
+    }
+
+    pub fn locked_bytes(&self) -> usize {
+        ranges_total_len(&self.mlocked_ranges)
+    }
+
+    pub fn locked_overlap_bytes(&self, start: usize, end: usize) -> usize {
+        self.mlocked_ranges
+            .iter()
+            .map(|(lock_start, lock_end)| range_overlap_len(start, end, *lock_start, *lock_end))
+            .sum()
+    }
+
+    pub fn locked_ranges_overlap(&self, start: usize, end: usize) -> bool {
+        ranges_overlap(&self.mlocked_ranges, start, end)
+    }
+
+    pub fn locked_bytes_after_add(&self, start: usize, end: usize) -> usize {
+        let mut next = self.mlocked_ranges.clone();
+        next.push((start, end));
+        normalize_ranges(&mut next);
+        ranges_total_len(&next)
+    }
+
+    pub fn add_locked_range(&mut self, start: usize, end: usize) {
+        self.mlocked_ranges.push((start, end));
+        normalize_ranges(&mut self.mlocked_ranges);
+    }
+
+    pub fn trim_locked_ranges(&mut self, start: usize, end: usize) {
+        trim_ranges(&mut self.mlocked_ranges, start, end);
+    }
+
+    pub fn move_locked_ranges(&mut self, old_addr: usize, old_len: usize, new_start: usize) {
+        let old_end = old_addr.saturating_add(old_len);
+        if old_end <= old_addr {
+            return;
+        }
+        let mut next = Vec::new();
+        for (lock_start, lock_end) in self.mlocked_ranges.drain(..) {
+            if old_end <= lock_start || old_addr >= lock_end {
+                next.push((lock_start, lock_end));
+                continue;
+            }
+            if old_addr > lock_start {
+                next.push((lock_start, old_addr));
+            }
+            let overlap_start = core::cmp::max(lock_start, old_addr);
+            let overlap_end = core::cmp::min(lock_end, old_end);
+            let moved_start = new_start.saturating_add(overlap_start.saturating_sub(old_addr));
+            let moved_end = new_start.saturating_add(overlap_end.saturating_sub(old_addr));
+            next.push((moved_start, moved_end));
+            if old_end < lock_end {
+                next.push((old_end, lock_end));
+            }
+        }
+        normalize_ranges(&mut next);
+        self.mlocked_ranges = next;
+    }
+
+    fn locked_ranges_with_current_mappings(&self) -> Vec<(usize, usize)> {
+        let mut next = self.mlocked_ranges.clone();
+        for (start, end) in self.user_mapped_ranges() {
+            next.push((start, end));
+        }
+        if next.is_empty() {
+            next.push((self.heap_start, self.heap_start.saturating_add(PAGE_SIZE)));
+        }
+        normalize_ranges(&mut next);
+        next
+    }
+
+    pub fn locked_bytes_after_mlockall_current(&self) -> usize {
+        let next = self.locked_ranges_with_current_mappings();
+        ranges_total_len(&next)
+    }
+
+    pub fn lock_current_mappings(&mut self) {
+        self.mlocked_ranges = self.locked_ranges_with_current_mappings();
+    }
+
+    pub fn clear_mlock_state(&mut self) {
+        self.mlocked_ranges.clear();
+        self.mlockall_future = false;
+    }
+
+    pub fn vm_regions_snapshot(&self) -> Vec<VmRegion> {
+        self.vm_regions.to_vec()
+    }
+
+    pub fn vm_regions_total_len(&self) -> usize {
+        self.vm_regions
+            .iter()
+            .filter(|region| region.is_mmap())
+            .map(|region| region.len)
+            .sum()
+    }
+
+    pub fn anon_private_writable_vm_bytes(&self) -> usize {
+        self.vm_regions.iter().fold(0usize, |sum, region| {
+            if region.is_mmap()
+                && Self::vm_region_is_private_anonymous(*region)
+                && region.map_permission().contains(MapPermission::W)
+            {
+                sum.saturating_add(region.len)
+            } else {
+                sum
+            }
+        })
+    }
+
+    pub fn vm_regions_overlap(&self, start: usize, end: usize) -> bool {
+        self.vm_regions.overlaps_range(start, end)
+    }
+
+    fn vm_region_containing_addr(&self, addr: usize) -> Option<VmRegion> {
+        self.vm_regions.containing_addr(addr)
+    }
+
+    pub fn shared_vm_region_overlaps(&self, start: usize, end: usize) -> bool {
+        self.vm_regions
+            .any_overlap_where(start, end, |region| region.shared)
+    }
+
+    fn vm_region_is_private_anonymous(region: VmRegion) -> bool {
+        region.is_private_anonymous()
+    }
+
+    pub fn vm_range_is_private_anonymous(&self, start: usize, end: usize) -> bool {
+        if !self.vm_regions.covers_range(start, end) {
+            return false;
+        }
+        self.vm_regions
+            .snapshot_range(start, end)
+            .into_iter()
+            .all(Self::vm_region_is_private_anonymous)
+    }
+
+    pub fn push_vm_region(&mut self, region: VmRegion) {
+        // VMA 新增后统一合并，并刷新 file backing 的派生状态。
+        let backing_id = region.backing_id;
+        self.vm_regions.push_merged(region);
+        if backing_id != 0 {
+            self.refresh_mmap_backing_state(backing_id);
+        }
+        self.debug_assert_user_vm_invariants();
+    }
+
+    fn static_user_region(
+        kind: VmRegionKind,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_type: MapType,
+        map_perm: MapPermission,
+    ) -> Option<VmRegion> {
+        if !map_perm.contains(MapPermission::U) {
+            return None;
+        }
+        let start = start_va.floor().0.saturating_mul(PAGE_SIZE);
+        let end = end_va.ceil().0.saturating_mul(PAGE_SIZE);
+        if end <= start {
+            return None;
+        }
+        let len = end - start;
+        Some(VmRegion {
+            kind,
+            start,
+            len,
+            prot: VmRegion::prot_from_permission(map_perm),
+            map_type,
+            map_perm,
+            file_valid_len: len,
+            sigbus_start: end,
+            shared: false,
+            may_write_upgrade: true,
+            file_backed: false,
+            file_dev: 0,
+            file_ino: 0,
+            file_offset: 0,
+            backing_id: 0,
+            memfd_id: 0,
+            anon_shared_id: 0,
+            sysv_shmid: 0,
+            growsdown: false,
+            fork_inherited_anon: false,
+        })
+    }
+
+    fn try_insert_static_user_framed_range(
+        &mut self,
+        kind: VmRegionKind,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        data: Option<&[u8]>,
+    ) -> Option<VirtPageNum> {
+        let region = Self::static_user_region(kind, start_va, end_va, MapType::Framed, permission);
+        let map_area = MapArea::new(start_va, end_va, MapType::Framed, permission);
+        let end_vpn = map_area.end_vpn();
+        if map_area.start_vpn() >= map_area.end_vpn() {
+            return Some(end_vpn);
+        }
+        if !self.try_push_raw(map_area, data) {
+            return None;
+        }
+        if let Some(region) = region {
+            self.push_vm_region(region);
+        } else {
+            self.debug_assert_user_vm_invariants();
+        }
+        Some(end_vpn)
+    }
+
+    /// 在空闲范围内插入一个新 VMA（VmRegion + MapArea）。
+    /// 若目标范围与任何已有映射重叠则返回 false，不做任何修改。
+    pub fn try_insert_user_vma(
+        &mut self,
+        region: VmRegion,
+        areas: Vec<VmaInsertArea>,
+        lock_range: bool,
+        backing_file: Option<&Arc<dyn File + Send + Sync>>,
+    ) -> bool {
+        self.try_insert_user_vma_with(region, areas, lock_range, backing_file, |_| true)
+    }
+
+    /// 同 try_insert_user_vma，但插入成功后额外执行 post_insert 回调（如预填充文件内容）。
+    /// 回调返回 false 时回滚整个插入。
+    pub fn try_insert_user_vma_with<F>(
+        &mut self,
+        region: VmRegion,
+        areas: Vec<VmaInsertArea>,
+        lock_range: bool,
+        backing_file: Option<&Arc<dyn File + Send + Sync>>,
+        post_insert: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut Self) -> bool,
+    {
+        // syscall 层只描述 VMA；这里负责同时建立 VMA 元数据和具体 MapArea。
+        let start = region.start;
+        let end = region.end();
+        // 重叠 （包括 已有 area + vma ) 以及 合法性检查
+        let invalid = end <= start;
+        let concrete_overlap = if cfg!(debug_assertions) {
+            self.concrete_range_overlaps(start.into(), end.into())
+        } else {
+            false
+        };
+        let vma_overlap = self.vm_regions_overlap(start, end);
+        let count_after = self.vm_regions.count_after_insert_merged(region);
+        let max_map_count = crate::fs::vm_max_map_count();
+        let compatible = areas
+            .iter()
+            .all(|area| area.compatible_with_region(&region));
+        let max_count_failure_point = max_map_count.saturating_add(1);
+        if invalid
+            || concrete_overlap
+            || vma_overlap
+            || count_after > max_count_failure_point
+            || !compatible
+        {
+            return false;
+        }
+        let needs_backing = region.file_backed || region.memfd_id != 0;
+        if needs_backing && backing_file.is_none() {
+            return false;
+        }
+
+        // 回滚机制，用来 在
+        // 1. 插入vma 失败 恢复
+        // 2. post 函数处理 失败恢复
+        let rollback = UserRangeRollback::capture(self, &[(start, end)]);
+        if !self.try_insert_user_vma_raw(region, areas, lock_range, backing_file) {
+            rollback.restore(self);
+            return false;
+        }
+        if post_insert(self) {
+            return true;
+        }
+        rollback.restore(self);
+        false
+    }
+
+    fn try_insert_user_vma_raw(
+        &mut self,
+        mut region: VmRegion,
+        areas: Vec<VmaInsertArea>,
+        lock_range: bool,
+        backing_file: Option<&Arc<dyn File + Send + Sync>>,
+    ) -> bool {
+        let start = region.start;
+        let end = region.end();
+        for area in areas {
+            let Some(area_permission) = area.concrete_permission_from_region(&region) else {
+                return false;
+            };
+            let inserted = match area {
+                VmaInsertArea::Lazy {
+                    start: area_start,
+                    end: area_end,
+                } => {
+                    if area_end <= area_start {
+                        true
+                    } else if area_start < start || area_end > end {
+                        false
+                    } else {
+                        self.try_insert_lazy_area_raw(
+                            area_start.into(),
+                            area_end.into(),
+                            area_permission,
+                        )
+                    }
+                }
+                VmaInsertArea::Framed {
+                    start: area_start,
+                    end: area_end,
+                } => {
+                    if area_end <= area_start {
+                        true
+                    } else if area_start < start || area_end > end {
+                        false
+                    } else {
+                        self.try_insert_framed_area_raw(
+                            area_start.into(),
+                            area_end.into(),
+                            area_permission,
+                        )
+                    }
+                }
+                VmaInsertArea::SharedFrames {
+                    start: area_start,
+                    end: area_end,
+                    frames,
+                } => {
+                    if area_end <= area_start {
+                        frames.is_empty()
+                    } else if area_start < start || area_end > end {
+                        false
+                    } else {
+                        self.try_insert_shared_frames_area_raw(
+                            area_start.into(),
+                            area_end.into(),
+                            area_permission,
+                            frames,
+                        )
+                    }
+                }
+            };
+            if !inserted {
+                return false;
+            }
+        }
+
+        if region.file_backed || region.memfd_id != 0 {
+            region.backing_id = self.allocate_mmap_backing(&region, backing_file);
+            if region.backing_id == 0 {
+                return false;
+            }
+        }
+        let backing_id = region.backing_id;
+        self.push_vm_region(region);
+        if backing_id != 0 {
+            self.refresh_mmap_backing_state(backing_id);
+        }
+        if lock_range {
+            self.add_locked_range(start, end);
+        }
+        true
+    }
+
+    /// 对 [start, end) 范围内的用户映射拍快照，供回滚使用。
+    /// 快照内容包括：
+    /// - 与该范围重叠的 MapArea（裁剪到范围边界）及其 PTE；
+    /// - 与该范围重叠的 VmRegion；
+    /// - 这些 VmRegion 对应的 mmap backing 条目；
+    /// - 与该范围重叠的 mlock 区段。
+    fn snapshot_user_range(&self, start: usize, end: usize) -> UserRangeSnapshot {
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).ceil();
+        let mut areas = Vec::new();
+        let mut ptes = Vec::new();
+
+        // 提取重合的 MapArea
+        for area in self.areas.iter() {
+            if !area.contains_perm(MapPermission::U) {
+                continue;
+            }
+            if !area.overlaps_vpn_range(start_vpn, end_vpn) {
+                continue;
+            }
+            let ov_start = core::cmp::max(start_vpn, area.start_vpn());
+            let ov_end = core::cmp::min(end_vpn, area.end_vpn());
+            if ov_start >= ov_end {
+                continue;
+            }
+            for vpn in VPNRange::new(ov_start, ov_end) {
+                if let Some(pte) = self.page_table.translate(vpn) {
+                    if pte.is_valid() {
+                        ptes.push((vpn, pte.ppn(), pte.flags()));
+                    }
+                }
+            }
+            let (_left, mid, _right) = area.clone().split_around(ov_start, ov_end);
+            areas.push(mid);
+        }
+
+        let vm_regions = self.vm_regions.snapshot_range(start, end);
+        let mut backing_entries = Vec::new();
+        for region in vm_regions.iter() {
+            if !(region.file_backed || region.memfd_id != 0) || region.backing_id == 0 {
+                continue;
+            }
+            if backing_entries
+                .iter()
+                .any(|(backing_id, _file)| *backing_id == region.backing_id)
+            {
+                continue;
+            }
+            if let Some(backing) = self.mmap_backings.get(&region.backing_id) {
+                backing_entries.push((region.backing_id, backing.clone()));
+            }
+        }
+
+        let locked_ranges = self
+            .mlocked_ranges
+            .iter()
+            .copied()
+            .filter_map(|(lock_start, lock_end)| {
+                let ov_start = core::cmp::max(start, lock_start);
+                let ov_end = core::cmp::min(end, lock_end);
+                (ov_start < ov_end).then_some((ov_start, ov_end))
+            })
+            .collect();
+
+        UserRangeSnapshot {
+            start,
+            end,
+            areas,
+            vm_regions,
+            locked_ranges,
+            ptes,
+            backing_entries,
+            next_mmap_backing_id: self.next_mmap_backing_id,
+        }
+    }
+
+    fn restore_user_range(&mut self, snapshot: UserRangeSnapshot) {
+        self.unmap_user_vma_range(snapshot.start.into(), snapshot.end.into());
+
+        self.areas.extend(snapshot.areas);
+        self.sort_user_areas();
+        for (vpn, ppn, flags) in snapshot.ptes {
+            self.page_table.map(vpn, ppn, flags);
+        }
+
+        for region in snapshot.vm_regions {
+            self.vm_regions.push_merged(region);
+        }
+
+        for (backing_id, backing) in snapshot.backing_entries {
+            self.mmap_backings.insert(backing_id, backing);
+        }
+        self.mlocked_ranges.extend(snapshot.locked_ranges);
+        normalize_ranges(&mut self.mlocked_ranges);
+        let next_live_backing_id = self
+            .mmap_backings
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.next_mmap_backing_id = snapshot.next_mmap_backing_id.max(next_live_backing_id);
+        self.debug_assert_user_vm_invariants();
+    }
+
+    /// MAP_FIXED 路径：先拆除目标范围内的所有已有映射，再插入新 VMA。
+    /// 插入失败时恢复原有映射（回滚）。
+    pub fn try_replace_user_vma(
+        &mut self,
+        region: VmRegion,
+        areas: Vec<VmaInsertArea>,
+        lock_range: bool,
+        backing_file: Option<&Arc<dyn File + Send + Sync>>,
+    ) -> bool {
+        self.try_replace_user_vma_with(region, areas, lock_range, backing_file, |_| true)
+    }
+
+    /// 同 try_replace_user_vma，但插入成功后额外执行 post_insert 回调。
+    /// 回调返回 false 时恢复被拆除的原有映射。
+    pub fn try_replace_user_vma_with<F>(
+        &mut self,
+        region: VmRegion,
+        areas: Vec<VmaInsertArea>,
+        lock_range: bool,
+        backing_file: Option<&Arc<dyn File + Send + Sync>>,
+        post_insert: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut Self) -> bool,
+    {
+        let start = region.start;
+        let end = region.end();
+        let snapshot = self.snapshot_user_range(start, end);
+        self.unmap_user_vma_range(start.into(), end.into());
+        if !self.try_insert_user_vma(region, areas, lock_range, backing_file) {
+            self.restore_user_range(snapshot);
+            return false;
+        }
+        if post_insert(self) {
+            return true;
+        }
+        self.restore_user_range(snapshot);
+        false
+    }
+
+    pub fn try_insert_heap_lazy_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        permission: MapPermission,
+    ) -> bool {
+        if end <= start {
+            return true;
+        }
+        let region = VmRegion {
+            kind: VmRegionKind::Heap,
+            start,
+            len: end - start,
+            prot: VmRegion::PROT_READ | VmRegion::PROT_WRITE,
+            map_type: MapType::Lazy,
+            map_perm: permission,
+            file_valid_len: end - start,
+            sigbus_start: end,
+            shared: false,
+            may_write_upgrade: true,
+            file_backed: false,
+            file_dev: 0,
+            file_ino: 0,
+            file_offset: start.saturating_sub(self.heap_start),
+            backing_id: 0,
+            memfd_id: 0,
+            anon_shared_id: 0,
+            sysv_shmid: 0,
+            growsdown: false,
+            fork_inherited_anon: false,
+        };
+        self.try_insert_user_vma(
+            region,
+            Vec::from([VmaInsertArea::Lazy { start, end }]),
+            self.mlockall_future(),
+            None,
+        )
+    }
+
+    pub fn try_insert_stack_framed_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        permission: MapPermission,
+    ) -> bool {
+        if end <= start || !permission.contains(MapPermission::U) {
+            return false;
+        }
+        let len = end - start;
+        let region = VmRegion {
+            kind: VmRegionKind::Stack,
+            start,
+            len,
+            prot: VmRegion::prot_from_permission(permission),
+            map_type: MapType::Framed,
+            map_perm: permission,
+            file_valid_len: len,
+            sigbus_start: end,
+            shared: false,
+            may_write_upgrade: true,
+            file_backed: false,
+            file_dev: 0,
+            file_ino: 0,
+            file_offset: 0,
+            backing_id: 0,
+            memfd_id: 0,
+            anon_shared_id: 0,
+            sysv_shmid: 0,
+            growsdown: false,
+            fork_inherited_anon: false,
+        };
+        self.try_insert_user_vma(
+            region,
+            Vec::from([VmaInsertArea::Framed { start, end }]),
+            self.mlockall_future(),
+            None,
+        )
+    }
+
+    pub fn trim_vm_regions(&mut self, start: usize, end: usize) {
+        self.vm_regions.trim_range(start, end);
+        self.prune_unused_mmap_backings();
+        self.debug_assert_user_vm_invariants();
+    }
+
+    pub fn trim_heap_regions(&mut self, start: usize, end: usize) {
+        self.vm_regions.trim_heap_range(start, end);
+        self.debug_assert_user_vm_invariants();
+    }
+
+    pub fn unmap_heap_vma_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        let start = start_va.0;
+        let end = end_va.0;
+        self.unmap_user_range(start_va, end_va);
+        self.trim_heap_regions(start, end);
+        self.trim_locked_ranges(start, end);
+    }
+
+    pub fn unmap_user_vma_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        let start = start_va.0;
+        let end = end_va.0;
+        self.unmap_user_range(start_va, end_va);
+        self.trim_vm_regions(start, end);
+        self.trim_locked_ranges(start, end);
+    }
+
+    pub fn can_mprotect_vm_regions(&self, start: usize, end: usize, new_prot: usize) -> bool {
+        self.vm_regions.can_mprotect_range(start, end, new_prot)
+    }
+
+    pub fn mprotect_user_vma_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        new_prot: usize,
+    ) -> Result<(), MprotectError> {
+        let start = start_va.0;
+        let end = end_va.0;
+        if !self.can_mprotect_vm_regions(start, end, new_prot) {
+            return Err(MprotectError::AccessDenied);
+        }
+
+        if !self.user_range_fully_mapped(start_va, end_va) {
+            return Err(MprotectError::Unmapped);
+        }
+
+        self.vm_regions
+            .apply_mprotect_range(start, end, new_prot)
+            .map_err(|_| MprotectError::AccessDenied)?;
+        for region in self.vm_regions.snapshot_range(start, end) {
+            let valid_start = region.start;
+            let valid_end = core::cmp::min(region.end(), region.sigbus_start());
+            if valid_start < valid_end
+                && !self.mprotect_user_range(
+                    valid_start.into(),
+                    valid_end.into(),
+                    region.map_permission(),
+                )
+            {
+                return Err(MprotectError::Unmapped);
+            }
+            let tail_start = valid_end;
+            if tail_start < region.end()
+                && !self.mprotect_user_range(
+                    tail_start.into(),
+                    region.end().into(),
+                    MapPermission::U,
+                )
+            {
+                return Err(MprotectError::Unmapped);
+            }
+        }
+        let backing_ids = self.backing_ids_for_vma_range(start, end);
+        self.refresh_mmap_backing_states(backing_ids);
+        self.debug_assert_user_vm_invariants();
+        Ok(())
+    }
+
+    fn move_vm_region_metadata_raw(&mut self, old_addr: usize, old_len: usize, new_start: usize) {
+        self.vm_regions
+            .move_range_metadata_raw(old_addr, old_len, new_start);
+    }
+
+    fn isolate_vm_region_range_raw(&mut self, start: usize, len: usize) -> bool {
+        self.vm_regions.isolate_range_raw(start, len)
+    }
+
+    pub fn move_user_vma_range(
+        &mut self,
+        old_addr: usize,
+        old_len: usize,
+        new_start: usize,
+    ) -> bool {
+        let Some(old_end) = old_addr.checked_add(old_len) else {
+            return false;
+        };
+        if !self.move_user_range_raw(old_addr.into(), old_end.into(), new_start.into()) {
+            return false;
+        }
+        let mut backing_ids = self.backing_ids_for_vma_range(old_addr, old_end);
+        self.move_vm_region_metadata_raw(old_addr, old_len, new_start);
+        self.move_locked_ranges(old_addr, old_len, new_start);
+        if let Some(new_end) = new_start.checked_add(old_len) {
+            for backing_id in self.backing_ids_for_vma_range(new_start, new_end) {
+                Self::push_unique_backing_id(&mut backing_ids, backing_id);
+            }
+        }
+        self.refresh_mmap_backing_states(backing_ids);
+        self.debug_assert_user_vm_invariants();
+        true
+    }
+
+    pub fn move_user_vma_range_replacing(
+        &mut self,
+        old_addr: usize,
+        old_len: usize,
+        new_start: usize,
+    ) -> bool {
+        let Some(old_end) = old_addr.checked_add(old_len) else {
+            return false;
+        };
+        let Some(new_end) = new_start.checked_add(old_len) else {
+            return false;
+        };
+        let rollback =
+            UserRangeRollback::capture(self, &[(old_addr, old_end), (new_start, new_end)]);
+        self.unmap_user_vma_range(new_start.into(), new_end.into());
+        if self.move_user_vma_range(old_addr, old_len, new_start) {
+            return true;
+        }
+        rollback.restore(self);
+        false
+    }
+
+    pub fn try_grow_user_vma_range<F>(
+        &mut self,
+        old_addr: usize,
+        old_len: usize,
+        target_start: usize,
+        new_len: usize,
+        grow_area: VmaInsertArea,
+        populate_grow: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut MemorySet) -> bool,
+    {
+        let mut grow_areas = Vec::new();
+        grow_areas.push(grow_area);
+        self.try_grow_user_vma_range_with_layout(
+            old_addr,
+            old_len,
+            target_start,
+            new_len,
+            grow_areas,
+            None,
+            populate_grow,
+        )
+    }
+
+    pub fn try_grow_user_vma_range_with_file_len<F>(
+        &mut self,
+        old_addr: usize,
+        old_len: usize,
+        target_start: usize,
+        new_len: usize,
+        grow_areas: Vec<VmaInsertArea>,
+        final_file_valid_len: usize,
+        populate_grow: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut MemorySet) -> bool,
+    {
+        self.try_grow_user_vma_range_with_layout(
+            old_addr,
+            old_len,
+            target_start,
+            new_len,
+            grow_areas,
+            Some(final_file_valid_len),
+            populate_grow,
+        )
+    }
+
+    fn try_grow_user_vma_range_with_layout<F>(
+        &mut self,
+        old_addr: usize,
+        old_len: usize,
+        target_start: usize,
+        new_len: usize,
+        grow_areas: Vec<VmaInsertArea>,
+        final_file_valid_len: Option<usize>,
+        populate_grow: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut MemorySet) -> bool,
+    {
+        if new_len <= old_len {
+            return false;
+        }
+        let Some(old_end) = old_addr.checked_add(old_len) else {
+            return false;
+        };
+        let Some(target_old_end) = target_start.checked_add(old_len) else {
+            return false;
+        };
+        let Some(target_new_end) = target_start.checked_add(new_len) else {
+            return false;
+        };
+        let mut cursor = target_old_end;
+        for area in grow_areas.iter() {
+            let (area_start, area_end) = area.bounds();
+            if area_end <= area_start {
+                continue;
+            }
+            if area_start != cursor || area_end > target_new_end {
+                return false;
+            }
+            cursor = area_end;
+        }
+        if cursor != target_new_end {
+            return false;
+        }
+
+        let rollback = UserRangeRollback::capture(
+            self,
+            &[(old_addr, old_end), (target_start, target_new_end)],
+        );
+        let relocated = target_start != old_addr;
+        if relocated && !self.move_user_vma_range(old_addr, old_len, target_start) {
+            rollback.restore(self);
+            return false;
+        }
+
+        if !relocated {
+            if !self.isolate_vm_region_range_raw(old_addr, old_len) {
+                rollback.restore(self);
+                return false;
+            }
+        }
+
+        let Some(mut grown_region) = self.vm_region_containing_addr(target_start) else {
+            rollback.restore(self);
+            return false;
+        };
+        if grown_region.start != target_start || grown_region.end() != target_old_end {
+            rollback.restore(self);
+            return false;
+        }
+        if let Some(file_valid_len) = final_file_valid_len {
+            grown_region.set_len_and_file_valid(new_len, file_valid_len);
+        } else {
+            grown_region.set_len(new_len);
+        }
+
+        for area in grow_areas {
+            if !self.try_insert_vma_area_raw_in_region(
+                area,
+                &grown_region,
+                target_old_end,
+                target_new_end,
+            ) {
+                rollback.restore(self);
+                return false;
+            }
+        }
+
+        if !populate_grow(self) {
+            rollback.restore(self);
+            return false;
+        }
+
+        let metadata_updated = if let Some(file_valid_len) = final_file_valid_len {
+            self.set_vm_region_len_and_file_valid_by_start(target_start, new_len, file_valid_len)
+        } else {
+            self.set_vm_region_len_by_start(target_start, new_len)
+        };
+        if !metadata_updated {
+            rollback.restore(self);
+            return false;
+        }
+        if let Some(region) = self.vm_region_containing_addr(target_start) {
+            if region.backing_id != 0 {
+                self.refresh_mmap_backing_state(region.backing_id);
+            }
+        }
+        self.debug_assert_user_vm_invariants();
+        true
+    }
+
+    fn try_insert_vma_area_raw_in_region(
+        &mut self,
+        area: VmaInsertArea,
+        region: &VmRegion,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        let Some(area_permission) = area.concrete_permission_from_region(region) else {
+            return false;
+        };
+        match area {
+            VmaInsertArea::Lazy {
+                start: area_start,
+                end: area_end,
+            } => {
+                if area_end <= area_start {
+                    true
+                } else if area_start < start || area_end > end {
+                    false
+                } else {
+                    self.try_insert_lazy_area_raw(
+                        area_start.into(),
+                        area_end.into(),
+                        area_permission,
+                    )
+                }
+            }
+            VmaInsertArea::Framed {
+                start: area_start,
+                end: area_end,
+            } => {
+                if area_end <= area_start {
+                    true
+                } else if area_start < start || area_end > end {
+                    false
+                } else {
+                    self.try_insert_framed_area_raw(
+                        area_start.into(),
+                        area_end.into(),
+                        area_permission,
+                    )
+                }
+            }
+            VmaInsertArea::SharedFrames {
+                start: area_start,
+                end: area_end,
+                frames,
+            } => {
+                if area_end <= area_start {
+                    frames.is_empty()
+                } else if area_start < start || area_end > end {
+                    false
+                } else {
+                    self.try_insert_shared_frames_area_raw(
+                        area_start.into(),
+                        area_end.into(),
+                        area_permission,
+                        frames,
+                    )
                 }
             }
         }
-        (
-            self.areas.len(),
-            total_data_frames,
-            identical_vpns,
-            lazy_areas,
-            framed_areas,
-            identical_areas,
-        )
     }
+
+    pub fn set_vm_region_len_by_start(&mut self, start: usize, len: usize) -> bool {
+        if self.vm_regions.set_len_by_start(start, len) {
+            if let Some(region) = self.vm_region_containing_addr(start) {
+                if region.backing_id != 0 {
+                    self.refresh_mmap_backing_state(region.backing_id);
+                }
+            }
+            self.debug_assert_user_vm_invariants();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_vm_region_len_and_file_valid_by_start(
+        &mut self,
+        start: usize,
+        len: usize,
+        file_valid_len: usize,
+    ) -> bool {
+        if self
+            .vm_regions
+            .set_len_and_file_valid_by_start(start, len, file_valid_len)
+        {
+            if let Some(region) = self.vm_region_containing_addr(start) {
+                if region.backing_id != 0 {
+                    self.refresh_mmap_backing_state(region.backing_id);
+                }
+            }
+            self.debug_assert_user_vm_invariants();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn vm_region_containing(&self, start: usize, end: usize) -> Option<VmRegion> {
+        let region = self.vm_region_containing_addr(start)?;
+        (region.is_mmap() && end <= region.end()).then_some(region)
+    }
+
+    pub fn page_overlaps_mmap_region(&self, page_start: usize) -> bool {
+        let page_end = page_start.saturating_add(PAGE_SIZE);
+        self.vm_regions
+            .any_overlap_where(page_start, page_end, |region| region.is_mmap())
+    }
+
+    pub fn page_overlaps_mmap_region_started_before(
+        &self,
+        page_start: usize,
+        limit: usize,
+    ) -> bool {
+        let page_end = page_start.saturating_add(PAGE_SIZE);
+        self.vm_regions
+            .any_overlap_where(page_start, page_end, |region| {
+                region.is_mmap() && region.start < limit
+            })
+    }
+
     /// Assume that no conflicts.
     #[allow(dead_code)]
     pub fn insert_framed_area(
@@ -120,14 +1717,41 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) -> bool {
-        self.try_push(
+        let inserted = self.try_insert_framed_area_raw(start_va, end_va, permission);
+        if inserted {
+            self.debug_assert_user_vm_invariants();
+        }
+        inserted
+    }
+
+    fn try_insert_framed_area_raw(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        self.try_push_raw(
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
         )
     }
 
     /// Try to insert a lazily-allocated (on-demand) anonymous area.
+    #[allow(dead_code)]
     pub fn try_insert_lazy_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let inserted = self.try_insert_lazy_area_raw(start_va, end_va, permission);
+        if inserted {
+            self.debug_assert_user_vm_invariants();
+        }
+        inserted
+    }
+
+    fn try_insert_lazy_area_raw(
         &mut self,
         start_va: VirtAddr,
         end_va: VirtAddr,
@@ -138,19 +1762,37 @@ impl MemorySet {
         if start_vpn >= end_vpn {
             return true;
         }
-
-        // Linux merges adjacent anonymous VMAs with identical attributes.
-        // Do the same so repeated mmap() doesn't explode VMA count.
-        if let Some(last) = self.areas.last_mut() {
-            if last.map_type == MapType::Lazy
-                && last.map_perm == permission
-                && last.vpn_range.get_end() == start_vpn
-            {
-                return last.append_to(&mut self.page_table, end_vpn);
-            }
+        // Refuse to insert over an existing VMA. brk()/mmap() already pre-scan
+        // for free space, but this is the last-resort guard that stops a racing
+        // or mis-computed range from silently overlapping a live mapping.
+        if self.concrete_range_overlaps(start_va, end_va) {
+            return false;
         }
 
-        self.try_push(
+        // Linux merges adjacent anonymous VMAs with identical attributes.
+        // Keep this independent of Vec ordering so brk-style growth can still
+        // coalesce after the area list is normalized by address.
+        if let Some(idx) = self.areas.iter().position(|area| {
+            area.is_lazy() && area.map_perm() == permission && area.end_vpn() == start_vpn
+        }) {
+            let appended = self.areas[idx].append_to(&mut self.page_table, end_vpn);
+            if appended {
+                self.sort_user_areas();
+            }
+            return appended;
+        }
+
+        if let Some(idx) = self.areas.iter().position(|area| {
+            area.is_lazy() && area.map_perm() == permission && area.start_vpn() == end_vpn
+        }) {
+            let prepended = self.areas[idx].prepend_to(&mut self.page_table, start_vpn);
+            if prepended {
+                self.sort_user_areas();
+            }
+            return prepended;
+        }
+
+        self.try_push_raw(
             MapArea::new(start_va, end_va, MapType::Lazy, permission),
             None,
         )
@@ -204,7 +1846,23 @@ impl MemorySet {
         assert!(self.try_push(map_area, data), "OOM: mapping area failed");
     }
 
-    fn try_push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) -> bool {
+    fn try_push(&mut self, map_area: MapArea, data: Option<&[u8]>) -> bool {
+        let pushed = self.try_push_raw(map_area, data);
+        if pushed {
+            self.debug_assert_user_vm_invariants();
+        }
+        pushed
+    }
+
+    fn try_push_raw(&mut self, mut map_area: MapArea, data: Option<&[u8]>) -> bool {
+        // Common choke point for every area insertion: bail out instead of
+        // mapping a range that overlaps an existing VMA, which would corrupt the
+        // page table and the `areas` bookkeeping.
+        let start_va = VirtAddr::from(map_area.start_vpn());
+        let end_va = VirtAddr::from(map_area.end_vpn());
+        if self.concrete_range_overlaps(start_va, end_va) {
+            return false;
+        }
         if !map_area.map(&mut self.page_table) {
             return false;
         }
@@ -212,12 +1870,13 @@ impl MemorySet {
             map_area.copy_data(&self.page_table, data);
         }
         self.areas.push(map_area);
+        self.sort_user_areas();
         true
     }
 
-    /// Push an already-mapped `MapArea` into this address space (used by COW fork).
-    fn push_mapped(&mut self, map_area: MapArea) {
+    fn push_mapped_raw(&mut self, map_area: MapArea) {
         self.areas.push(map_area);
+        self.sort_user_areas();
     }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
@@ -337,6 +1996,7 @@ impl MemorySet {
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
         // map program headers of elf, with U flag
+        validate_elf_arch_abi(elf_arch_abi_from_bytes(elf_data)?)?;
         let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
         let load_bias: usize = match elf.header.pt2.type_().as_type() {
             // Map ET_DYN (shared objects / PIE) at a non-zero base so that:
@@ -381,15 +2041,18 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
-                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-                let seg_end = map_area.vpn_range.get_end();
+                let Some(seg_end) = memory_set.try_insert_static_user_framed_range(
+                    VmRegionKind::Elf,
+                    start_va,
+                    end_va,
+                    map_perm,
+                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+                ) else {
+                    return Err(ENOMEM);
+                };
                 if seg_end > max_end_vpn {
                     max_end_vpn = seg_end;
                 }
-                memory_set.push(
-                    map_area,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                );
 
                 // Best-effort: compute AT_PHDR virtual address if PHDR table bytes are in this LOAD.
                 let seg_off = ph.offset() as usize;
@@ -415,15 +2078,18 @@ impl MemorySet {
         //     user_stack_bottom, user_stack_top
         // );
 
-        memory_set.push(
-            MapArea::new(
+        if memory_set
+            .try_insert_static_user_framed_range(
+                VmRegionKind::Stack,
                 user_stack_bottom.into(),
                 user_stack_top.into(),
-                MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
-            ),
-            None,
-        );
+                None,
+            )
+            .is_none()
+        {
+            return Err(ENOMEM);
+        }
         let heap_base = user_stack_top + USER_HEAP_GAP;
         // used in sbrk (lazy heap to avoid eager page allocation)
         memory_set.push(
@@ -435,16 +2101,9 @@ impl MemorySet {
             ),
             None,
         );
+        memory_set.reset_user_layout(user_stack_bottom);
         // map TrapContext
-        memory_set.push(
-            MapArea::new(
-                TRAP_CONTEXT.into(),
-                SIGRETURN_TRAMPOLINE.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W,
-            ),
-            None,
-        );
+        assert!(memory_set.try_insert_initial_trap_context());
         // Return user_stack_bottom as ustack_base for thread allocation
         // Each thread will calculate its stack as: ustack_base + tid * (PAGE_SIZE + USER_STACK_SIZE)
         Ok((
@@ -465,6 +2124,7 @@ impl MemorySet {
         F: FnMut(usize, &mut [u8]) -> usize,
     {
         let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
+        validate_elf_arch_abi(hdr.arch_abi())?;
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
@@ -485,15 +2145,16 @@ impl MemorySet {
         user_stack_bottom += PAGE_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
 
-        if !memory_set.try_push(
-            MapArea::new(
+        if memory_set
+            .try_insert_static_user_framed_range(
+                VmRegionKind::Stack,
                 user_stack_bottom.into(),
                 user_stack_top.into(),
-                MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
-            ),
-            None,
-        ) {
+                None,
+            )
+            .is_none()
+        {
             return Err(ENOMEM);
         }
         let heap_base = user_stack_top + USER_HEAP_GAP;
@@ -508,15 +2169,8 @@ impl MemorySet {
         ) {
             return Err(ENOMEM);
         }
-        if !memory_set.try_push(
-            MapArea::new(
-                TRAP_CONTEXT.into(),
-                SIGRETURN_TRAMPOLINE.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W,
-            ),
-            None,
-        ) {
+        memory_set.reset_user_layout(user_stack_bottom);
+        if !memory_set.try_insert_initial_trap_context() {
             return Err(ENOMEM);
         }
 
@@ -534,6 +2188,7 @@ impl MemorySet {
         load_bias: usize,
         max_end_vpn: &mut VirtPageNum,
     ) -> Result<(usize, ElfAux), isize> {
+        validate_elf_arch_abi(elf_arch_abi_from_bytes(elf_data)?)?;
         let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
@@ -572,15 +2227,18 @@ impl MemorySet {
             if ph_flags.is_execute() {
                 map_perm |= MapPermission::X;
             }
-            let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-            let seg_end = map_area.vpn_range.get_end();
+            let Some(seg_end) = memory_set.try_insert_static_user_framed_range(
+                VmRegionKind::Elf,
+                start_va,
+                end_va,
+                map_perm,
+                Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
+            ) else {
+                return Err(ENOMEM);
+            };
             if seg_end > *max_end_vpn {
                 *max_end_vpn = seg_end;
             }
-            memory_set.push(
-                map_area,
-                Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-            );
 
             // Best-effort: compute AT_PHDR virtual address if PHDR table bytes are in this LOAD.
             let seg_off = ph.offset() as usize;
@@ -639,13 +2297,17 @@ impl MemorySet {
             if (ph.p_flags & PF_X) != 0 {
                 map_perm |= MapPermission::X;
             }
-            let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-            let seg_end = map_area.vpn_range.get_end();
+            let Some(seg_end) = memory_set.try_insert_static_user_framed_range(
+                VmRegionKind::Elf,
+                start_va,
+                end_va,
+                map_perm,
+                None,
+            ) else {
+                return Err(ENOMEM);
+            };
             if seg_end > *max_end_vpn {
                 *max_end_vpn = seg_end;
-            }
-            if !memory_set.try_push(map_area, None) {
-                return Err(ENOMEM);
             }
 
             // Populate segment data from the file.
@@ -699,6 +2361,10 @@ impl MemorySet {
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
 
+        validate_elf_interp_abi(
+            elf_arch_abi_from_bytes(main_elf)?,
+            elf_arch_abi_from_bytes(interp_elf)?,
+        )?;
         let main = xmas_elf::ElfFile::new(main_elf).map_err(|_| -8isize)?;
         let _interp = xmas_elf::ElfFile::new(interp_elf).map_err(|_| -8isize)?;
 
@@ -733,15 +2399,18 @@ impl MemorySet {
         user_stack_bottom += PAGE_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
 
-        memory_set.push(
-            MapArea::new(
+        if memory_set
+            .try_insert_static_user_framed_range(
+                VmRegionKind::Stack,
                 user_stack_bottom.into(),
                 user_stack_top.into(),
-                MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
-            ),
-            None,
-        );
+                None,
+            )
+            .is_none()
+        {
+            return Err(ENOMEM);
+        }
         let heap_base = user_stack_top + USER_HEAP_GAP;
         // used in sbrk (lazy heap to avoid eager page allocation)
         memory_set.push(
@@ -753,16 +2422,9 @@ impl MemorySet {
             ),
             None,
         );
+        memory_set.reset_user_layout(user_stack_bottom);
         // map TrapContext
-        memory_set.push(
-            MapArea::new(
-                TRAP_CONTEXT.into(),
-                SIGRETURN_TRAMPOLINE.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W,
-            ),
-            None,
-        );
+        assert!(memory_set.try_insert_initial_trap_context());
 
         Ok((
             memory_set,
@@ -783,6 +2445,7 @@ impl MemorySet {
         F: FnMut(usize, &mut [u8]) -> usize,
     {
         let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
+        validate_elf_interp_abi(hdr.arch_abi(), elf_arch_abi_from_bytes(interp_elf)?)?;
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
@@ -814,15 +2477,16 @@ impl MemorySet {
         user_stack_bottom += PAGE_SIZE;
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
 
-        if !memory_set.try_push(
-            MapArea::new(
+        if memory_set
+            .try_insert_static_user_framed_range(
+                VmRegionKind::Stack,
                 user_stack_bottom.into(),
                 user_stack_top.into(),
-                MapType::Framed,
                 MapPermission::R | MapPermission::W | MapPermission::U,
-            ),
-            None,
-        ) {
+                None,
+            )
+            .is_none()
+        {
             return Err(ENOMEM);
         }
         let heap_base = user_stack_top + USER_HEAP_GAP;
@@ -837,15 +2501,8 @@ impl MemorySet {
         ) {
             return Err(ENOMEM);
         }
-        if !memory_set.try_push(
-            MapArea::new(
-                TRAP_CONTEXT.into(),
-                SIGRETURN_TRAMPOLINE.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W,
-            ),
-            None,
-        ) {
+        memory_set.reset_user_layout(user_stack_bottom);
+        if !memory_set.try_insert_initial_trap_context() {
             return Err(ENOMEM);
         }
 
@@ -888,9 +2545,9 @@ impl MemorySet {
             dst_walk_cache.reset();
             let mut new_area = MapArea::from_another(area);
 
-            match area.map_type {
+            match area.map_type() {
                 MapType::Identical => {
-                    for vpn in area.vpn_range {
+                    for vpn in area.vpn_range() {
                         let Some(src_pte) = user_space
                             .page_table
                             .translate_cached(vpn, &mut src_walk_cache)
@@ -914,7 +2571,7 @@ impl MemorySet {
                 // For Framed/Lazy areas we only walk materialized pages.
                 // This avoids O(vma_len) scans for huge untouched lazy mappings.
                 MapType::Framed | MapType::Lazy => {
-                    for (&vpn, frame_tracker) in area.data_frames.iter() {
+                    for (vpn, frame_tracker) in area.tracked_frames() {
                         let Some(src_pte) = user_space
                             .page_table
                             .translate_cached(vpn, &mut src_walk_cache)
@@ -942,7 +2599,7 @@ impl MemorySet {
                                 src_flags,
                                 &mut dst_walk_cache,
                             );
-                            new_area.data_frames.insert(vpn, frame);
+                            new_area.insert_tracked_frame(vpn, frame);
                             kernel_private_pages = kernel_private_pages.saturating_add(1);
                             continue;
                         }
@@ -966,12 +2623,12 @@ impl MemorySet {
                             src_flags,
                             &mut dst_walk_cache,
                         );
-                        new_area.data_frames.insert(vpn, frame_tracker.clone());
+                        new_area.insert_tracked_frame(vpn, frame_tracker.clone());
                     }
                 }
             }
 
-            memory_set.push_mapped(new_area);
+            memory_set.push_mapped_raw(new_area);
         }
 
         let before_parent_update_cycles = if diag_enabled {
@@ -1033,94 +2690,7 @@ impl MemorySet {
             }
         }
 
-        memory_set
-    }
-
-    /// Fork a user address space by sharing mapped user frames.
-    ///
-    /// This is used for Linux `clone(..., CLONE_VM, ...)`-style semantics:
-    /// parent and child keep separate page tables but map the same user
-    /// physical frames with the same permissions.
-    pub fn from_existed_user_shared(user_space: &MemorySet) -> MemorySet {
-        let mut memory_set = Self::new_bare();
-        memory_set.map_trampoline();
-        memory_set.map_sigreturn_trampoline_user();
-        let mut src_walk_cache = PageWalkCache::new();
-        let mut dst_walk_cache = PageWalkCache::new();
-
-        for area in user_space.areas.iter() {
-            src_walk_cache.reset();
-            dst_walk_cache.reset();
-            let mut new_area = MapArea::from_another(area);
-
-            match area.map_type {
-                MapType::Identical => {
-                    for vpn in area.vpn_range {
-                        let Some(src_pte) = user_space
-                            .page_table
-                            .translate_cached(vpn, &mut src_walk_cache)
-                        else {
-                            continue;
-                        };
-                        if !src_pte.is_valid() {
-                            continue;
-                        }
-                        memory_set.page_table.map_cached(
-                            vpn,
-                            src_pte.ppn(),
-                            src_pte.flags(),
-                            &mut dst_walk_cache,
-                        );
-                    }
-                }
-                // Share only materialized pages for Framed/Lazy areas.
-                MapType::Framed | MapType::Lazy => {
-                    for (&vpn, frame_tracker) in area.data_frames.iter() {
-                        let Some(src_pte) = user_space
-                            .page_table
-                            .translate_cached(vpn, &mut src_walk_cache)
-                        else {
-                            continue;
-                        };
-                        if !src_pte.is_valid() {
-                            continue;
-                        }
-                        let src_ppn = src_pte.ppn();
-                        let src_flags = src_pte.flags();
-
-                        // Keep kernel-only mappings private.
-                        if !src_flags.contains(PTEFlags::U) {
-                            let Some(frame) = frame_alloc() else {
-                                continue;
-                            };
-                            frame
-                                .ppn
-                                .get_bytes_array()
-                                .copy_from_slice(src_ppn.get_bytes_array());
-                            memory_set.page_table.map_cached(
-                                vpn,
-                                frame.ppn,
-                                src_flags,
-                                &mut dst_walk_cache,
-                            );
-                            new_area.data_frames.insert(vpn, frame);
-                            continue;
-                        }
-
-                        memory_set.page_table.map_cached(
-                            vpn,
-                            src_ppn,
-                            src_flags,
-                            &mut dst_walk_cache,
-                        );
-                        new_area.data_frames.insert(vpn, frame_tracker.clone());
-                    }
-                }
-            }
-
-            memory_set.push_mapped(new_area);
-        }
-
+        memory_set.inherit_user_vm_metadata_from(user_space);
         memory_set
     }
 
@@ -1140,9 +2710,9 @@ impl MemorySet {
             dst_walk_cache.reset();
             let mut new_area = MapArea::from_another(area);
 
-            match area.map_type {
+            match area.map_type() {
                 MapType::Identical => {
-                    for vpn in area.vpn_range {
+                    for vpn in area.vpn_range() {
                         let Some(src_pte) = user_space
                             .page_table
                             .translate_cached(vpn, &mut src_walk_cache)
@@ -1165,7 +2735,7 @@ impl MemorySet {
                 // Lazy areas can span terabytes with no materialized pages.
                 // Copy only present pages tracked in data_frames.
                 MapType::Framed | MapType::Lazy => {
-                    for (&vpn, _) in area.data_frames.iter() {
+                    for vpn in area.tracked_vpns() {
                         let Some(src_pte) = user_space
                             .page_table
                             .translate_cached(vpn, &mut src_walk_cache)
@@ -1183,21 +2753,22 @@ impl MemorySet {
                             .ppn
                             .get_bytes_array()
                             .copy_from_slice(src_ppn.get_bytes_array());
-                        let pte_flags = PTEFlags::from(area.map_perm);
+                        let pte_flags = area.pte_flags();
                         memory_set.page_table.map_cached(
                             vpn,
                             frame.ppn,
                             pte_flags,
                             &mut dst_walk_cache,
                         );
-                        new_area.data_frames.insert(vpn, frame);
+                        new_area.insert_tracked_frame(vpn, frame);
                     }
                 }
             }
 
-            memory_set.push_mapped(new_area);
+            memory_set.push_mapped_raw(new_area);
         }
 
+        memory_set.inherit_user_vm_metadata_from(user_space);
         memory_set
     }
 
@@ -1205,6 +2776,53 @@ impl MemorySet {
     ///
     /// Used by System V shared memory (`shmat`) to map the same physical pages
     /// into multiple processes.
+    pub fn try_insert_shared_frames_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        frames: Vec<FrameTracker>,
+    ) -> bool {
+        let inserted = self.try_insert_shared_frames_area_raw(start_va, end_va, permission, frames);
+        if inserted {
+            self.debug_assert_user_vm_invariants();
+        }
+        inserted
+    }
+
+    fn try_insert_shared_frames_area_raw(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+        frames: Vec<FrameTracker>,
+    ) -> bool {
+        let mut area = MapArea::new(start_va, end_va, MapType::Framed, permission);
+        let expected_pages = area.page_count();
+        if expected_pages == 0 {
+            return frames.is_empty();
+        }
+        if frames.len() != expected_pages || self.concrete_range_overlaps(start_va, end_va) {
+            return false;
+        }
+        for vpn in area.vpn_range() {
+            if let Some(pte) = self.page_table.translate(vpn) {
+                if pte.is_valid() {
+                    return false;
+                }
+            }
+        }
+
+        let pte_flags = area.pte_flags() | PTEFlags::SHARED;
+        for (vpn, frame) in area.vpn_range().into_iter().zip(frames.into_iter()) {
+            self.page_table.map(vpn, frame.ppn, pte_flags);
+            area.insert_tracked_frame(vpn, frame);
+        }
+        self.push_mapped_raw(area);
+        true
+    }
+
+    #[allow(dead_code)]
     pub fn insert_shared_frames_area(
         &mut self,
         start_va: VirtAddr,
@@ -1212,130 +2830,12 @@ impl MemorySet {
         permission: MapPermission,
         frames: Vec<FrameTracker>,
     ) {
-        let mut area = MapArea::new(start_va, end_va, MapType::Framed, permission);
-        let pte_flags = PTEFlags::from(area.map_perm) | PTEFlags::SHARED;
-        for (vpn, frame) in area.vpn_range.into_iter().zip(frames.into_iter()) {
-            self.page_table.map(vpn, frame.ppn, pte_flags);
-            area.data_frames.insert(vpn, frame);
-        }
-        self.push_mapped(area);
+        assert!(
+            self.try_insert_shared_frames_area(start_va, end_va, permission, frames),
+            "OOM or overlap while inserting shared frames"
+        );
     }
 
-    /// Resolve a copy-on-write fault at `fault_va` if the page is tagged COW.
-    pub fn resolve_cow_fault(&mut self, fault_va: usize) -> bool {
-        let vpn: VirtPageNum = VirtAddr::from(fault_va).floor();
-        let Some(pte) = self.translate(vpn) else {
-            return false;
-        };
-        let flags = pte.flags();
-        if !flags.contains(PTEFlags::COW) {
-            return false;
-        }
-        let old_ppn = pte.ppn();
-        let Some(frame) = frame_alloc() else {
-            return false;
-        };
-        frame
-            .ppn
-            .get_bytes_array()
-            .copy_from_slice(old_ppn.get_bytes_array());
-
-        let mut new_flags = flags;
-        new_flags.remove(PTEFlags::COW);
-        new_flags.insert(PTEFlags::W);
-        new_flags.insert(PTEFlags::D);
-        if !self.page_table.remap(vpn, frame.ppn, new_flags) {
-            return false;
-        }
-
-        // Update the owning MapArea's frame tracker so the old shared frame gets its refcount decremented.
-        for area in self.areas.iter_mut() {
-            if area.map_type == MapType::Identical {
-                continue;
-            }
-            if vpn < area.vpn_range.get_start() || vpn >= area.vpn_range.get_end() {
-                continue;
-            }
-            area.data_frames.insert(vpn, frame);
-            break;
-        }
-
-        // Flush TLB for this address.
-        #[cfg(target_arch = "riscv64")]
-        // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.
-        unsafe {
-            core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
-        }
-        #[cfg(target_arch = "loongarch64")]
-        // SAFETY: invtlb is valid in S-mode; fault_va is the address to flush from TLB.
-        unsafe {
-            core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
-        }
-        true
-    }
-
-    /// Resolve a lazy anonymous mapping fault by allocating a page on demand.
-    pub fn resolve_lazy_fault(
-        &mut self,
-        fault_va: usize,
-        access: MapPermission,
-    ) -> LazyFaultResult {
-        let vpn: VirtPageNum = VirtAddr::from(fault_va).floor();
-        for area in self.areas.iter_mut() {
-            if area.map_type != MapType::Lazy {
-                continue;
-            }
-            if vpn < area.vpn_range.get_start() || vpn >= area.vpn_range.get_end() {
-                continue;
-            }
-            if !area.map_perm.contains(access) {
-                return LazyFaultResult::Invalid;
-            }
-            if let Some(pte) = self.page_table.translate(vpn) {
-                if pte.is_valid() {
-                    return LazyFaultResult::Invalid;
-                }
-            }
-            let total_pages = area
-                .vpn_range
-                .get_end()
-                .0
-                .saturating_sub(area.vpn_range.get_start().0);
-            let accounted_pages = area.charged_pages.max(area.data_frames.len());
-            let new_charge_pages = total_pages.saturating_sub(accounted_pages);
-            let Some(frame) = frame_alloc() else {
-                crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
-                return LazyFaultResult::Oom;
-            };
-            // Allocate before charging so OOM in frame_alloc() cannot leak cgroup accounting;
-            // if charging fails, the uninstalled frame is dropped immediately.
-            if new_charge_pages > 0
-                && area.map_perm.contains(MapPermission::U)
-                && area.map_perm.contains(MapPermission::W)
-            {
-                let charge_bytes = new_charge_pages.saturating_mul(crate::config::PAGE_SIZE);
-                if !cgroup_charge_anon_current(current_process().getpid(), charge_bytes) {
-                    return LazyFaultResult::Oom;
-                }
-                area.charged_pages = accounted_pages.saturating_add(new_charge_pages);
-            }
-            let pte_flags = PTEFlags::from(area.map_perm);
-            self.page_table.map(vpn, frame.ppn, pte_flags);
-            area.data_frames.insert(vpn, frame);
-            #[cfg(target_arch = "riscv64")]
-            // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.
-            unsafe {
-                core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
-            }
-            #[cfg(target_arch = "loongarch64")]
-            // SAFETY: invtlb is valid in S-mode; fault_va is the address to flush from TLB.
-            unsafe {
-                core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
-            }
-            return LazyFaultResult::Resolved;
-        }
-        LazyFaultResult::Invalid
-    }
     pub fn activate(&self) {
         #[cfg(target_arch = "riscv64")]
         {
@@ -1363,9 +2863,11 @@ impl MemorySet {
         if let Some(area) = self
             .areas
             .iter_mut()
-            .find(|area| area.vpn_range.get_start() == start.floor())
+            .find(|area| area.start_vpn() == start.floor())
         {
             area.shrink_to(&mut self.page_table, new_end.ceil());
+            self.sort_user_areas();
+            self.debug_assert_user_vm_invariants();
             true
         } else {
             false
@@ -1376,25 +2878,33 @@ impl MemorySet {
         if let Some(area) = self
             .areas
             .iter_mut()
-            .find(|area| area.vpn_range.get_start() == start.floor())
+            .find(|area| area.start_vpn() == start.floor())
         {
-            area.append_to(&mut self.page_table, new_end.ceil())
+            let appended = area.append_to(&mut self.page_table, new_end.ceil());
+            if appended {
+                self.sort_user_areas();
+                self.debug_assert_user_vm_invariants();
+            }
+            appended
         } else {
             false
         }
     }
 
     pub fn remove_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
-        if let Some((idx, area)) = self.areas.iter_mut().enumerate().find(|(_idx, area)| {
-            area.vpn_range.get_start() == start_va.floor()
-                && area.vpn_range.get_end() == end_va.ceil()
-        }) {
+        if let Some((idx, area)) = self
+            .areas
+            .iter_mut()
+            .enumerate()
+            .find(|(_idx, area)| area.has_exact_vpn_range(start_va.floor(), end_va.ceil()))
+        {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
+            self.debug_assert_user_vm_invariants();
         };
     }
 
-    pub fn move_user_range(
+    fn move_user_range_raw(
         &mut self,
         old_start_va: VirtAddr,
         old_end_va: VirtAddr,
@@ -1407,10 +2917,11 @@ impl MemorySet {
             return true;
         }
         let delta = new_start_vpn.0 as isize - old_start_vpn.0 as isize;
-        let shifted_vpn = |vpn: VirtPageNum| -> Option<VirtPageNum> {
-            let next = vpn.0 as isize + delta;
-            (next >= 0).then_some(VirtPageNum(next as usize))
-        };
+        if shift_vpn_by_delta(old_start_vpn, delta).is_none()
+            || shift_vpn_by_delta(old_end_vpn, delta).is_none()
+        {
+            return false;
+        }
 
         let mut moved_ptes: Vec<(VirtPageNum, PhysPageNum, PTEFlags)> = Vec::new();
         let mut moved_areas: Vec<MapArea> = Vec::new();
@@ -1418,15 +2929,15 @@ impl MemorySet {
         let mut found = false;
 
         let mut areas = core::mem::take(&mut self.areas);
-        for mut area in areas.drain(..) {
-            if !area.map_perm.contains(MapPermission::U) {
+        for area in areas.drain(..) {
+            if !area.contains_perm(MapPermission::U) {
                 new_areas.push(area);
                 continue;
             }
 
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if old_end_vpn <= area_start || old_start_vpn >= area_end {
+            let area_start = area.start_vpn();
+            let area_end = area.end_vpn();
+            if !area.overlaps_vpn_range(old_start_vpn, old_end_vpn) {
                 new_areas.push(area);
                 continue;
             }
@@ -1438,7 +2949,7 @@ impl MemorySet {
             for vpn in VPNRange::new(ov_start, ov_end) {
                 if let Some(pte) = self.page_table.translate(vpn) {
                     if pte.is_valid() {
-                        let Some(new_vpn) = shifted_vpn(vpn) else {
+                        let Some(new_vpn) = shift_vpn_by_delta(vpn, delta) else {
                             return false;
                         };
                         moved_ptes.push((new_vpn, pte.ppn(), pte.flags()));
@@ -1447,57 +2958,25 @@ impl MemorySet {
                 }
             }
 
-            let mut left_frames = BTreeMap::new();
-            let mut mid_frames = BTreeMap::new();
-            let mut right_frames = BTreeMap::new();
-            if area.map_type != MapType::Identical {
-                let mut remaining = core::mem::take(&mut area.data_frames);
-                right_frames = remaining.split_off(&ov_end);
-                mid_frames = remaining.split_off(&ov_start);
-                left_frames = remaining;
-            }
-
-            if area_start < ov_start {
-                let mut left = MapArea::from_another(&area);
-                left.vpn_range = VPNRange::new(area_start, ov_start);
-                left.data_frames = left_frames;
+            let (left, mid, right) = area.split_around(ov_start, ov_end);
+            if let Some(left) = left {
                 new_areas.push(left);
             }
 
-            let Some(new_mid_start) = shifted_vpn(ov_start) else {
+            let Some(mid) = mid.move_by_delta(delta) else {
                 return false;
             };
-            let Some(new_mid_end) = shifted_vpn(ov_end) else {
-                return false;
-            };
-            let mut mid = MapArea::from_another(&area);
-            mid.vpn_range = VPNRange::new(new_mid_start, new_mid_end);
-            if ov_start != area_start {
-                mid.start_offset = 0;
-            }
-            if area.map_type != MapType::Identical {
-                let mut remapped = BTreeMap::new();
-                for (vpn, frame) in mid_frames {
-                    let Some(new_vpn) = shifted_vpn(vpn) else {
-                        return false;
-                    };
-                    remapped.insert(new_vpn, frame);
-                }
-                mid.data_frames = remapped;
-            }
             moved_areas.push(mid);
 
-            if ov_end < area_end {
-                let mut right = MapArea::from_another(&area);
-                right.vpn_range = VPNRange::new(ov_end, area_end);
-                right.start_offset = 0;
-                right.data_frames = right_frames;
+            if let Some(right) = right {
                 new_areas.push(right);
             }
         }
 
         if !found {
             self.areas = new_areas;
+            self.sort_user_areas();
+            self.debug_assert_user_vm_invariants();
             return false;
         }
 
@@ -1506,8 +2985,7 @@ impl MemorySet {
             self.page_table.map(vpn, ppn, flags);
         }
         self.areas.extend(moved_areas);
-        self.areas
-            .sort_unstable_by_key(|area| area.vpn_range.get_start().0);
+        self.sort_user_areas();
         true
     }
 
@@ -1525,9 +3003,7 @@ impl MemorySet {
         // Fast path: exact-area munmap (common in tight mmap/munmap loops).
         // Avoid rebuilding the whole area list when we can remove one area directly.
         if let Some(idx) = self.areas.iter().position(|area| {
-            area.map_perm.contains(MapPermission::U)
-                && area.vpn_range.get_start() == start_vpn
-                && area.vpn_range.get_end() == end_vpn
+            area.contains_perm(MapPermission::U) && area.has_exact_vpn_range(start_vpn, end_vpn)
         }) {
             let mut area = self.areas.remove(idx);
             area.unmap(&mut self.page_table);
@@ -1537,14 +3013,14 @@ impl MemorySet {
         let mut new_areas: Vec<MapArea> = Vec::new();
         let mut areas = core::mem::take(&mut self.areas);
         for mut area in areas.drain(..) {
-            if !area.map_perm.contains(MapPermission::U) {
+            if !area.contains_perm(MapPermission::U) {
                 new_areas.push(area);
                 continue;
             }
 
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if end_vpn <= area_start || start_vpn >= area_end {
+            let area_start = area.start_vpn();
+            let area_end = area.end_vpn();
+            if !area.overlaps_vpn_range(start_vpn, end_vpn) {
                 new_areas.push(area);
                 continue;
             }
@@ -1552,40 +3028,25 @@ impl MemorySet {
             let ov_start = core::cmp::max(start_vpn, area_start);
             let ov_end = core::cmp::min(end_vpn, area_end);
 
-            for vpn in VPNRange::new(ov_start, ov_end) {
-                area.unmap_one_maybe(&mut self.page_table, vpn);
-            }
+            area.unmap_range_maybe(&mut self.page_table, ov_start, ov_end);
 
-            let mut left_frames = BTreeMap::new();
-            let mut right_frames = BTreeMap::new();
-            if area.map_type != MapType::Identical {
-                let mut remaining = core::mem::take(&mut area.data_frames);
-                right_frames = remaining.split_off(&ov_end);
-                let overlap = remaining.split_off(&ov_start);
-                drop(overlap);
-                left_frames = remaining;
-            }
-
-            if area_start < ov_start {
-                let mut left = MapArea::from_another(&area);
-                left.vpn_range = VPNRange::new(area_start, ov_start);
-                left.data_frames = left_frames;
+            let (left, _mid, right) = area.split_around(ov_start, ov_end);
+            if let Some(left) = left {
                 new_areas.push(left);
             }
-            if ov_end < area_end {
-                let mut right = MapArea::from_another(&area);
-                right.vpn_range = VPNRange::new(ov_end, area_end);
-                right.start_offset = 0;
-                right.data_frames = right_frames;
+            if let Some(right) = right {
                 new_areas.push(right);
             }
         }
         self.areas = new_areas;
+        self.sort_user_areas();
     }
 
-    /// Update user mapping permissions in `[start_va, end_va)`.
+    /// Update concrete user mapping permissions in `[start_va, end_va)`.
     ///
-    /// Returns `false` if any portion of the range is not mapped as a user area.
+    /// Syscall-visible coverage is checked against `VmRegionSet` before this
+    /// helper runs. Missing `MapArea` coverage is therefore a bookkeeping bug,
+    /// not an `mprotect(2)` policy decision.
     pub fn mprotect_user_range(
         &mut self,
         start_va: VirtAddr,
@@ -1594,219 +3055,220 @@ impl MemorySet {
     ) -> bool {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
-        if start_vpn >= end_vpn {
-            return true;
-        }
-
-        // Ensure the range is fully covered by user areas.
-        let mut cursor = start_vpn;
-        while cursor < end_vpn {
-            let mut covered = false;
-            let mut next = end_vpn;
-            for area in self.areas.iter() {
-                if !area.map_perm.contains(MapPermission::U) {
-                    continue;
-                }
-                let area_start = area.vpn_range.get_start();
-                let area_end = area.vpn_range.get_end();
-                if cursor >= area_start && cursor < area_end {
-                    covered = true;
-                    next = core::cmp::min(area_end, end_vpn);
-                    break;
-                }
-            }
-            if !covered {
-                return false;
-            }
-            cursor = next;
-        }
+        let mut touched_area = false;
 
         let mut new_areas: Vec<MapArea> = Vec::new();
         let mut areas = core::mem::take(&mut self.areas);
-        for mut area in areas.drain(..) {
-            if !area.map_perm.contains(MapPermission::U) {
+        for area in areas.drain(..) {
+            if !area.contains_perm(MapPermission::U) {
                 new_areas.push(area);
                 continue;
             }
 
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if end_vpn <= area_start || start_vpn >= area_end {
+            let area_start = area.start_vpn();
+            let area_end = area.end_vpn();
+            if !area.overlaps_vpn_range(start_vpn, end_vpn) {
                 new_areas.push(area);
                 continue;
             }
+            touched_area = true;
 
             let ov_start = core::cmp::max(start_vpn, area_start);
             let ov_end = core::cmp::min(end_vpn, area_end);
 
-            let mut left_frames = BTreeMap::new();
-            let mut mid_frames = BTreeMap::new();
-            let mut right_frames = BTreeMap::new();
-            if area.map_type != MapType::Identical {
-                let mut remaining = core::mem::take(&mut area.data_frames);
-                right_frames = remaining.split_off(&ov_end);
-                let overlap = remaining.split_off(&ov_start);
-                mid_frames = overlap;
-                left_frames = remaining;
-            }
+            let (left, mut mid, right) = area.split_around(ov_start, ov_end);
 
             for vpn in VPNRange::new(ov_start, ov_end) {
                 if let Some(pte) = self.page_table.translate(vpn) {
                     if pte.is_valid() {
                         if new_perm == MapPermission::U {
                             // PROT_NONE: unmap but keep the frame tracker.
+                            mid.save_pte_flags(vpn, pte.flags());
                             self.page_table.unmap(vpn);
                             continue;
                         }
-                        let mut pte_flags = PTEFlags::from(new_perm);
                         let old_flags = pte.flags();
-                        if old_flags.contains(PTEFlags::COW) {
-                            pte_flags.insert(PTEFlags::COW);
-                            pte_flags.remove(PTEFlags::W);
-                        }
-                        if old_flags.contains(PTEFlags::SHARED) {
-                            pte_flags.insert(PTEFlags::SHARED);
-                        }
+                        let pte_flags = pte_flags_for_mprotect(new_perm, Some(old_flags));
+                        let _ = mid.take_saved_pte_flags(vpn);
                         let _ = self.page_table.set_flags(vpn, pte_flags);
                         continue;
                     }
                 }
                 if new_perm != MapPermission::U {
-                    if let Some(frame) = mid_frames.get(&vpn) {
-                        let pte_flags = PTEFlags::from(new_perm);
-                        self.page_table.map(vpn, frame.ppn, pte_flags);
+                    if let Some(ppn) = mid.tracked_frame(vpn).map(|frame| frame.ppn) {
+                        let old_flags = mid.take_saved_pte_flags(vpn);
+                        let pte_flags = pte_flags_for_mprotect(new_perm, old_flags);
+                        self.page_table.map(vpn, ppn, pte_flags);
                     }
                 }
             }
 
-            if area_start < ov_start {
-                let mut left = MapArea::from_another(&area);
-                left.vpn_range = VPNRange::new(area_start, ov_start);
-                left.data_frames = left_frames;
+            if let Some(left) = left {
                 new_areas.push(left);
             }
 
-            let mut mid = MapArea::from_another(&area);
-            mid.vpn_range = VPNRange::new(ov_start, ov_end);
-            if ov_start != area_start {
-                mid.start_offset = 0;
-            }
-            mid.map_perm = new_perm;
-            mid.data_frames = mid_frames;
+            mid.set_map_perm(new_perm);
             new_areas.push(mid);
 
-            if ov_end < area_end {
-                let mut right = MapArea::from_another(&area);
-                right.vpn_range = VPNRange::new(ov_end, area_end);
-                right.start_offset = 0;
-                right.data_frames = right_frames;
+            if let Some(right) = right {
                 new_areas.push(right);
             }
         }
         self.areas = new_areas;
+        self.sort_user_areas();
+        debug_assert!(
+            touched_area || start_vpn >= end_vpn,
+            "mprotect concrete update had no MapArea coverage for {:?}..{:?}",
+            start_vpn,
+            end_vpn
+        );
         true
     }
 
-    /// Discard mapped pages in lazy user areas within `[start_va, end_va)`.
-    ///
-    /// This keeps the virtual ranges intact but frees any physical frames
-    /// so they will be re-allocated on the next fault.
-    pub fn discard_lazy_user_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+    fn discard_lazy_concrete_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
         if start_vpn >= end_vpn {
             return;
         }
         for area in self.areas.iter_mut() {
-            if area.map_type != MapType::Lazy {
+            if !area.is_lazy() {
                 continue;
             }
-            if !area.map_perm.contains(MapPermission::U) {
+            if !area.contains_perm(MapPermission::U) {
                 continue;
             }
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            if end_vpn <= area_start || start_vpn >= area_end {
+            let area_start = area.start_vpn();
+            let area_end = area.end_vpn();
+            if !area.overlaps_vpn_range(start_vpn, end_vpn) {
                 continue;
             }
             let ov_start = core::cmp::max(start_vpn, area_start);
             let ov_end = core::cmp::min(end_vpn, area_end);
-            for vpn in VPNRange::new(ov_start, ov_end) {
-                area.unmap_one_maybe(&mut self.page_table, vpn);
-            }
+            area.unmap_range_maybe(&mut self.page_table, ov_start, ov_end);
         }
     }
 
-    /// Returns true if any existing mapping overlaps the range.
-    pub fn range_overlaps(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    fn discard_framed_concrete_to_lazy_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
-        self.areas.iter().any(|area| {
-            let area_start = area.vpn_range.get_start();
-            let area_end = area.vpn_range.get_end();
-            end_vpn > area_start && start_vpn < area_end
-        })
+        if start_vpn >= end_vpn {
+            return;
+        }
+
+        let mut new_areas: Vec<MapArea> = Vec::new();
+        let mut areas = core::mem::take(&mut self.areas);
+        for area in areas.drain(..) {
+            if !area.contains_perm(MapPermission::U)
+                || area.map_type() != MapType::Framed
+                || area.map_perm() != permission
+                || !area.overlaps_vpn_range(start_vpn, end_vpn)
+            {
+                new_areas.push(area);
+                continue;
+            }
+
+            let ov_start = core::cmp::max(start_vpn, area.start_vpn());
+            let ov_end = core::cmp::min(end_vpn, area.end_vpn());
+            let (left, mut mid, right) = area.split_around(ov_start, ov_end);
+            mid.unmap(&mut self.page_table);
+
+            if let Some(left) = left {
+                new_areas.push(left);
+            }
+            new_areas.push(MapArea::new(
+                VirtAddr::from(ov_start),
+                VirtAddr::from(ov_end),
+                MapType::Lazy,
+                permission,
+            ));
+            if let Some(right) = right {
+                new_areas.push(right);
+            }
+        }
+        self.areas = new_areas;
+        self.sort_user_areas();
+    }
+
+    /// Discard pages for `madvise(MADV_DONTNEED)`.
+    ///
+    /// VMA metadata decides which ranges are eligible; `MapArea` is only the
+    /// resident/lazy page cache being dropped. Private anonymous framed stack
+    /// pages can be turned into lazy zero-fill holes, and private OSInode-backed
+    /// framed pages can be turned back into lazy file refault holes. ELF
+    /// text/data still keeps its framed pages until it has a file-backed refault
+    /// source.
+    pub fn discard_madvise_dontneed_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        let start = start_va.0;
+        let end = end_va.0;
+        if start >= end {
+            return;
+        }
+        let regions = self.vm_regions.snapshot_range(start, end);
+        for region in regions {
+            if region.shared {
+                continue;
+            }
+            let discard_start = core::cmp::max(start, region.start);
+            let discard_end = core::cmp::min(end, region.end());
+            if region.map_type == MapType::Lazy || region.is_file_like() {
+                self.discard_lazy_concrete_range(discard_start.into(), discard_end.into());
+            }
+            if region.can_file_framed_refault() || region.can_zero_fill_framed_refault() {
+                self.discard_lazy_concrete_range(discard_start.into(), discard_end.into());
+                self.discard_framed_concrete_to_lazy_range(
+                    discard_start.into(),
+                    discard_end.into(),
+                    region.map_permission(),
+                );
+            }
+        }
+        self.debug_assert_user_vm_invariants();
+    }
+
+    /// Returns true if any concrete `MapArea` overlaps the range.
+    ///
+    /// This is a page-table/bookkeeping guard, not a syscall-visible VMA
+    /// coverage test. Use `VmRegionSet`-backed helpers for policy decisions.
+    /// 逐一 检查 已有 area  是否 与 给定的 重叠
+    pub fn concrete_range_overlaps(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        self.areas
+            .iter()
+            .any(|area| area.overlaps_vpn_range(start_vpn, end_vpn))
     }
 
     /// Return merged user virtual-memory ranges from current VMAs.
     pub fn user_mapped_ranges(&self) -> Vec<(usize, usize)> {
         let mut ranges = Vec::new();
-        for area in self.areas.iter() {
-            if !area.map_perm.contains(MapPermission::U) {
-                continue;
+        for region in self.vm_regions.iter() {
+            if let Some((start, end)) = Self::vm_region_user_range(*region) {
+                push_range_merged(&mut ranges, start, end);
             }
-            let start = area.vpn_range.get_start().0.saturating_mul(PAGE_SIZE);
-            let end = area.vpn_range.get_end().0.saturating_mul(PAGE_SIZE);
-            if end <= start {
-                continue;
-            }
-            ranges.push((start, end));
         }
-        ranges.sort_unstable_by_key(|(start, _)| *start);
-        let mut merged: Vec<(usize, usize)> = Vec::new();
-        for (start, end) in ranges {
-            if let Some(last) = merged.last_mut() {
-                if start <= last.1 {
-                    last.1 = last.1.max(end);
-                    continue;
-                }
-            }
-            merged.push((start, end));
-        }
-        merged
+        ranges
     }
 
     /// Highest end address among current user VMAs.
     pub fn max_user_mapped_end(&self) -> usize {
-        self.areas
+        self.vm_regions
             .iter()
-            .filter(|area| area.map_perm.contains(MapPermission::U))
-            .map(|area| area.vpn_range.get_end().0.saturating_mul(PAGE_SIZE))
+            .filter_map(|region| Self::vm_region_user_range(*region).map(|(_start, end)| end))
             .max()
             .unwrap_or(0)
     }
 
     /// Whether every page in `[start_va, end_va)` belongs to some user VMA.
     pub fn user_range_fully_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
-        let start: usize = start_va.into();
-        let end: usize = end_va.into();
-        if start >= end {
-            return true;
-        }
-        let mut cursor = start;
-        for (range_start, range_end) in self.user_mapped_ranges() {
-            if range_end <= cursor {
-                continue;
-            }
-            if range_start > cursor {
-                return false;
-            }
-            cursor = cursor.max(range_end);
-            if cursor >= end {
-                return true;
-            }
-        }
-        false
+        let start = start_va.0;
+        let end = end_va.0;
+        self.vm_regions.covers_range(start, end)
     }
 
     pub fn remove_area_with_start_vpn(&mut self, start_va: VirtAddr) {
@@ -1814,10 +3276,11 @@ impl MemorySet {
             .areas
             .iter_mut()
             .enumerate()
-            .find(|(_idx, area)| area.vpn_range.get_start() == start_va.floor())
+            .find(|(_idx, area)| area.start_vpn() == start_va.floor())
         {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
+            self.debug_assert_user_vm_invariants();
         };
     }
 
@@ -1827,21 +3290,21 @@ impl MemorySet {
         let has_user = self
             .areas
             .iter()
-            .any(|area| area.map_perm.contains(MapPermission::U));
+            .any(|area| area.contains_perm(MapPermission::U));
         new_memory_set.map_trampoline();
         if has_user {
             new_memory_set.map_sigreturn_trampoline_user();
         }
         for area in &self.areas {
             let mut new_area = MapArea::new(
-                VirtAddr::from(area.vpn_range.get_start()),
-                VirtAddr::from(area.vpn_range.get_end()),
-                area.map_type,
-                area.map_perm,
+                VirtAddr::from(area.start_vpn()),
+                VirtAddr::from(area.end_vpn()),
+                area.map_type(),
+                area.map_perm(),
             );
-            if area.map_type == MapType::Lazy {
-                let pte_flags = PTEFlags::from(new_area.map_perm);
-                for vpn in area.vpn_range {
+            if area.is_lazy() {
+                let pte_flags = new_area.pte_flags();
+                for vpn in area.vpn_range() {
                     let Some(src_pte) = self.page_table.translate(vpn) else {
                         continue;
                     };
@@ -1857,16 +3320,16 @@ impl MemorySet {
                         .get_bytes_array()
                         .copy_from_slice(src_ppn.get_bytes_array());
                     new_memory_set.page_table.map(vpn, frame.ppn, pte_flags);
-                    new_area.data_frames.insert(vpn, frame);
+                    new_area.insert_tracked_frame(vpn, frame);
                 }
-                new_memory_set.push_mapped(new_area);
+                new_memory_set.push_mapped_raw(new_area);
                 continue;
             }
 
-            new_memory_set.push(new_area, None);
+            assert!(new_memory_set.try_push_raw(new_area, None));
             //then copy data
 
-            for vpn in area.vpn_range {
+            for vpn in area.vpn_range() {
                 let src_ppn = self.page_table.translate(vpn).unwrap().ppn();
                 let dst_ppn = new_memory_set.page_table.translate(vpn).unwrap().ppn();
                 let src_bytes = src_ppn.get_bytes_array();
@@ -1875,203 +3338,14 @@ impl MemorySet {
             }
         }
 
+        new_memory_set.inherit_user_vm_metadata_from(self);
         new_memory_set
     }
     #[allow(dead_code)]
     pub fn recycle_data_pages(&mut self) {
         //*self = Self::new_bare();
         self.areas.clear();
-    }
-}
-
-/// map area structure, controls a contiguous piece of virtual memory
-pub struct MapArea {
-    vpn_range: VPNRange,
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
-    charged_pages: usize,
-    map_type: MapType,
-    map_perm: MapPermission,
-    start_offset: usize,
-}
-
-impl MapArea {
-    pub fn new(
-        start_va: VirtAddr,
-        end_va: VirtAddr,
-        map_type: MapType,
-        map_perm: MapPermission,
-    ) -> Self {
-        let start_vpn: VirtPageNum = start_va.floor();
-        let end_vpn: VirtPageNum = end_va.ceil();
-        Self {
-            vpn_range: VPNRange::new(start_vpn, end_vpn),
-            data_frames: BTreeMap::new(),
-            charged_pages: 0,
-            map_type,
-            map_perm,
-            start_offset: start_va.page_offset(),
-        }
-    }
-    pub fn from_another(another: &MapArea) -> Self {
-        Self {
-            vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
-            data_frames: BTreeMap::new(),
-            charged_pages: another.charged_pages,
-            map_type: another.map_type,
-            map_perm: another.map_perm,
-            start_offset: another.start_offset,
-        }
-    }
-    /// map _one 两种映射类型.其中恒等映射 本人是不持有 frame 的.
-    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
-        if self.map_type == MapType::Lazy {
-            return true;
-        }
-        let ppn: PhysPageNum = match self.map_type {
-            MapType::Identical => PhysPageNum(vpn.0),
-            MapType::Framed => {
-                let Some(frame) = frame_alloc() else {
-                    crate::println!("[mm] OOM: frame_alloc failed for vpn={:?}", vpn);
-                    return false;
-                };
-                let ppn = frame.ppn;
-                self.data_frames.insert(vpn, frame);
-                ppn
-            }
-            MapType::Lazy => unreachable!(),
-        };
-        let pte_flags = PTEFlags::from(self.map_perm);
-        page_table.map(vpn, ppn, pte_flags);
-        true
-    }
-    #[allow(unused)]
-    pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
-        if self.map_type != MapType::Identical {
-            self.data_frames.remove(&vpn);
-        }
-        if self.map_type == MapType::Lazy {
-            page_table.unmap_if_mapped(vpn);
-        } else {
-            page_table.unmap(vpn);
-        }
-    }
-
-    pub fn unmap_one_maybe(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
-        if self.map_type != MapType::Identical {
-            self.data_frames.remove(&vpn);
-        }
-        page_table.unmap_if_mapped(vpn);
-    }
-
-    /// 清理内存,并且将内存进行映射,内部使用map_one 逐个映射.
-    pub fn map(&mut self, page_table: &mut PageTable) -> bool {
-        if self.map_type == MapType::Lazy {
-            return true;
-        }
-        let mut mapped: Vec<VirtPageNum> = Vec::new();
-        for vpn in self.vpn_range {
-            if !self.map_one(page_table, vpn) {
-                // Roll back any partial mappings to avoid leaving an invalid address space.
-                for vpn in mapped {
-                    self.unmap_one_maybe(page_table, vpn);
-                }
-                return false;
-            }
-            mapped.push(vpn);
-        }
-        true
-    }
-    #[allow(unused)]
-    pub fn unmap(&mut self, page_table: &mut PageTable) {
-        for vpn in self.vpn_range {
-            self.unmap_one(page_table, vpn);
-        }
-    }
-    #[allow(unused)]
-    pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
-        for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
-            self.unmap_one(page_table, vpn)
-        }
-        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
-    }
-    #[allow(unused)]
-    pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) -> bool {
-        if self.map_type == MapType::Lazy {
-            self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
-            return true;
-        }
-        let old_end = self.vpn_range.get_end();
-        let mut mapped: Vec<VirtPageNum> = Vec::new();
-        for vpn in VPNRange::new(old_end, new_end) {
-            if !self.map_one(page_table, vpn) {
-                // Roll back the newly mapped suffix.
-                for vpn in mapped {
-                    self.unmap_one_maybe(page_table, vpn);
-                }
-                return false;
-            }
-            mapped.push(vpn);
-        }
-        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
-        true
-    }
-    /// data: start-aligned but maybe with shorter length
-    /// assume that all frames were cleared before
-    pub fn copy_data(&mut self, page_table: &PageTable, data: &[u8]) {
-        assert_eq!(self.map_type, MapType::Framed);
-        let mut current_vpn = self.vpn_range.get_start();
-        let mut src_off = 0usize;
-
-        // First page may start at an offset within the page.
-        let mut page_off = self.start_offset;
-        while src_off < data.len() {
-            let dst_page = page_table
-                .translate(current_vpn)
-                .unwrap()
-                .ppn()
-                .get_bytes_array();
-            let cap = PAGE_SIZE - page_off;
-            let to_copy = core::cmp::min(cap, data.len() - src_off);
-            dst_page[page_off..page_off + to_copy]
-                .copy_from_slice(&data[src_off..src_off + to_copy]);
-            src_off += to_copy;
-            current_vpn.step();
-            page_off = 0;
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum LazyFaultResult {
-    Resolved,
-    Oom,
-    Invalid,
-}
-
-impl LazyFaultResult {
-    #[allow(dead_code)]
-    pub fn is_resolved(self) -> bool {
-        matches!(self, Self::Resolved)
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Debug)]
-/// map type for memory set: identical, framed, or lazy (on-demand)
-pub enum MapType {
-    Identical,
-    Framed,
-    Lazy,
-}
-
-bitflags! {
-    /// map permission corresponding to that in pte: `R W X U`
-    pub struct MapPermission: u8 {
-        const R = 1 << 1;
-        const W = 1 << 2;
-        const X = 1 << 3;
-        const U = 1 << 4;
-        /// Device/IO memory mapping (non-cacheable on loongarch64).
-        const IO = 1 << 5;
+        self.debug_assert_user_vm_invariants();
     }
 }
 pub fn kernel_token() -> usize {

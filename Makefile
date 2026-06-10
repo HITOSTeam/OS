@@ -71,6 +71,7 @@ endif
 # Build-level configuration
 # ----------------------------------------------------------------------
 MODE         ?= release
+CARGO_MODE_FLAG := $(if $(filter release,$(MODE)),--release,)
 SMP          ?= 4
 MEM          ?= 1G
 QEMU_TIMEOUT ?= 0
@@ -159,7 +160,7 @@ prepare-cargo:
 # `rust-objcopy` is optional: QEMU boots the ELF directly when the raw
 # binary cannot be produced.
 kernel: prepare-cargo user_apps
-	@cargo build --$(MODE) --target $(TARGET)
+	@cargo build $(CARGO_MODE_FLAG) --target $(TARGET)
 	@OBJCOPY=$$(command -v rust-objcopy || command -v llvm-objcopy || true); \
 	if [ -n "$$OBJCOPY" ]; then \
 		$$OBJCOPY --strip-all $(KERNEL_ELF) -O binary $(KERNEL_BIN); \
@@ -174,7 +175,7 @@ kernel: prepare-cargo user_apps
 # the log quiet when a binary has not actually changed.
 user_apps: prepare-cargo
 	@cd $(USER_DIR) && CARGO_TARGET_DIR=target \
-	    cargo build --$(MODE) $(USER_FEATURES) --target $(TARGET)
+	    cargo build $(CARGO_MODE_FLAG) $(USER_FEATURES) --target $(TARGET)
 	@mkdir -p $(APP_DIR)
 	@for f in $(USER_TARGET_DIR)/*; do \
 		[ -f "$$f" ] && [ -x "$$f" ] || continue; \

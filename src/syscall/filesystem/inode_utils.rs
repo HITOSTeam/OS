@@ -13,6 +13,7 @@ use super::{
     resolve_parent_and_name, rofs_for_path, syscall_fchmod, try_copy_from_user,
     try_copy_to_user_unchecked,
 };
+use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
 use alloc::vec;
 use lazy_static::lazy_static;
 
@@ -664,66 +665,172 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
     }
 
     let inode = os_inode.ext4_inode();
-    let (dev, ino) = {
+    let pending_end = os_inode.pending_write_end();
+    let (dev, ino, file_size) = {
         let _ext4_guard = ext4_lock();
-        (inode.device_id(), inode.inode_num())
+        (
+            inode.device_id(),
+            inode.inode_num(),
+            (inode.size() as usize).max(pending_end),
+        )
     };
-    let write_end = write_off.saturating_add(len);
+    update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    // 当前进程的 user-buffer write 可以直接按用户地址做旧路径镜像。
     let copies: Vec<(usize, usize, usize)> = {
         let process = current_process();
         let inner = process.borrow_mut();
-        let mut pending = Vec::new();
-        for region in inner.mmap_areas.iter() {
-            if !region.file_backed || region.file_dev != dev || region.file_ino != ino {
-                continue;
-            }
-            let Some(region_file_end) = region.file_offset.checked_add(region.len) else {
-                continue;
-            };
-            let overlap_start = core::cmp::max(write_off, region.file_offset);
-            let mut overlap_end = core::cmp::min(write_end, region_file_end);
-            let region_valid_len = region
-                .sigbus_start
-                .saturating_sub(region.start)
-                .min(region.len);
-            let region_valid_end = region.file_offset.saturating_add(region_valid_len);
-            overlap_end = core::cmp::min(overlap_end, region_valid_end);
-            if overlap_end <= overlap_start {
-                continue;
-            }
-            pending.push((
-                region.start + (overlap_start - region.file_offset),
-                overlap_start - write_off,
-                overlap_end - overlap_start,
-            ));
-        }
-        pending
+        inner.memory_set.update_file_vm_size(dev, ino, file_size);
+        inner
+            .memory_set
+            .file_vm_copy_targets(dev, ino, write_off, len)
     };
-    if copies.is_empty() {
+    if !copies.is_empty() {
+        let token = get_current_token();
+        let mut tmp = [0u8; 1024];
+        for (dst, src_off, total) in copies {
+            let mut done = 0usize;
+            while done < total {
+                let chunk = core::cmp::min(tmp.len(), total - done);
+                if try_copy_from_user(
+                    token,
+                    (user_src + src_off + done) as *const u8,
+                    &mut tmp[..chunk],
+                )
+                .is_err()
+                {
+                    return;
+                }
+                if try_copy_to_user_unchecked(token, (dst + done) as *mut u8, &tmp[..chunk])
+                    .is_err()
+                {
+                    return;
+                }
+                done += chunk;
+            }
+        }
+    }
+    // 其他 mm 不能使用当前 token 写用户地址，只能先拷贝到内核缓冲再广播。
+    mirror_inode_write_to_shared_mmaps_all_processes(dev, ino, write_off, user_src, len);
+}
+
+fn mirror_inode_write_to_shared_mmaps_all_processes(
+    dev: usize,
+    ino: u32,
+    write_off: usize,
+    user_src: usize,
+    len: usize,
+) {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    if processes.is_empty() {
         return;
     }
 
     let token = get_current_token();
     let mut tmp = [0u8; 1024];
-    for (dst, src_off, total) in copies {
-        let mut done = 0usize;
-        while done < total {
-            let chunk = core::cmp::min(tmp.len(), total - done);
-            if try_copy_from_user(
-                token,
-                (user_src + src_off + done) as *const u8,
-                &mut tmp[..chunk],
-            )
-            .is_err()
-            {
-                return;
-            }
-            if try_copy_to_user_unchecked(token, (dst + done) as *mut u8, &tmp[..chunk]).is_err() {
-                return;
-            }
-            done += chunk;
+    let mut done = 0usize;
+    while done < len {
+        let chunk = core::cmp::min(tmp.len(), len - done);
+        if try_copy_from_user(token, (user_src + done) as *const u8, &mut tmp[..chunk]).is_err() {
+            return;
         }
+        // 同步全局 cache 和所有已 resident 的 MAP_SHARED 页。
+        update_shared_file_page_cache(dev, ino, write_off + done, &tmp[..chunk]);
+        for process in processes.iter() {
+            let Some(inner) = process.try_borrow_mut() else {
+                continue;
+            };
+            inner.memory_set.mirror_shared_file_write_to_resident_mmaps(
+                dev,
+                ino,
+                write_off + done,
+                &tmp[..chunk],
+            );
+        }
+        done += chunk;
     }
+}
+
+pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
+    os_inode: &OSInode,
+    write_off: usize,
+    data: &[u8],
+) {
+    if data.is_empty() {
+        return;
+    }
+
+    let inode = os_inode.ext4_inode();
+    let pending_end = os_inode.pending_write_end();
+    let (dev, ino, file_size) = {
+        let _ext4_guard = ext4_lock();
+        (
+            inode.device_id(),
+            inode.inode_num(),
+            (inode.size() as usize).max(pending_end),
+        )
+    };
+    update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    // sendfile/splice/copy_file_range 等 kernel-buffer 写入也要同步 mmap 视图。
+    update_shared_file_page_cache(dev, ino, write_off, data);
+
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes.iter() {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        inner
+            .memory_set
+            .mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
+    }
+}
+
+fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize) {
+    // inode size 是全局事实，所有 mm 的 file_valid_len/SIGBUS tail 都要更新。
+    resize_shared_file_page_cache(dev, ino, file_size);
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        inner.memory_set.update_file_vm_size(dev, ino, file_size);
+    }
+}
+
+pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
+    let (dev, ino, file_size) = {
+        let _ext4_guard = ext4_lock();
+        (inode.device_id(), inode.inode_num(), inode.size() as usize)
+    };
+    update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    let process = current_process();
+    let inner = process.borrow_mut();
+    inner.memory_set.update_file_vm_size(dev, ino, file_size);
+}
+
+pub(crate) fn update_current_os_inode_mmaps_size(os_inode: &OSInode) {
+    let pending_end = os_inode.pending_write_end();
+    let inode = os_inode.ext4_inode();
+    let (dev, ino, file_size) = {
+        let _ext4_guard = ext4_lock();
+        (
+            inode.device_id(),
+            inode.inode_num(),
+            (inode.size() as usize).max(pending_end),
+        )
+    };
+    update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    let process = current_process();
+    let inner = process.borrow_mut();
+    inner.memory_set.update_file_vm_size(dev, ino, file_size);
 }
 
 /// Linux `pread64(2)` (syscall 67 on riscv64).

@@ -184,14 +184,17 @@ impl Drop for KernelStack {
 ///THREAD USER RESOURCES
 pub struct TaskUserRes {
     pub tid: usize,
+    trap_cx_slot: usize,
     pub ustack_base: usize,
     pub process: Weak<ProcessControlBlock>,
     owns_ustack: bool,
 }
 
-// 现在 顶部映射的 有多个 trap_cx , 每个线程一个
-fn trap_cx_bottom_from_tid(tid: usize) -> usize {
-    TRAP_CONTEXT_BASE - tid * PAGE_SIZE
+// Trap contexts live in per-mm slots near the top of user VA. The slot is
+// intentionally separate from per-PCB tid so future non-thread CLONE_VM tasks
+// can share one mm without colliding at tid 0.
+fn trap_cx_bottom_from_slot(slot: usize) -> usize {
+    TRAP_CONTEXT_BASE - slot * PAGE_SIZE
 }
 
 // 用户占 也有多份
@@ -221,9 +224,20 @@ impl TaskUserRes {
         ustack_base: usize,
         alloc_user_res: bool,
     ) -> Option<Self> {
-        let tid = process.borrow_mut().alloc_tid();
+        let (tid, trap_cx_slot) = {
+            let mut process_inner = process.borrow_mut();
+            let tid = process_inner.alloc_tid();
+            let trap_cx_slot = if alloc_user_res {
+                process_inner.memory_set.alloc_trap_context_slot()
+            } else {
+                process_inner.memory_set.reserve_trap_context_slot(tid);
+                tid
+            };
+            (tid, trap_cx_slot)
+        };
         let task_user_res = Self {
             tid,
+            trap_cx_slot,
             ustack_base,
             process: Arc::downgrade(&process),
             owns_ustack: true,
@@ -235,9 +249,16 @@ impl TaskUserRes {
     }
 
     pub fn try_new_trap_cx_only(process: Arc<ProcessControlBlock>) -> Option<Self> {
-        let tid = process.borrow_mut().alloc_tid();
+        let (tid, trap_cx_slot) = {
+            let mut process_inner = process.borrow_mut();
+            (
+                process_inner.alloc_tid(),
+                process_inner.memory_set.alloc_trap_context_slot(),
+            )
+        };
         let task_user_res = Self {
             tid,
+            trap_cx_slot,
             ustack_base: 0,
             process: Arc::downgrade(&process),
             owns_ustack: false,
@@ -251,7 +272,7 @@ impl TaskUserRes {
     fn try_alloc_trap_cx_only(&self) -> bool {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.borrow_mut();
-        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+        let trap_cx_bottom = trap_cx_bottom_from_slot(self.trap_cx_slot);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
         process_inner.memory_set.try_insert_framed_area(
             trap_cx_bottom.into(),
@@ -276,9 +297,9 @@ impl TaskUserRes {
             let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
             let ustack_top = ustack_bottom + USER_STACK_SIZE;
             // insert the user resource into the program memory space
-            if !process_inner.memory_set.try_insert_framed_area(
-                ustack_bottom.into(),
-                ustack_top.into(),
+            if !process_inner.memory_set.try_insert_stack_framed_range(
+                ustack_bottom,
+                ustack_top,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ) {
                 return false;
@@ -286,7 +307,7 @@ impl TaskUserRes {
         }
         // alloc trap_cx
         // if trap alloc failed,we will remove the user_stack too
-        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
+        let trap_cx_bottom = trap_cx_bottom_from_slot(self.trap_cx_slot);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
         if !process_inner.memory_set.try_insert_framed_area(
             trap_cx_bottom.into(),
@@ -294,11 +315,11 @@ impl TaskUserRes {
             MapPermission::R | MapPermission::W,
         ) {
             if self.owns_ustack {
-                let ustack_bottom_va: VirtAddr =
-                    ustack_bottom_from_tid(self.ustack_base, self.tid).into();
+                let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
+                let ustack_top = ustack_bottom + USER_STACK_SIZE;
                 process_inner
                     .memory_set
-                    .remove_area_with_start_vpn(ustack_bottom_va.into());
+                    .unmap_user_vma_range(ustack_bottom.into(), ustack_top.into());
             }
             return false;
         }
@@ -313,24 +334,20 @@ impl TaskUserRes {
         let mut process_inner = process.borrow_mut();
         if self.owns_ustack {
             // dealloc ustack manually
-            let ustack_bottom_va: VirtAddr =
-                ustack_bottom_from_tid(self.ustack_base, self.tid).into();
+            let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
+            let ustack_top = ustack_bottom + USER_STACK_SIZE;
             process_inner
                 .memory_set
-                .remove_area_with_start_vpn(ustack_bottom_va.into());
+                .unmap_user_vma_range(ustack_bottom.into(), ustack_top.into());
         }
         // dealloc trap_cx manually
-        let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
+        let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_slot(self.trap_cx_slot).into();
         process_inner
             .memory_set
             .remove_area_with_start_vpn(trap_cx_bottom_va.into());
-    }
-
-    #[allow(unused)]
-    pub fn alloc_tid(&mut self) {
-        if let Some(process) = self.process.upgrade() {
-            self.tid = process.borrow_mut().alloc_tid();
-        }
+        process_inner
+            .memory_set
+            .dealloc_trap_context_slot(self.trap_cx_slot);
     }
 
     pub fn dealloc_tid(&self) {
@@ -342,13 +359,13 @@ impl TaskUserRes {
     }
 
     pub fn trap_cx_user_va(&self) -> usize {
-        trap_cx_bottom_from_tid(self.tid)
+        trap_cx_bottom_from_slot(self.trap_cx_slot)
     }
 
     pub fn trap_cx_ppn(&self) -> PhysPageNum {
         let process = self.process.upgrade().expect("process already dropped");
         let process_inner = process.borrow_mut();
-        let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
+        let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_slot(self.trap_cx_slot).into();
         process_inner
             .memory_set
             .translate(trap_cx_bottom_va.into())
@@ -361,6 +378,16 @@ impl TaskUserRes {
     }
     pub fn ustack_top(&self) -> usize {
         ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE
+    }
+
+    pub fn trap_cx_slot(&self) -> usize {
+        self.trap_cx_slot
+    }
+
+    pub fn reset_for_exec(&mut self, ustack_base: usize) {
+        self.trap_cx_slot = 0;
+        self.ustack_base = ustack_base;
+        self.owns_ustack = true;
     }
 
     /// Whether this thread uses a user-managed stack (Linux CLONE_VM threads do).

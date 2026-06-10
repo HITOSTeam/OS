@@ -556,17 +556,19 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             let child_cpu_ns = reap_zombie_child(&child);
             // Reaping is complete now; remove it from the global PID table.
             crate::task::manager::remove_from_pid2process(pid);
-            let child_refs = Arc::strong_count(&child);
-            // 若 PID 表删除后 child Arc 仍有多个持有者，说明存在子系统未释放引用。
-            if child_refs > 1 {
-                let seq = REAP_CHILD_ARC_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if seq <= 16 || (seq & (seq - 1)) == 0 {
-                    crate::println!(
-                        "[reap-child-debug] child_pid={} refs_after_reap={} seq={}",
-                        pid,
-                        child_refs,
-                        seq
-                    );
+            if crate::debug_config::DEBUG_TASK_LIFECYCLE {
+                let child_refs = Arc::strong_count(&child);
+                // 若 PID 表删除后 child Arc 仍有多个持有者，说明存在子系统未释放引用。
+                if child_refs > 1 {
+                    let seq = REAP_CHILD_ARC_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if seq <= 16 || (seq & (seq - 1)) == 0 {
+                        crate::println!(
+                            "[reap-child-debug] child_pid={} refs_after_reap={} seq={}",
+                            pid,
+                            child_refs,
+                            seq
+                        );
+                    }
                 }
             }
             {

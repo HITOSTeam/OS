@@ -4,7 +4,7 @@ use core::{
 };
 
 use super::context::TrapContext;
-use crate::config::{PAGE_SIZE, TRAMPOLINE};
+use crate::config::TRAMPOLINE;
 use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, PageTable, VirtAddr};
 use crate::println;
@@ -192,7 +192,7 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(mut inner) = process.try_borrow_mut() else {
+    let Some(inner) = process.try_borrow_mut() else {
         return false;
     };
     if matches!(cause, Trap::Exception(STORE_PAGE_FAULT))
@@ -340,6 +340,9 @@ pub fn trap_handler() {
     check_timer();
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
+    // 返回用户态前的抢占点：消费本 hart 的 NEED_RESCHED，让刚唤醒的高优先级
+    // 任务尽快运行（见 processor::reschedule_before_user_return_if_needed）。
+    crate::task::processor::reschedule_before_user_return_if_needed();
     trap_return();
 }
 
@@ -362,84 +365,22 @@ fn exception_name(code: usize) -> &'static str {
 }
 
 fn try_expand_mmap_growsdown(fault_va: usize, access: MapPermission) -> bool {
-    const PROT_READ: usize = 1;
-    const PROT_WRITE: usize = 2;
-    const PROT_EXEC: usize = 4;
-
-    let fault_page = fault_va & !(PAGE_SIZE - 1);
     let process = crate::task::processor::current_process();
-    let mut inner = process.borrow_mut();
-
-    for idx in 0..inner.mmap_areas.len() {
-        let region = inner.mmap_areas[idx];
-        if !region.growsdown {
-            continue;
+    let inner = process.borrow_mut();
+    match inner.memory_set.try_expand_growsdown(fault_va, access) {
+        LazyFaultResult::Resolved => true,
+        LazyFaultResult::Oom => {
+            drop(inner);
+            exit_group_and_run_next(-9);
         }
-        let Some(expected) = region.start.checked_sub(PAGE_SIZE) else {
-            continue;
-        };
-        if fault_page != expected {
-            continue;
-        }
-
-        let mut perm = MapPermission::U;
-        if (region.prot & PROT_READ) != 0 {
-            perm |= MapPermission::R;
-        }
-        if (region.prot & PROT_WRITE) != 0 {
-            perm |= MapPermission::W;
-        }
-        if (region.prot & PROT_EXEC) != 0 {
-            perm |= MapPermission::X;
-        }
-        if !perm.contains(access) {
-            return false;
-        }
-        if inner
-            .memory_set
-            .range_overlaps(fault_page.into(), region.start.into())
-        {
-            return false;
-        }
-        // Keep one-page guard below the expanded stack segment.
-        let Some(next_guard_start) = fault_page.checked_sub(PAGE_SIZE) else {
-            return false;
-        };
-        if inner
-            .memory_set
-            .range_overlaps(next_guard_start.into(), fault_page.into())
-        {
-            return false;
-        }
-        if !inner
-            .memory_set
-            .try_insert_lazy_area(fault_page.into(), region.start.into(), perm)
-        {
-            return false;
-        }
-
-        let grown = region.start - fault_page;
-        inner.mmap_areas[idx].start = fault_page;
-        inner.mmap_areas[idx].len += grown;
-        return match inner.memory_set.resolve_lazy_fault(fault_va, access) {
-            LazyFaultResult::Resolved => true,
-            LazyFaultResult::Oom => {
-                drop(inner);
-                exit_group_and_run_next(-9);
-            }
-            LazyFaultResult::Invalid => false,
-        };
+        LazyFaultResult::Invalid => false,
     }
-    false
 }
 
 fn fault_hits_mmap_sigbus_tail(addr: usize) -> bool {
     let process = crate::task::processor::current_process();
     let inner = process.borrow_mut();
-    inner
-        .mmap_areas
-        .iter()
-        .any(|region| addr >= region.start && addr < region.end() && addr >= region.sigbus_start)
+    inner.memory_set.fault_hits_mmap_sigbus_tail(addr)
 }
 
 fn current_signal_handler(signum: usize) -> usize {
@@ -465,7 +406,15 @@ fn current_signal_handler(signum: usize) -> usize {
     }
 }
 
+/// Handle a synchronous exception taken from user mode (page faults, illegal
+/// instruction, ...). It walks a fixed priority chain of "can we fix this and
+/// resume?" attempts; the first stage that succeeds `return`s. If none can
+/// resolve the fault it is translated into a signal (SIGSEGV/SIGBUS/SIGILL),
+/// and an unrecognized exception kills the task as a last resort.
 fn handle_user_exception(code: usize, stval: usize) {
+    /// Read 8 user bytes through `token`'s page table byte-by-byte, so an
+    /// unmapped page yields `None` instead of faulting inside the kernel.
+    /// Used only by the ld-linux diagnostics further down.
     fn try_read_user_u64(token: usize, addr: usize) -> Option<u64> {
         let page_table = PageTable::from_token(token);
         let mut bytes = [0u8; 8];
@@ -479,27 +428,38 @@ fn handle_user_exception(code: usize, stval: usize) {
         Some(u64::from_le_bytes(bytes))
     }
 
+    // 1. Signal return: the sigreturn trampoline jumps to a sentinel address,
+    //    surfacing as an instruction-fetch fault at VA 0. If a signal frame is
+    //    awaiting restoration, consume it and resume the interrupted code.
     if code == INSTRUCTION_PAGE_FAULT && stval == 0 {
         if crate::syscall::signal::try_sigreturn_from_fault() {
             return;
         }
     }
-    // Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
+    // 2. Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
     if code == STORE_PAGE_FAULT {
         let process = crate::task::processor::current_process();
-        let mut inner = process.borrow_mut();
+        let inner = process.borrow_mut();
         if inner.memory_set.resolve_cow_fault(stval) {
             return;
         }
     }
+    // 3. userfaultfd: if the faulting range is registered with a userfaultfd,
+    //    hand the fault to user space and resume once it has been serviced.
     if (code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT)
         && crate::syscall::dummy::try_handle_userfaultfd_page_fault(stval, code == STORE_PAGE_FAULT)
     {
         return;
     }
+    // 4. Lazy (on-demand) allocation: the common case. brk heap, anonymous
+    //    mmap and file-backed mmap install lazy areas, so their first touch
+    //    faults here and `resolve_lazy_fault` backs the page. This MUST run on
+    //    every page fault — it is core functionality, not diagnostics, and must
+    //    never be gated behind a debug flag. `Oom` terminates the process;
+    //    `Invalid` falls through to the stages below.
     if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {
         let process = crate::task::processor::current_process();
-        let mut inner = process.borrow_mut();
+        let inner = process.borrow_mut();
         let access = match code {
             LOAD_PAGE_FAULT => MapPermission::R,
             STORE_PAGE_FAULT => MapPermission::W,
@@ -515,6 +475,8 @@ fn handle_user_exception(code: usize, stval: usize) {
             LazyFaultResult::Invalid => {}
         }
     }
+    // 5. Stack / MAP_GROWSDOWN auto-growth: a fault just below such a region
+    //    extends it downward and resolves the page.
     if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {
         let access = match code {
             LOAD_PAGE_FAULT => MapPermission::R,
@@ -527,6 +489,10 @@ fn handle_user_exception(code: usize, stval: usize) {
         }
     }
     let cx = get_trap_context();
+    // Diagnostics only: dump the faulting registers for an unresolved page
+    // fault. This has no effect on control flow, so it stays gated behind
+    // DEBUG_SYSCALL (default off). Keep functional fault handling (the stages
+    // above, especially the lazy-fault one) OUT of this guard.
     if crate::debug_config::DEBUG_SYSCALL
         && (code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT)
     {
@@ -604,6 +570,10 @@ fn handle_user_exception(code: usize, stval: usize) {
             }
         }
     }
+    // 6. Unresolved: translate the fault into a signal. A fault that lands in a
+    //    file-backed mmap's EOF tail becomes SIGBUS, any other page fault
+    //    SIGSEGV, and a bad instruction SIGILL. SIG_IGN swallows it, SIG_DFL
+    //    terminates the process, and a custom handler gets the pending bit set.
     if let Some(sig) = match code {
         ILLEGAL_INSTRUCTION => Some(4), // SIGILL
         INSTRUCTION_PAGE_FAULT | LOAD_PAGE_FAULT | STORE_PAGE_FAULT => {
@@ -630,6 +600,8 @@ fn handle_user_exception(code: usize, stval: usize) {
         }
         return;
     }
+    // Unrecognized exception class (not a fault we map to a signal): log it and
+    // kill the offending task as a last resort.
     log::warn!(
         "[user_exn] code={} ({}) sepc={:#x} stval={:#x}",
         code,

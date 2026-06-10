@@ -82,6 +82,7 @@ pub struct StackFrameAllocator {
     current: usize,
     end: usize,
     recycled: Vec<usize>,
+    managed_pages: usize,
 }
 
 #[allow(dead_code)]
@@ -89,12 +90,14 @@ impl StackFrameAllocator {
     pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
         self.current = l.0;
         self.end = r.0;
+        self.managed_pages = r.0.saturating_sub(l.0);
     }
 
     pub fn add_range(&mut self, l: PhysPageNum, r: PhysPageNum) {
         if r <= l {
             return;
         }
+        self.managed_pages = self.managed_pages.saturating_add(r.0.saturating_sub(l.0));
         for ppn in l.0..r.0 {
             self.recycled.push(ppn);
         }
@@ -118,6 +121,7 @@ impl FrameAllocator for StackFrameAllocator {
             current: 0,
             end: 0,
             recycled: Vec::new(),
+            managed_pages: 0,
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
@@ -169,33 +173,54 @@ pub fn init_frame_allocator() {
 }
 
 /// allocate a frame
+/// 优先分配，分配失败 尝试回收
 pub fn frame_alloc() -> Option<FrameTracker> {
     let mut allocator = FRAME_ALLOCATOR.lock();
-    let Some(ppn) = allocator.alloc() else {
-        let fails = FRAME_ALLOC_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if fails <= 8 || (fails & (fails - 1)) == 0 {
-            let current = allocator.current;
-            let end = allocator.end;
-            let recycled = allocator.recycled.len();
-            drop(allocator);
-            let refcnt_entries = FRAME_REFCOUNTS.lock().len();
-            println!(
-                "[mm-debug] frame_alloc failed count={} current={:#x} end={:#x} recycled={} refcnt_entries={}",
-                fails, current, end, recycled, refcnt_entries
-            );
+    if let Some(ppn) = allocator.alloc() {
+        return Some(FrameTracker::new(ppn));
+    }
+    drop(allocator);
+
+    let reclaimed = super::memory_set::reclaim_shared_file_page_cache();
+    if reclaimed > 0 {
+        let mut allocator = FRAME_ALLOCATOR.lock();
+        if let Some(ppn) = allocator.alloc() {
+            return Some(FrameTracker::new(ppn));
         }
-        return None;
-    };
-    Some(FrameTracker::new(ppn))
+        drop(allocator);
+    }
+
+    if crate::debug_config::DEBUG_PERF {
+        let allocator = FRAME_ALLOCATOR.lock();
+        let fails = FRAME_ALLOC_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let current = allocator.current;
+        let end = allocator.end;
+        let recycled = allocator.recycled.len();
+        drop(allocator);
+        let refcnt_entries = FRAME_REFCOUNTS.lock().len();
+        println!(
+            "[mm-debug] frame_alloc failed count={} current={:#x} end={:#x} recycled={} refcnt_entries={}",
+            fails, current, end, recycled, refcnt_entries
+        );
+    }
+    None
 }
 
 pub fn frame_refcount_entries() -> usize {
     FRAME_REFCOUNTS.lock().len()
 }
 
+pub(crate) fn frame_refcount(ppn: PhysPageNum) -> usize {
+    FRAME_REFCOUNTS.lock().get(&ppn.0).copied().unwrap_or(0)
+}
+
 pub fn frame_available_pages() -> usize {
     let allocator = FRAME_ALLOCATOR.lock();
     allocator.recycled.len() + allocator.end.saturating_sub(allocator.current)
+}
+
+pub fn frame_managed_pages() -> usize {
+    FRAME_ALLOCATOR.lock().managed_pages
 }
 
 pub fn frame_alloc_contiguous(pages: usize) -> Option<Vec<FrameTracker>> {
