@@ -348,7 +348,7 @@ fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(mut inner) = process.try_borrow_mut() else {
+    let Some(inner) = process.try_borrow_mut() else {
         return false;
     };
     if token != inner.memory_set.token() {
@@ -371,7 +371,7 @@ fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(mut inner) = process.try_borrow_mut() else {
+    let Some(inner) = process.try_borrow_mut() else {
         return false;
     };
     if token != inner.memory_set.token() {

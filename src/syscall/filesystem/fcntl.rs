@@ -45,7 +45,6 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_GETPIPE_SZ: usize = 1032;
     const F_ADD_SEALS: usize = 1033;
     const F_GET_SEALS: usize = 1034;
-    const PROT_WRITE: usize = 0x2;
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
@@ -515,9 +514,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                     let id = shm.memfd_id();
                     let process = current_process();
                     let inner = process.borrow_mut();
-                    inner.mmap_areas.iter().any(|region| {
-                        region.memfd_id == id && region.shared && (region.prot & PROT_WRITE) != 0
-                    })
+                    inner.memory_set.has_writable_shared_memfd_mapping(id)
                 } else {
                     false
                 };

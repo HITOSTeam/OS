@@ -71,11 +71,11 @@ endif
 # Build-level configuration
 # ----------------------------------------------------------------------
 MODE         ?= release
+CARGO_MODE_FLAG := $(if $(filter release,$(MODE)),--release,)
 SMP          ?= 4
 MEM          ?= 1G
 QEMU_TIMEOUT ?= 0
-# 为了编译debug模式额外添加的命令参数
-QEMU_EXTRA_ARGS ?=
+
 SUBMIT       ?= 0
 EXT4_REBUILD ?= 0
 EXT4_SIZE    ?= 1G
@@ -91,8 +91,6 @@ HOST_TRIPLE  ?= $(shell rustc -vV | sed -n 's/^host: //p')
 
 # Forward `--features submit` to user apps when SUBMIT=1.
 USER_FEATURES := $(if $(filter 1,$(SUBMIT)),--features submit,)
-# Cargo's debug profile is the default; only release needs an explicit flag.
-CARGO_MODE_ARGS := $(if $(filter release,$(MODE)),--release,)
 
 # ----------------------------------------------------------------------
 # Derived paths
@@ -164,7 +162,7 @@ prepare-cargo:
 # `rust-objcopy` is optional: QEMU boots the ELF directly when the raw
 # binary cannot be produced.
 kernel: prepare-cargo user_apps
-	@cargo build $(CARGO_MODE_ARGS) --target $(TARGET)
+	@cargo build $(CARGO_MODE_FLAG) --target $(TARGET)
 	@OBJCOPY=$$(command -v rust-objcopy || command -v llvm-objcopy || true); \
 	if [ -n "$$OBJCOPY" ]; then \
 		$$OBJCOPY --strip-all $(KERNEL_ELF) -O binary $(KERNEL_BIN); \
@@ -182,7 +180,7 @@ kernel: prepare-cargo user_apps
 # the log quiet when a binary has not actually changed.
 user_apps: prepare-cargo
 	@cd $(USER_DIR) && CARGO_TARGET_DIR=target \
-	    cargo build $(CARGO_MODE_ARGS) $(USER_FEATURES) --target $(TARGET)
+	    cargo build $(CARGO_MODE_FLAG) $(USER_FEATURES) --target $(TARGET)
 	@mkdir -p $(APP_DIR)
 	@for f in $(USER_TARGET_DIR)/*; do \
 		[ -f "$$f" ] && [ -x "$$f" ] || continue; \

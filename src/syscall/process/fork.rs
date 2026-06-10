@@ -131,6 +131,12 @@ fn clone_from_parts(
     if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_THREAD) != 0 {
         return err(SyscallError::EINVAL);
     }
+    // SysV shm attachments are mm-local in this kernel.  Sharing the mm while
+    // moving only the child into a new IPC namespace would leave shared VMAs
+    // owned by the old namespace with no unambiguous cleanup owner.
+    if (flags & CLONE_NEWIPC) != 0 && (flags & CLONE_VM) != 0 {
+        return err(SyscallError::EINVAL);
+    }
     // 新建 mount 命名空间时不能再共享 fs（cwd/root/umask），否则两个 ns 会互相污染挂载点
     if (flags & CLONE_NEWNS) != 0 && (flags & CLONE_FS) != 0 {
         return err(SyscallError::EINVAL);
@@ -170,6 +176,9 @@ fn clone_from_parts(
             return err(SyscallError::EINVAL);
         }
         let task = current_task().unwrap();
+        // Linux fork/clone first saves the caller's current FPU registers, then
+        // copies that snapshot into the child so user FP registers survive clone.
+        crate::arch::save_user_fp_state(&task);
         // 复制父线程的信号屏蔽字，子线程沿用直到自己 sigprocmask
         let parent_mask = {
             let inner = task.borrow_mut();
@@ -191,6 +200,7 @@ fn clone_from_parts(
             Ok(t) => Arc::new(t),
             Err(e) => return err(SyscallError::from(e)),
         };
+        new_task.inherit_fp_state_from(&task);
         // 为新线程挑选一个负载较轻的 hart 作为初始运行核
         new_task.set_cpu_id(select_hart_for_new_task());
 
@@ -332,15 +342,15 @@ fn clone_from_parts(
     // 父进程继承下来的 System V 共享内存挂载需要回滚（新 ns 内不应可见），
     // 然后再分配一个独立的 ipc_ns_id
     if (flags & CLONE_NEWIPC) != 0 {
-        let (parent_ipc_ns_id, inherited_attaches) = {
+        let inherited_attaches = {
             let child_inner = child.borrow_mut();
-            (child_inner.ipc_ns_id, child_inner.sysv_shm_attaches.clone())
+            child_inner.memory_set.sysv_shm_attaches_snapshot()
         };
-        if !inherited_attaches.is_empty() {
-            crate::syscall::sysv_shm::rollback_fork_inherit(parent_ipc_ns_id, &inherited_attaches);
+        if !share_vm && !inherited_attaches.is_empty() {
+            crate::syscall::sysv_shm::rollback_fork_inherit(&inherited_attaches);
         }
         let mut child_inner = child.borrow_mut();
-        child_inner.sysv_shm_attaches.clear();
+        child_inner.memory_set.replace_sysv_shm_attaches(Vec::new());
         child_inner.ipc_ns_id = crate::task::alloc_ipc_namespace_id();
     }
     // CLONE_NEWUTS：拆出独立的 UTS（hostname/domain）命名空间
@@ -447,7 +457,7 @@ fn clone_from_parts(
     // 子的页表与父不同（除非 CLONE_VM），写入前需先处理 COW/lazy 缺页
     if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
         let child_token = {
-            let mut inner = child.borrow_mut();
+            let inner = child.borrow_mut();
             let _ = inner.memory_set.resolve_cow_fault(_ctid);
             let _ = inner.memory_set.resolve_lazy_fault(_ctid, MapPermission::W);
             inner.memory_set.token()
@@ -474,28 +484,14 @@ fn clone_from_parts(
             Arc::strong_count(&task)
         );
     }
-    // 记录子是否会落在当前 hart，下面决定是否主动让出 CPU
-    let child_same_hart = task.get_cpu_id() == hart_id();
     // 将子任务推入调度队列；至此子才真正可被调度执行
     add_task(task);
     // 落入 fork 诊断统计（按 parent_pid 聚合，节流输出）
     record_fork_diag(process.getpid(), child_pid, flags, fork_elapsed_us);
 
-    // 进程型 fork 且非 vfork：若父子都是 CFS 公平类、又在同一 hart，
-    // 主动让出一次让新子先跑 exec/信号初始化，避免父在用户态飞奔
-    if !is_thread_like && (flags & CLONE_VFORK) == 0 {
-        let parent_fair =
-            sched_class(process.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
-        let child_fair =
-            sched_class(child.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
-        if parent_fair && child_fair && child_same_hart {
-            // Let a freshly forked fair child run promptly so it can finish
-            // exec/signal setup before the parent races ahead in user space.
-            // 让刚 fork 的公平类子尽快上 CPU，完成 exec/信号准备；
-            // 否则父进程在用户态先跑会引发可见的竞争
-            suspend_current_and_run_next();
-        }
-    }
+    // 普通 fork 不强制 child-first。Linux/CFS 只把 child 放入就绪队列，
+    // 是否抢占由调度器决定；这里主动让父进程让出会把 fork-heavy 程序
+    // 串行化，例如 mmapstress09 需要父进程先完成一批 fork 再设置 alarm。
 
     // CLONE_VFORK：父需阻塞直到子调用 execve 或退出；本实现以 wait_queue + 自检的方式模拟
     if (flags & CLONE_VFORK) != 0 {
@@ -592,6 +588,18 @@ fn read_clone3_args(args_ptr: usize, size: usize) -> Result<Clone3Args, SyscallE
     Ok(args)
 }
 
+/// `clone3(CLONE_PIDFD)` 的收尾步骤：为刚创建的子进程构造 pidfd 并安装到父进程的 fd 表，
+/// 再将 fd 编号回写到用户态指针 `user_ptr`。
+///
+/// 关键设计：直接传入 `&Arc<ProcessControlBlock>` 而非裸 PID，
+/// 使 [`PidFdFile`] 内部持有 `Weak<ProcessControlBlock>`。
+/// 这样即便 PID 数值在子进程退出后被重新分配，
+/// 外部通过此 pidfd 做 `waitid(P_PIDFD)` / `pidfd_send_signal` 时
+/// `target_process()` 升级会返回 `None`（`ECHILD`/`ESRCH`），不会错误地作用于无关进程。
+///
+/// 若 fd 安装成功但用户态回写失败（`EFAULT`），则立即撤销已分配的 fd，
+/// 保证不泄露 fd 资源；随后 `clone_from_parts` 调用 `rollback_unstarted_child`
+/// 回滚整个 clone 操作。
 fn install_child_pidfd(
     child: &Arc<ProcessControlBlock>,
     token: usize,
@@ -624,19 +632,20 @@ fn install_child_pidfd(
 fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>) {
     let child_pid = child.getpid();
     crate::fs::cgroup_exit_process(child_pid);
-    let (exec_dev, exec_ino, ipc_ns_id, shm_attaches, parent) = {
+    let (exec_dev, exec_ino, shm_attaches, parent) = {
         let mut child_inner = child.borrow_mut();
-        let shm_attaches = core::mem::take(&mut child_inner.sysv_shm_attaches);
+        let shm_attaches = child_inner.memory_set.take_sysv_shm_attaches_for_cleanup();
         (
             child_inner.exec_inode_dev,
             child_inner.exec_inode_num,
-            child_inner.ipc_ns_id,
             shm_attaches,
             child_inner.parent.as_ref().and_then(|p| p.upgrade()),
         )
     };
-    if !shm_attaches.is_empty() {
-        crate::syscall::sysv_shm::rollback_fork_inherit(ipc_ns_id, &shm_attaches);
+    if let Some(shm_attaches) = shm_attaches {
+        if !shm_attaches.is_empty() {
+            crate::syscall::sysv_shm::rollback_fork_inherit(&shm_attaches);
+        }
     }
     unregister_executing_inode(exec_dev, exec_ino);
     if let Some(parent) = parent {

@@ -2,26 +2,30 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config;
-use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages};
+use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages, frame_managed_pages};
 use crate::task::manager::{PID2PCB, pid2process};
 use crate::task::task_block::TaskStatus;
 
 use super::ProcFileKind;
 use super::entries::{decode_proc_linux_tid, proc_pid_task_alive, proc_simple_text_content};
-use super::parse_proc_sys_usize;
+use super::{parse_proc_sys_i64, parse_proc_sys_usize};
 use crate::syscall::error::{SyscallError, err};
 
 const VM_OVERCOMMIT_MEMORY_DEFAULT: usize = 0;
 const VM_OVERCOMMIT_MEMORY_MAX: usize = 2;
 const VM_OVERCOMMIT_RATIO_DEFAULT: usize = 50;
 const VM_OVERCOMMIT_RATIO_MAX: usize = 100;
+const VM_MIN_FREE_KBYTES_DEFAULT: usize = 1024;
+const VM_MIN_FREE_KBYTES_MAX: usize = usize::MAX / 1024;
 const FS_FILE_MAX_DEFAULT: usize = 8192;
 const FS_FILE_MAX_MAX: usize = isize::MAX as usize;
 static VM_OVERCOMMIT_MEMORY: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_MEMORY_DEFAULT);
 static VM_OVERCOMMIT_RATIO: AtomicUsize = AtomicUsize::new(VM_OVERCOMMIT_RATIO_DEFAULT);
+static VM_MIN_FREE_KBYTES: AtomicUsize = AtomicUsize::new(VM_MIN_FREE_KBYTES_DEFAULT);
 static FS_FILE_MAX: AtomicUsize = AtomicUsize::new(FS_FILE_MAX_DEFAULT);
 static PROC_PID_STAT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PROC_PID_STAT_STATE_S: AtomicUsize = AtomicUsize::new(0);
@@ -88,10 +92,12 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
         ProcFileKind::Perf => proc_perf(),
+        ProcFileKind::Kallsyms => proc_kallsyms(),
         ProcFileKind::Kpageflags => String::new(),
         ProcFileKind::SysvipcMsg => crate::syscall::sysv_ipc::proc_sysvipc_msg(),
         ProcFileKind::SysvipcSem => crate::syscall::sysv_ipc::proc_sysvipc_sem(),
         ProcFileKind::SysvipcShm => crate::syscall::sysv_shm::proc_sysvipc_shm(),
+        ProcFileKind::VmMinFreeKbytes => alloc::format!("{}\n", vm_min_free_kbytes()),
         ProcFileKind::VmOvercommitMemory => alloc::format!("{}\n", vm_overcommit_memory()),
         ProcFileKind::VmOvercommitRatio => alloc::format!("{}\n", vm_overcommit_ratio()),
         ProcFileKind::VmDropCaches => String::from("0\n"),
@@ -134,6 +140,15 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
             "{}\n",
             crate::syscall::sysv_shm::runtime_shmall_for_procfs()
         ),
+        ProcFileKind::KernelSchedRtPeriodUs => {
+            alloc::format!("{}\n", crate::task::sched::rt_period_us())
+        }
+        ProcFileKind::KernelSchedRtRuntimeUs => {
+            alloc::format!("{}\n", crate::task::sched::rt_runtime_us())
+        }
+        ProcFileKind::KernelSchedRrTimesliceMs => {
+            alloc::format!("{}\n", crate::task::sched::rr_timeslice_ms())
+        }
         ProcFileKind::SimpleText(path) => proc_simple_text_content(path),
         ProcFileKind::PidStat(pid) => proc_pid_stat(*pid),
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
@@ -149,6 +164,14 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
     }
 }
 
+fn proc_kallsyms() -> String {
+    String::from(
+        "ffffffff80200000 T _stext\n\
+         ffffffff80201000 T kernel_start\n\
+         ffffffff80202000 T trap_handler\n",
+    )
+}
+
 fn proc_mounts_current() -> String {
     crate::syscall::filesystem::proc_mounts_snapshot()
 }
@@ -162,6 +185,7 @@ fn proc_mounts_for_pid(pid: u32) -> String {
 
 pub(super) fn write_vm_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
     let (slot, max) = match path {
+        "/proc/sys/vm/min_free_kbytes" => (&VM_MIN_FREE_KBYTES, VM_MIN_FREE_KBYTES_MAX),
         "/proc/sys/vm/overcommit_memory" => (&VM_OVERCOMMIT_MEMORY, VM_OVERCOMMIT_MEMORY_MAX),
         "/proc/sys/vm/overcommit_ratio" => (&VM_OVERCOMMIT_RATIO, VM_OVERCOMMIT_RATIO_MAX),
         _ => return Err(err(SyscallError::EINVAL)),
@@ -183,8 +207,35 @@ pub(super) fn write_fs_file_max_sysctl(data: &[u8]) -> Result<Vec<u8>, isize> {
     Ok(alloc::format!("{}\n", value).into_bytes())
 }
 
+/// 处理对三个 `/proc/sys/kernel/sched_*` 文件的写入：解析 i64 后路由到
+/// `task::sched` 的对应 setter；setter 拒绝（越界/违反约束）则返回 EINVAL，
+/// 成功则回显实际生效值（与 Linux procfs 行为一致）。
+pub(super) fn write_sched_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let value = parse_proc_sys_i64(data)?;
+    let applied = match path {
+        "/proc/sys/kernel/sched_rt_period_us" => {
+            crate::task::sched::set_rt_period_us_from_procfs(value)
+        }
+        "/proc/sys/kernel/sched_rt_runtime_us" => {
+            crate::task::sched::set_rt_runtime_us_from_procfs(value)
+        }
+        "/proc/sys/kernel/sched_rr_timeslice_ms" => {
+            crate::task::sched::set_rr_timeslice_ms_from_procfs(value).map(|v| v as i64)
+        }
+        _ => None,
+    };
+    let Some(applied) = applied else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    Ok(alloc::format!("{}\n", applied).into_bytes())
+}
+
 pub fn vm_overcommit_memory() -> usize {
     VM_OVERCOMMIT_MEMORY.load(Ordering::Relaxed)
+}
+
+pub fn vm_min_free_kbytes() -> usize {
+    VM_MIN_FREE_KBYTES.load(Ordering::Relaxed)
 }
 
 fn vm_overcommit_ratio() -> usize {
@@ -196,10 +247,11 @@ fn fs_file_max() -> usize {
 }
 
 pub fn vm_commit_limit_bytes() -> usize {
-    let totalram = config::phys_mem_end().saturating_sub(config::phys_mem_start());
-    totalram
+    let managed_ram = frame_managed_pages().saturating_mul(config::PAGE_SIZE);
+    let strict_limit = managed_ram
         .saturating_mul(vm_overcommit_ratio())
-        .saturating_div(100)
+        .saturating_div(100);
+    strict_limit.saturating_sub(vm_min_free_kbytes().saturating_mul(1024))
 }
 
 pub fn vm_committed_as_bytes() -> usize {
@@ -211,20 +263,15 @@ pub fn vm_committed_as_bytes() -> usize {
         let Some(inner) = process.try_borrow_mut() else {
             return acc;
         };
-        let heap = inner.brk.saturating_sub(inner.heap_start);
-        let anon_private = inner.mmap_areas.iter().fold(0usize, |sum, region| {
-            if !region.shared && !region.file_backed && (region.prot & 0x2) != 0 {
-                sum.saturating_add(region.len)
-            } else {
-                sum
-            }
-        });
+        let memory_set = inner.memory_set.lock();
+        let heap = memory_set.heap_size();
+        let anon_private = memory_set.anon_private_writable_vm_bytes();
         acc.saturating_add(heap).saturating_add(anon_private)
     })
 }
 
 fn proc_meminfo() -> String {
-    let totalram = config::phys_mem_end().saturating_sub(config::phys_mem_start());
+    let totalram = frame_managed_pages().saturating_mul(config::PAGE_SIZE);
     let mem_total_kb = (totalram / 1024) as u64;
     let mem_free_kb =
         ((frame_available_pages().saturating_mul(config::PAGE_SIZE)).min(totalram) / 1024) as u64;
@@ -336,13 +383,14 @@ fn proc_pid_status(pid: u32) -> String {
                 .map(|ti| (ti.task_status, ti.cgroup_frozen))
         })
         .unwrap_or((TaskStatus::Ready, false));
-    let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-    let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
-    let vmlck_bytes: usize = inner
-        .mlocked_ranges
-        .iter()
-        .map(|(start, end)| end.saturating_sub(*start))
-        .sum();
+    let (heap_bytes, mmap_bytes, vmlck_bytes) = {
+        let memory_set = inner.memory_set.lock();
+        (
+            memory_set.heap_size(),
+            memory_set.vm_regions_total_len(),
+            memory_set.locked_bytes(),
+        )
+    };
     let vsize_kb: usize = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
     let vmlck_kb: usize = (vmlck_bytes + 1023) / 1024;
     let uid = inner.uid;
@@ -431,8 +479,10 @@ fn proc_pid_stat(pid: u32) -> String {
                 .map(|ti| (ti.task_status, ti.cgroup_frozen))
         })
         .unwrap_or((TaskStatus::Ready, false));
-    let heap_bytes = inner.brk.saturating_sub(inner.heap_start);
-    let mmap_bytes: usize = inner.mmap_areas.iter().map(|r| r.len).sum();
+    let (heap_bytes, mmap_bytes) = {
+        let memory_set = inner.memory_set.lock();
+        (memory_set.heap_size(), memory_set.vm_regions_total_len())
+    };
     let vsize: u64 = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
 
     let comm = if inner.comm.is_empty() {
@@ -618,17 +668,14 @@ fn proc_pid_maps(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        if crate::debug_config::DEBUG_PROCFS {
-            crate::println!("[procfs] maps pid={} lock busy", pid);
-        }
-        return String::new();
+    let inner = proc.borrow_mut();
+    let regions = {
+        let memory_set = inner.memory_set.lock();
+        memory_set.vm_regions_snapshot()
     };
-    let mut regions = inner.mmap_areas.clone();
     drop(inner);
-    regions.sort_by_key(|r| r.start);
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(regions.len().saturating_mul(48));
     for region in regions {
         let end = region.end();
         if end <= region.start {
@@ -650,15 +697,18 @@ fn proc_pid_maps(pid: u32) -> String {
             '-'
         };
         let p = if region.shared { 's' } else { 'p' };
-        out.push_str(&alloc::format!(
-            "{:x}-{:x} {}{}{}{} 00000000 00:00 0 \n",
-            region.start,
-            end,
-            r,
-            w,
-            x,
-            p
-        ));
+        let path = if region.is_heap() {
+            " [heap]"
+        } else if region.is_stack() {
+            " [stack]"
+        } else {
+            " "
+        };
+        let _ = writeln!(
+            out,
+            "{:x}-{:x} {}{}{}{} 00000000 00:00 0{}",
+            region.start, end, r, w, x, p, path
+        );
     }
     out
 }
@@ -674,7 +724,8 @@ fn proc_pid_pagemap_entry(pid: u32, entry: usize) -> u64 {
         return 0;
     };
     let vpn = VirtAddr::from(vaddr).floor();
-    if let Some(pte) = inner.memory_set.translate(vpn) {
+    let memory_set = inner.memory_set.lock();
+    if let Some(pte) = memory_set.translate(vpn) {
         if pte.is_valid() {
             return (1u64 << 63) | (pte.ppn().0 as u64 & ((1u64 << 55) - 1));
         }
@@ -691,11 +742,12 @@ fn proc_kpageflags_entry(pfn: usize) -> u64 {
         let Some(inner) = process.try_borrow_mut() else {
             continue;
         };
-        for (start, end) in inner.memory_set.user_mapped_ranges() {
+        let memory_set = inner.memory_set.lock();
+        for (start, end) in memory_set.user_mapped_ranges() {
             let mut cur = start;
             while cur < end {
                 let vpn = VirtAddr::from(cur).floor();
-                if let Some(pte) = inner.memory_set.translate(vpn) {
+                if let Some(pte) = memory_set.translate(vpn) {
                     if pte.is_valid() && pte.ppn().0 == pfn {
                         let mut flags = 0u64;
                         if pte.flags().contains(PTEFlags::D) {
@@ -712,8 +764,10 @@ fn proc_kpageflags_entry(pfn: usize) -> u64 {
 }
 
 pub(super) fn proc_kpageflags_len() -> usize {
-    let phys_bytes = config::phys_mem_end().saturating_sub(config::phys_mem_start());
-    let page_count = phys_bytes / config::PAGE_SIZE;
+    // /proc/kpageflags is indexed by absolute PFN, matching the PFN exposed by
+    // /proc/*/pagemap.  RISC-V physical memory starts at a high address, so a
+    // span-only length makes valid PFN offsets look like EOF.
+    let page_count = config::phys_mem_end() / config::PAGE_SIZE;
     page_count.saturating_mul(8)
 }
 
@@ -724,7 +778,10 @@ pub(super) fn proc_pid_pagemap_len(pid: u32) -> usize {
     let Some(inner) = proc.try_borrow_mut() else {
         return 0;
     };
-    let max_end = inner.memory_set.max_user_mapped_end();
+    let max_end = {
+        let memory_set = inner.memory_set.lock();
+        memory_set.max_user_mapped_end()
+    };
     let page_count = max_end.saturating_add(config::PAGE_SIZE - 1) / config::PAGE_SIZE;
     page_count.saturating_mul(8)
 }
@@ -771,12 +828,6 @@ pub(super) fn proc_pid_pagemap_read(pid: u32, offset: &mut usize, buf: &mut User
     total
 }
 
-fn range_overlap_len(start: usize, end: usize, lock_start: usize, lock_end: usize) -> usize {
-    let left = core::cmp::max(start, lock_start);
-    let right = core::cmp::min(end, lock_end);
-    right.saturating_sub(left)
-}
-
 fn proc_pid_smaps(pid: u32) -> String {
     const PROT_READ: usize = 1;
     const PROT_WRITE: usize = 2;
@@ -785,19 +836,23 @@ fn proc_pid_smaps(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        if crate::debug_config::DEBUG_PROCFS {
-            crate::println!("[procfs] smaps pid={} lock busy", pid);
-        }
-        return String::new();
+    let inner = proc.borrow_mut();
+    let regions = {
+        let memory_set = inner.memory_set.lock();
+        let mut regions = memory_set.vm_regions_snapshot();
+        regions.sort_by_key(|r| r.start);
+        regions
+            .into_iter()
+            .map(|region| {
+                let locked_bytes = memory_set.locked_overlap_bytes(region.start, region.end());
+                (region, locked_bytes)
+            })
+            .collect::<Vec<_>>()
     };
-    let mut regions = inner.mmap_areas.clone();
-    let mlocked = inner.mlocked_ranges.clone();
     drop(inner);
-    regions.sort_by_key(|r| r.start);
 
     let mut out = String::new();
-    for region in regions {
+    for (region, locked_bytes) in regions {
         let end = region.end();
         if end <= region.start {
             continue;
@@ -818,25 +873,29 @@ fn proc_pid_smaps(pid: u32) -> String {
             '-'
         };
         let p = if region.shared { 's' } else { 'p' };
+        let path = if region.is_heap() {
+            " [heap]"
+        } else if region.is_stack() {
+            " [stack]"
+        } else {
+            " "
+        };
 
         let size_bytes = end - region.start;
         let size_kb = (size_bytes + 1023) / 1024;
-        let locked_bytes: usize = mlocked
-            .iter()
-            .map(|(ls, le)| range_overlap_len(region.start, end, *ls, *le))
-            .sum();
         let locked_kb = (locked_bytes + 1023) / 1024;
         // LTP mlock05 only validates that Rss/Locked reflect mlock'ed mappings.
         let rss_kb = if locked_bytes > 0 { size_kb } else { 0 };
 
         out.push_str(&alloc::format!(
-            "{:x}-{:x} {}{}{}{} 00000000 00:00 0 \n",
+            "{:x}-{:x} {}{}{}{} 00000000 00:00 0{}\n",
             region.start,
             end,
             r,
             w,
             x,
-            p
+            p,
+            path
         ));
         out.push_str(&alloc::format!("Size:\t\t{} kB\n", size_kb));
         out.push_str(&alloc::format!("Rss:\t\t{} kB\n", rss_kb));

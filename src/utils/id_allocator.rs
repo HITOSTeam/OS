@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+#[derive(Clone)]
 pub struct RecycleAllocator {
     current: usize,
     recycled: Vec<usize>,
@@ -28,5 +29,15 @@ impl RecycleAllocator {
             id
         );
         self.recycled.push(id);
+    }
+
+    pub fn reserve(&mut self, id: usize) {
+        if id >= self.current {
+            self.current = id + 1;
+            return;
+        }
+        if let Some(pos) = self.recycled.iter().position(|recycled| *recycled == id) {
+            self.recycled.swap_remove(pos);
+        }
     }
 }

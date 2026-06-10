@@ -186,7 +186,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 }
                 {
                     let process = current_process();
-                    let mut inner = process.borrow_mut();
+                    let inner = process.borrow_mut();
                     let start = copy.dst as usize & !(PAGE_SIZE - 1);
                     let end = ((copy.dst as usize)
                         .saturating_add(len)

@@ -13,6 +13,7 @@ use super::{
 };
 use alloc::vec;
 
+/// 返回当前实时时钟的 `(秒, 纳秒)` 对，对应 `CLOCK_REALTIME`。
 pub(crate) fn current_timespec() -> (i64, i64) {
     crate::syscall::time_sys::realtime_now_timespec()
 }
@@ -51,12 +52,15 @@ pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
     out
 }
 
+/// 返回当前进程的根目录（`chroot` 设置的路径，默认 `"/"`）。
 pub(crate) fn current_process_root() -> String {
     let process = current_process();
     let inner = process.borrow_mut();
     inner.root.clone()
 }
 
+/// 将进程根目录前缀附加到绝对路径 `abs` 上，实现 `chroot` jail 效果。
+/// 若进程根为 `"/"` 则直接返回原路径不做处理。
 pub(crate) fn apply_process_root(abs: &str) -> String {
     let root = current_process_root();
     if root == "/" {
@@ -73,6 +77,7 @@ pub(crate) fn apply_process_root(abs: &str) -> String {
     normalize_path("/", &out)
 }
 
+/// 规范化一个相对路径：去掉 `.`、解析 `..`、合并多余斜杠，返回不含前导 `/` 的字符串。
 pub(crate) fn normalize_relative_path(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for seg in path.split('/') {
@@ -88,6 +93,7 @@ pub(crate) fn normalize_relative_path(path: &str) -> String {
     parts.join("/")
 }
 
+/// 检查路径中每个分量的长度是否超过 `NAME_MAX`，超过则返回 `ENAMETOOLONG`。
 pub(crate) fn validate_path_components(path: &str) -> Result<(), isize> {
     for seg in path.split('/').filter(|s| !s.is_empty()) {
         if seg.len() > NAME_MAX {
@@ -97,10 +103,12 @@ pub(crate) fn validate_path_components(path: &str) -> Result<(), isize> {
     Ok(())
 }
 
+/// 返回路径的最后一个分量（basename），无斜杠时返回原字符串。
 pub(crate) fn path_basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// 检查文件系统中是否存在任一 busybox 可执行文件。
 pub(crate) fn busybox_exists() -> bool {
     let candidates = [
         "/musl/busybox",
@@ -120,6 +128,11 @@ pub(crate) fn busybox_exists() -> bool {
     false
 }
 
+/// 判断 `path` 是否值得尝试作为 busybox applet 执行。
+///
+/// 满足以下所有条件才返回 `true`：basename 非空且不是 `busybox` 本身、
+/// 不是 `.sh` 脚本、在 busybox applet 白名单内，且路径在允许的目录下
+/// （`/bin/`、`/usr/bin/` 等）或是无斜杠的裸名（需 `allow_relative = true`）。
 pub(crate) fn should_try_busybox_applet_path(path: &str, allow_relative: bool) -> bool {
     let base = path_basename(path);
     if base.is_empty() || base == "busybox" {
@@ -140,6 +153,8 @@ pub(crate) fn should_try_busybox_applet_path(path: &str, allow_relative: bool) -
         || path.starts_with("/usr/sbin/")
 }
 
+/// 将路径拆分为 `(父目录, 末尾名称)`。
+/// 路径为空或仅由斜杠组成时返回 `None`。
 pub(crate) fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -174,12 +189,14 @@ pub(crate) enum AtPath {
     PseudoAbs(String),
 }
 
+/// 根据当前进程的挂载命名空间，判断绝对路径属于 ext4 还是伪文件系统。
 pub(crate) fn classify_current_abs_path(abs: &str) -> ClassifiedAbsPath {
     let state = current_mount_namespace();
     let state = state.lock();
     state.classify_logical_abs_path(abs)
 }
 
+/// 将绝对路径字符串转换为 `AtPath` 枚举，区分 ext4 路径与伪文件系统路径。
 pub(crate) fn classify_abs_at_path(abs: String) -> AtPath {
     match classify_current_abs_path(&abs) {
         ClassifiedAbsPath::Ext4(translated) => AtPath::Ext4Abs(translated),
@@ -187,6 +204,10 @@ pub(crate) fn classify_abs_at_path(abs: String) -> AtPath {
     }
 }
 
+/// 根据 `dirfd` 确定相对路径的基准：
+/// - `AT_FDCWD`：返回当前工作目录的逻辑绝对路径；
+/// - 伪目录 fd：返回其逻辑绝对路径；
+/// - ext4 目录 fd：返回对应的 inode 及其逻辑路径（如可知）。
 pub(crate) fn resolve_relative_at_path_base(dirfd: isize) -> Result<RelativeAtPathBase, isize> {
     if dirfd == AT_FDCWD {
         return Ok(RelativeAtPathBase::LogicalAbs(current_cwd_path()));
@@ -213,6 +234,8 @@ pub(crate) fn resolve_relative_at_path_base(dirfd: isize) -> Result<RelativeAtPa
     })
 }
 
+/// 从逻辑绝对路径基准解析相对路径，处理 `/proc` 魔法路径、挂载点重定向等情况，
+/// 返回最终的 `AtPath`（ext4 绝对、ext4 相对 inode 或伪文件系统）。
 pub(crate) fn resolve_relative_at_path_from_logical_base(
     base_path: &str,
     path: &str,
@@ -258,6 +281,9 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
     Ok(AtPath::Ext4Rel { base, rel })
 }
 
+/// 从已知 ext4 目录 inode 出发解析相对路径。
+/// 若有逻辑路径上下文，优先通过逻辑路径检测伪文件系统或挂载点；
+/// 否则直接返回相对于该 inode 的 `Ext4Rel`。
 pub(crate) fn resolve_relative_at_path_from_ext4_base(
     base: alloc::sync::Arc<ext4_fs::Inode>,
     logical_base: Option<String>,
@@ -277,6 +303,9 @@ pub(crate) fn resolve_relative_at_path_from_ext4_base(
     Ok(AtPath::Ext4Rel { base, rel })
 }
 
+/// 将 `(dirfd, path)` 解析为 `AtPath`，统一处理绝对路径、相对路径、
+/// `AT_FDCWD`、进程 chroot jail、路径长度/分量校验。
+/// 这是所有文件系统系统调用路径解析的统一入口。
 pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     if path.is_empty() {
         return Err(err(SyscallError::ENOENT));
@@ -303,6 +332,9 @@ pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize>
     }
 }
 
+/// 从 ext4 绝对路径解析 inode，自动在主磁盘和辅助磁盘之间回退。
+/// `/musl` 和 `/glibc` 前缀优先从辅助磁盘查找，找不到再回退到主磁盘。
+/// 需在调用前持有 `ext4_lock`。
 pub(crate) fn resolve_ext4_abs_path(
     path: &str,
     uid: u32,
@@ -358,6 +390,8 @@ pub(crate) fn resolve_ext4_abs_path(
     }
 }
 
+/// 若 `path` 是当前进程的 `/proc/self/fd/<n>` 或 `/proc/<pid>/fd/<n>`，
+/// 返回文件描述符编号，否则返回 `None`。
 pub(crate) fn parse_proc_fd_for_current_process(path: &str) -> Option<usize> {
     let trimmed = if path.len() > 1 {
         path.trim_end_matches('/')
@@ -381,6 +415,9 @@ pub(crate) fn parse_proc_fd_for_current_process(path: &str) -> Option<usize> {
     parse_fd(rest)
 }
 
+/// 处理 `*at` 系统调用 `path=""` 的情况：
+/// 若设置了 `AT_EMPTY_PATH`，返回 `dirfd` 本身；
+/// 否则 O_PATH fd 返回 `EBADF`，普通 fd 返回 `ENOENT`。
 pub(crate) fn empty_path_fd_for_at_op(dirfd: isize, flags: usize) -> Result<usize, isize> {
     if dirfd < 0 {
         return Err(err(SyscallError::ENOENT));
@@ -397,6 +434,8 @@ pub(crate) fn empty_path_fd_for_at_op(dirfd: isize, flags: usize) -> Result<usiz
     Err(err(SyscallError::ENOENT))
 }
 
+/// 若 `abs` 指向当前进程的 `/proc/<pid>/fd/<n>`，则直接以 fd 调用 `op` 并返回结果；
+/// 设置了 `AT_SYMLINK_NOFOLLOW` 时跳过（不解引用符号链接）。
 pub(crate) fn maybe_dispatch_proc_fd_at(
     abs: &str,
     flags: usize,
@@ -409,6 +448,8 @@ pub(crate) fn maybe_dispatch_proc_fd_at(
     Some(op(fd))
 }
 
+/// 若原始绝对路径或 `AtPath` 指向 `/proc` 伪文件系统，返回对应路径字符串引用，
+/// 供调用方走 proc 特殊处理分支。
 pub(crate) fn proc_path_for_at<'a>(raw_abs: Option<&'a str>, at: &'a AtPath) -> Option<&'a str> {
     if let Some(abs) = raw_abs {
         if crate::fs::is_proc_pseudo_path(abs) {
@@ -421,6 +462,9 @@ pub(crate) fn proc_path_for_at<'a>(raw_abs: Option<&'a str>, at: &'a AtPath) -> 
     }
 }
 
+/// 以指定模式重新打开一个已有文件（通常来自 `/proc/self/fd` 符号链接解析），
+/// 安装为新 fd 并返回。若设置了 `O_TRUNC` 且非 O_PATH，则截断文件；
+/// 截断失败时关闭新 fd 并向上传播错误。
 pub(crate) fn reopen_proc_link_file(
     src_file: alloc::sync::Arc<dyn File + Send + Sync>,
     flags: usize,
@@ -446,6 +490,8 @@ pub(crate) fn reopen_proc_link_file(
     Ok(fd)
 }
 
+/// 检查伪文件系统路径是否存在，返回 `0` 或 `ENOENT`。
+/// 对 `/dev/shm/` 路径检查共享内存对象是否存在，其余路径通过 `open_pseudo` 探测。
 pub(crate) fn pseudo_path_exists_result(abs: &str) -> isize {
     if let Some(name) = shm_object_name(abs) {
         return if shm_get(name).is_some() {
@@ -461,6 +507,8 @@ pub(crate) fn pseudo_path_exists_result(abs: &str) -> isize {
     }
 }
 
+/// 将 ext4 根目录的所有目录项（跳过 `.` 和 `..`）合并到 `entries` 映射中，
+/// 已存在的项不覆盖（用于主磁盘优先的 union 合并）。
 pub(crate) fn add_root_dir_entries(
     root: &alloc::sync::Arc<ext4_fs::Inode>,
     entries: &mut BTreeMap<String, (u64, u8)>,
@@ -525,6 +573,7 @@ pub(crate) fn read_user_cstring(token: usize, ptr: usize) -> Result<String, isiz
     Err(err(SyscallError::ENAMETOOLONG))
 }
 
+/// 校验扩展属性名称：非空、不超过 `XATTR_NAME_MAX`，且必须含 `namespace.key` 格式的点分隔符。
 pub(crate) fn validate_xattr_name(name: &str) -> Result<(), isize> {
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
         return Err(err(SyscallError::ERANGE));
@@ -538,12 +587,14 @@ pub(crate) fn validate_xattr_name(name: &str) -> Result<(), isize> {
     Ok(())
 }
 
+/// 从用户空间读取扩展属性名称字符串并校验格式。
 pub(crate) fn read_user_xattr_name(token: usize, ptr: usize) -> Result<String, isize> {
     let name = read_user_cstring(token, ptr)?;
     validate_xattr_name(&name)?;
     Ok(name)
 }
 
+/// 从用户空间读取扩展属性值（最多 `XATTR_SIZE_MAX` 字节），`size=0` 时返回空 `Vec`。
 pub(crate) fn read_user_xattr_value(
     token: usize,
     value: usize,
@@ -565,14 +616,17 @@ pub(crate) fn read_user_xattr_value(
     Ok(out)
 }
 
+/// 判断扩展属性名称是否属于 `user.` 命名空间（用户可写的 xattr 命名空间）。
 pub(crate) fn xattr_is_user_namespace(name: &str) -> bool {
     name.starts_with("user.")
 }
 
+/// 判断 inode 是否支持 `user.*` 扩展属性（仅普通文件和目录支持）。
 pub(crate) fn inode_supports_user_xattr(inode: &Arc<ext4_fs::Inode>) -> bool {
     inode.is_file() || inode.is_dir()
 }
 
+/// 从路径指针解析出用于 xattr 操作的 ext4 inode，拒绝伪文件系统路径。
 pub(crate) fn resolve_xattr_path_inode(
     path_ptr: usize,
     follow_final: bool,
@@ -588,6 +642,8 @@ pub(crate) fn resolve_xattr_path_inode(
     resolve_at_inode(&at, fsuid, fsgid, follow_final)
 }
 
+/// 从文件描述符解析出用于 xattr 操作的 ext4 inode。
+/// O_PATH fd 返回 `EBADF`；非 inode 后端的 fd（如 socket）返回 `Ok(None)`。
 pub(crate) fn resolve_xattr_fd_inode(fd: usize) -> Result<Option<Arc<ext4_fs::Inode>>, isize> {
     if fd_has_o_path(fd) {
         return Err(err(SyscallError::EBADF));
@@ -602,6 +658,8 @@ pub(crate) fn resolve_xattr_fd_inode(fd: usize) -> Result<Option<Arc<ext4_fs::In
     Ok(Some(os_inode.ext4_inode()))
 }
 
+/// 设置 inode 的扩展属性，遵循 `XATTR_CREATE`/`XATTR_REPLACE` 标志语义，
+/// 拒绝 immutable/append-only inode 的修改，成功后更新 mtime/ctime。
 pub(crate) fn do_setxattr(
     inode: &Arc<ext4_fs::Inode>,
     name: &str,
@@ -635,6 +693,8 @@ pub(crate) fn do_setxattr(
     0
 }
 
+/// 读取 inode 的扩展属性值并写入用户缓冲区。
+/// `size=0` 时仅返回值的字节长度（不写入数据），缓冲区不足时返回 `ERANGE`。
 pub(crate) fn do_getxattr(
     inode: &Arc<ext4_fs::Inode>,
     name: &str,
@@ -671,6 +731,8 @@ pub(crate) fn do_getxattr(
     value.len() as isize
 }
 
+/// 列出 inode 的所有扩展属性名称（`\0` 分隔）并写入用户缓冲区。
+/// `size=0` 时仅返回所需字节数，缓冲区不足时返回 `ERANGE`。
 pub(crate) fn do_listxattr(
     inode: &Arc<ext4_fs::Inode>,
     list_ptr: usize,
@@ -704,6 +766,8 @@ pub(crate) fn do_listxattr(
     data.len() as isize
 }
 
+/// 删除 inode 的指定扩展属性，不存在时返回 `ENODATA`，
+/// immutable/append-only inode 返回 `EPERM`，成功后更新 mtime/ctime。
 pub(crate) fn do_removexattr(inode: &Arc<ext4_fs::Inode>, name: &str) -> isize {
     if xattr_is_user_namespace(name) && !inode_supports_user_xattr(inode) {
         return err(SyscallError::ENODATA);
@@ -729,6 +793,12 @@ pub(crate) fn do_removexattr(inode: &Arc<ext4_fs::Inode>, name: &str) -> isize {
     0
 }
 
+/// 从 ext4 起始 inode 出发，按路径分量逐级查找目标 inode，完整处理：
+/// - `.` / `..` 导航（含跨越起始点的 `..`）；
+/// - 目录执行权限检查（`x` 位）；
+/// - 符号链接解引用（`follow_final` 控制是否解引用最后一个分量），
+///   检测循环（深度 + 已见 inode 集合），绝对符号链接回到根解析。
+/// 需在调用前持有 `ext4_lock`。
 pub(crate) fn resolve_ext4_path(
     start: alloc::sync::Arc<ext4_fs::Inode>,
     path: &str,
@@ -825,6 +895,8 @@ pub(crate) fn resolve_ext4_path(
     Ok(stack.last().unwrap().clone())
 }
 
+/// 将 `AtPath` 解析为 ext4 inode，统一分发到绝对路径或相对 inode 两条路径。
+/// `PseudoAbs` 路径无法解析为 inode，返回 `ENOENT`。
 pub(crate) fn resolve_at_inode(
     at: &AtPath,
     uid: u32,
@@ -856,6 +928,8 @@ pub(crate) fn resolve_at_inode(
     }
 }
 
+/// 解析可执行文件路径为 inode，校验：不在 noexec 挂载点、是普通文件、有执行权限。
+/// `.sh` 文件检查读权限（`r` 位）而非执行权限（`x` 位）。
 pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     if let Some(abs) = resolve_abs_path(AT_FDCWD, path)? {
         if path_is_noexec(&abs) {
@@ -879,6 +953,8 @@ pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
     Ok(inode)
 }
 
+/// `execveat` 版本的可执行 inode 解析，支持 `AT_EMPTY_PATH`（对 fd 本身执行）
+/// 和 `AT_SYMLINK_NOFOLLOW`（不解引用最终符号链接，此时若目标是符号链接则报 `ELOOP`）。
 pub(crate) fn resolve_exec_inode_at(
     dirfd: isize,
     path: &str,
@@ -937,6 +1013,7 @@ pub(crate) fn resolve_exec_inode_at(
     Ok(inode)
 }
 
+/// 解析路径为可读文件的 inode，校验是普通文件且当前用户有读权限（`r` 位）。
 pub(crate) fn resolve_read_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let at = resolve_at_path(AT_FDCWD, path)?;
     if let AtPath::PseudoAbs(_) = &at {
@@ -958,6 +1035,8 @@ pub(crate) fn resolve_read_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
 ///
 /// We only validate the path and permissions for LTP. Accounting is not enabled.
 
+/// 将 `AtPath` 拆分为父目录 inode 和末尾名称，用于 `create`/`link`/`rename` 等需要
+/// 操作父目录的系统调用。`PseudoAbs` 路径返回 `EROFS`。
 pub(crate) fn resolve_parent_and_name(
     at: &AtPath,
     uid: u32,
@@ -1016,6 +1095,8 @@ pub(crate) fn resolve_parent_and_name(
     }
 }
 
+/// 将 `(dirfd, path)` 解析为规范化的逻辑绝对路径字符串（不进入 ext4 查找）。
+/// 路径为空时返回 `Ok(None)`；主要用于挂载点/noexec 检查等不需要 inode 的场景。
 pub(crate) fn resolve_abs_path(dirfd: isize, path: &str) -> Result<Option<String>, isize> {
     if path.is_empty() {
         return Ok(None);

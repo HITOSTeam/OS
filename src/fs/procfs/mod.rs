@@ -15,6 +15,7 @@ pub(crate) mod magic_link;
 pub(crate) mod open;
 
 pub use content::{vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory};
+pub(crate) use entries::vm_max_map_count;
 pub(crate) use magic_link::resolve_proc_magic_intermediate_abs_path;
 pub use magic_link::{
     normalize_proc_magic_path, proc_fd_link_file, proc_magic_link_exists, proc_readlink,
@@ -32,10 +33,12 @@ pub enum ProcFileKind {
     Uptime,
     Stat,
     Perf,
+    Kallsyms,
     Kpageflags,
     SysvipcMsg,
     SysvipcSem,
     SysvipcShm,
+    VmMinFreeKbytes,
     VmOvercommitMemory,
     VmOvercommitRatio,
     VmDropCaches,
@@ -51,6 +54,9 @@ pub enum ProcFileKind {
     KernelShmmax,
     KernelShmmni,
     KernelShmall,
+    KernelSchedRtPeriodUs,
+    KernelSchedRtRuntimeUs,
+    KernelSchedRrTimesliceMs,
     SimpleText(&'static str),
     PidStat(u32),
     PidCmdline(u32),
@@ -68,6 +74,7 @@ pub enum ProcFileKind {
 
 struct ProcPseudoInner {
     offset: usize,
+    cache: Option<String>,
 }
 
 pub struct ProcPseudoFile {
@@ -84,7 +91,10 @@ impl ProcPseudoFile {
     pub fn new(kind: ProcFileKind) -> Arc<Self> {
         Arc::new(Self {
             kind,
-            inner: Mutex::new(ProcPseudoInner { offset: 0 }),
+            inner: Mutex::new(ProcPseudoInner {
+                offset: 0,
+                cache: None,
+            }),
         })
     }
 
@@ -93,7 +103,9 @@ impl ProcPseudoFile {
     }
 
     pub fn set_offset(&self, offset: usize) {
-        self.inner.lock().offset = offset;
+        let mut inner = self.inner.lock();
+        inner.offset = offset;
+        inner.cache = None;
     }
 
     pub fn seek_end(&self) -> isize {
@@ -109,6 +121,9 @@ impl ProcPseudoFile {
             return Err(err(SyscallError::EINVAL));
         }
         let _normalized = match self.kind {
+            ProcFileKind::VmMinFreeKbytes => {
+                content::write_vm_sysctl("/proc/sys/vm/min_free_kbytes", data)?
+            }
             ProcFileKind::VmOvercommitMemory => {
                 content::write_vm_sysctl("/proc/sys/vm/overcommit_memory", data)?
             }
@@ -151,9 +166,19 @@ impl ProcPseudoFile {
             ProcFileKind::KernelShmall => {
                 crate::syscall::sysv_shm::write_shm_sysctl("/proc/sys/kernel/shmall", data)?
             }
+            ProcFileKind::KernelSchedRtPeriodUs => {
+                content::write_sched_sysctl("/proc/sys/kernel/sched_rt_period_us", data)?
+            }
+            ProcFileKind::KernelSchedRtRuntimeUs => {
+                content::write_sched_sysctl("/proc/sys/kernel/sched_rt_runtime_us", data)?
+            }
+            ProcFileKind::KernelSchedRrTimesliceMs => {
+                content::write_sched_sysctl("/proc/sys/kernel/sched_rr_timeslice_ms", data)?
+            }
             ProcFileKind::SimpleText(path) => entries::write_proc_simple_text(path, data)?,
             _ => return Err(err(SyscallError::EINVAL)),
         };
+        self.inner.lock().cache = None;
         Ok(data.len())
     }
 }
@@ -190,6 +215,7 @@ impl File for ProcPseudoFile {
     fn writable(&self) -> bool {
         match self.kind {
             ProcFileKind::VmOvercommitMemory
+            | ProcFileKind::VmMinFreeKbytes
             | ProcFileKind::VmOvercommitRatio
             | ProcFileKind::VmDropCaches
             | ProcFileKind::VmCompactMemory
@@ -203,7 +229,10 @@ impl File for ProcPseudoFile {
             | ProcFileKind::KernelSem
             | ProcFileKind::KernelShmmax
             | ProcFileKind::KernelShmmni
-            | ProcFileKind::KernelShmall => true,
+            | ProcFileKind::KernelShmall
+            | ProcFileKind::KernelSchedRtPeriodUs
+            | ProcFileKind::KernelSchedRtRuntimeUs
+            | ProcFileKind::KernelSchedRrTimesliceMs => true,
             ProcFileKind::SimpleText(path) => entries::proc_simple_text_is_writable(path),
             _ => false,
         }
@@ -217,24 +246,32 @@ impl File for ProcPseudoFile {
         if let ProcFileKind::Kpageflags = self.kind {
             return content::proc_kpageflags_read(&mut inner.offset, &mut buf);
         }
-        let data = content::proc_file_content(&self.kind);
-        let bytes = data.as_bytes();
-        if inner.offset >= bytes.len() {
+        if inner.cache.is_none() {
+            inner.cache = Some(content::proc_file_content(&self.kind));
+        }
+        let mut offset = inner.offset;
+        let bytes = inner
+            .cache
+            .as_ref()
+            .expect("proc cache populated")
+            .as_bytes();
+        if offset >= bytes.len() {
             return 0;
         }
         let mut total = 0usize;
         for slice in buf.buffers.iter_mut() {
-            if inner.offset >= bytes.len() {
+            if offset >= bytes.len() {
                 break;
             }
-            let n = core::cmp::min(slice.len(), bytes.len() - inner.offset);
-            slice[..n].copy_from_slice(&bytes[inner.offset..inner.offset + n]);
-            inner.offset += n;
+            let n = core::cmp::min(slice.len(), bytes.len() - offset);
+            slice[..n].copy_from_slice(&bytes[offset..offset + n]);
+            offset += n;
             total += n;
             if n < slice.len() {
                 break;
             }
         }
+        inner.offset = offset;
         total
     }
 
@@ -291,5 +328,20 @@ pub(crate) fn parse_proc_sys_usize(data: &[u8]) -> Result<usize, isize> {
     }
     trimmed
         .parse::<usize>()
+        .map_err(|_| err(SyscallError::EINVAL))
+}
+
+/// 解析 procfs 写入的有符号整数（与 `parse_proc_sys_usize` 对应，但允许负数，
+/// 例如 `-1` 这类“复位 / 不限制”语义）。空或非法返回 EINVAL。
+pub(crate) fn parse_proc_sys_i64(data: &[u8]) -> Result<i64, isize> {
+    let Ok(raw) = core::str::from_utf8(data) else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(err(SyscallError::EINVAL));
+    }
+    trimmed
+        .parse::<i64>()
         .map_err(|_| err(SyscallError::EINVAL))
 }

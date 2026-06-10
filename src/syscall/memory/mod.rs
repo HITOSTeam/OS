@@ -8,14 +8,17 @@ pub use unmap::*;
 
 pub(super) use crate::syscall::error::{SyscallError, err};
 pub(super) use crate::{
-    config::{PAGE_SIZE, USER_HEAP_GAP},
+    config::PAGE_SIZE,
     fs::{
         File, OSInode, PseudoShmFile, ext4_lock, vm_commit_limit_bytes, vm_committed_as_bytes,
         vm_overcommit_memory,
     },
-    mm::{MapPermission, PTEFlags, frame_alloc, try_copy_to_user, try_copy_to_user_unchecked},
+    mm::{
+        BrkUpdate, MapPermission, MapType, MemorySet, MprotectError, PTEFlags, VmRegion,
+        VmRegionKind, VmaInsertArea, frame_available_pages, reclaim_shared_file_page_cache,
+        try_copy_to_user, try_copy_to_user_unchecked,
+    },
     task::{
-        MmapRegion,
         manager::PID2PCB,
         processor::{current_files, current_process},
     },
@@ -63,27 +66,21 @@ pub(super) fn align_down(x: usize, align: usize) -> usize {
 pub(super) fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
-
+/// 用户地址区间检查，不要覆盖trap 跳板代码就行
 pub(super) fn user_range_valid(start: usize, end: usize) -> bool {
     start < end && end <= USER_VA_TOP
 }
 
-pub(super) fn anon_private_commit_charge(
-    map_len: usize,
-    prot: usize,
-    is_anon: bool,
-    is_shared: bool,
-) -> usize {
-    if is_anon && !is_shared && (prot & PROT_WRITE) != 0 {
-        map_len
-    } else {
-        0
-    }
-}
-
 pub(super) fn overcommit_limit_bytes() -> Option<usize> {
     match vm_overcommit_memory() {
-        0 => None,
+        // 模式 0 是 Linux 的启发式 overcommit。当前内核还没有 swap/reclaim，
+        // 因此给匿名私有可写 commit 留出有限裕量，但仍拒绝明显超过
+        // 物理内存两倍的大额请求。
+        0 => {
+            let total = crate::mm::frame_managed_pages().saturating_mul(PAGE_SIZE);
+            Some(total.saturating_add(total / 2))
+        }
+        // 不设限
         1 => None,
         2 => Some(vm_commit_limit_bytes()),
         _ => None,
@@ -98,143 +95,6 @@ pub(super) fn exceeds_overcommit_limit(additional_bytes: usize) -> bool {
         return false;
     };
     vm_committed_as_bytes().saturating_add(additional_bytes) > limit
-}
-
-pub(super) fn find_free_user_range(
-    ranges: &[(usize, usize)],
-    min_start: usize,
-    len: usize,
-) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    let mut cursor = align_up(min_start, PAGE_SIZE);
-    for (range_start, range_end) in ranges.iter().copied() {
-        if range_end <= cursor {
-            continue;
-        }
-        let end = cursor.checked_add(len)?;
-        if end <= range_start {
-            return user_range_valid(cursor, end).then_some(cursor);
-        }
-        cursor = align_up(range_end, PAGE_SIZE);
-    }
-    let end = cursor.checked_add(len)?;
-    user_range_valid(cursor, end).then_some(cursor)
-}
-
-pub(super) fn get_fd_file(fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
-    current_files().lock().get_file(fd)
-}
-
-pub(super) fn push_mmap_region_merged(
-    regions: &mut alloc::vec::Vec<MmapRegion>,
-    region: MmapRegion,
-) {
-    if region.len == 0 {
-        return;
-    }
-    if let Some(last) = regions.last_mut() {
-        if last.end() == region.start
-            && last.prot == region.prot
-            && last.shared == region.shared
-            && last.may_write_upgrade == region.may_write_upgrade
-            && last.file_backed == region.file_backed
-            && last.file_dev == region.file_dev
-            && last.file_ino == region.file_ino
-            && last.file_offset + last.len == region.file_offset
-            && last.growsdown == region.growsdown
-            && last.sigbus_start == region.sigbus_start
-        {
-            last.len += region.len;
-            return;
-        }
-    }
-    regions.push(region);
-}
-
-pub(super) fn slice_mmap_region(region: MmapRegion, start: usize, len: usize) -> MmapRegion {
-    let end = start.saturating_add(len);
-    let file_delta = start.saturating_sub(region.start);
-    MmapRegion {
-        start,
-        len,
-        file_offset: region.file_offset.saturating_add(file_delta),
-        sigbus_start: region.sigbus_start.clamp(start, end),
-        ..region
-    }
-}
-
-pub(super) fn move_mmap_region(region: MmapRegion, new_start: usize) -> MmapRegion {
-    let sigbus_delta = region
-        .sigbus_start
-        .saturating_sub(region.start)
-        .min(region.len);
-    MmapRegion {
-        start: new_start,
-        sigbus_start: new_start.saturating_add(sigbus_delta),
-        ..region
-    }
-}
-
-pub(super) fn trim_mmap_regions(
-    regions: &mut alloc::vec::Vec<MmapRegion>,
-    start: usize,
-    end: usize,
-) {
-    let mut next = alloc::vec::Vec::new();
-    for region in regions.drain(..) {
-        let r_end = region.end();
-        if end <= region.start || start >= r_end {
-            push_mmap_region_merged(&mut next, region);
-            continue;
-        }
-        if start > region.start {
-            push_mmap_region_merged(
-                &mut next,
-                slice_mmap_region(region, region.start, start - region.start),
-            );
-        }
-        if end < r_end {
-            push_mmap_region_merged(&mut next, slice_mmap_region(region, end, r_end - end));
-        }
-    }
-    *regions = next;
-}
-
-pub(super) fn apply_mprotect_to_mmap_regions(
-    regions: &mut alloc::vec::Vec<MmapRegion>,
-    start: usize,
-    end: usize,
-    new_prot: usize,
-) -> Result<(), ()> {
-    let mut next = alloc::vec::Vec::new();
-    for region in regions.iter().copied() {
-        let r_end = region.end();
-        if end <= region.start || start >= r_end {
-            push_mmap_region_merged(&mut next, region);
-            continue;
-        }
-        if start > region.start {
-            push_mmap_region_merged(
-                &mut next,
-                slice_mmap_region(region, region.start, start - region.start),
-            );
-        }
-        let ov_start = core::cmp::max(start, region.start);
-        let ov_end = core::cmp::min(end, r_end);
-        let mut mid = slice_mmap_region(region, ov_start, ov_end - ov_start);
-        if (new_prot & PROT_WRITE) != 0 && (mid.prot & PROT_WRITE) == 0 && !mid.may_write_upgrade {
-            return Err(());
-        }
-        mid.prot = new_prot;
-        push_mmap_region_merged(&mut next, mid);
-        if end < r_end {
-            push_mmap_region_merged(&mut next, slice_mmap_region(region, end, r_end - end));
-        }
-    }
-    *regions = next;
-    Ok(())
 }
 
 pub(super) fn find_inode_file_in_snapshot(
@@ -280,70 +140,48 @@ pub(super) fn find_open_inode_file(
     None
 }
 
-pub(super) fn push_range_merged(
-    ranges: &mut alloc::vec::Vec<(usize, usize)>,
-    start: usize,
-    end: usize,
-) {
-    if end <= start {
-        return;
+pub(super) fn find_shm_file_in_snapshot(
+    files: &[(usize, Arc<dyn File + Send + Sync>)],
+    memfd_id: u64,
+) -> Option<Arc<dyn File + Send + Sync>> {
+    if memfd_id == 0 {
+        return None;
     }
-    if let Some(last) = ranges.last_mut() {
-        if start <= last.1 {
-            last.1 = last.1.max(end);
-            return;
+    for (_fd, file) in files {
+        let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
+            continue;
+        };
+        if shm.memfd_id() == memfd_id {
+            return Some(Arc::clone(file));
         }
     }
-    ranges.push((start, end));
+    None
 }
 
-pub(super) fn normalize_ranges(ranges: &mut alloc::vec::Vec<(usize, usize)>) {
-    ranges.sort_unstable_by_key(|(start, _)| *start);
-    let mut merged = alloc::vec::Vec::new();
-    for (start, end) in ranges.drain(..) {
-        push_range_merged(&mut merged, start, end);
+pub(super) fn find_open_shm_file(memfd_id: u64) -> Option<Arc<dyn File + Send + Sync>> {
+    if memfd_id == 0 {
+        return None;
     }
-    *ranges = merged;
-}
-
-pub(super) fn trim_ranges(ranges: &mut alloc::vec::Vec<(usize, usize)>, start: usize, end: usize) {
-    if end <= start {
-        return;
-    }
-    let mut next = alloc::vec::Vec::new();
-    for (r_start, r_end) in ranges.drain(..) {
-        if end <= r_start || start >= r_end {
-            push_range_merged(&mut next, r_start, r_end);
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    let mut seen_tables = BTreeSet::new();
+    for process in processes {
+        let Some(inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        let files = Arc::clone(&inner.files);
+        drop(inner);
+        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }
-        if start > r_start {
-            push_range_merged(&mut next, r_start, start);
-        }
-        if end < r_end {
-            push_range_merged(&mut next, end, r_end);
+        let snapshot = files.lock().iter_files_snapshot();
+        if let Some(file) = find_shm_file_in_snapshot(&snapshot, memfd_id) {
+            return Some(file);
         }
     }
-    *ranges = next;
-}
-
-pub(super) fn ranges_total_len(ranges: &[(usize, usize)]) -> usize {
-    ranges
-        .iter()
-        .map(|(start, end)| end.saturating_sub(*start))
-        .sum()
-}
-
-pub(super) fn ranges_overlap(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
-    ranges
-        .iter()
-        .any(|(r_start, r_end)| end > *r_start && start < *r_end)
-}
-
-pub(super) fn page_overlaps_mmap_regions(page_start: usize, regions: &[MmapRegion]) -> bool {
-    let page_end = page_start.saturating_add(PAGE_SIZE);
-    regions
-        .iter()
-        .any(|region| page_end > region.start && page_start < region.end())
+    None
 }
 
 pub(super) fn page_overlaps_sysv_shm_regions(

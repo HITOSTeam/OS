@@ -104,6 +104,38 @@ impl TaskControlBlock {
         let inner = process.borrow_mut();
         inner.memory_set.token()
     }
+
+    /// Reset the saved user floating-point state to the Linux exec/thread
+    /// initial state: all FP registers and control bits are zero.
+    /// 初始化fp 相关 寄存器
+    pub fn reset_fp_state(&self) {
+        let mut inner = self.borrow_mut();
+        inner.fp_regs = [0; 32];
+        inner.fp_fcsr = 0;
+        inner.fp_fcc = 0;
+        inner.fp_valid = true;
+    }
+
+    /// Copy the parent's saved user floating-point state into a freshly
+    /// forked/cloned child. The caller must first save the current hardware FPU
+    /// state into `parent`, matching Linux arch_dup_task_struct()/copy_thread().
+    /// 继承 父亲的 寄存器
+    pub fn inherit_fp_state_from(&self, parent: &TaskControlBlock) {
+        let (fp_regs, fp_fcsr, fp_fcc, fp_valid) = {
+            let parent_inner = parent.borrow_mut();
+            (
+                parent_inner.fp_regs,
+                parent_inner.fp_fcsr,
+                parent_inner.fp_fcc,
+                parent_inner.fp_valid,
+            )
+        };
+        let mut inner = self.borrow_mut();
+        inner.fp_regs = fp_regs;
+        inner.fp_fcsr = fp_fcsr;
+        inner.fp_fcc = fp_fcc;
+        inner.fp_valid = fp_valid;
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -270,7 +302,7 @@ impl TaskControlBlock {
                 fp_regs: [0; 32],
                 fp_fcsr: 0,
                 fp_fcc: 0,
-                fp_valid: false,
+                fp_valid: true,
             }),
         };
         TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -367,11 +399,11 @@ impl TaskControlBlock {
                 // 继承父进程的 nice，新线程从同一起跑线开始竞争 CPU
                 nice: process_nice,
                 nice_query_hint: false,
-                // 浮点寄存器初值置零；首次切换时按需做 lazy 保存/恢复
+                // 浮点寄存器初值是有效的全零快照，避免首次调度继承 hart 残留状态
                 fp_regs: [0; 32],
                 fp_fcsr: 0,
                 fp_fcc: 0,
-                fp_valid: false,
+                fp_valid: true,
             }),
         };
         // 全局 TCB 计数 +1，配合 drop 端的减法可监控泄漏

@@ -7,7 +7,13 @@ pub const USER_STACK_SIZE: usize = 4096 * 256; // 1 MiB
 // Keep the initial program break away from the top of the first thread stack.
 // Some libc `sbrk()` paths reject growth when brk starts too close to stack.
 pub const USER_HEAP_GAP: usize = 64 * 1024; // 64 KiB
-pub const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32KB
+// Debug builds keep assertions and less optimized call frames; give kernel
+// stacks extra headroom so syscall/fork diagnostics can run without touching
+// the guard page. Release keeps the smaller footprint.
+#[cfg(debug_assertions)]
+pub const KERNEL_STACK_SIZE: usize = 4096 * 16; // 64 KiB
+#[cfg(not(debug_assertions))]
+pub const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 // Kernel heap must be large enough for fork-heavy LTP runs on glibc.
 // LoongArch QEMU virt places the linked kernel near the top of the high RAM
 // bank, so an oversized static heap can push `.bss` past the end of usable
@@ -18,6 +24,9 @@ pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
 pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
+// Keep MAP_GROWSDOWN stacks separated from lower VMAs. Linux defaults this
+// policy to hundreds of pages rather than a single unmapped guard page.
+pub const USER_STACK_GUARD_GAP: usize = PAGE_SIZE * 256; // 1 MiB
 
 #[cfg(not(target_arch = "loongarch64"))]
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;

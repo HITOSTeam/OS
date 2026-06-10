@@ -7,14 +7,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
-use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_HEAP_GAP, USER_STACK_SIZE};
-use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
+use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
+use crate::debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{
-    File, MountNamespace, PollWaitQueue, cgroup_attach_fork_child, clone_mount_namespace,
+    MountNamespace, PollWaitQueue, cgroup_attach_fork_child, clone_mount_namespace,
     initial_mount_namespace, mount_namespace_id,
 };
 use crate::mm::{
-    ElfAux, KERNEL_SPACE, MemorySet, read_user_value, translated_mutref, write_user_value,
+    ElfAux, KERNEL_SPACE, MemorySet, MmRef, read_user_value, translated_mutref, write_user_value,
 };
 use crate::println;
 use crate::task::FilesStruct;
@@ -25,6 +25,7 @@ use crate::task::manager::{
     wakeup_task,
 };
 use crate::task::processor::current_task;
+use crate::task::sched::{SCHED_DEADLINE, SCHED_FIFO, SCHED_OTHER, SCHED_RR};
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
     RT_SIG_MAX, RtSigAction, SIG_IGN, SIGCHLD_NUM, SignalAction, SignalActions, SignalFlags,
@@ -36,7 +37,6 @@ use crate::utils::RecycleAllocator;
 use lazy_static::lazy_static;
 use spin::{Mutex as SpinMutex, MutexGuard, RwLock};
 
-const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
 static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FORK_PRE_COW_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -258,36 +258,6 @@ fn process_comm_from_argv(argv: &[String]) -> String {
         String::from("CongCore")
     } else {
         out
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MmapRegion {
-    pub start: usize,
-    pub len: usize,
-    pub prot: usize,
-    pub shared: bool,
-    /// False for shared file mappings on descriptors without write access.
-    pub may_write_upgrade: bool,
-    /// File-backed mapping identity for write/mmap coherence.
-    pub file_backed: bool,
-    pub file_dev: usize,
-    pub file_ino: u32,
-    pub file_offset: usize,
-    /// Stable backing entry for file-backed mmap writeback after close(fd).
-    pub backing_id: usize,
-    /// Non-zero for `PseudoShmFile`/memfd-backed mappings.
-    pub memfd_id: u64,
-    /// Whether this region should expand downward on guard-page faults.
-    pub growsdown: bool,
-    /// Start address (inclusive) of the SIGBUS tail for file mappings.
-    /// `>= end()` means no SIGBUS tail.
-    pub sigbus_start: usize,
-}
-
-impl MmapRegion {
-    pub fn end(&self) -> usize {
-        self.start.saturating_add(self.len)
     }
 }
 
@@ -528,6 +498,11 @@ const AT_RANDOM: usize = 25;
 const AT_HWCAP2: usize = 26;
 const AT_EXECFN: usize = 31;
 
+/// 按 Linux ELF ABI 构造新程序的初始用户栈。
+///
+/// 返回值依次为 `(sp, argv_base, envp_base, auxv_base)`，调用方会把它们放入
+/// trap context 的 a0-a3，供新程序或动态链接器启动时读取。栈内容从低地址到
+/// 高地址为：argc、argv 指针数组、envp 指针数组、auxv 表、字符串和随机数据。
 fn build_linux_stack(
     token: usize,
     mut sp: usize,
@@ -539,16 +514,19 @@ fn build_linux_stack(
 ) -> (usize, usize, usize, usize) {
     #[cfg(target_arch = "loongarch64")]
     {
+        // LoongArch 的字符串对齐和入口寄存器约定与 RISC-V 略有差异，单独实现。
         return build_linux_stack_loongarch(token, sp, args, envs, elf_aux, at_entry, at_base);
     }
     #[cfg(not(target_arch = "loongarch64"))]
     {
+        // 下面是 RISC-V 等通用 64 位路径。所有写入都发生在新地址空间 token 下。
         fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
             for (i, b) in bytes.iter().enumerate() {
                 *translated_mutref(token, (addr + i) as *mut u8) = *b;
             }
         }
 
+        // 栈向低地址增长，压入一个 usize 后更新 sp。
         fn push_usize(token: usize, sp: &mut usize, value: usize) {
             *sp -= core::mem::size_of::<usize>();
             write_user_value(token, *sp as *mut usize, &value);
@@ -557,7 +535,7 @@ fn build_linux_stack(
         let argc = args.len();
         let envc = envs.len();
 
-        // Push argument and environment strings (top-down).
+        // 先把 argv/env 字符串拷到栈顶区域，并记录每个字符串的用户态地址。
         let mut arg_ptrs: Vec<usize> = Vec::with_capacity(argc);
         for arg in args.iter().rev() {
             let bytes = arg.as_bytes();
@@ -630,11 +608,12 @@ fn build_linux_stack(
         ];
         // We do not provide a VDSO (AT_SYSINFO_EHDR). glibc should fall back to syscalls.
         if at_base != 0 {
+            // 动态链接程序通过 AT_BASE 得知解释器自身的加载基址；静态 ELF 为 0。
             auxv.push((AT_BASE, at_base));
         }
 
-        // Make the final entry stack pointer 16-byte aligned.
-        // Starting from a 16-byte boundary, pushing an odd number of usize words flips alignment.
+        // 入口栈指针需要 16 字节对齐。下面先按将要压入的 word 数预留一次
+        // 对齐填充，避免最终 sp 因奇数个 usize 破坏 ABI 对齐要求。
         let aux_words = (auxv.len() + 1) * 2; // + AT_NULL
         let envp_words = envc + 1; // NULL-terminated
         let argv_words = argc + 1; // NULL-terminated
@@ -644,7 +623,7 @@ fn build_linux_stack(
             sp -= core::mem::size_of::<usize>();
         }
 
-        // auxv (type, val) pairs, ends with AT_NULL.
+        // auxv 按 (type, value) 成对存放，以 AT_NULL 结束。
         push_usize(token, &mut sp, 0);
         push_usize(token, &mut sp, AT_NULL);
         for (t, v) in auxv.iter().rev() {
@@ -653,21 +632,21 @@ fn build_linux_stack(
         }
         let auxv_base = sp;
 
-        // envp pointers array (envc + 1), with trailing NULL.
+        // envp 指针数组，末尾以 NULL 结束。
         push_usize(token, &mut sp, 0);
         for p in env_ptrs.iter().rev() {
             push_usize(token, &mut sp, *p);
         }
         let envp_base = sp;
 
-        // argv pointers array (argc + 1), with trailing NULL.
+        // argv 指针数组，末尾以 NULL 结束。
         push_usize(token, &mut sp, 0);
         for p in arg_ptrs.iter().rev() {
             push_usize(token, &mut sp, *p);
         }
         let argv_base = sp;
 
-        // argc.
+        // 最低地址处放 argc，动态链接器和 libc 从这里开始解析整个初始栈。
         push_usize(token, &mut sp, argc);
 
         (sp, argv_base, envp_base, auxv_base)
@@ -794,15 +773,22 @@ fn build_linux_stack_loongarch(
     (sp, argv_base, envp_base, auxv_base)
 }
 
+/// 调试用：按 Linux 初始栈布局打印 exec 后的 argc/argv 和关键 auxv 项。
+///
+/// 该函数只在 `DEBUG_SYSCALL` 或 `DEBUG_EXEC` 打开时工作，用于排查
+/// glibc/ld-linux 启动阶段的问题。它只做 best-effort 读取，不参与
+/// exec 语义，也不修改用户栈。
 fn dump_linux_initial_stack(token: usize, sp: usize) {
-    if !DEBUG_SYSCALL {
+    if !(DEBUG_SYSCALL || DEBUG_EXEC) {
         return;
     }
-    // Best-effort stack dump for diagnosing glibc/ld-linux startup issues.
+    // Linux 初始栈从低地址开始依次是 argc、argv 指针数组、envp 指针数组、
+    // auxv 表；argv/env 字符串和 AT_* 指向的数据放在更高地址区域。
     let argc = read_user_value(token, sp as *const usize);
     let argv0_ptr = read_user_value(token, (sp + core::mem::size_of::<usize>()) as *const usize);
     let mut argv0 = alloc::string::String::new();
     if argv0_ptr != 0 {
+        // 只读前 64 字节，避免调试输出因异常字符串或缺少 NUL 结束符无限扩张。
         for i in 0..64usize {
             let ch = *translated_mutref(token, (argv0_ptr + i) as *mut u8);
             if ch == 0 {
@@ -818,11 +804,30 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
         argv0_ptr,
         argv0
     );
+    // 打印前 16 个 argv，足够定位 exec 参数布局问题，同时避免日志过大。
+    for idx in 0..argc.min(16) {
+        let ptr = read_user_value(
+            token,
+            (sp + (idx + 1) * core::mem::size_of::<usize>()) as *const usize,
+        );
+        let mut arg = alloc::string::String::new();
+        if ptr != 0 {
+            // 每个参数同样限制 128 字节，调试函数不能让日志量由用户输入放大。
+            for i in 0..128usize {
+                let ch = *translated_mutref(token, (ptr + i) as *mut u8);
+                if ch == 0 {
+                    break;
+                }
+                arg.push(ch as char);
+            }
+        }
+        crate::println!("[exec_dyn] argv[{}]='{}'", idx, arg);
+    }
 
-    // Walk argv/envp to find auxv.
+    // 跳过 argv 指针数组及其 NULL 结束项，继续跳过 envp，最终定位 auxv 起点。
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-    // Skip envp pointers (NULL terminated).
+    // envp 以 NULL 指针结束；设置 256 的上限是为了防止坏栈导致无限扫描。
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();
@@ -830,7 +835,8 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
             break;
         }
     }
-    // Now p points just past envp NULL, i.e. auxv starts here.
+    // auxv 是 (type, value) 成对存放，以 AT_NULL 结束；只打印动态链接器
+    // 启动时最关键的几项，便于核对 PHDR/ENTRY/BASE/RANDOM 等值。
     let mut aux_p = p;
     for _ in 0..64usize {
         let t = read_user_value(token, aux_p as *const usize);
@@ -912,6 +918,8 @@ pub struct ProcessScheduling {
     pub sched_period: u64,
     /// POSIX nice value used by getpriority/setpriority.
     pub nice: i32,
+    /// Linux SCHED_RESET_ON_FORK / SCHED_FLAG_RESET_ON_FORK state.
+    pub reset_on_fork: bool,
 }
 
 // TODO(credentials): ProcessCredentials (uid/euid/suid/fsuid, gid/egid/sgid/fsgid,
@@ -944,7 +952,7 @@ pub struct ProcessControlBlockInner {
     pub continued: bool,
     /// Tracer pid for basic ptrace support (`PTRACE_TRACEME`).
     pub ptrace_tracer_pid: Option<usize>,
-    pub memory_set: MemorySet,
+    pub memory_set: MmRef,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub exit_code: i32,
@@ -999,16 +1007,6 @@ pub struct ProcessControlBlockInner {
     /// Process root directory (host-absolute path), used for `chroot`.
     pub root: String,
     pub cwd: String,
-    pub heap_start: usize,
-    pub brk: usize,
-    pub mmap_next: usize,
-    pub mmap_areas: Vec<MmapRegion>,
-    pub mmap_backings: BTreeMap<usize, Arc<dyn File + Send + Sync>>,
-    pub next_mmap_backing_id: usize,
-    /// Virtual ranges currently locked by mlock/mlockall.
-    pub mlocked_ranges: Vec<(usize, usize)>,
-    /// Whether MCL_FUTURE is currently enabled.
-    pub mlockall_future: bool,
     /// IPC namespace id used by SysV IPC / POSIX MQ isolation.
     pub ipc_ns_id: usize,
     /// Shared UTS namespace state (hostname/domainname).
@@ -1023,8 +1021,6 @@ pub struct ProcessControlBlockInner {
     pub pid_ns_vpid: usize,
     /// Whether this process is PID 1 inside its PID namespace.
     pub pid_ns_init: bool,
-    /// System V shared memory attachments (shmat/shmdt).
-    pub sysv_shm_attaches: Vec<crate::syscall::sysv_shm::ShmAttach>,
     pub signals: SignalFlags,
     pub signals_actions: SignalActions,
     pub signals_masks: SignalFlags,
@@ -1161,7 +1157,6 @@ impl ProcessControlBlock {
         let (memory_set, ustack_base, entry_point, elf_aux) =
             MemorySet::from_elf(elf_data).expect("failed to parse init_proc ELF");
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
         // allocate a pid
         let pid_handle =
             pid_alloc().expect("failed to allocate PID for init process (PID exhausted)");
@@ -1190,7 +1185,7 @@ impl ProcessControlBlock {
                 stop_pending: false,
                 continued: false,
                 ptrace_tracer_pid: None,
-                memory_set,
+                memory_set: MmRef::new(memory_set),
                 parent: None,
                 children: Vec::new(),
                 exit_code: 0,
@@ -1259,15 +1254,6 @@ impl ProcessControlBlock {
                 },
                 root: String::from("/"),
                 cwd: String::from("/user"),
-                heap_start,
-                brk: heap_start,
-                // Keep anonymous/file mmaps high to avoid colliding with ELF segments.
-                mmap_next: DEFAULT_MMAP_BASE,
-                mmap_areas: Vec::new(),
-                mmap_backings: BTreeMap::new(),
-                next_mmap_backing_id: 1,
-                mlocked_ranges: Vec::new(),
-                mlockall_future: false,
                 ipc_ns_id: 0,
                 uts_ns: Arc::new(SpinMutex::new(UtsNamespaceState::new())),
                 mnt_ns: initial_mount_namespace(),
@@ -1275,7 +1261,6 @@ impl ProcessControlBlock {
                 pid_ns_id: 0,
                 pid_ns_vpid: pid,
                 pid_ns_init: false,
-                sysv_shm_attaches: Vec::new(),
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
@@ -1293,6 +1278,7 @@ impl ProcessControlBlock {
                     sched_deadline: 0,
                     sched_period: 0,
                     nice: 0,
+                    reset_on_fork: false,
                 },
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
@@ -1422,19 +1408,24 @@ impl ProcessControlBlock {
         }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
-        {
+        let task = self.borrow_mut().get_task(0);
+        let old_trap_cx_slot = {
+            let task_inner = task.borrow_mut();
+            task_inner.res.as_ref().map(|res| res.trap_cx_slot())
+        };
+        let old_shm_cleanup = {
             let mut inner = self.borrow_mut();
-            let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
-            crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
+            if let Some(slot) = old_trap_cx_slot {
+                let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
+                inner
+                    .memory_set
+                    .remove_area_with_start_vpn(trap_cx_bottom.into());
+                inner.memory_set.dealloc_trap_context_slot(slot);
+            }
+            let old_shm_cleanup = inner.memory_set.take_sysv_shm_attaches_for_cleanup();
             reset_signal_handlers_on_exec(&mut inner);
-            inner.memory_set = memory_set;
-            inner.heap_start = heap_start;
-            inner.brk = heap_start;
-            inner.mmap_next = DEFAULT_MMAP_BASE;
-            inner.mmap_areas.clear();
-            inner.mlocked_ranges.clear();
-            inner.mlockall_future = false;
+            inner.memory_set = MmRef::new(memory_set);
+            inner.scheduling.reset_on_fork = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
             let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
@@ -1451,11 +1442,14 @@ impl ProcessControlBlock {
                 exec_inode.1,
             );
             inner.did_exec = true;
+            old_shm_cleanup
+        };
+        if let Some(old_shm) = old_shm_cleanup {
+            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
-        let task = self.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
         let res = task_inner.res.as_mut().unwrap();
-        res.ustack_base = ustack_base;
+        res.reset_for_exec(ustack_base);
         task_inner.trap_cx_ppn = res.trap_cx_ppn();
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
             new_token,
@@ -1478,6 +1472,9 @@ impl ProcessControlBlock {
         trap_cx.x[REG_A2] = envp_base;
         trap_cx.x[REG_A3] = auxv_base;
         *task_inner.get_trap_cx() = trap_cx;
+        drop(task_inner);
+        task.reset_fp_state();
+        crate::arch::restore_user_fp_state(&task);
     }
 
     pub fn exec_dyn_with_memory_set(
@@ -1506,19 +1503,24 @@ impl ProcessControlBlock {
         }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
-        let heap_start = ustack_base + USER_STACK_SIZE + USER_HEAP_GAP;
-        {
+        let task = self.borrow_mut().get_task(0);
+        let old_trap_cx_slot = {
+            let task_inner = task.borrow_mut();
+            task_inner.res.as_ref().map(|res| res.trap_cx_slot())
+        };
+        let old_shm_cleanup = {
             let mut inner = self.borrow_mut();
-            let old_shm = core::mem::take(&mut inner.sysv_shm_attaches);
-            crate::syscall::sysv_shm::exit_cleanup(inner.ipc_ns_id, &old_shm);
+            if let Some(slot) = old_trap_cx_slot {
+                let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
+                inner
+                    .memory_set
+                    .remove_area_with_start_vpn(trap_cx_bottom.into());
+                inner.memory_set.dealloc_trap_context_slot(slot);
+            }
+            let old_shm_cleanup = inner.memory_set.take_sysv_shm_attaches_for_cleanup();
             reset_signal_handlers_on_exec(&mut inner);
-            inner.memory_set = memory_set;
-            inner.heap_start = heap_start;
-            inner.brk = heap_start;
-            inner.mmap_next = DEFAULT_MMAP_BASE;
-            inner.mmap_areas.clear();
-            inner.mlocked_ranges.clear();
-            inner.mlockall_future = false;
+            inner.memory_set = MmRef::new(memory_set);
+            inner.scheduling.reset_on_fork = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
             let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
@@ -1535,16 +1537,19 @@ impl ProcessControlBlock {
                 exec_inode.1,
             );
             inner.did_exec = true;
+            old_shm_cleanup
+        };
+        if let Some(old_shm) = old_shm_cleanup {
+            crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
 
         // Workaround glibc ld-linux early crash by seeding an internal cached
         // DT_SYMTAB dynamic-entry pointer before entering the interpreter.
         patch_glibc_ld_linux_symtab_dyn(new_token, interp_base, interp_data);
 
-        let task = self.borrow_mut().get_task(0);
         let mut task_inner = task.borrow_mut();
         let res = task_inner.res.as_mut().unwrap();
-        res.ustack_base = ustack_base;
+        res.reset_for_exec(ustack_base);
         task_inner.trap_cx_ppn = res.trap_cx_ppn();
 
         let (user_sp, argv_base, envp_base, auxv_base) = build_linux_stack(
@@ -1570,6 +1575,9 @@ impl ProcessControlBlock {
         trap_cx.x[REG_A2] = envp_base;
         trap_cx.x[REG_A3] = auxv_base;
         *task_inner.get_trap_cx() = trap_cx;
+        drop(task_inner);
+        task.reset_fp_state();
+        crate::arch::restore_user_fp_state(&task);
     }
 
     fn fork_impl(
@@ -1577,6 +1585,15 @@ impl ProcessControlBlock {
         share_files: bool,
         share_vm: bool,
     ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
+        let caller_task = crate::task::processor::current_task();
+        if let Some(task) = caller_task.as_ref() {
+            crate::arch::save_user_fp_state(task);
+        }
+        let caller_task_res = caller_task.as_ref().and_then(|t| {
+            let inner = t.borrow_mut();
+            inner.res.as_ref().map(|r| (r.tid, r.ustack_base()))
+        });
+        let caller_tid = caller_task_res.map(|(tid, _)| tid).unwrap_or(0);
         let diag_enabled = DEBUG_FUTEX;
         let fork_start_cycles = if diag_enabled {
             crate::arch::read_time()
@@ -1602,10 +1619,40 @@ impl ProcessControlBlock {
         let sched_deadline = parent.scheduling.sched_deadline;
         let sched_period = parent.scheduling.sched_period;
         let nice = parent.scheduling.nice;
+        let reset_on_fork = parent.scheduling.reset_on_fork;
+        let (
+            child_sched_policy,
+            child_sched_priority,
+            child_sched_runtime,
+            child_sched_deadline,
+            child_sched_period,
+            child_nice,
+        ) = if reset_on_fork {
+            let (policy, priority, runtime, deadline, period) = match sched_policy {
+                SCHED_FIFO | SCHED_RR | SCHED_DEADLINE => (SCHED_OTHER, 0, 0, 0, 0),
+                _ => (
+                    sched_policy,
+                    sched_priority,
+                    sched_runtime,
+                    sched_deadline,
+                    sched_period,
+                ),
+            };
+            (policy, priority, runtime, deadline, period, nice.max(0))
+        } else {
+            (
+                sched_policy,
+                sched_priority,
+                sched_runtime,
+                sched_deadline,
+                sched_period,
+                nice,
+            )
+        };
         let cpu_affinity_mask = parent.scheduling.cpu_affinity_mask;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
-        let inherited_shm = parent.sysv_shm_attaches.clone();
+        let inherited_shm = parent.memory_set.sysv_shm_attaches_snapshot();
         if crate::debug_config::DEBUG_PID_MAP {
             let seq = FORK_PRE_COW_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if seq <= 8 || (seq & (seq - 1)) == 0 {
@@ -1625,24 +1672,22 @@ impl ProcessControlBlock {
             }
         }
         // Fork address space (COW by default, full copy on LoongArch).
-        let caller_tid = crate::task::processor::current_task()
-            .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.tid))
-            .unwrap_or(0);
         #[cfg(target_arch = "loongarch64")]
-        let mut memory_set = if DEBUG_LOONGARCH_FULL_COPY_FORK {
-            MemorySet::from_existed_user(&parent.memory_set)
+        let memory_set = if DEBUG_LOONGARCH_FULL_COPY_FORK {
+            MmRef::from_existed_user_deep(&parent.memory_set)
         } else if share_vm {
-            MemorySet::from_existed_user_shared(&parent.memory_set)
+            parent.memory_set.clone()
         } else {
-            MemorySet::from_existed_user_cow(&mut parent.memory_set)
+            MmRef::from_existed_user_cow(&parent.memory_set)
         };
         #[cfg(not(target_arch = "loongarch64"))]
-        let mut memory_set = if share_vm {
-            MemorySet::from_existed_user_shared(&parent.memory_set)
+        let memory_set = if share_vm {
+            parent.memory_set.clone()
         } else {
-            MemorySet::from_existed_user_cow(&mut parent.memory_set)
+            MmRef::from_existed_user_cow(&parent.memory_set)
         };
-        if thread_count > 1 {
+        if thread_count > 1 && !share_vm {
+            let mut child_mm = memory_set.lock();
             for task in parent.tasks.iter().filter_map(|t| t.as_ref()) {
                 let mut task_inner = task.borrow_mut();
                 let Some(res) = task_inner.res.as_ref() else {
@@ -1651,8 +1696,10 @@ impl ProcessControlBlock {
                 if res.tid == 0 {
                     continue;
                 }
-                let trap_cx_bottom = TRAP_CONTEXT_BASE - res.tid * PAGE_SIZE;
-                memory_set.remove_area_with_start_vpn(trap_cx_bottom.into());
+                let trap_cx_slot = res.trap_cx_slot();
+                let trap_cx_bottom = TRAP_CONTEXT_BASE - trap_cx_slot * PAGE_SIZE;
+                child_mm.remove_area_with_start_vpn(trap_cx_bottom.into());
+                child_mm.dealloc_trap_context_slot(trap_cx_slot);
             }
         }
         if diag_enabled {
@@ -1685,12 +1732,6 @@ impl ProcessControlBlock {
         let rlimits = parent.rlimits.clone();
         let root = parent.root.clone();
         let cwd = parent.cwd.clone();
-        let heap_start = parent.heap_start;
-        let brk = parent.brk;
-        let mmap_next = parent.mmap_next;
-        let mmap_areas = parent.mmap_areas.clone();
-        let mmap_backings = parent.mmap_backings.clone();
-        let next_mmap_backing_id = parent.next_mmap_backing_id;
         let ipc_ns_id = parent.ipc_ns_id;
         let uts_ns = Arc::clone(&parent.uts_ns);
         let mnt_ns = Arc::clone(&parent.mnt_ns);
@@ -1699,17 +1740,15 @@ impl ProcessControlBlock {
         let exec_inode_dev = parent.exec_inode_dev;
         let exec_inode_num = parent.exec_inode_num;
         // Remember parent's user-stack base for the calling thread.
-        let parent_ustack_base = crate::task::processor::current_task()
-            .and_then(|t| t.borrow_mut().res.as_ref().map(|r| r.ustack_base()))
-            .unwrap_or_else(|| {
-                parent
-                    .get_task(0)
-                    .borrow_mut()
-                    .res
-                    .as_ref()
-                    .unwrap()
-                    .ustack_base()
-            });
+        let parent_ustack_base = caller_task_res.map(|(_, base)| base).unwrap_or_else(|| {
+            parent
+                .get_task(0)
+                .borrow_mut()
+                .res
+                .as_ref()
+                .unwrap()
+                .ustack_base()
+        });
         // Fork state is not a single atomic snapshot across all PCB fields and
         // the descriptor table.  Linux allows those domains to move separately;
         // here that choice also keeps the PCB lock from nesting with the files
@@ -1767,15 +1806,6 @@ impl ProcessControlBlock {
                 rlimits,
                 root,
                 cwd,
-                heap_start,
-                brk,
-                mmap_next,
-                mmap_areas,
-                mmap_backings,
-                next_mmap_backing_id,
-                // Linux does not inherit mlock/mlockall locks across fork.
-                mlocked_ranges: Vec::new(),
-                mlockall_future: false,
                 ipc_ns_id,
                 uts_ns,
                 mnt_ns,
@@ -1783,7 +1813,6 @@ impl ProcessControlBlock {
                 pid_ns_id,
                 pid_ns_vpid: pid_value,
                 pid_ns_init: false,
-                sysv_shm_attaches: inherited_shm.clone(),
                 exec_inode_dev,
                 exec_inode_num,
                 // Pending signals are not inherited across fork.
@@ -1793,13 +1822,14 @@ impl ProcessControlBlock {
                 handling_signal: -1,
                 rt_sig_handlers,
                 scheduling: ProcessScheduling {
-                    sched_policy,
+                    sched_policy: child_sched_policy,
                     cpu_affinity_mask,
-                    sched_priority,
-                    sched_runtime,
-                    sched_deadline,
-                    sched_period,
-                    nice,
+                    sched_priority: child_sched_priority,
+                    sched_runtime: child_sched_runtime,
+                    sched_deadline: child_sched_deadline,
+                    sched_period: child_sched_period,
+                    nice: child_nice,
+                    reset_on_fork: false,
                 },
                 tasks: Vec::new(),
                 task_res_allocator: RecycleAllocator::new(),
@@ -1810,19 +1840,28 @@ impl ProcessControlBlock {
                 pidfd_poll_waiters: PollWaitQueue::default(),
             }),
         });
-        crate::syscall::sysv_shm::fork_inherit(ipc_ns_id, &inherited_shm);
         if diag_enabled {
             after_pcb_cycles = crate::arch::read_time();
         }
 
         // create main thread of child process (allocates a fresh kernel stack)
-        let task = Arc::new(TaskControlBlock::try_new(
-            Arc::clone(&child),
-            parent_ustack_base,
-            // here we do not allocate trap_cx or ustack again
-            // but mention that we allocate a new kstack here
-            false,
-        )?);
+        let task = Arc::new(if share_vm {
+            // Process-style CLONE_VM shares the mm but is not a thread-group
+            // member. Its user stack is supplied by clone(2), so only allocate
+            // a distinct trap-context slot in the shared mm.
+            TaskControlBlock::try_new_linux_thread(Arc::clone(&child))?
+        } else {
+            TaskControlBlock::try_new(
+                Arc::clone(&child),
+                parent_ustack_base,
+                // here we do not allocate trap_cx or ustack again
+                // but mention that we allocate a new kstack here
+                false,
+            )?
+        });
+        if !share_vm {
+            crate::syscall::sysv_shm::fork_inherit(&inherited_shm);
+        }
         // Distribute child processes across harts.
         task.set_cpu_id(select_hart_for_new_task());
         // attach task to child process
@@ -1834,8 +1873,7 @@ impl ProcessControlBlock {
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         cgroup_attach_fork_child(self.getpid(), child.getpid());
         // Seed trap context from the calling thread when available.
-        let parent_trap_cx =
-            crate::task::processor::current_task().map(|t| *t.borrow_mut().get_trap_cx());
+        let parent_trap_cx = caller_task.as_ref().map(|t| *t.borrow_mut().get_trap_cx());
         // modify kstack_top in trap_cx of this thread
         let mut task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
@@ -1845,7 +1883,7 @@ impl ProcessControlBlock {
         trap_cx.kernel_sp = task.kstack_top();
         // set return value for child process
         trap_cx.x[REG_A0] = 0;
-        if caller_tid != 0 {
+        if !share_vm && caller_tid != 0 {
             if let Some(res) = task_inner.res.as_mut() {
                 let caller_stack_bottom =
                     parent_ustack_base + caller_tid * (PAGE_SIZE + USER_STACK_SIZE);
@@ -1859,6 +1897,9 @@ impl ProcessControlBlock {
         // );
 
         drop(task_inner);
+        if let Some(parent_task) = caller_task.as_ref() {
+            task.inherit_fp_state_from(parent_task);
+        }
         if diag_enabled {
             after_task_cycles = crate::arch::read_time();
         }

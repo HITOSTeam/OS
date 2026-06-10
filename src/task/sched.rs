@@ -3,6 +3,8 @@
 //! 本模块定义了与 Linux 兼容的调度常量（SCHED_OTHER/SCHED_FIFO/SCHED_RR 等）、
 //! 调度类别枚举[SchedClass]、优先级范围以及策略校验/转换辅助函数。
 
+use core::sync::atomic::{AtomicI64, AtomicIsize, Ordering};
+
 /// 调度类别：CFS 公平调度、FIFO 实时、RR 实时。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SchedClass {
@@ -26,6 +28,10 @@ pub const SCHED_BATCH: i32 = 3;
 pub const SCHED_IDLE: i32 = 5;
 /// SCHED_DEADLINE — 实时 deadline 调度策略（目前仅做参数校验，未实际调度）。
 pub const SCHED_DEADLINE: i32 = 6;
+/// Linux policy flag: reset privileged scheduling state in children after fork.
+pub const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+/// `sched_setattr(2)` flag corresponding to SCHED_RESET_ON_FORK.
+pub const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 
 /// POSIX nice 值下限：-20（最高优先级）。
 pub const NICE_MIN: i32 = -20;
@@ -42,6 +48,76 @@ pub const RT_PRIO_LEVELS: usize = (RT_PRIO_MAX - RT_PRIO_MIN + 1) as usize;
 pub const RR_TIMESLICE_MS: isize = 100;
 /// RR 时间片长度：以 tick（10ms）为单位，即 10 个 tick。
 pub const RR_TIMESLICE_TICKS: usize = (RR_TIMESLICE_MS as usize) / 10;
+/// Linux 默认 RT 调度周期：1s。
+pub const RT_PERIOD_US_DEFAULT: i64 = 1_000_000;
+/// Linux 默认 RT 调度运行时间：950ms。
+pub const RT_RUNTIME_US_DEFAULT: i64 = 950_000;
+const RT_SYSCTL_MAX_US: i64 = i32::MAX as i64;
+
+// 这三个调度参数通过 /proc/sys/kernel/{sched_rr_timeslice_ms,sched_rt_period_us,
+// sched_rt_runtime_us} 暴露给用户态、可在运行时修改（proc_sched_rt01 依赖）。
+// 用原子量保存当前生效值，初值取上方的 Linux 默认常量。
+static RR_TIMESLICE_MS_CURRENT: AtomicIsize = AtomicIsize::new(RR_TIMESLICE_MS);
+static RT_PERIOD_US_CURRENT: AtomicI64 = AtomicI64::new(RT_PERIOD_US_DEFAULT);
+static RT_RUNTIME_US_CURRENT: AtomicI64 = AtomicI64::new(RT_RUNTIME_US_DEFAULT);
+
+pub fn rr_timeslice_ms() -> isize {
+    RR_TIMESLICE_MS_CURRENT.load(Ordering::Relaxed)
+}
+
+/// 当前 RR 时间片换算成 tick 数（10ms/tick，向上取整，至少 1）。
+pub fn rr_timeslice_ticks() -> usize {
+    core::cmp::max(1, (rr_timeslice_ms().max(1) as usize).div_ceil(10))
+}
+
+/// 写 `sched_rr_timeslice_ms`：`-1` 复位为默认值 `RR_TIMESLICE_MS`，否则取
+/// `[1, i32::MAX]` 内的毫秒值；越界返回 `None`（上层转成 EINVAL）。
+pub fn set_rr_timeslice_ms_from_procfs(value: i64) -> Option<isize> {
+    let applied = if value == -1 {
+        RR_TIMESLICE_MS
+    } else if (1..=RT_SYSCTL_MAX_US).contains(&value) {
+        value as isize
+    } else {
+        return None;
+    };
+    RR_TIMESLICE_MS_CURRENT.store(applied, Ordering::Relaxed);
+    Some(applied)
+}
+
+pub fn rt_period_us() -> i64 {
+    RT_PERIOD_US_CURRENT.load(Ordering::Relaxed)
+}
+
+pub fn rt_runtime_us() -> i64 {
+    RT_RUNTIME_US_CURRENT.load(Ordering::Relaxed)
+}
+
+/// 写 `sched_rt_period_us`：取 `[1, i32::MAX]` 微秒，且不允许小于当前 runtime
+/// （否则 runtime > period 不自洽）。越界或违反约束返回 `None`。
+pub fn set_rt_period_us_from_procfs(value: i64) -> Option<i64> {
+    if !(1..=RT_SYSCTL_MAX_US).contains(&value) {
+        return None;
+    }
+    let runtime = rt_runtime_us();
+    if runtime != -1 && runtime > value {
+        return None;
+    }
+    RT_PERIOD_US_CURRENT.store(value, Ordering::Relaxed);
+    Some(value)
+}
+
+/// 写 `sched_rt_runtime_us`：`-1` 表示关闭 RT 带宽限制（不 throttle），其余取
+/// `[-1, i32::MAX]` 微秒且不得大于当前 period；违反约束返回 `None`。
+pub fn set_rt_runtime_us_from_procfs(value: i64) -> Option<i64> {
+    if !(-1..=RT_SYSCTL_MAX_US).contains(&value) {
+        return None;
+    }
+    if value != -1 && value > rt_period_us() {
+        return None;
+    }
+    RT_RUNTIME_US_CURRENT.store(value, Ordering::Relaxed);
+    Some(value)
+}
 
 /// 将 nice 值钳制在 [-20, 19] 范围内。
 pub fn clamp_nice(nice: i32) -> i32 {
