@@ -1,16 +1,18 @@
 use super::{
-    ACCT_COMM, ACCT_STATE, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Acct, AcctState, Arc,
-    AtPath, ClassifiedAbsPath, FILE_LEASES, FileLockKey, OSInode, ProcessControlBlock, PseudoDir,
-    RECORD_LOCK_WAITERS, RECORD_LOCKS, String, SyscallError, TaskControlBlock, Vec,
-    apply_chown_to_inode, busybox_exists, classify_current_abs_path, clear_record_lock_waiting,
-    current_cwd_path, current_effective_uid_gid, current_fsuid_gid, current_in_group,
-    current_process, current_real_uid_gid, do_fchmodat, empty_path_fd_for_at_op, err, ext4_lock,
-    fd_has_o_path, find_path_in_roots, get_current_token, get_fd_file, get_time_ms,
-    inode_mode_allows, inode_mode_allows_uid_gid, is_privileged_or_owner, logical_path_for_open_fd,
+    ACCT_COMM, ACCT_STATE, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Acct,
+    AcctState, Arc, AtPath, ClassifiedAbsPath, FILE_LEASES, FileLockKey, OSInode,
+    ProcessControlBlock, PseudoDir, RECORD_LOCK_WAITERS, RECORD_LOCKS, String, SyscallError,
+    TaskControlBlock, Vec, apply_chown_to_inode, apply_process_root, busybox_exists,
+    classify_current_abs_path, clear_record_lock_waiting, current_cwd_path,
+    current_effective_uid_gid, current_fsuid_gid, current_in_group, current_process,
+    current_real_uid_gid, do_fchmodat, empty_path_fd_for_at_op, err, ext4_lock, fd_has_o_path,
+    find_path_in_roots, get_current_token, get_fd_file, get_time_ms, inode_mode_allows,
+    inode_mode_allows_uid_gid, is_privileged_or_owner, logical_path_for_open_fd,
     maybe_dispatch_proc_fd_at, mount_note_path_access, normalize_path, open_pseudo,
     pseudo_path_exists_result, read_user_cstring, resolve_abs_path, resolve_at_inode,
     resolve_at_path, resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked,
-    rofs_for_path, should_try_busybox_applet_path, wake_record_lock_waiters,
+    resolve_proc_magic_intermediate_abs_path, rofs_for_path, should_try_busybox_applet_path,
+    wake_record_lock_waiters,
 };
 
 /// Enables or disables BSD-style process accounting on an ext4 regular file.
@@ -198,8 +200,11 @@ pub fn release_all_file_leases_for_owner(owner_pid: usize) {
     table.retain(|_, lease| lease.owner_pid != owner_pid);
 }
 
-/// Checks pathname accessibility using Linux-like `faccessat(2)` permission rules.
-pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usize) -> isize {
+fn do_faccessat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
+    let valid_flags = AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+    if (flags & !valid_flags) != 0 {
+        return err(SyscallError::EINVAL);
+    }
     if mode & !0x7 != 0 {
         return err(SyscallError::EINVAL);
     }
@@ -209,7 +214,29 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
         Err(e) => return e,
     };
     if path.is_empty() {
-        return err(SyscallError::ENOENT);
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return err(SyscallError::ENOENT);
+        }
+        if dirfd < 0 {
+            return err(SyscallError::EBADF);
+        }
+        let Some(file) = get_fd_file(dirfd as usize) else {
+            return err(SyscallError::EBADF);
+        };
+        let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+            return 0;
+        };
+        let (uid, gid) = if (flags & AT_EACCESS) != 0 {
+            current_effective_uid_gid()
+        } else {
+            current_real_uid_gid()
+        };
+        let _ext4_guard = ext4_lock();
+        return if inode_mode_allows_uid_gid(&os_inode.ext4_inode(), mode, uid, gid) {
+            0
+        } else {
+            err(SyscallError::EACCES)
+        };
     }
     if busybox_exists() && should_try_busybox_applet_path(&path, false) {
         return 0;
@@ -232,40 +259,48 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
         };
     }
 
-    let (uid, gid) = current_real_uid_gid();
-    let _ext4_guard = ext4_lock();
-    let inode = match resolve_at_inode(&at, uid, gid, true) {
-        Ok(v) => v,
-        Err(e)
-            if e == err(SyscallError::ENOENT)
-                && matches!(path.as_str(), "busybox" | "./busybox") =>
-        {
-            let candidates = [
-                "/musl/busybox",
-                "/glibc/busybox",
-                "/bin/busybox",
-                "/busybox",
-            ];
-            let mut found = None;
-            for cand in candidates {
-                if let Some(inode) = find_path_in_roots(cand) {
-                    found = Some(inode);
-                    break;
+    let write_on_readonly_mount = (mode & 2) != 0 && rofs_for_path(dirfd, &path);
+    let (uid, gid) = if (flags & AT_EACCESS) != 0 {
+        current_effective_uid_gid()
+    } else {
+        current_real_uid_gid()
+    };
+    let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    {
+        let _ext4_guard = ext4_lock();
+        let inode = match resolve_at_inode(&at, uid, gid, follow_final) {
+            Ok(v) => v,
+            Err(e)
+                if e == err(SyscallError::ENOENT)
+                    && matches!(path.as_str(), "busybox" | "./busybox") =>
+            {
+                let candidates = [
+                    "/musl/busybox",
+                    "/glibc/busybox",
+                    "/bin/busybox",
+                    "/busybox",
+                ];
+                let mut found = None;
+                for cand in candidates {
+                    if let Some(inode) = find_path_in_roots(cand) {
+                        found = Some(inode);
+                        break;
+                    }
+                }
+                match found {
+                    Some(v) => v,
+                    None => return err(SyscallError::ENOENT),
                 }
             }
-            match found {
-                Some(v) => v,
-                None => return err(SyscallError::ENOENT),
-            }
-        }
-        Err(e) => return e,
-    };
+            Err(e) => return e,
+        };
 
-    if (mode & 2) != 0 && rofs_for_path(dirfd, &path) {
-        return err(SyscallError::EROFS);
-    }
-    if !inode_mode_allows_uid_gid(&inode, mode, uid, gid) {
-        return err(SyscallError::EACCES);
+        if write_on_readonly_mount {
+            return err(SyscallError::EROFS);
+        }
+        if !inode_mode_allows_uid_gid(&inode, mode, uid, gid) {
+            return err(SyscallError::EACCES);
+        }
     }
     if let Some(abs) = match resolve_abs_path(dirfd, &path) {
         Ok(v) => v,
@@ -276,9 +311,18 @@ pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usi
     0
 }
 
-/// Changes mode bits on the inode referenced by an open file descriptor.
-pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
-    if fd_has_o_path(fd) {
+/// Checks pathname accessibility using Linux-like `faccessat(2)` permission rules.
+pub fn syscall_faccessat(dirfd: isize, pathname: usize, mode: usize, _flags: usize) -> isize {
+    do_faccessat(dirfd, pathname, mode, 0)
+}
+
+/// `faccessat2(2)` adds reliable flag handling to `faccessat`.
+pub fn syscall_faccessat2(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
+    do_faccessat(dirfd, pathname, mode, flags)
+}
+
+fn chmod_fd(fd: usize, mode: usize, allow_o_path: bool) -> isize {
+    if fd_has_o_path(fd) && !allow_o_path {
         return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
@@ -304,6 +348,15 @@ pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
     0
 }
 
+/// Changes mode bits on the inode referenced by an open file descriptor.
+pub fn syscall_fchmod(fd: usize, mode: usize) -> isize {
+    chmod_fd(fd, mode, false)
+}
+
+pub(crate) fn fchmod_fd_for_at_empty_path(fd: usize, mode: usize) -> isize {
+    chmod_fd(fd, mode, true)
+}
+
 /// Compatibility wrapper for `fchmodat(2)` that delegates to `fchmodat2`.
 pub fn syscall_fchmodat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isize {
     do_fchmodat(dirfd, pathname, mode, flags, false)
@@ -314,9 +367,8 @@ pub fn syscall_fchmodat2(dirfd: isize, pathname: usize, mode: usize, flags: usiz
     do_fchmodat(dirfd, pathname, mode, flags, true)
 }
 
-/// Changes ownership on the inode referenced by an open file descriptor.
-pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
-    if fd_has_o_path(fd) {
+fn chown_fd(fd: usize, uid: usize, gid: usize, allow_o_path: bool) -> isize {
+    if fd_has_o_path(fd) && !allow_o_path {
         return err(SyscallError::EBADF);
     }
     let Some(file) = get_fd_file(fd) else {
@@ -334,6 +386,15 @@ pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
         }
     }
     0
+}
+
+/// Changes ownership on the inode referenced by an open file descriptor.
+pub fn syscall_fchown(fd: usize, uid: usize, gid: usize) -> isize {
+    chown_fd(fd, uid, gid, false)
+}
+
+pub(crate) fn fchown_fd_for_at_empty_path(fd: usize, uid: usize, gid: usize) -> isize {
+    chown_fd(fd, uid, gid, true)
 }
 
 /// Changes ownership on a pathname, with support for `dirfd` and proc-fd empty paths.
@@ -359,7 +420,11 @@ pub fn syscall_fchownat(
             Ok(v) => v,
             Err(e) => return e,
         };
-        return syscall_fchown(fd, uid, gid);
+        return if (flags & AT_EMPTY_PATH) != 0 {
+            fchown_fd_for_at_empty_path(fd, uid, gid)
+        } else {
+            syscall_fchown(fd, uid, gid)
+        };
     }
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -377,14 +442,17 @@ pub fn syscall_fchownat(
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let _ext4_guard = ext4_lock();
-    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
-        Ok(v) => v,
-        Err(e) => return e,
+    let inode = {
+        let _ext4_guard = ext4_lock();
+        match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
     };
     if rofs_for_path(dirfd, &path) {
         return err(SyscallError::EROFS);
     }
+    let _ext4_guard = ext4_lock();
     let ret = apply_chown_to_inode(&inode, uid, gid);
     if ret != 0 {
         return ret;
@@ -470,8 +538,17 @@ pub fn syscall_chdir(pathname: usize) -> isize {
     let process = current_process();
     let cwd = { process.borrow_mut().cwd.clone() };
     let new_cwd = match &at {
-        AtPath::Ext4Abs(abs) => abs.clone(),
-        AtPath::Ext4Rel { .. } => normalize_path(&cwd, &path),
+        AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
+            let requested = if path.starts_with('/') {
+                apply_process_root(&normalize_path("/", &path))
+            } else {
+                normalize_path(&cwd, &path)
+            };
+            match resolve_proc_magic_intermediate_abs_path(&requested) {
+                Ok(abs) => abs,
+                Err(e) => return e,
+            }
+        }
         AtPath::PseudoAbs(abs) => abs.clone(),
     };
     if crate::debug_config::DEBUG_SYSCALL {

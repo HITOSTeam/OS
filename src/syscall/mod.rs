@@ -36,9 +36,10 @@ static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
 // The base image ships `/bin/busybox` but not individual applet symlinks.
 // Allow a conservative subset of common LTP shell dependencies to fall back
 // to busybox when the standalone binary path is absent.
-const BUSYBOX_APPLET_ALLOWLIST: [&str; 17] = [
+const BUSYBOX_APPLET_ALLOWLIST: [&str; 18] = [
     "awk",
     "bash",
+    "cmp",
     "dmesg",
     "find",
     "grep",
@@ -115,6 +116,7 @@ const SYSCALL_FCHOWN: usize = 55;
 const SYSCALL_FTRUNCATE: usize = 46;
 const SYSCALL_FALLOCATE: usize = 47;
 const SYSCALL_FACCESSAT: usize = 48;
+const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_CHDIR: usize = 49;
@@ -559,6 +561,9 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MOUNT => filesystem::syscall_mount(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_FACCESSAT => {
             filesystem::syscall_faccessat(args[0] as isize, args[1], args[2], args[3])
+        }
+        SYSCALL_FACCESSAT2 => {
+            filesystem::syscall_faccessat2(args[0] as isize, args[1], args[2], args[3])
         }
         SYSCALL_CHDIR => filesystem::syscall_chdir(args[0]),
         SYSCALL_FCHDIR => filesystem::syscall_fchdir(args[0]),

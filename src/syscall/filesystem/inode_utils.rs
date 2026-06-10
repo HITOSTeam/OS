@@ -4,13 +4,13 @@ use super::{
     O_TMPFILE, O_TRUNC, O_WRONLY, OSInode, Ordering, PID2PCB, S_IFBLK, S_IFCHR, S_IFMT,
     SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec, cgroup_rename, current_effective_uid_gid,
     current_files, current_fsuid_gid, current_in_group, current_process, current_timespec,
-    empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock, fifo_pipe_state_for_inode,
-    file_lock_key_from_inode, get_current_token, inode_mode_allows, inode_mode_allows_uid_gid,
-    install_open_file_fd, is_inode_currently_executed_locked, lock_executing_inodes,
-    maybe_dispatch_proc_fd_at, maybe_signal_lease_break, note_inode_path_hint, open_pseudo,
-    path_is_nodev, path_is_rofs, pseudo_path_exists_result, queue_process_signal,
-    read_user_cstring, register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path,
-    resolve_parent_and_name, rofs_for_path, syscall_fchmod, try_copy_from_user,
+    empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock, fchmod_fd_for_at_empty_path,
+    fifo_pipe_state_for_inode, file_lock_key_from_inode, get_current_token, inode_mode_allows,
+    inode_mode_allows_uid_gid, install_open_file_fd, is_inode_currently_executed_locked,
+    lock_executing_inodes, maybe_dispatch_proc_fd_at, maybe_signal_lease_break,
+    note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs, pseudo_path_exists_result,
+    queue_process_signal, read_user_cstring, register_deferred_unlink_cleanup, resolve_at_inode,
+    resolve_at_path, resolve_parent_and_name, rofs_for_path, syscall_fchmod, try_copy_from_user,
     try_copy_to_user_unchecked,
 };
 use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
@@ -276,6 +276,7 @@ pub(crate) fn do_fchmodat(
     if strict_flags && (flags & !valid_flags) != 0 {
         return err(SyscallError::EINVAL);
     }
+    let flags = if strict_flags { flags } else { 0 };
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
         Ok(p) => p,
@@ -286,7 +287,11 @@ pub(crate) fn do_fchmodat(
             Ok(v) => v,
             Err(e) => return e,
         };
-        return syscall_fchmod(fd, mode);
+        return if (flags & AT_EMPTY_PATH) != 0 {
+            fchmod_fd_for_at_empty_path(fd, mode)
+        } else {
+            syscall_fchmod(fd, mode)
+        };
     }
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -304,14 +309,17 @@ pub(crate) fn do_fchmodat(
     let (fsuid, fsgid) = current_fsuid_gid();
     let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let _ext4_guard = ext4_lock();
-    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
-        Ok(v) => v,
-        Err(e) => return e,
+    let inode = {
+        let _ext4_guard = ext4_lock();
+        match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
     };
     if rofs_for_path(dirfd, &path) {
         return err(SyscallError::EROFS);
     }
+    let _ext4_guard = ext4_lock();
     if euid != 0 && inode.uid() != euid {
         return err(SyscallError::EPERM);
     }

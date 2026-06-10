@@ -81,6 +81,8 @@ pub(crate) use mount_utils::*;
 pub(crate) const AT_FDCWD: isize = -100;
 /// `*at` flag: do not follow the final symbolic link.
 pub(crate) const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+/// `faccessat2` flag: check with effective uid/gid rather than real uid/gid.
+pub(crate) const AT_EACCESS: usize = 0x200;
 /// `*at` flag: follow the final symbolic link when the syscall supports both modes.
 pub(crate) const AT_SYMLINK_FOLLOW: usize = 0x400;
 /// `*at` flag: reserved for automount control; currently accepted for compatibility.
