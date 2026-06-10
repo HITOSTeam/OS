@@ -4,8 +4,9 @@
 //! `MapArea` 记录已经物化的页，`PageTable` 是硬件最终看到的映射。
 
 use super::elf_loader::{
-    ENOMEM, ET_DYN, ElfHeader64, ElfPhdr64, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR, parse_elf_headers,
-    read_exact_with,
+    ENOMEM, ET_DYN, ElfHeader64, ElfPhdr64, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
+    elf_arch_abi_from_bytes, parse_elf_headers, read_exact_with, validate_elf_arch_abi,
+    validate_elf_interp_abi,
 };
 use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
@@ -1995,6 +1996,7 @@ impl MemorySet {
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
         // map program headers of elf, with U flag
+        validate_elf_arch_abi(elf_arch_abi_from_bytes(elf_data)?)?;
         let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
         let load_bias: usize = match elf.header.pt2.type_().as_type() {
             // Map ET_DYN (shared objects / PIE) at a non-zero base so that:
@@ -2122,6 +2124,7 @@ impl MemorySet {
         F: FnMut(usize, &mut [u8]) -> usize,
     {
         let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
+        validate_elf_arch_abi(hdr.arch_abi())?;
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
@@ -2185,6 +2188,7 @@ impl MemorySet {
         load_bias: usize,
         max_end_vpn: &mut VirtPageNum,
     ) -> Result<(usize, ElfAux), isize> {
+        validate_elf_arch_abi(elf_arch_abi_from_bytes(elf_data)?)?;
         let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
         let elf_header = elf.header;
         let magic = elf_header.pt1.magic;
@@ -2357,6 +2361,10 @@ impl MemorySet {
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();
 
+        validate_elf_interp_abi(
+            elf_arch_abi_from_bytes(main_elf)?,
+            elf_arch_abi_from_bytes(interp_elf)?,
+        )?;
         let main = xmas_elf::ElfFile::new(main_elf).map_err(|_| -8isize)?;
         let _interp = xmas_elf::ElfFile::new(interp_elf).map_err(|_| -8isize)?;
 
@@ -2437,6 +2445,7 @@ impl MemorySet {
         F: FnMut(usize, &mut [u8]) -> usize,
     {
         let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
+        validate_elf_interp_abi(hdr.arch_abi(), elf_arch_abi_from_bytes(interp_elf)?)?;
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
         memory_set.map_sigreturn_trampoline_user();

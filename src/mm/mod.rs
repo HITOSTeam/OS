@@ -50,7 +50,9 @@ pub fn activate_kernel_space() {
         memory_set::activate_token(token);
     }
 }
-pub(crate) use elf_loader::elf_interp_path_from_reader;
+pub(crate) use elf_loader::{
+    ElfArchAbi, elf_arch_abi_from_bytes, elf_load_info_from_reader, validate_elf_interp_abi,
+};
 #[allow(unused_imports)]
 pub use memory_set::remap_test;
 pub use memory_set::{
