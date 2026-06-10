@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
-use crate::debug_config::{DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
+use crate::debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
 use crate::fs::{
     MountNamespace, PollWaitQueue, cgroup_attach_fork_child, clone_mount_namespace,
     initial_mount_namespace, mount_namespace_id,
@@ -498,6 +498,11 @@ const AT_RANDOM: usize = 25;
 const AT_HWCAP2: usize = 26;
 const AT_EXECFN: usize = 31;
 
+/// 按 Linux ELF ABI 构造新程序的初始用户栈。
+///
+/// 返回值依次为 `(sp, argv_base, envp_base, auxv_base)`，调用方会把它们放入
+/// trap context 的 a0-a3，供新程序或动态链接器启动时读取。栈内容从低地址到
+/// 高地址为：argc、argv 指针数组、envp 指针数组、auxv 表、字符串和随机数据。
 fn build_linux_stack(
     token: usize,
     mut sp: usize,
@@ -509,16 +514,19 @@ fn build_linux_stack(
 ) -> (usize, usize, usize, usize) {
     #[cfg(target_arch = "loongarch64")]
     {
+        // LoongArch 的字符串对齐和入口寄存器约定与 RISC-V 略有差异，单独实现。
         return build_linux_stack_loongarch(token, sp, args, envs, elf_aux, at_entry, at_base);
     }
     #[cfg(not(target_arch = "loongarch64"))]
     {
+        // 下面是 RISC-V 等通用 64 位路径。所有写入都发生在新地址空间 token 下。
         fn write_bytes(token: usize, addr: usize, bytes: &[u8]) {
             for (i, b) in bytes.iter().enumerate() {
                 *translated_mutref(token, (addr + i) as *mut u8) = *b;
             }
         }
 
+        // 栈向低地址增长，压入一个 usize 后更新 sp。
         fn push_usize(token: usize, sp: &mut usize, value: usize) {
             *sp -= core::mem::size_of::<usize>();
             write_user_value(token, *sp as *mut usize, &value);
@@ -527,7 +535,7 @@ fn build_linux_stack(
         let argc = args.len();
         let envc = envs.len();
 
-        // Push argument and environment strings (top-down).
+        // 先把 argv/env 字符串拷到栈顶区域，并记录每个字符串的用户态地址。
         let mut arg_ptrs: Vec<usize> = Vec::with_capacity(argc);
         for arg in args.iter().rev() {
             let bytes = arg.as_bytes();
@@ -600,11 +608,12 @@ fn build_linux_stack(
         ];
         // We do not provide a VDSO (AT_SYSINFO_EHDR). glibc should fall back to syscalls.
         if at_base != 0 {
+            // 动态链接程序通过 AT_BASE 得知解释器自身的加载基址；静态 ELF 为 0。
             auxv.push((AT_BASE, at_base));
         }
 
-        // Make the final entry stack pointer 16-byte aligned.
-        // Starting from a 16-byte boundary, pushing an odd number of usize words flips alignment.
+        // 入口栈指针需要 16 字节对齐。下面先按将要压入的 word 数预留一次
+        // 对齐填充，避免最终 sp 因奇数个 usize 破坏 ABI 对齐要求。
         let aux_words = (auxv.len() + 1) * 2; // + AT_NULL
         let envp_words = envc + 1; // NULL-terminated
         let argv_words = argc + 1; // NULL-terminated
@@ -614,7 +623,7 @@ fn build_linux_stack(
             sp -= core::mem::size_of::<usize>();
         }
 
-        // auxv (type, val) pairs, ends with AT_NULL.
+        // auxv 按 (type, value) 成对存放，以 AT_NULL 结束。
         push_usize(token, &mut sp, 0);
         push_usize(token, &mut sp, AT_NULL);
         for (t, v) in auxv.iter().rev() {
@@ -623,21 +632,21 @@ fn build_linux_stack(
         }
         let auxv_base = sp;
 
-        // envp pointers array (envc + 1), with trailing NULL.
+        // envp 指针数组，末尾以 NULL 结束。
         push_usize(token, &mut sp, 0);
         for p in env_ptrs.iter().rev() {
             push_usize(token, &mut sp, *p);
         }
         let envp_base = sp;
 
-        // argv pointers array (argc + 1), with trailing NULL.
+        // argv 指针数组，末尾以 NULL 结束。
         push_usize(token, &mut sp, 0);
         for p in arg_ptrs.iter().rev() {
             push_usize(token, &mut sp, *p);
         }
         let argv_base = sp;
 
-        // argc.
+        // 最低地址处放 argc，动态链接器和 libc 从这里开始解析整个初始栈。
         push_usize(token, &mut sp, argc);
 
         (sp, argv_base, envp_base, auxv_base)
@@ -764,15 +773,22 @@ fn build_linux_stack_loongarch(
     (sp, argv_base, envp_base, auxv_base)
 }
 
+/// 调试用：按 Linux 初始栈布局打印 exec 后的 argc/argv 和关键 auxv 项。
+///
+/// 该函数只在 `DEBUG_SYSCALL` 或 `DEBUG_EXEC` 打开时工作，用于排查
+/// glibc/ld-linux 启动阶段的问题。它只做 best-effort 读取，不参与
+/// exec 语义，也不修改用户栈。
 fn dump_linux_initial_stack(token: usize, sp: usize) {
-    if !DEBUG_SYSCALL {
+    if !(DEBUG_SYSCALL || DEBUG_EXEC) {
         return;
     }
-    // Best-effort stack dump for diagnosing glibc/ld-linux startup issues.
+    // Linux 初始栈从低地址开始依次是 argc、argv 指针数组、envp 指针数组、
+    // auxv 表；argv/env 字符串和 AT_* 指向的数据放在更高地址区域。
     let argc = read_user_value(token, sp as *const usize);
     let argv0_ptr = read_user_value(token, (sp + core::mem::size_of::<usize>()) as *const usize);
     let mut argv0 = alloc::string::String::new();
     if argv0_ptr != 0 {
+        // 只读前 64 字节，避免调试输出因异常字符串或缺少 NUL 结束符无限扩张。
         for i in 0..64usize {
             let ch = *translated_mutref(token, (argv0_ptr + i) as *mut u8);
             if ch == 0 {
@@ -788,11 +804,30 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
         argv0_ptr,
         argv0
     );
+    // 打印前 16 个 argv，足够定位 exec 参数布局问题，同时避免日志过大。
+    for idx in 0..argc.min(16) {
+        let ptr = read_user_value(
+            token,
+            (sp + (idx + 1) * core::mem::size_of::<usize>()) as *const usize,
+        );
+        let mut arg = alloc::string::String::new();
+        if ptr != 0 {
+            // 每个参数同样限制 128 字节，调试函数不能让日志量由用户输入放大。
+            for i in 0..128usize {
+                let ch = *translated_mutref(token, (ptr + i) as *mut u8);
+                if ch == 0 {
+                    break;
+                }
+                arg.push(ch as char);
+            }
+        }
+        crate::println!("[exec_dyn] argv[{}]='{}'", idx, arg);
+    }
 
-    // Walk argv/envp to find auxv.
+    // 跳过 argv 指针数组及其 NULL 结束项，继续跳过 envp，最终定位 auxv 起点。
     let argv_base = sp + core::mem::size_of::<usize>();
     let mut p = argv_base + (argc + 1) * core::mem::size_of::<usize>(); // skip argv + NULL
-    // Skip envp pointers (NULL terminated).
+    // envp 以 NULL 指针结束；设置 256 的上限是为了防止坏栈导致无限扫描。
     for _ in 0..256usize {
         let v = read_user_value(token, p as *const usize);
         p += core::mem::size_of::<usize>();
@@ -800,7 +835,8 @@ fn dump_linux_initial_stack(token: usize, sp: usize) {
             break;
         }
     }
-    // Now p points just past envp NULL, i.e. auxv starts here.
+    // auxv 是 (type, value) 成对存放，以 AT_NULL 结束；只打印动态链接器
+    // 启动时最关键的几项，便于核对 PHDR/ENTRY/BASE/RANDOM 等值。
     let mut aux_p = p;
     for _ in 0..64usize {
         let t = read_user_value(token, aux_p as *const usize);
@@ -1439,6 +1475,9 @@ impl ProcessControlBlock {
         trap_cx.x[REG_A2] = envp_base;
         trap_cx.x[REG_A3] = auxv_base;
         *task_inner.get_trap_cx() = trap_cx;
+        drop(task_inner);
+        task.reset_fp_state();
+        crate::arch::restore_user_fp_state(&task);
     }
 
     pub fn exec_dyn_with_memory_set(
@@ -1539,6 +1578,9 @@ impl ProcessControlBlock {
         trap_cx.x[REG_A2] = envp_base;
         trap_cx.x[REG_A3] = auxv_base;
         *task_inner.get_trap_cx() = trap_cx;
+        drop(task_inner);
+        task.reset_fp_state();
+        crate::arch::restore_user_fp_state(&task);
     }
 
     fn fork_impl(
@@ -1546,7 +1588,11 @@ impl ProcessControlBlock {
         share_files: bool,
         share_vm: bool,
     ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
-        let caller_task_res = crate::task::processor::current_task().and_then(|t| {
+        let caller_task = crate::task::processor::current_task();
+        if let Some(task) = caller_task.as_ref() {
+            crate::arch::save_user_fp_state(task);
+        }
+        let caller_task_res = caller_task.as_ref().and_then(|t| {
             let inner = t.borrow_mut();
             inner.res.as_ref().map(|r| (r.tid, r.ustack_base()))
         });
@@ -1831,8 +1877,7 @@ impl ProcessControlBlock {
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         cgroup_attach_fork_child(self.getpid(), child.getpid());
         // Seed trap context from the calling thread when available.
-        let parent_trap_cx =
-            crate::task::processor::current_task().map(|t| *t.borrow_mut().get_trap_cx());
+        let parent_trap_cx = caller_task.as_ref().map(|t| *t.borrow_mut().get_trap_cx());
         // modify kstack_top in trap_cx of this thread
         let mut task_inner = task.borrow_mut();
         let trap_cx = task_inner.get_trap_cx();
@@ -1856,6 +1901,9 @@ impl ProcessControlBlock {
         // );
 
         drop(task_inner);
+        if let Some(parent_task) = caller_task.as_ref() {
+            task.inherit_fp_state_from(parent_task);
+        }
         if diag_enabled {
             after_task_cycles = crate::arch::read_time();
         }

@@ -6,3 +6,6 @@ kernel_release.bin
 kernel_release.elf
 /results
 *.elf
+.cargo
+src/link_app.asm
+kernel_debug.bin

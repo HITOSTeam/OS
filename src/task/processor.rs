@@ -807,6 +807,7 @@ pub fn idle_task() {
             // access coming task TCB exclusively
             let mut task_inner = task.borrow_mut();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
+            //第一次调度发生的日志
             if IDLE_FIRST_SWITCH_LOG.swap(false, Ordering::SeqCst) {
                 let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 let trap_cx = task_inner
