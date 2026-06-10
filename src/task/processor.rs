@@ -283,10 +283,14 @@ fn finish_thread_exit_cleanup(
     )
 }
 
-fn process_dumped_core(_process: &Arc<ProcessControlBlock>, _exit_code: i32) -> bool {
-    // Until core-file generation is implemented, do not report WCOREDUMP.
-    // Userspace treats that bit as a promise that a core file was produced.
-    false
+fn process_dumped_core(process: &Arc<ProcessControlBlock>, exit_code: i32) -> bool {
+    let Some(signum) = exit_code.checked_neg().filter(|sig| *sig > 0) else {
+        return false;
+    };
+    if !crate::task::signal::signal_has_core_dump(signum as usize) {
+        return false;
+    }
+    process.borrow_mut().rlimits.rlimit_core_cur != 0
 }
 
 fn cleanup_process_threads_for_group_exit(
