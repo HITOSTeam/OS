@@ -15,12 +15,8 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 16; // 64 KiB
 #[cfg(not(debug_assertions))]
 pub const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 // Kernel heap must be large enough for fork-heavy LTP runs on glibc.
-// LoongArch QEMU virt places the linked kernel near the top of the high RAM
-// bank, so an oversized static heap can push `.bss` past the end of usable
-// memory and fault during early `clear_bss()`.
-#[cfg(target_arch = "loongarch64")]
-pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
-#[cfg(not(target_arch = "loongarch64"))]
+// 256 MiB reduces allocator OOMs in long `fork13` stress loops.
+#[allow(dead_code)]
 pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
@@ -37,8 +33,8 @@ pub const SIGRETURN_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
 pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 
 // LoongArch64 uses split PGDL/PGDH and a 3-level (Sv39-style) page walk here,
-// so keep user trap-related pages inside the low canonical user half, matching
-// RocketOS and avoiding extra high-half refill assumptions in the current path.
+// so the user-range VA width is 39 bits. Keep trap-related pages inside the
+// low canonical range (max 0x0000_003f_ffff_ffff) so PGDL can translate them.
 #[cfg(target_arch = "loongarch64")]
 pub const TRAMPOLINE: usize = 0x0000_003f_ffff_f000;
 /// User-accessible sigreturn trampoline page (separate from kernel trap trampoline).

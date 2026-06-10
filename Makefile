@@ -57,7 +57,7 @@ else ifeq ($(ARCH),loongarch64)
     QEMU_BLK_DEV1    := virtio-blk-pci,drive=x1
     QEMU_NET_DEV     := virtio-net-pci,netdev=net
     QEMU_BIOS_ARGS   :=
-    GDB_ARCH         := Loongarch64
+    GDB_ARCH         := loongarch
     CARGO_CONFIG     := $(ROOT_DIR)/cargo-config/config_loongarch64.toml
     DISK_IMG         ?= ../sdcard-la.img
     EXT4_BASE_IMG    ?= ../img/disk-la.img
@@ -75,7 +75,6 @@ CARGO_MODE_FLAG := $(if $(filter release,$(MODE)),--release,)
 SMP          ?= 4
 MEM          ?= 1G
 QEMU_TIMEOUT ?= 0
-
 SUBMIT       ?= 0
 EXT4_REBUILD ?= 0
 EXT4_SIZE    ?= 1G
@@ -96,7 +95,6 @@ USER_FEATURES := $(if $(filter 1,$(SUBMIT)),--features submit,)
 # Derived paths
 # ----------------------------------------------------------------------
 KERNEL_ELF      := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)/os
-KERNEL_LOAD_ELF := kernel_$(MODE).load.elf
 KERNEL_BIN      := kernel_$(MODE).bin
 KERNEL_DBG_ELF  := kernel_$(MODE).elf
 USER_TARGET_DIR := $(USER_DIR)/target/$(TARGET)/$(MODE)
@@ -116,7 +114,7 @@ endif
 # ----------------------------------------------------------------------
 # QEMU command-line fragments
 # ----------------------------------------------------------------------
-QEMU_BASE_ARGS  := -machine virt -kernel $(KERNEL_LOAD_ELF) -m $(MEM) -smp $(SMP) \
+QEMU_BASE_ARGS  := -machine virt -kernel $(KERNEL_ELF) -m $(MEM) -smp $(SMP) \
                    -nographic -rtc base=utc -no-reboot
 QEMU_DISK0_ARGS := -drive file=$(EXT4_IMG),if=none,format=raw,id=x0 \
                    -device $(QEMU_BLK_DEV0)
@@ -167,11 +165,8 @@ kernel: prepare-cargo user_apps
 	if [ -n "$$OBJCOPY" ]; then \
 		$$OBJCOPY --strip-all $(KERNEL_ELF) -O binary $(KERNEL_BIN); \
 		echo "Build $(KERNEL_BIN) successfully."; \
-		$$OBJCOPY --strip-debug $(KERNEL_ELF) $(KERNEL_LOAD_ELF); \
-		echo "Build $(KERNEL_LOAD_ELF) successfully."; \
 	else \
 		echo "⚠️  No objcopy found; skip $(KERNEL_BIN) (QEMU uses ELF)."; \
-		cp $(KERNEL_ELF) $(KERNEL_LOAD_ELF); \
 	fi
 	@cp $(KERNEL_ELF) $(KERNEL_DBG_ELF)
 
@@ -255,7 +250,7 @@ ext4_base_img:
 run run_ext4: kernel ext4_img
 	@echo "🔍 Running QEMU with VirtIO block device..."
 	@echo "   ➜ File System Image: $(EXT4_IMG)"
-	$(QEMU_RUN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_EXTRA_ARGS) \
+	$(QEMU_RUN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) \
 	    $(QEMU_DISK0_ARGS) $(QEMU_NET_ARGS) $(QEMU_DISK1_ARGS)
 
 # QEMU halts at reset and listens for a GDB client on :1234. The
@@ -263,44 +258,16 @@ run run_ext4: kernel ext4_img
 # are not killed mid-debug.
 debug debug_ext4: kernel ext4_img
 	@echo "🐛 Starting QEMU in debug mode (gdb target: localhost:1234)..."
-	@$(QEMU_BIN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_EXTRA_ARGS) $(QEMU_DISK0_ARGS) -s -S
+	@$(QEMU_BIN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) $(QEMU_DISK0_ARGS) -s -S
 
 # Companion to `debug` / `debug_ext4`: attach the bundled GDB client.
 client_gdb:
 	@./elf-gdb \
 		-ex 'file $(KERNEL_ELF)' \
 		-ex 'set arch $(GDB_ARCH)' \
-		-ex 'target remote 127.0.0.1:1234' \
+		-ex 'target remote localhost:1234' \
 		-ex 'display/10i $$pc'
-		
-#我本地没有elf-gdb,所以改成使用这个
-client_gdb_xcy:
-	@GDB_CMD=""; \
-	if [ "$(ARCH)" = "riscv64" ]; then \
-		GDB_CMD="../bin/riscv64-unknown-elf-gdb"; \
-	elif [ "$(ARCH)" = "loongarch64" ]; then \
-		GDB_CMD="../bin/loongarch64-linux-gnu-gdb"; \
-	else \
-		echo "❌ Unsupported ARCH=$(ARCH) for client_gdb"; \
-		exit 2; \
-	fi; \
-	if [ ! -x "$$GDB_CMD" ]; then \
-		echo "❌ GDB not found or not executable: $$GDB_CMD"; \
-		exit 127; \
-	fi; \
-	echo "🔗 Using GDB: $$GDB_CMD"; \
-	if [ "$(ARCH)" = "loongarch64" ]; then \
-		GDB_VER=$$($$GDB_CMD --version | head -n1); \
-		echo "ℹ️  $$GDB_VER"; \
-		echo "ℹ️  If you see 'Architecture rejected target-supplied description' or"; \
-		echo "   'Remote g packet reply is too long', this is a GDB<->QEMU version mismatch,"; \
-		echo "   not a kernel runtime bug. Use a newer loongarch gdb."; \
-	fi; \
-	$$GDB_CMD \
-		-ex 'file $(KERNEL_ELF)' \
-		-ex 'set arch $(GDB_ARCH)' \
-		-ex 'target remote 127.0.0.1:1234' \
-		-ex 'display/10i $$pc'
+
 # ======================================================================
 # Housekeeping
 # ======================================================================

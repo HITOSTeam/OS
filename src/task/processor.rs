@@ -845,18 +845,6 @@ pub fn idle_task() {
             // Keep interrupts disabled while resuming kernel context; sret will enable them for user.
             // SAFETY: both task contexts are valid kernel stack pointers owned by their respective tasks;
             // idle_task_cx_ptr is the idle context, next_task_cx_ptr is the next task's saved context.
-            // println!(
-            //     "[idle] before switch: idle_task_cx_ptr={:#x}, next_task_cx_ptr={:#x}",
-            //     idle_task_cx_ptr as usize,
-            //     next_task_cx_ptr as usize,
-            // );
-            // unsafe {
-            //     println!(
-            //         "[idle] next ctx: ra={:#x}, sp={:#x}",
-            //         *(next_task_cx_ptr as *const usize),
-            //         *((next_task_cx_ptr as *const usize).add(1)),
-            //     );
-            // }
             unsafe {
                 switch::switch(
                     idle_task_cx_ptr as *const usize,

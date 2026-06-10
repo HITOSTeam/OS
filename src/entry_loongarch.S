@@ -30,8 +30,6 @@ _start:
     csrwr       $t2,    CSR_DMW1
     csrwr       $t1,    CSR_DMW0
 
-
-
     bl rust_main
 
     .section .bss.stack

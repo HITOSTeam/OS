@@ -8,7 +8,7 @@ switch:
     # ra, sp, tp, fp, and s0..s8. The remaining slot in `s[12]` is unused.
     st.d $ra, $a0, 0
     st.d $sp, $a0, 8
-    st.d $r2, $a0, 16
+    st.d $r21, $a0, 16
     st.d $r22, $a0, 24
     st.d $r23, $a0, 32
     st.d $r24, $a0, 40
