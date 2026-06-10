@@ -247,33 +247,41 @@ impl MemorySet {
                 };
                 (frame, false)
             };
-            if !reused_cached_frame && let Some(file) = file_backing.as_ref() {
-                if region.file_backed {
-                    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-                        // 新分配的 file-backed 页从文件读入，EOF 页尾保持零填充。
-                        let region_delta = page_start.saturating_sub(region.start);
-                        let file_off = region.file_offset.saturating_add(region_delta);
-                        let valid_len = region.file_valid_len();
-                        let read_len = valid_len.saturating_sub(region_delta).min(PAGE_SIZE);
-                        if read_len > 0 {
-                            let page = frame.ppn.get_bytes_array();
-                            let _ = os_inode.pread_at(file_off, &mut page[..read_len]);
+            if !reused_cached_frame {
+                if let Some(file) = file_backing.as_ref() {
+                    if region.file_backed {
+                        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+                            // 新分配的 file-backed 页从文件读入，EOF 页尾保持零填充。
+                            let region_delta = page_start.saturating_sub(region.start);
+                            let file_off = region.file_offset.saturating_add(region_delta);
+                            let valid_len = region.file_valid_len();
+                            let read_len = valid_len.saturating_sub(region_delta).min(PAGE_SIZE);
+                            if read_len > 0 {
+                                let page = frame.ppn.get_bytes_array();
+                                let _ = os_inode.pread_at(file_off, &mut page[..read_len]);
+                            }
                         }
                     }
                 }
             }
-            let frame = if shared_inode_backed && let Some(file_page) = file_page {
-                // insert_or_get 处理并发/重入语义：若已有共享页，统一使用已有 frame。
-                shared_file_page_cache_insert_or_get(
-                    region.file_dev,
-                    region.file_ino,
-                    file_page,
-                    frame,
-                )
-            } else if shared_anon_backed && let Some(anon_page) = anon_page {
-                shared_anon_page_cache_insert_or_get(region.anon_shared_id, anon_page, frame)
-            } else {
-                frame
+            let frame = match (shared_inode_backed, file_page) {
+                (true, Some(file_page)) => {
+                    // insert_or_get 处理并发/重入语义：若已有共享页，统一使用已有 frame。
+                    shared_file_page_cache_insert_or_get(
+                        region.file_dev,
+                        region.file_ino,
+                        file_page,
+                        frame,
+                    )
+                }
+                _ => match (shared_anon_backed, anon_page) {
+                    (true, Some(anon_page)) => shared_anon_page_cache_insert_or_get(
+                        region.anon_shared_id,
+                        anon_page,
+                        frame,
+                    ),
+                    _ => frame,
+                },
             };
             // 先分配帧再 cgroup 记账，避免 OOM 导致记账泄漏。
             if new_charge_pages > 0
@@ -289,22 +297,22 @@ impl MemorySet {
             }
             self.page_table.map(vpn, frame.ppn, pte_flags);
             area.insert_tracked_frame(vpn, frame);
-            if region.backing_id != 0
-                && let Some(file_page) = file_page
-            {
-                // 记录 resident 页，供 msync/munmap/writeback 和 debug invariant 使用。
-                let backing_frame = area
-                    .tracked_frame(vpn)
-                    .expect("lazy fault inserted frame")
-                    .clone();
-                if let Some(backing) = self.mmap_backings.get_mut(&region.backing_id) {
-                    let cache_frame =
-                        (region.shared && region.file_backed).then_some(&backing_frame);
-                    backing.add_resident_page_ref(
-                        file_page,
-                        cache_frame,
-                        pte_flags.contains(PTEFlags::D),
-                    );
+            if region.backing_id != 0 {
+                if let Some(file_page) = file_page {
+                    // 记录 resident 页，供 msync/munmap/writeback 和 debug invariant 使用。
+                    let backing_frame = area
+                        .tracked_frame(vpn)
+                        .expect("lazy fault inserted frame")
+                        .clone();
+                    if let Some(backing) = self.mmap_backings.get_mut(&region.backing_id) {
+                        let cache_frame =
+                            (region.shared && region.file_backed).then_some(&backing_frame);
+                        backing.add_resident_page_ref(
+                            file_page,
+                            cache_frame,
+                            pte_flags.contains(PTEFlags::D),
+                        );
+                    }
                 }
             }
             #[cfg(target_arch = "riscv64")]

@@ -60,10 +60,17 @@ restore:
     # vectors to the trampoline handler (which is mapped in both page tables).
     # Reconstruct the trampoline page base from the current PC so we stay
     # entirely within the trampoline mapping and avoid a GOT/literal-pool load.
-    # 用当前 PC 计算 trampoline 页基址，并写入 EENTRY。
+    # 之前是使用死地址,就是alltraps的符号地址,使用la $t0, alltraps
+    # alltraps对应的地址是物理地址,现在使用pc去计算(pc是虚拟地址),计算得到的就是alltraps的虚拟地址
+    # alltraps函数位于trampoline页面开头,所以是对应虚拟地址块的开头,
+    # 使用的是sv39 直接把末位清零就好了
     pcaddi $t0, 0
     srli.d $t0, $t0, 12
     slli.d $t0, $t0, 12
+
+
+
+    # 0xc是EENTRY  的CSR编号,是trap发生的时候cpu跳转执行的函数地址
     csrwr $t0, 0xc
     # Now switch PGDL to user page table.
     slli.d $t0, $a1, 12

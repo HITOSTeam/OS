@@ -191,10 +191,15 @@ fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static st
     }
 }
 
+
+/// lua的shebnag是 #!/bin/busybox sh 解析后 interp_name = "busybox" opt_arg = Some("sh")
+/// 所以需要再额外判断解释器是不是busybox
 /// 决定 shebang 的可选参数（如 `#!/usr/bin/env sh` 中的 `sh`）是否应透传给解释器。
 /// 当解释器是 `env` 且参数已被识别为 shell 名称时，不再重复传递。
 fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> Option<&'a str> {
-    if interp_name == "env" && matches!(opt_arg, Some("sh") | Some("bash")) {
+    if matches!(interp_name, "busybox" | "env")
+        && matches!(opt_arg, Some("sh") | Some("bash") | Some("dash"))
+    {
         None
     } else {
         opt_arg

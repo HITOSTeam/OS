@@ -8,7 +8,9 @@ switch:
     # ra, sp, tp, fp, and s0..s8. The remaining slot in `s[12]` is unused.
     st.d $ra, $a0, 0
     st.d $sp, $a0, 8
-    st.d $r21, $a0, 16
+    # 保存tp(r2)
+    st.d $r2, $a0, 16 
+    # 保存11个 callee-saved 寄存器
     st.d $r22, $a0, 24
     st.d $r23, $a0, 32
     st.d $r24, $a0, 40
@@ -19,7 +21,11 @@ switch:
     st.d $r29, $a0, 80
     st.d $r30, $a0, 88
     st.d $r31, $a0, 96
+    # 保留,因为代码里面要保存12个,所以第12个先填充0
     st.d $zero, $a0, 104
+
+    # 新增的保存CSR_PGDL 以及CSR_PGDH 否则任务切换之后页表还是使用老的页表
+    # 使用temp寄存器进行切换
     csrrd $t0, CSR_PGDL
     st.d $t0, $a0, 112
     csrrd $t0, CSR_PGDH
