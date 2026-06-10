@@ -176,6 +176,9 @@ fn clone_from_parts(
             return err(SyscallError::EINVAL);
         }
         let task = current_task().unwrap();
+        // Linux fork/clone first saves the caller's current FPU registers, then
+        // copies that snapshot into the child so user FP registers survive clone.
+        crate::arch::save_user_fp_state(&task);
         // 复制父线程的信号屏蔽字，子线程沿用直到自己 sigprocmask
         let parent_mask = {
             let inner = task.borrow_mut();
@@ -197,6 +200,7 @@ fn clone_from_parts(
             Ok(t) => Arc::new(t),
             Err(e) => return err(SyscallError::from(e)),
         };
+        new_task.inherit_fp_state_from(&task);
         // 为新线程挑选一个负载较轻的 hart 作为初始运行核
         new_task.set_cpu_id(select_hart_for_new_task());
 
@@ -480,28 +484,14 @@ fn clone_from_parts(
             Arc::strong_count(&task)
         );
     }
-    // 记录子是否会落在当前 hart，下面决定是否主动让出 CPU
-    let child_same_hart = task.get_cpu_id() == hart_id();
     // 将子任务推入调度队列；至此子才真正可被调度执行
     add_task(task);
     // 落入 fork 诊断统计（按 parent_pid 聚合，节流输出）
     record_fork_diag(process.getpid(), child_pid, flags, fork_elapsed_us);
 
-    // 进程型 fork 且非 vfork：若父子都是 CFS 公平类、又在同一 hart，
-    // 主动让出一次让新子先跑 exec/信号初始化，避免父在用户态飞奔
-    if !is_thread_like && (flags & CLONE_VFORK) == 0 {
-        let parent_fair =
-            sched_class(process.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
-        let child_fair =
-            sched_class(child.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair);
-        if parent_fair && child_fair && child_same_hart {
-            // Let a freshly forked fair child run promptly so it can finish
-            // exec/signal setup before the parent races ahead in user space.
-            // 让刚 fork 的公平类子尽快上 CPU，完成 exec/信号准备；
-            // 否则父进程在用户态先跑会引发可见的竞争
-            suspend_current_and_run_next();
-        }
-    }
+    // 普通 fork 不强制 child-first。Linux/CFS 只把 child 放入就绪队列，
+    // 是否抢占由调度器决定；这里主动让父进程让出会把 fork-heavy 程序
+    // 串行化，例如 mmapstress09 需要父进程先完成一批 fork 再设置 alarm。
 
     // CLONE_VFORK：父需阻塞直到子调用 execve 或退出；本实现以 wait_queue + 自检的方式模拟
     if (flags & CLONE_VFORK) != 0 {
