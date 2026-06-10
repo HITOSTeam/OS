@@ -139,10 +139,10 @@ pub(super) fn shared_file_page_cache_resize(dev: usize, ino: u32, file_size: usi
 
     let mut cache = SHARED_FILE_PAGE_CACHE.lock();
     // truncate 后 EOF 页尾清零，EOF 之后的缓存页必须丢弃，避免 shrink/grow 复用旧脏页。
-    if eof_off != 0
-        && let Some(frame) = cache.get(&shared_file_page_key(dev, ino, eof_page))
-    {
-        frame.ppn.get_bytes_array()[eof_off..PAGE_SIZE].fill(0);
+    if eof_off != 0 {
+        if let Some(frame) = cache.get(&shared_file_page_key(dev, ino, eof_page)) {
+            frame.ppn.get_bytes_array()[eof_off..PAGE_SIZE].fill(0);
+        }
     }
 
     let stale_keys = cache

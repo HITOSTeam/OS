@@ -66,7 +66,7 @@ fn write_pgdl(base: usize) {
     // SAFETY: `base` is a kernel-constructed page-table root physical address, and writing PGDL
     // is only valid in kernel mode. A bogus base would redirect low-half translations incorrectly.
     unsafe {
-        asm!("csrwr {}, 0x19", in(reg) base);
+        asm!("csrwr {}, 0x19", inout(reg) base => _);
     }
 }
 
@@ -75,7 +75,7 @@ fn write_pgdh(base: usize) {
     // SAFETY: `base` is the current root page-table base and this privileged CSR write updates
     // the high-half walker state. An invalid base would break kernel address translation.
     unsafe {
-        asm!("csrwr {}, 0x1a", in(reg) base);
+        asm!("csrwr {}, 0x1a", inout(reg) base => _);
     }
 }
 

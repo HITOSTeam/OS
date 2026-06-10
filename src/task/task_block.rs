@@ -189,6 +189,7 @@ pub struct TaskControlBlockInner {
     /// Number of timer ticks consumed in current SCHED_RR round.
     pub rr_ticks: usize,
     /// Best-effort per-thread CPU runtime used for *_CPUTIME clocks.
+    /// 每次时钟中断时候更新,
     pub cpu_time_ns: u64,
     /// Monotonic timestamp captured when the task most recently started running.
     pub runtime_start_ns: u64,
@@ -264,6 +265,7 @@ impl TaskControlBlock {
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
+                //创建应用的时候把他设置为trap_return,这样第一次switch的时候就会从trap_return进入
                 task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
                 task_status: TaskStatus::Ready,
                 exit_code: None,
