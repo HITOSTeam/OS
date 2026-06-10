@@ -157,6 +157,7 @@ pub struct TaskControlBlockInner {
     /// Number of timer ticks consumed in current SCHED_RR round.
     pub rr_ticks: usize,
     /// Best-effort per-thread CPU runtime used for *_CPUTIME clocks.
+    /// 每次时钟中断时候更新,
     pub cpu_time_ns: u64,
     /// Monotonic timestamp captured when the task most recently started running.
     pub runtime_start_ns: u64,

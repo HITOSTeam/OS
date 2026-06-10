@@ -12,6 +12,7 @@
     .globl alltraps_k
     .globl restore_k
     .globl sigreturn_trampoline
+    # loongarch指令都是4字节对齐
     .align 2
 alltraps:
     # Swap sp with SAVE0 (CSR 0x30): sp->TrapContext, SAVE0->user sp.
@@ -33,15 +34,21 @@ alltraps:
     csrrd $t2, 0x30
     st.d $t2, $sp, 3*8
     # Load kernel_tp, kernel_sp, trap_handler, kernel page table.
-    ld.d $t0, $sp, 37*8
+    # t开头的寄存器是temp,是caller saved
+    # 37是 kernel_tp
+    ld.d $t0, $sp, 37*8 
     ld.d $t1, $sp, 35*8
     ld.d $t2, $sp, 36*8
     ld.d $t3, $sp, 34*8
     slli.d $t3, $t3, 12
+    # 一个复制,进入内核态的时候,两个寄存器都写成内核页表
     add.d $t4, $t3, $r0
     # Switch to kernel page table so trap_handler/kstack are mapped.
+    # CSR 0x19 = PGDL
+    # CSR 0x1a = PGDH
     csrwr $t3, 0x19
     csrwr $t4, 0x1a
+    # 刷新TLB
     invtlb 0x3, $r0, $r0
     add.d $r2, $t0, $r0
     add.d $sp, $t1, $r0

@@ -44,6 +44,8 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
 static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 
 /// initiate heap allocator
+/// 这个部分初始化的是rust的动态分配内容,测试发现几乎就是bss段(还有一些别的全局变量啥的),
+/// 初始化之后rust的大部分和堆内存有关的数据结构都会从这里分配
 #[allow(dead_code)]
 pub fn init_heap() {
     unsafe {

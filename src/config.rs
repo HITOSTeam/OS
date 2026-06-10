@@ -13,7 +13,7 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32KB
 // bank, so an oversized static heap can push `.bss` past the end of usable
 // memory and fault during early `clear_bss()`.
 #[cfg(target_arch = "loongarch64")]
-pub const KERNEL_HEAP_SIZE: usize = 0x0800_0000; // 128 MiB
+pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
 #[cfg(not(target_arch = "loongarch64"))]
 pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
 pub const PAGE_SIZE: usize = 0x1000;

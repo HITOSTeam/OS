@@ -5,6 +5,7 @@ use crate::{
     config::clock_freq,
 };
 
+///默认一秒钟执行100个时钟中断
 const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
 
@@ -42,6 +43,7 @@ pub fn set_next_trigger() {
         // mismatches between rdtime and timer countdown sources.
         let mut delta = LOONGARCH_TIMER_DELTA.load(Ordering::Relaxed);
         if delta == 0 {
+            //默认给设置的值,delta表示是多少个时钟tick之后执行一个中断
             delta = clock_freq() / TICKS_PER_SEC;
             if delta == 0 {
                 delta = 4;
@@ -83,10 +85,15 @@ pub fn set_next_trigger() {
     }
 }
 
+///校准下一次的时钟中断间隔,把实际的处理时间(第一次和第二次处理时钟中断的时间差)和理论时间做比较
+///时钟只是在设置的时间把对应标志位设置为1,但设置为1之后cpu可能不会直接执行中断
+///如果实际间隔 dt 太大，说明 timer 来得太慢，就把 LOONGARCH_TIMER_DELTA 调小。
+///如果实际间隔 dt 太小，说明 timer 来得太快，就把 LOONGARCH_TIMER_DELTA 调大。
 #[cfg(target_arch = "loongarch64")]
 pub fn loongarch_record_timer_tick() {
-    let now = read_time();
-    let last = LOONGARCH_TIMER_LAST_TIME.swap(now, Ordering::Relaxed);
+    let now: usize = read_time();
+    //swap的返回值是LOONGARCH_TIMER_LAST_TIME的旧值
+    let last: usize = LOONGARCH_TIMER_LAST_TIME.swap(now, Ordering::Relaxed);
     if last == 0 {
         return;
     }

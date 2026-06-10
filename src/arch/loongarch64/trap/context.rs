@@ -13,12 +13,13 @@ pub struct TrapContext {
     pub sstatus: usize,
     /// ERA (stored in the same slot as sepc on RISC-V).
     pub sepc: usize,
-    /// Kernel page table token (unused for LoongArch but kept for compatibility).
+    /// Kernel page table token 记得读取之后要交换PGDL/PGDH：
     pub kernel_satp: usize,
     /// Kernel stack pointer.
     pub kernel_sp: usize,
-    /// Trap handler entry (unused for LoongArch but kept for compatibility).
-    pub trap_handler: usize,
+    /// Trap handler entry trap的返回地址,一般初始化为 trap_handler
+    /// 位于OS_Workspace/os/src/arch/loongarch64/trap/handler.rs
+    pub trap_handler: usize, 
     /// Kernel tp (hart id) saved when returning to user.
     pub kernel_tp: usize,
 }

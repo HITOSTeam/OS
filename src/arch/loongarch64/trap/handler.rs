@@ -185,15 +185,25 @@ pub fn trap_handler() {
         println!("[trap_handler#{}] hart={}", idx, hart);
     }
 
+    //从用户态上来的时候需要设置trap入口,不然等下容易死循环
     set_kernel_trap_entry();
 
+    //记录trap类型
     let estat = read_estat();
+    //
     let ecode = (estat >> ESTAT_ECODE_SHIFT) & ESTAT_ECODE_MASK;
     let badv = read_badv();
     let badi = read_badi();
 
+    /*
+    
+        ecode == 0              -> 中断类，当前主要处理 timer interrupt
+        ecode == ECODE_SYSCALL  -> syscall
+        其他 ecode              -> 用户异常，例如缺页、非法访问、权限错误、地址未对齐
+     */
     if ecode == 0 {
         if (estat & (1 << ESTAT_TIMER_BIT)) != 0 {
+            //清理对应的寄存器,否则返回用户态之后即使计时器没有到,还会继续触发时钟中断
             super::super::clear_timer_interrupt();
             crate::time::loongarch_record_timer_tick();
             set_next_trigger();
@@ -230,6 +240,7 @@ pub fn trap_handler() {
                 suspend_current_and_run_next();
             }
         } else {
+            //非时钟中断目前先panic 
             panic!(
                 "Unhandled interrupt: estat={:#x} badv={:#x} badi={:#x}",
                 estat, badv, badi

@@ -179,9 +179,11 @@ pub fn clear_timer_interrupt() {
         asm!("csrwr {}, 0x44", in(reg) 1usize);
     }
 }
-
+/// riscv 是设置绝对触发时间,设置某个tick处发生中断
+/// loongarch是设置倒数 delta 个tick之后产生时钟中断
 pub fn set_timer(timer: usize) {
-    // For LoongArch, TCFG holds a relative countdown value in bits [2..].
+    // For LoongArch, TCFG holds a relative countdown value in bits [2..].,
+    //至少4个tick之后执行一次时钟中断
     let delta = timer.max(4);
     let tcfg = (delta & TCFG_INITVAL_MASK) | TCFG_EN;
     // SAFETY: TCFG (CSR 0x41) write is valid in kernel mode; configures timer countdown.
