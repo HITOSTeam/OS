@@ -23,8 +23,8 @@ use crate::{
         shm_object_name, shm_remove,
     },
     mm::{
-        MapPermission, UserBuffer, read_user_value, translated_byte_buffer, translated_mutref,
-        try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
+        MapPermission, UserBuffer, translated_byte_buffer, translated_mutref, try_copy_from_user,
+        try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
         try_translated_byte_buffer, try_write_user_value,
     },
     syscall::process::{is_inode_currently_executed_locked, lock_executing_inodes},

@@ -1,19 +1,19 @@
 use super::{
     AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE, AT_SYMLINK_NOFOLLOW, AtPath,
     BTreeSet, CgroupFile, EXT4_ST_DEV, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
-    FALLOC_FL_SUPPORTED_MASK, FifoDuplexFile, File, KStat, NetSocketFile, OSInode, PID2PCB, Pipe,
-    ProcPseudoFile, ProcessControlBlock, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
-    RtcFile, Statx, String, SyscallError, TimeSpec, Vec, current_effective_uid_gid,
-    current_fsuid_gid, current_process, current_timespec, err, ext4_lock, fd_has_o_path,
-    file_lock_key_from_inode, fill_statfs, find_path_in_roots, flush_open_inode_views,
-    fsize_limit_allows, get_current_token, get_fd_file, get_inode_times, inode_mode_allows_uid_gid,
-    inode_rdev_for_mode, inode_visible_size, is_privileged_or_owner, kstat_from_fd,
-    kstat_from_file, maybe_signal_lease_break, open_pseudo, proc_magic_link_target_kstat,
-    proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync, punch_hole_keep_size,
-    read_user_cstring, read_user_value, require_fd_file, resolve_abs_path, resolve_at_inode,
+    FALLOC_FL_SUPPORTED_MASK, FS_APPEND_FL, FS_IMMUTABLE_FL, FifoDuplexFile, File, KStat,
+    NetSocketFile, OSInode, PID2PCB, Pipe, ProcPseudoFile, ProcessControlBlock, PseudoBlock,
+    PseudoDir, PseudoFile, PseudoShmFile, RtcFile, Statx, String, SyscallError, TimeSpec, Vec,
+    current_effective_uid_gid, current_fsuid_gid, current_process, current_timespec, err,
+    ext4_lock, fd_has_o_path, file_lock_key_from_inode, fill_statfs, find_path_in_roots,
+    flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file, get_inode_times,
+    inode_fs_flags, inode_mode_allows_uid_gid, inode_rdev_for_mode, inode_visible_size,
+    is_privileged_or_owner, kstat_from_fd, kstat_from_file, maybe_signal_lease_break, open_pseudo,
+    proc_magic_link_target_kstat, proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync,
+    punch_hole_keep_size, read_user_cstring, require_fd_file, resolve_abs_path, resolve_at_inode,
     resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, statfs_mount_flags_for_abs,
     statx_from_kstat, sync_all, touch_inode_mtime_ctime_now, truncate_regular_inode,
-    try_copy_to_user, try_write_user_value, update_current_inode_mmaps_size,
+    try_copy_to_user, try_read_user_value, try_write_user_value, update_current_inode_mmaps_size,
     update_current_os_inode_mmaps_size, write_zeros_range,
 };
 
@@ -293,67 +293,174 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
     }
 }
 
+#[derive(Clone, Copy)]
+enum UtimensSpec {
+    Touch,
+    Times(TimeSpec, TimeSpec),
+}
+
+fn read_utimens_spec(token: usize, times_ptr: usize) -> Result<Option<UtimensSpec>, isize> {
+    if times_ptr == 0 {
+        return Ok(Some(UtimensSpec::Touch));
+    }
+    let ts0 = try_read_user_value(token, times_ptr as *const TimeSpec)
+        .ok_or_else(|| err(SyscallError::EFAULT))?;
+    let ts1 = try_read_user_value(
+        token,
+        (times_ptr + core::mem::size_of::<TimeSpec>()) as *const TimeSpec,
+    )
+    .ok_or_else(|| err(SyscallError::EFAULT))?;
+    if ts0.nsec == super::UTIME_OMIT && ts1.nsec == super::UTIME_OMIT {
+        return Ok(None);
+    }
+    if ts0.nsec == super::UTIME_NOW && ts1.nsec == super::UTIME_NOW {
+        return Ok(Some(UtimensSpec::Touch));
+    }
+    Ok(Some(UtimensSpec::Times(ts0, ts1)))
+}
+
+fn resolve_utimens_spec(
+    spec: UtimensSpec,
+    now: (i64, i64),
+) -> Result<(Option<(i64, i64)>, Option<(i64, i64)>, bool), isize> {
+    match spec {
+        UtimensSpec::Touch => Ok((Some(now), Some(now), true)),
+        UtimensSpec::Times(ts0, ts1) => {
+            let atime = resolve_utime(ts0, now)?;
+            let mtime = resolve_utime(ts1, now)?;
+            Ok((atime, mtime, false))
+        }
+    }
+}
+
+fn check_utimens_permission(
+    inode: &alloc::sync::Arc<ext4_fs::Inode>,
+    fsuid: u32,
+    fsgid: u32,
+    euid: u32,
+    touch: bool,
+) -> Result<(), isize> {
+    let fs_flags = inode_fs_flags(inode.inode_num() as u64);
+    if touch {
+        if (fs_flags & FS_IMMUTABLE_FL) != 0 {
+            return Err(err(SyscallError::EPERM));
+        }
+        if !is_privileged_or_owner(euid, inode)
+            && !inode_mode_allows_uid_gid(inode, 2, fsuid, fsgid)
+        {
+            return Err(err(SyscallError::EACCES));
+        }
+    } else {
+        if (fs_flags & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0 {
+            return Err(err(SyscallError::EPERM));
+        }
+        if !is_privileged_or_owner(euid, inode) {
+            return Err(err(SyscallError::EPERM));
+        }
+    }
+    Ok(())
+}
+
+fn apply_utimens_to_inode(inode: &alloc::sync::Arc<ext4_fs::Inode>, spec: UtimensSpec) -> isize {
+    let now = current_timespec();
+    let (atime, mtime, _touch) = match resolve_utimens_spec(spec, now) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ino = inode.inode_num() as u64;
+    let mut cur = get_inode_times(ino);
+    if let Some((sec, nsec)) = atime {
+        cur.atime_sec = sec;
+        cur.atime_nsec = nsec;
+    }
+    if let Some((sec, nsec)) = mtime {
+        cur.mtime_sec = sec;
+        cur.mtime_nsec = nsec;
+    }
+    if atime.is_some() || mtime.is_some() {
+        cur.ctime_sec = now.0;
+        cur.ctime_nsec = now.1;
+    }
+    set_inode_times(ino, cur);
+    0
+}
+
 /// Updates inode timestamps by path or fd, including Linux `UTIME_*` semantics.
 pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: usize) -> isize {
+    let token = get_current_token();
+    let spec = match read_utimens_spec(token, _times) {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return 0,
+        Err(e) => return e,
+    };
+
     // `futimens` passes a null pathname and uses dirfd as the target fd.
-    if pathname == 0 {
-        if dirfd == AT_FDCWD {
-            return err(SyscallError::EFAULT);
+    if pathname == 0 && dirfd != AT_FDCWD {
+        if _flags != 0 {
+            return err(SyscallError::EINVAL);
         }
         if dirfd < 0 {
             return err(SyscallError::EBADF);
         }
         let file = require_fd_file!(dirfd);
         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            let inode = os_inode.ext4_inode();
+            let now = current_timespec();
+            let (_atime, _mtime, touch) = match resolve_utimens_spec(spec, now) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
             if os_inode.readonly_fs() {
                 return err(SyscallError::EROFS);
             }
-            let inode = os_inode.ext4_inode();
-            let ino = inode.inode_num() as u64;
-            let now = current_timespec();
-            let (atime, mtime) = if _times == 0 {
-                (Some(now), Some(now))
-            } else {
-                let token = get_current_token();
-                let ts0 = read_user_value(token, _times as *const TimeSpec);
-                let ts1 = read_user_value(
-                    token,
-                    (_times + core::mem::size_of::<TimeSpec>()) as *const TimeSpec,
-                );
-                let at = match resolve_utime(ts0, now) {
-                    Ok(v) => v,
-                    Err(e) => return e,
-                };
-                let mt = match resolve_utime(ts1, now) {
-                    Ok(v) => v,
-                    Err(e) => return e,
-                };
-                (at, mt)
-            };
-            let mut cur = get_inode_times(ino);
-            if let Some((sec, nsec)) = atime {
-                cur.atime_sec = sec;
-                cur.atime_nsec = nsec;
+            let (fsuid, fsgid) = current_fsuid_gid();
+            let (euid, _egid) = current_effective_uid_gid();
+            if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
+                return e;
             }
-            if let Some((sec, nsec)) = mtime {
-                cur.mtime_sec = sec;
-                cur.mtime_nsec = nsec;
-            }
-            if atime.is_some() || mtime.is_some() {
-                cur.ctime_sec = now.0;
-                cur.ctime_nsec = now.1;
-            }
-            set_inode_times(ino, cur);
+            return apply_utimens_to_inode(&inode, spec);
         }
         return 0;
     }
-    let token = get_current_token();
-    let path = match read_user_cstring(token, pathname) {
-        Ok(v) => v,
-        Err(e) => return e,
+
+    if (_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 {
+        return err(SyscallError::EINVAL);
+    }
+
+    let path = if pathname == 0 {
+        return err(SyscallError::EFAULT);
+    } else {
+        match read_user_cstring(token, pathname) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
     };
     if path.is_empty() {
-        return err(SyscallError::ENOENT);
+        if (_flags & AT_EMPTY_PATH) == 0 {
+            return err(SyscallError::ENOENT);
+        }
+        if dirfd < 0 {
+            return err(SyscallError::EBADF);
+        }
+        let file = require_fd_file!(dirfd);
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            let inode = os_inode.ext4_inode();
+            let now = current_timespec();
+            let (_atime, _mtime, touch) = match resolve_utimens_spec(spec, now) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if os_inode.readonly_fs() {
+                return err(SyscallError::EROFS);
+            }
+            let (fsuid, fsgid) = current_fsuid_gid();
+            let (euid, _egid) = current_effective_uid_gid();
+            if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
+                return e;
+            }
+            return apply_utimens_to_inode(&inode, spec);
+        }
+        return 0;
     }
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -386,43 +493,24 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let (euid, _egid) = current_effective_uid_gid();
+    let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
     let _ext4_guard = ext4_lock();
-    let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let now = current_timespec();
+    let (atime, mtime, touch) = match resolve_utimens_spec(spec, now) {
         Ok(v) => v,
         Err(e) => return e,
     };
     if rofs_for_path(dirfd, &path) {
         return err(SyscallError::EROFS);
     }
-    if _times == 0 {
-        if !is_privileged_or_owner(euid, &inode)
-            && !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid)
-        {
-            return err(SyscallError::EACCES);
-        }
-    } else if !is_privileged_or_owner(euid, &inode) {
-        return err(SyscallError::EPERM);
+    if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
+        return e;
     }
     let ino = inode.inode_num() as u64;
-    let now = current_timespec();
-    let (atime, mtime) = if _times == 0 {
-        (Some(now), Some(now))
-    } else {
-        let ts0 = read_user_value(token, _times as *const TimeSpec);
-        let ts1 = read_user_value(
-            token,
-            (_times + core::mem::size_of::<TimeSpec>()) as *const TimeSpec,
-        );
-        let at = match resolve_utime(ts0, now) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let mt = match resolve_utime(ts1, now) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        (at, mt)
-    };
     let mut cur = get_inode_times(ino);
     if let Some((sec, nsec)) = atime {
         cur.atime_sec = sec;

@@ -116,10 +116,13 @@ pub(super) fn enqueue_waiter_once(
 fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     // Main-thread resources are already detached in exit path; this aggressively
     // drops lingering task Arcs so kernel stacks are reclaimed on reap.
-    let cpu_ns = crate::task::runtime::process_cpu_time_ns_at(
-        child,
-        crate::task::runtime::monotonic_time_ns(),
-    );
+    let (own_cpu_ns, child_cpu_ns) = {
+        let inner = child.borrow_mut();
+        (inner.cpu_time_ns, inner.child_cpu_time_ns)
+    };
+    // Linux accumulates the child's thread-group CPU time plus the child's
+    // already waited descendants into the parent at reap time.
+    let cpu_ns = own_cpu_ns.saturating_add(child_cpu_ns);
     let tasks = {
         let mut inner = child.borrow_mut();
         core::mem::take(&mut inner.tasks)
