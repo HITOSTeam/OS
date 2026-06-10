@@ -5,176 +5,112 @@ app_0_name:
 .section .rodata
 .align 3
 app_1_name:
-    .asciz "cat"
-.section .rodata
-.align 3
-app_2_name:
-    .asciz "init_proc"
-.section .rodata
-.align 3
-app_3_name:
-    .asciz "ls"
-.section .rodata
-.align 3
-app_4_name:
-    .asciz "testcode_runner"
-.section .rodata
-.align 3
-app_5_name:
     .asciz "basename"
 .section .rodata
 .align 3
-app_6_name:
-    .asciz "submit_script"
+app_2_name:
+    .asciz "cat"
 .section .rodata
 .align 3
-app_7_name:
-    .asciz "poweroff"
-.section .rodata
-.align 3
-app_8_name:
-    .asciz "ifconfig"
-.section .rodata
-.align 3
-app_9_name:
-    .asciz "ps"
-.section .rodata
-.align 3
-app_10_name:
-    .asciz "nested_epoll_smoke"
-.section .rodata
-.align 3
-app_11_name:
-    .asciz "epoll_ctl_wakeup_smoke"
-.section .rodata
-.align 3
-app_12_name:
-    .asciz "eventfd_epoll_smoke"
-.section .rodata
-.align 3
-app_13_name:
-    .asciz "timerfd_epoll_smoke"
-.section .rodata
-.align 3
-app_14_name:
-    .asciz "mq_epoll_smoke"
-.section .rodata
-.align 3
-app_15_name:
-    .asciz "mq_unlink_epoll_smoke"
-.section .rodata
-.align 3
-app_16_name:
-    .asciz "mq_notify_signal_smoke"
-.section .rodata
-.align 3
-app_17_name:
-    .asciz "nested_epoll_ctl_wakeup_smoke"
-.section .rodata
-.align 3
-app_18_name:
-    .asciz "nested_epoll_oneshot_smoke"
-.section .rodata
-.align 3
-app_19_name:
-    .asciz "nested_epoll_ctl_del_smoke"
-.section .rodata
-.align 3
-app_20_name:
-    .asciz "nested_epoll_et_smoke"
-.section .rodata
-.align 3
-app_21_name:
-    .asciz "nested_epoll_et_maxevents_smoke"
-.section .rodata
-.align 3
-app_22_name:
-    .asciz "nested_epoll_parent_oneshot_smoke"
-.section .rodata
-.align 3
-app_23_name:
-    .asciz "proc_magic_links_smoke"
-.section .rodata
-.align 3
-app_24_name:
-    .asciz "mount_namespace_smoke"
-.section .rodata
-.align 3
-app_25_name:
-    .asciz "umount_once"
-.section .rodata
-.align 3
-app_26_name:
+app_3_name:
     .asciz "dup3_lock_cleanup_smoke"
 .section .rodata
 .align 3
-app_27_name:
-    .asciz "file_mmap_lazy_fault_smoke"
+app_4_name:
+    .asciz "epoll_ctl_wakeup_smoke"
 .section .rodata
 .align 3
-app_28_name:
-    .asciz "proc_maps_stack_smoke"
+app_5_name:
+    .asciz "eventfd_epoll_smoke"
 .section .rodata
 .align 3
-app_29_name:
-    .asciz "clone_vm_mmap_smoke"
+app_6_name:
+    .asciz "ifconfig"
 .section .rodata
 .align 3
-app_30_name:
-    .asciz "memfd_mremap_shared_smoke"
+app_7_name:
+    .asciz "init_proc"
 .section .rodata
 .align 3
-app_31_name:
-    .asciz "sysv_shm_mremap_smoke"
+app_8_name:
+    .asciz "ls"
 .section .rodata
 .align 3
-app_32_name:
-    .asciz "cow_mprotect_smoke"
+app_9_name:
+    .asciz "mount_namespace_smoke"
 .section .rodata
 .align 3
-app_33_name:
-    .asciz "mmap_placement_smoke"
+app_10_name:
+    .asciz "mq_epoll_smoke"
 .section .rodata
 .align 3
-app_34_name:
-    .asciz "growsdown_guard_smoke"
+app_11_name:
+    .asciz "mq_notify_signal_smoke"
 .section .rodata
 .align 3
-app_35_name:
-    .asciz "clone_vm_sysv_shm_smoke"
+app_12_name:
+    .asciz "mq_unlink_epoll_smoke"
 .section .rodata
 .align 3
-app_36_name:
-    .asciz "stack_madvise_dontneed_smoke"
+app_13_name:
+    .asciz "nested_epoll_ctl_del_smoke"
 .section .rodata
 .align 3
-app_37_name:
-    .asciz "private_file_madvise_dontneed_smoke"
+app_14_name:
+    .asciz "nested_epoll_ctl_wakeup_smoke"
 .section .rodata
 .align 3
-app_38_name:
-    .asciz "shared_file_alias_smoke"
+app_15_name:
+    .asciz "nested_epoll_et_maxevents_smoke"
 .section .rodata
 .align 3
-app_39_name:
-    .asciz "shared_file_cross_mm_smoke"
+app_16_name:
+    .asciz "nested_epoll_et_smoke"
 .section .rodata
 .align 3
-app_40_name:
-    .asciz "shared_file_kernel_write_smoke"
+app_17_name:
+    .asciz "nested_epoll_oneshot_smoke"
 .section .rodata
 .align 3
-app_41_name:
-    .asciz "shared_file_fault_cache_smoke"
+app_18_name:
+    .asciz "nested_epoll_parent_oneshot_smoke"
 .section .rodata
 .align 3
-app_42_name:
-    .asciz "shared_file_truncate_cache_smoke"
+app_19_name:
+    .asciz "nested_epoll_smoke"
+.section .rodata
+.align 3
+app_20_name:
+    .asciz "poweroff"
+.section .rodata
+.align 3
+app_21_name:
+    .asciz "proc_magic_links_smoke"
+.section .rodata
+.align 3
+app_22_name:
+    .asciz "ps"
+.section .rodata
+.align 3
+app_23_name:
+    .asciz "submit_script"
+.section .rodata
+.align 3
+app_24_name:
+    .asciz "testcode_runner"
+.section .rodata
+.align 3
+app_25_name:
+    .asciz "timerfd_epoll_smoke"
+.section .rodata
+.align 3
+app_26_name:
+    .asciz "umount_once"
 .section .rodata
 .align 3
     .global num_user_apps
 num_user_apps:
-    .quad 43
+    .quad 27
     .quad app_0_name
     .quad app_1_name
     .quad app_2_name
@@ -202,19 +138,3 @@ num_user_apps:
     .quad app_24_name
     .quad app_25_name
     .quad app_26_name
-    .quad app_27_name
-    .quad app_28_name
-    .quad app_29_name
-    .quad app_30_name
-    .quad app_31_name
-    .quad app_32_name
-    .quad app_33_name
-    .quad app_34_name
-    .quad app_35_name
-    .quad app_36_name
-    .quad app_37_name
-    .quad app_38_name
-    .quad app_39_name
-    .quad app_40_name
-    .quad app_41_name
-    .quad app_42_name
