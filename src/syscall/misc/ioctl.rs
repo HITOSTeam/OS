@@ -90,9 +90,11 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const FS_APPEND_FL: u32 = 0x0000_0020;
     const FS_NODUMP_FL: u32 = 0x0000_0040;
     const SIOCATMARK: usize = 0x8905;
+    const SIOCGIFNAME: usize = 0x8910;
     const SIOCGIFCONF: usize = 0x8912;
     const SIOCGIFFLAGS: usize = 0x8913;
     const SIOCSIFFLAGS: usize = 0x8914;
+    const SIOCGIFINDEX: usize = 0x8933;
     const IFF_UP: i16 = 0x1;
     const IFF_LOOPBACK: i16 = 0x8;
     const IFF_RUNNING: i16 = 0x40;
@@ -481,7 +483,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         }
     }
 
-    if let Some(sock) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
+    if crate::syscall::net::is_socket_file(file.as_ref()) {
+        let net_sock = file.as_any().downcast_ref::<crate::fs::NetSocketFile>();
         #[repr(C)]
         #[derive(Clone, Copy)]
         struct Ifconf {
@@ -501,12 +504,37 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
             ifr_name: [u8; 16],
             ifr_addr: SockAddr,
         }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct IfreqIndex {
+            ifr_name: [u8; 16],
+            ifr_ifindex: i32,
+        }
+
+        fn ifreq_lookup_index(ifr_name: &[u8; 16]) -> Option<i32> {
+            let mut end = 0usize;
+            while end < ifr_name.len() && ifr_name[end] != 0 && ifr_name[end] != b':' {
+                end += 1;
+            }
+            match &ifr_name[..end] {
+                b"lo" => Some(1),
+                b"eth0" => Some(2),
+                _ => None,
+            }
+        }
+
+        fn write_ifreq_name(dst: &mut [u8; 16], name: &[u8]) {
+            dst.fill(0);
+            let copy_len = core::cmp::min(dst.len() - 1, name.len());
+            dst[..copy_len].copy_from_slice(&name[..copy_len]);
+        }
 
         return match request {
             SIOCATMARK => {
                 if _argp == 0 {
                     err(SyscallError::EFAULT)
-                } else if sock.kind() == crate::fs::NetSocketKind::Udp {
+                } else if net_sock.is_some_and(|sock| sock.kind() == crate::fs::NetSocketKind::Udp)
+                {
                     ENOTTY
                 } else if try_write_user_value(token, _argp as *mut i32, &0i32).is_err() {
                     err(SyscallError::EFAULT)
@@ -561,6 +589,39 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                         0
                     }
                 }
+            }
+            SIOCGIFINDEX => {
+                if _argp == 0 {
+                    return err(SyscallError::EFAULT);
+                }
+                let Some(mut ifr) = try_read_user_value(token, _argp as *const IfreqIndex) else {
+                    return err(SyscallError::EFAULT);
+                };
+                let Some(index) = ifreq_lookup_index(&ifr.ifr_name) else {
+                    return err(SyscallError::ENODEV);
+                };
+                ifr.ifr_ifindex = index;
+                if try_write_user_value(token, _argp as *mut IfreqIndex, &ifr).is_err() {
+                    return err(SyscallError::EFAULT);
+                }
+                0
+            }
+            SIOCGIFNAME => {
+                if _argp == 0 {
+                    return err(SyscallError::EFAULT);
+                }
+                let Some(mut ifr) = try_read_user_value(token, _argp as *const IfreqIndex) else {
+                    return err(SyscallError::EFAULT);
+                };
+                match ifr.ifr_ifindex {
+                    1 => write_ifreq_name(&mut ifr.ifr_name, b"lo"),
+                    2 => write_ifreq_name(&mut ifr.ifr_name, b"eth0"),
+                    _ => return err(SyscallError::ENXIO),
+                }
+                if try_write_user_value(token, _argp as *mut IfreqIndex, &ifr).is_err() {
+                    return err(SyscallError::EFAULT);
+                }
+                0
             }
             SIOCSIFFLAGS => {
                 if _argp == 0 {

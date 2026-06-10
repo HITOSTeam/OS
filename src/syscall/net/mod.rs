@@ -35,6 +35,18 @@ use crate::task::manager::pid2process;
 use crate::task::processor::current_files;
 use crate::trap::get_current_token;
 
+pub(crate) fn is_socket_file(file: &(dyn File + Send + Sync)) -> bool {
+    file.as_any()
+        .downcast_ref::<crate::fs::NetSocketFile>()
+        .is_some()
+        || file
+            .as_any()
+            .downcast_ref::<crate::fs::SocketPairEnd>()
+            .is_some()
+        || file.as_any().downcast_ref::<UnixSocketFile>().is_some()
+        || file.as_any().downcast_ref::<NetlinkSocketFile>().is_some()
+}
+
 // ── 地址族（AF_*,Address family）常量，对应 Linux <bits/socket.h> ──────────────────────────
 /// unspecified
 pub(super) const AF_UNSPEC: u16 = 0;
