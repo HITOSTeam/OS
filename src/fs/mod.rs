@@ -1,20 +1,26 @@
 //! File system in os
-mod cgroupfs;
-mod dummy;
-mod eventfd;
-mod inode;
-mod mountns;
-mod namespace_file;
-mod net_socket;
-mod pidfd;
-mod pipe;
-mod procfs;
-mod pseudo;
-mod socketpair;
-mod stdio;
-mod timerfd;
-mod tty;
-mod userfaultfd;
+//!
+//! 本模块是内核文件系统层的聚合入口：对外统一暴露 `File` trait 与各类文件实现，
+//! 负责伪文件系统（/proc、/sys、/dev、cgroup 等）的按路径分发，以及 poll/epoll
+//! 就绪等待队列等通用机制。真实数据落盘走 ext4（见 `inode` 子模块），其余多为内存态伪文件。
+
+// ---- 各类文件实现与文件系统子模块 ----
+mod cgroupfs; // cgroup v2 伪文件系统
+mod dummy; // 占位/哑文件
+mod eventfd; // eventfd
+mod inode; // ext4 真实文件 inode 与打开逻辑
+mod mountns; // 挂载命名空间
+mod namespace_file; // /proc/[pid]/ns/* 命名空间文件
+mod net_socket; // 网络 socket 文件
+mod pidfd; // pidfd
+mod pipe; // 匿名/命名管道
+mod procfs; // /proc 伪文件系统
+mod pseudo; // 通用伪文件/伪目录（/sys、/dev 等）
+mod socketpair; // socketpair 两端
+mod stdio; // 标准输入输出
+mod timerfd; // timerfd
+mod tty; // tty / pty
+mod userfaultfd; // userfaultfd
 use crate::mm::UserBuffer;
 use crate::task::{
     manager::wakeup_task,
@@ -29,12 +35,20 @@ use alloc::{
 };
 use core::any::Any;
 
+// ---- poll/select/epoll 就绪事件位（对应 Linux <poll.h> 的 POLL* 常量）----
+/// 有数据可读。
 pub(crate) const POLLIN: i16 = 0x0001;
+/// 有紧急（带外）数据可读。
 pub(crate) const POLLPRI: i16 = 0x0002;
+/// 可写而不阻塞。
 pub(crate) const POLLOUT: i16 = 0x0004;
+/// 发生错误条件（始终被 poll 返回，无需在 events 中请求）。
 pub(crate) const POLLERR: i16 = 0x0008;
+/// 对端挂断/连接关闭。
 pub(crate) const POLLHUP: i16 = 0x0010;
+/// 传入的 fd 非法（始终被返回）。
 pub(crate) const POLLNVAL: i16 = 0x0020;
+/// 对端关闭了写方向（半关闭）。
 pub(crate) const POLLRDHUP: i16 = 0x2000;
 
 /// File trait
@@ -68,6 +82,7 @@ pub trait File: Send + Sync {
     fn register_poll_waiter(&self, _task: &Arc<TaskControlBlock>) -> bool {
         false
     }
+    /// 向下转型支持：返回 `&dyn Any`，便于按具体文件类型 downcast。
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -139,12 +154,15 @@ impl PollWaitQueue {
     }
 }
 
+/// 批量唤醒一组任务（通常配合 `PollWaitQueue::take_wakeups` 使用）。
 pub(crate) fn wake_tasks(tasks: Vec<Arc<TaskControlBlock>>) {
     for task in tasks {
         wakeup_task(task);
     }
 }
 
+/// 从绝对路径中解析 POSIX 共享内存对象名。
+/// 仅接受形如 `/dev/shm/<name>` 的单层路径（name 非空且不含 `/`），否则返回 None。
 pub(crate) fn shm_object_name(abs: &str) -> Option<&str> {
     // Only accept `/dev/shm/<name>` (single path component).
     let rest = abs.strip_prefix("/dev/shm/")?;
@@ -155,6 +173,8 @@ pub(crate) fn shm_object_name(abs: &str) -> Option<&str> {
     Some(name)
 }
 
+/// 判断某绝对路径是否落在内核内置的伪文件系统命名空间下（/sys、/dev、/proc/sys）。
+/// 这些路径由 `open_pseudo` 提供，不走真实 ext4。
 pub(crate) fn is_builtin_pseudo_path(abs: &str) -> bool {
     abs == "/sys"
         || abs.starts_with("/sys/")
@@ -162,20 +182,26 @@ pub(crate) fn is_builtin_pseudo_path(abs: &str) -> bool {
         || abs.starts_with("/dev/")
         || abs == "/proc/sys"
         || abs.starts_with("/proc/sys/")
-        || abs == "/etc"
-        || abs.starts_with("/etc/")
 }
 
+/// 把内核内部的绝对路径翻译成当前进程挂载命名空间下用户可见的显示路径。
 pub(crate) fn current_mount_display_abs(abs: &str) -> String {
     let ns = current_process().mount_namespace();
     let state = ns.lock();
     state.display_mount_abs(abs)
 }
 
+/// 根据 inode 的路径提示反查其逻辑路径，并转换为当前挂载命名空间下的可见路径。
 pub(crate) fn inode_logical_path(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
     inode::inode_path_hint(inode).map(|path| current_mount_display_abs(&path))
 }
 
+/// 伪文件系统的按路径打开分发器。
+///
+/// 依次尝试 cgroup、procfs，然后按固定路径表匹配 `/sys`、`/dev`、`/sys/block`、
+/// `/sys/devices/...` 等伪目录/伪文件，以及 `/dev/{null,zero,urandom,ptmx,tty,...}`
+/// 和 `/dev/shm/<name>` 共享内存对象。命中则返回对应的 `File` 实现，未命中返回 None
+/// （交由上层走真实文件系统）。
 pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     if let Some(node) = cgroupfs::open_cgroup_pseudo(path) {
         return Some(node);
@@ -372,42 +398,6 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         ];
         return Some(Arc::new(pseudo::PseudoDir::new("/dev/misc", entries)));
     }
-    if path == "/etc" || path == "/etc/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("passwd"),
-                ino: 2,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("group"),
-                ino: 3,
-                dtype: 8,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/etc", entries)));
-    }
-    if path == "/etc/passwd" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static(
-            "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:\n",
-        )));
-    }
-    if path == "/etc/group" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static(
-            "root:x:0:\ndaemon:x:1:\nusers:x:100:\nnobody:x:65534:\nnogroup:x:65534:\n",
-        )));
-    }
-
     if path == "/sys/block" || path == "/sys/block/" {
         let entries = alloc::vec![
             pseudo::PseudoDirent {
@@ -667,6 +657,7 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     None
 }
 
+// ---- 子模块的对外重导出（汇总各文件系统/文件类型供 crate 其余部分使用）----
 pub(crate) use cgroupfs::{
     CgroupAttachTarget, cgroup_attach_process_to_target, cgroup_clone_into_target_from_file,
 };
