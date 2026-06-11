@@ -19,12 +19,12 @@ use crate::trap::get_current_token;
 use super::abi::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT,
     IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, SEM_A, SEM_INFO, SEM_R, SEM_STAT, SEM_STAT_ANY,
-    SEM_UNDO, SEMVMX, SETALL, SETVAL, SemBuf, SemInfoUser, SemTimeSpecUser, SemidDsUser,
+    SEM_UNDO, SEMAEM, SEMVMX, SETALL, SETVAL, SemBuf, SemInfoUser, SemTimeSpecUser, SemidDsUser,
 };
 use super::common::{
-    IpcPermKernel, add_waiter_once, check_ipc_access, current_cred, current_ipc_namespace_id,
-    drain_live_waiters, has_pending_unmasked_signal, is_owner_or_root, now_secs,
-    retain_blocked_waiters,
+    IpcPermKernel, add_waiter_once, check_ipc_access, count_blocked_waiters, current_cred,
+    current_ipc_namespace_id, drain_live_waiters, has_pending_unmasked_signal, is_owner_or_root,
+    now_secs,
 };
 use super::sysctl::runtime_sem_limits;
 
@@ -193,12 +193,37 @@ fn clear_undo_for_set(ipc_ns_id: usize, semid: usize) {
     });
 }
 
-fn record_sem_undo(pid: usize, ipc_ns_id: usize, semid: usize, deltas: &[i32]) {
+fn record_sem_undo(
+    pid: usize,
+    ipc_ns_id: usize,
+    semid: usize,
+    deltas: &[i32],
+) -> Result<(), isize> {
     if deltas.iter().all(|delta| *delta == 0) {
-        return;
+        return Ok(());
     }
     let mut undo = SEM_UNDOS.lock();
     let entries = undo.entry(pid).or_default();
+
+    for (semnum, delta) in deltas.iter().copied().enumerate() {
+        if delta == 0 {
+            continue;
+        }
+        let current = entries
+            .iter()
+            .find(|entry| {
+                entry.ipc_ns_id == ipc_ns_id && entry.semid == semid && entry.semnum == semnum
+            })
+            .map(|entry| entry.adj)
+            .unwrap_or(0);
+        let Some(next) = current.checked_add(delta) else {
+            return Err(err(SyscallError::ERANGE));
+        };
+        if !(-SEMAEM..=SEMAEM).contains(&next) {
+            return Err(err(SyscallError::ERANGE));
+        }
+    }
+
     for (semnum, delta) in deltas.iter().copied().enumerate() {
         if delta == 0 {
             continue;
@@ -206,7 +231,7 @@ fn record_sem_undo(pid: usize, ipc_ns_id: usize, semid: usize, deltas: &[i32]) {
         if let Some(entry) = entries.iter_mut().find(|entry| {
             entry.ipc_ns_id == ipc_ns_id && entry.semid == semid && entry.semnum == semnum
         }) {
-            entry.adj = entry.adj.saturating_add(delta);
+            entry.adj += delta;
         } else {
             entries.push(SemUndoEntry {
                 ipc_ns_id,
@@ -220,6 +245,7 @@ fn record_sem_undo(pid: usize, ipc_ns_id: usize, semid: usize, deltas: &[i32]) {
     if entries.is_empty() {
         undo.remove(&pid);
     }
+    Ok(())
 }
 
 /// Apply and forget all SEM_UNDO adjustments owned by a process.
@@ -351,12 +377,16 @@ pub fn syscall_semget(key: usize, nsems: usize, semflg: usize) -> isize {
 /// IPC_STAT/IPC_SET/IPC_RMID，以及对单个/全部信号量值的操作
 /// GETVAL/SETVAL/GETALL/SETALL/GETPID/GETNCNT/GETZCNT。
 pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> isize {
+    // 调用者凭据用于权限检查；token 用于读写用户态 semid_ds/seminfo/value 数组。
     let cred = current_cred();
     let token = get_current_token();
+    // SysV IPC 对象按 IPC namespace 隔离，同一个 semid 只在当前 namespace 内解释。
     let ipc_ns_id = current_ipc_namespace_id();
 
     match cmd {
         IPC_INFO | SEM_INFO => {
+            // IPC_INFO / SEM_INFO 不针对具体 semid。返回值是当前最大内部 id，
+            // 供用户态从 0..highest_index 逐个尝试 SEM_STAT/SEM_STAT_ANY。
             let mut managers = SEM_MANAGERS.lock();
             let mgr = managers.entry(ipc_ns_id).or_default();
             let highest_index = mgr.sets.keys().next_back().copied().unwrap_or(0);
@@ -365,6 +395,8 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
                 .sets
                 .values()
                 .fold(0usize, |acc, set| acc.saturating_add(set.sems.len()));
+            // Linux 复用 seminfo：IPC_INFO 返回限制常量，SEM_INFO 的 semusz/semaem
+            // 返回运行时占用统计。
             let info = SemInfoUser {
                 semmni: semmni as i32,
                 semmns: semmns as i32,
@@ -374,7 +406,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
                 semaem: if cmd == SEM_INFO {
                     total_sems as i32
                 } else {
-                    SEMVMX
+                    SEMAEM
                 },
                 semvmx: SEMVMX,
                 ..SemInfoUser::default()
@@ -390,6 +422,8 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
     let mut managers = SEM_MANAGERS.lock();
     let mgr = managers.entry(ipc_ns_id).or_default();
     if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
+        // SEM_STAT/SEM_STAT_ANY 按当前内部 id 直查对象；SEM_STAT_ANY 跳过读权限检查。
+        // id 分配不带 sequence bits，这与 IPC_INFO 返回 highest id 的遍历约定一致。
         let Some(set) = mgr.sets.get(&semid) else {
             return err(SyscallError::EINVAL);
         };
@@ -409,10 +443,13 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
 
     match cmd {
         IPC_RMID => {
+            // 删除集合需要属主/创建者或 root。删除后唤醒所有 semop 等待者，
+            // 它们重试时会因 waited=true 返回 EIDRM。
             if !is_owner_or_root(&set.perm, &cred) {
                 return err(SyscallError::EPERM);
             }
             let wake = mgr.remove_set(semid);
+            // Linux 在 IPC_RMID 时丢弃该集合相关的所有 semadj。
             clear_undo_for_set(ipc_ns_id, semid);
             drop(managers);
             for task in wake {
@@ -421,6 +458,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             0
         }
         IPC_STAT => {
+            // 读取 semid_ds 需要读权限，失败优先返回 EACCES。
             if !check_ipc_access(&set.perm, SEM_R, &cred) {
                 return err(SyscallError::EACCES);
             }
@@ -431,6 +469,7 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             0
         }
         IPC_SET => {
+            // 修改属主/权限仍使用 SysV IPC 的 owner/root 规则，不按 SEM_A 位授权。
             if !is_owner_or_root(&set.perm, &cred) {
                 return err(SyscallError::EPERM);
             }
@@ -444,8 +483,9 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             0
         }
         GETALL => {
-            if semnum > set.sems.len() {
-                return err(SyscallError::EINVAL);
+            // GETALL 忽略 semnum；Linux 只要求集合读权限，然后拷出全部值。
+            if !check_ipc_access(&set.perm, SEM_R, &cred) {
+                return err(SyscallError::EACCES);
             }
             let mut vals = Vec::with_capacity(set.sems.len());
             for sem in set.sems.iter() {
@@ -464,7 +504,8 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             0
         }
         SETALL => {
-            if !is_owner_or_root(&set.perm, &cred) {
+            // SETALL 按 SEM_A 权限授权。成功后会清掉该集合所有进程的 semadj。
+            if !check_ipc_access(&set.perm, SEM_A, &cred) {
                 return err(SyscallError::EACCES);
             }
             let mut vals = vec![0u16; set.sems.len()];
@@ -486,18 +527,25 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
                 sem.last_pid = cred.pid;
                 wake_sem_waiters(sem);
             }
+            // SETALL 清除所有进程在本集合上的 SEM_UNDO 调整记录。
             clear_undo_for_set(ipc_ns_id, semid);
             set.otime = now_secs();
             0
         }
         GETVAL => {
+            // Linux semctl_main 先检查权限，再检查 semnum；这影响
+            // “无权限且 semnum 越界”时 EACCES/EINVAL 的优先级。
+            if !check_ipc_access(&set.perm, SEM_R, &cred) {
+                return err(SyscallError::EACCES);
+            }
             let Some(sem) = set.sems.get(semnum) else {
                 return err(SyscallError::EINVAL);
             };
             sem.val as isize
         }
         SETVAL => {
-            if !is_owner_or_root(&set.perm, &cred) {
+            // SETVAL 同样先做 SEM_A 权限检查，再做 semnum/范围校验。
+            if !check_ipc_access(&set.perm, SEM_A, &cred) {
                 return err(SyscallError::EACCES);
             }
             let Some(sem) = set.sems.get_mut(semnum) else {
@@ -510,29 +558,41 @@ pub fn syscall_semctl(semid: usize, semnum: usize, cmd: usize, arg: usize) -> is
             sem.val = val;
             sem.last_pid = cred.pid;
             wake_sem_waiters(sem);
+            // SETVAL 只清理该单个信号量对应的 semadj。
             clear_undo_for_sem(ipc_ns_id, semid, semnum);
             set.otime = now_secs();
             0
         }
         GETPID => {
+            // GETPID/GETNCNT/GETZCNT 都是读类查询，要求 SEM_R。
+            if !check_ipc_access(&set.perm, SEM_R, &cred) {
+                return err(SyscallError::EACCES);
+            }
             let Some(sem) = set.sems.get(semnum) else {
                 return err(SyscallError::EINVAL);
             };
             sem.last_pid as isize
         }
         GETNCNT => {
+            // 计数时只清死引用，不移除仍存活但尚未切到 Blocked 的等待者，
+            // 否则 SMP 下会破坏 semop 等待队列并丢唤醒。
+            if !check_ipc_access(&set.perm, SEM_R, &cred) {
+                return err(SyscallError::EACCES);
+            }
             let Some(sem) = set.sems.get_mut(semnum) else {
                 return err(SyscallError::EINVAL);
             };
-            retain_blocked_waiters(&mut sem.ncnt_waiters);
-            sem.ncnt_waiters.len() as isize
+            count_blocked_waiters(&mut sem.ncnt_waiters) as isize
         }
         GETZCNT => {
+            // 等零等待者计数与 GETNCNT 使用同一套非破坏式清理规则。
+            if !check_ipc_access(&set.perm, SEM_R, &cred) {
+                return err(SyscallError::EACCES);
+            }
             let Some(sem) = set.sems.get_mut(semnum) else {
                 return err(SyscallError::EINVAL);
             };
-            retain_blocked_waiters(&mut sem.zcnt_waiters);
-            sem.zcnt_waiters.len() as isize
+            count_blocked_waiters(&mut sem.zcnt_waiters) as isize
         }
         _ => err(SyscallError::EINVAL),
     }
@@ -730,6 +790,9 @@ fn do_semop_ops(semid: usize, ops: Vec<SemBuf>, timeout: SemTimeout) -> isize {
         }
 
         if would_block.is_none() {
+            if let Err(e) = record_sem_undo(cred.pid as usize, ipc_ns_id, semid, &undo_deltas) {
+                return e;
+            }
             for (idx, sem) in set.sems.iter_mut().enumerate() {
                 if operated[idx] {
                     sem.val = values[idx];
@@ -740,7 +803,6 @@ fn do_semop_ops(semid: usize, ops: Vec<SemBuf>, timeout: SemTimeout) -> isize {
                 }
             }
             set.otime = now_secs();
-            record_sem_undo(cred.pid as usize, ipc_ns_id, semid, &undo_deltas);
             return 0;
         }
 

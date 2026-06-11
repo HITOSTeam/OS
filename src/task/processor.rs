@@ -1105,6 +1105,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         crate::fs::wake_pidfd_poll_waiters(pid);
         kill_pid_namespace_members_on_init_exit(&process);
         cgroup_exit_process(pid);
+        crate::syscall::sysv_ipc::exit_cleanup(pid);
         crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
         // ...then wake parent waiters (waitpid) without holding the child PCB lock.
@@ -1236,6 +1237,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     };
     crate::fs::wake_pidfd_poll_waiters(pid);
     cgroup_exit_process(pid);
+    crate::syscall::sysv_ipc::exit_cleanup(pid);
     crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
     if let Some(parent) = parent {

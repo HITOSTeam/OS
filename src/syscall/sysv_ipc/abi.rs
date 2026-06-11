@@ -69,6 +69,8 @@ pub(super) const SEM_UNDO: i16 = 0x1000;
 // ---- 系统级资源上限（默认值，运行时可经 procfs 覆盖）----
 /// 信号量可取的最大值（semop 增大后超过此值返回 ERANGE）。
 pub(super) const SEMVMX: i32 = 32767;
+/// SEM_UNDO 调整值的最大绝对值。
+pub(super) const SEMAEM: i32 = SEMVMX;
 /// 单个信号量集中信号量的最大个数。
 pub(super) const SEMMSL: usize = 32000;
 /// 系统范围内信号量总数的上限。

@@ -105,15 +105,26 @@ pub(super) fn check_ipc_access(perm: &IpcPermKernel, req: u16, cred: &Cred) -> b
     (allow & need) == need
 }
 
-/// 清理计数用等待队列：丢弃已释放（Weak 失效）或不再处于 Blocked 状态的等待者。
-pub(super) fn retain_blocked_waiters(queue: &mut VecDeque<Weak<TaskControlBlock>>) {
+/// 清理计数用等待队列中的死引用，并返回当前处于 Blocked 状态的等待者数量。
+///
+/// 不能按状态删除存活任务：SMP 下等待者会先登记到对象等待队列，随后才在
+/// `block_current_and_run_next()` 中切为 Blocked。计数命令若在这个 Running 窗口
+/// 把它移除，就会制造和唤醒路径相同的丢唤醒问题。
+pub(super) fn count_blocked_waiters(queue: &mut VecDeque<Weak<TaskControlBlock>>) -> usize {
+    let mut blocked = 0;
     queue.retain(|task| {
+        // 没有被持有了，可以放心扔掉
         let Some(task) = task.upgrade() else {
             return false;
         };
+
         let inner = task.borrow_mut();
-        inner.task_status == TaskStatus::Blocked
+        if inner.task_status == TaskStatus::Blocked {
+            blocked += 1;
+        }
+        true
     });
+    blocked
 }
 
 /// 取出所有仍存活的等待者用于唤醒。
@@ -121,6 +132,7 @@ pub(super) fn retain_blocked_waiters(queue: &mut VecDeque<Weak<TaskControlBlock>
 /// 不按 `TaskStatus::Blocked` 过滤：SMP 下等待者会先登记到对象等待队列，
 /// 随后才在 `block_current_and_run_next()` 中切为 Blocked。若唤醒方在这个窗口
 /// 按状态过滤，会绕过 `wakeup_task()` 的 wakeup_pending 机制并丢失唤醒。
+/// 这里会唤醒所有存活等待者，依赖阻塞 syscall 被唤醒后循环重查对象条件。
 pub(super) fn drain_live_waiters(
     queue: &mut VecDeque<Weak<TaskControlBlock>>,
 ) -> Vec<Arc<TaskControlBlock>> {
