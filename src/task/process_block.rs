@@ -972,7 +972,9 @@ pub struct ProcessControlBlockInner {
     pub timer_slack_default_ns: u64,
     /// Process creation time since boot (ms).
     pub start_time_ms: usize,
-    /// Accumulated CPU time of reaped children (ns), used by `times(2)`.
+    /// 本进程已退出线程或 zombie 快照中的 CPU 时间（ns）。
+    pub cpu_time_ns: u64,
+    /// 已 wait 子进程及其后代的 CPU 时间（ns），用于 `times(2)`/`getrusage`。
     pub child_cpu_time_ns: u64,
     /// Real/effective/saved user IDs and filesystem UID.
     pub uid: u32,
@@ -1198,6 +1200,7 @@ impl ProcessControlBlock {
                 timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                 timer_slack_default_ns: DEFAULT_TIMER_SLACK_NS,
                 start_time_ms: crate::time::get_time_ms(),
+                cpu_time_ns: 0,
                 child_cpu_time_ns: 0,
                 uid: 0,
                 euid: 0,
@@ -1225,8 +1228,8 @@ impl ProcessControlBlock {
                     rlimit_fsize_max: u64::MAX,
                     rlimit_data_cur: u64::MAX,
                     rlimit_data_max: u64::MAX,
-                    rlimit_stack_cur: 1 * 1024 * 1024,
-                    rlimit_stack_max: 1 * 1024 * 1024,
+                    rlimit_stack_cur: USER_STACK_SIZE as u64,
+                    rlimit_stack_max: USER_STACK_SIZE as u64,
                     rlimit_cpu_cur: u64::MAX,
                     rlimit_cpu_max: u64::MAX,
                     rlimit_cpu_start_ms: crate::time::get_time_ms(),
@@ -1785,6 +1788,7 @@ impl ProcessControlBlock {
                 timer_slack_ns,
                 timer_slack_default_ns: timer_slack_ns,
                 start_time_ms: crate::time::get_time_ms(),
+                cpu_time_ns: 0,
                 child_cpu_time_ns: 0,
                 uid,
                 euid,

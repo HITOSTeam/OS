@@ -362,10 +362,10 @@ pub fn syscall_mmap(
     // 找不到时回退到 brk 附近的低地址（与 Linux 行为一致）。
     let is_fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     let start = if is_fixed {
-        if addr == 0 {
+        if addr == 0 || addr % PAGE_SIZE != 0 {
             return err(SyscallError::EINVAL);
         }
-        align_down(addr, PAGE_SIZE)
+        addr
     } else {
         let mut memory_set = inner.memory_set.lock();
         let Some(start) =

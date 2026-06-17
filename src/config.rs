@@ -2,8 +2,9 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-// Linux userland (busybox/glibc) expects a large initial stack.
-pub const USER_STACK_SIZE: usize = 4096 * 256; // 1 MiB
+// Linux userland can place MiB-scale buffers on the initial stack.
+// Keep this modest because current user stacks are eagerly framed.
+pub const USER_STACK_SIZE: usize = 4096 * 512; // 2 MiB
 // Keep the initial program break away from the top of the first thread stack.
 // Some libc `sbrk()` paths reject growth when brk starts too close to stack.
 pub const USER_HEAP_GAP: usize = 64 * 1024; // 64 KiB

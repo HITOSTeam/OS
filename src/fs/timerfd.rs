@@ -193,12 +193,22 @@ impl TimerFdFile {
             && !inner.canceled
     }
 
-    fn update_schedule_locked(&self, inner: &mut TimerFdInner, was_armed: bool) {
+    fn update_schedule_locked(
+        &self,
+        inner: &mut TimerFdInner,
+        was_armed: bool,
+        old_deadline_ns: Option<u64>,
+    ) {
         let is_armed = self.is_armed_locked(inner);
+        let new_deadline_ns = inner.deadline_ns.filter(|_| is_armed);
+        if was_armed == is_armed && old_deadline_ns == new_deadline_ns {
+            return;
+        }
+
         inner.schedule_seq = inner.schedule_seq.wrapping_add(1);
         let mut state = TIMERFD_SCHEDULE.lock();
         state.adjust_armed(self.clock_id, was_armed, is_armed);
-        let Some(deadline_ns) = inner.deadline_ns.filter(|_| is_armed) else {
+        let Some(deadline_ns) = new_deadline_ns else {
             return;
         };
         let Some(heap) = Self::schedule_heap_mut(&mut state, self.clock_id) else {
@@ -240,7 +250,7 @@ impl TimerFdFile {
         let prev_deadline = inner.deadline_ns;
         let became_ready = Self::update_expirations_locked(inner, now_ns);
         if inner.deadline_ns != prev_deadline {
-            self.update_schedule_locked(inner, was_armed);
+            self.update_schedule_locked(inner, was_armed, prev_deadline);
         }
         became_ready
     }
@@ -327,12 +337,13 @@ impl TimerFdFile {
         };
         let old_interval_ns = inner.interval_ns;
         let was_armed = self.is_armed_locked(&inner);
+        let old_deadline_ns = inner.deadline_ns.filter(|_| was_armed);
         inner.deadline_ns = deadline_ns;
         inner.interval_ns = interval_ns;
         inner.expirations = 0;
         inner.cancel_on_set = cancel_on_set;
         inner.canceled = false;
-        self.update_schedule_locked(&mut inner, was_armed);
+        self.update_schedule_locked(&mut inner, was_armed, old_deadline_ns);
         let became_ready = self.flush_expirations(&mut inner);
         if became_ready {
             let mut waiters = Self::wake_read_waiters(&mut inner.read_waiters);
@@ -349,10 +360,11 @@ impl TimerFdFile {
             return false;
         }
         let was_armed = self.is_armed_locked(&inner);
+        let old_deadline_ns = inner.deadline_ns.filter(|_| was_armed);
         inner.canceled = true;
         inner.deadline_ns = None;
         inner.expirations = 0;
-        self.update_schedule_locked(&mut inner, was_armed);
+        self.update_schedule_locked(&mut inner, was_armed, old_deadline_ns);
         let mut waiters = Self::wake_read_waiters(&mut inner.read_waiters);
         waiters.extend(inner.poll_waiters.take_wakeups());
         drop(inner);

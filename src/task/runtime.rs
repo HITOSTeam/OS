@@ -183,11 +183,20 @@ pub fn process_task_by_index(
 ///
 /// 进程所有存活线程到 `now_ns` 的累计 CPU 时间总和（纳秒）。
 pub fn process_cpu_time_ns_at(process: &Arc<ProcessControlBlock>, now_ns: u64) -> u64 {
-    process_tasks(process)
+    let (saved_cpu_ns, tasks) = {
+        let inner = process.borrow_mut();
+        let tasks = inner
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref().cloned())
+            .collect::<Vec<_>>();
+        (inner.cpu_time_ns, tasks)
+    };
+    tasks
         .into_iter()
         .map(|task| task_cpu_time_ns_at(&task, now_ns))
         // saturating_add：在极端情况（如进程运行数千年）下防止 u64 回绕为 0
-        .fold(0u64, |acc, ns| acc.saturating_add(ns))
+        .fold(saved_cpu_ns, |acc, ns| acc.saturating_add(ns))
 }
 
 /// 使用当前单调时间戳查询进程的累计 CPU 时间，是 [`process_cpu_time_ns_at`] 的便捷封装。

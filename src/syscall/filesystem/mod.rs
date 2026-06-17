@@ -23,8 +23,8 @@ use crate::{
         shm_object_name, shm_remove,
     },
     mm::{
-        MapPermission, UserBuffer, read_user_value, translated_byte_buffer, translated_mutref,
-        try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
+        MapPermission, UserBuffer, translated_byte_buffer, translated_mutref, try_copy_from_user,
+        try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
         try_translated_byte_buffer, try_write_user_value,
     },
     syscall::process::{is_inode_currently_executed_locked, lock_executing_inodes},
@@ -81,6 +81,8 @@ pub(crate) use mount_utils::*;
 pub(crate) const AT_FDCWD: isize = -100;
 /// `*at` flag: do not follow the final symbolic link.
 pub(crate) const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+/// `faccessat2` flag: check with effective uid/gid rather than real uid/gid.
+pub(crate) const AT_EACCESS: usize = 0x200;
 /// `*at` flag: follow the final symbolic link when the syscall supports both modes.
 pub(crate) const AT_SYMLINK_FOLLOW: usize = 0x400;
 /// `*at` flag: reserved for automount control; currently accepted for compatibility.

@@ -252,6 +252,17 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
         };
         return Ok(AtPath::Ext4Abs(translated));
     }
+    if let Some(base_mount) = mount_lookup_for_abs(base_path) {
+        let same_mount = mount_lookup_for_abs(&abs).is_some_and(|mount| {
+            mount.target == base_mount.target && mount.stack_seq == base_mount.stack_seq
+        });
+        if !same_mount {
+            let ClassifiedAbsPath::Ext4(translated) = classified_abs else {
+                unreachable!();
+            };
+            return Ok(AtPath::Ext4Abs(translated));
+        }
+    }
     let rel = if let Some(mount) = mount_lookup_for_abs(&abs) {
         let suffix = if abs == mount.target {
             String::new()

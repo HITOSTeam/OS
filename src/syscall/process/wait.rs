@@ -106,19 +106,23 @@ pub(super) fn enqueue_waiter_once(
 ///
 /// exit 路径已将主线程资源解绑，但 task Arc 可能仍被调度器运行队列、
 /// futex 等待列表、管道等处持有。本函数对每个 task 执行两次 `remove_inactive_task`
-/// 以尽量清除残余引用；若 Arc 引用计数仍 >1，则触发诊断日志（见下方说明）。
+/// 以尽量清除残余引用；若 `DEBUG_SIGNAL` 开启且 Arc 引用计数仍 >1，
+/// 则触发诊断日志（见下方说明）。
 ///
-/// 诊断日志策略（`REAP_LINGER_DIAG_COUNT`）：
+/// `DEBUG_SIGNAL` 诊断日志策略（`REAP_LINGER_DIAG_COUNT`）：
 /// - 前 16 次每次打印，之后仅在计数为 2 的幂时打印，避免日志在大量 fork/exit 场景下爆炸。
 /// - `debug_task_ref_breakdown` 分解各子系统的引用计数，帮助定位哪个子系统未正常释放引用。
 /// - `unknown_refs` = 总引用数 − 1（本函数自持） − 已知子系统之和，非零说明存在未被追踪的持有者。
 fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     // Main-thread resources are already detached in exit path; this aggressively
     // drops lingering task Arcs so kernel stacks are reclaimed on reap.
-    let cpu_ns = crate::task::runtime::process_cpu_time_ns_at(
-        child,
-        crate::task::runtime::monotonic_time_ns(),
-    );
+    let (own_cpu_ns, child_cpu_ns) = {
+        let inner = child.borrow_mut();
+        (inner.cpu_time_ns, inner.child_cpu_time_ns)
+    };
+    // Linux accumulates the child's thread-group CPU time plus the child's
+    // already waited descendants into the parent at reap time.
+    let cpu_ns = own_cpu_ns.saturating_add(child_cpu_ns);
     let tasks = {
         let mut inner = child.borrow_mut();
         core::mem::take(&mut inner.tasks)
@@ -127,7 +131,7 @@ fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     for task in tasks.into_iter().flatten() {
         remove_inactive_task(task.clone());
         let strong = Arc::strong_count(&task);
-        if strong > 1 {
+        if strong > 1 && DEBUG_SIGNAL {
             // Retry once so duplicate stale queue entries are aggressively dropped.
             remove_inactive_task(task.clone());
             let count = REAP_LINGER_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;

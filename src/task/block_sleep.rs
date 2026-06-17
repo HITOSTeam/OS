@@ -564,6 +564,21 @@ pub fn add_timer(task: Arc<TaskControlBlock>, time_wait: usize) {
     TIMERS.lock().push(timer);
 }
 
+/// Remove pending sleep timers owned by a task after an object-specific wait
+/// completes normally. A task can only be blocked on one object at a time, so
+/// clearing all generic sleep timers for it also drops stale timeout wakeups
+/// left by earlier interrupted waits.
+pub fn remove_timers_for_task(task: &Arc<TaskControlBlock>) {
+    let mut timers = TIMERS.lock();
+    let mut kept = BinaryHeap::<TimeWrap>::new();
+    for timer in timers.drain() {
+        if !Arc::ptr_eq(&timer.task, task) {
+            kept.push(timer);
+        }
+    }
+    *timers = kept;
+}
+
 pub fn debug_count_task_refs_in_timers(task: &Arc<TaskControlBlock>) -> usize {
     TIMERS
         .lock()

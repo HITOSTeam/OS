@@ -59,6 +59,7 @@ pub enum SyscallError {
     EAFNOSUPPORT = 97,
     EADDRINUSE = 98,
     EADDRNOTAVAIL = 99,
+    ENOBUFS = 105,
     EISCONN = 106,
     ENOTCONN = 107,
     ETIMEDOUT = 110,

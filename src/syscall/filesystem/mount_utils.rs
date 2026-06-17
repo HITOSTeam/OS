@@ -381,7 +381,13 @@ pub(crate) fn source_for_device_mount(key: &str) -> Result<String, isize> {
         match root.create_dir(&name) {
             Ok(dir) => {
                 dir.set_uid_gid(0, 0);
-                dir.set_mode(0o755);
+                if fresh_instance {
+                    // Linux tmpfs defaults its root to 1777, so unprivileged
+                    // tasks can traverse a freshly mounted tmpfs instance.
+                    dir.set_mode(0o1777);
+                } else {
+                    dir.set_mode(0o755);
+                }
                 let path = alloc::format!("/.ltp_mounts/{}", name);
                 if !fresh_instance {
                     DEVICE_MOUNT_SOURCES
@@ -1076,6 +1082,9 @@ pub(crate) fn syscall_mount_impl(
     };
     if source_display.is_empty() || fsname.is_empty() {
         return err(SyscallError::EINVAL);
+    }
+    if mount_record_for_target(&target).is_some() {
+        return err(SyscallError::EBUSY);
     }
     if fsname == "cgroup2" {
         let spec = CgroupMountSpec::unified();

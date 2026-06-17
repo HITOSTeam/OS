@@ -391,6 +391,7 @@ fn proc_pid_status(pid: u32) -> String {
             memory_set.locked_bytes(),
         )
     };
+    let vmdata_kb: usize = (heap_bytes + 1023) / 1024;
     let vsize_kb: usize = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
     let vmlck_kb: usize = (vmlck_bytes + 1023) / 1024;
     let uid = inner.uid;
@@ -436,7 +437,7 @@ fn proc_pid_status(pid: u32) -> String {
         _ => "R (running)",
     };
     alloc::format!(
-        "Name:\t{comm}\nState:\t{state_desc}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{euid}\t{suid}\t{fsuid}\nGid:\t{gid}\t{egid}\t{sgid}\t{fsgid}\nThreads:\t{num_threads}\nVmLck:\t{vmlck_kb} kB\nVmSize:\t{vsize_kb} kB\n"
+        "Name:\t{comm}\nState:\t{state_desc}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{euid}\t{suid}\t{fsuid}\nGid:\t{gid}\t{egid}\t{sgid}\t{fsgid}\nThreads:\t{num_threads}\nVmLck:\t{vmlck_kb} kB\nVmSize:\t{vsize_kb} kB\nVmData:\t{vmdata_kb} kB\n"
     )
 }
 

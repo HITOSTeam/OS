@@ -283,10 +283,14 @@ fn finish_thread_exit_cleanup(
     )
 }
 
-fn process_dumped_core(_process: &Arc<ProcessControlBlock>, _exit_code: i32) -> bool {
-    // Until core-file generation is implemented, do not report WCOREDUMP.
-    // Userspace treats that bit as a promise that a core file was produced.
-    false
+fn process_dumped_core(process: &Arc<ProcessControlBlock>, exit_code: i32) -> bool {
+    let Some(signum) = exit_code.checked_neg().filter(|sig| *sig > 0) else {
+        return false;
+    };
+    if !crate::task::signal::signal_has_core_dump(signum as usize) {
+        return false;
+    }
+    process.borrow_mut().rlimits.rlimit_core_cur != 0
 }
 
 fn cleanup_process_threads_for_group_exit(
@@ -1031,15 +1035,17 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             cgroup_exit_thread(process.getpid(), tid);
             // For Linux threads, remove from the process task table immediately.
             // Joiners use futexes instead of waittid, so we don't need the slot.
+            let thread_cpu_ns = crate::task::runtime::task_cpu_time_ns(&task);
             let mut process_inner = process.borrow_mut();
-            if let Some(slot) = process_inner.tasks.get_mut(tid) {
-                if slot
-                    .as_ref()
-                    .map(|t| Arc::ptr_eq(t, &task))
-                    .unwrap_or(false)
-                {
-                    *slot = None;
-                }
+            let remove_slot = process_inner
+                .tasks
+                .get(tid)
+                .and_then(|slot| slot.as_ref())
+                .map(|t| Arc::ptr_eq(t, &task))
+                .unwrap_or(false);
+            if remove_slot {
+                process_inner.cpu_time_ns = process_inner.cpu_time_ns.saturating_add(thread_cpu_ns);
+                process_inner.tasks[tid] = None;
             }
         }
     }
@@ -1052,6 +1058,8 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     );
 
     let dumped_core = process_dumped_core(&process, exit_code);
+    let process_cpu_ns =
+        crate::task::runtime::process_cpu_time_ns_at(&process, monotonic_time_ns());
 
     // 已经从current_task拿走了 所以 对于一般的 线程,可以了.
     //  对于主线程,我们需要处理一些 清理工作
@@ -1088,6 +1096,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             process_inner.is_zombie = true;
             process_inner.dumped_core = dumped_core;
             process_inner.exit_code = exit_code;
+            process_inner.cpu_time_ns = process_cpu_ns;
             (
                 process_inner.parent.as_ref().and_then(|p| p.upgrade()),
                 process_inner.exit_signal,
@@ -1096,6 +1105,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         crate::fs::wake_pidfd_poll_waiters(pid);
         kill_pid_namespace_members_on_init_exit(&process);
         cgroup_exit_process(pid);
+        crate::syscall::sysv_ipc::exit_cleanup(pid);
         crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
         // ...then wake parent waiters (waitpid) without holding the child PCB lock.
@@ -1194,6 +1204,8 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     );
 
     let dumped_core = process_dumped_core(&process, exit_code);
+    let process_cpu_ns =
+        crate::task::runtime::process_cpu_time_ns_at(&process, monotonic_time_ns());
 
     let pid = process.getpid();
     if pid == IDLE_PID {
@@ -1217,6 +1229,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         process_inner.is_zombie = true;
         process_inner.dumped_core = dumped_core;
         process_inner.exit_code = exit_code;
+        process_inner.cpu_time_ns = process_cpu_ns;
         (
             process_inner.parent.as_ref().and_then(|p| p.upgrade()),
             process_inner.exit_signal,
@@ -1224,6 +1237,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     };
     crate::fs::wake_pidfd_poll_waiters(pid);
     cgroup_exit_process(pid);
+    crate::syscall::sysv_ipc::exit_cleanup(pid);
     crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
     if let Some(parent) = parent {

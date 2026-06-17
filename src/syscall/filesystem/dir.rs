@@ -131,6 +131,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
     if let AtPath::PseudoAbs(_) = &at {
         return err(SyscallError::EROFS);
     }
+    let path_rofs = rofs_for_path(newdirfd, &path);
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
@@ -144,7 +145,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
         return err(SyscallError::EACCES);
     }
-    if rofs_for_path(newdirfd, &path) {
+    if path_rofs {
         return err(SyscallError::EROFS);
     }
 
@@ -201,6 +202,18 @@ pub fn syscall_linkat(
         Ok(v) => v,
         Err(e) => return e,
     };
+    let old_abs = if old_s.is_empty() {
+        None
+    } else {
+        match resolve_abs_path(olddirfd, &old_s) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    };
+    let new_abs = match resolve_abs_path(newdirfd, &new_s) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     if matches!(new_at, AtPath::PseudoAbs(_)) {
         return err(SyscallError::EROFS);
     }
@@ -209,13 +222,17 @@ pub fn syscall_linkat(
             return err(SyscallError::EXDEV);
         }
     }
-    if let (Some(AtPath::Ext4Abs(old_abs)), AtPath::Ext4Abs(new_abs)) = (&old_at, &new_at) {
-        if hardlink_cross_mount(old_abs, new_abs) {
+    let old_is_proc_fd_magic = matches!(&old_at, Some(AtPath::PseudoAbs(abs)) if parse_proc_fd_for_current_process(abs).is_some());
+    if let (Some(old_abs), Some(new_abs)) = (old_abs.as_deref(), new_abs.as_deref()) {
+        // `/proc/self/fd/N` is a magic link to the opened inode. Its textual
+        // path is under procfs, but Linux applies EXDEV to the resolved inode.
+        if !old_is_proc_fd_magic && hardlink_cross_mount(old_abs, new_abs) {
             return err(SyscallError::EXDEV);
         }
     }
 
-    if rofs_for_path(newdirfd, &new_s) {
+    let new_path_rofs = rofs_for_path(newdirfd, &new_s);
+    if new_path_rofs {
         return err(SyscallError::EROFS);
     }
 
@@ -275,7 +292,7 @@ pub fn syscall_linkat(
     if parent.device_id() != source.device_id() {
         return err(SyscallError::EXDEV);
     }
-    if rofs_for_path(newdirfd, &new_s) {
+    if new_path_rofs {
         return err(SyscallError::EROFS);
     }
 
@@ -368,6 +385,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     if let AtPath::PseudoAbs(_) = &at {
         return err(SyscallError::EROFS);
     }
+    let path_rofs = rofs_for_path(dirfd, &path);
     let (fsuid, fsgid) = current_fsuid_gid();
 
     let _ext4_guard = ext4_lock();
@@ -379,7 +397,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
         Ok(v) => v,
         Err(e) => return e,
     };
-    if dirfd_rofs || rofs_for_path(dirfd, &path) {
+    if dirfd_rofs || path_rofs {
         return err(SyscallError::EROFS);
     }
     if !parent.is_dir() {
@@ -485,6 +503,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
         }
         return err(SyscallError::EROFS);
     }
+    let path_rofs = rofs_for_path(dirfd, &path);
 
     let _ext4_guard = ext4_lock();
     if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
@@ -506,7 +525,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     if parent.find(&name).is_some() {
         return err(SyscallError::EEXIST);
     }
-    if rofs_for_path(dirfd, &path) {
+    if path_rofs {
         return err(SyscallError::EROFS);
     }
     match parent.create_dir(&name) {
@@ -617,6 +636,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         }
         return err(SyscallError::EROFS);
     }
+    let path_rofs = rofs_for_path(dirfd, &path);
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
@@ -646,7 +666,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
 
     // Validate target type: unlink vs rmdir semantics.
     let Some(child) = parent.find(&name) else {
-        if rofs_for_path(dirfd, &path) {
+        if path_rofs {
             return err(SyscallError::EROFS);
         }
         return err(SyscallError::ENOENT);
@@ -669,7 +689,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     if inode_is_immutable_or_append(&child) {
         return err(SyscallError::EPERM);
     }
-    if rofs_for_path(dirfd, &path) {
+    if path_rofs {
         return err(SyscallError::EROFS);
     }
 
