@@ -1,6 +1,7 @@
 mod capability;
 mod identity;
 mod ioctl;
+mod module;
 mod namespace;
 mod other;
 mod prctl;
@@ -12,6 +13,7 @@ pub use self::sysinfo::*;
 pub use capability::*;
 pub use identity::*;
 pub use ioctl::*;
+pub use module::*;
 pub use namespace::*;
 pub use other::*;
 pub use prctl::*;

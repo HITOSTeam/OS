@@ -10,7 +10,7 @@ pub(crate) mod futex;
 mod memory;
 pub(crate) mod misc;
 mod mutex;
-mod net;
+pub(crate) mod net;
 pub(crate) mod posix_mq;
 pub(crate) mod process;
 pub(crate) mod robust_list;
@@ -36,18 +36,22 @@ static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
 // The base image ships `/bin/busybox` but not individual applet symlinks.
 // Allow a conservative subset of common LTP shell dependencies to fall back
 // to busybox when the standalone binary path is absent.
-const BUSYBOX_APPLET_ALLOWLIST: [&str; 18] = [
+const BUSYBOX_APPLET_ALLOWLIST: [&str; 22] = [
     "awk",
     "bash",
     "cmp",
     "dmesg",
     "find",
     "grep",
+    "insmod",
+    "lsmod",
+    "modprobe",
     "mount",
     "mountpoint",
     "pgrep",
     "pkill",
     "ps",
+    "rmmod",
     "seq",
     "sysctl",
     "umount",
@@ -175,6 +179,8 @@ const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_NANOSLEEP: usize = 101;
 const SYSCALL_GETITIMER: usize = 102;
 const SYSCALL_SETITIMER: usize = 103;
+const SYSCALL_INIT_MODULE: usize = 105;
+const SYSCALL_DELETE_MODULE: usize = 106;
 const SYSCALL_TIMER_CREATE: usize = 107;
 const SYSCALL_TIMER_GETTIME: usize = 108;
 const SYSCALL_TIMER_GETOVERRUN: usize = 109;
@@ -199,6 +205,7 @@ const SYSCALL_SCHED_RR_GET_INTERVAL: usize = 127;
 const SYSCALL_CLOCK_ADJTIME: usize = 266;
 const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_SETNS: usize = 268;
+const SYSCALL_FINIT_MODULE: usize = 273;
 const SYSCALL_CLOCK_ADJTIME64: usize = 405;
 const SYSCALL_SCHED_SETATTR: usize = 274;
 const SYSCALL_SCHED_GETATTR: usize = 275;
@@ -643,6 +650,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_NANOSLEEP => time_sys::syscall_nanosleep(args[0], args[1]),
         SYSCALL_GETITIMER => time_sys::syscall_getitimer(args[0], args[1]),
         SYSCALL_SETITIMER => time_sys::syscall_setitimer(args[0], args[1], args[2]),
+        SYSCALL_INIT_MODULE => misc::syscall_init_module(args[0], args[1], args[2]),
+        SYSCALL_DELETE_MODULE => misc::syscall_delete_module(args[0], args[1]),
         SYSCALL_TIMER_CREATE => time_sys::syscall_timer_create(args[0], args[1], args[2]),
         SYSCALL_TIMER_GETTIME => time_sys::syscall_timer_gettime(args[0] as isize, args[1]),
         SYSCALL_TIMER_GETOVERRUN => time_sys::syscall_timer_getoverrun(args[0] as isize),
@@ -658,6 +667,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             time_sys::syscall_clock_adjtime(args[0], args[1])
         }
         SYSCALL_SYNCFS => filesystem::syscall_syncfs(args[0]),
+        SYSCALL_FINIT_MODULE => misc::syscall_finit_module(args[0] as isize, args[1], args[2]),
         SYSCALL_CLOCK_NANOSLEEP => {
             time_sys::syscall_clock_nanosleep(args[0], args[1], args[2], args[3])
         }
