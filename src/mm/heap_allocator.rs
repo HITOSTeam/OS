@@ -36,6 +36,7 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
         args[4],
         args[5]
     );
+    crate::fs::debug_net_socket_atomic_heap_state();
     panic!("Heap allocation error, layout = {:?}", layout);
 }
 
