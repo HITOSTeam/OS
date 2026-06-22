@@ -8,8 +8,9 @@ use super::{
     String, SyscallError, TMPFILE_SEQ, UMOUNT_NOFOLLOW, Vec, cgroup_logical_path_for_file,
     cgroup_mount, cgroup_umount, current_fsuid_gid, current_process, current_timespec, err,
     ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token, get_inode_times,
-    inode_logical_path, mount_namespace_id, normalize_path, open_pseudo, pseudo_block_is_read_only,
-    read_user_cstring, resolve_at_inode, resolve_at_path, set_inode_times,
+    inode_logical_path, inode_raw_logical_path, mount_namespace_id, normalize_path, open_pseudo,
+    pseudo_block_is_read_only, read_user_cstring, resolve_at_inode, resolve_at_path,
+    set_inode_times,
 };
 use lazy_static::lazy_static;
 
@@ -283,7 +284,7 @@ pub(crate) fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Opt
         return Some(String::from("/dev/shm"));
     }
     let os_inode = file.as_any().downcast_ref::<OSInode>()?;
-    logical_path_for_inode(&os_inode.ext4_inode())
+    inode_raw_logical_path(&os_inode.ext4_inode())
 }
 
 pub(crate) fn pseudo_abs_for_ext4_dirfd(base: &Arc<ext4_fs::Inode>, path: &str) -> Option<String> {
@@ -412,6 +413,24 @@ pub(crate) fn target_dir_exists(abs: &str) -> Result<(), isize> {
     let _ext4_guard = ext4_lock();
     let inode = find_path_in_roots(&translated).ok_or_else(|| err(SyscallError::ENOENT))?;
     if !inode.is_dir() {
+        return Err(err(SyscallError::ENOTDIR));
+    }
+    Ok(())
+}
+
+fn bind_target_matches_source_kind(abs: &str, source_is_dir: bool) -> Result<(), isize> {
+    if let Some(node) = open_pseudo(abs) {
+        let target_is_dir = node.as_any().downcast_ref::<PseudoDir>().is_some();
+        return if target_is_dir == source_is_dir {
+            Ok(())
+        } else {
+            Err(err(SyscallError::ENOTDIR))
+        };
+    }
+    let translated = translate_mount_abs(abs);
+    let _ext4_guard = ext4_lock();
+    let inode = find_path_in_roots(&translated).ok_or_else(|| err(SyscallError::ENOENT))?;
+    if inode.is_dir() != source_is_dir {
         return Err(err(SyscallError::ENOTDIR));
     }
     Ok(())
@@ -812,6 +831,9 @@ pub(crate) fn remove_mount_records_by_event(event_id: usize) -> usize {
                 }
                 true
             });
+            for target in &affected_targets {
+                state.remove_bound_file(target);
+            }
             before.saturating_sub(state.mounts().len())
         });
         if removed_in_ns == 0 {
@@ -995,6 +1017,74 @@ pub(crate) fn syscall_mount_impl(
         }
     }
 
+    if (flags & MS_BIND) != 0 && (flags & (MS_REMOUNT | MS_MOVE)) == 0 {
+        let Some(source_display) = special.as_deref() else {
+            return err(SyscallError::EINVAL);
+        };
+        if source_display.is_empty() {
+            return err(SyscallError::EINVAL);
+        }
+        let source_abs = normalize_path(&cwd, source_display);
+        if mount_lookup_for_abs(&source_abs)
+            .map(|record| record.propagation == MountPropagation::Unbindable)
+            .unwrap_or(false)
+        {
+            return err(SyscallError::EINVAL);
+        }
+
+        if let Some(source_file) = open_pseudo(&source_abs) {
+            if source_file.as_any().downcast_ref::<PseudoDir>().is_none() {
+                if let Err(e) = bind_target_matches_source_kind(&target, false) {
+                    return e;
+                }
+                let fsname = fstype.as_deref().unwrap_or("none");
+                let base_flags = mount_lookup_for_abs(&source_abs)
+                    .map(|m| m.flags)
+                    .unwrap_or(0);
+                let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
+                create_bind_mount_record_with_propagation(
+                    &target,
+                    &source_abs,
+                    &source_abs,
+                    fsname,
+                    bind_flags,
+                );
+                with_mount_namespace_mut(&current_mount_namespace(), |state| {
+                    state.bind_file(&target, Arc::clone(&source_file));
+                });
+                return 0;
+            }
+        }
+
+        let source = translate_mount_abs(&source_abs);
+        let source_is_dir = {
+            let _ext4_guard = ext4_lock();
+            let Some(source_inode) = find_path_in_roots(&source) else {
+                return err(SyscallError::ENOENT);
+            };
+            source_inode.is_dir()
+        };
+        if let Err(e) = bind_target_matches_source_kind(&target, source_is_dir) {
+            return e;
+        }
+        if !source_is_dir {
+            return err(SyscallError::ENOTDIR);
+        }
+        let fsname = fstype.as_deref().unwrap_or("none");
+        let base_flags = mount_lookup_for_abs(&source_abs)
+            .map(|m| m.flags)
+            .unwrap_or(0);
+        let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
+        create_bind_mount_record_with_propagation(
+            &target,
+            &source,
+            &source_abs,
+            fsname,
+            bind_flags,
+        );
+        return 0;
+    }
+
     if let Err(e) = target_dir_exists(&target) {
         return e;
     }
@@ -1037,40 +1127,6 @@ pub(crate) fn syscall_mount_impl(
         {
             return err(SyscallError::EACCES);
         }
-        return 0;
-    }
-
-    if (flags & MS_BIND) != 0 {
-        let Some(source_display) = special.as_deref() else {
-            return err(SyscallError::EINVAL);
-        };
-        if source_display.is_empty() {
-            return err(SyscallError::EINVAL);
-        }
-        let source_abs = normalize_path(&cwd, source_display);
-        if mount_lookup_for_abs(&source_abs)
-            .map(|record| record.propagation == MountPropagation::Unbindable)
-            .unwrap_or(false)
-        {
-            return err(SyscallError::EINVAL);
-        }
-        let source = translate_mount_abs(&source_abs);
-        let _ext4_guard = ext4_lock();
-        if find_path_in_roots(&source).is_none() {
-            return err(SyscallError::ENOENT);
-        }
-        let fsname = fstype.as_deref().unwrap_or("none");
-        let base_flags = mount_lookup_for_abs(&source_abs)
-            .map(|m| m.flags)
-            .unwrap_or(0);
-        let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
-        create_bind_mount_record_with_propagation(
-            &target,
-            &source,
-            &source_abs,
-            fsname,
-            bind_flags,
-        );
         return 0;
     }
 
@@ -1253,12 +1309,124 @@ pub(crate) fn proc_mounts_snapshot_for_namespace(ns: &MountNamespace) -> String 
     out
 }
 
+fn mountinfo_escape(input: &str) -> String {
+    let mut out = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b' ' => out.push_str("\\040"),
+            b'\t' => out.push_str("\\011"),
+            b'\n' => out.push_str("\\012"),
+            b'\\' => out.push_str("\\134"),
+            _ => out.push(byte as char),
+        }
+    }
+    out
+}
+
+fn mountinfo_optional_fields(record: &MountRecord) -> String {
+    let mut fields = Vec::new();
+    match record.propagation {
+        MountPropagation::Shared => {
+            if let Some(id) = record.peer_group_id {
+                fields.push(alloc::format!("shared:{id}"));
+            }
+        }
+        MountPropagation::Slave => {
+            if let Some(id) = record.master_group_id {
+                fields.push(alloc::format!("master:{id}"));
+            }
+        }
+        MountPropagation::Private | MountPropagation::Unbindable => {}
+    }
+    fields.join(" ")
+}
+
+fn push_mountinfo_line(
+    out: &mut String,
+    id: usize,
+    parent_id: usize,
+    dev: &str,
+    root: &str,
+    target: &str,
+    fs_type: &str,
+    source: &str,
+    opts: &str,
+    optional: &str,
+) {
+    let root = mountinfo_escape(root);
+    let target = mountinfo_escape(target);
+    let fs_type = mountinfo_escape(fs_type);
+    let source = mountinfo_escape(source);
+    let opts = mountinfo_escape(opts);
+    if optional.is_empty() {
+        out.push_str(&alloc::format!(
+            "{id} {parent_id} {dev} {root} {target} {opts} - {fs_type} {source} {opts}\n"
+        ));
+    } else {
+        out.push_str(&alloc::format!(
+            "{id} {parent_id} {dev} {root} {target} {opts} {optional} - {fs_type} {source} {opts}\n"
+        ));
+    }
+}
+
+pub(crate) fn proc_mountinfo_snapshot_for_namespace(ns: &MountNamespace) -> String {
+    let mut out = String::new();
+    push_mountinfo_line(
+        &mut out,
+        1,
+        0,
+        "8:1",
+        "/",
+        "/",
+        "ext4",
+        "/dev/root",
+        "rw,relatime",
+        "",
+    );
+
+    let mut mounts = {
+        let state = ns.lock();
+        state.mounts().to_vec()
+    };
+    mounts.sort_by(|a, b| a.target.cmp(&b.target));
+    for (idx, mount) in mounts.iter().enumerate() {
+        let opts = mount_flags_to_proc_opts(mount.flags);
+        let optional = mountinfo_optional_fields(mount);
+        let source = if mount.source_display.is_empty() {
+            mount.source.as_str()
+        } else {
+            mount.source_display.as_str()
+        };
+        push_mountinfo_line(
+            &mut out,
+            100 + idx,
+            1,
+            &alloc::format!("0:{}", mount.event_id.max(1)),
+            "/",
+            &mount.target,
+            &mount.fs_type,
+            source,
+            &opts,
+            &optional,
+        );
+    }
+    out
+}
+
 pub(crate) fn proc_mounts_snapshot() -> String {
     proc_mounts_snapshot_for_namespace(&current_mount_namespace())
 }
 
 pub(crate) fn proc_mounts_snapshot_for_process(process: &Arc<ProcessControlBlock>) -> String {
     proc_mounts_snapshot_for_namespace(&process.mount_namespace())
+}
+
+pub(crate) fn proc_mountinfo_snapshot() -> String {
+    proc_mountinfo_snapshot_for_namespace(&current_mount_namespace())
+}
+
+pub(crate) fn proc_mountinfo_snapshot_for_process(process: &Arc<ProcessControlBlock>) -> String {
+    proc_mountinfo_snapshot_for_namespace(&process.mount_namespace())
 }
 
 pub(crate) fn statfs_mount_flags_for_abs(abs: &str) -> i64 {

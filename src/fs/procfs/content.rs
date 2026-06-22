@@ -83,17 +83,35 @@ fn record_proc_pid_stat_diag(pid: u32, state_char: char, elapsed_cycles: usize, 
 pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
     match kind {
         ProcFileKind::Mounts => proc_mounts_current(),
+        ProcFileKind::Mountinfo => proc_mountinfo_current(),
         ProcFileKind::PidMounts(pid) => proc_mounts_for_pid(*pid),
+        ProcFileKind::PidMountinfo(pid) => proc_mountinfo_for_pid(*pid),
         ProcFileKind::Cgroups => crate::fs::cgroup_proc_cgroups_content(),
         ProcFileKind::Meminfo => proc_meminfo(),
         ProcFileKind::Cpuinfo => proc_cpuinfo(),
         ProcFileKind::Cmdline => proc_cmdline(),
+        ProcFileKind::Interrupts => proc_interrupts(),
         ProcFileKind::Loadavg => String::from("0.00 0.00 0.00 1/1 1\n"),
         ProcFileKind::Uptime => proc_uptime(),
         ProcFileKind::Stat => proc_stat(),
         ProcFileKind::Perf => proc_perf(),
         ProcFileKind::Kallsyms => proc_kallsyms(),
         ProcFileKind::Kpageflags => String::new(),
+        ProcFileKind::Modules => crate::syscall::misc::proc_modules_content(),
+        ProcFileKind::NetDev => crate::syscall::net::netdev::proc_net_dev_content(),
+        ProcFileKind::NetDevMcast => crate::syscall::net::netdev::proc_net_dev_mcast_content(),
+        ProcFileKind::NetIfInet6 => crate::syscall::net::netdev::proc_net_if_inet6_content(),
+        ProcFileKind::NetRoute => crate::syscall::net::netdev::proc_net_route_content(),
+        ProcFileKind::NetArp => crate::syscall::net::netdev::proc_net_arp_content(),
+        ProcFileKind::NetIgmp => crate::syscall::net::netdev::proc_net_igmp_content(),
+        ProcFileKind::NetSnmp => crate::syscall::net::netdev::proc_net_snmp_content(),
+        ProcFileKind::NetNetstat => crate::syscall::net::netdev::proc_net_netstat_content(),
+        ProcFileKind::NetSockstat => crate::syscall::net::netdev::proc_net_sockstat_content(),
+        ProcFileKind::NetTcp => crate::syscall::net::netdev::proc_net_tcp_content(),
+        ProcFileKind::NetUdp => crate::syscall::net::netdev::proc_net_udp_content(),
+        ProcFileKind::NetRaw => crate::syscall::net::netdev::proc_net_raw_content(),
+        ProcFileKind::NetUnix => crate::syscall::net::netdev::proc_net_unix_content(),
+        ProcFileKind::NetNetlink => crate::syscall::net::netdev::proc_net_netlink_content(),
         ProcFileKind::SysvipcMsg => crate::syscall::sysv_ipc::proc_sysvipc_msg(),
         ProcFileKind::SysvipcSem => crate::syscall::sysv_ipc::proc_sysvipc_sem(),
         ProcFileKind::SysvipcShm => crate::syscall::sysv_shm::proc_sysvipc_shm(),
@@ -154,6 +172,9 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::PidCmdline(pid) => proc_pid_cmdline(*pid),
         ProcFileKind::PidComm(pid) => proc_pid_comm(*pid),
         ProcFileKind::PidStatus(pid) => proc_pid_status(*pid),
+        ProcFileKind::PidUidMap(pid) => proc_pid_uid_map(*pid),
+        ProcFileKind::PidGidMap(pid) => proc_pid_gid_map(*pid),
+        ProcFileKind::PidSetgroups(pid) => proc_pid_setgroups(*pid),
         ProcFileKind::PidMaps(pid) => proc_pid_maps(*pid),
         ProcFileKind::PidPagemap(_) => String::new(),
         ProcFileKind::PidSmaps(pid) => proc_pid_smaps(*pid),
@@ -162,6 +183,45 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::PidTaskStat(pid, tid) => proc_pid_task_stat(*pid, *tid),
         ProcFileKind::PidTaskComm(pid, tid) => proc_pid_task_comm(*pid, *tid),
     }
+}
+
+pub(crate) fn proc_irq_smp_affinity() -> String {
+    alloc::format!("{:x}\n", crate::task::manager::online_hart_mask())
+}
+
+fn proc_interrupts() -> String {
+    let mask = crate::task::manager::online_hart_mask();
+    let mut cpus = Vec::new();
+    for cpu in 0..usize::BITS as usize {
+        if (mask & (1usize << cpu)) != 0 {
+            cpus.push(cpu);
+        }
+    }
+    if cpus.is_empty() {
+        cpus.push(0);
+    }
+
+    let mut out = String::new();
+    write!(out, "           ").unwrap();
+    for cpu in &cpus {
+        write!(out, "CPU{}       ", cpu).unwrap();
+    }
+    out.push('\n');
+
+    let timer_ticks = crate::time::get_time_ms() / 10;
+    write_interrupt_row(&mut out, 5, &cpus, timer_ticks, "kernel   timer");
+    write_interrupt_row(&mut out, 7, &cpus, 0, "kernel   software");
+    write_interrupt_row(&mut out, 8, &cpus, 0, "virtio0");
+    out
+}
+
+fn write_interrupt_row(out: &mut String, irq: usize, cpus: &[usize], count: usize, name: &str) {
+    write!(out, "{:4}:", irq).unwrap();
+    for cpu in cpus {
+        let value = if *cpu == 0 { count } else { 0 };
+        write!(out, "{:10}", value).unwrap();
+    }
+    writeln!(out, "  {}", name).unwrap();
 }
 
 fn proc_kallsyms() -> String {
@@ -181,6 +241,115 @@ fn proc_mounts_for_pid(pid: u32) -> String {
         return proc_mounts_current();
     };
     crate::syscall::filesystem::proc_mounts_snapshot_for_process(&process)
+}
+
+fn proc_mountinfo_current() -> String {
+    crate::syscall::filesystem::proc_mountinfo_snapshot()
+}
+
+fn proc_mountinfo_for_pid(pid: u32) -> String {
+    let Some(process) = pid2process(pid as usize) else {
+        return proc_mountinfo_current();
+    };
+    crate::syscall::filesystem::proc_mountinfo_snapshot_for_process(&process)
+}
+
+fn proc_pid_uid_map(pid: u32) -> String {
+    pid2process(pid as usize)
+        .and_then(|process| {
+            process
+                .try_borrow_mut()
+                .map(|inner| inner.userns_uid_map.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn proc_pid_gid_map(pid: u32) -> String {
+    pid2process(pid as usize)
+        .and_then(|process| {
+            process
+                .try_borrow_mut()
+                .map(|inner| inner.userns_gid_map.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn proc_pid_setgroups(pid: u32) -> String {
+    pid2process(pid as usize)
+        .and_then(|process| {
+            process
+                .try_borrow_mut()
+                .map(|inner| inner.userns_setgroups.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_userns_id_map(data: &[u8]) -> Result<String, isize> {
+    let raw = core::str::from_utf8(data).map_err(|_| err(SyscallError::EINVAL))?;
+    if raw.contains('\0') {
+        return Err(err(SyscallError::EINVAL));
+    }
+    let mut parts = raw.split_whitespace();
+    let Some(ns_id) = parts.next() else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    let Some(parent_id) = parts.next() else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    let Some(count) = parts.next() else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    if parts.next().is_some() {
+        return Err(err(SyscallError::EINVAL));
+    }
+    let ns_id = ns_id
+        .parse::<u32>()
+        .map_err(|_| err(SyscallError::EINVAL))?;
+    let parent_id = parent_id
+        .parse::<u32>()
+        .map_err(|_| err(SyscallError::EINVAL))?;
+    let count = count
+        .parse::<u32>()
+        .map_err(|_| err(SyscallError::EINVAL))?;
+    if count == 0 {
+        return Err(err(SyscallError::EINVAL));
+    }
+    Ok(alloc::format!("{ns_id} {parent_id} {count}\n"))
+}
+
+pub(super) fn write_proc_pid_uid_map(pid: u32, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let normalized = normalize_userns_id_map(data)?;
+    let Some(process) = pid2process(pid as usize) else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    process.borrow_mut().userns_uid_map = normalized.clone();
+    Ok(normalized.into_bytes())
+}
+
+pub(super) fn write_proc_pid_gid_map(pid: u32, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let normalized = normalize_userns_id_map(data)?;
+    let Some(process) = pid2process(pid as usize) else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    process.borrow_mut().userns_gid_map = normalized.clone();
+    Ok(normalized.into_bytes())
+}
+
+pub(super) fn write_proc_pid_setgroups(pid: u32, data: &[u8]) -> Result<Vec<u8>, isize> {
+    let raw = core::str::from_utf8(data).map_err(|_| err(SyscallError::EINVAL))?;
+    if raw.contains('\0') {
+        return Err(err(SyscallError::EINVAL));
+    }
+    let value = match raw.trim() {
+        "allow" => "allow\n",
+        "deny" => "deny\n",
+        _ => return Err(err(SyscallError::EINVAL)),
+    };
+    let Some(process) = pid2process(pid as usize) else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    process.borrow_mut().userns_setgroups = String::from(value);
+    Ok(value.as_bytes().to_vec())
 }
 
 pub(super) fn write_vm_sysctl(path: &str, data: &[u8]) -> Result<Vec<u8>, isize> {

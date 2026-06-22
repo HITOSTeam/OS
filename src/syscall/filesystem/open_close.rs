@@ -595,17 +595,22 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
     0
 }
 
+const O_NOTIFICATION_PIPE: usize = O_EXCL;
+
 /// Creates a pipe pair and installs both ends into the caller's fd table.
-pub fn syscall_pipe2(pipefd: usize, _flags: usize) -> isize {
+pub fn syscall_pipe2(pipefd: usize, flags: usize) -> isize {
+    if (flags & O_NOTIFICATION_PIPE) != 0 {
+        return err(SyscallError::ENOPKG);
+    }
     let (files, limit) = current_files_and_nofile_limit();
     let token = get_current_token();
     let (pipe_read, pipe_write) = make_pipe();
 
     let mut descriptor_flags = 0u32;
-    if (_flags & O_CLOEXEC) != 0 {
+    if (flags & O_CLOEXEC) != 0 {
         descriptor_flags |= FD_CLOEXEC;
     }
-    if (_flags & O_NONBLOCK) != 0 {
+    if (flags & O_NONBLOCK) != 0 {
         descriptor_flags |= O_NONBLOCK as u32;
     }
     let mut files_guard = files.lock();

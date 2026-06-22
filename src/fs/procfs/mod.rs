@@ -15,7 +15,7 @@ pub(crate) mod magic_link;
 pub(crate) mod open;
 
 pub use content::{vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory};
-pub(crate) use entries::vm_max_map_count;
+pub(crate) use entries::{net_core_busy_poll_usecs, net_core_busy_read_usecs, vm_max_map_count};
 pub(crate) use magic_link::resolve_proc_magic_intermediate_abs_path;
 pub use magic_link::{
     normalize_proc_magic_path, proc_fd_link_file, proc_magic_link_exists, proc_readlink,
@@ -25,16 +25,33 @@ pub use open::open_proc_pseudo;
 #[derive(Clone, Copy, Debug)]
 pub enum ProcFileKind {
     Mounts,
+    Mountinfo,
     Cgroups,
     Meminfo,
     Cpuinfo,
     Cmdline,
+    Interrupts,
     Loadavg,
     Uptime,
     Stat,
     Perf,
     Kallsyms,
     Kpageflags,
+    Modules,
+    NetDev,
+    NetDevMcast,
+    NetIfInet6,
+    NetRoute,
+    NetArp,
+    NetIgmp,
+    NetSnmp,
+    NetNetstat,
+    NetSockstat,
+    NetTcp,
+    NetUdp,
+    NetRaw,
+    NetUnix,
+    NetNetlink,
     SysvipcMsg,
     SysvipcSem,
     SysvipcShm,
@@ -62,11 +79,15 @@ pub enum ProcFileKind {
     PidCmdline(u32),
     PidStatus(u32),
     PidComm(u32),
+    PidUidMap(u32),
+    PidGidMap(u32),
+    PidSetgroups(u32),
     PidMaps(u32),
     PidPagemap(u32),
     PidSmaps(u32),
     PidCoredumpFilter,
     PidMounts(u32),
+    PidMountinfo(u32),
     PidCgroup(u32),
     PidTaskStat(u32, u32),
     PidTaskComm(u32, u32),
@@ -175,6 +196,9 @@ impl ProcPseudoFile {
             ProcFileKind::KernelSchedRrTimesliceMs => {
                 content::write_sched_sysctl("/proc/sys/kernel/sched_rr_timeslice_ms", data)?
             }
+            ProcFileKind::PidUidMap(pid) => content::write_proc_pid_uid_map(pid, data)?,
+            ProcFileKind::PidGidMap(pid) => content::write_proc_pid_gid_map(pid, data)?,
+            ProcFileKind::PidSetgroups(pid) => content::write_proc_pid_setgroups(pid, data)?,
             ProcFileKind::SimpleText(path) => entries::write_proc_simple_text(path, data)?,
             _ => return Err(err(SyscallError::EINVAL)),
         };
@@ -232,7 +256,10 @@ impl File for ProcPseudoFile {
             | ProcFileKind::KernelShmall
             | ProcFileKind::KernelSchedRtPeriodUs
             | ProcFileKind::KernelSchedRtRuntimeUs
-            | ProcFileKind::KernelSchedRrTimesliceMs => true,
+            | ProcFileKind::KernelSchedRrTimesliceMs
+            | ProcFileKind::PidUidMap(_)
+            | ProcFileKind::PidGidMap(_)
+            | ProcFileKind::PidSetgroups(_) => true,
             ProcFileKind::SimpleText(path) => entries::proc_simple_text_is_writable(path),
             _ => false,
         }

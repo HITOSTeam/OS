@@ -300,7 +300,9 @@ pub(crate) fn do_fchmodat(
     };
 
     if let AtPath::PseudoAbs(abs) = &at {
-        if let Some(ret) = maybe_dispatch_proc_fd_at(abs, flags, |fd| syscall_fchmod(fd, mode)) {
+        if let Some(ret) =
+            maybe_dispatch_proc_fd_at(abs, flags, |fd| fchmod_fd_for_at_empty_path(fd, mode))
+        {
             return ret;
         }
         return pseudo_path_exists_result(abs);

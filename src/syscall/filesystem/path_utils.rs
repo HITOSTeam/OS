@@ -85,7 +85,11 @@ pub(crate) fn normalize_relative_path(path: &str) -> String {
             continue;
         }
         if seg == ".." {
-            parts.pop();
+            if parts.last().is_some_and(|last| *last != "..") {
+                parts.pop();
+            } else {
+                parts.push(seg);
+            }
             continue;
         }
         parts.push(seg);
@@ -344,7 +348,8 @@ pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize>
 }
 
 /// 从 ext4 绝对路径解析 inode，自动在主磁盘和辅助磁盘之间回退。
-/// `/musl` 和 `/glibc` 前缀优先从辅助磁盘查找，找不到再回退到主磁盘。
+/// 主磁盘承载 packer 生成的 overlay，应优先命中；辅助磁盘仅作为完整
+/// LTP 根目录的后备来源。
 /// 需在调用前持有 `ext4_lock`。
 pub(crate) fn resolve_ext4_abs_path(
     path: &str,
@@ -355,28 +360,6 @@ pub(crate) fn resolve_ext4_abs_path(
     seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let abs = crate::fs::normalize_proc_magic_path(path).into_owned();
-
-    // Prefer the secondary disk for OSComp test roots when available.
-    if abs == "/musl" || abs.starts_with("/musl/") || abs == "/glibc" || abs.starts_with("/glibc/")
-    {
-        if let Some(secondary) = secondary_root_inode() {
-            let mut sec_depth = 0usize;
-            let mut sec_seen = Vec::new();
-            match resolve_ext4_path(
-                secondary,
-                &abs,
-                uid,
-                gid,
-                follow_final,
-                &mut sec_depth,
-                &mut sec_seen,
-            ) {
-                Ok(v) => return Ok(v),
-                Err(e) if e == err(SyscallError::ENOENT) => {}
-                Err(e) => return Err(e),
-            }
-        }
-    }
 
     let primary = crate::fs::root_inode_for_path(&abs);
     match resolve_ext4_path(primary, &abs, uid, gid, follow_final, depth, seen_symlinks) {

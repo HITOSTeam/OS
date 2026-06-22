@@ -6,9 +6,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::fs::{
-    File, NamespaceFile, NamespaceKind, OSInode, Pipe, PseudoDir, PseudoFile, PseudoKindTag,
-    PseudoShmFile, RtcFile, inode_logical_path, inode_path_hint, inode_path_in_roots,
-    path_resolves_to_inode,
+    File, NamespaceFile, NamespaceKind, NetSocketFile, OSInode, Pipe, PseudoDir, PseudoFile,
+    PseudoKindTag, PseudoShmFile, RtcFile, inode_logical_path, inode_path_hint,
+    inode_path_in_roots, path_resolves_to_inode,
 };
 use crate::task::manager::pid2process;
 use crate::task::processor::{current_process, current_task};
@@ -277,6 +277,9 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
         return Some(alloc::format!("pipe:[{}]", pipe as *const Pipe as usize));
     }
+    if let Some(sock) = file.as_any().downcast_ref::<NetSocketFile>() {
+        return Some(alloc::format!("socket:[{}]", sock.proc_inode()));
+    }
     if let Some(ns) = file.as_any().downcast_ref::<NamespaceFile>() {
         return Some(ns.target_string());
     }
@@ -322,6 +325,7 @@ fn proc_pid_namespace_target(pid: u32, kind: NamespaceKind) -> Option<String> {
     let ns_id = match kind {
         NamespaceKind::Ipc => proc.try_borrow_mut()?.ipc_ns_id,
         NamespaceKind::Mount => proc.mount_namespace_id(),
+        NamespaceKind::Net => proc.net_namespace_id(),
     };
     Some(kind.target_string(ns_id))
 }
@@ -338,6 +342,7 @@ pub(crate) fn proc_pid_namespace_file(
             Arc::new(NamespaceFile::new_ipc(inner.ipc_ns_id))
         }
         NamespaceKind::Mount => Arc::new(NamespaceFile::new_mount(proc.mount_namespace())),
+        NamespaceKind::Net => Arc::new(NamespaceFile::new_net(proc.net_namespace_id())),
     };
     Some(file)
 }
@@ -403,6 +408,10 @@ fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget
         return proc_pid_namespace_file(pid, NamespaceKind::Mount)
             .map(ProcMagicLinkFollowTarget::File);
     }
+    if rest == "ns/net" {
+        return proc_pid_namespace_file(pid, NamespaceKind::Net)
+            .map(ProcMagicLinkFollowTarget::File);
+    }
     if let Some(fd_name) = rest.strip_prefix("fd/") {
         let fd = parse_proc_fd_component(fd_name)?;
         return proc_pid_fd_file(pid, fd).map(ProcMagicLinkFollowTarget::File);
@@ -421,6 +430,10 @@ fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget
     }
     if tail == "ns/mnt" {
         return proc_pid_namespace_file(pid, NamespaceKind::Mount)
+            .map(ProcMagicLinkFollowTarget::File);
+    }
+    if tail == "ns/net" {
+        return proc_pid_namespace_file(pid, NamespaceKind::Net)
             .map(ProcMagicLinkFollowTarget::File);
     }
     let fd_name = tail.strip_prefix("fd/")?;
@@ -449,7 +462,7 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if !proc_pid_exists(pid) {
         return false;
     }
-    if rest == "cwd" || rest == "ns/ipc" || rest == "ns/mnt" {
+    if rest == "cwd" || rest == "ns/ipc" || rest == "ns/mnt" || rest == "ns/net" {
         return true;
     }
     if let Some(fd_name) = rest.strip_prefix("fd/") {
@@ -464,7 +477,7 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if !proc_pid_task_alive(pid, tid) {
         return false;
     }
-    if tail == "cwd" || tail == "ns/ipc" || tail == "ns/mnt" {
+    if tail == "cwd" || tail == "ns/ipc" || tail == "ns/mnt" || tail == "ns/net" {
         return true;
     }
     tail.strip_prefix("fd/")
@@ -531,6 +544,9 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     if rest == "ns/mnt" {
         return proc_pid_namespace_target(pid, NamespaceKind::Mount);
     }
+    if rest == "ns/net" {
+        return proc_pid_namespace_target(pid, NamespaceKind::Net);
+    }
 
     if let Some(fd_name) = rest.strip_prefix("fd/") {
         let fd = parse_proc_fd_component(fd_name)?;
@@ -549,6 +565,9 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     }
     if tail == "ns/mnt" {
         return proc_pid_namespace_target(pid, NamespaceKind::Mount);
+    }
+    if tail == "ns/net" {
+        return proc_pid_namespace_target(pid, NamespaceKind::Net);
     }
     let fd_name = tail.strip_prefix("fd/")?;
     let fd = parse_proc_fd_component(fd_name)?;

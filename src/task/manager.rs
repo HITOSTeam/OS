@@ -733,6 +733,26 @@ pub fn remove_from_pid2process(pid: usize) {
     }
 }
 
+/// Return whether any non-zombie process still owns the given network namespace.
+///
+/// Zombie PCBs stay in `PID2PCB` until wait4() reaps them, but their fd tables
+/// and address spaces have already been released.  Network namespace teardown
+/// must therefore ignore zombies and only treat live processes as owners.
+pub fn live_process_uses_net_namespace(ns_id: usize) -> bool {
+    let map = PID2PCB.lock();
+    for process in map.values() {
+        let Some(inner) = process.try_borrow_mut() else {
+            // A contended PCB may be in the middle of clone/exit/setns.  Keep
+            // the namespace alive rather than racing teardown against it.
+            return true;
+        };
+        if !inner.is_zombie && inner.net_ns_id == ns_id {
+            return true;
+        }
+    }
+    false
+}
+
 /// 从全局定时器堆中移除所有属于指定任务的定时器（任务退出时清理）
 pub fn remove_timer(task: Arc<TaskControlBlock>) {
     let mut timers = TIMERS.lock();
