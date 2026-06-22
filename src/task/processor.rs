@@ -506,6 +506,16 @@ pub fn request_reschedule_for_wakeup(woken: &Arc<TaskControlBlock>, target_hart:
     NEED_RESCHED[local_hart].store(true, Ordering::Release);
 }
 
+/// 当前 hart 需要在返回用户态前重新调度。
+///
+/// 用于已经有 runnable 任务等待、但当前路径不是严格的 blocked->ready 唤醒
+/// 的场景。例如信号投递给已在就绪队列中的任务时，Linux 可以在 syscall 返回前
+/// 发生抢占；本内核需要显式补一个合作式抢占点。
+pub fn request_reschedule_current_hart() {
+    let local_hart = hart_id() % MAX_HARTS;
+    NEED_RESCHED[local_hart].store(true, Ordering::Release);
+}
+
 /// trap 返回用户态前的抢占点：本 hart 若被标记 `NEED_RESCHED` 就让出当前任务，
 /// 使刚唤醒的高优先级任务尽快得到运行，缓解 starvation。仿 Linux 的
 /// `TIF_NEED_RESCHED` 检查点。
@@ -681,6 +691,26 @@ pub fn should_preempt_current_on_tick() -> bool {
         }
     }
 }
+
+/// syscall-heavy 工作负载可能长期不触发硬件 timer interrupt；返回用户态前
+/// 若本 hart 已经有其他 runnable 任务，则复用 tick 抢占规则补一个合作式
+/// 调度检查，避免 fork 出来的子进程或被唤醒任务饥饿。
+pub fn should_preempt_current_on_syscall_return() -> bool {
+    if fair_ready_task_count() == 0 && !has_ready_rt_at_or_above(RT_PRIO_MIN) {
+        return false;
+    }
+    should_preempt_current_on_tick()
+}
+
+/// Busy-poll 等内核短自旋循环使用的轻量 `need_resched` 判断。
+/// Linux `napi_busy_loop()` 只在真正需要调度时退出忙轮询；不能因为普通
+/// fair runnable 任务存在就每轮让出，否则 50us 的 busy-poll 预算会被
+/// 上下文切换成本放大。
+pub fn should_resched_for_busy_poll() -> bool {
+    let local_hart = hart_id() % MAX_HARTS;
+    NEED_RESCHED[local_hart].swap(false, Ordering::AcqRel) || has_ready_rt_at_or_above(RT_PRIO_MIN)
+}
+
 pub fn idle_task() {
     #[allow(dead_code)]
     static EMPTY_SPINS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -927,8 +957,9 @@ pub fn suspend_current_and_run_next() {
         crate::println!("[kernel] {}", msg);
         exit_group_and_run_next(errno);
     }
-    // There must be an application running.
-    let task = take_current_task().unwrap();
+    let Some(task) = take_current_task() else {
+        return;
+    };
     charge_running_task(&task);
 
     // ---- access current TCB exclusively
@@ -957,8 +988,9 @@ pub fn block_current_and_run_next() {
         crate::println!("[kernel] {}", msg);
         exit_group_and_run_next(errno);
     }
-    // There must be an application running.
-    let task = take_current_task().unwrap();
+    let Some(task) = take_current_task() else {
+        return;
+    };
     charge_running_task(&task);
 
     // ---- access current TCB exclusively
@@ -1137,9 +1169,11 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // same exit-side futex/join cleanup as the current thread.
         let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
         recycle_res.clear();
-        let old_shm_cleanup = {
+        let (old_shm_cleanup, old_mm_token, old_net_ns_id) = {
             let mut process_inner = process.borrow_mut();
             process_inner.children.clear();
+            let old_mm_token = process_inner.memory_set.token();
+            let old_net_ns_id = process_inner.net_ns_id;
             let old_shm_cleanup = process_inner
                 .memory_set
                 .take_sysv_shm_attaches_for_cleanup();
@@ -1152,11 +1186,13 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             // Replace the table Arc instead of clearing it: other CLONE_FILES users
             // may still hold the old Arc and must keep their descriptors alive.
             process_inner.files = Arc::new(spin::Mutex::new(FilesStruct::new()));
-            old_shm_cleanup
+            (old_shm_cleanup, old_mm_token, old_net_ns_id)
         };
+        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
+        crate::syscall::net::cleanup_net_namespace_if_unused(old_net_ns_id);
         // Keep zombie `tasks[]` until wait4() reaps the process so reaping has
         // a deterministic place to drop any lingering task Arcs.
     }
@@ -1266,9 +1302,11 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
 
     let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();
-    let old_shm_cleanup = {
+    let (old_shm_cleanup, old_mm_token, old_net_ns_id) = {
         let mut process_inner = process.borrow_mut();
         process_inner.children.clear();
+        let old_mm_token = process_inner.memory_set.token();
+        let old_net_ns_id = process_inner.net_ns_id;
         let old_shm_cleanup = process_inner
             .memory_set
             .take_sysv_shm_attaches_for_cleanup();
@@ -1280,11 +1318,13 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         // Replace the table Arc instead of clearing it: other CLONE_FILES users
         // may still hold the old Arc and must keep their descriptors alive.
         process_inner.files = Arc::new(spin::Mutex::new(FilesStruct::new()));
-        old_shm_cleanup
+        (old_shm_cleanup, old_mm_token, old_net_ns_id)
     };
+    crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
     if let Some(old_shm) = old_shm_cleanup {
         crate::syscall::sysv_shm::exit_cleanup(&old_shm);
     }
+    crate::syscall::net::cleanup_net_namespace_if_unused(old_net_ns_id);
 
     // Same as `exit_current_and_run_next()`: keep zombie `tasks[]` until wait4().
 

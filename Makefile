@@ -201,7 +201,7 @@ USER_APPS: user_apps
 # Rebuild the ext4 image when any of the following holds:
 #   1. the image itself is missing
 #   2. any user-app binary is newer than the image
-#   3. any file under ext4-fs-packer/extra is newer than the image
+#   3. any file under ext4-fs-packer/extra or extra-$(ARCH) is newer than the image
 #   4. the base image is newer than the packed image
 #   5. the caller forces it with EXT4_REBUILD=1
 ext4_img: user_apps $(EXT4_BASE_DEP)
@@ -209,8 +209,13 @@ ext4_img: user_apps $(EXT4_BASE_DEP)
 	[ -f "$(EXT4_IMG)" ] || needs=1; \
 	if [ $$needs -eq 0 ] && find "$(APP_DIR)" -type f -newer "$(EXT4_IMG)" \
 	    2>/dev/null | head -n1 | grep -q .; then needs=1; fi; \
-	if [ $$needs -eq 0 ] && find ../ext4-fs-packer/extra -type f -newer \
-	    "$(EXT4_IMG)" 2>/dev/null | head -n1 | grep -q .; then needs=1; fi; \
+	if [ $$needs -eq 0 ]; then \
+		for dir in ../ext4-fs-packer/extra ../ext4-fs-packer/extra-$(ARCH); do \
+			[ -d "$$dir" ] || continue; \
+			if find "$$dir" -type f -newer "$(EXT4_IMG)" \
+			    2>/dev/null | head -n1 | grep -q .; then needs=1; break; fi; \
+		done; \
+	fi; \
 	if [ $$needs -eq 0 ] && [ -n "$(EXT4_BASE_IMG)" ] && [ -f "$(EXT4_BASE_IMG)" ] \
 	    && [ "$(EXT4_BASE_IMG)" -nt "$(EXT4_IMG)" ]; then needs=1; fi; \
 	[ "$(EXT4_REBUILD)" = "1" ] && needs=1; \
@@ -219,7 +224,7 @@ ext4_img: user_apps $(EXT4_BASE_DEP)
 	else \
 		echo "🔧 Building ext4 filesystem image..."; \
 		cd ../ext4-fs-packer && CARGO_BUILD_TARGET=$(HOST_TRIPLE) cargo run --release -- \
-			-u ../os/$(APP_DIR) -e extra $(EXT4_BASE_ARG) \
+			-u ../os/$(APP_DIR) -e extra --arch-extra extra-$(ARCH) $(EXT4_BASE_ARG) \
 			-t target -S $(EXT4_SIZE); \
 		echo "✅ Ext4 image created: $(EXT4_IMG)"; \
 	fi

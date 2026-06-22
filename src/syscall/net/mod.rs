@@ -5,16 +5,26 @@
 /// - 定义与 Linux ABI 兼容的常量（地址族、套接字类型、选项名、消息标志）
 /// - 提供在内核态与用户态之间安全传递套接字地址、iovec、msghdr 的辅助函数
 /// - 为消息队列异步通知（mq_notify SIGEV_THREAD）提供跨进程套接字操作接口
+pub(crate) mod cbpf;
+mod consts;
+pub(crate) mod netdev;
 mod netlink;
 mod sendrecv;
 mod socket;
 mod sockopt;
 mod unix;
+pub(crate) mod wireguard;
+mod wireguard_crypto;
 
-use self::netlink::{NetlinkSocketFile, SockAddrNl, parse_sockaddr_nl, write_sockaddr_nl};
+pub(crate) use consts::*;
+
+use self::netlink::{
+    NetlinkSender, NetlinkSocketFile, SockAddrNl, parse_sockaddr_nl_connect,
+    parse_sockaddr_nl_kernel_peer, write_sockaddr_nl,
+};
 use self::unix::{
-    SockAddrUn, UnixSocketFile, bind_unix_socket, parse_unix_bound_addr, write_msg_name_un,
-    write_sockaddr_un,
+    UnixSocketFile, bind_unix_socket, parse_unix_bound_addr, read_sockaddr_un_family,
+    write_msg_name_un, write_sockaddr_un,
 };
 
 pub use sendrecv::*;
@@ -25,6 +35,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fs::File;
 use crate::mm::{
@@ -35,6 +46,104 @@ use crate::task::manager::pid2process;
 use crate::task::processor::current_files;
 use crate::trap::get_current_token;
 
+static NEXT_SOCKET_INODE: AtomicU64 = AtomicU64::new(100_000);
+
+pub(crate) fn alloc_socket_inode() -> u64 {
+    NEXT_SOCKET_INODE.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) fn cleanup_net_namespace_if_unused(ns_id: usize) {
+    if ns_id == 0
+        || crate::task::manager::live_process_uses_net_namespace(ns_id)
+        || crate::fs::net_namespace_file_refs(ns_id) != 0
+    {
+        return;
+    }
+    crate::fs::cleanup_net_socket_namespace(ns_id);
+    socket::cleanup_net_namespace(ns_id);
+    unix::cleanup_net_namespace(ns_id);
+    NetlinkSocketFile::cleanup_net_namespace(ns_id);
+    netdev::cleanup_net_namespace(ns_id);
+    crate::net::cleanup_namespace(ns_id);
+}
+
+/// 套接字层记录的一个时间戳（秒 + 纳秒），用于 `SO_TIMESTAMP*` 选项返回收包时刻。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SocketTimestamp {
+    pub(crate) sec: i64,
+    pub(crate) nsec: i64,
+}
+
+/// IPv4 套接字错误队列（`MSG_ERRQUEUE`）中的一条条目，对应 Linux `sock_extended_err`。
+///
+/// 当启用 `IP_RECVERR` 后，本机产生的或 ICMP 反馈的错误会以此结构入队，
+/// 供 `recvmsg(MSG_ERRQUEUE)` 读取。`offender` 为触发错误的对端地址/端口（可选），
+/// `payload` 为随错误一同返回的原始数据片段。
+#[derive(Clone, Debug)]
+pub(crate) struct Ipv4ErrorQueueEntry {
+    pub(crate) errno: u32,
+    pub(crate) origin: u8,
+    pub(crate) ty: u8,
+    pub(crate) code: u8,
+    pub(crate) info: u32,
+    pub(crate) data: u32,
+    pub(crate) offender: Option<([u8; 4], u16)>,
+    pub(crate) payload: Vec<u8>,
+}
+
+impl Ipv4ErrorQueueEntry {
+    /// 构造一条「本地来源」（`SO_EE_ORIGIN_LOCAL`）的错误条目，仅带 errno。
+    pub(crate) fn local(errno: i32) -> Self {
+        Self::local_with_info(errno, 0, None, Vec::new())
+    }
+
+    /// 构造一条本地来源错误条目，可附带 `info`（如 MTU 值）、触发方地址与负载。
+    ///
+    /// `errno` 会被规整为非负值后存为 `u32`，与 Linux 错误队列字段语义一致。
+    pub(crate) fn local_with_info(
+        errno: i32,
+        info: u32,
+        offender: Option<([u8; 4], u16)>,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            errno: errno.max(0) as u32,
+            origin: SO_EE_ORIGIN_LOCAL,
+            ty: 0,
+            code: 0,
+            info,
+            data: 0,
+            offender,
+            payload,
+        }
+    }
+}
+
+/// 套接字时间戳模式，对应 `SO_TIMESTAMP(NS)` 新旧两套 ABI 的取值组合。
+///
+/// `*Old`/`*New` 区分 32 位 time_t 与 time64 ABI；`Timeval` 用秒+微秒、
+/// `Timespec` 用秒+纳秒。`Off` 表示未开启时间戳。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SocketTimestampMode {
+    #[default]
+    Off,
+    TimevalOld,
+    TimespecOld,
+    TimevalNew,
+    TimespecNew,
+}
+
+impl SocketTimestamp {
+    /// 取当前 CLOCK_REALTIME 时刻作为时间戳。
+    pub(crate) fn now() -> Self {
+        let (sec, nsec) = crate::syscall::time_sys::realtime_now_timespec();
+        Self { sec, nsec }
+    }
+}
+
+/// 判断给定文件对象是否为任意一种套接字（INET/UnixPair/Unix/Netlink/Packet/Raw）。
+///
+/// 套接字专用的系统调用（如 `getsockopt`、`bind`）入口先用它过滤掉普通文件 fd。
 pub(crate) fn is_socket_file(file: &(dyn File + Send + Sync)) -> bool {
     file.as_any()
         .downcast_ref::<crate::fs::NetSocketFile>()
@@ -45,90 +154,130 @@ pub(crate) fn is_socket_file(file: &(dyn File + Send + Sync)) -> bool {
             .is_some()
         || file.as_any().downcast_ref::<UnixSocketFile>().is_some()
         || file.as_any().downcast_ref::<NetlinkSocketFile>().is_some()
+        || file.as_any().downcast_ref::<PacketSocketFile>().is_some()
+        || file.as_any().downcast_ref::<RawSocketFile>().is_some()
+        || file.as_any().downcast_ref::<VsockSocketFile>().is_some()
 }
 
-// ── 地址族（AF_*,Address family）常量，对应 Linux <bits/socket.h> ──────────────────────────
-/// unspecified
-pub(super) const AF_UNSPEC: u16 = 0;
-/// IPC 套接字
-pub(super) const AF_UNIX: u16 = 1;
-/// ipv4 地址族
-pub(super) const AF_INET: u16 = 2;
-// 特殊套接字 ,可以读取网络配置
-pub(super) const AF_NETLINK: u16 = 16;
+/// 返回该套接字最近一次记录的收包时间戳（若未开启时间戳或类型不支持则为 `None`）。
+///
+/// 按套接字具体类型向下转型后转发到各自实现；Netlink 不携带数据时间戳，故不在列。
+pub(crate) fn socket_last_timestamp(file: &(dyn File + Send + Sync)) -> Option<SocketTimestamp> {
+    if let Some(sock) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
+        return sock.socket_timestamp();
+    }
+    if let Some(sock) = file.as_any().downcast_ref::<crate::fs::SocketPairEnd>() {
+        return sock.socket_timestamp();
+    }
+    if let Some(sock) = file.as_any().downcast_ref::<UnixSocketFile>() {
+        return sock.socket_timestamp();
+    }
+    if let Some(sock) = file.as_any().downcast_ref::<PacketSocketFile>() {
+        return sock.socket_timestamp();
+    }
+    if let Some(sock) = file.as_any().downcast_ref::<RawSocketFile>() {
+        return sock.socket_timestamp();
+    }
+    None
+}
 
-// ── 套接字类型（SOCK_*）及创建标志 ───────────────────────────────────────────
-pub(super) const SOCK_STREAM: usize = 1;
-pub(super) const SOCK_DGRAM: usize = 2;
-/// 直接处理IP 包 标志
-pub(super) const SOCK_RAW: usize = 3;
-/// SCTP 特殊
-pub(super) const SOCK_SEQPACKET: usize = 5;
-/// 以下不是 纯粹的socket 而是 结合使用的标志位(SOCK是创建标志，O 是fcntl设置标志)
-/// 创建时即设置 O_NONBLOCK，避免额外的 fcntl 调用
+/// 查询套接字当前的时间戳模式；不支持时间戳的类型一律返回 [`SocketTimestampMode::Off`]。
+pub(crate) fn socket_timestamp_mode(file: &(dyn File + Send + Sync)) -> SocketTimestampMode {
+    if let Some(sock) = file.as_any().downcast_ref::<crate::fs::NetSocketFile>() {
+        return sock.timestamp_mode();
+    }
+    if let Some(sock) = file.as_any().downcast_ref::<PacketSocketFile>() {
+        return sock.timestamp_mode();
+    }
+    if let Some(sock) = file.as_any().downcast_ref::<RawSocketFile>() {
+        return sock.timestamp_mode();
+    }
+    SocketTimestampMode::Off
+}
 
-pub(super) const SOCK_NONBLOCK: usize = 0x800;
-/// 创建时即设置 FD_CLOEXEC，防止 fd 泄漏到子进程
-pub(super) const SOCK_CLOEXEC: usize = 0x80000;
-pub(super) const O_NONBLOCK: u32 = 0x800;
-/// O_PATH fd 只能用于路径操作，不能进行 I/O，因此对套接字无效
-pub(super) const O_PATH: u32 = 0x200000;
-pub(super) const FD_CLOEXEC: u32 = 1;
+/// 套接字上的 `write(2)` 走与 `sendto(2)` 相同的发送路径。
+///
+/// 这样数据报套接字才能按协议返回错误，并且能发送零长度数据包。
+pub(crate) fn socket_write_uses_sendto(file: &(dyn File + Send + Sync)) -> bool {
+    file.as_any()
+        .downcast_ref::<crate::fs::NetSocketFile>()
+        .is_some()
+        || file
+            .as_any()
+            .downcast_ref::<crate::fs::SocketPairEnd>()
+            .is_some()
+        || file.as_any().downcast_ref::<UnixSocketFile>().is_some()
+        || file.as_any().downcast_ref::<NetlinkSocketFile>().is_some()
+        || file.as_any().downcast_ref::<PacketSocketFile>().is_some()
+        || file.as_any().downcast_ref::<RawSocketFile>().is_some()
+        || file.as_any().downcast_ref::<VsockSocketFile>().is_some()
+}
 
-// ── setsockopt/getsockopt 的协议层（level）标识 ──────────────────────────────
-pub(super) const SOL_IP: usize = 0;
-/// SOL_SOCKET = 1，作用于通用套接字层而非具体协议
-pub(super) const SOL_SOCKET: usize = 1;
-pub(super) const SOL_TCP: usize = 6;
-pub(super) const SOL_UDP: usize = 17;
+/// 套接字上的 `read(2)` 对齐 Linux `sock_read_iter()`，复用接收路径。
+///
+/// 这样 fd 标志、待处理错误和数据包截断规则都能与 `recvfrom(2)` 保持一致。
+pub(crate) fn socket_read_uses_recvfrom(file: &(dyn File + Send + Sync)) -> bool {
+    file.as_any()
+        .downcast_ref::<crate::fs::NetSocketFile>()
+        .is_some()
+        || file
+            .as_any()
+            .downcast_ref::<crate::fs::SocketPairEnd>()
+            .is_some()
+        || file.as_any().downcast_ref::<UnixSocketFile>().is_some()
+        || file.as_any().downcast_ref::<NetlinkSocketFile>().is_some()
+        || file.as_any().downcast_ref::<PacketSocketFile>().is_some()
+        || file.as_any().downcast_ref::<RawSocketFile>().is_some()
+        || file.as_any().downcast_ref::<VsockSocketFile>().is_some()
+}
 
-// ── SOL_SOCKET 层选项名 ───────────────────────────────────────────────────────
-/// 允许复用TIME_WAIT
-
-pub(super) const SO_REUSEADDR: usize = 2;
-/// 设置大小
-pub(super) const SO_SNDBUF: usize = 7;
-pub(super) const SO_RCVBUF: usize = 8;
-/// 带外数据内联到普通数据流，而非通过独立通道接收
-pub(super) const SO_OOBINLINE: usize = 10;
-/// 获取对端进程凭证（pid/uid/gid），仅 Unix 域套接字支持
-pub(super) const SO_PEERCRED: usize = 17;
-/// 与 SO_SNDBUF/SO_RCVBUF 的区别：FORCE 变体绕过系统上限，需要 CAP_NET_ADMIN
-pub(super) const SO_SNDBUFFORCE: usize = 32;
-pub(super) const SO_RCVBUFFORCE: usize = 33;
-/// 将 eBPF 程序附加到套接字，用于流量过滤
-pub(super) const SO_ATTACH_BPF: usize = 50;
-/// IP 组播组加入/离开选项，用于 setsockopt(SOL_IP, MCAST_JOIN_GROUP, ...)
-pub(super) const MCAST_JOIN_GROUP: usize = 42;
-pub(super) const MCAST_LEAVE_GROUP: usize = 45;
-
-// ── sendmsg/recvmsg flags ────────────────────────────────────────────────────
-/// 带外（紧急）数据标志
-pub(super) const MSG_OOB: usize = 0x1;
-/// 窥视缓冲区内容而不消耗数据
-pub(super) const MSG_PEEK: usize = 0x2;
-pub(super) const MSG_WAITALL: usize = 0x100;
-/// recvmsg 返回实际数据长度而非截断后的长度
-pub(super) const MSG_TRUNC: usize = 0x20;
-pub(super) const MSG_DONTWAIT: usize = 0x40;
-/// 读取错误队列中的异步错误（如 ICMP 不可达），而非正常数据
-pub(super) const MSG_ERRQUEUE: usize = 0x2000;
-/// 发送端请求不因对端未处理 SIGPIPE 而终止进程
-pub(super) const MSG_NOSIGNAL: usize = 0x4000;
-/// 提示内核后续还有更多数据，可与当前数据合并（类似 TCP_CORK）
-pub(super) const MSG_MORE: usize = 0x8000;
-/// recvmmsg 专用：收到第一条消息后立即返回，不再等待后续消息
-pub(super) const MSG_WAITFORONE: usize = 0x10000;
-
-/// scatter/gather I/O 的最大 iovec 数量上限，与 Linux 保持一致
-pub(super) const UIO_MAXIOV: usize = 1024;
-/// mq_notify SIGEV_THREAD 模式下，通知 cookie 的固定字节长度
-pub(super) const MQ_THREAD_NOTIFY_COOKIE_LEN: usize = 32;
+/// 判断 `socket(AF_INET, SOCK_RAW, protocol)` 请求的协议号是否受支持。
+///
+/// 显式实现的协议（ICMP/IGMP/TCP/UDP/RAW）直接放行；其余小于 `IPPROTO_RAW`(255)
+/// 的协议号按 Linux 行为也接受（内核创建 raw socket 时不预先拒绝未知协议）。
+pub(super) fn raw_protocol_supported(protocol: usize) -> bool {
+    protocol != 0
+        && (matches!(
+            protocol,
+            IPPROTO_ICMP | IPPROTO_IGMP | IPPROTO_TCP | IPPROTO_UDP | IPPROTO_RAW
+        ) || protocol < IPPROTO_RAW)
+}
 
 /// 内核内部传递文件对象的类型别名，要求可跨线程共享（Send + Sync）
 pub(super) type FileArc = Arc<dyn File + Send + Sync>;
 
-/// 与 Linux `struct iovec` ABI 兼容的 scatter/gather 缓冲区描述符。
+/// Unix 套接字控制消息中的 `SCM_RIGHTS` 载荷。
+///
+/// Linux 传递的是打开文件描述对象；这里用 `Arc<File>` 克隆同一个内核文件对象，
+/// 接收端再安装成新的 fd，从而保持偏移、socket 状态等共享语义。
+#[derive(Clone)]
+pub(crate) struct ScmRights {
+    files: Vec<Arc<dyn File + Send + Sync>>,
+}
+
+impl ScmRights {
+    /// 用一组待传递的文件对象构造 `SCM_RIGHTS` 载荷。
+    pub(crate) fn new(files: Vec<Arc<dyn File + Send + Sync>>) -> Self {
+        Self { files }
+    }
+
+    /// 待传递的文件个数。
+    pub(crate) fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// 是否不携带任何文件。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// 遍历待传递的文件对象。
+    pub(crate) fn iter(&self) -> core::slice::Iter<'_, Arc<dyn File + Send + Sync>> {
+        self.files.iter()
+    }
+}
+
+/// 与 Linux `struct iovec` ABI 兼容的分散/聚合缓冲区描述符。
 ///
 /// `base` 为用户空间虚拟地址，`len` 为字节数。
 #[repr(C)]
@@ -153,7 +302,7 @@ pub(super) struct MsgHdr {
     /// 指向用户空间 `iovec` 数组的指针
     pub(super) msg_iov: usize,
     pub(super) msg_iovlen: usize,
-    /// 辅助数据（control message）缓冲区的用户空间指针
+    /// 辅助数据（控制消息）缓冲区的用户空间指针
     pub(super) msg_control: usize,
     pub(super) msg_controllen: usize,
     /// 接收时由内核填充的标志位（如 MSG_TRUNC、MSG_CTRUNC）
@@ -183,11 +332,103 @@ pub(super) struct UserTimespec {
 
 /// 套接字对端进程凭证，对应 `SO_PEERCRED` 选项返回的 `struct ucred`。
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct UCred {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UCred {
     pub(super) pid: u32,
     pub(super) uid: u32,
     pub(super) gid: u32,
+}
+
+impl UCred {
+    /// 取当前进程的有效凭证（pid/euid/egid），用于 `SO_PEERCRED`。
+    pub(crate) fn current() -> Self {
+        let proc = crate::task::processor::current_process();
+        let inner = proc.borrow_mut();
+        Self {
+            pid: proc.pid.0 as u32,
+            uid: inner.euid as u32,
+            gid: inner.egid as u32,
+        }
+    }
+
+    /// 取当前进程的发送凭证（pid/uid/gid），用于自动生成 `SCM_CREDENTIALS`。
+    pub(crate) fn current_scm() -> Self {
+        let proc = crate::task::processor::current_process();
+        let inner = proc.borrow_mut();
+        Self {
+            pid: proc.pid.0 as u32,
+            uid: inner.uid as u32,
+            gid: inner.gid as u32,
+        }
+    }
+}
+
+/// 一次逻辑发送所携带的 Unix 套接字辅助数据（控制消息）。
+///
+/// 可同时携带传递的文件描述符（`SCM_RIGHTS`）与发送方凭证（`SCM_CREDENTIALS`）。
+#[derive(Clone, Default)]
+pub(crate) struct ScmControl {
+    pub(crate) rights: Option<ScmRights>,
+    pub(crate) credentials: Option<UCred>,
+}
+
+impl ScmControl {
+    /// 是否携带至少一个待传递的文件描述符。
+    pub(crate) fn has_rights(&self) -> bool {
+        self.rights
+            .as_ref()
+            .is_some_and(|rights| !rights.is_empty())
+    }
+
+    /// 是否既无可传递的 fd 也无凭证（即无需附带任何控制消息）。
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.has_rights() && self.credentials.is_none()
+    }
+
+    /// 若发送侧规则要求携带凭证且尚未填充，则补上当前进程凭证。
+    pub(crate) fn ensure_credentials_if(&mut self, needed: bool) {
+        if needed && self.credentials.is_none() {
+            self.credentials = Some(UCred::current_scm());
+        }
+    }
+
+    /// 取走（move）非空的 `SCM_RIGHTS`，用于接收端安装这些 fd。
+    pub(crate) fn take_rights(&mut self) -> Option<ScmRights> {
+        self.rights.take().filter(|rights| !rights.is_empty())
+    }
+
+    /// 合并另一份控制数据：fd 列表追加合并，凭证缺省时采用对方的。
+    pub(crate) fn merge_from(&mut self, mut other: Self) {
+        if let Some(rights) = other.rights.take().filter(|rights| !rights.is_empty()) {
+            if let Some(existing) = self.rights.as_mut() {
+                existing.files.extend(rights.files);
+            } else {
+                self.rights = Some(rights);
+            }
+        }
+        if self.credentials.is_none() {
+            self.credentials = other.credentials;
+        }
+    }
+
+    /// 返回去掉凭证后的副本（仅保留 fd 传递部分）。
+    pub(crate) fn without_credentials(mut self) -> Self {
+        self.credentials = None;
+        self
+    }
+
+    /// 控制消息是否会被当前接收端实际暴露给用户。
+    pub(crate) fn visible_for_passcred(&self, passcred: bool) -> bool {
+        self.has_rights() || (passcred && self.credentials.is_some())
+    }
+}
+
+/// Packet/RAW 套接字上随单个包传播的发送元数据。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PacketMetadata {
+    pub(crate) mark: u32,
+    pub(crate) priority: u32,
+    pub(crate) orig_ifindex: i32,
 }
 
 /// 与 Linux `struct sockaddr_in` ABI 兼容的 IPv4 套接字地址。
@@ -197,9 +438,49 @@ pub(super) struct UCred {
 #[derive(Clone, Copy)]
 pub(super) struct SockAddrIn {
     sin_family: u16,
-    sin_port: u16, // network byte order
-    sin_addr: u32, // network byte order
+    sin_port: u16, // 网络字节序
+    sin_addr: u32, // 网络字节序
     sin_zero: [u8; 8],
+}
+
+/// 与 Linux `struct sockaddr_in6` ABI 兼容的 IPv6 套接字地址。
+///
+/// 当前内核没有完整 IPv6 数据面，只消费/返回 IPv4-mapped IPv6 地址，
+/// 以兼容 Linux 双栈套接字的常见控制流。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct SockAddrIn6 {
+    sin6_family: u16,
+    sin6_port: u16,
+    sin6_flowinfo: u32,
+    sin6_addr: [u8; 16],
+    sin6_scope_id: u32,
+}
+
+/// 与 Linux `struct sockaddr_ll` ABI 兼容的 packet 套接字地址。
+///
+/// `sll_protocol` 与 Linux 一样保持网络字节序；AF_PACKET 的 `protocol`
+/// 参数也按原始 `__be16` 值保存。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct SockAddrLl {
+    pub(super) sll_family: u16,
+    pub(super) sll_protocol: u16,
+    pub(super) sll_ifindex: i32,
+    pub(super) sll_hatype: u16,
+    pub(super) sll_pkttype: u8,
+    pub(super) sll_halen: u8,
+    pub(super) sll_addr: [u8; 8],
+}
+
+/// `read_sockaddr_in` 的解析结果：已转为主机字节序的 IPv4 地址与端口，
+/// 外加原始的地址族 `family` 和用户传入长度 `len`（供上层做进一步的 ABI 校验）。
+#[derive(Clone, Copy)]
+pub(super) struct ParsedSockAddrIn {
+    pub(super) family: u16,
+    pub(super) ip: smoltcp::wire::IpAddress,
+    pub(super) port: u16,
+    pub(super) len: usize,
 }
 
 /// 从当前进程的文件描述符表中获取指定 fd 对应的文件对象。
@@ -279,7 +560,7 @@ fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {
         let Some(dst) = it.next() else {
             break;
         };
-        // SAFETY: dst is a valid mutable pointer from UserBuffer iterator; src[copied] is in bounds.
+        // SAFETY: dst 来自 UserBuffer 迭代器，是有效可写指针；src[copied] 不越界。
         unsafe { *dst = src[copied] };
         copied += 1;
     }
@@ -292,7 +573,7 @@ fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {
 fn copy_user_buffer_to_vec(buf: UserBuffer) -> Vec<u8> {
     let mut data = Vec::with_capacity(buf.len());
     for p in buf.into_iter() {
-        // SAFETY: p is a valid pointer from UserBuffer iterator which guarantees page is mapped.
+        // SAFETY: p 来自 UserBuffer 迭代器，迭代器保证对应页面已映射。
         data.push(unsafe { *p });
     }
     data
@@ -300,31 +581,214 @@ fn copy_user_buffer_to_vec(buf: UserBuffer) -> Vec<u8> {
 
 /// 从用户空间读取 `sockaddr_in` 并解析为内核使用的 IPv4 地址和端口。
 ///
-/// `sin_family` 为 0 时按 AF_INET 静默处理，与 Linux 行为保持一致（部分旧程序不填写 family）。
+/// 按 Linux `move_addr_to_kernel()` + IPv4 层校验顺序处理：
+/// 先根据用户提供的长度触碰地址内存，坏地址返回 EFAULT；之后长度不足才返回 EINVAL。
+/// `sin_family` 为 0 时按 AF_INET 静默处理，与 raw 套接字的兼容路径一致。
 /// 端口和地址均以网络字节序存储，此处转换为主机字节序后再返回。
+pub(super) fn read_sockaddr_in(user_ptr: usize, len: usize) -> Result<ParsedSockAddrIn, isize> {
+    if len > SOCKADDR_STORAGE_SIZE {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if len != 0 && user_ptr == 0 {
+        return Err(err(SyscallError::EFAULT));
+    }
+    let mut storage = [0u8; SOCKADDR_STORAGE_SIZE];
+    let token = get_current_token();
+    if len > 0 {
+        if try_copy_from_user(token, user_ptr as *const u8, &mut storage[..len]).is_err() {
+            return Err(err(SyscallError::EFAULT));
+        }
+    }
+    if len < size_of::<u16>() {
+        return Err(err(SyscallError::EINVAL));
+    }
+    let family = unsafe { core::ptr::read_unaligned(storage.as_ptr() as *const u16) };
+    if len < size_of::<SockAddrIn>() {
+        return Ok(ParsedSockAddrIn {
+            family,
+            ip: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
+            port: 0,
+            len,
+        });
+    }
+    // SAFETY: `storage` 至少包含完整 sockaddr_in，但字节数组只有 u8 对齐。
+    // 使用 read_unaligned 符合 C ABI 的按字节复制语义。
+    let sa = unsafe { core::ptr::read_unaligned(storage.as_ptr() as *const SockAddrIn) };
+    let port = u16::from_be(sa.sin_port);
+    let ip_raw = u32::from_be(sa.sin_addr);
+    let ip = smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(
+        &ip_raw.to_be_bytes(),
+    ));
+    Ok(ParsedSockAddrIn {
+        family: sa.sin_family,
+        ip,
+        port,
+        len,
+    })
+}
+
+/// 读取并校验 `sockaddr_in`，返回 IPv4 地址与端口（主机字节序）。
+///
+/// 在 [`read_sockaddr_in`] 基础上追加 IPv4 专用校验：长度必须足够容纳完整
+/// `sockaddr_in`（否则 EINVAL），地址族只接受 `AF_INET`/`AF_UNSPEC`（否则 EAFNOSUPPORT）。
 pub(super) fn parse_sockaddr_in(
     user_ptr: usize,
     len: usize,
 ) -> Result<(smoltcp::wire::Ipv4Address, u16), isize> {
-    if user_ptr == 0 || len < size_of::<SockAddrIn>() {
+    let sa = read_sockaddr_in(user_ptr, len)?;
+    if sa.len < size_of::<SockAddrIn>() {
         return Err(err(SyscallError::EINVAL));
     }
-    if len > i32::MAX as usize {
+    if sa.family != AF_INET && sa.family != AF_UNSPEC {
+        return Err(err(SyscallError::EAFNOSUPPORT));
+    }
+    let smoltcp::wire::IpAddress::Ipv4(ip) = sa.ip else {
+        return Err(err(SyscallError::EAFNOSUPPORT));
+    };
+    Ok((ip, sa.port))
+}
+
+fn ipv4_from_in6_addr(addr: [u8; 16]) -> Option<smoltcp::wire::Ipv4Address> {
+    if addr == [0; 16] {
+        return Some(smoltcp::wire::Ipv4Address::UNSPECIFIED);
+    }
+    if addr[..10].iter().all(|byte| *byte == 0) && addr[10] == 0xff && addr[11] == 0xff {
+        return Some(smoltcp::wire::Ipv4Address::from_bytes(&addr[12..16]));
+    }
+    if addr[..15].iter().all(|byte| *byte == 0) && addr[15] == 1 {
+        return Some(smoltcp::wire::Ipv4Address::new(127, 0, 0, 1));
+    }
+    None
+}
+
+fn in6_addr_from_ipv4(ip: smoltcp::wire::Ipv4Address) -> [u8; 16] {
+    if ip == smoltcp::wire::Ipv4Address::UNSPECIFIED {
+        return [0; 16];
+    }
+    let b = ip.as_bytes();
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, b[0], b[1], b[2], b[3],
+    ]
+}
+
+fn in6_addr_from_ip(ip: smoltcp::wire::IpAddress) -> [u8; 16] {
+    match ip {
+        smoltcp::wire::IpAddress::Ipv4(ip) => in6_addr_from_ipv4(ip),
+        smoltcp::wire::IpAddress::Ipv6(ip) => {
+            let mut out = [0u8; 16];
+            out.copy_from_slice(ip.as_bytes());
+            out
+        }
+    }
+}
+
+pub(super) fn read_sockaddr_in_for_domain(
+    user_ptr: usize,
+    len: usize,
+    socket_domain: u16,
+) -> Result<ParsedSockAddrIn, isize> {
+    if socket_domain == AF_INET {
+        return read_sockaddr_in(user_ptr, len);
+    }
+    if socket_domain != AF_INET6 {
+        return Err(err(SyscallError::EAFNOSUPPORT));
+    }
+    if len > SOCKADDR_STORAGE_SIZE {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if len != 0 && user_ptr == 0 {
+        return Err(err(SyscallError::EFAULT));
+    }
+    if len < size_of::<u16>() {
         return Err(err(SyscallError::EINVAL));
     }
     let token = get_current_token();
-    let Some(sa) = try_read_user_value(token, user_ptr as *const SockAddrIn) else {
+    let Some(family) = try_read_user_value::<u16>(token, user_ptr as *const u16) else {
         return Err(err(SyscallError::EFAULT));
     };
-    if sa.sin_family != AF_INET {
-        if sa.sin_family != 0 {
-            return Err(err(SyscallError::EAFNOSUPPORT));
-        }
+    if family == AF_UNSPEC {
+        return Ok(ParsedSockAddrIn {
+            family,
+            ip: smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
+            port: 0,
+            len,
+        });
     }
-    let port = u16::from_be(sa.sin_port);
-    let ip_raw = u32::from_be(sa.sin_addr);
-    let ip = smoltcp::wire::Ipv4Address::from_bytes(&ip_raw.to_be_bytes());
-    Ok((ip, port))
+    if family != AF_INET6 {
+        return Err(err(SyscallError::EAFNOSUPPORT));
+    }
+    if len < size_of::<SockAddrIn6>() {
+        return Err(err(SyscallError::EINVAL));
+    }
+    let Some(sa) = try_read_user_value::<SockAddrIn6>(token, user_ptr as *const SockAddrIn6) else {
+        return Err(err(SyscallError::EFAULT));
+    };
+    let ip = if let Some(ip) = ipv4_from_in6_addr(sa.sin6_addr) {
+        smoltcp::wire::IpAddress::Ipv4(ip)
+    } else {
+        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_bytes(&sa.sin6_addr))
+    };
+    Ok(ParsedSockAddrIn {
+        family,
+        ip,
+        port: u16::from_be(sa.sin6_port),
+        len,
+    })
+}
+
+pub(super) fn parse_sockaddr_in_for_domain(
+    user_ptr: usize,
+    len: usize,
+    socket_domain: u16,
+) -> Result<(smoltcp::wire::IpAddress, u16), isize> {
+    let sa = read_sockaddr_in_for_domain(user_ptr, len, socket_domain)?;
+    let required = if sa.family == AF_INET6 {
+        size_of::<SockAddrIn6>()
+    } else {
+        size_of::<SockAddrIn>()
+    };
+    if sa.len < required {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if sa.family != socket_domain && sa.family != AF_UNSPEC {
+        return Err(err(SyscallError::EAFNOSUPPORT));
+    }
+    Ok((sa.ip, sa.port))
+}
+
+/// 从用户空间读取 Linux `sockaddr_ll`，用于 AF_PACKET bind/sendto。
+///
+/// 参考 Linux `packet_bind()`：长度不足或 family 非 AF_PACKET 均返回 EINVAL；
+/// 用户指针不可读返回 EFAULT。
+pub(super) fn parse_sockaddr_ll(user_ptr: usize, len: usize) -> Result<SockAddrLl, isize> {
+    if len > SOCKADDR_STORAGE_SIZE {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if len < size_of::<SockAddrLl>() {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if user_ptr == 0 {
+        return Err(err(SyscallError::EFAULT));
+    }
+    let token = get_current_token();
+    let mut storage = [0u8; SOCKADDR_STORAGE_SIZE];
+    if try_copy_from_user(token, user_ptr as *const u8, &mut storage[..len]).is_err() {
+        return Err(err(SyscallError::EFAULT));
+    }
+    let sa = unsafe { core::ptr::read_unaligned(storage.as_ptr() as *const SockAddrLl) };
+    if sa.sll_family != AF_PACKET {
+        return Err(err(SyscallError::EINVAL));
+    }
+    Ok(sa)
+}
+
+/// 校验 `sendto`/`sendmsg` 给出的 `sockaddr_ll`：硬件地址长度 `sll_halen`
+/// 不得超过 `sll_addr` 数组容量，否则返回 EINVAL。
+pub(super) fn validate_sockaddr_ll_send(sa: &SockAddrLl) -> Result<(), isize> {
+    if usize::from(sa.sll_halen) > sa.sll_addr.len() {
+        return Err(err(SyscallError::EINVAL));
+    }
+    Ok(())
 }
 
 /// 将内核侧的 IPv4 地址和端口序列化为 `sockaddr_in` 写回用户空间。
@@ -363,7 +827,7 @@ pub(super) fn write_sockaddr_in(
     // 用户缓冲区可能小于结构体大小，只写入可容纳的部分
     let copy_len = core::cmp::min(len, required);
     if copy_len > 0 {
-        // SAFETY: sa is a stack-local struct with known layout; copy_len <= size_of::<SockAddrIn>().
+        // SAFETY: sa 是栈上结构体且布局已知；copy_len <= size_of::<SockAddrIn>()。
         let bytes = unsafe {
             core::slice::from_raw_parts((&sa as *const SockAddrIn) as *const u8, copy_len)
         };
@@ -375,6 +839,116 @@ pub(super) fn write_sockaddr_in(
         return err(SyscallError::EFAULT);
     }
     0
+}
+
+pub(super) fn write_sockaddr_in6(
+    user_ptr: usize,
+    user_len_ptr: usize,
+    ip: smoltcp::wire::IpAddress,
+    port: u16,
+) -> isize {
+    if user_ptr == 0 || user_len_ptr == 0 {
+        return err(SyscallError::EFAULT);
+    }
+    let token = get_current_token();
+    let Some(len_u32) = try_read_user_value::<u32>(token, user_len_ptr as *const u32) else {
+        return err(SyscallError::EFAULT);
+    };
+    let len = len_u32 as usize;
+    if len > i32::MAX as usize {
+        return err(SyscallError::EINVAL);
+    }
+    let sa = SockAddrIn6 {
+        sin6_family: AF_INET6,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: in6_addr_from_ip(ip),
+        sin6_scope_id: 0,
+    };
+    let required = size_of::<SockAddrIn6>();
+    let copy_len = core::cmp::min(len, required);
+    if copy_len > 0 {
+        // SAFETY: sa 是栈上结构体且布局已知；copy_len <= size_of::<SockAddrIn6>()。
+        let bytes = unsafe {
+            core::slice::from_raw_parts((&sa as *const SockAddrIn6) as *const u8, copy_len)
+        };
+        if try_copy_to_user(token, user_ptr as *mut u8, bytes).is_err() {
+            return err(SyscallError::EFAULT);
+        }
+    }
+    if try_write_user_value(token, user_len_ptr as *mut u32, &(required as u32)).is_err() {
+        return err(SyscallError::EFAULT);
+    }
+    0
+}
+
+pub(super) fn write_sockaddr_in_for_domain(
+    user_ptr: usize,
+    user_len_ptr: usize,
+    domain: u16,
+    ip: smoltcp::wire::IpAddress,
+    port: u16,
+) -> isize {
+    if domain == AF_INET6 {
+        write_sockaddr_in6(user_ptr, user_len_ptr, ip, port)
+    } else {
+        let smoltcp::wire::IpAddress::Ipv4(ip) = ip else {
+            return err(SyscallError::EINVAL);
+        };
+        write_sockaddr_in(user_ptr, user_len_ptr, ip, port)
+    }
+}
+
+/// 将 `sockaddr_ll` 写回用户空间的公共实现，`required` 为应回填的「完整地址长度」。
+///
+/// 遵循 getsockname/recvfrom 语义：按用户缓冲区可用空间截断写入，但始终把
+/// `*user_len_ptr` 更新为 `required`，让调用者得知实际/所需长度。由
+/// [`write_sockaddr_ll`] 与 [`write_recv_sockaddr_ll`] 以不同 `required` 复用。
+fn write_sockaddr_ll_with_len(
+    user_ptr: usize,
+    user_len_ptr: usize,
+    sa: &SockAddrLl,
+    required: usize,
+) -> isize {
+    if user_ptr == 0 || user_len_ptr == 0 {
+        return err(SyscallError::EFAULT);
+    }
+    let token = get_current_token();
+    let Some(len_u32) = try_read_user_value::<u32>(token, user_len_ptr as *const u32) else {
+        return err(SyscallError::EFAULT);
+    };
+    let len = len_u32 as usize;
+    if len > i32::MAX as usize {
+        return err(SyscallError::EINVAL);
+    }
+    let copy_len = core::cmp::min(len, required);
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (sa as *const SockAddrLl) as *const u8,
+            size_of::<SockAddrLl>(),
+        )
+    };
+    if copy_len > 0 && try_copy_to_user(token, user_ptr as *mut u8, &bytes[..copy_len]).is_err() {
+        return err(SyscallError::EFAULT);
+    }
+    let required_u32 = required as u32;
+    if try_write_user_value(token, user_len_ptr as *mut u32, &required_u32).is_err() {
+        return err(SyscallError::EFAULT);
+    }
+    0
+}
+
+pub(super) fn write_sockaddr_ll(user_ptr: usize, user_len_ptr: usize, sa: &SockAddrLl) -> isize {
+    let required = SOCKADDR_LL_ADDR_OFFSET + usize::from(sa.sll_halen).min(sa.sll_addr.len());
+    write_sockaddr_ll_with_len(user_ptr, user_len_ptr, sa, required)
+}
+
+pub(super) fn write_recv_sockaddr_ll(
+    user_ptr: usize,
+    user_len_ptr: usize,
+    sa: &SockAddrLl,
+) -> isize {
+    write_sockaddr_ll_with_len(user_ptr, user_len_ptr, sa, size_of::<SockAddrLl>())
 }
 
 /// 从用户空间读取 `iovcnt` 个 `iovec` 结构体，返回内核侧副本。
@@ -394,7 +968,13 @@ pub(super) fn read_iovecs(iov_ptr: usize, iovcnt: usize) -> Result<Vec<IoVec>, i
     let token = get_current_token();
     let mut iovs = Vec::with_capacity(iovcnt);
     for i in 0..iovcnt {
-        let ptr = (iov_ptr + i * size_of::<IoVec>()) as *const IoVec;
+        let Some(ptr) = i
+            .checked_mul(size_of::<IoVec>())
+            .and_then(|off| iov_ptr.checked_add(off))
+        else {
+            return Err(err(SyscallError::EFAULT));
+        };
+        let ptr = ptr as *const IoVec;
         let Some(iv) = try_read_user_value::<IoVec>(token, ptr) else {
             return Err(err(SyscallError::EFAULT));
         };
@@ -406,7 +986,7 @@ pub(super) fn read_iovecs(iov_ptr: usize, iovcnt: usize) -> Result<Vec<IoVec>, i
 /// 按 gather 语义将多个用户空间 iovec 缓冲区的内容合并到单个连续字节向量中。
 ///
 /// 对应 sendmsg 发送路径：将分散的用户缓冲区聚合为一段连续数据后再交给协议栈。
-/// 先计算总长度以一次性分配内存，避免多次 realloc。
+/// 先计算总长度以一次性分配内存，避免多次重新分配。
 pub(super) fn gather_iovecs_data(iovs: &[IoVec]) -> Result<Vec<u8>, isize> {
     let total = iovecs_total_len(iovs)?;
     let token = get_current_token();
@@ -498,7 +1078,7 @@ pub(super) fn write_msg_name_in(
         },
         sin_zero: [0; 8],
     };
-    // SAFETY: sa is a stack-local struct with known layout; length equals size_of::<SockAddrIn>().
+    // SAFETY: sa 是栈上结构体且布局已知；长度等于 size_of::<SockAddrIn>()。
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&sa as *const SockAddrIn) as *const u8,
@@ -508,11 +1088,51 @@ pub(super) fn write_msg_name_in(
     write_msg_name_bytes(msg, bytes)
 }
 
+pub(super) fn write_msg_name_in6(
+    msg: &mut MsgHdr,
+    ip: smoltcp::wire::IpAddress,
+    port: u16,
+) -> isize {
+    let sa = SockAddrIn6 {
+        sin6_family: AF_INET6,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: in6_addr_from_ip(ip),
+        sin6_scope_id: 0,
+    };
+    // SAFETY: sa 是栈上结构体且布局已知；长度等于 size_of::<SockAddrIn6>()。
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&sa as *const SockAddrIn6) as *const u8,
+            size_of::<SockAddrIn6>(),
+        )
+    };
+    write_msg_name_bytes(msg, bytes)
+}
+
+pub(super) fn write_msg_name_in_for_domain(
+    msg: &mut MsgHdr,
+    domain: u16,
+    ip: smoltcp::wire::IpAddress,
+    port: u16,
+) -> isize {
+    if domain == AF_INET6 {
+        write_msg_name_in6(msg, ip, port)
+    } else {
+        let smoltcp::wire::IpAddress::Ipv4(ip) = ip else {
+            return err(SyscallError::EINVAL);
+        };
+        write_msg_name_in(msg, ip, port)
+    }
+}
+
 /// 校验 sendmsg/sendto 的 flags 参数，拒绝内核尚未实现的标志位。
 ///
-/// MSG_NOSIGNAL 在内核侧无需特殊处理（内核不会向自身发信号），此处仅做合法性检查。
+/// MSG_NOSIGNAL 在内核侧无需特殊处理；MSG_DONTROUTE 由支持本地选路的
+/// 发送路径消费；MSG_CONFIRM 会传到 IPv4 UDP/RAW 路径刷新邻居项；MSG_EOR
+/// 作为 Linux 兼容标志暂按空操作处理。
 pub(super) fn validate_send_flags(flags: usize) -> isize {
-    let supported = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE;
+    let supported = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE | MSG_DONTROUTE | MSG_EOR | MSG_CONFIRM;
     if (flags & !supported) != 0 {
         return err(SyscallError::EOPNOTSUPP);
     }
@@ -521,21 +1141,21 @@ pub(super) fn validate_send_flags(flags: usize) -> isize {
 
 /// 校验 recvmsg/recvfrom 的 flags 参数，拒绝内核尚未实现的标志位。
 ///
-/// MSG_OOB 返回 EINVAL 而非 EOPNOTSUPP，是因为该标志在语义上明确无效（内核不支持带外数据）。
-/// MSG_ERRQUEUE 返回 EAGAIN，向调用者表明错误队列为空（当前实现未维护错误队列）。
+/// MSG_OOB：当前协议栈不实现带外数据。TCP 在无紧急数据时 Linux 返回 EINVAL
+/// （见 net/ipv4/tcp.c `tcp_recv_urg`）；我们恒无紧急数据，故对所有套接字统一返回 EINVAL。
+/// MSG_ERRQUEUE 需要在拿到具体 socket 后读取错误队列，这里只把标志认作已知。
 pub(super) fn validate_recv_flags(flags: usize) -> isize {
     if (flags & MSG_OOB) != 0 {
         return err(SyscallError::EINVAL);
-    }
-    if (flags & MSG_ERRQUEUE) != 0 {
-        return err(SyscallError::EAGAIN);
     }
     let known = MSG_DONTWAIT
         | MSG_PEEK
         | MSG_ERRQUEUE
         | MSG_OOB
+        | MSG_TRUNC
         | MSG_WAITFORONE
         | MSG_WAITALL
+        | MSG_CMSG_CLOEXEC
         | MSG_NOSIGNAL;
     if (flags & !known) != 0 {
         return err(SyscallError::EOPNOTSUPP);
@@ -557,9 +1177,17 @@ pub(super) fn read_msghdr(user_ptr: usize) -> Result<MsgHdr, isize> {
 /// 跳过整个 `MMsgHdr` 的写回，减少不必要的用户空间写操作。
 pub(super) fn write_mmsghdr_msg_len(user_ptr: usize, idx: usize, msg_len: u32) -> isize {
     let token = get_current_token();
-    let base = user_ptr + idx * size_of::<MMsgHdr>();
+    let Some(base) = idx
+        .checked_mul(size_of::<MMsgHdr>())
+        .and_then(|off| user_ptr.checked_add(off))
+    else {
+        return err(SyscallError::EFAULT);
+    };
     // msg_len 字段紧跟在 MsgHdr 之后，偏移量等于 size_of::<MsgHdr>()
-    let ptr = (base + size_of::<MsgHdr>()) as *mut u32;
+    let Some(ptr) = base.checked_add(size_of::<MsgHdr>()) else {
+        return err(SyscallError::EFAULT);
+    };
+    let ptr = ptr as *mut u32;
     if try_write_user_value(token, ptr, &msg_len).is_err() {
         return err(SyscallError::EFAULT);
     }
@@ -569,7 +1197,13 @@ pub(super) fn write_mmsghdr_msg_len(user_ptr: usize, idx: usize, msg_len: u32) -
 /// 将完整的 `MMsgHdr` 写回用户空间 `mmsghdr` 数组的第 `idx` 项。
 pub(super) fn write_mmsghdr(user_ptr: usize, idx: usize, mmsg: &MMsgHdr) -> isize {
     let token = get_current_token();
-    let ptr = (user_ptr + idx * size_of::<MMsgHdr>()) as *mut MMsgHdr;
+    let Some(ptr) = idx
+        .checked_mul(size_of::<MMsgHdr>())
+        .and_then(|off| user_ptr.checked_add(off))
+    else {
+        return err(SyscallError::EFAULT);
+    };
+    let ptr = ptr as *mut MMsgHdr;
     if try_write_user_value(token, ptr, mmsg).is_err() {
         return err(SyscallError::EFAULT);
     }

@@ -3,8 +3,8 @@ use alloc::sync::Arc;
 
 use crate::{
     fs::{
-        DummyFile, EventFdFile, File, PidFdFile, PseudoShmFile, TimerFdFile, UserfaultfdFile,
-        shm_create_anonymous,
+        DummyFile, EventFdFile, File, PidFdFile, PseudoShmFile, SignalfdFile, TimerFdFile,
+        UserfaultfdFile, shm_create_anonymous,
     },
     mm::{try_copy_from_user, try_read_user_value, try_write_user_value},
     task::{
@@ -162,7 +162,7 @@ pub fn syscall_signalfd4(_fd: isize, _mask: usize, _sigsetsize: usize, flags: us
     if _fd != -1 {
         return err(SyscallError::EINVAL);
     }
-    alloc_dummy_fd(descriptor_flags)
+    alloc_fd(Arc::new(SignalfdFile::new()), descriptor_flags)
 }
 
 pub fn syscall_timerfd_create(clockid: usize, flags: usize) -> isize {

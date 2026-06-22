@@ -6,6 +6,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+use super::File;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MountPropagation {
     Private,
@@ -38,11 +40,11 @@ pub(crate) enum ClassifiedAbsPath {
     Pseudo(String),
 }
 
-#[derive(Debug)]
 pub(crate) struct MountNamespaceState {
     id: usize,
     mounts: Vec<MountRecord>,
     rofs_mounts: Vec<String>,
+    file_binds: BTreeMap<String, Arc<dyn File + Send + Sync>>,
 }
 
 impl MountNamespaceState {
@@ -51,6 +53,7 @@ impl MountNamespaceState {
             id,
             mounts: Vec::new(),
             rofs_mounts: Vec::new(),
+            file_binds: BTreeMap::new(),
         }
     }
 
@@ -72,6 +75,18 @@ impl MountNamespaceState {
 
     pub(crate) fn rofs_mounts_mut(&mut self) -> &mut Vec<String> {
         &mut self.rofs_mounts
+    }
+
+    pub(crate) fn bound_file_for_path(&self, abs: &str) -> Option<Arc<dyn File + Send + Sync>> {
+        self.file_binds.get(abs).cloned()
+    }
+
+    pub(crate) fn bind_file(&mut self, target: &str, file: Arc<dyn File + Send + Sync>) {
+        self.file_binds.insert(String::from(target), file);
+    }
+
+    pub(crate) fn remove_bound_file(&mut self, target: &str) {
+        self.file_binds.remove(target);
     }
 
     pub(crate) fn top_mount_index_for_target(&self, target: &str) -> Option<usize> {
@@ -128,6 +143,9 @@ impl MountNamespaceState {
     }
 
     pub(crate) fn classify_logical_abs_path(&self, abs: &str) -> ClassifiedAbsPath {
+        if self.bound_file_for_path(abs).is_some() {
+            return ClassifiedAbsPath::Pseudo(String::from(abs));
+        }
         if super::procfs::is_proc_pseudo_path(abs)
             || super::cgroupfs::is_cgroup_pseudo_path(abs)
             || super::is_builtin_pseudo_path(abs)
@@ -215,6 +233,9 @@ impl MountNamespaceState {
             return false;
         };
         self.mounts[idx].target = String::from(new_target);
+        if let Some(file) = self.file_binds.remove(old_target) {
+            self.file_binds.insert(String::from(new_target), file);
+        }
         true
     }
 
@@ -254,6 +275,7 @@ impl MountNamespaceState {
             id: alloc_mount_namespace_id(),
             mounts: self.mounts.clone(),
             rofs_mounts: self.rofs_mounts.clone(),
+            file_binds: self.file_binds.clone(),
         }
     }
 }

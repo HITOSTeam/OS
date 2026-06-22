@@ -37,14 +37,23 @@ virtio-drivers = { path = "../vendor/virtio-drivers-pci" }
 ext4-fs = { path = "../ext4-fs" }
 log = "0.4"
 spin = "0.7.0"
+# WireGuard Noise handshake 与 data message 加密。
+blake2 = { version = "0.10", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false }
 smoltcp = { path = "../vendor/smoltcp", default-features = false, features = [
     "alloc",
     "log",
     "medium-ip",
     "proto-ipv4",
+    # netns、loopback 和 WireGuard 内层包需要 IPv6 地址/包头支持。
+    "proto-ipv6",
     "socket-tcp",
     "socket-udp",
+    # lo 同时挂 IPv4/IPv6 地址，后续虚拟设备也会继续扩展地址数量。
+    "iface-max-addr-count-8",
 ] }
+# WireGuard peer 公钥、临时密钥和 DH shared secret。
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv = "0.15.0"

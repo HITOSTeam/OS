@@ -26,8 +26,8 @@ pub mod mutex;
 mod process_block;
 pub(crate) use process_block::{
     ForkError, ProcessControlBlock, UtsNamespaceState, alloc_ipc_namespace_id,
-    alloc_pid_namespace_id, pid_namespace_member_pids, process_visible_in_pid_namespace,
-    register_pid_namespace, resolve_process_in_pid_namespace,
+    alloc_net_namespace_id, alloc_pid_namespace_id, pid_namespace_member_pids,
+    process_visible_in_pid_namespace, register_pid_namespace, resolve_process_in_pid_namespace,
 };
 pub mod processor;
 pub mod runtime;

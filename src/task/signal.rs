@@ -606,8 +606,19 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             );
         }
     }
+    let current = current_task();
+    let mut signal_sent_to_other_task = false;
     for t in tasks {
+        if current
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &t))
+        {
+            signal_sent_to_other_task = true;
+        }
         wakeup_task(t);
+    }
+    if sig_bit != 0 && signal_sent_to_other_task {
+        crate::task::processor::request_reschedule_current_hart();
     }
     0
 }

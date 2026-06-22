@@ -126,7 +126,6 @@ pub fn disable_direct_map_windows() {
     }
 }
 
-
 pub fn hart_id() -> usize {
     let mut id: usize;
     // SAFETY: CPUID (CSR 0x20) read is valid in kernel mode on LoongArch.

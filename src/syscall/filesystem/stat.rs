@@ -8,14 +8,16 @@ use super::{
     ext4_lock, fd_has_o_path, file_lock_key_from_inode, fill_statfs, find_path_in_roots,
     flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file, get_inode_times,
     inode_fs_flags, inode_mode_allows_uid_gid, inode_rdev_for_mode, inode_visible_size,
-    is_privileged_or_owner, kstat_from_fd, kstat_from_file, maybe_signal_lease_break, open_pseudo,
+    is_privileged_or_owner, kstat_from_dev_pts_path, kstat_from_fd, kstat_from_file,
+    kstat_from_followed_proc_symlink, maybe_signal_lease_break, open_pseudo,
     proc_magic_link_target_kstat, proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync,
     punch_hole_keep_size, read_user_cstring, require_fd_file, resolve_abs_path, resolve_at_inode,
-    resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, statfs_mount_flags_for_abs,
-    statx_from_kstat, sync_all, touch_inode_mtime_ctime_now, truncate_regular_inode,
-    try_copy_to_user, try_read_user_value, try_write_user_value, update_current_inode_mmaps_size,
-    update_current_os_inode_mmaps_size, write_zeros_range,
+    resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, stat_blocks_for_mode_size,
+    statfs_mount_flags_for_abs, statx_from_kstat, sync_all, touch_inode_mtime_ctime_now,
+    truncate_regular_inode, try_copy_to_user, try_read_user_value, try_write_user_value,
+    update_current_inode_mmaps_size, update_current_os_inode_mmaps_size, write_zeros_range,
 };
+use crate::fs::TunTapFile;
 
 /// Preallocates file space or punches holes on supported file types.
 pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
@@ -680,6 +682,7 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
         || file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
+        || file.as_any().downcast_ref::<TunTapFile>().is_some()
         || file.as_any().downcast_ref::<NetSocketFile>().is_some()
     {
         return err(SyscallError::ESPIPE);
@@ -813,12 +816,16 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
             }
         }
         let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
-        let Some(node) = open_pseudo(pseudo_path) else {
-            return err(SyscallError::ENOENT);
-        };
-        let st = match kstat_from_file(&node) {
-            Ok(st) => st,
-            Err(e) => return e,
+        let st = if let Some(st) = kstat_from_dev_pts_path(pseudo_path) {
+            st
+        } else {
+            let Some(node) = open_pseudo(pseudo_path) else {
+                return err(SyscallError::ENOENT);
+            };
+            match kstat_from_file(&node) {
+                Ok(st) => st,
+                Err(e) => return e,
+            }
         };
         if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
             return err(SyscallError::EFAULT);
@@ -828,6 +835,20 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
+    if follow_final {
+        if let Some(abs) = raw_abs.as_deref() {
+            match kstat_from_followed_proc_symlink(abs) {
+                Ok(Some(st)) => {
+                    if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
+                        return err(SyscallError::EFAULT);
+                    }
+                    return 0;
+                }
+                Ok(None) => {}
+                Err(e) => return e,
+            }
+        }
+    }
     let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
         Ok(v) => v,
@@ -863,7 +884,7 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
     let nlink = inode.link_count();
     let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
     let size = inode_visible_size(&inode) as i64;
-    let blocks = (((size as u64) + 511) / 512) as u64;
+    let blocks = stat_blocks_for_mode_size(mode, size);
     let times = get_inode_times(inode.inode_num() as u64);
 
     let st = KStat {
@@ -973,18 +994,39 @@ pub fn syscall_statx(
             }
         }
         let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
-        let Some(node) = open_pseudo(pseudo_path) else {
-            return err(SyscallError::ENOENT);
-        };
-        let st = match kstat_from_file(&node) {
-            Ok(st) => st,
-            Err(e) => return e,
+        let st = if let Some(st) = kstat_from_dev_pts_path(pseudo_path) {
+            st
+        } else {
+            let Some(node) = open_pseudo(pseudo_path) else {
+                return err(SyscallError::ENOENT);
+            };
+            match kstat_from_file(&node) {
+                Ok(st) => st,
+                Err(e) => return e,
+            }
         };
         let stx = statx_from_kstat(&st);
         if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
             return err(SyscallError::EFAULT);
         }
         return 0;
+    }
+
+    let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    if follow_final {
+        if let Some(abs) = raw_abs.as_deref() {
+            match kstat_from_followed_proc_symlink(abs) {
+                Ok(Some(st)) => {
+                    let stx = statx_from_kstat(&st);
+                    if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
+                        return err(SyscallError::EFAULT);
+                    }
+                    return 0;
+                }
+                Ok(None) => {}
+                Err(e) => return e,
+            }
+        }
     }
 
     let _ext4_guard = ext4_lock();
@@ -1025,7 +1067,7 @@ pub fn syscall_statx(
     let nlink = inode.link_count();
     let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
     let size = inode_visible_size(&inode) as i64;
-    let blocks = (((size as u64) + 511) / 512) as u64;
+    let blocks = stat_blocks_for_mode_size(mode, size);
     let times = get_inode_times(inode.inode_num() as u64);
 
     let st = KStat {

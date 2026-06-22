@@ -123,22 +123,80 @@ fn parse_gid_opt(gid: usize) -> Option<u32> {
     }
 }
 
+fn uid_capability_transition(
+    keep_caps: bool,
+    cap_effective: u64,
+    cap_permitted: u64,
+    old_uid: u32,
+    old_euid: u32,
+    old_suid: u32,
+    new_uid: u32,
+    new_euid: u32,
+    new_suid: u32,
+) -> (u64, u64) {
+    let mut next_effective = cap_effective;
+    let mut next_permitted = cap_permitted;
+    let old_has_root = old_uid == 0 || old_euid == 0 || old_suid == 0;
+    let new_has_root = new_uid == 0 || new_euid == 0 || new_suid == 0;
+
+    if old_has_root && !new_has_root && !keep_caps {
+        next_permitted = 0;
+        next_effective = 0;
+    }
+    if old_euid == 0 && new_euid != 0 {
+        next_effective = 0;
+    }
+    if old_euid != 0 && new_euid == 0 {
+        next_effective = next_permitted;
+    }
+    (next_effective, next_permitted)
+}
+
 /// Linux `setuid(2)` (syscall 146 on riscv64).
 pub fn syscall_setuid(uid: usize) -> isize {
     let uid = uid as u32;
     let process = current_process();
     let mut inner = process.borrow_mut();
+    let old_uid = inner.uid;
+    let old_euid = inner.euid;
+    let old_suid = inner.suid;
     if inner.euid == 0 {
         inner.uid = uid;
         inner.euid = uid;
         inner.suid = uid;
         inner.fsuid = uid;
+        let (cap_effective, cap_permitted) = uid_capability_transition(
+            inner.keep_caps,
+            inner.cap_effective,
+            inner.cap_permitted,
+            old_uid,
+            old_euid,
+            old_suid,
+            inner.uid,
+            inner.euid,
+            inner.suid,
+        );
+        inner.cap_effective = cap_effective;
+        inner.cap_permitted = cap_permitted;
         return 0;
     }
     if uid_allowed(uid, inner.uid, inner.euid, inner.suid) {
         inner.euid = uid;
         inner.suid = uid;
         inner.fsuid = uid;
+        let (cap_effective, cap_permitted) = uid_capability_transition(
+            inner.keep_caps,
+            inner.cap_effective,
+            inner.cap_permitted,
+            old_uid,
+            old_euid,
+            old_suid,
+            inner.uid,
+            inner.euid,
+            inner.suid,
+        );
+        inner.cap_effective = cap_effective;
+        inner.cap_permitted = cap_permitted;
         return 0;
     }
     err(SyscallError::EPERM)
@@ -198,6 +256,19 @@ pub fn syscall_setreuid(ruid: usize, euid: usize) -> isize {
     if new_ruid.is_some() || (new_euid.is_some() && next_euid != old_ruid) {
         inner.suid = next_euid;
     }
+    let (cap_effective, cap_permitted) = uid_capability_transition(
+        inner.keep_caps,
+        inner.cap_effective,
+        inner.cap_permitted,
+        old_ruid,
+        old_euid,
+        old_suid,
+        inner.uid,
+        inner.euid,
+        inner.suid,
+    );
+    inner.cap_effective = cap_effective;
+    inner.cap_permitted = cap_permitted;
     0
 }
 
@@ -244,6 +315,9 @@ pub fn syscall_setresuid(ruid: usize, euid: usize, suid: usize) -> isize {
     let new_suid = parse_uid_opt(suid);
     let process = current_process();
     let mut inner = process.borrow_mut();
+    let old_ruid = inner.uid;
+    let old_euid = inner.euid;
+    let old_suid = inner.suid;
     if inner.euid != 0 {
         for cand in [new_ruid, new_euid, new_suid] {
             if let Some(v) = cand {
@@ -263,6 +337,19 @@ pub fn syscall_setresuid(ruid: usize, euid: usize, suid: usize) -> isize {
     if let Some(s) = new_suid {
         inner.suid = s;
     }
+    let (cap_effective, cap_permitted) = uid_capability_transition(
+        inner.keep_caps,
+        inner.cap_effective,
+        inner.cap_permitted,
+        old_ruid,
+        old_euid,
+        old_suid,
+        inner.uid,
+        inner.euid,
+        inner.suid,
+    );
+    inner.cap_effective = cap_effective;
+    inner.cap_permitted = cap_permitted;
     0
 }
 

@@ -12,6 +12,7 @@ use super::{
     try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
     write_optional_offset,
 };
+use crate::fs::{PtyMasterFile, PtySlaveFile, TunTapFile};
 use alloc::vec;
 
 /// Reads from regular files and special waitable descriptors into a user buffer.
@@ -25,6 +26,61 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if len == 0 {
         return 0;
+    }
+    if crate::syscall::net::socket_read_uses_recvfrom(file.as_ref()) {
+        return crate::syscall::net::syscall_recvfrom(fd, buffer, len, 0, 0, 0);
+    }
+    if let Some(pty) = file.as_any().downcast_ref::<PtyMasterFile>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        return match pty.read_result(UserBuffer::new(user_bufs)) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
+    if let Some(pty) = file.as_any().downcast_ref::<PtySlaveFile>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        return match pty.read_result(UserBuffer::new(user_bufs)) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
+    if let Some(tun) = file.as_any().downcast_ref::<TunTapFile>() {
+        if len > 0
+            && let Err(e) = tun.wait_readable(fd_has_nonblock(fd))
+        {
+            return e;
+        }
+        let buf = if len == 0 {
+            UserBuffer::new(Vec::new())
+        } else {
+            let Ok(user_bufs) = try_translated_byte_buffer(
+                get_current_token(),
+                buffer as *mut u8,
+                len,
+                MapPermission::W,
+            ) else {
+                return err(SyscallError::EFAULT);
+            };
+            UserBuffer::new(user_bufs)
+        };
+        return match tun.read_packet(buf) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
     }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, os_inode.offset()) {
@@ -120,6 +176,56 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if !file.writable() {
         return err(SyscallError::EBADF);
+    }
+    if crate::syscall::net::socket_write_uses_sendto(file.as_ref()) {
+        return crate::syscall::net::syscall_sendto(fd, buffer, len, 0, 0, 0);
+    }
+    if let Some(pty) = file.as_any().downcast_ref::<PtyMasterFile>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        return match pty.write_result(UserBuffer::new(user_bufs)) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
+    if let Some(pty) = file.as_any().downcast_ref::<PtySlaveFile>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        return match pty.write_result(UserBuffer::new(user_bufs)) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
+    }
+    if let Some(tun) = file.as_any().downcast_ref::<TunTapFile>() {
+        let buf = if len == 0 {
+            UserBuffer::new(Vec::new())
+        } else {
+            let Ok(user_bufs) = try_translated_byte_buffer(
+                get_current_token(),
+                buffer as *mut u8,
+                len,
+                MapPermission::R,
+            ) else {
+                return err(SyscallError::EFAULT);
+            };
+            UserBuffer::new(user_bufs)
+        };
+        return match tun.write_packet(buf) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
     }
     if len == 0 {
         return 0;
@@ -659,6 +765,7 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
         Err(e) => return e,
     };
 
+    let out_net_socket = out_file.as_any().downcast_ref::<crate::fs::NetSocketFile>();
     let out_is_socketpair = out_file.as_any().downcast_ref::<SocketPairEnd>().is_some();
     let nonblock = fd_has_nonblock(out_fd);
     if nonblock && out_is_socketpair {
@@ -669,7 +776,6 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
             return err(SyscallError::EAGAIN);
         }
     }
-
     let mut in_pos = raw_in_pos;
     let mut total = 0usize;
     let mut remaining = count;
@@ -704,6 +810,18 @@ pub fn syscall_sendfile(out_fd: usize, in_fd: usize, offset: usize, count: usize
             }
         } else if out_is_socketpair {
             match socketpair_write_from_kernel(&out_file, &buf[..read], nonblock) {
+                Ok(n) => n,
+                Err(e) => return if total > 0 { total as isize } else { e },
+            }
+        } else if let Some(sock) = out_net_socket {
+            if sock.kind() != crate::fs::NetSocketKind::TcpStream {
+                return if total > 0 {
+                    total as isize
+                } else {
+                    err(SyscallError::EINVAL)
+                };
+            }
+            match sock.tcp_send(&buf[..read], nonblock) {
                 Ok(n) => n,
                 Err(e) => return if total > 0 { total as isize } else { e },
             }

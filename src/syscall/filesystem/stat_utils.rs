@@ -7,6 +7,7 @@ use super::{
     resolve_at_inode, resolve_at_path, translated_mutref, try_read_user_value,
     try_write_user_value,
 };
+use crate::fs::{TunTapFile, dev_pts_exists, dev_pts_index_from_path};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -174,6 +175,17 @@ pub(crate) const STATX_ATTR_NODUMP: u64 = 0x0000_0040;
 
 pub(crate) const EXT4_ST_DEV: u64 = 1;
 
+/// Computes Linux `st_blocks` units (512-byte sectors) for synthetic/ext4 stats.
+pub(crate) fn stat_blocks_for_mode_size(mode: u32, size: i64) -> u64 {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFLNK: u32 = 0o120000;
+    if (mode & S_IFMT) == S_IFLNK || size <= 0 {
+        0
+    } else {
+        (size as u64 + 511) / 512
+    }
+}
+
 /// Maps ext4 dirent file types to Linux `DT_*` values.
 pub(crate) fn dt_type_from_ext4(ftype: u8) -> u8 {
     match ftype {
@@ -231,15 +243,11 @@ pub(crate) fn statx_timestamp(sec: i64, nsec: i64) -> StatxTimestamp {
 /// Synthesizes `stat` metadata for a proc magic symlink from its target length.
 pub(crate) fn proc_symlink_kstat(link_len: usize) -> KStat {
     let st_size = link_len as i64;
-    let st_blocks = if st_size <= 0 {
-        0
-    } else {
-        ((st_size as u64 + 511) / 512) as u64
-    };
+    let st_mode = 0o120777;
     KStat {
         st_dev: 0,
         st_ino: 1,
-        st_mode: 0o120777,
+        st_mode,
         st_nlink: 1,
         st_uid: 0,
         st_gid: 0,
@@ -248,7 +256,7 @@ pub(crate) fn proc_symlink_kstat(link_len: usize) -> KStat {
         st_size,
         st_blksize: 4096,
         __pad2: 0,
-        st_blocks,
+        st_blocks: stat_blocks_for_mode_size(st_mode, st_size),
         st_atime_sec: 0,
         st_atime_nsec: 0,
         st_mtime_sec: 0,
@@ -257,6 +265,42 @@ pub(crate) fn proc_symlink_kstat(link_len: usize) -> KStat {
         st_ctime_nsec: 0,
         __unused: [0, 0],
     }
+}
+
+fn linux_makedev(major: u32, minor: u32) -> u64 {
+    ((minor as u64) & 0xff)
+        | (((major as u64) & 0xfff) << 8)
+        | (((minor as u64) & !0xff) << 12)
+        | (((major as u64) & !0xfff) << 32)
+}
+
+pub(crate) fn kstat_from_dev_pts_path(path: &str) -> Option<KStat> {
+    let index = dev_pts_index_from_path(path)?;
+    if !dev_pts_exists(index) {
+        return None;
+    }
+    let (uid, gid) = current_fsuid_gid();
+    Some(KStat {
+        st_dev: 0,
+        st_ino: 2000 + index as u64,
+        st_mode: 0o020620,
+        st_nlink: 1,
+        st_uid: uid,
+        st_gid: gid,
+        st_rdev: linux_makedev(136, index),
+        __pad: 0,
+        st_size: 0,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: 0,
+        st_atime_sec: 0,
+        st_atime_nsec: 0,
+        st_mtime_sec: 0,
+        st_mtime_nsec: 0,
+        st_ctime_sec: 0,
+        st_ctime_nsec: 0,
+        __unused: [0, 0],
+    })
 }
 
 /// Synthesizes `stat` metadata for open descriptors across pseudo, proc, and ext4 files.
@@ -274,6 +318,7 @@ pub(crate) fn kstat_from_file(
         || file.as_any().downcast_ref::<PseudoBlock>().is_some()
         || file.as_any().downcast_ref::<PseudoShmFile>().is_some()
         || file.as_any().downcast_ref::<RtcFile>().is_some()
+        || file.as_any().downcast_ref::<TunTapFile>().is_some()
         || file.as_any().downcast_ref::<TtyFile>().is_some()
         || file.as_any().downcast_ref::<PtyMasterFile>().is_some()
         || file.as_any().downcast_ref::<PtySlaveFile>().is_some()
@@ -290,6 +335,7 @@ pub(crate) fn kstat_from_file(
             0o060600
         } else if file.as_any().downcast_ref::<PseudoShmFile>().is_some()
             || file.as_any().downcast_ref::<RtcFile>().is_some()
+            || file.as_any().downcast_ref::<TunTapFile>().is_some()
         {
             0o100666
         } else if file.as_any().downcast_ref::<TtyFile>().is_some()
@@ -323,6 +369,8 @@ pub(crate) fn kstat_from_file(
                 crate::fs::PseudoKindTag::Urandom => 0x109,
                 crate::fs::PseudoKindTag::Static => 0,
             }
+        } else if file.as_any().downcast_ref::<TunTapFile>().is_some() {
+            0x0a_c8
         } else if file.as_any().downcast_ref::<TtyFile>().is_some() {
             0x500
         } else if file.as_any().downcast_ref::<PtyMasterFile>().is_some() {
@@ -418,7 +466,7 @@ pub(crate) fn kstat_from_file(
     let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
     let disk_size = inode.size() as usize;
     let size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
-    let blocks = (((size as u64) + 511) / 512) as u64;
+    let blocks = stat_blocks_for_mode_size(mode, size);
     let times = get_inode_times(inode.inode_num() as u64);
 
     Ok(KStat {
@@ -444,14 +492,50 @@ pub(crate) fn kstat_from_file(
     })
 }
 
+pub(crate) fn kstat_from_proc_pseudo_path(
+    path: &str,
+    nofollow_magic: bool,
+) -> Result<Option<KStat>, isize> {
+    if crate::fs::proc_magic_link_exists(path) {
+        if nofollow_magic {
+            let link_len = crate::fs::proc_readlink(path)
+                .map(|target| target.len())
+                .unwrap_or(0);
+            return Ok(Some(proc_symlink_kstat(link_len)));
+        }
+        return proc_magic_link_target_kstat(path);
+    }
+
+    if let Some(st) = kstat_from_dev_pts_path(path) {
+        return Ok(Some(st));
+    }
+
+    if let Some(file) = open_pseudo(path) {
+        return kstat_from_file(&file).map(Some);
+    }
+
+    Ok(None)
+}
+
+pub(crate) fn kstat_from_followed_proc_symlink(abs: &str) -> Result<Option<KStat>, isize> {
+    let target = crate::fs::resolve_final_symlink_abs_path(abs);
+    if target == abs || !crate::fs::is_proc_pseudo_path(&target) {
+        return Ok(None);
+    }
+    kstat_from_proc_pseudo_path(&target, false)
+}
+
 /// Resolves an absolute path and produces the `stat` view userspace should observe.
 pub(crate) fn kstat_from_abs_path(abs: &str) -> Result<KStat, isize> {
     let at = resolve_at_path(AT_FDCWD, abs)?;
     if let AtPath::PseudoAbs(_) = &at {
-        let Some(file) = open_pseudo(abs) else {
+        let Some(st) = kstat_from_proc_pseudo_path(abs, false)? else {
             return Err(err(SyscallError::ENOENT));
         };
-        return kstat_from_file(&file);
+        return Ok(st);
+    }
+    if let Some(st) = kstat_from_followed_proc_symlink(abs)? {
+        return Ok(st);
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -464,7 +548,7 @@ pub(crate) fn kstat_from_abs_path(abs: &str) -> Result<KStat, isize> {
     let nlink = inode.link_count();
     let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
     let size = inode_visible_size(&inode) as i64;
-    let blocks = (((size as u64) + 511) / 512) as u64;
+    let blocks = stat_blocks_for_mode_size(mode, size);
     let times = get_inode_times(inode.inode_num() as u64);
 
     Ok(KStat {

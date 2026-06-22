@@ -4,6 +4,7 @@ use crate::syscall::sysv_shm::{
     detach_attaches_overlapping, find_attach_containing, release_detached_attach_refs,
     segment_shared_frames_existing, segment_size, split_mremap_attach,
 };
+use alloc::vec;
 
 pub fn syscall_brk(addr: usize) -> isize {
     const BRK_RELATIVE_COMPAT_MAX: usize = 64 * 1024;
@@ -233,6 +234,148 @@ fn commit_mmap_vma(
     }
 }
 
+fn mmap_packet_socket_ring(
+    packet_sock: &crate::syscall::net::PacketSocketFile,
+    addr: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    off: usize,
+) -> isize {
+    if off != 0 || (prot & PROT_WRITE) == 0 {
+        return err(SyscallError::EINVAL);
+    }
+    let map_type = flags & MAP_TYPE_MASK;
+    if map_type != MAP_SHARED && map_type != MAP_SHARED_VALIDATE {
+        return err(SyscallError::EINVAL);
+    }
+    let Some(ring_len) = packet_sock.rx_ring_mmap_len() else {
+        return err(SyscallError::EINVAL);
+    };
+    let map_len = align_up(len, PAGE_SIZE);
+    // Linux packet_mmap() requires the VMA size to match the total configured
+    // packet ring size exactly; accepting a larger mapping would expose pages
+    // that are not owned by the ring ABI.
+    if map_len != ring_len {
+        return err(SyscallError::EINVAL);
+    }
+
+    let process = current_process();
+    let inner = process.borrow_mut();
+    let is_fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
+    let start = if is_fixed {
+        if addr == 0 || addr % PAGE_SIZE != 0 {
+            return err(SyscallError::EINVAL);
+        }
+        addr
+    } else {
+        let mut memory_set = inner.memory_set.lock();
+        let Some(start) =
+            memory_set.find_free_mmap_range((addr != 0).then_some(addr), map_len, USER_VA_TOP)
+        else {
+            return err(SyscallError::ENOMEM);
+        };
+        start
+    };
+    let Some(end) = start.checked_add(map_len) else {
+        return err(SyscallError::ENOMEM);
+    };
+    if !user_range_valid(start, end) {
+        return if is_fixed {
+            err(SyscallError::EINVAL)
+        } else {
+            err(SyscallError::ENOMEM)
+        };
+    }
+
+    let lock_range = {
+        let memory_set = inner.memory_set.lock();
+        if !is_fixed && !memory_set.user_range_is_free(start, end, USER_VA_TOP) {
+            return err(SyscallError::ENOMEM);
+        }
+        if (flags & MAP_FIXED_NOREPLACE) != 0
+            && !memory_set.user_range_is_free(start, end, USER_VA_TOP)
+        {
+            return err(SyscallError::EEXIST);
+        }
+        if (flags & MAP_FIXED) != 0 {
+            let mut cur = start;
+            while cur < end {
+                let vpn = crate::mm::VirtAddr::from(cur).floor();
+                if let Some(pte) = memory_set.translate(vpn) {
+                    if pte.is_valid() && !pte.flags().contains(PTEFlags::U) {
+                        return err(SyscallError::ENOMEM);
+                    }
+                }
+                cur += PAGE_SIZE;
+            }
+        }
+        memory_set.mlockall_future() || (flags & MAP_LOCKED) != 0
+    };
+
+    let region = VmRegion {
+        kind: VmRegionKind::Mmap,
+        start,
+        len: map_len,
+        prot: prot & (PROT_READ | PROT_WRITE | PROT_EXEC),
+        map_type: MapType::Framed,
+        map_perm: VmRegion::permission_from_prot(prot),
+        file_valid_len: map_len,
+        sigbus_start: end,
+        shared: true,
+        may_write_upgrade: true,
+        file_backed: false,
+        file_dev: 0,
+        file_ino: 0,
+        file_offset: 0,
+        backing_id: 0,
+        memfd_id: 0,
+        anon_shared_id: crate::mm::allocate_shared_anon_id(),
+        sysv_shmid: 0,
+        growsdown: false,
+        fork_inherited_anon: false,
+    };
+    let areas = vec![VmaInsertArea::Framed { start, end }];
+    let replace_existing = (flags & MAP_FIXED) != 0;
+    let mut memory_set = inner.memory_set.lock();
+    let inserted = commit_mmap_vma(
+        &mut memory_set,
+        replace_existing,
+        region,
+        areas,
+        lock_range,
+        None,
+        None,
+        start,
+        len,
+        off,
+    );
+    if !inserted {
+        return err(SyscallError::ENOMEM);
+    }
+    if !replace_existing {
+        memory_set.note_mmap_end(end);
+    }
+    let token = memory_set.token();
+    drop(memory_set);
+    drop(inner);
+
+    if replace_existing {
+        crate::syscall::net::clear_packet_ring_mmaps_for_range(token, start, end);
+    }
+    let ret = packet_sock.set_rx_ring_mmap(start, map_len, token);
+    if ret < 0 {
+        let process = current_process();
+        let inner = process.borrow_mut();
+        inner
+            .memory_set
+            .lock()
+            .unmap_user_vma_range(start.into(), end.into());
+        return ret;
+    }
+    start as isize
+}
+
 pub fn syscall_mmap(
     addr: usize,
     len: usize,
@@ -291,6 +434,13 @@ pub fn syscall_mmap(
     } else {
         None
     };
+    if let Some(file) = file.as_ref()
+        && let Some(packet_sock) = file
+            .as_any()
+            .downcast_ref::<crate::syscall::net::PacketSocketFile>()
+    {
+        return mmap_packet_socket_ring(packet_sock, addr, len, prot, flags, off);
+    }
     // 像 Linux can_mmap_file() 一样先显式确认 fd 类型；未知文件不能 fallback 成零页。
     let source = if is_anon {
         MmapSource::Anonymous
@@ -511,7 +661,7 @@ pub fn syscall_mmap(
     };
     let populate_file = should_populate_file.then_some(backing_file).flatten();
     let replace_existing = (flags & MAP_FIXED) != 0;
-    let detached_shmids = {
+    let (detached_shmids, fixed_packet_ring_token) = {
         let mut memory_set = inner.memory_set.lock();
         let fixed_attach_update = if replace_existing {
             let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
@@ -550,10 +700,14 @@ pub fn syscall_mmap(
         if !replace_existing {
             memory_set.note_mmap_end(end);
         }
-        detached_shmids
+        let clear_token = replace_existing.then_some(memory_set.token());
+        (detached_shmids, clear_token)
     };
     let pid = process.getpid() as u32;
     drop(inner);
+    if let Some(token) = fixed_packet_ring_token {
+        crate::syscall::net::clear_packet_ring_mmaps_for_range(token, map_start, map_end);
+    }
     release_detached_attach_refs(pid, detached_shmids.as_slice());
 
     start as isize
@@ -589,7 +743,7 @@ pub fn syscall_mremap(
     let files_snapshot = current_files().lock().iter_files_snapshot();
     let process = current_process();
     let inner = process.borrow_mut();
-    let (src_region, sysv_attach) = {
+    let (src_region, sysv_attach, mm_token) = {
         let memory_set = inner.memory_set.lock();
         let Some(src_region) = memory_set.vm_region_containing(old_addr, old_end) else {
             return err(SyscallError::EFAULT);
@@ -608,8 +762,14 @@ pub fn syscall_mremap(
         } else {
             None
         };
-        (src_region, sysv_attach)
+        (src_region, sysv_attach, memory_set.token())
     };
+    if crate::syscall::net::packet_ring_mmap_overlaps_range(mm_token, old_addr, old_end) {
+        // Our packet rings store the userspace base address in the socket state.
+        // Without Linux-style VMA ops, moving or resizing that mapping would
+        // leave the socket writing to stale addresses.
+        return err(SyscallError::EINVAL);
+    }
 
     if (flags & MREMAP_FIXED) != 0 {
         if new_addr % PAGE_SIZE != 0 {
@@ -674,6 +834,7 @@ pub fn syscall_mremap(
         };
         let pid = process.getpid() as u32;
         drop(inner);
+        crate::syscall::net::clear_packet_ring_mmaps_for_range(mm_token, new_addr, new_end);
         release_detached_attach_refs(pid, detached_shmids.as_slice());
         return new_addr as isize;
     }
@@ -1029,5 +1190,12 @@ pub fn syscall_mremap(
         }
         memory_set.note_mmap_end(target_new_end);
     }
+    drop(inner);
+    let clear_start = if target_start == old_addr {
+        old_end
+    } else {
+        target_start
+    };
+    crate::syscall::net::clear_packet_ring_mmaps_for_range(mm_token, clear_start, target_new_end);
     target_start as isize
 }

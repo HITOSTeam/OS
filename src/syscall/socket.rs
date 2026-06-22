@@ -2,10 +2,8 @@ use crate::syscall::error::{SyscallError, err};
 use core::mem::size_of;
 
 use crate::{
-    fs::make_socketpair,
-    mm::{try_write_user_value, write_user_value},
-    task::processor::current_files_and_nofile_limit,
-    trap::get_current_token,
+    fs::make_socketpair_with_type, mm::try_write_user_value,
+    task::processor::current_files_and_nofile_limit, trap::get_current_token,
 };
 
 // Linux errno (negative return in kernel ABI).
@@ -25,6 +23,10 @@ const FD_CLOEXEC: u32 = 1;
 ///
 /// Minimal support for `AF_UNIX` + `SOCK_STREAM`, sufficient for rt-tests `hackbench`.
 pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: usize) -> isize {
+    let flags = type_ & !SOCK_TYPE_MASK;
+    if (flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK)) != 0 {
+        return err(SyscallError::EINVAL);
+    }
     if sv_ptr == 0 {
         return err(SyscallError::EFAULT);
     }
@@ -61,7 +63,7 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
     let cloexec = (type_ & SOCK_CLOEXEC) != 0;
     let nonblock = (type_ & SOCK_NONBLOCK) != 0;
 
-    let (end0, end1) = make_socketpair();
+    let (end0, end1) = make_socketpair_with_type(sock_type);
 
     let mut descriptor_flags = 0u32;
     if cloexec {
@@ -81,12 +83,21 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
     };
     drop(files);
 
-    // ABI: `int sv[2]` (i32).
-    write_user_value(token, sv_ptr as *mut i32, &(fd0 as i32));
-    write_user_value(
-        token,
-        (sv_ptr + size_of::<i32>()) as *mut i32,
-        &(fd1 as i32),
-    );
+    // ABI: `int sv[2]` (i32). If userspace writeback fails after fd
+    // installation, close both descriptors instead of reporting a leaked pair.
+    if try_write_user_value(token, sv_ptr as *mut i32, &(fd0 as i32)).is_err()
+        || try_write_user_value(
+            token,
+            (sv_ptr + size_of::<i32>()) as *mut i32,
+            &(fd1 as i32),
+        )
+        .is_err()
+    {
+        let (files, _) = current_files_and_nofile_limit();
+        let mut files = files.lock();
+        let _ = files.clear_fd(fd0);
+        let _ = files.clear_fd(fd1);
+        return err(SyscallError::EFAULT);
+    }
     0
 }

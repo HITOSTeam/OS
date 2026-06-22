@@ -303,6 +303,10 @@ pub fn cgroup_mkdir(abs: &str) -> isize {
     if !state.nodes.contains_key(&parent) {
         return ENOENT;
     }
+    // cgroup 控制文件名由内核保留，不能再创建同名子 cgroup。
+    if CgroupFileKind::from_name(&_name, state.kind).is_some() {
+        return EEXIST;
+    }
     // 目标节点不能已存在
     if state.nodes.contains_key(&rel_path) {
         return EEXIST;

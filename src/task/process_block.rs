@@ -41,7 +41,9 @@ const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
 static FORK_IMPL_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FORK_PRE_COW_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPC_NS_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_USER_NS_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_PID_NS_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_NET_NS_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Reason why `fork_impl()` failed.
 #[derive(Debug)]
@@ -81,8 +83,16 @@ pub fn alloc_ipc_namespace_id() -> usize {
     NEXT_IPC_NS_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+pub fn alloc_user_namespace_id() -> usize {
+    NEXT_USER_NS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 pub fn alloc_pid_namespace_id() -> usize {
     NEXT_PID_NS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn alloc_net_namespace_id() -> usize {
+    NEXT_NET_NS_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn register_pid_namespace(parent_ns_id: usize, child_ns_id: usize) {
@@ -994,6 +1004,8 @@ pub struct ProcessControlBlockInner {
     pub cap_inheritable: u64,
     /// Capability bounding set used by PR_CAPBSET_DROP checks.
     pub cap_bounding: u64,
+    /// `PR_SET_KEEPCAPS` / `SECBIT_KEEP_CAPS` state.
+    pub keep_caps: bool,
     /// Linux personality(2) flags (PER_LINUX by default).
     pub personality: u32,
     /// Per-process I/O priority encoded like Linux `ioprio_get/set(2)`.
@@ -1011,6 +1023,15 @@ pub struct ProcessControlBlockInner {
     pub cwd: String,
     /// IPC namespace id used by SysV IPC / POSIX MQ isolation.
     pub ipc_ns_id: usize,
+    /// User namespace id.  Full uid/gid translation is not implemented yet;
+    /// this tracks Linux's namespace control plane for unshare/procfs tests.
+    pub user_ns_id: usize,
+    pub userns_uid_map: String,
+    pub userns_gid_map: String,
+    pub userns_setgroups: String,
+    /// Network namespace id.  Net devices are still globally shared; the id
+    /// exists so Linux namespace handles and setns/clone3 ABI behave correctly.
+    pub net_ns_id: usize,
     /// Shared UTS namespace state (hostname/domainname).
     pub uts_ns: Arc<SpinMutex<UtsNamespaceState>>,
     /// Shared mount namespace state used by mount/umount/path view syscalls.
@@ -1215,6 +1236,7 @@ impl ProcessControlBlock {
                 cap_permitted: u64::MAX,
                 cap_inheritable: u64::MAX,
                 cap_bounding: u64::MAX,
+                keep_caps: false,
                 personality: 0,
                 ioprio: 0,
                 umask: 0,
@@ -1258,6 +1280,11 @@ impl ProcessControlBlock {
                 root: String::from("/"),
                 cwd: String::from("/user"),
                 ipc_ns_id: 0,
+                user_ns_id: 0,
+                userns_uid_map: String::from("0 0 4294967295\n"),
+                userns_gid_map: String::from("0 0 4294967295\n"),
+                userns_setgroups: String::from("allow\n"),
+                net_ns_id: 0,
                 uts_ns: Arc::new(SpinMutex::new(UtsNamespaceState::new())),
                 mnt_ns: initial_mount_namespace(),
                 cgroup_ns_root: String::from("/"),
@@ -1416,8 +1443,9 @@ impl ProcessControlBlock {
             let task_inner = task.borrow_mut();
             task_inner.res.as_ref().map(|res| res.trap_cx_slot())
         };
-        let old_shm_cleanup = {
+        let (old_shm_cleanup, old_mm_token) = {
             let mut inner = self.borrow_mut();
+            let old_mm_token = inner.memory_set.token();
             if let Some(slot) = old_trap_cx_slot {
                 let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
                 inner
@@ -1429,6 +1457,7 @@ impl ProcessControlBlock {
             reset_signal_handlers_on_exec(&mut inner);
             inner.memory_set = MmRef::new(memory_set);
             inner.scheduling.reset_on_fork = false;
+            inner.keep_caps = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
             let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
@@ -1445,8 +1474,9 @@ impl ProcessControlBlock {
                 exec_inode.1,
             );
             inner.did_exec = true;
-            old_shm_cleanup
+            (old_shm_cleanup, old_mm_token)
         };
+        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
@@ -1511,8 +1541,9 @@ impl ProcessControlBlock {
             let task_inner = task.borrow_mut();
             task_inner.res.as_ref().map(|res| res.trap_cx_slot())
         };
-        let old_shm_cleanup = {
+        let (old_shm_cleanup, old_mm_token) = {
             let mut inner = self.borrow_mut();
+            let old_mm_token = inner.memory_set.token();
             if let Some(slot) = old_trap_cx_slot {
                 let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
                 inner
@@ -1524,6 +1555,7 @@ impl ProcessControlBlock {
             reset_signal_handlers_on_exec(&mut inner);
             inner.memory_set = MmRef::new(memory_set);
             inner.scheduling.reset_on_fork = false;
+            inner.keep_caps = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
             let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
@@ -1540,8 +1572,9 @@ impl ProcessControlBlock {
                 exec_inode.1,
             );
             inner.did_exec = true;
-            old_shm_cleanup
+            (old_shm_cleanup, old_mm_token)
         };
+        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
@@ -1656,6 +1689,7 @@ impl ProcessControlBlock {
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.memory_set.sysv_shm_attaches_snapshot();
+        let parent_mm_token = parent.memory_set.token();
         if crate::debug_config::DEBUG_PID_MAP {
             let seq = FORK_PRE_COW_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if seq <= 8 || (seq & (seq - 1)) == 0 {
@@ -1689,6 +1723,7 @@ impl ProcessControlBlock {
         } else {
             MmRef::from_existed_user_cow(&parent.memory_set)
         };
+        let child_mm_token = memory_set.token();
         if thread_count > 1 && !share_vm {
             let mut child_mm = memory_set.lock();
             for task in parent.tasks.iter().filter_map(|t| t.as_ref()) {
@@ -1729,6 +1764,7 @@ impl ProcessControlBlock {
         let cap_permitted = parent.cap_permitted;
         let cap_inheritable = parent.cap_inheritable;
         let cap_bounding = parent.cap_bounding;
+        let keep_caps = parent.keep_caps;
         let personality = parent.personality;
         let ioprio = parent.ioprio;
         let umask = parent.umask;
@@ -1736,6 +1772,11 @@ impl ProcessControlBlock {
         let root = parent.root.clone();
         let cwd = parent.cwd.clone();
         let ipc_ns_id = parent.ipc_ns_id;
+        let user_ns_id = parent.user_ns_id;
+        let userns_uid_map = parent.userns_uid_map.clone();
+        let userns_gid_map = parent.userns_gid_map.clone();
+        let userns_setgroups = parent.userns_setgroups.clone();
+        let net_ns_id = parent.net_ns_id;
         let uts_ns = Arc::clone(&parent.uts_ns);
         let mnt_ns = Arc::clone(&parent.mnt_ns);
         let cgroup_ns_root = parent.cgroup_ns_root.clone();
@@ -1803,6 +1844,7 @@ impl ProcessControlBlock {
                 cap_permitted,
                 cap_inheritable,
                 cap_bounding,
+                keep_caps,
                 personality,
                 ioprio,
                 umask,
@@ -1811,6 +1853,11 @@ impl ProcessControlBlock {
                 root,
                 cwd,
                 ipc_ns_id,
+                user_ns_id,
+                userns_uid_map,
+                userns_gid_map,
+                userns_setgroups,
+                net_ns_id,
                 uts_ns,
                 mnt_ns,
                 cgroup_ns_root,
@@ -1863,6 +1910,9 @@ impl ProcessControlBlock {
                 false,
             )?
         });
+        if !share_vm {
+            crate::syscall::net::clone_packet_ring_mmaps_for_fork(parent_mm_token, child_mm_token);
+        }
         if !share_vm {
             crate::syscall::sysv_shm::fork_inherit(&inherited_shm);
         }
@@ -1978,6 +2028,30 @@ impl ProcessControlBlock {
 
     pub fn pid_namespace_id(&self) -> usize {
         self.borrow_mut().pid_ns_id
+    }
+
+    pub fn user_namespace_id(&self) -> usize {
+        self.borrow_mut().user_ns_id
+    }
+
+    pub fn unshare_user_namespace(&self) {
+        let mut inner = self.borrow_mut();
+        inner.user_ns_id = alloc_user_namespace_id();
+        inner.userns_uid_map.clear();
+        inner.userns_gid_map.clear();
+        inner.userns_setgroups = String::from("allow\n");
+    }
+
+    pub fn net_namespace_id(&self) -> usize {
+        self.borrow_mut().net_ns_id
+    }
+
+    pub fn set_net_namespace_id(&self, ns_id: usize) {
+        self.borrow_mut().net_ns_id = ns_id;
+    }
+
+    pub fn unshare_net_namespace(&self) {
+        self.borrow_mut().net_ns_id = alloc_net_namespace_id();
     }
 
     pub fn uts_namespace(self: &Arc<Self>) -> Arc<SpinMutex<UtsNamespaceState>> {

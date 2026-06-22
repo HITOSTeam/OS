@@ -1,7 +1,7 @@
 use crate::{
     config::clock_freq,
     debug_config::DEBUG_PTHREAD,
-    fs::{POLLERR, POLLHUP, POLLNVAL},
+    fs::{NetSocketFile, POLLERR, POLLHUP, POLLIN, POLLNVAL},
     mm::{MapPermission, translated_byte_buffer, try_read_user_value, try_write_user_value},
     syscall::{
         error::{SyscallError, err},
@@ -15,7 +15,7 @@ use crate::{
     time::get_time,
     trap::get_current_token,
 };
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::mem::size_of;
 
 use super::{current_linux_tid, encode_linux_tid};
@@ -280,17 +280,7 @@ pub fn syscall_ppoll(
         pfds.push(pfd);
     }
 
-    let ret = loop {
-        let (pending, mask) = {
-            let inner = task.borrow_mut();
-            (inner.pending_signals, inner.signal_mask)
-        };
-        // Keep poll-like waits aligned with epoll/pipe behavior: don't let
-        // default SIGCHLD bookkeeping spuriously interrupt readiness waits.
-        if has_wait_interrupting_pending(pending, mask) {
-            break EINTR;
-        }
-
+    let scan_ready = |pfds: &mut [PollFd]| -> isize {
         let mut ready = 0isize;
         for pfd in pfds.iter_mut() {
             pfd.revents = 0;
@@ -305,14 +295,48 @@ pub fn syscall_ppoll(
                 continue;
             };
 
-            let mut revents: i16 = 0;
             let mask = file.poll_mask();
-            revents |= mask & (pfd.events | POLLERR | POLLHUP);
-            pfd.revents = revents;
-            if revents != 0 {
+            pfd.revents = mask & (pfd.events | POLLERR | POLLHUP);
+            if pfd.revents != 0 {
                 ready += 1;
             }
         }
+        ready
+    };
+    let busy_poll_net_read = |pfds: &mut [PollFd]| -> isize {
+        let mut ready = 0isize;
+        for pfd in pfds.iter_mut() {
+            if pfd.fd < 0 || (pfd.events & POLLIN) == 0 {
+                continue;
+            }
+            let fd = pfd.fd as usize;
+            let Some(file) = files.lock().get_file(fd) else {
+                continue;
+            };
+            let Some(sock) = file.as_any().downcast_ref::<NetSocketFile>() else {
+                continue;
+            };
+            let revents = sock.busy_poll_revents_for_poll_events(pfd.events);
+            if revents != 0 {
+                pfd.revents = revents;
+                ready += 1;
+            }
+        }
+        ready
+    };
+
+    let ret = loop {
+        let (pending, mask) = {
+            let inner = task.borrow_mut();
+            (inner.pending_signals, inner.signal_mask)
+        };
+        // Keep poll-like waits aligned with epoll/pipe behavior: don't let
+        // default SIGCHLD bookkeeping spuriously interrupt readiness waits.
+        if has_wait_interrupting_pending(pending, mask) {
+            break EINTR;
+        }
+
+        let ready = scan_ready(&mut pfds);
 
         if ready != 0 {
             break ready;
@@ -322,12 +346,51 @@ pub fn syscall_ppoll(
             if now >= deadline {
                 break 0;
             }
-            if nfds == 0 {
-                let remain_ns = deadline.saturating_sub(now);
-                let mut sleep_ms = ((remain_ns.saturating_add(999_999)) / 1_000_000) as usize;
-                if sleep_ms == 0 {
-                    sleep_ms = 1;
-                }
+        }
+        let ready = busy_poll_net_read(&mut pfds);
+        if ready != 0 {
+            break ready;
+        }
+        let mut waiter_armed = false;
+        let mut net_timer_needed = false;
+        for pfd in pfds.iter() {
+            if pfd.fd < 0 {
+                continue;
+            }
+            let fd = pfd.fd as usize;
+            let Some(file) = files.lock().get_file(fd) else {
+                continue;
+            };
+            if file.as_any().downcast_ref::<NetSocketFile>().is_some() {
+                net_timer_needed = true;
+            }
+            waiter_armed = file.register_poll_waiter(&task) || waiter_armed;
+        }
+        let ready = scan_ready(&mut pfds);
+        if ready != 0 {
+            break ready;
+        }
+        if let Some(deadline) = deadline_ns {
+            let now = ppoll_now_ns();
+            if now >= deadline {
+                break 0;
+            }
+        }
+        if let Some(deadline) = deadline_ns {
+            let now = ppoll_now_ns();
+            let remain_ns = deadline.saturating_sub(now);
+            let mut sleep_ms = ((remain_ns.saturating_add(999_999)) / 1_000_000) as usize;
+            if sleep_ms == 0 {
+                sleep_ms = 1;
+            }
+            if net_timer_needed {
+                // 当前网络栈由 poll 推进；长时间阻塞在 poll 中时也要周期性运行 TCP 定时器。
+                sleep_ms = sleep_ms.min(1);
+            }
+            if waiter_armed {
+                crate::task::block_sleep::add_timer(Arc::clone(&task), sleep_ms);
+                block_current_and_run_next();
+            } else {
                 let r = crate::syscall::thread::sys_sleep(sleep_ms);
                 if r == EINTR {
                     let (pending, mask) = {
@@ -338,10 +401,13 @@ pub fn syscall_ppoll(
                         break EINTR;
                     }
                 }
-            } else {
-                crate::task::processor::suspend_current_and_run_next();
             }
         } else if nfds == 0 {
+            block_current_and_run_next();
+        } else if waiter_armed {
+            if net_timer_needed {
+                crate::task::block_sleep::add_timer(Arc::clone(&task), 1);
+            }
             block_current_and_run_next();
         } else {
             crate::task::processor::suspend_current_and_run_next();

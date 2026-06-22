@@ -93,12 +93,6 @@ fn clone_from_parts(
     const CLONE_NEWPID: usize = 0x2000_0000; // 新建 PID namespace
     const CLONE_NEWNET: usize = 0x4000_0000; // 新建 network namespace
 
-    // Network namespace is not implemented yet.
-    // 网络命名空间尚未实现，调用者请求时直接拒绝
-    if (flags & CLONE_NEWNET) != 0 {
-        return err(SyscallError::EINVAL);
-    }
-
     // Linux flag constraints:
     // - CLONE_SIGHAND requires CLONE_VM.
     // - CLONE_THREAD requires CLONE_SIGHAND (and therefore CLONE_VM).
@@ -360,6 +354,10 @@ fn clone_from_parts(
     // CLONE_NEWNS：拆出独立的 mount 命名空间，后续 mount/umount 不影响父
     if (flags & CLONE_NEWNS) != 0 {
         child.unshare_mount_namespace();
+    }
+    // CLONE_NEWNET：当前只分配 namespace 句柄，网络设备表仍全局共享。
+    if (flags & CLONE_NEWNET) != 0 {
+        child.unshare_net_namespace();
     }
     // CLONE_NEWCGROUP：以当前 cgroup 路径作为子的 cgroup ns 根
     if (flags & CLONE_NEWCGROUP) != 0 {
@@ -696,6 +694,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     const CLONE_NEWUTS: usize = 0x0400_0000; // 新建 UTS namespace
     const CLONE_NEWIPC: usize = 0x0800_0000; // 新建 IPC namespace
     const CLONE_NEWPID: usize = 0x2000_0000; // 新建 PID namespace
+    const CLONE_NEWNET: usize = 0x4000_0000; // 新建 network namespace
     const CLONE_INTO_CGROUP: usize = 0x0000_0002_0000_0000; // 原子性加入目标 cgroup
     const CLONE_ARGS_CGROUP_SIZE: usize = size_of::<Clone3Args>();
     const SUPPORTED_CLONE3_FLAGS: usize = CLONE_VM
@@ -715,6 +714,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
         | CLONE_NEWUTS
         | CLONE_NEWIPC
         | CLONE_NEWPID
+        | CLONE_NEWNET
         | CLONE_INTO_CGROUP;
 
     // 从用户空间安全读取 clone_args；按 size 兼容更短/更长版本，

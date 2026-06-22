@@ -491,11 +491,12 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     }
 
     if let AtPath::PseudoAbs(abs) = &at {
+        let cgroup_rc = cgroup_mkdir(abs);
+        if cgroup_rc != err(SyscallError::EROFS) {
+            return cgroup_rc;
+        }
         if open_pseudo(abs).is_some() || crate::fs::proc_readlink(abs).is_some() {
             return err(SyscallError::EEXIST);
-        }
-        if crate::fs::is_cgroup_pseudo_path(abs) {
-            return cgroup_mkdir(abs);
         }
         let rc = crate::fs::pseudo_dev_dir_mkdir(abs);
         if rc != err(SyscallError::EROFS) {
@@ -577,12 +578,23 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     }
     let remove_dir = (flags & AT_REMOVEDIR) != 0;
 
+    let at = match resolve_at_path(dirfd, &path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
     if remove_dir {
         if final_non_empty_component(&path) == Some(".") {
             return err(SyscallError::EINVAL);
         }
         if final_non_empty_component(&path) == Some("..") {
             return err(SyscallError::ENOTEMPTY);
+        }
+        if let AtPath::PseudoAbs(abs) = &at {
+            let cgroup_rc = cgroup_rmdir(abs);
+            if cgroup_rc != err(SyscallError::EROFS) {
+                return cgroup_rc;
+            }
         }
         if let Some(abs) = match resolve_abs_path(dirfd, &path) {
             Ok(v) => v,
@@ -594,11 +606,6 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         }
     }
 
-    let at = match resolve_at_path(dirfd, &path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
     if let AtPath::PseudoAbs(abs) = &at {
         // Minimal `/dev/shm` support for POSIX `shm_unlink`.
         if abs == "/dev/shm" || abs == "/dev/shm/" {
@@ -609,9 +616,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
             };
         }
         if crate::fs::is_cgroup_pseudo_path(abs) {
-            return if remove_dir {
-                cgroup_rmdir(abs)
-            } else if open_pseudo(abs).is_some() {
+            return if open_pseudo(abs).is_some() {
                 err(SyscallError::EISDIR)
             } else {
                 err(SyscallError::ENOENT)
@@ -828,7 +833,10 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         return err(SyscallError::ENOTDIR);
     };
     if inode.link_count() == 0 {
-        return err(SyscallError::ENOENT);
+        // Linux keeps an opened directory fd usable after the directory entry is
+        // removed.  Our ext4 layer has already detached the backing blocks, so
+        // report EOF instead of surfacing ENOENT to user-space directory walkers.
+        return 0;
     }
 
     if len == 0 {

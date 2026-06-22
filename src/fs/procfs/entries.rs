@@ -57,12 +57,24 @@ pub(crate) fn proc_root_entries() -> Vec<PseudoDirent> {
         ino: 1,
         dtype: 4,
     });
+    entries.push(PseudoDirent {
+        name: String::from("irq"),
+        ino: 1,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("net"),
+        ino: 1,
+        dtype: 4,
+    });
     for name in [
         "mounts",
+        "mountinfo",
         "cgroups",
         "meminfo",
         "cpuinfo",
         "cmdline",
+        "interrupts",
         "loadavg",
         "uptime",
         "stat",
@@ -70,6 +82,7 @@ pub(crate) fn proc_root_entries() -> Vec<PseudoDirent> {
         "kallsyms",
         "kpageflags",
         "config.gz",
+        "modules",
     ] {
         entries.push(PseudoDirent {
             name: String::from(name),
@@ -85,6 +98,14 @@ pub(crate) fn proc_root_entries() -> Vec<PseudoDirent> {
         });
     }
     entries
+}
+
+pub(crate) fn proc_irq_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("default_smp_affinity", 8), ("5", 4), ("7", 4), ("8", 4)])
+}
+
+pub(crate) fn proc_irq_number_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("smp_affinity", 8)])
 }
 
 pub(crate) fn proc_dir_entries(children: &[(&str, u8)]) -> Vec<PseudoDirent> {
@@ -177,22 +198,125 @@ pub(crate) fn proc_sys_vm_entries() -> Vec<PseudoDirent> {
 }
 
 pub(crate) fn proc_sys_net_entries() -> Vec<PseudoDirent> {
-    proc_dir_entries(&[("ipv4", 4)])
+    proc_dir_entries(&[("core", 4), ("ipv4", 4), ("ipv6", 4)])
+}
+
+pub(crate) fn proc_sys_net_core_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[
+        ("busy_poll", 8),
+        ("busy_read", 8),
+        ("rmem_default", 8),
+        ("rmem_max", 8),
+        ("wmem_default", 8),
+        ("wmem_max", 8),
+    ])
 }
 
 pub(crate) fn proc_sys_net_ipv4_entries() -> Vec<PseudoDirent> {
-    proc_dir_entries(&[("conf", 4)])
+    proc_dir_entries(&[
+        ("conf", 4),
+        ("igmp_max_memberships", 8),
+        ("igmp_max_msf", 8),
+        ("tcp_syn_retries", 8),
+    ])
 }
 
 pub(crate) fn proc_sys_net_ipv4_conf_entries() -> Vec<PseudoDirent> {
-    proc_dir_entries(&[("lo", 4), ("default", 4)])
+    let mut entries = proc_dir_entries(&[("all", 4), ("default", 4)]);
+    for dev in crate::syscall::net::netdev::devices_snapshot() {
+        if entries.iter().any(|entry| entry.name == dev.name) {
+            continue;
+        }
+        entries.push(PseudoDirent {
+            name: dev.name,
+            ino: 1,
+            dtype: 4,
+        });
+    }
+    entries
 }
 
 pub(crate) fn proc_sys_net_ipv4_conf_if_entries() -> Vec<PseudoDirent> {
-    proc_dir_entries(&[("tag", 8)])
+    proc_dir_entries(&[
+        ("accept_redirects", 8),
+        ("force_igmp_version", 8),
+        ("secure_redirects", 8),
+        ("tag", 8),
+    ])
+}
+
+pub(crate) fn proc_sys_net_ipv6_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("conf", 4)])
+}
+
+pub(crate) fn proc_sys_net_ipv6_conf_entries() -> Vec<PseudoDirent> {
+    let mut entries = proc_dir_entries(&[("all", 4), ("default", 4)]);
+    for dev in crate::syscall::net::netdev::devices_snapshot() {
+        if entries.iter().any(|entry| entry.name == dev.name) {
+            continue;
+        }
+        entries.push(PseudoDirent {
+            name: dev.name,
+            ino: 1,
+            dtype: 4,
+        });
+    }
+    entries
+}
+
+pub(crate) fn proc_sys_net_ipv6_conf_if_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("accept_dad", 8), ("disable_ipv6", 8)])
+}
+
+pub(crate) fn proc_sys_user_entries() -> Vec<PseudoDirent> {
+    proc_dir_entries(&[("max_user_namespaces", 8)])
+}
+
+fn proc_sys_net_ipv4_conf_simple_path(path: &str) -> Option<&'static str> {
+    let rest = path.strip_prefix("/proc/sys/net/ipv4/conf/")?;
+    let mut parts = rest.split('/');
+    let iface = parts.next()?;
+    let file = parts.next()?;
+    if iface.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    match file {
+        "accept_redirects" => Some("/proc/sys/net/ipv4/conf/default/accept_redirects"),
+        "force_igmp_version" if iface == "all" => {
+            Some("/proc/sys/net/ipv4/conf/all/force_igmp_version")
+        }
+        "force_igmp_version" => Some("/proc/sys/net/ipv4/conf/default/force_igmp_version"),
+        "secure_redirects" => Some("/proc/sys/net/ipv4/conf/default/secure_redirects"),
+        "tag" => Some("/proc/sys/net/ipv4/conf/default/tag"),
+        _ => None,
+    }
+}
+
+fn proc_sys_net_ipv6_conf_simple_path(path: &str) -> Option<&'static str> {
+    let rest = path.strip_prefix("/proc/sys/net/ipv6/conf/")?;
+    let mut parts = rest.split('/');
+    let iface = parts.next()?;
+    let file = parts.next()?;
+    if iface.is_empty() || parts.next().is_some() || !matches!(file, "accept_dad" | "disable_ipv6")
+    {
+        return None;
+    }
+    match (iface, file) {
+        ("all", "accept_dad") => Some("/proc/sys/net/ipv6/conf/all/accept_dad"),
+        (_, "accept_dad") => Some("/proc/sys/net/ipv6/conf/default/accept_dad"),
+        ("all", "disable_ipv6") => Some("/proc/sys/net/ipv6/conf/all/disable_ipv6"),
+        (_, "disable_ipv6") => Some("/proc/sys/net/ipv6/conf/default/disable_ipv6"),
+        _ => None,
+    }
 }
 
 fn proc_simple_text_path(path: &str) -> Option<&'static str> {
+    if let Some(path) = proc_sys_net_ipv4_conf_simple_path(path) {
+        return Some(path);
+    }
+    if let Some(path) = proc_sys_net_ipv6_conf_simple_path(path) {
+        return Some(path);
+    }
     match path {
         "/proc/sys/kernel/core_pattern" => Some("/proc/sys/kernel/core_pattern"),
         "/proc/sys/kernel/threads-max" => Some("/proc/sys/kernel/threads-max"),
@@ -210,6 +334,7 @@ fn proc_simple_text_path(path: &str) -> Option<&'static str> {
         "/proc/sys/fs/pipe-user-pages-soft" => Some("/proc/sys/fs/pipe-user-pages-soft"),
         "/proc/sys/fs/pipe-user-pages-hard" => Some("/proc/sys/fs/pipe-user-pages-hard"),
         "/proc/sys/fs/lease-break-time" => Some("/proc/sys/fs/lease-break-time"),
+        "/proc/sys/user/max_user_namespaces" => Some("/proc/sys/user/max_user_namespaces"),
         "/proc/sys/vm/vfs_cache_pressure" => Some("/proc/sys/vm/vfs_cache_pressure"),
         "/proc/sys/vm/min_free_kbytes" => Some("/proc/sys/vm/min_free_kbytes"),
         "/proc/sys/vm/nr_hugepages" => Some("/proc/sys/vm/nr_hugepages"),
@@ -225,8 +350,50 @@ fn proc_simple_text_path(path: &str) -> Option<&'static str> {
         "/proc/sys/vm/dirty_expire_centisecs" => Some("/proc/sys/vm/dirty_expire_centisecs"),
         "/proc/sys/vm/unprivileged_userfaultfd" => Some("/proc/sys/vm/unprivileged_userfaultfd"),
         "/proc/sys/vm/memory_failure_early_kill" => Some("/proc/sys/vm/memory_failure_early_kill"),
+        "/proc/sys/net/ipv4/igmp_max_memberships" => {
+            Some("/proc/sys/net/ipv4/igmp_max_memberships")
+        }
+        "/proc/sys/net/ipv4/igmp_max_msf" => Some("/proc/sys/net/ipv4/igmp_max_msf"),
+        "/proc/sys/net/ipv4/tcp_syn_retries" => Some("/proc/sys/net/ipv4/tcp_syn_retries"),
+        "/proc/sys/net/core/busy_poll" => Some("/proc/sys/net/core/busy_poll"),
+        "/proc/sys/net/core/busy_read" => Some("/proc/sys/net/core/busy_read"),
+        "/proc/sys/net/core/rmem_default" => Some("/proc/sys/net/core/rmem_default"),
+        "/proc/sys/net/core/rmem_max" => Some("/proc/sys/net/core/rmem_max"),
+        "/proc/sys/net/core/wmem_default" => Some("/proc/sys/net/core/wmem_default"),
+        "/proc/sys/net/core/wmem_max" => Some("/proc/sys/net/core/wmem_max"),
+        "/proc/sys/net/ipv4/conf/lo/accept_redirects" => {
+            Some("/proc/sys/net/ipv4/conf/default/accept_redirects")
+        }
+        "/proc/sys/net/ipv4/conf/lo/force_igmp_version" => {
+            Some("/proc/sys/net/ipv4/conf/default/force_igmp_version")
+        }
+        "/proc/sys/net/ipv4/conf/lo/secure_redirects" => {
+            Some("/proc/sys/net/ipv4/conf/default/secure_redirects")
+        }
         "/proc/sys/net/ipv4/conf/lo/tag" => Some("/proc/sys/net/ipv4/conf/lo/tag"),
+        "/proc/sys/net/ipv4/conf/default/accept_redirects" => {
+            Some("/proc/sys/net/ipv4/conf/default/accept_redirects")
+        }
+        "/proc/sys/net/ipv4/conf/default/force_igmp_version" => {
+            Some("/proc/sys/net/ipv4/conf/default/force_igmp_version")
+        }
+        "/proc/sys/net/ipv4/conf/default/secure_redirects" => {
+            Some("/proc/sys/net/ipv4/conf/default/secure_redirects")
+        }
         "/proc/sys/net/ipv4/conf/default/tag" => Some("/proc/sys/net/ipv4/conf/default/tag"),
+        "/proc/sys/net/ipv4/conf/all/force_igmp_version" => {
+            Some("/proc/sys/net/ipv4/conf/all/force_igmp_version")
+        }
+        "/proc/sys/net/ipv6/conf/all/accept_dad" => Some("/proc/sys/net/ipv6/conf/all/accept_dad"),
+        "/proc/sys/net/ipv6/conf/all/disable_ipv6" => {
+            Some("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+        }
+        "/proc/sys/net/ipv6/conf/default/accept_dad" => {
+            Some("/proc/sys/net/ipv6/conf/default/accept_dad")
+        }
+        "/proc/sys/net/ipv6/conf/default/disable_ipv6" => {
+            Some("/proc/sys/net/ipv6/conf/default/disable_ipv6")
+        }
         _ => None,
     }
 }
@@ -249,6 +416,7 @@ fn proc_simple_text_default(path: &'static str) -> Vec<u8> {
         "/proc/sys/fs/pipe-user-pages-soft" => b"128\n".to_vec(),
         "/proc/sys/fs/pipe-user-pages-hard" => b"0\n".to_vec(),
         "/proc/sys/fs/lease-break-time" => b"45\n".to_vec(),
+        "/proc/sys/user/max_user_namespaces" => b"1024\n".to_vec(),
         "/proc/sys/vm/vfs_cache_pressure" => b"100\n".to_vec(),
         "/proc/sys/vm/nr_hugepages" => b"0\n".to_vec(),
         "/proc/sys/vm/nr_overcommit_hugepages" => b"0\n".to_vec(),
@@ -265,8 +433,25 @@ fn proc_simple_text_default(path: &'static str) -> Vec<u8> {
         "/proc/sys/vm/dirty_expire_centisecs" => b"3000\n".to_vec(),
         "/proc/sys/vm/unprivileged_userfaultfd" => b"0\n".to_vec(),
         "/proc/sys/vm/memory_failure_early_kill" => b"0\n".to_vec(),
+        "/proc/sys/net/ipv4/igmp_max_memberships" => b"20\n".to_vec(),
+        "/proc/sys/net/ipv4/igmp_max_msf" => b"10\n".to_vec(),
+        "/proc/sys/net/ipv4/tcp_syn_retries" => b"6\n".to_vec(),
+        "/proc/sys/net/core/busy_poll" => b"0\n".to_vec(),
+        "/proc/sys/net/core/busy_read" => b"0\n".to_vec(),
+        "/proc/sys/net/core/rmem_default" => b"212992\n".to_vec(),
+        "/proc/sys/net/core/rmem_max" => b"212992\n".to_vec(),
+        "/proc/sys/net/core/wmem_default" => b"212992\n".to_vec(),
+        "/proc/sys/net/core/wmem_max" => b"212992\n".to_vec(),
+        "/proc/sys/net/ipv4/conf/all/force_igmp_version" => b"0\n".to_vec(),
+        "/proc/sys/net/ipv4/conf/default/accept_redirects" => b"0\n".to_vec(),
+        "/proc/sys/net/ipv4/conf/default/force_igmp_version" => b"0\n".to_vec(),
+        "/proc/sys/net/ipv4/conf/default/secure_redirects" => b"0\n".to_vec(),
         "/proc/sys/net/ipv4/conf/lo/tag" => b"0\n".to_vec(),
         "/proc/sys/net/ipv4/conf/default/tag" => b"0\n".to_vec(),
+        "/proc/sys/net/ipv6/conf/all/accept_dad" => b"1\n".to_vec(),
+        "/proc/sys/net/ipv6/conf/all/disable_ipv6" => b"0\n".to_vec(),
+        "/proc/sys/net/ipv6/conf/default/accept_dad" => b"1\n".to_vec(),
+        "/proc/sys/net/ipv6/conf/default/disable_ipv6" => b"0\n".to_vec(),
         _ => Vec::new(),
     }
 }
@@ -299,6 +484,16 @@ pub(crate) fn proc_simple_text_content(path: &'static str) -> String {
 pub(crate) fn vm_max_map_count() -> usize {
     let text = proc_simple_text_content("/proc/sys/vm/max_map_count");
     text.trim().parse().unwrap_or(VM_MAX_MAP_COUNT_DEFAULT)
+}
+
+pub(crate) fn net_core_busy_read_usecs() -> u32 {
+    let text = proc_simple_text_content("/proc/sys/net/core/busy_read");
+    text.trim().parse::<u32>().unwrap_or(0)
+}
+
+pub(crate) fn net_core_busy_poll_usecs() -> u32 {
+    let text = proc_simple_text_content("/proc/sys/net/core/busy_poll");
+    text.trim().parse::<u32>().unwrap_or(0)
 }
 
 pub(super) fn write_proc_simple_text(path: &'static str, data: &[u8]) -> Result<Vec<u8>, isize> {
@@ -390,7 +585,11 @@ pub(crate) fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
         "pagemap",
         "smaps",
         "coredump_filter",
+        "uid_map",
+        "gid_map",
+        "setgroups",
         "mounts",
+        "mountinfo",
         "cgroup",
     ] {
         entries.push(PseudoDirent {
@@ -441,6 +640,11 @@ pub(crate) fn proc_pid_ns_entries(pid: u32) -> Vec<PseudoDirent> {
     });
     entries.push(PseudoDirent {
         name: String::from("mnt"),
+        ino: pid as u64,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("net"),
         ino: pid as u64,
         dtype: 10,
     });
@@ -627,6 +831,11 @@ pub(crate) fn proc_pid_task_tid_entries(pid: u32, tid: u32) -> Vec<PseudoDirent>
     });
     entries.push(PseudoDirent {
         name: String::from("mounts"),
+        ino: tid as u64,
+        dtype: 8,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("mountinfo"),
         ino: tid as u64,
         dtype: 8,
     });

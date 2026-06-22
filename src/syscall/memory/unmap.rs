@@ -25,7 +25,10 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
     {
         return err(SyscallError::EIO);
     }
+    let token = memory_set.token();
     memory_set.unmap_user_vma_range(start.into(), end.into());
+    drop(memory_set);
+    crate::syscall::net::clear_packet_ring_mmaps_for_range(token, start, end);
     0
 }
 
