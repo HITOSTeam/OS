@@ -220,13 +220,14 @@ pub fn trap_handler() {
     let ecode = (estat >> ESTAT_ECODE_SHIFT) & ESTAT_ECODE_MASK;
     let badv = read_badv();
     let badi = read_badi();
+    let mut syscall_return = false;
 
     /*
-    
-        ecode == 0              -> 中断类，当前主要处理 timer interrupt
-        ecode == ECODE_SYSCALL  -> syscall
-        其他 ecode              -> 用户异常，例如缺页、非法访问、权限错误、地址未对齐
-     */
+
+       ecode == 0              -> 中断类，当前主要处理 timer interrupt
+       ecode == ECODE_SYSCALL  -> syscall
+       其他 ecode              -> 用户异常，例如缺页、非法访问、权限错误、地址未对齐
+    */
     if ecode == 0 {
         if (estat & (1 << ESTAT_TIMER_BIT)) != 0 {
             //清理对应的寄存器,否则返回用户态之后即使计时器没有到,还会继续触发时钟中断
@@ -266,13 +267,14 @@ pub fn trap_handler() {
                 suspend_current_and_run_next();
             }
         } else {
-            //非时钟中断目前先panic 
+            //非时钟中断目前先panic
             panic!(
                 "Unhandled interrupt: estat={:#x} badv={:#x} badi={:#x}",
                 estat, badv, badi
             );
         }
     } else if ecode == ECODE_SYSCALL {
+        syscall_return = true;
         let cx = get_trap_context();
         cx.sepc = cx.sepc.wrapping_add(4);
         let args = [
@@ -301,6 +303,9 @@ pub fn trap_handler() {
     check_timer();
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
+    if syscall_return && crate::task::processor::should_preempt_current_on_syscall_return() {
+        suspend_current_and_run_next();
+    }
     // 返回用户态前的抢占点：消费本 hart 的 NEED_RESCHED，让刚唤醒的高优先级
     // 任务尽快运行（见 processor::reschedule_before_user_return_if_needed）。
     crate::task::processor::reschedule_before_user_return_if_needed();
@@ -399,7 +404,6 @@ pub fn trap_return() -> ! {
         );
     }
 }
-
 
 pub fn get_current_token() -> usize {
     let now_task_block = crate::task::processor::current_task().unwrap();

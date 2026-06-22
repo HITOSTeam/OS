@@ -257,9 +257,11 @@ pub fn trap_handler() {
     let scause = scause::read();
     let stval = stval::read();
     let code = scause.cause(); // usize
+    let mut syscall_return = false;
     match code {
         // user env call ...
         Trap::Exception(USER_ENV_CALL) => {
+            syscall_return = true;
             // Get syscall arguments
             let (syscall_id, args) = {
                 let cx = get_trap_context();
@@ -340,6 +342,9 @@ pub fn trap_handler() {
     check_timer();
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
+    if syscall_return && crate::task::processor::should_preempt_current_on_syscall_return() {
+        suspend_current_and_run_next();
+    }
     // 返回用户态前的抢占点：消费本 hart 的 NEED_RESCHED，让刚唤醒的高优先级
     // 任务尽快运行（见 processor::reschedule_before_user_return_if_needed）。
     crate::task::processor::reschedule_before_user_return_if_needed();

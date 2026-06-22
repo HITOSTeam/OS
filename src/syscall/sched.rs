@@ -2,13 +2,12 @@ use crate::syscall::error::{SyscallError, err};
 use alloc::sync::Arc;
 
 use crate::{
-    config::MAX_HARTS,
     debug_config::DEBUG_CYCLICTEST,
     mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value},
     syscall::misc::decode_linux_tid,
     task::{
         ProcessControlBlock,
-        manager::{pid2process, refresh_process_runqueues},
+        manager::{online_hart_mask, pid2process, refresh_process_runqueues},
         processor::{current_process, hart_id, suspend_current_and_run_next},
         sched::{
             SCHED_BATCH, SCHED_DEADLINE, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_OTHER,
@@ -77,11 +76,7 @@ fn can_control_target(target: &Arc<ProcessControlBlock>) -> bool {
 }
 
 fn full_affinity_mask() -> usize {
-    if MAX_HARTS >= usize::BITS as usize {
-        usize::MAX
-    } else {
-        (1usize << MAX_HARTS) - 1
-    }
+    online_hart_mask()
 }
 
 fn resolve_process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
@@ -301,11 +296,13 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     };
     let mut tmp = alloc::vec![0u8; cpusetsize];
     let max_bits = cpusetsize * 8;
-    for cpu in 0..MAX_HARTS {
+    let online_mask = full_affinity_mask();
+    let effective_mask = affinity_mask & online_mask;
+    for cpu in 0..usize::BITS as usize {
         if cpu >= max_bits {
             break;
         }
-        if (affinity_mask & (1usize << cpu)) != 0 {
+        if (effective_mask & (1usize << cpu)) != 0 {
             tmp[cpu / 8] |= 1u8 << (cpu % 8);
         }
     }
@@ -349,7 +346,7 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     }
     let max_bits = cpusetsize * 8;
     let mut requested_mask = 0usize;
-    for cpu in 0..MAX_HARTS {
+    for cpu in 0..usize::BITS as usize {
         if cpu >= max_bits {
             break;
         }
@@ -357,11 +354,12 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
             requested_mask |= 1usize << cpu;
         }
     }
+    requested_mask &= full_affinity_mask();
     if requested_mask == 0 {
         return err(SyscallError::EINVAL);
     }
 
-    let current_hart = hart_id() % MAX_HARTS;
+    let current_hart = hart_id() % usize::BITS as usize;
     let preferred_cpu = if (requested_mask & (1usize << current_hart)) != 0 {
         current_hart
     } else {

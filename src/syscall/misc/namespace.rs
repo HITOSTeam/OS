@@ -9,28 +9,41 @@ use crate::{
 /// Minimal support:
 /// - `CLONE_FILES`: unshare file descriptor table from CLONE_FILES owner.
 /// - `CLONE_FS`: currently a no-op (cwd/umask are already process-local).
+/// - `CLONE_NEWUSER`: allocate a user namespace handle and reset proc uid/gid maps.
 /// - `CLONE_NEWNS`: clone the current mount namespace.
+/// - `CLONE_NEWNET`: allocate a net namespace handle; devices remain global for now.
 pub fn syscall_unshare(flags: usize) -> isize {
     const CLONE_FS: usize = 0x0000_0200;
     const CLONE_FILES: usize = 0x0000_0400;
     const CLONE_NEWNS: usize = 0x0002_0000;
+    const CLONE_NEWUSER: usize = 0x1000_0000;
     const CLONE_NEWUTS: usize = 0x0400_0000;
-    let valid = CLONE_FILES | CLONE_FS | CLONE_NEWNS | CLONE_NEWUTS;
+    const CLONE_NEWNET: usize = 0x4000_0000;
+    let valid = CLONE_FILES | CLONE_FS | CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_NEWNET;
     if (flags & !valid) != 0 {
         return err(SyscallError::EINVAL);
     }
     let process = current_process();
-    if (flags & (CLONE_NEWNS | CLONE_NEWUTS)) != 0 && process.borrow_mut().euid != 0 {
-        return err(SyscallError::EPERM);
+    if (flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWNET)) != 0 {
+        let inner = process.borrow_mut();
+        if inner.euid != 0 && inner.user_ns_id == 0 && (flags & CLONE_NEWUSER) == 0 {
+            return err(SyscallError::EPERM);
+        }
     }
     if (flags & CLONE_FILES) != 0 {
         process.unshare_files();
+    }
+    if (flags & CLONE_NEWUSER) != 0 {
+        process.unshare_user_namespace();
     }
     if (flags & CLONE_NEWNS) != 0 {
         process.unshare_mount_namespace();
     }
     if (flags & CLONE_NEWUTS) != 0 {
         process.unshare_uts_namespace();
+    }
+    if (flags & CLONE_NEWNET) != 0 {
+        process.unshare_net_namespace();
     }
     0
 }
@@ -40,11 +53,13 @@ pub fn syscall_unshare(flags: usize) -> isize {
 /// Minimal support:
 /// - IPC namespace fd from `/proc/<pid>/ns/ipc`
 /// - mount namespace fd from `/proc/<pid>/ns/mnt`
-/// - `nstype` of 0, `CLONE_NEWIPC`, or `CLONE_NEWNS`
+/// - net namespace fd from `/proc/<pid>/ns/net`
+/// - `nstype` of 0, `CLONE_NEWIPC`, `CLONE_NEWNS`, or `CLONE_NEWNET`
 pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
     const EBADF: isize = -9;
     const CLONE_NEWNS: usize = 0x0002_0000;
     const CLONE_NEWIPC: usize = 0x0800_0000;
+    const CLONE_NEWNET: usize = 0x4000_0000;
 
     if fd < 0 {
         return EBADF;
@@ -91,6 +106,13 @@ pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
                 return err(SyscallError::EINVAL);
             };
             process.set_mount_namespace(namespace);
+            0
+        }
+        crate::fs::NamespaceKind::Net => {
+            if expected != CLONE_NEWNET {
+                return err(SyscallError::EINVAL);
+            }
+            inner.net_ns_id = ns_file.ns_id();
             0
         }
     }

@@ -5,7 +5,8 @@ use crate::{
     mm::{try_copy_from_user, try_read_user_value},
     println,
     task::processor::{
-        exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
+        current_files, exit_current_and_run_next, exit_group_and_run_next,
+        suspend_current_and_run_next,
     },
     trap::get_current_token,
 };
@@ -82,6 +83,15 @@ where
         }
     }
     total
+}
+
+fn fd_uses_socket_msg_io(fd: usize) -> bool {
+    let files = current_files();
+    let files = files.lock();
+    let Some(file) = files.get_file(fd) else {
+        return false;
+    };
+    crate::syscall::net::is_socket_file(file.as_ref())
 }
 
 fn do_iov_with_offset<F>(
@@ -196,12 +206,30 @@ pub fn syscall_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
             return ret;
         }
     }
+    let Ok(iovcnt) = validate_iovcnt(iovcnt) else {
+        return err(SyscallError::EINVAL);
+    };
+    if iovcnt == 0 {
+        return 0;
+    }
+    if fd_uses_socket_msg_io(fd) {
+        return super::net::syscall_sendmsg_iov(fd, iov_ptr, iovcnt, 0);
+    }
     do_iov(iov_ptr, iovcnt, |base, len| {
         syscall_write(fd, base as *const u8, len)
     })
 }
 
 pub fn syscall_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
+    let Ok(iovcnt) = validate_iovcnt(iovcnt) else {
+        return err(SyscallError::EINVAL);
+    };
+    if iovcnt == 0 {
+        return 0;
+    }
+    if fd_uses_socket_msg_io(fd) {
+        return super::net::syscall_recvmsg_iov(fd, iov_ptr, iovcnt, 0);
+    }
     do_iov(iov_ptr, iovcnt, |base, len| {
         syscall_read(fd, base as *mut u8, len)
     })

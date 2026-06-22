@@ -3,7 +3,7 @@ use crate::task::task_block::TaskControlBlock;
 use crate::{
     config::clock_freq,
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    fs::{POLLIN, POLLOUT, POLLPRI},
+    fs::{NetSocketFile, POLLIN, POLLOUT, POLLPRI},
     mm::{
         try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
         write_user_value,
@@ -1366,6 +1366,27 @@ pub fn syscall_pselect6(
         }
         0
     };
+    let busy_poll_net_read = || -> bool {
+        if readfds == 0 {
+            return false;
+        }
+        let mut polled = false;
+        for fd in 0..nfds {
+            let byte = fd / 8;
+            let bit = fd % 8;
+            if (in_r[byte] & (1u8 << bit)) == 0 {
+                continue;
+            }
+            let Some(file) = files.lock().get_file(fd) else {
+                continue;
+            };
+            let Some(sock) = file.as_any().downcast_ref::<NetSocketFile>() else {
+                continue;
+            };
+            polled = sock.busy_poll_for_poll_events(POLLIN) || polled;
+        }
+        polled
+    };
 
     // 主等待循环:每一轮 = "检查信号 → 扫一遍 fd → 命中就返回 / 超时就返回 / 都没命中就 yield"。
     // 没有事件驱动唤醒机制,采用 busy poll + suspend 让出 CPU 的简化模型。
@@ -1454,6 +1475,10 @@ pub fn syscall_pselect6(
                 }
                 break 0;
             }
+        }
+
+        if busy_poll_net_read() {
+            continue;
         }
 
         // ⑥ 让出 CPU,等下次被调度回来再扫一遍。
