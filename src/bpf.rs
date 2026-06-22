@@ -18,6 +18,7 @@ const ENOENT: isize = -2;
 const EEXIST: isize = -17;
 const ENOMEM: isize = -12;
 const EACCES: isize = -13;
+const E2BIG: isize = -7;
 
 const BPF_MAP_CREATE: usize = 0;
 const BPF_MAP_LOOKUP_ELEM: usize = 1;
@@ -39,6 +40,7 @@ const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = 1;
 
 const BPF_CLASS_MASK: u8 = 0x07;
 const BPF_LD: u8 = 0x00;
+const BPF_LDX: u8 = 0x01;
 const BPF_ST: u8 = 0x02;
 const BPF_STX: u8 = 0x03;
 const BPF_ALU: u8 = 0x04;
@@ -47,6 +49,7 @@ const BPF_ALU64: u8 = 0x07;
 
 const BPF_SIZE_MASK: u8 = 0x18;
 const BPF_W: u8 = 0x00;
+const BPF_H: u8 = 0x08;
 const BPF_B: u8 = 0x10;
 const BPF_DW: u8 = 0x18;
 
@@ -76,6 +79,7 @@ const BPF_REG_2: usize = 2;
 const BPF_REG_10: usize = 10;
 const MAX_BPF_REG: usize = 11;
 const BPF_STACK_SIZE: usize = 512;
+const BPF_MAXINSNS: u32 = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -292,20 +296,64 @@ impl File for BpfMapFile {
 #[derive(Clone)]
 pub struct BpfProgFile {
     insns: Vec<BpfInsn>,
+    maps: BTreeMap<u32, Arc<dyn File + Send + Sync>>,
 }
 
 impl BpfProgFile {
-    fn new(insns: Vec<BpfInsn>) -> Self {
-        Self { insns }
+    fn new(insns: Vec<BpfInsn>, maps: BTreeMap<u32, Arc<dyn File + Send + Sync>>) -> Self {
+        Self { insns, maps }
     }
 
-    pub fn run_packet(&self, packet: &[u8]) {
-        let _ = self.execute(packet);
+    pub fn filter_len(&self, packet: &[u8]) -> Option<usize> {
+        let len = self.execute(packet).ok()? as usize;
+        (len != 0).then_some(len.min(packet.len()))
     }
 
-    fn execute(&self, _packet: &[u8]) -> Result<u64, isize> {
+    fn with_map<R>(&self, fd: u32, f: impl FnOnce(&BpfMapFile) -> R) -> Option<R> {
+        let file = self.maps.get(&fd)?;
+        let map = file.as_any().downcast_ref::<BpfMapFile>()?;
+        Some(f(map))
+    }
+
+    fn map_key_size(&self, fd: u32) -> Result<usize, isize> {
+        self.with_map(fd, |map| map.key_size as usize).ok_or(EBADF)
+    }
+
+    fn map_lookup_bytes(&self, fd: u32, key: &[u8]) -> Option<Vec<u8>> {
+        self.with_map(fd, |map| map.lookup(key)).flatten()
+    }
+
+    fn map_load_bytes(
+        &self,
+        fd: u32,
+        key: &[u8],
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, isize> {
+        let value = self.map_lookup_bytes(fd, key).ok_or(ENOENT)?;
+        let end = offset.checked_add(len).ok_or(EINVAL)?;
+        if end > value.len() {
+            return Err(EACCES);
+        }
+        Ok(value[offset..end].to_vec())
+    }
+
+    fn map_store_bytes(
+        &self,
+        fd: u32,
+        key: &[u8],
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), isize> {
+        self.with_map(fd, |map| map.store_bytes(key, offset, data))
+            .ok_or(EBADF)?
+    }
+
+    fn execute(&self, packet: &[u8]) -> Result<u64, isize> {
         let mut regs: [RuntimeValue; MAX_BPF_REG] =
             core::array::from_fn(|_| RuntimeValue::Scalar(0));
+        regs[BPF_REG_1] = RuntimeValue::PacketPtr { offset: 0 };
+        regs[BPF_REG_2] = RuntimeValue::Scalar(packet.len() as u64);
         regs[BPF_REG_10] = RuntimeValue::FramePtr;
         let mut stack = [0u8; BPF_STACK_SIZE];
         let mut pc = 0usize;
@@ -331,16 +379,26 @@ impl BpfProgFile {
                     pc += 2;
                     continue;
                 }
+                BPF_LDX if (insn.code & BPF_MODE_MASK) == BPF_MEM => {
+                    regs[insn.dst_reg()] = RuntimeValue::Scalar(load_value(
+                        self,
+                        &stack,
+                        packet,
+                        &regs[insn.src_reg()],
+                        insn.off,
+                        insn.code & BPF_SIZE_MASK,
+                    )?);
+                }
                 BPF_ST if (insn.code & BPF_MODE_MASK) == BPF_MEM => {
                     let data = imm_to_bytes(insn.imm, insn.code & BPF_SIZE_MASK);
-                    store_value(&mut stack, &mut regs[insn.dst_reg()], insn.off, &data)?;
+                    store_value(self, &mut stack, &mut regs[insn.dst_reg()], insn.off, &data)?;
                 }
                 BPF_STX if (insn.code & BPF_MODE_MASK) == BPF_MEM => {
                     let data = scalar_to_sized_bytes(
                         regs[insn.src_reg()].as_u64(),
                         insn.code & BPF_SIZE_MASK,
                     )?;
-                    store_value(&mut stack, &mut regs[insn.dst_reg()], insn.off, &data)?;
+                    store_value(self, &mut stack, &mut regs[insn.dst_reg()], insn.off, &data)?;
                 }
                 BPF_ALU | BPF_ALU64 => {
                     let is_alu64 = class == BPF_ALU64;
@@ -372,21 +430,18 @@ impl BpfProgFile {
                         let RuntimeValue::MapFd(map_fd) = regs[BPF_REG_1] else {
                             return Err(EINVAL);
                         };
-                        let key = load_stack_key(
-                            &stack,
-                            &regs[BPF_REG_2],
-                            map_key_size(map_fd as usize)?,
-                        )?;
-                        regs[BPF_REG_0] =
-                            if map_lookup_bytes(map_fd as usize, key.as_slice()).is_some() {
-                                RuntimeValue::MapValuePtr {
-                                    map_fd,
-                                    key,
-                                    offset: 0,
-                                }
-                            } else {
-                                RuntimeValue::Null
-                            };
+                        let key =
+                            load_stack_key(&stack, &regs[BPF_REG_2], self.map_key_size(map_fd)?)?;
+                        regs[BPF_REG_0] = if self.map_lookup_bytes(map_fd, key.as_slice()).is_some()
+                        {
+                            RuntimeValue::MapValuePtr {
+                                map_fd,
+                                key,
+                                offset: 0,
+                            }
+                        } else {
+                            RuntimeValue::Null
+                        };
                     } else if op == BPF_EXIT {
                         return Ok(regs[BPF_REG_0].as_u64());
                     } else if op == BPF_JEQ || op == BPF_JNE {
@@ -451,6 +506,9 @@ enum RuntimeValue {
         key: Vec<u8>,
         offset: i64,
     },
+    PacketPtr {
+        offset: i64,
+    },
 }
 
 impl RuntimeValue {
@@ -462,20 +520,29 @@ impl RuntimeValue {
             Self::FramePtr => 0,
             Self::StackPtr(off) => *off as u64,
             Self::MapValuePtr { .. } => 1,
+            Self::PacketPtr { offset } => *offset as u64,
         }
     }
 }
 
 fn exec_alu(dst: &mut RuntimeValue, op: u8, src: u64, is_alu64: bool) -> Result<(), isize> {
     match dst {
-        RuntimeValue::FramePtr | RuntimeValue::StackPtr(_) => {
+        RuntimeValue::FramePtr | RuntimeValue::StackPtr(_) | RuntimeValue::PacketPtr { .. } => {
             let cur = match dst {
                 RuntimeValue::FramePtr => 0,
                 RuntimeValue::StackPtr(off) => *off,
+                RuntimeValue::PacketPtr { offset } => *offset,
                 _ => 0,
             };
             let src = src as i64;
+            let was_packet_ptr = matches!(dst, RuntimeValue::PacketPtr { .. });
             *dst = match op {
+                BPF_ADD if was_packet_ptr => RuntimeValue::PacketPtr {
+                    offset: cur.wrapping_add(src),
+                },
+                BPF_SUB if was_packet_ptr => RuntimeValue::PacketPtr {
+                    offset: cur.wrapping_sub(src),
+                },
                 BPF_ADD => RuntimeValue::StackPtr(cur.wrapping_add(src)),
                 BPF_SUB => RuntimeValue::StackPtr(cur.wrapping_sub(src)),
                 BPF_MOV => RuntimeValue::Scalar(src as u64),
@@ -525,6 +592,74 @@ fn exec_alu(dst: &mut RuntimeValue, op: u8, src: u64, is_alu64: bool) -> Result<
     }
 }
 
+fn sized_bytes_to_scalar(bytes: &[u8]) -> Result<u64, isize> {
+    Ok(match bytes.len() {
+        1 => bytes[0] as u64,
+        2 => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
+        4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+        8 => u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+        _ => return Err(ENOSYS),
+    })
+}
+
+fn size_to_len(size: u8) -> Result<usize, isize> {
+    match size {
+        BPF_B => Ok(1),
+        BPF_H => Ok(2),
+        BPF_W => Ok(4),
+        BPF_DW => Ok(8),
+        _ => Err(ENOSYS),
+    }
+}
+
+fn load_value(
+    prog: &BpfProgFile,
+    stack: &[u8; BPF_STACK_SIZE],
+    packet: &[u8],
+    src: &RuntimeValue,
+    off: i16,
+    size: u8,
+) -> Result<u64, isize> {
+    let len = size_to_len(size)?;
+    match src {
+        RuntimeValue::FramePtr => {
+            let start = pointer_offset_to_stack(0, off, len)?;
+            sized_bytes_to_scalar(&stack[start..start + len])
+        }
+        RuntimeValue::StackPtr(base) => {
+            let start = pointer_offset_to_stack(*base, off, len)?;
+            sized_bytes_to_scalar(&stack[start..start + len])
+        }
+        RuntimeValue::MapValuePtr {
+            map_fd,
+            key,
+            offset,
+        } => {
+            let start = offset.checked_add(off as i64).ok_or(EINVAL)?;
+            if start < 0 {
+                return Err(EACCES);
+            }
+            let data = prog.map_load_bytes(*map_fd, key.as_slice(), start as usize, len)?;
+            sized_bytes_to_scalar(&data)
+        }
+        RuntimeValue::PacketPtr { offset } => {
+            let start = offset.checked_add(off as i64).ok_or(EINVAL)?;
+            if start < 0 {
+                return Err(EACCES);
+            }
+            let start = start as usize;
+            let end = start.checked_add(len).ok_or(EINVAL)?;
+            if end > packet.len() {
+                return Err(EACCES);
+            }
+            sized_bytes_to_scalar(&packet[start..end])
+        }
+        _ => Err(EINVAL),
+    }
+}
+
 fn pointer_offset_to_stack(base: i64, off: i16, len: usize) -> Result<usize, isize> {
     let start = (BPF_STACK_SIZE as i64)
         .checked_add(base)
@@ -538,6 +673,7 @@ fn pointer_offset_to_stack(base: i64, off: i16, len: usize) -> Result<usize, isi
 }
 
 fn store_value(
+    prog: &BpfProgFile,
     stack: &mut [u8; BPF_STACK_SIZE],
     dst: &mut RuntimeValue,
     off: i16,
@@ -563,7 +699,7 @@ fn store_value(
             if start < 0 {
                 return Err(EACCES);
             }
-            map_store_bytes(*map_fd as usize, key.as_slice(), start as usize, data)
+            prog.map_store_bytes(*map_fd, key.as_slice(), start as usize, data)
         }
         _ => Err(EINVAL),
     }
@@ -585,6 +721,7 @@ fn load_stack_key(
 fn imm_to_bytes(imm: i32, size: u8) -> Vec<u8> {
     match size {
         BPF_B => vec![imm as u8],
+        BPF_H => (imm as u16).to_le_bytes().to_vec(),
         BPF_W => (imm as u32).to_le_bytes().to_vec(),
         BPF_DW => (imm as i64 as u64).to_le_bytes().to_vec(),
         _ => vec![],
@@ -594,27 +731,37 @@ fn imm_to_bytes(imm: i32, size: u8) -> Vec<u8> {
 fn scalar_to_sized_bytes(value: u64, size: u8) -> Result<Vec<u8>, isize> {
     Ok(match size {
         BPF_B => vec![value as u8],
+        BPF_H => (value as u16).to_le_bytes().to_vec(),
         BPF_W => (value as u32).to_le_bytes().to_vec(),
         BPF_DW => value.to_le_bytes().to_vec(),
         _ => return Err(ENOSYS),
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RegKind {
     Scalar,
     MapFd,
     FramePtr,
     StackPtr,
     MapValuePtr,
+    PacketPtr,
 }
 
 fn verify_program(insns: &[BpfInsn]) -> Result<(), &'static str> {
+    if !insns.last().is_some_and(|insn| {
+        (insn.code & BPF_CLASS_MASK) == BPF_JMP && (insn.code & BPF_OP_MASK) == BPF_EXIT
+    }) {
+        return Err("program must end with exit");
+    }
     let mut regs = [RegKind::Scalar; MAX_BPF_REG];
+    regs[BPF_REG_1] = RegKind::PacketPtr;
     regs[BPF_REG_10] = RegKind::FramePtr;
     let mut pc = 0usize;
     while pc < insns.len() {
         let insn = insns[pc];
+        let dst = checked_reg(insn.dst_reg())?;
+        let src = checked_reg(insn.src_reg())?;
         let class = insn.code & BPF_CLASS_MASK;
         match class {
             BPF_LD
@@ -624,7 +771,17 @@ fn verify_program(insns: &[BpfInsn]) -> Result<(), &'static str> {
                 if pc + 1 >= insns.len() {
                     return Err("truncated ldimm64");
                 }
-                regs[insn.dst_reg()] = if insn.src_reg() as u8 == BPF_PSEUDO_MAP_FD {
+                let next = insns[pc + 1];
+                if next.code != 0 || next.dst_reg() != 0 || next.src_reg() != 0 || next.off != 0 {
+                    return Err("invalid ldimm64 pair");
+                }
+                if insn.off != 0 {
+                    return Err("ldimm64 uses reserved fields");
+                }
+                if !matches!(insn.src_reg() as u8, 0 | BPF_PSEUDO_MAP_FD) {
+                    return Err("unsupported ldimm64 pseudo source");
+                }
+                regs[dst] = if insn.src_reg() as u8 == BPF_PSEUDO_MAP_FD {
                     RegKind::MapFd
                 } else {
                     RegKind::Scalar
@@ -632,9 +789,21 @@ fn verify_program(insns: &[BpfInsn]) -> Result<(), &'static str> {
                 pc += 2;
                 continue;
             }
+            BPF_LDX if (insn.code & BPF_MODE_MASK) == BPF_MEM => {
+                if !matches!(
+                    regs[src],
+                    RegKind::FramePtr
+                        | RegKind::StackPtr
+                        | RegKind::MapValuePtr
+                        | RegKind::PacketPtr
+                ) {
+                    return Err("memory load requires valid pointer");
+                }
+                regs[dst] = RegKind::Scalar;
+            }
             BPF_ST if (insn.code & BPF_MODE_MASK) == BPF_MEM => {
                 if !matches!(
-                    regs[insn.dst_reg()],
+                    regs[dst],
                     RegKind::FramePtr | RegKind::StackPtr | RegKind::MapValuePtr
                 ) {
                     return Err("memory store requires valid pointer");
@@ -642,35 +811,42 @@ fn verify_program(insns: &[BpfInsn]) -> Result<(), &'static str> {
             }
             BPF_STX if (insn.code & BPF_MODE_MASK) == BPF_MEM => {
                 if !matches!(
-                    regs[insn.dst_reg()],
+                    regs[dst],
                     RegKind::FramePtr | RegKind::StackPtr | RegKind::MapValuePtr
                 ) {
                     return Err("memory store requires valid pointer");
                 }
+                if !matches!(regs[src], RegKind::Scalar) {
+                    return Err("memory store value must be scalar");
+                }
             }
             BPF_ALU | BPF_ALU64 => {
-                let dst = insn.dst_reg();
                 let op = insn.code & BPF_OP_MASK;
                 let src_is_reg = (insn.code & BPF_SRC_MASK) == BPF_X;
                 if op == BPF_MOV {
                     regs[dst] = if src_is_reg {
-                        regs[insn.src_reg()]
+                        regs[src]
                     } else {
                         RegKind::Scalar
                     };
                 } else {
+                    if src_is_reg && !matches!(regs[src], RegKind::Scalar) {
+                        return Err("alu source must be scalar");
+                    }
                     match regs[dst] {
+                        RegKind::MapFd => {
+                            return Err("map fd arithmetic rejected");
+                        }
                         RegKind::MapValuePtr => {
                             return Err("pointer arithmetic on map value rejected");
                         }
-                        RegKind::FramePtr | RegKind::StackPtr => {
+                        RegKind::FramePtr | RegKind::StackPtr | RegKind::PacketPtr => {
                             if !matches!(op, BPF_ADD | BPF_SUB) {
-                                return Err("unsupported stack pointer operation");
+                                return Err("unsupported pointer operation");
                             }
-                            if src_is_reg && !matches!(regs[insn.src_reg()], RegKind::Scalar) {
-                                return Err("stack pointer arithmetic requires scalar offset");
+                            if regs[dst] != RegKind::PacketPtr {
+                                regs[dst] = RegKind::StackPtr;
                             }
-                            regs[dst] = RegKind::StackPtr;
                         }
                         _ => regs[dst] = RegKind::Scalar,
                     }
@@ -689,7 +865,15 @@ fn verify_program(insns: &[BpfInsn]) -> Result<(), &'static str> {
                         return Err("map_lookup_elem needs stack key pointer in r2");
                     }
                     regs[BPF_REG_0] = RegKind::MapValuePtr;
-                } else if !matches!(op, BPF_EXIT | BPF_JEQ | BPF_JNE) {
+                } else if op == BPF_EXIT {
+                    // Multiple return sites are valid; the final instruction check above
+                    // prevents falling off the end without an explicit EXIT.
+                } else if matches!(op, BPF_JEQ | BPF_JNE) {
+                    let target = checked_jump_target(pc, insn.off, insns.len())?;
+                    if target <= pc {
+                        return Err("backward jumps unsupported");
+                    }
+                } else {
                     return Err("unsupported jump instruction");
                 }
             }
@@ -698,6 +882,57 @@ fn verify_program(insns: &[BpfInsn]) -> Result<(), &'static str> {
         pc += 1;
     }
     Ok(())
+}
+
+fn checked_reg(reg: usize) -> Result<usize, &'static str> {
+    if reg < MAX_BPF_REG {
+        Ok(reg)
+    } else {
+        Err("invalid register")
+    }
+}
+
+fn checked_jump_target(pc: usize, off: i16, len: usize) -> Result<usize, &'static str> {
+    let target = (pc as isize)
+        .checked_add(1)
+        .and_then(|base| base.checked_add(off as isize))
+        .ok_or("jump target overflow")?;
+    if target < 0 || target >= len as isize {
+        return Err("jump out of range");
+    }
+    Ok(target as usize)
+}
+
+fn collect_prog_map_refs(
+    insns: &[BpfInsn],
+) -> Result<BTreeMap<u32, Arc<dyn File + Send + Sync>>, isize> {
+    let files = current_files();
+    let files = files.lock();
+    let mut maps = BTreeMap::new();
+    let mut pc = 0usize;
+    while pc < insns.len() {
+        let insn = insns[pc];
+        if (insn.code & BPF_CLASS_MASK) == BPF_LD
+            && (insn.code & BPF_MODE_MASK) == BPF_IMM
+            && (insn.code & BPF_SIZE_MASK) == BPF_DW
+        {
+            if pc + 1 >= insns.len() {
+                return Err(EINVAL);
+            }
+            if insn.src_reg() as u8 == BPF_PSEUDO_MAP_FD {
+                let fd = insn.imm as u32;
+                let file = files.get_file(fd as usize).ok_or(EBADF)?;
+                if file.as_any().downcast_ref::<BpfMapFile>().is_none() {
+                    return Err(EBADF);
+                }
+                maps.insert(fd, file);
+            }
+            pc += 2;
+            continue;
+        }
+        pc += 1;
+    }
+    Ok(maps)
 }
 
 fn copy_user_struct<T: Copy + Default>(user_ptr: usize) -> Result<T, isize> {
@@ -746,24 +981,6 @@ fn alloc_fd(file: Arc<dyn File + Send + Sync>) -> isize {
         .install_fd(file, 0, limit)
         .map(|fd| fd as isize)
         .unwrap_or(EMFILE)
-}
-
-fn with_map<R>(fd: usize, f: impl FnOnce(&BpfMapFile) -> R) -> Option<R> {
-    let file = current_files().lock().get_file(fd)?;
-    let map = file.as_any().downcast_ref::<BpfMapFile>()?;
-    Some(f(map))
-}
-
-fn map_key_size(fd: usize) -> Result<usize, isize> {
-    with_map(fd, |map| map.key_size as usize).ok_or(EBADF)
-}
-
-fn map_lookup_bytes(fd: usize, key: &[u8]) -> Option<Vec<u8>> {
-    with_map(fd, |map| map.lookup(key)).flatten()
-}
-
-fn map_store_bytes(fd: usize, key: &[u8], offset: usize, data: &[u8]) -> Result<(), isize> {
-    with_map(fd, |map| map.store_bytes(key, offset, data)).ok_or(EBADF)?
 }
 
 fn write_verifier_log(attr: &BpfProgLoadAttr, msg: &str) {
@@ -879,11 +1096,21 @@ fn syscall_bpf_prog_load(attr_ptr: usize, size: usize) -> isize {
         write_verifier_log(&attr, "unsupported program type\n");
         return EINVAL;
     }
+    if attr.insn_cnt > BPF_MAXINSNS {
+        write_verifier_log(&attr, "program too large\n");
+        return E2BIG;
+    }
     let Ok(insns) = copy_user_insns(attr.insns as usize, attr.insn_cnt as usize) else {
         return EFAULT;
     };
     match verify_program(insns.as_slice()) {
-        Ok(()) => alloc_fd(Arc::new(BpfProgFile::new(insns))),
+        Ok(()) => {
+            let maps = match collect_prog_map_refs(insns.as_slice()) {
+                Ok(maps) => maps,
+                Err(e) => return e,
+            };
+            alloc_fd(Arc::new(BpfProgFile::new(insns, maps)))
+        }
         Err(msg) => {
             write_verifier_log(&attr, msg);
             EACCES

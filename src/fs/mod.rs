@@ -33,7 +33,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::any::Any;
+use core::{any::Any, fmt::Write};
 
 // ---- poll/select/epoll 就绪事件位（对应 Linux <poll.h> 的 POLL* 常量）----
 /// 有数据可读。
@@ -50,6 +50,35 @@ pub(crate) const POLLHUP: i16 = 0x0010;
 pub(crate) const POLLNVAL: i16 = 0x0020;
 /// 对端关闭了写方向（半关闭）。
 pub(crate) const POLLRDHUP: i16 = 0x2000;
+
+fn cpu_list_from_mask(mask: usize) -> String {
+    let mut out = String::new();
+    let mask = if mask == 0 { 1 } else { mask };
+    let mut first = true;
+    let mut cpu = 0;
+    while cpu < usize::BITS as usize {
+        if (mask & (1usize << cpu)) == 0 {
+            cpu += 1;
+            continue;
+        }
+        let start = cpu;
+        while cpu + 1 < usize::BITS as usize && (mask & (1usize << (cpu + 1))) != 0 {
+            cpu += 1;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        if start == cpu {
+            let _ = write!(out, "{}", start);
+        } else {
+            let _ = write!(out, "{}-{}", start, cpu);
+        }
+        cpu += 1;
+    }
+    out.push('\n');
+    out
+}
 
 /// File trait
 pub trait File: Send + Sync {
@@ -191,9 +220,20 @@ pub(crate) fn current_mount_display_abs(abs: &str) -> String {
     state.display_mount_abs(abs)
 }
 
+pub(crate) fn mounted_file_for_abs(abs: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    let ns = current_process().mount_namespace();
+    let state = ns.lock();
+    state.bound_file_for_path(abs)
+}
+
 /// 根据 inode 的路径提示反查其逻辑路径，并转换为当前挂载命名空间下的可见路径。
 pub(crate) fn inode_logical_path(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
     inode::inode_path_hint(inode).map(|path| current_mount_display_abs(&path))
+}
+
+/// 返回 inode 记录的原始逻辑路径，不经过当前挂载命名空间的显示路径转换。
+pub(crate) fn inode_raw_logical_path(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
+    inode::inode_path_hint(inode)
 }
 
 /// 伪文件系统的按路径打开分发器。
@@ -203,6 +243,9 @@ pub(crate) fn inode_logical_path(inode: &Arc<ext4_fs::Inode>) -> Option<String> 
 /// 和 `/dev/shm/<name>` 共享内存对象。命中则返回对应的 `File` 实现，未命中返回 None
 /// （交由上层走真实文件系统）。
 pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    if let Some(node) = mounted_file_for_abs(path) {
+        return Some(node);
+    }
     if let Some(node) = cgroupfs::open_cgroup_pseudo(path) {
         return Some(node);
     }
@@ -234,6 +277,11 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             pseudo::PseudoDirent {
                 name: String::from("dev"),
                 ino: 4,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("class"),
+                ino: 5,
                 dtype: 4,
             },
         ];
@@ -306,9 +354,34 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
                 ino: 7,
                 dtype: 4,
             },
+            pseudo::PseudoDirent {
+                name: String::from("net"),
+                ino: 13,
+                dtype: 4,
+            },
         ];
         entries.extend(pseudo::pseudo_dev_dir_entries());
         return Some(Arc::new(pseudo::PseudoDir::new("/dev", entries)));
+    }
+    if path == "/dev/net" || path == "/dev/net/" {
+        let entries = alloc::vec![
+            pseudo::PseudoDirent {
+                name: String::from("."),
+                ino: 13,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from(".."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("tun"),
+                ino: 14,
+                dtype: 2,
+            },
+        ];
+        return Some(Arc::new(pseudo::PseudoDir::new("/dev/net", entries)));
     }
     if path == "/dev/cgroup" || path == "/dev/cgroup/" {
         let entries = alloc::vec![
@@ -397,6 +470,85 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             },
         ];
         return Some(Arc::new(pseudo::PseudoDir::new("/dev/misc", entries)));
+    }
+    if path == "/sys/class" || path == "/sys/class/" {
+        let entries = alloc::vec![
+            pseudo::PseudoDirent {
+                name: String::from("."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from(".."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("net"),
+                ino: 2,
+                dtype: 4,
+            },
+        ];
+        return Some(Arc::new(pseudo::PseudoDir::new("/sys/class", entries)));
+    }
+    if path == "/sys/class/net" || path == "/sys/class/net/" {
+        let mut entries = alloc::vec![
+            pseudo::PseudoDirent {
+                name: String::from("."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from(".."),
+                ino: 1,
+                dtype: 4,
+            },
+        ];
+        for (idx, (name, dtype)) in crate::syscall::net::netdev::sys_class_net_entries()
+            .into_iter()
+            .enumerate()
+        {
+            entries.push(pseudo::PseudoDirent {
+                name,
+                ino: (10 + idx) as u64,
+                dtype,
+            });
+        }
+        return Some(Arc::new(pseudo::PseudoDir::new("/sys/class/net", entries)));
+    }
+    if let Some(rest) = path.strip_prefix("/sys/class/net/") {
+        let trimmed = rest.trim_end_matches('/');
+        if !trimmed.is_empty() && !trimmed.contains('/') {
+            if crate::syscall::net::netdev::device_snapshot_by_name(trimmed).is_some() {
+                let mut entries = alloc::vec![
+                    pseudo::PseudoDirent {
+                        name: String::from("."),
+                        ino: 1,
+                        dtype: 4,
+                    },
+                    pseudo::PseudoDirent {
+                        name: String::from(".."),
+                        ino: 1,
+                        dtype: 4,
+                    },
+                ];
+                for (idx, (name, dtype)) in
+                    crate::syscall::net::netdev::sys_class_net_device_entries(trimmed)
+                        .into_iter()
+                        .enumerate()
+                {
+                    entries.push(pseudo::PseudoDirent {
+                        name: String::from(name),
+                        ino: (20 + idx) as u64,
+                        dtype,
+                    });
+                }
+                return Some(Arc::new(pseudo::PseudoDir::new(path, entries)));
+            }
+        }
+        if let Some(content) = crate::syscall::net::netdev::sys_class_net_file_content(path) {
+            return Some(Arc::new(pseudo::PseudoFile::new_static(&content)));
+        }
     }
     if path == "/sys/block" || path == "/sys/block/" {
         let entries = alloc::vec![
@@ -602,14 +754,7 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         || path == "/sys/devices/system/cpu/present"
         || path == "/sys/devices/system/cpu/online"
     {
-        let n = crate::config::MAX_HARTS;
-        let s = if n == 0 {
-            String::from("\n")
-        } else if n == 1 {
-            String::from("0\n")
-        } else {
-            alloc::format!("0-{}\n", n - 1)
-        };
+        let s = cpu_list_from_mask(crate::task::manager::online_hart_mask());
         return Some(Arc::new(pseudo::PseudoFile::new_static(&s)));
     }
     if path == "/sys/devices/system/cpu/kernel_max" {
@@ -651,6 +796,9 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     if path == "/dev/misc/rtc" {
         return Some(Arc::new(pseudo::RtcFile::new()));
     }
+    if path == "/dev/net/tun" {
+        return Some(Arc::new(pseudo::TunTapFile::new()));
+    }
     if let Some(node) = pseudo::open_pseudo_dev_dir(path) {
         return Some(node);
     }
@@ -669,7 +817,7 @@ pub use cgroupfs::{
     cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
     legacy_cpu_fair_group,
 };
-pub use dummy::DummyFile;
+pub use dummy::{DummyFile, SignalfdFile};
 pub use eventfd::EventFdFile;
 #[allow(unused_imports)]
 pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
@@ -683,9 +831,13 @@ pub(crate) use mountns::{
     ClassifiedAbsPath, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
     clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
 };
+pub(crate) use namespace_file::net_namespace_file_refs;
 pub use namespace_file::{NamespaceFile, NamespaceKind};
-pub(crate) use net_socket::notify_net_poll_events;
-pub use net_socket::{NetSocketFile, NetSocketKind};
+pub use net_socket::{Ipv4SourceFilterMode, NetSocketFile, NetSocketKind, ProcNetSocketSnapshot};
+pub(crate) use net_socket::{
+    cleanup_net_namespace as cleanup_net_socket_namespace, debug_net_socket_atomic_heap_state,
+    notify_net_poll_events_in,
+};
 pub use pidfd::PidFdFile;
 pub(crate) use pidfd::wake_pidfd_poll_waiters;
 pub(crate) use pipe::remove_task_waiters as remove_pipe_waiters_for_task;
@@ -702,18 +854,23 @@ pub use procfs::{
     vm_committed_as_bytes, vm_overcommit_memory,
 };
 pub use pseudo::PseudoBlock;
+pub use pseudo::TunTapFile;
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
 pub(crate) use pseudo::{
-    pseudo_block_is_read_only, pseudo_block_note_sync, pseudo_block_read_ahead,
-    pseudo_block_set_read_ahead, pseudo_block_set_read_only, pseudo_dev_dir_exists,
-    pseudo_dev_dir_mkdir, pseudo_dev_dir_rmdir, shm_create, shm_create_anonymous, shm_get,
-    shm_remove,
+    enqueue_tuntap_packet, pseudo_block_is_read_only, pseudo_block_note_sync,
+    pseudo_block_read_ahead, pseudo_block_set_read_ahead, pseudo_block_set_read_only,
+    pseudo_dev_dir_exists, pseudo_dev_dir_mkdir, pseudo_dev_dir_rmdir, shm_create,
+    shm_create_anonymous, shm_get, shm_remove,
 };
-pub use socketpair::{SocketPairEnd, make_socketpair};
+pub(crate) use pseudo::{tuntap_link_owner_group, tuntap_link_sysfs_info};
+pub use socketpair::{SocketPairEnd, make_socketpair, make_socketpair_with_type};
 pub use stdio::{Stdin, Stdout};
 pub use timerfd::TimerFdFile;
 pub(crate) use timerfd::{
     cancel_realtime_timerfds_on_set, has_pending_timerfds, process_timerfd_expirations,
 };
-pub use tty::{LinuxTermio, LinuxTermios, PtyMasterFile, PtySlaveFile, TtyFile};
+pub use tty::{
+    LinuxTermio, LinuxTermios, LinuxWinSize, PtyMasterFile, PtySlaveFile, TtyFile, dev_pts_exists,
+    dev_pts_index_from_path,
+};
 pub use userfaultfd::UserfaultfdFile;
