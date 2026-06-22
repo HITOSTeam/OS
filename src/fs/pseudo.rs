@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -11,9 +11,146 @@ use spin::Mutex;
 
 use crate::config::PAGE_SIZE;
 use crate::mm::{FrameTracker, UserBuffer, frame_alloc};
+use crate::syscall::error::{SyscallError, err};
 use crate::task::ProcessControlBlock;
 
 use super::File;
+
+const TUNTAP_QUEUE_LIMIT: usize = 256;
+const TUNTAP_IFF_TUN: u16 = 0x0001;
+const TUNTAP_IFF_TAP: u16 = 0x0002;
+const TUNTAP_IFF_PERSIST: u16 = 0x0800;
+const TUNTAP_IFF_NO_PI: u16 = 0x1000;
+const TUNTAP_IFF_ONE_QUEUE: u16 = 0x2000;
+const TUNTAP_IFF_VNET_HDR: u16 = 0x4000;
+const TUNTAP_ETH_P_IP: u16 = 0x0800;
+const VIRTIO_NET_HDR_LEN: usize = 10;
+const TUNTAP_SYSFS_FLAG_MASK: u16 =
+    TUNTAP_IFF_TUN | TUNTAP_IFF_TAP | TUNTAP_IFF_NO_PI | TUNTAP_IFF_ONE_QUEUE | TUNTAP_IFF_VNET_HDR;
+
+lazy_static! {
+    static ref TUNTAP_QUEUES: Mutex<BTreeMap<i32, VecDeque<Vec<u8>>>> = Mutex::new(BTreeMap::new());
+    static ref TUNTAP_LINKS: Mutex<BTreeMap<i32, TunTapLinkState>> = Mutex::new(BTreeMap::new());
+}
+
+#[derive(Clone, Copy)]
+struct TunTapLinkState {
+    refs: usize,
+    persistent: bool,
+    owner: Option<u32>,
+    group: Option<u32>,
+    flags: u16,
+}
+
+pub(crate) fn enqueue_tuntap_packet(ifindex: i32, packet: Vec<u8>) {
+    if crate::syscall::net::netdev::device_snapshot_by_global_ifindex(ifindex).is_none() {
+        return;
+    }
+    let mut queues = TUNTAP_QUEUES.lock();
+    let queue = queues.entry(ifindex).or_default();
+    if queue.len() >= TUNTAP_QUEUE_LIMIT {
+        queue.pop_front();
+    }
+    queue.push_back(packet);
+}
+
+fn pop_tuntap_packet(ifindex: i32) -> Option<Vec<u8>> {
+    TUNTAP_QUEUES.lock().get_mut(&ifindex)?.pop_front()
+}
+
+fn tuntap_queue_has_packet(ifindex: i32) -> bool {
+    TUNTAP_QUEUES
+        .lock()
+        .get(&ifindex)
+        .is_some_and(|queue| !queue.is_empty())
+}
+
+fn register_tuntap_link(ifindex: i32, flags: u16) {
+    let mut links = TUNTAP_LINKS.lock();
+    let entry = links.entry(ifindex).or_insert(TunTapLinkState {
+        refs: 0,
+        persistent: false,
+        owner: None,
+        group: None,
+        flags: flags & TUNTAP_SYSFS_FLAG_MASK,
+    });
+    entry.refs = entry.refs.saturating_add(1);
+    entry.flags = flags & TUNTAP_SYSFS_FLAG_MASK;
+}
+
+fn set_tuntap_persistent(ifindex: i32, persistent: bool) {
+    let mut links = TUNTAP_LINKS.lock();
+    let entry = links.entry(ifindex).or_insert(TunTapLinkState {
+        refs: 0,
+        persistent,
+        owner: None,
+        group: None,
+        flags: 0,
+    });
+    entry.persistent = persistent;
+}
+
+pub(crate) fn tuntap_link_owner_group(name: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let ifindex = crate::syscall::net::netdev::ifindex_by_name(name)?;
+    let links = TUNTAP_LINKS.lock();
+    let entry = links.get(&ifindex)?;
+    Some((entry.owner, entry.group))
+}
+
+pub(crate) fn tuntap_link_sysfs_info(name: &str) -> Option<(Option<u32>, Option<u32>, u16)> {
+    let ifindex = crate::syscall::net::netdev::ifindex_by_name(name)?;
+    let links = TUNTAP_LINKS.lock();
+    let entry = links.get(&ifindex)?;
+    let mut flags = entry.flags & TUNTAP_SYSFS_FLAG_MASK;
+    if entry.persistent {
+        flags |= TUNTAP_IFF_PERSIST;
+    }
+    Some((entry.owner, entry.group, flags))
+}
+
+fn set_tuntap_owner(ifindex: i32, owner: u32) {
+    let mut links = TUNTAP_LINKS.lock();
+    let entry = links.entry(ifindex).or_insert(TunTapLinkState {
+        refs: 0,
+        persistent: false,
+        owner: None,
+        group: None,
+        flags: 0,
+    });
+    entry.owner = Some(owner);
+}
+
+fn set_tuntap_group(ifindex: i32, group: u32) {
+    let mut links = TUNTAP_LINKS.lock();
+    let entry = links.entry(ifindex).or_insert(TunTapLinkState {
+        refs: 0,
+        persistent: false,
+        owner: None,
+        group: None,
+        flags: 0,
+    });
+    entry.group = Some(group);
+}
+
+fn release_tuntap_link(ifindex: i32) {
+    let should_delete = {
+        let mut links = TUNTAP_LINKS.lock();
+        let Some(entry) = links.get_mut(&ifindex) else {
+            return;
+        };
+        entry.refs = entry.refs.saturating_sub(1);
+        if entry.refs == 0 && !entry.persistent {
+            links.remove(&ifindex);
+            true
+        } else {
+            false
+        }
+    };
+    if should_delete {
+        let _ = crate::syscall::net::netdev::delete_link_by_global_ifindex(ifindex);
+        TUNTAP_QUEUES.lock().remove(&ifindex);
+    }
+}
 
 /// 伪文件的内容类型。
 ///
@@ -188,6 +325,329 @@ impl File for RtcFile {
 
     fn write(&self, buf: UserBuffer) -> usize {
         buf.len()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Minimal `/dev/net/tun` endpoint.
+///
+/// It implements the single-queue TUN/TAP data path used by network tests:
+/// userspace can inject packets through `write`, and packet-socket traffic
+/// addressed to the attached device is queued for `read`.
+pub struct TunTapFile {
+    inner: Mutex<TunTapInner>,
+}
+
+struct TunTapInner {
+    attached_ifindex: Option<i32>,
+    kind: Option<crate::syscall::net::netdev::NetDeviceKind>,
+    flags: u16,
+    persistent: bool,
+    _owner: u32,
+    _group: u32,
+    vnet_hdr_size: i32,
+    _offload_flags: usize,
+}
+
+impl TunTapFile {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(TunTapInner {
+                attached_ifindex: None,
+                kind: None,
+                flags: 0,
+                persistent: false,
+                _owner: u32::MAX,
+                _group: u32::MAX,
+                vnet_hdr_size: 10,
+                _offload_flags: 0,
+            }),
+        }
+    }
+
+    pub(crate) fn attach(
+        &self,
+        ifindex: i32,
+        kind: crate::syscall::net::netdev::NetDeviceKind,
+        flags: u16,
+    ) {
+        let mut inner = self.inner.lock();
+        register_tuntap_link(ifindex, flags);
+        inner.attached_ifindex = Some(ifindex);
+        inner.kind = Some(kind);
+        inner.flags = flags;
+    }
+
+    pub(crate) fn attached_name(&self) -> Option<String> {
+        let ifindex = self.inner.lock().attached_ifindex?;
+        crate::syscall::net::netdev::device_snapshot_by_global_ifindex(ifindex)
+            .map(|(_, dev)| dev.name)
+    }
+
+    pub(crate) fn attached_ifindex(&self) -> Option<i32> {
+        self.inner.lock().attached_ifindex
+    }
+
+    pub(crate) fn attached_device_snapshot(
+        &self,
+    ) -> Option<crate::syscall::net::netdev::NetDeviceSnapshot> {
+        let ifindex = self.inner.lock().attached_ifindex?;
+        crate::syscall::net::netdev::device_snapshot_by_global_ifindex(ifindex).map(|(_, dev)| dev)
+    }
+
+    pub(crate) fn flags(&self) -> u16 {
+        self.inner.lock().flags
+    }
+
+    pub(crate) fn set_persistent(&self, persistent: bool) {
+        let ifindex = {
+            let mut inner = self.inner.lock();
+            inner.persistent = persistent;
+            inner.attached_ifindex
+        };
+        if let Some(ifindex) = ifindex {
+            set_tuntap_persistent(ifindex, persistent);
+        }
+    }
+
+    pub(crate) fn set_owner(&self, owner: u32) {
+        let ifindex = {
+            let mut inner = self.inner.lock();
+            inner._owner = owner;
+            inner.attached_ifindex
+        };
+        if let Some(ifindex) = ifindex {
+            set_tuntap_owner(ifindex, owner);
+        }
+    }
+
+    pub(crate) fn set_group(&self, group: u32) {
+        let ifindex = {
+            let mut inner = self.inner.lock();
+            inner._group = group;
+            inner.attached_ifindex
+        };
+        if let Some(ifindex) = ifindex {
+            set_tuntap_group(ifindex, group);
+        }
+    }
+
+    pub(crate) fn vnet_hdr_size(&self) -> i32 {
+        self.inner.lock().vnet_hdr_size
+    }
+
+    pub(crate) fn set_vnet_hdr_size(&self, size: i32) {
+        self.inner.lock().vnet_hdr_size = size;
+    }
+
+    pub(crate) fn set_offload_flags(&self, flags: usize) {
+        self.inner.lock()._offload_flags = flags;
+    }
+
+    fn attached_device(
+        &self,
+    ) -> Option<(
+        usize,
+        String,
+        i32,
+        crate::syscall::net::netdev::NetDeviceKind,
+        u16,
+    )> {
+        let inner = self.inner.lock();
+        let ifindex = inner.attached_ifindex?;
+        let kind = inner.kind?;
+        let flags = inner.flags;
+        drop(inner);
+        let (ns_id, dev) = crate::syscall::net::netdev::device_snapshot_by_global_ifindex(ifindex)?;
+        if dev.kind != kind {
+            return None;
+        }
+        Some((ns_id, dev.name, ifindex, kind, flags))
+    }
+
+    fn copy_packet_to_user(buf: UserBuffer, packet: Vec<u8>) -> usize {
+        let copied = core::cmp::min(buf.len(), packet.len());
+        for (dst, src) in buf.into_iter().zip(packet.iter().take(copied)) {
+            unsafe {
+                *dst = *src;
+            }
+        }
+        copied
+    }
+
+    fn user_visible_packet(
+        kind: crate::syscall::net::netdev::NetDeviceKind,
+        flags: u16,
+        vnet_hdr_size: usize,
+        packet: Vec<u8>,
+    ) -> Vec<u8> {
+        let vnet_len = if (flags & TUNTAP_IFF_VNET_HDR) != 0 {
+            vnet_hdr_size
+        } else {
+            0
+        };
+        let proto = match kind {
+            crate::syscall::net::netdev::NetDeviceKind::Tun => TUNTAP_ETH_P_IP,
+            crate::syscall::net::netdev::NetDeviceKind::Tap if packet.len() >= 14 => {
+                u16::from_be_bytes([packet[12], packet[13]])
+            }
+            _ => 0,
+        };
+        let pi_len = if (flags & TUNTAP_IFF_NO_PI) == 0 {
+            4
+        } else {
+            0
+        };
+        let mut visible = Vec::with_capacity(packet.len() + pi_len + vnet_len);
+        if pi_len != 0 {
+            visible.extend_from_slice(&[0, 0]);
+            visible.extend_from_slice(&proto.to_be_bytes());
+        }
+        if vnet_len != 0 {
+            visible.resize(visible.len() + vnet_len, 0);
+        }
+        visible.extend_from_slice(&packet);
+        visible
+    }
+
+    fn parse_vnet_header(
+        data: &[u8],
+        offset: &mut usize,
+        vnet_hdr_size: usize,
+    ) -> Result<(), isize> {
+        let Some(end) = offset.checked_add(vnet_hdr_size) else {
+            return Err(err(SyscallError::EINVAL));
+        };
+        if data.len() < end || vnet_hdr_size < VIRTIO_NET_HDR_LEN {
+            return Err(err(SyscallError::EINVAL));
+        }
+        if data[*offset..*offset + VIRTIO_NET_HDR_LEN]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(err(SyscallError::EINVAL));
+        }
+        *offset = end;
+        Ok(())
+    }
+
+    pub(crate) fn wait_readable(&self, nonblock: bool) -> Result<(), isize> {
+        let (_ns_id, _name, ifindex, _kind, _flags) =
+            self.attached_device().ok_or(err(SyscallError::EBADFD))?;
+        loop {
+            if tuntap_queue_has_packet(ifindex) {
+                return Ok(());
+            }
+            if nonblock {
+                return Err(err(SyscallError::EAGAIN));
+            }
+            if let Some(task) = crate::task::processor::current_task() {
+                let inner = task.borrow_mut();
+                if crate::task::signal::has_wait_interrupting_pending(
+                    inner.pending_signals,
+                    inner.signal_mask,
+                ) {
+                    return Err(err(SyscallError::EINTR));
+                }
+            }
+            crate::task::processor::suspend_current_and_run_next();
+        }
+    }
+
+    pub(crate) fn read_packet(&self, buf: UserBuffer) -> Result<usize, isize> {
+        let (_ns_id, _name, ifindex, kind, flags) =
+            self.attached_device().ok_or(err(SyscallError::EBADFD))?;
+        let vnet_hdr_size = self.vnet_hdr_size().max(VIRTIO_NET_HDR_LEN as i32) as usize;
+        if buf.len() == 0 {
+            return Ok(0);
+        }
+        let packet = pop_tuntap_packet(ifindex).ok_or(err(SyscallError::EAGAIN))?;
+        let visible = Self::user_visible_packet(kind, flags, vnet_hdr_size, packet);
+        Ok(Self::copy_packet_to_user(buf, visible))
+    }
+
+    pub(crate) fn write_packet(&self, buf: UserBuffer) -> Result<usize, isize> {
+        let len = buf.len();
+        let (ns_id, _name, ifindex, kind, flags) =
+            self.attached_device().ok_or(err(SyscallError::EBADFD))?;
+        let mut data = Vec::with_capacity(len);
+        for byte_ref in buf.into_iter() {
+            unsafe {
+                data.push(*byte_ref);
+            }
+        }
+
+        let mut payload_start = 0usize;
+        if (flags & TUNTAP_IFF_NO_PI) == 0 {
+            if data.len() < 4 {
+                return Err(err(SyscallError::EINVAL));
+            }
+            let proto = u16::from_be_bytes([data[2], data[3]]);
+            if kind == crate::syscall::net::netdev::NetDeviceKind::Tun && proto != TUNTAP_ETH_P_IP {
+                return Err(err(SyscallError::EAFNOSUPPORT));
+            }
+            payload_start = 4;
+        }
+        if (flags & TUNTAP_IFF_VNET_HDR) != 0 {
+            let vnet_hdr_size = self.vnet_hdr_size().max(VIRTIO_NET_HDR_LEN as i32) as usize;
+            Self::parse_vnet_header(&data, &mut payload_start, vnet_hdr_size)?;
+        }
+        let payload = &data[payload_start..];
+
+        match kind {
+            crate::syscall::net::netdev::NetDeviceKind::Tun => {
+                crate::syscall::net::observe_tuntap_ip_packet(ns_id, ifindex, payload);
+                Ok(len)
+            }
+            crate::syscall::net::netdev::NetDeviceKind::Tap => {
+                if payload.len() < 14 {
+                    return Err(err(SyscallError::EINVAL));
+                }
+                crate::syscall::net::observe_tuntap_ethernet_frame(ns_id, ifindex, payload);
+                Ok(len)
+            }
+            _ => Err(err(SyscallError::ENODEV)),
+        }
+    }
+}
+
+impl Drop for TunTapFile {
+    fn drop(&mut self) {
+        let ifindex = self.inner.lock().attached_ifindex;
+        if let Some(ifindex) = ifindex {
+            release_tuntap_link(ifindex);
+        }
+    }
+}
+
+impl File for TunTapFile {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn read(&self, buf: UserBuffer) -> usize {
+        self.read_packet(buf).unwrap_or(0)
+    }
+
+    fn write(&self, buf: UserBuffer) -> usize {
+        self.write_packet(buf).unwrap_or(0)
+    }
+
+    fn poll_mask(&self) -> i16 {
+        let mut mask = super::POLLOUT;
+        if let Some((_ns_id, _name, ifindex, _kind, _flags)) = self.attached_device()
+            && tuntap_queue_has_packet(ifindex)
+        {
+            mask |= super::POLLIN;
+        }
+        mask
     }
 
     fn as_any(&self) -> &dyn Any {

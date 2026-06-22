@@ -14,7 +14,12 @@ use crate::{
         File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, parse_proc_sys_usize, wake_tasks,
     },
     mm::UserBuffer,
+    syscall::{
+        error::{SyscallError, err},
+        net::cbpf::ClassicBpfProgram,
+    },
     task::{
+        block_sleep::add_timer,
         manager::{PID2PCB, wakeup_task},
         processor::{block_current_and_run_next, current_process, current_task},
         signal::{
@@ -125,6 +130,9 @@ impl Pipe {
             return false;
         }
         let ring = self.buffer.lock();
+        if ring.write_end_shutdown {
+            return false;
+        }
         ring.available_write() >= ring.poll_writable_threshold() || ring.all_read_ends_closed()
     }
 
@@ -142,11 +150,63 @@ impl Pipe {
         self.buffer.lock().available_read()
     }
 
+    pub fn wait_readable_lowat(
+        &self,
+        lowat: usize,
+        nonblock: bool,
+        deadline_ms: Option<usize>,
+        signal_as_eintr: bool,
+    ) -> Result<(), isize> {
+        const EAGAIN: isize = -11;
+        assert!(self.readable());
+        let target = lowat.max(1);
+        let task = current_task().unwrap();
+        let has_pending_signal = || {
+            let inner = task.borrow_mut();
+            has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
+        };
+        loop {
+            let mut ring_buffer = self.buffer.lock();
+            let avail = ring_buffer.available_read();
+            if avail >= target || ring_buffer.all_write_ends_closed() || (nonblock && avail > 0) {
+                ring_buffer.remove_reader(&task);
+                return Ok(());
+            }
+            if nonblock {
+                ring_buffer.remove_reader(&task);
+                return Err(EAGAIN);
+            }
+            if has_pending_signal() {
+                ring_buffer.remove_reader(&task);
+                return if signal_as_eintr {
+                    Err(err(SyscallError::EINTR))
+                } else {
+                    Ok(())
+                };
+            }
+            if let Some(deadline_ms) = deadline_ms {
+                let now = crate::time::get_time_ms();
+                if now >= deadline_ms {
+                    ring_buffer.remove_reader(&task);
+                    return Err(EAGAIN);
+                }
+                add_timer(task.clone(), deadline_ms.saturating_sub(now).max(1));
+            }
+            ring_buffer.push_reader(task.clone());
+            drop(ring_buffer);
+            block_current_and_run_next();
+        }
+    }
+
     pub fn available_write(&self) -> usize {
         if !self.writable {
             return 0;
         }
-        self.buffer.lock().available_write()
+        let ring = self.buffer.lock();
+        if ring.write_end_shutdown {
+            return 0;
+        }
+        ring.available_write()
     }
 
     pub fn pipe_size(&self) -> usize {
@@ -187,8 +247,55 @@ impl Pipe {
         self.buffer.lock().set_end_ref_bias(read_bias, write_bias);
     }
 
-    pub fn attach_bpf(&self, prog: Arc<BpfProgFile>) {
-        self.buffer.lock().attached_bpf = Some(prog);
+    pub fn attach_filter(&self, filter: ClassicBpfProgram) -> isize {
+        let mut ring = self.buffer.lock();
+        if ring.filter_locked {
+            return err(SyscallError::EPERM);
+        }
+        ring.classic_filter = Some(filter);
+        ring.attached_bpf = None;
+        0
+    }
+
+    pub fn attach_bpf(&self, prog: Arc<BpfProgFile>) -> isize {
+        let mut ring = self.buffer.lock();
+        if ring.filter_locked {
+            return err(SyscallError::EPERM);
+        }
+        ring.classic_filter = None;
+        ring.attached_bpf = Some(prog);
+        0
+    }
+
+    pub fn detach_filter(&self) -> isize {
+        let mut ring = self.buffer.lock();
+        if ring.filter_locked {
+            return err(SyscallError::EPERM);
+        }
+        let had_filter = ring.classic_filter.take().is_some() | ring.attached_bpf.take().is_some();
+        if had_filter {
+            0
+        } else {
+            err(SyscallError::ENOENT)
+        }
+    }
+
+    pub fn set_filter_locked(&self, locked: bool) -> isize {
+        let mut ring = self.buffer.lock();
+        if ring.filter_locked && !locked {
+            return err(SyscallError::EPERM);
+        }
+        ring.filter_locked = locked;
+        0
+    }
+
+    pub fn filter_locked(&self) -> bool {
+        self.buffer.lock().filter_locked
+    }
+
+    pub fn classic_filter_snapshot(&self) -> (Option<ClassicBpfProgram>, bool) {
+        let ring = self.buffer.lock();
+        (ring.classic_filter.clone(), ring.attached_bpf.is_some())
     }
 
     #[allow(dead_code)]
@@ -262,6 +369,36 @@ impl Pipe {
         self.buffer.lock().all_read_ends_closed()
     }
 
+    pub fn all_write_ends_closed(&self) -> bool {
+        self.buffer.lock().all_write_ends_closed()
+    }
+
+    pub fn shutdown_read_end(&self) {
+        if !self.readable {
+            return;
+        }
+        let (writers, pollers) = {
+            let mut ring = self.buffer.lock();
+            ring.read_end_shutdown = true;
+            (ring.drain_writers(), ring.drain_poll_waiters())
+        };
+        wake_tasks(writers);
+        wake_tasks(pollers);
+    }
+
+    pub fn shutdown_write_end(&self) {
+        if !self.writable {
+            return;
+        }
+        let (readers, pollers) = {
+            let mut ring = self.buffer.lock();
+            ring.write_end_shutdown = true;
+            (ring.drain_readers(), ring.drain_poll_waiters())
+        };
+        wake_tasks(readers);
+        wake_tasks(pollers);
+    }
+
     pub fn same_buffer(&self, other: &Pipe) -> bool {
         Arc::ptr_eq(&self.buffer, &other.buffer)
     }
@@ -280,6 +417,25 @@ impl Pipe {
     /// 读取成功后，唤醒一个阻塞写者（`pop_writer`）和所有 poll 等待者，
     /// 保证写端不会永久挂起。唤醒操作在锁外执行，避免锁序反转。
     pub fn read_to_slice(&self, out: &mut [u8], nonblock: bool) -> Result<usize, isize> {
+        self.read_to_slice_inner(out, nonblock, None, false)
+    }
+
+    pub fn read_to_slice_with_deadline(
+        &self,
+        out: &mut [u8],
+        nonblock: bool,
+        deadline_ms: Option<usize>,
+    ) -> Result<usize, isize> {
+        self.read_to_slice_inner(out, nonblock, deadline_ms, true)
+    }
+
+    fn read_to_slice_inner(
+        &self,
+        out: &mut [u8],
+        nonblock: bool,
+        deadline_ms: Option<usize>,
+        signal_as_eintr: bool,
+    ) -> Result<usize, isize> {
         const EAGAIN: isize = -11;
         assert!(self.readable());
         if out.is_empty() {
@@ -308,7 +464,19 @@ impl Pipe {
                 // 信号优先处理
                 if has_pending_signal() {
                     ring_buffer.remove_reader(&task);
-                    return Ok(0);
+                    return if signal_as_eintr {
+                        Err(err(SyscallError::EINTR))
+                    } else {
+                        Ok(0)
+                    };
+                }
+                if let Some(deadline_ms) = deadline_ms {
+                    let now = crate::time::get_time_ms();
+                    if now >= deadline_ms {
+                        ring_buffer.remove_reader(&task);
+                        return Err(EAGAIN);
+                    }
+                    add_timer(task.clone(), deadline_ms.saturating_sub(now).max(1));
                 }
                 // 阻塞写read，加入阻塞队列
                 ring_buffer.push_reader(task.clone());
@@ -357,6 +525,25 @@ impl Pipe {
     /// 2. 若开启了异步 IO（`F_SETFL O_ASYNC`），向属主发送 `SIGIO`/自定义信号。
     /// 3. 唤醒一个阻塞读者（`pop_reader`）和所有 poll 等待者。
     pub fn write_from_slice(&self, data: &[u8], nonblock: bool) -> Result<usize, isize> {
+        self.write_from_slice_inner(data, nonblock, None, false)
+    }
+
+    pub fn write_from_slice_with_deadline(
+        &self,
+        data: &[u8],
+        nonblock: bool,
+        deadline_ms: Option<usize>,
+    ) -> Result<usize, isize> {
+        self.write_from_slice_inner(data, nonblock, deadline_ms, true)
+    }
+
+    fn write_from_slice_inner(
+        &self,
+        data: &[u8],
+        nonblock: bool,
+        deadline_ms: Option<usize>,
+        signal_as_eintr: bool,
+    ) -> Result<usize, isize> {
         const EAGAIN: isize = -11;
         assert!(self.writable());
         if data.is_empty() {
@@ -390,7 +577,23 @@ impl Pipe {
                 }
                 if has_pending_signal() {
                     ring_buffer.remove_writer(&task);
-                    return Ok(written);
+                    return if signal_as_eintr && written == 0 {
+                        Err(err(SyscallError::EINTR))
+                    } else {
+                        Ok(written)
+                    };
+                }
+                if let Some(deadline_ms) = deadline_ms {
+                    let now = crate::time::get_time_ms();
+                    if now >= deadline_ms {
+                        ring_buffer.remove_writer(&task);
+                        return if written > 0 {
+                            Ok(written)
+                        } else {
+                            Err(EAGAIN)
+                        };
+                    }
+                    add_timer(task.clone(), deadline_ms.saturating_sub(now).max(1));
                 }
                 ring_buffer.push_writer(task.clone());
                 drop(ring_buffer);
@@ -401,7 +604,27 @@ impl Pipe {
             if nonblock && to_write > PIPE_BUF {
                 to_write = to_write.min(avail);
             }
-            for byte in data[written..written + to_write].iter().copied() {
+            let classic_filter = ring_buffer.classic_filter.clone();
+            let attached_bpf = ring_buffer.attached_bpf.clone();
+            let write_slice = &data[written..written + to_write];
+            let mut filter_truncated = false;
+            if let Some(filter) = classic_filter.as_ref() {
+                let Some(filter_len) = filter.filter_len(write_slice) else {
+                    ring_buffer.remove_writer(&task);
+                    return Ok(data.len());
+                };
+                filter_truncated |= filter_len < write_slice.len();
+                to_write = to_write.min(filter_len);
+            }
+            if let Some(filter) = attached_bpf.as_ref() {
+                let Some(filter_len) = filter.filter_len(&write_slice[..to_write]) else {
+                    ring_buffer.remove_writer(&task);
+                    return Ok(data.len());
+                };
+                filter_truncated |= filter_len < to_write;
+                to_write = to_write.min(filter_len);
+            }
+            for byte in write_slice[..to_write].iter().copied() {
                 ring_buffer.write_byte(byte);
             }
             written += to_write;
@@ -420,20 +643,7 @@ impl Pipe {
             } else {
                 None
             };
-            let attached_bpf = if to_write > 0 {
-                ring_buffer.attached_bpf.clone()
-            } else {
-                None
-            };
-            let bpf_packet = if to_write > 0 && attached_bpf.is_some() {
-                Some(data[written - to_write..written].to_vec())
-            } else {
-                None
-            };
             drop(ring_buffer);
-            if let (Some(prog), Some(packet)) = (attached_bpf, bpf_packet) {
-                prog.run_packet(packet.as_slice());
-            }
             if let Some((owner_type, owner_pid, sig, fd)) = async_notify {
                 notify_async_io(owner_type, owner_pid, sig, fd);
             }
@@ -441,6 +651,9 @@ impl Pipe {
                 wakeup_task(reader);
             }
             wake_tasks(pollers);
+            if filter_truncated {
+                return Ok(data.len());
+            }
             if written == data.len() || nonblock {
                 return Ok(written);
             }
@@ -453,6 +666,25 @@ impl Pipe {
     /// 阻塞/非阻塞、信号处理策略与 `read_to_slice` 相同；
     /// 区别在于读取成功后不唤醒写者（数据未被消费，空间未释放）。
     pub fn peek_to_slice(&self, out: &mut [u8], nonblock: bool) -> Result<usize, isize> {
+        self.peek_to_slice_inner(out, nonblock, None, false)
+    }
+
+    pub fn peek_to_slice_with_deadline(
+        &self,
+        out: &mut [u8],
+        nonblock: bool,
+        deadline_ms: Option<usize>,
+    ) -> Result<usize, isize> {
+        self.peek_to_slice_inner(out, nonblock, deadline_ms, true)
+    }
+
+    fn peek_to_slice_inner(
+        &self,
+        out: &mut [u8],
+        nonblock: bool,
+        deadline_ms: Option<usize>,
+        signal_as_eintr: bool,
+    ) -> Result<usize, isize> {
         const EAGAIN: isize = -11;
         assert!(self.readable());
         if out.is_empty() {
@@ -477,7 +709,19 @@ impl Pipe {
                 }
                 if has_pending_signal() {
                     ring_buffer.remove_reader(&task);
-                    return Ok(0);
+                    return if signal_as_eintr {
+                        Err(err(SyscallError::EINTR))
+                    } else {
+                        Ok(0)
+                    };
+                }
+                if let Some(deadline_ms) = deadline_ms {
+                    let now = crate::time::get_time_ms();
+                    if now >= deadline_ms {
+                        ring_buffer.remove_reader(&task);
+                        return Err(EAGAIN);
+                    }
+                    add_timer(task.clone(), deadline_ms.saturating_sub(now).max(1));
                 }
                 ring_buffer.push_reader(task.clone());
                 drop(ring_buffer);
@@ -498,6 +742,8 @@ enum RingBufferStatus {
 /// 管道缓冲区
 pub struct PipeRingBuffer {
     arr: Option<Vec<u8>>,
+    filter_locked: bool,
+    classic_filter: Option<ClassicBpfProgram>,
     attached_bpf: Option<Arc<BpfProgFile>>,
     capacity: usize,
     head: usize,
@@ -505,6 +751,8 @@ pub struct PipeRingBuffer {
     status: RingBufferStatus,
     read_end: Option<Weak<Pipe>>,
     write_end: Option<Weak<Pipe>>,
+    read_end_shutdown: bool,
+    write_end_shutdown: bool,
     /// 读端引用计数基线：从 `read_end.strong_count()` 中减去此值才得到"真实打开的读端数"。
     /// 用于 FIFO 场景：`FifoPipeState` 自身持有一份 `Arc<Pipe>` 作为注册引用，
     /// 将 bias 设为 1 可让 `all_read_ends_closed()` 和 `read_end_count()` 忽略该注册引用，
@@ -527,6 +775,8 @@ impl PipeRingBuffer {
         let capacity = default_pipe_capacity_for_current();
         Self {
             arr: None,
+            filter_locked: false,
+            classic_filter: None,
             attached_bpf: None,
             capacity,
             head: 0,
@@ -534,6 +784,8 @@ impl PipeRingBuffer {
             status: RingBufferStatus::EMPTY,
             read_end: None,
             write_end: None,
+            read_end_shutdown: false,
+            write_end_shutdown: false,
             read_end_ref_bias: 0,
             write_end_ref_bias: 0,
             read_waiters: VecDeque::new(),
@@ -736,6 +988,9 @@ impl PipeRingBuffer {
     }
     /// 通过weak Ptr 判断是否所有写端都关闭
     pub fn all_write_ends_closed(&self) -> bool {
+        if self.write_end_shutdown {
+            return true;
+        }
         match self.write_end.as_ref() {
             Some(end) => end.strong_count() <= self.write_end_ref_bias,
             None => true,
@@ -744,6 +999,9 @@ impl PipeRingBuffer {
 
     /// 通过weak Ptr 判断是否所有读端都关闭
     pub fn all_read_ends_closed(&self) -> bool {
+        if self.read_end_shutdown {
+            return true;
+        }
         match self.read_end.as_ref() {
             Some(end) => end.strong_count() <= self.read_end_ref_bias,
             None => true,
