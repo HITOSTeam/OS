@@ -16,25 +16,39 @@ pub(crate) enum MountPropagation {
     Unbindable,
 }
 
+/// One mount entry visible inside a mount namespace.
 #[derive(Clone, Debug)]
 pub(crate) struct MountRecord {
+    /// Logical mount point seen by processes, e.g. `/proc` or `/mnt`.
     pub(crate) target: String,
+    /// Internal source path used for path translation in this kernel.
     pub(crate) source: String,
+    /// Source name shown to userspace in `/proc/*/mountinfo`.
     pub(crate) source_display: String,
+    /// Filesystem type name, e.g. `ext4`, `proc`, `tmpfs`, or `cgroup2`.
     pub(crate) fs_type: String,
+    /// Linux mount flags such as `MS_RDONLY`, `MS_NOSUID`, or propagation flags.
     pub(crate) flags: usize,
+    /// Monotonic order for mounts stacked on the same target; larger wins lookups.
     pub(crate) stack_seq: usize,
+    /// Shared event id for mount records created by the same propagated mount operation.
     pub(crate) event_id: usize,
+    /// Mount propagation mode controlling whether mount events spread to peers/slaves.
     pub(crate) propagation: MountPropagation,
+    /// Shared peer group id for `MS_SHARED` mounts.
     pub(crate) peer_group_id: Option<usize>,
+    /// Upstream peer group id followed by `MS_SLAVE` mounts.
     pub(crate) master_group_id: Option<usize>,
+    /// Access counter used by lazy unmount expiry bookkeeping.
     pub(crate) access_seq: usize,
+    /// Last access counter value observed when this mount was marked for expiry.
     pub(crate) expire_mark_seq: Option<usize>,
 }
 
 pub(crate) type MountNamespace = Arc<Mutex<MountNamespaceState>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// whether a path is psudo file or real file
 pub(crate) enum ClassifiedAbsPath {
     Ext4(String),
     Pseudo(String),
