@@ -19,9 +19,15 @@ pub(crate) fn current_timespec() -> (i64, i64) {
 }
 
 /// Normalize a path by connect cwd + path. Remove dot
+/// for example cwd == '/a/b/c' path ="."
+/// we get '/a/b/c'
+/// cwd and path can contain relative path like './' ' ../'
+/// final path must be abs path
 pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
     let absolute = path.starts_with('/');
+    // normalize the cwd first
+    // get parts finally
     if !absolute {
         for seg in cwd.split('/') {
             if seg.is_empty() || seg == "." {
@@ -34,6 +40,7 @@ pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
             parts.push(seg);
         }
     }
+    // then normalize the input path
     for seg in path.split('/') {
         if seg.is_empty() || seg == "." {
             continue;
@@ -45,6 +52,7 @@ pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
         parts.push(seg);
     }
     let mut out = String::from("/");
+    // connect the two parts
     out.push_str(&parts.join("/"));
     if out.len() > 1 && out.ends_with('/') {
         out.pop();
@@ -61,6 +69,8 @@ pub(crate) fn current_process_root() -> String {
 
 /// 将进程根目录前缀附加到绝对路径 `abs` 上，实现 `chroot` jail 效果。
 /// 若进程根为 `"/"` 则直接返回原路径不做处理。
+/// examples:
+/// now process root is /abc if we want to go  a path /d then the exact path will be /abc/d
 pub(crate) fn apply_process_root(abs: &str) -> String {
     let root = current_process_root();
     if root == "/" {
@@ -74,10 +84,13 @@ pub(crate) fn apply_process_root(abs: &str) -> String {
         out.push('/');
     }
     out.push_str(abs.trim_start_matches('/'));
+    // now out can contain relative path(just in case) so we need to normalize it
     normalize_path("/", &out)
 }
 
 /// 规范化一个相对路径：去掉 `.`、解析 `..`、合并多余斜杠，返回不含前导 `/` 的字符串。
+/// remove aubndant .. for example ../../.. we get .. finally
+/// and . will be removed directly
 pub(crate) fn normalize_relative_path(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for seg in path.split('/') {
@@ -113,6 +126,7 @@ pub(crate) fn path_basename(path: &str) -> &str {
 }
 
 /// 检查文件系统中是否存在任一 busybox 可执行文件。
+/// todo: remove this  we will add busybox direcly to the image
 pub(crate) fn busybox_exists() -> bool {
     let candidates = [
         "/musl/busybox",
@@ -137,6 +151,7 @@ pub(crate) fn busybox_exists() -> bool {
 /// 满足以下所有条件才返回 `true`：basename 非空且不是 `busybox` 本身、
 /// 不是 `.sh` 脚本、在 busybox applet 白名单内，且路径在允许的目录下
 /// （`/bin/`、`/usr/bin/` 等）或是无斜杠的裸名（需 `allow_relative = true`）。
+/// todo: remove this
 pub(crate) fn should_try_busybox_applet_path(path: &str, allow_relative: bool) -> bool {
     let base = path_basename(path);
     if base.is_empty() || base == "busybox" {
@@ -174,20 +189,28 @@ pub(crate) fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
 }
 
 pub(crate) enum RelativeAtPathBase {
+    // real path,but not real file(psudo),so no inode
     LogicalAbs(String),
+    // path based on an inode
     Ext4Dir {
         base: alloc::sync::Arc<ext4_fs::Inode>,
         logical_base: Option<String>,
     },
 }
 
+//
 pub(crate) enum AtPath {
     /// An ext4 lookup rooted at `/`.
     Ext4Abs(String),
     /// An ext4 lookup rooted at an open directory fd.
+    /// if we dont find file in the base + rel w,then go to fallback abs
+    /// THIS is used becuase current environmemt has 2 disks,and we need to cover some files in no.2
+    /// by no.1 disk.This will cause the relative search in disk no.1 can't find the file in no.2.
+    /// So we use this.Should be removed in future
     Ext4Rel {
         base: alloc::sync::Arc<ext4_fs::Inode>,
         rel: String,
+        fallback_abs: Option<String>,
     },
     /// A pseudo filesystem lookup expressed as an absolute path.
     PseudoAbs(String),
@@ -212,6 +235,9 @@ pub(crate) fn classify_abs_at_path(abs: String) -> AtPath {
 /// - `AT_FDCWD`：返回当前工作目录的逻辑绝对路径；
 /// - 伪目录 fd：返回其逻辑绝对路径；
 /// - ext4 目录 fd：返回对应的 inode 及其逻辑路径（如可知）。
+/// tldr:
+/// 简单来说 就是判断dirfd是什么类型的地址，如果是 psudo file 那么会返回 logical addr  反之，返回
+/// 真实node 节点 + 对因地址
 pub(crate) fn resolve_relative_at_path_base(dirfd: isize) -> Result<RelativeAtPathBase, isize> {
     if dirfd == AT_FDCWD {
         return Ok(RelativeAtPathBase::LogicalAbs(current_cwd_path()));
@@ -240,11 +266,15 @@ pub(crate) fn resolve_relative_at_path_base(dirfd: isize) -> Result<RelativeAtPa
 
 /// 从逻辑绝对路径基准解析相对路径，处理 `/proc` 魔法路径、挂载点重定向等情况，
 /// 返回最终的 `AtPath`（ext4 绝对、ext4 相对 inode 或伪文件系统）。
+/// tldr:
+/// 对于非真实文件 或者 包含magic link的 at 我们返回 abs
+/// 对于真实文件 返回 inode + relative path 的 相对地址类型
 pub(crate) fn resolve_relative_at_path_from_logical_base(
     base_path: &str,
     path: &str,
 ) -> Result<AtPath, isize> {
     let logical_abs = normalize_path(base_path, path);
+    // abs main contain some magic part like self
     let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
     let classified_abs = classify_current_abs_path(&abs);
     if matches!(classified_abs, ClassifiedAbsPath::Pseudo(_)) {
@@ -277,7 +307,11 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
         let Some(base) = find_path_in_roots(&mount.source) else {
             return Err(err(SyscallError::ENOENT));
         };
-        return Ok(AtPath::Ext4Rel { base, rel: suffix });
+        return Ok(AtPath::Ext4Rel {
+            base,
+            rel: suffix,
+            fallback_abs: None,
+        });
     } else {
         normalize_relative_path(path)
     };
@@ -293,7 +327,11 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
         &mut depth,
         &mut seen_symlinks,
     )?;
-    Ok(AtPath::Ext4Rel { base, rel })
+    Ok(AtPath::Ext4Rel {
+        base,
+        rel,
+        fallback_abs: Some(translate_mount_abs(&abs)),
+    })
 }
 
 /// 从已知 ext4 目录 inode 出发解析相对路径。
@@ -315,13 +353,19 @@ pub(crate) fn resolve_relative_at_path_from_ext4_base(
         return Ok(AtPath::PseudoAbs(abs));
     }
     let rel = normalize_relative_path(path);
-    Ok(AtPath::Ext4Rel { base, rel })
+    Ok(AtPath::Ext4Rel {
+        base,
+        rel,
+        fallback_abs: None,
+    })
 }
 
+/// 核心函数
 /// 将 `(dirfd, path)` 解析为 `AtPath`，统一处理绝对路径、相对路径、
 /// `AT_FDCWD`、进程 chroot jail、路径长度/分量校验。
-/// 这是所有文件系统系统调用路径解析的统一入口。
+/// 这是所有文件系统系统调用路径解析的统一入口。 是外部传入的路径 变成 内部数据结构AtPath的器idian
 pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
+    // pre check
     if path.is_empty() {
         return Err(err(SyscallError::ENOENT));
     }
@@ -331,12 +375,15 @@ pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize>
     validate_path_components(path)?;
 
     // Absolute path: ignore dirfd.
+    // if starts with / then it must be real path or psudo
+    // This is decided in the classify function
     if path.starts_with('/') {
         let jail_abs = normalize_path("/", path);
         let abs = resolve_proc_magic_intermediate_abs_path(&apply_process_root(&jail_abs))?;
         return Ok(classify_abs_at_path(abs));
     }
 
+    // handle relative address:
     match resolve_relative_at_path_base(dirfd)? {
         RelativeAtPathBase::LogicalAbs(base_path) => {
             resolve_relative_at_path_from_logical_base(&base_path, path)
@@ -903,11 +950,15 @@ pub(crate) fn resolve_at_inode(
         AtPath::Ext4Abs(abs) => {
             resolve_ext4_abs_path(abs, uid, gid, follow_final, &mut depth, &mut seen_symlinks)
         }
-        AtPath::Ext4Rel { base, rel } => {
+        AtPath::Ext4Rel {
+            base,
+            rel,
+            fallback_abs,
+        } => {
             if rel.is_empty() {
                 Ok(alloc::sync::Arc::clone(base))
             } else {
-                resolve_ext4_path(
+                match resolve_ext4_path(
                     alloc::sync::Arc::clone(base),
                     rel,
                     uid,
@@ -915,7 +966,27 @@ pub(crate) fn resolve_at_inode(
                     follow_final,
                     &mut depth,
                     &mut seen_symlinks,
-                )
+                ) {
+                    Ok(inode) => Ok(inode),
+                    Err(e) if e == err(SyscallError::ENOENT) => {
+                        // the relative path's basic node is at no.1 disk
+                        // The file is at no.2 disk.we should resolve that by an abs path
+                        let Some(abs) = fallback_abs else {
+                            return Err(e);
+                        };
+                        let mut abs_depth = 0usize;
+                        let mut abs_seen = Vec::new();
+                        resolve_ext4_abs_path(
+                            abs,
+                            uid,
+                            gid,
+                            follow_final,
+                            &mut abs_depth,
+                            &mut abs_seen,
+                        )
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
         AtPath::PseudoAbs(_) => Err(err(SyscallError::ENOENT)),
@@ -1060,7 +1131,7 @@ pub(crate) fn resolve_parent_and_name(
                 resolve_ext4_abs_path(&parent_abs, uid, gid, true, &mut depth, &mut seen_symlinks)?;
             Ok((parent, alloc::string::String::from(name)))
         }
-        AtPath::Ext4Rel { base, rel } => {
+        AtPath::Ext4Rel { base, rel, .. } => {
             if rel.is_empty() {
                 return Err(err(SyscallError::EINVAL));
             }
@@ -1091,6 +1162,7 @@ pub(crate) fn resolve_parent_and_name(
 
 /// 将 `(dirfd, path)` 解析为规范化的逻辑绝对路径字符串（不进入 ext4 查找）。
 /// 路径为空时返回 `Ok(None)`；主要用于挂载点/noexec 检查等不需要 inode 的场景。
+/// attetion: path can have relative parts.'abs' means the final result is abs path
 pub(crate) fn resolve_abs_path(dirfd: isize, path: &str) -> Result<Option<String>, isize> {
     if path.is_empty() {
         return Ok(None);
@@ -1113,6 +1185,7 @@ pub(crate) fn resolve_abs_path(dirfd: isize, path: &str) -> Result<Option<String
             return Ok(None);
         }
     };
+    // handle magic part like self or /proc/self/fd/4 . changes these to real path
     resolve_proc_magic_intermediate_abs_path(&abs).map(Some)
 }
 

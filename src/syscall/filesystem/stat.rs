@@ -1029,18 +1029,9 @@ pub fn syscall_statx(
         }
     }
 
+    let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
-    let mut inode = match at {
-        AtPath::Ext4Abs(abs) => find_path_in_roots(&abs),
-        AtPath::Ext4Rel { base, rel } => {
-            if rel.is_empty() {
-                Some(base)
-            } else {
-                base.find_path(&rel)
-            }
-        }
-        AtPath::PseudoAbs(_) => unreachable!(),
-    };
+    let mut inode = resolve_at_inode(&at, fsuid, fsgid, follow_final).ok();
     if inode.is_none() && matches!(path.as_str(), "busybox" | "./busybox") {
         let candidates = [
             "/musl/busybox",
