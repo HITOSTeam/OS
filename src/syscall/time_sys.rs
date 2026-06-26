@@ -8,8 +8,8 @@ use crate::{
         try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
         write_user_value,
     },
-    syscall::misc::decode_linux_tid,
     syscall::thread,
+    syscall::{CyclicDiagEvent, cyclic_diag_note, misc::decode_linux_tid},
     task::block_sleep::{
         create_posix_timer, delete_posix_timer, itimer_remaining_and_interval_ms,
         query_posix_timer, set_itimer_timer, set_posix_timer, take_posix_timer_overrun,
@@ -611,8 +611,7 @@ pub fn syscall_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
             break;
         }
         let remaining = deadline_ns.saturating_sub(current);
-        let ms = ((remaining + 999_999) / 1_000_000) as usize;
-        let ret = thread::sys_sleep(ms.max(1));
+        let ret = thread::sys_sleep_ns(remaining.max(1));
         if ret == err(SyscallError::EINTR) {
             if DEBUG_SIGNAL {
                 let now_ms = (get_time() as u64)
@@ -741,11 +740,12 @@ pub fn syscall_clock_getres(clk_id: usize, tp_ptr: usize) -> isize {
     if tp_ptr == 0 {
         return 0;
     }
-    let token = get_current_token();
-    let ts = TimeSpec {
-        sec: 0,
-        nsec: 1_000_000,
+    let res_ns = match clk_id {
+        CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => 1_000_000,
+        _ => 1,
     };
+    let token = get_current_token();
+    let ts = ns_to_timespec(res_ns);
     if try_write_user_value(token, tp_ptr as *mut TimeSpec, &ts).is_err() {
         return err(SyscallError::EFAULT);
     }
@@ -937,6 +937,13 @@ pub fn syscall_clock_nanosleep(
         _ => now_ns(),
     };
     let start_ns = clock_now_ns();
+    if DEBUG_CYCLICTEST {
+        let pid = current_process().getpid();
+        let tid = current_task()
+            .and_then(|task| task.borrow_mut().res.as_ref().map(|r| r.tid))
+            .unwrap_or(usize::MAX);
+        cyclic_diag_note(CyclicDiagEvent::ClockNanosleep, pid, tid);
+    }
     if DEBUG_SIGNAL {
         let pid = crate::task::processor::current_process().getpid();
         let tid = current_task()
@@ -979,30 +986,24 @@ pub fn syscall_clock_nanosleep(
             return 0;
         }
         let delta_ns = target_ns - current_ns;
-        // Our sleep granularity is milliseconds; don't block on sub-ms targets.
-        let ms = ((delta_ns + 999_999) / 1_000_000) as usize;
         if DEBUG_CYCLICTEST {
             let idx = CLOCK_NS_LOGS.fetch_add(1, Ordering::Relaxed);
-            if idx < CYCLICTEST_LOG_LIMIT || ms > 2_000 {
+            if idx < CYCLICTEST_LOG_LIMIT || delta_ns > 2_000_000_000 {
                 let tid = current_task()
                     .and_then(|task| task.borrow_mut().res.as_ref().map(|r| r.tid))
                     .unwrap_or(usize::MAX);
                 log::warn!(
-                    "[clock_nanosleep] tid={} clk_id={} flags={:#x} target_ns={} now_ns={} delta_ns={} sleep_ms={}",
+                    "[clock_nanosleep] tid={} clk_id={} flags={:#x} target_ns={} now_ns={} delta_ns={}",
                     tid,
                     clk_id,
                     flags,
                     target_ns,
                     current_ns,
-                    delta_ns,
-                    ms
+                    delta_ns
                 );
             }
         }
-        if ms == 0 {
-            return 0;
-        }
-        let ret = thread::sys_sleep(ms);
+        let ret = thread::sys_sleep_ns(delta_ns);
         if ret == err(SyscallError::EINTR) {
             if DEBUG_SIGNAL {
                 let now_ms = (get_time() as u64)

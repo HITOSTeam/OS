@@ -9,7 +9,7 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
-use crate::task::block_sleep::check_timer;
+use crate::task::block_sleep::{check_timer, timer_work_pending_for_user_return};
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
@@ -109,7 +109,7 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     if ecode == 0 && (estat & (1 << ESTAT_TIMER_BIT)) != 0 {
         super::super::clear_timer_interrupt();
         set_next_trigger();
-        check_timer();
+        crate::task::block_sleep::note_kernel_timer_tick();
         return;
     }
     panic!(
@@ -187,7 +187,7 @@ fn handle_user_exception(ecode: usize, badv: usize) {
         }
     }
     if let Some((errno, msg)) = check_if_current_signals_error() {
-        println!("[kernel] {}", msg);
+        crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
     let cx = get_trap_context();
@@ -259,7 +259,7 @@ pub fn trap_handler() {
             }
             crate::syscall::signal::maybe_deliver_signal();
             if let Some((errno, msg)) = check_if_current_signals_error() {
-                println!("[kernel] {}", msg);
+                crate::task::signal::log_signal_exit(msg);
                 exit_group_and_run_next(errno);
             }
             crate::fs::cgroup_maybe_block_current();
@@ -297,10 +297,12 @@ pub fn trap_handler() {
     }
 
     if let Some((errno, msg)) = check_if_current_signals_error() {
-        println!("[kernel] {}", msg);
+        crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
-    check_timer();
+    if timer_work_pending_for_user_return() {
+        check_timer();
+    }
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
     if syscall_return && crate::task::processor::should_preempt_current_on_syscall_return() {

@@ -23,7 +23,7 @@ mod tty; // tty / pty
 mod userfaultfd; // userfaultfd
 use crate::mm::UserBuffer;
 use crate::task::{
-    manager::wakeup_task,
+    manager::wakeup_tasks,
     processor::current_process,
     task_block::{TaskControlBlock, TaskStatus},
 };
@@ -185,9 +185,7 @@ impl PollWaitQueue {
 
 /// 批量唤醒一组任务（通常配合 `PollWaitQueue::take_wakeups` 使用）。
 pub(crate) fn wake_tasks(tasks: Vec<Arc<TaskControlBlock>>) {
-    for task in tasks {
-        wakeup_task(task);
-    }
+    wakeup_tasks(tasks);
 }
 
 /// 从绝对路径中解析 POSIX 共享内存对象名。
@@ -815,7 +813,7 @@ pub use cgroupfs::{
     cgroup_exit_thread, cgroup_fork_precheck, cgroup_logical_path_for_file,
     cgroup_maybe_block_current, cgroup_mkdir, cgroup_mount, cgroup_proc_cgroups_content,
     cgroup_proc_pid_content, cgroup_rename, cgroup_rmdir, cgroup_umount, is_cgroup_pseudo_path,
-    legacy_cpu_fair_group,
+    refresh_thread_legacy_cpu_fair_group_cache,
 };
 pub use dummy::{DummyFile, SignalfdFile};
 pub use eventfd::EventFdFile;
@@ -867,7 +865,8 @@ pub use socketpair::{SocketPairEnd, make_socketpair, make_socketpair_with_type};
 pub use stdio::{Stdin, Stdout};
 pub use timerfd::TimerFdFile;
 pub(crate) use timerfd::{
-    cancel_realtime_timerfds_on_set, has_pending_timerfds, process_timerfd_expirations,
+    cancel_realtime_timerfds_on_set, process_timerfd_expirations,
+    timerfd_work_pending_for_user_return,
 };
 pub use tty::{
     LinuxTermio, LinuxTermios, LinuxWinSize, PtyMasterFile, PtySlaveFile, TtyFile, dev_pts_exists,

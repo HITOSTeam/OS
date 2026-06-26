@@ -10,7 +10,7 @@ use crate::{
     arch::REG_A0,
     mm::kernel_token,
     task::{
-        block_sleep::add_timer,
+        block_sleep::add_timer_ns,
         manager::{add_task, select_hart_for_new_task},
         processor::{block_current_and_run_next, current_task},
         signal::has_wait_interrupting_pending,
@@ -28,11 +28,13 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let Some(ustack_base) = task.borrow_mut().res.as_ref().map(|r| r.ustack_base) else {
         return -1;
     };
+    let parent_scheduling = task.scheduling_snapshot();
     // create a new thread
     let new_task = match TaskControlBlock::try_new(Arc::clone(&process), ustack_base, true) {
         Ok(t) => Arc::new(t),
         Err(e) => return err(SyscallError::from(e)),
     };
+    new_task.set_scheduling_snapshot(parent_scheduling);
     // Spread newly created threads across harts (Linux-like: task has a target cpu).
     new_task.set_cpu_id(select_hart_for_new_task());
 
@@ -147,10 +149,18 @@ pub fn sys_waittid(tid: usize) -> i32 {
 }
 
 pub fn sys_sleep(time_ms: usize) -> isize {
-    // Edge case: sleeping for 0ms should return immediately.
+    sys_sleep_duration_ns((time_ms as u64).saturating_mul(1_000_000), Some(time_ms))
+}
+
+pub fn sys_sleep_ns(time_ns: u64) -> isize {
+    sys_sleep_duration_ns(time_ns, None)
+}
+
+fn sys_sleep_duration_ns(time_ns: u64, request_ms: Option<usize>) -> isize {
+    // Edge case: zero-duration sleep should return immediately.
     // Blocking here can hang if no timer tick arrives and wakes us up
     // (or if the wakeup happens before we actually block).
-    if time_ms == 0 {
+    if time_ns == 0 {
         return 0;
     }
     let task = current_task().expect("sys_sleep: no current task");
@@ -170,14 +180,15 @@ pub fn sys_sleep(time_ms: usize) -> isize {
     };
     if DEBUG_TIMER {
         crate::println!(
-            "[sleep] tid={} request_ms={} now_ms={}",
+            "[sleep] tid={} request_ns={} request_ms={:?} now_ms={}",
             tid,
-            time_ms,
+            time_ns,
+            request_ms,
             get_time_ms()
         );
     }
-    if DEBUG_CYCLICTEST && time_ms > 2_000 {
-        log::warn!("[sleep] tid={} long sleep request_ms={}", tid, time_ms);
+    if DEBUG_CYCLICTEST && time_ns > 2_000_000_000 {
+        log::warn!("[sleep] tid={} long sleep request_ns={}", tid, time_ns);
     }
     // Prevent "lost wakeup": make the enqueue+block sequence atomic w.r.t. timer interrupts.
     // Keep interrupts disabled in kernel code paths; restore the previous SIE state after we
@@ -187,7 +198,7 @@ pub fn sys_sleep(time_ms: usize) -> isize {
         let mut inner = task.borrow_mut();
         inner.task_status = crate::task::task_block::TaskStatus::Blocked;
     }
-    add_timer(Arc::clone(&task), time_ms);
+    add_timer_ns(Arc::clone(&task), time_ns);
     // This will take the task out of PROCESSOR and switch to idle, letting the scheduler run.
     block_current_and_run_next();
     arch::restore_interrupts(prev_sie);
@@ -228,7 +239,7 @@ pub fn sys_sleep(time_ms: usize) -> isize {
                 .unwrap_or(usize::MAX),
             get_time_ms(),
             get_time_ms().saturating_sub(start_ms),
-            time_ms
+            request_ms.unwrap_or_else(|| ((time_ns + 999_999) / 1_000_000) as usize)
         );
     }
     if DEBUG_TIMER {
@@ -239,10 +250,10 @@ pub fn sys_sleep(time_ms: usize) -> isize {
             .map(|r| r.tid)
             .unwrap_or(usize::MAX);
         crate::println!(
-            "[sleep] tid={} woke now_ms={} slept_for~={}ms",
+            "[sleep] tid={} woke now_ms={} slept_for~={}ns",
             tid,
             get_time_ms(),
-            time_ms
+            time_ns
         );
     }
     0
