@@ -12,7 +12,6 @@ use crate::{
     syscall::error::{SyscallError, err},
     syscall::net::{ScmControl, SocketTimestamp, UCred, cbpf::ClassicBpfProgram},
     task::{
-        manager::wakeup_task,
         processor::{block_current_and_run_next, current_task},
         signal::has_wait_interrupting_pending,
         task_block::TaskControlBlock,
@@ -279,7 +278,7 @@ impl DatagramQueue {
 
     fn enqueue(&self, packet: Vec<u8>, control: ScmControl) -> Result<usize, isize> {
         let len = packet.len();
-        let (reader, pollers) = {
+        let wakeups = {
             let mut inner = self.inner.lock();
             let mut packet = packet;
             if let Some(filter) = inner.classic_filter.as_ref() {
@@ -298,15 +297,13 @@ impl DatagramQueue {
                 payload: packet,
                 control,
             });
-            (
-                inner.read_waiters.pop_front(),
-                inner.poll_waiters.take_wakeups(),
-            )
+            let mut wakeups = inner.poll_waiters.take_wakeups();
+            if let Some(reader) = inner.read_waiters.pop_front() {
+                wakeups.push(reader);
+            }
+            wakeups
         };
-        if let Some(reader) = reader {
-            wakeup_task(reader);
-        }
-        wake_tasks(pollers);
+        wake_tasks(wakeups);
         Ok(len)
     }
 
@@ -375,15 +372,13 @@ impl DatagramQueue {
     }
 
     fn wake_all(&self) {
-        let (readers, pollers) = {
+        let wakeups = {
             let mut inner = self.inner.lock();
-            (
-                inner.read_waiters.drain(..).collect::<Vec<_>>(),
-                inner.poll_waiters.take_wakeups(),
-            )
+            let mut wakeups = inner.read_waiters.drain(..).collect::<Vec<_>>();
+            wakeups.extend(inner.poll_waiters.take_wakeups());
+            wakeups
         };
-        wake_tasks(readers);
-        wake_tasks(pollers);
+        wake_tasks(wakeups);
     }
 }
 

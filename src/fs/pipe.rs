@@ -9,7 +9,6 @@ use spin::Mutex;
 
 use crate::{
     bpf::BpfProgFile,
-    debug_config::DEBUG_UNIXBENCH,
     fs::{
         File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, parse_proc_sys_usize, wake_tasks,
     },
@@ -20,7 +19,7 @@ use crate::{
     },
     task::{
         block_sleep::add_timer,
-        manager::{PID2PCB, wakeup_task},
+        manager::PID2PCB,
         processor::{block_current_and_run_next, current_process, current_task},
         signal::{
             SIGPIPE_NUM, has_wait_interrupting_pending, queue_process_signal_info, signal_bit,
@@ -33,6 +32,7 @@ use crate::{
 // A small pipe buffer makes typical shell pipelines (busybox/ash, rt-tests) extremely
 // slow and can even deadlock if producers/consumers don't run concurrently.
 const PIPE_BUF: usize = 4096;
+const INLINE_PIPE_WRITE_BYTES: usize = 256;
 const DEFAULT_PIPE_CAPACITY: usize = 16 * PIPE_BUF;
 const MAX_PIPE_CAPACITY: usize = DEFAULT_PIPE_CAPACITY;
 static PIPE_MAX_SIZE_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_CAPACITY);
@@ -377,26 +377,28 @@ impl Pipe {
         if !self.readable {
             return;
         }
-        let (writers, pollers) = {
+        let wakeups = {
             let mut ring = self.buffer.lock();
             ring.read_end_shutdown = true;
-            (ring.drain_writers(), ring.drain_poll_waiters())
+            let mut wakeups = ring.drain_writers();
+            wakeups.extend(ring.drain_poll_waiters());
+            wakeups
         };
-        wake_tasks(writers);
-        wake_tasks(pollers);
+        wake_tasks(wakeups);
     }
 
     pub fn shutdown_write_end(&self) {
         if !self.writable {
             return;
         }
-        let (readers, pollers) = {
+        let wakeups = {
             let mut ring = self.buffer.lock();
             ring.write_end_shutdown = true;
-            (ring.drain_readers(), ring.drain_poll_waiters())
+            let mut wakeups = ring.drain_readers();
+            wakeups.extend(ring.drain_poll_waiters());
+            wakeups
         };
-        wake_tasks(readers);
-        wake_tasks(pollers);
+        wake_tasks(wakeups);
     }
 
     pub fn same_buffer(&self, other: &Pipe) -> bool {
@@ -492,12 +494,12 @@ impl Pipe {
 
             // 通知 写者，和 epoll
             let writer = ring_buffer.pop_writer();
-            let pollers = ring_buffer.drain_poll_waiters();
+            let mut wakeups = ring_buffer.drain_poll_waiters();
             drop(ring_buffer);
             if let Some(writer) = writer {
-                wakeup_task(writer);
+                wakeups.push(writer);
             }
-            wake_tasks(pollers);
+            wake_tasks(wakeups);
             return Ok(to_read);
         }
     }
@@ -633,7 +635,7 @@ impl Pipe {
             } else {
                 None
             };
-            let pollers = if to_write > 0 {
+            let mut wakeups = if to_write > 0 {
                 ring_buffer.drain_poll_waiters()
             } else {
                 Vec::new()
@@ -648,9 +650,9 @@ impl Pipe {
                 notify_async_io(owner_type, owner_pid, sig, fd);
             }
             if let Some(reader) = reader_to_wake {
-                wakeup_task(reader);
+                wakeups.push(reader);
             }
-            wake_tasks(pollers);
+            wake_tasks(wakeups);
             if filter_truncated {
                 return Ok(data.len());
             }
@@ -658,6 +660,105 @@ impl Pipe {
                 return Ok(written);
             }
         }
+    }
+
+    /// Read directly into a user buffer while preserving Linux syscall errors.
+    ///
+    /// The legacy `File::read` trait returns only `usize`, which forces waitable
+    /// objects to squash signal interruption into a zero-length read.  Syscall
+    /// paths use this typed helper so a signal that wakes an interruptible pipe
+    /// wait returns `-EINTR`, matching Linux pipe semantics.
+    pub fn read_user_result(&self, buf: UserBuffer, nonblock: bool) -> Result<usize, isize> {
+        const EAGAIN: isize = -11;
+        assert!(self.readable());
+        let want_to_read = buf.len();
+        if want_to_read == 0 {
+            return Ok(0);
+        }
+        let task = current_task().unwrap();
+        let has_pending_signal = || {
+            let inner = task.borrow_mut();
+            has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
+        };
+        loop {
+            let mut ring_buffer = self.buffer.lock();
+            let avail = ring_buffer.available_read();
+            if avail == 0 {
+                if ring_buffer.all_write_ends_closed() {
+                    ring_buffer.remove_reader(&task);
+                    return Ok(0);
+                }
+                if nonblock {
+                    ring_buffer.remove_reader(&task);
+                    return Err(EAGAIN);
+                }
+                if has_pending_signal() {
+                    ring_buffer.remove_reader(&task);
+                    return Err(err(SyscallError::EINTR));
+                }
+                ring_buffer.push_reader(task.clone());
+                drop(ring_buffer);
+                block_current_and_run_next();
+                continue;
+            }
+
+            let mut buf_iter = buf.into_iter();
+            let mut read_now = 0usize;
+            let to_read = core::cmp::min(avail, want_to_read);
+            for _ in 0..to_read {
+                let Some(byte_ref) = buf_iter.next() else {
+                    break;
+                };
+                // Safety: UserBuffer exposes already translated user pages.
+                unsafe {
+                    *byte_ref = ring_buffer.read_byte();
+                }
+                read_now += 1;
+            }
+            let writer = if read_now > 0 {
+                ring_buffer.pop_writer()
+            } else {
+                None
+            };
+            let mut wakeups = if read_now > 0 {
+                ring_buffer.drain_poll_waiters()
+            } else {
+                Vec::new()
+            };
+            drop(ring_buffer);
+            if let Some(writer) = writer {
+                wakeups.push(writer);
+            }
+            wake_tasks(wakeups);
+            return Ok(read_now);
+        }
+    }
+
+    /// Write from a user buffer while preserving Linux syscall errors.
+    pub fn write_user_result(&self, buf: UserBuffer, nonblock: bool) -> Result<usize, isize> {
+        assert!(self.writable());
+        let want_to_write = buf.len();
+        if want_to_write == 0 {
+            return Ok(0);
+        }
+        if want_to_write <= INLINE_PIPE_WRITE_BYTES {
+            let mut data = [0u8; INLINE_PIPE_WRITE_BYTES];
+            let mut written = 0usize;
+            for byte_ref in buf.into_iter() {
+                unsafe {
+                    data[written] = *byte_ref;
+                }
+                written += 1;
+            }
+            return self.write_from_slice_with_deadline(&data[..written], nonblock, None);
+        }
+        let mut data = Vec::with_capacity(want_to_write);
+        for byte_ref in buf.into_iter() {
+            unsafe {
+                data.push(*byte_ref);
+            }
+        }
+        self.write_from_slice_with_deadline(data.as_slice(), nonblock, None)
     }
 
     /// 窥看（peek）管道数据到 `out`，**不消费**缓冲区内容（head/tail 不移动）。
@@ -760,8 +861,8 @@ pub struct PipeRingBuffer {
     read_end_ref_bias: usize,
     /// 写端引用计数基线，语义同 `read_end_ref_bias`。
     write_end_ref_bias: usize,
-    read_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
-    write_waiters: VecDeque<Arc<crate::task::task_block::TaskControlBlock>>,
+    read_waiters: VecDeque<Weak<crate::task::task_block::TaskControlBlock>>,
+    write_waiters: VecDeque<Weak<crate::task::task_block::TaskControlBlock>>,
     poll_waiters: PollWaitQueue,
     async_enabled: bool,
     async_owner_type: i32,
@@ -1022,50 +1123,91 @@ impl PipeRingBuffer {
             .unwrap_or(0)
     }
 
+    fn waiter_matches(
+        waiter: &Weak<crate::task::task_block::TaskControlBlock>,
+        task: &Arc<crate::task::task_block::TaskControlBlock>,
+    ) -> bool {
+        waiter.upgrade().is_some_and(|t| Arc::ptr_eq(&t, task))
+    }
+
     fn push_reader(&mut self, task: Arc<crate::task::task_block::TaskControlBlock>) -> bool {
-        if self.read_waiters.iter().any(|t| Arc::ptr_eq(t, &task)) {
+        self.read_waiters.retain(|w| w.strong_count() > 0);
+        if self
+            .read_waiters
+            .iter()
+            .any(|waiter| Self::waiter_matches(waiter, &task))
+        {
             return false;
         }
-        self.read_waiters.push_back(task);
+        self.read_waiters.push_back(Arc::downgrade(&task));
         true
     }
 
     fn push_writer(&mut self, task: Arc<crate::task::task_block::TaskControlBlock>) -> bool {
-        if self.write_waiters.iter().any(|t| Arc::ptr_eq(t, &task)) {
+        self.write_waiters.retain(|w| w.strong_count() > 0);
+        if self
+            .write_waiters
+            .iter()
+            .any(|waiter| Self::waiter_matches(waiter, &task))
+        {
             return false;
         }
-        self.write_waiters.push_back(task);
+        self.write_waiters.push_back(Arc::downgrade(&task));
         true
     }
 
     fn pop_reader(&mut self) -> Option<Arc<crate::task::task_block::TaskControlBlock>> {
-        self.read_waiters.pop_front()
+        while let Some(waiter) = self.read_waiters.pop_front() {
+            if let Some(task) = waiter.upgrade() {
+                return Some(task);
+            }
+        }
+        None
     }
 
     fn pop_writer(&mut self) -> Option<Arc<crate::task::task_block::TaskControlBlock>> {
-        self.write_waiters.pop_front()
+        while let Some(waiter) = self.write_waiters.pop_front() {
+            if let Some(task) = waiter.upgrade() {
+                return Some(task);
+            }
+        }
+        None
     }
 
     fn remove_reader(&mut self, task: &Arc<crate::task::task_block::TaskControlBlock>) -> bool {
         let before = self.read_waiters.len();
-        self.read_waiters.retain(|t| !Arc::ptr_eq(t, task));
+        self.read_waiters.retain(|waiter| {
+            waiter
+                .upgrade()
+                .is_some_and(|waiter_task| !Arc::ptr_eq(&waiter_task, task))
+        });
         before != self.read_waiters.len()
     }
 
     fn remove_writer(&mut self, task: &Arc<crate::task::task_block::TaskControlBlock>) -> bool {
         let before = self.write_waiters.len();
-        self.write_waiters.retain(|t| !Arc::ptr_eq(t, task));
+        self.write_waiters.retain(|waiter| {
+            waiter
+                .upgrade()
+                .is_some_and(|waiter_task| !Arc::ptr_eq(&waiter_task, task))
+        });
         before != self.write_waiters.len()
     }
 
     /// 取出所有的 reader
     fn drain_readers(&mut self) -> Vec<Arc<crate::task::task_block::TaskControlBlock>> {
-        self.read_waiters.drain(..).collect()
+        self.read_waiters
+            .drain(..)
+            .filter_map(|w| w.upgrade())
+            .collect()
     }
 
     /// 取出所有的 write
     fn drain_writers(&mut self) -> Vec<Arc<crate::task::task_block::TaskControlBlock>> {
-        self.write_waiters.drain(..).collect()
+        self.write_waiters
+            .drain(..)
+            .filter_map(|w| w.upgrade())
+            .collect()
     }
 
     fn add_poll_waiter_once(
@@ -1182,13 +1324,13 @@ pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
             refs = refs.saturating_add(
                 ring.read_waiters
                     .iter()
-                    .filter(|w| Arc::ptr_eq(w, task))
+                    .filter(|w| PipeRingBuffer::waiter_matches(w, task))
                     .count(),
             );
             refs = refs.saturating_add(
                 ring.write_waiters
                     .iter()
-                    .filter(|w| Arc::ptr_eq(w, task))
+                    .filter(|w| PipeRingBuffer::waiter_matches(w, task))
                     .count(),
             );
         }
@@ -1196,94 +1338,11 @@ pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
     refs
 }
 
-/// 从全局所有管道的读/写等待队列中移除 `task`，返回实际移除的队列数。
-///
-/// 在 task 退出或被强制终止时调用，防止其 Arc 留在管道等待队列中
-/// 造成内存泄漏或在后续唤醒时 panic（task 已无效但仍被调度）。
-/// 同样使用双重去重（`seen_tables` + `seen`）处理共享文件表和 `dup` 场景。
-pub fn remove_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    let mut seen = BTreeSet::new();
-    let mut seen_tables = BTreeSet::new();
-    let mut removed = 0usize;
-    for process in processes {
-        let files = {
-            let Some(inner) = process.try_borrow_mut() else {
-                continue;
-            };
-            Arc::clone(&inner.files)
-        };
-        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
-            continue;
-        }
-        for (_fd, file) in files.lock().iter_files_snapshot() {
-            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                continue;
-            };
-            let ring_ptr = Arc::as_ptr(&pipe.buffer) as usize;
-            if !seen.insert(ring_ptr) {
-                continue;
-            }
-            let mut ring = pipe.buffer.lock();
-            if ring.remove_reader(task) {
-                removed = removed.saturating_add(1);
-            }
-            if ring.remove_writer(task) {
-                removed = removed.saturating_add(1);
-            }
-        }
-    }
-    removed
-}
-
-fn log_pipe_end_owners(end: &Arc<Pipe>, label: &str) {
-    if !DEBUG_UNIXBENCH {
-        return;
-    }
-    let end_ptr = Arc::as_ptr(end);
-    let processes = {
-        let map = PID2PCB.lock();
-        map.iter()
-            .map(|(pid, pcb)| (*pid, Arc::clone(pcb)))
-            .collect::<Vec<_>>()
-    };
-    let mut owners = Vec::new();
-    let mut total = 0usize;
-    let mut seen_tables = BTreeSet::new();
-    for (pid, pcb) in processes {
-        let Some(inner) = pcb.try_borrow_mut() else {
-            continue;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
-        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
-            continue;
-        }
-        for (fd, file) in files.lock().iter_files_snapshot() {
-            let Some(pipe) = file.as_any().downcast_ref::<Pipe>() else {
-                continue;
-            };
-            if (pipe as *const Pipe) == end_ptr {
-                total += 1;
-                if owners.len() < 8 {
-                    owners.push((pid, fd));
-                }
-            }
-        }
-    }
-    if total > 0 {
-        crate::log_if!(
-            DEBUG_UNIXBENCH,
-            info,
-            "[pipe] {} owners={:?} total={}",
-            label,
-            owners,
-            total
-        );
-    }
+/// Pipe read/write waiters are weak references, so exiting tasks do not need a
+/// global fd-table scan to drop pipe waiter references. Stale weak entries are
+/// pruned on local pipe enqueue/pop/drain paths.
+pub fn remove_task_waiters(_task: &Arc<TaskControlBlock>) -> usize {
+    0
 }
 
 /// Return (read_end, write_end)
@@ -1301,17 +1360,22 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
 
 impl Drop for Pipe {
     fn drop(&mut self) {
-        let (readers, writers, pollers) = {
+        let wakeups = {
             let mut ring = self.buffer.lock();
-            (
-                ring.drain_readers(),
-                ring.drain_writers(),
-                ring.drain_poll_waiters(),
-            )
+            let mut wakeups = if self.writable {
+                // Last write end vanished: blocked readers must observe EOF.
+                ring.drain_readers()
+            } else {
+                Vec::new()
+            };
+            if self.readable {
+                // Last read end vanished: blocked writers must observe EPIPE/SIGPIPE.
+                wakeups.extend(ring.drain_writers());
+            }
+            wakeups.extend(ring.drain_poll_waiters());
+            wakeups
         };
-        wake_tasks(readers);
-        wake_tasks(writers);
-        wake_tasks(pollers);
+        wake_tasks(wakeups);
     }
 }
 
@@ -1328,145 +1392,30 @@ impl File for Pipe {
     /// 通过迭代器逐字节写入（内核已映射用户页，此处直接 unsafe 写指针）。
     /// 读到数据后返回短读（short read）而非等满 `want_to_read`，符合 POSIX 管道语义。
     fn read(&self, buf: UserBuffer) -> usize {
-        assert!(self.readable());
-        let want_to_read = buf.len();
-        // 零字节请求直接返回，不进入等待逻辑
-        if want_to_read == 0 {
-            return 0;
-        }
-        let task = current_task().unwrap();
-        // 闭包：检查当前 task 是否有未屏蔽的挂起信号。
-        // 每次循环重新检查，确保信号在阻塞期间能及时中断 read。
-        let has_pending_signal = || {
-            let inner = task.borrow_mut();
-            has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
-        };
-        loop {
-            // 每次循环重新加锁：被唤醒后需要重新观察缓冲区状态（spurious wakeup 也安全）
-            let mut ring_buffer = self.buffer.lock();
-            let avail = ring_buffer.available_read();
-            if avail == 0 {
-                // --- 缓冲区为空，进入等待或返回 ---
-
-                // 优先检查信号：信号到来时 read 应被中断，返回 0 让上层处理
-                // （注意：此处先于 all_write_ends_closed 检查，与 read_to_slice 顺序相反，
-                //  是为了让信号能中断等待，即使写端已全部关闭也要先处理信号）
-                if has_pending_signal() {
-                    ring_buffer.remove_reader(&task); // 确保不留悬挂引用
-                    crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] read abort (pending signal)");
-                    return 0;
-                }
-                // 写端全关闭 → EOF：管道再无数据来源，返回 0
-                if ring_buffer.all_write_ends_closed() {
-                    ring_buffer.remove_reader(&task);
-                    crate::log_if!(DEBUG_UNIXBENCH, info, "[pipe] read EOF");
-                    return 0;
-                }
-
-                // 以下进入真正的阻塞等待路径：
-                // push_reader 去重插入，返回 false 说明已在队列中（可能是 spurious wakeup）
-                let task_for_log = task.clone();
-                let inserted = ring_buffer.push_reader(task.clone());
-
-                // 调试模式下在锁内采样诊断信息（锁外不可再访问 ring_buffer 字段）
-                let mut waiters = 0usize;
-                let mut writers = 0usize;
-                let mut write_end: Option<Arc<Pipe>> = None;
-                if DEBUG_UNIXBENCH && inserted {
-                    waiters = ring_buffer.read_waiters.len();
-                    writers = ring_buffer.write_end_count();
-                    if writers > 0 {
-                        // upgrade Weak 以便锁外打印写端属主
-                        write_end = ring_buffer.write_end.as_ref().and_then(|w| w.upgrade());
-                    }
-                }
-
-                // 必须在 block 之前释放锁：
-                // 1. 写端写完数据后需要加锁才能 pop_reader 唤醒我们
-                // 2. 持锁挂起会导致死锁
-                drop(ring_buffer);
-
-                // 锁已释放，可以安全打印（避免持锁 I/O）
-                if DEBUG_UNIXBENCH && inserted {
-                    let pid = task_for_log
-                        .process
-                        .upgrade()
-                        .map(|p| p.getpid())
-                        .unwrap_or(usize::MAX);
-                    let tid = task_for_log
-                        .borrow_mut()
-                        .res
-                        .as_ref()
-                        .map(|r| r.tid)
-                        .unwrap_or(usize::MAX);
-                    crate::log_if!(
-                        DEBUG_UNIXBENCH,
-                        info,
-                        "[pipe] wait read pid={} tid={} waiters={} writers={}",
-                        pid,
-                        tid,
-                        waiters,
-                        writers
-                    );
-                    if writers > 0 {
-                        if let Some(end) = write_end {
-                            log_pipe_end_owners(&end, "write");
-                        }
-                    }
-                }
-                // 挂起当前 task，调度器切换到其它 task 运行；
-                // 被 write 路径的 wakeup_task 唤醒后从 continue 开始下一轮循环
-                block_current_and_run_next();
-                continue;
-            }
-
-            // --- 缓冲区有数据，执行实际读取 ---
-            // 短读语义：只读取当前已有的字节，不等到 want_to_read 全部满足
-            let mut buf_iter = buf.into_iter();
-            let mut read_now = 0usize;
-            let to_read = core::cmp::min(avail, want_to_read);
-            for _ in 0..to_read {
-                let Some(byte_ref) = buf_iter.next() else {
-                    break;
-                };
-                // Safety: UserBuffer 的迭代器返回的是内核已映射的用户页指针，
-                // 且当前持有 ring_buffer 锁，不存在并发写同一字节的情况
-                unsafe {
-                    *byte_ref = ring_buffer.read_byte();
-                }
-                read_now += 1;
-            }
-
-            // 数据已消费，空间释放 → 唤醒等待写入的 task（只取队头，避免惊群）
-            let writer = if read_now > 0 {
-                ring_buffer.pop_writer()
-            } else {
-                None
-            };
-            // 同步唤醒所有 poll/epoll/select 等待者（通知"可写"事件）
-            let pollers = if read_now > 0 {
-                ring_buffer.drain_poll_waiters()
-            } else {
-                Vec::new()
-            };
-            // 先释放锁，再唤醒：避免被唤醒的 task 立即加锁时与我们产生竞争
-            drop(ring_buffer);
-            if let Some(writer) = writer {
-                wakeup_task(writer);
-            }
-            wake_tasks(pollers);
-            return read_now;
-        }
+        self.read_user_result(buf, false).unwrap_or(0)
     }
-    /// `File::write` 的管道实现：先将用户态 `UserBuffer` 拷贝到内核堆上的临时 `Vec`，
-    /// 再委托给 `write_from_slice` 完成阻塞写入。
-    /// 预先拷贝是因为 `write_from_slice` 在阻塞期间需要释放 buffer 锁，
-    /// 此时不能持有对用户页面的引用（页面可能被换出或映射变化）。
+    /// `File::write` 的管道实现：先将用户态 `UserBuffer` 拷贝到内核缓冲区，
+    /// 再委托给 `write_from_slice` 完成阻塞写入。小写入走栈缓冲以避开堆分配；
+    /// 大写入仍使用 `Vec`。预先拷贝是因为 `write_from_slice` 在阻塞期间需要
+    /// 释放 buffer 锁，此时不能持有对用户页面的引用。
     fn write(&self, buf: UserBuffer) -> usize {
         assert!(self.writable());
         let want_to_write = buf.len();
         if want_to_write == 0 {
             return 0;
+        }
+        if want_to_write <= INLINE_PIPE_WRITE_BYTES {
+            let mut data = [0u8; INLINE_PIPE_WRITE_BYTES];
+            let mut written = 0usize;
+            for byte_ref in buf.into_iter() {
+                unsafe {
+                    data[written] = *byte_ref;
+                }
+                written += 1;
+            }
+            return self
+                .write_from_slice_with_deadline(&data[..written], false, None)
+                .unwrap_or(0);
         }
         let mut data = Vec::with_capacity(want_to_write);
         for byte_ref in buf.into_iter() {
@@ -1474,7 +1423,8 @@ impl File for Pipe {
                 data.push(*byte_ref);
             }
         }
-        self.write_from_slice(data.as_slice(), false).unwrap_or(0)
+        self.write_from_slice_with_deadline(data.as_slice(), false, None)
+            .unwrap_or(0)
     }
 
     fn poll_mask(&self) -> i16 {

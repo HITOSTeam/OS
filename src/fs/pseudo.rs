@@ -181,6 +181,7 @@ pub enum PseudoKindTag {
 pub struct PseudoFile {
     readable: bool,
     writable: bool,
+    kind_tag: PseudoKindTag,
     inner: Mutex<PseudoInner>,
 }
 
@@ -1183,6 +1184,7 @@ impl PseudoFile {
         Self {
             readable: true,
             writable,
+            kind_tag: PseudoKindTag::Static,
             inner: Mutex::new(PseudoInner {
                 offset: 0,
                 kind: PseudoKind::Static(content.as_bytes().to_vec()),
@@ -1194,6 +1196,7 @@ impl PseudoFile {
         Self {
             readable: true,
             writable: false,
+            kind_tag: PseudoKindTag::Static,
             inner: Mutex::new(PseudoInner {
                 offset: 0,
                 kind: PseudoKind::Static(data.to_vec()),
@@ -1205,6 +1208,7 @@ impl PseudoFile {
         Self {
             readable: true,
             writable: false,
+            kind_tag: PseudoKindTag::Urandom,
             inner: Mutex::new(PseudoInner {
                 offset: 0,
                 kind: PseudoKind::Urandom(seed),
@@ -1216,6 +1220,7 @@ impl PseudoFile {
         Self {
             readable: true,
             writable: true,
+            kind_tag: PseudoKindTag::Null,
             inner: Mutex::new(PseudoInner {
                 offset: 0,
                 kind: PseudoKind::Null,
@@ -1227,6 +1232,7 @@ impl PseudoFile {
         Self {
             readable: true,
             writable: false,
+            kind_tag: PseudoKindTag::Zero,
             inner: Mutex::new(PseudoInner {
                 offset: 0,
                 kind: PseudoKind::Zero,
@@ -1252,12 +1258,7 @@ impl PseudoFile {
     }
 
     pub fn kind_tag(&self) -> PseudoKindTag {
-        match &self.inner.lock().kind {
-            PseudoKind::Static(_) => PseudoKindTag::Static,
-            PseudoKind::Urandom(_) => PseudoKindTag::Urandom,
-            PseudoKind::Null => PseudoKindTag::Null,
-            PseudoKind::Zero => PseudoKindTag::Zero,
-        }
+        self.kind_tag
     }
 }
 

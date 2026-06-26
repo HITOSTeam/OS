@@ -7,7 +7,7 @@ use core::cmp::min;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
-use crate::task::manager::{PID2PCB, wakeup_task};
+use crate::task::manager::{PID2PCB, wakeup_tasks};
 use crate::{
     fs::{
         CgroupFile, CgroupMountSpec, ClassifiedAbsPath, EventFdFile, File, MountNamespace,

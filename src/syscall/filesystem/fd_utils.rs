@@ -134,6 +134,13 @@ pub(crate) fn get_fd_file(fd: usize) -> Option<alloc::sync::Arc<dyn File + Send 
     current_files().lock().get_file(fd)
 }
 
+/// Returns the file and descriptor flags currently installed at `fd`, if any.
+pub(crate) fn get_fd_file_and_flags(
+    fd: usize,
+) -> Option<(alloc::sync::Arc<dyn File + Send + Sync>, u32)> {
+    current_files().lock().get_file_and_flags(fd)
+}
+
 /// Get the file for `fd`, returning `-EBADF` if the descriptor is not open.
 macro_rules! require_fd_file {
     ($fd:expr) => {
