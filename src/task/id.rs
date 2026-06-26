@@ -6,7 +6,10 @@ use crate::{
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    mem::ManuallyDrop,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use spin::Mutex;
 
 const PID_MAX_DEFAULT: usize = 32768;
@@ -393,6 +396,19 @@ impl TaskUserRes {
     /// Whether this thread uses a user-managed stack (Linux CLONE_VM threads do).
     pub fn is_linux_thread(&self) -> bool {
         !self.owns_ustack
+    }
+
+    /// Consume thread user-resource bookkeeping during whole-process exit without
+    /// individually unmapping its stack/trap-cx areas. The address space is being
+    /// detached as one `mm`, so per-thread VMA teardown would duplicate work on
+    /// the latency-sensitive exit path.
+    pub fn detach_for_process_exit(self) {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: `this` will not run `Drop`, so explicitly drop the only field
+        // with ownership semantics. The remaining fields are plain integers/bools.
+        unsafe {
+            core::ptr::drop_in_place(&mut this.process);
+        }
     }
 }
 

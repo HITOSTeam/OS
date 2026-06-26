@@ -102,6 +102,42 @@ pub(super) fn enqueue_waiter_once(
     true
 }
 
+fn wait4_signal_matches(exit_signal: i32, options: usize, wall: usize, wclone: usize) -> bool {
+    let is_clone_child = exit_signal != SIGCHLD_NUM as i32;
+    (options & wall) != 0 || ((options & wclone) != 0) == is_clone_child
+}
+
+fn note_ptrace_attach_to(tracer_pid: usize) {
+    if let Some(tracer) = pid2process(tracer_pid) {
+        let mut inner = tracer.borrow_mut();
+        inner.ptrace_tracee_count = inner.ptrace_tracee_count.saturating_add(1);
+    }
+}
+
+fn note_ptrace_detach_from(tracer_pid: usize) {
+    if let Some(tracer) = pid2process(tracer_pid) {
+        let mut inner = tracer.borrow_mut();
+        inner.ptrace_tracee_count = inner.ptrace_tracee_count.saturating_sub(1);
+    }
+}
+
+pub(crate) fn release_ptrace_tracer(process: &Arc<ProcessControlBlock>) {
+    let tracer_pid = {
+        let mut inner = process.borrow_mut();
+        inner.ptrace_tracer_pid.take()
+    };
+    if let Some(tracer_pid) = tracer_pid {
+        note_ptrace_detach_from(tracer_pid);
+    }
+}
+
+fn remove_exited_child_ref(
+    queue: &mut alloc::collections::VecDeque<Arc<ProcessControlBlock>>,
+    child: &Arc<ProcessControlBlock>,
+) {
+    queue.retain(|queued| !Arc::ptr_eq(queued, child));
+}
+
 /// 回收僵尸子进程占用的内核资源，并返回其累计 CPU 时间（纳秒）。
 ///
 /// exit 路径已将主线程资源解绑，但 task Arc 可能仍被调度器运行队列、
@@ -129,7 +165,12 @@ fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     };
     let child_pid = child.getpid();
     for task in tasks.into_iter().flatten() {
-        remove_inactive_task(task.clone());
+        let exit_cleaned = task.borrow_mut().res.is_none();
+        if exit_cleaned {
+            remove_sched_timer_refs(task.clone());
+        } else {
+            remove_inactive_task(task.clone());
+        }
         let strong = Arc::strong_count(&task);
         if strong > 1 && DEBUG_SIGNAL {
             // Retry once so duplicate stale queue entries are aggressively dropped.
@@ -413,10 +454,54 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
         remove_wait_queue_entry(&mut process_inner.wait_queue, &task);
         let parent_pgid = process_inner.pgid;
         let parent_pid = cur_process.getpid();
+        let has_ptrace_tracees = process_inner.ptrace_tracee_count != 0;
         let mut stop_event: Option<(Arc<ProcessControlBlock>, i32)> = None;
         let mut cont_event: Option<Arc<ProcessControlBlock>> = None;
+        let mut queued_zombie_child: Option<Arc<ProcessControlBlock>> = None;
+        if pid == -1 && (options & (WUNTRACED | WCONTINUED)) == 0 {
+            let mut index = 0;
+            while index < process_inner.exited_children.len() {
+                let child = Arc::clone(&process_inner.exited_children[index]);
+                let mut child_inner = child.borrow_mut();
+                let still_child = child_inner
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| parent.upgrade())
+                    .map_or(false, |parent| Arc::ptr_eq(&parent, &cur_process));
+                if !still_child || !child_inner.is_zombie {
+                    if child_inner.exited_parent_queue_pid == Some(parent_pid) {
+                        child_inner.exited_parent_queue_pid = None;
+                    }
+                    drop(child_inner);
+                    process_inner.exited_children.remove(index);
+                    continue;
+                }
+                if !wait4_signal_matches(child_inner.exit_signal, options, __WALL, __WCLONE) {
+                    drop(child_inner);
+                    index += 1;
+                    continue;
+                }
+                temp_exit_code = child_inner.exit_code;
+                temp_signal = if temp_exit_code < 0 {
+                    Some(-temp_exit_code)
+                } else {
+                    None
+                };
+                temp_coredump = child_inner.dumped_core;
+                drop(child_inner);
+                let child = process_inner
+                    .exited_children
+                    .remove(index)
+                    .expect("queued child index disappeared");
+                let _ = process_inner.remove_child(&child);
+                queued_zombie_child = Some(child);
+                break;
+            }
+        }
         // --- 阶段一：扫描亲子进程列表，按 zombie > stop > cont 优先级查找事件 ---
-        let (has_matching_child, zombie_child) = if process_inner.children.is_empty() {
+        let (has_matching_child, zombie_child) = if let Some(child) = queued_zombie_child {
+            (true, Some(child))
+        } else if process_inner.children.is_empty() {
             (false, None)
         } else {
             let mut found: Option<usize> = None;
@@ -471,7 +556,8 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                 }
             }
             if let Some(index) = found {
-                let child = process_inner.children.remove(index);
+                let child = process_inner.remove_child_at(index);
+                remove_exited_child_ref(&mut process_inner.exited_children, &child);
                 (true, Some(child))
             } else {
                 (has_match, None)
@@ -481,7 +567,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
         // --- 阶段二：若阶段一未找到 stop/zombie 事件，补充扫描 ptrace 被追踪进程 ---
         // 被追踪进程不一定是当前进程的亲子，因此需要扫描全局 PID 表。
         let mut has_matching_ptrace = false;
-        if stop_event.is_none() && zombie_child.is_none() {
+        if has_ptrace_tracees && stop_event.is_none() && zombie_child.is_none() {
             let traced_processes = {
                 let map = PID2PCB.lock();
                 map.values().cloned().collect::<Vec<_>>()
@@ -825,7 +911,9 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             let child_pid = process_inner.children[index].pid.0;
             // WNOWAIT：不从 children 列表移除，保留僵尸以供后续 wait 重复查询。
             let child = if (options & WNOWAIT) == 0 {
-                Some(process_inner.children.remove(index))
+                let child = process_inner.remove_child_at(index);
+                remove_exited_child_ref(&mut process_inner.exited_children, &child);
+                Some(child)
             } else {
                 None
             };
@@ -996,6 +1084,8 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                 return err(SyscallError::EPERM);
             };
             inner.ptrace_tracer_pid = Some(parent_pid);
+            drop(inner);
+            note_ptrace_attach_to(parent_pid);
             0
         }
         PTRACE_ATTACH => {
@@ -1032,6 +1122,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                     .filter_map(|t| t.as_ref().cloned())
                     .collect::<Vec<_>>()
             };
+            note_ptrace_attach_to(tracer_pid);
             // 将目标进程的所有线程标记为因信号停止，以便 DETACH/CONT 能精确恢复它们。
             for task in tasks {
                 let mut task_inner = task.borrow_mut();
@@ -1055,19 +1146,23 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            let tasks = {
+            let (old_tracer, tasks) = {
                 let mut inner = target.borrow_mut();
-                inner.ptrace_tracer_pid = None;
+                let old_tracer = inner.ptrace_tracer_pid.take();
                 inner.stopped = false;
                 inner.stop_pending = false;
                 inner.stop_signal = 0;
                 inner.continued = true;
-                inner
+                let tasks = inner
                     .tasks
                     .iter()
                     .filter_map(|t| t.as_ref().cloned())
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (old_tracer, tasks)
             };
+            if let Some(tracer_pid) = old_tracer {
+                note_ptrace_detach_from(tracer_pid);
+            }
             // 只恢复因 ptrace stop 而 Blocked 的线程，避免错误唤醒因其他原因（如 futex）阻塞的线程。
             for task in tasks {
                 let mut task_inner = task.borrow_mut();

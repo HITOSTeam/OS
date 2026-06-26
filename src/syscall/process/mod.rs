@@ -21,7 +21,7 @@ use crate::{
     fs::{
         CgroupAttachTarget, PidFdFile, cgroup_attach_process_to_target, cgroup_attach_thread,
         cgroup_clone_into_target_from_file, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
-        root_inode_for_path, secondary_root_inode,
+        refresh_thread_legacy_cpu_fair_group_cache, root_inode_for_path, secondary_root_inode,
     },
     mm::{
         MapPermission, MemorySet, kernel_token, try_copy_from_user, try_read_user_value,
@@ -38,8 +38,8 @@ use crate::{
     task::{
         ProcessControlBlock,
         manager::{
-            PID2PCB, add_task, pid2process, remove_inactive_task, select_hart_for_new_task,
-            wakeup_task,
+            PID2PCB, add_task, pid2process, remove_inactive_task, remove_sched_timer_refs,
+            select_hart_for_new_task, wakeup_task,
         },
         processor::{
             block_current_and_run_next, current_files, current_files_and_nofile_limit,

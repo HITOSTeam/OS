@@ -178,6 +178,7 @@ fn clone_from_parts(
             let inner = task.borrow_mut();
             inner.signal_mask
         };
+        let parent_scheduling = task.scheduling_snapshot();
         // 记录父线程在进程线程表中的 tid 索引，用于 cgroup 线程附挂时定位归属
         let parent_tid_index = {
             let inner = task.borrow_mut();
@@ -195,6 +196,7 @@ fn clone_from_parts(
             Err(e) => return err(SyscallError::from(e)),
         };
         new_task.inherit_fp_state_from(&task);
+        new_task.set_scheduling_snapshot(parent_scheduling);
         // 为新线程挑选一个负载较轻的 hart 作为初始运行核
         new_task.set_cpu_id(select_hart_for_new_task());
 
@@ -259,6 +261,12 @@ fn clone_from_parts(
             }
             (tid_index, linux_tid)
         };
+        refresh_thread_legacy_cpu_fair_group_cache(process.getpid(), _tid_index);
+        crate::syscall::cyclic_diag_note(
+            crate::syscall::CyclicDiagEvent::Clone,
+            process.getpid(),
+            _tid_index,
+        );
 
         // 线程克隆路径的调试日志：仅在打开 DEBUG_PTHREAD 时输出
         if DEBUG_PTHREAD {
@@ -430,7 +438,7 @@ fn clone_from_parts(
             // 1) 从调用者的子列表里移除新子
             {
                 let mut caller_inner = process.borrow_mut();
-                caller_inner.children.retain(|c| !Arc::ptr_eq(c, &child));
+                let _ = caller_inner.remove_child(&child);
             }
             // 2) 把新子的父指针改指向调用者的真父
             {
@@ -440,7 +448,7 @@ fn clone_from_parts(
             // 3) 把新子挂到真父的子列表
             {
                 let mut real_parent_inner = real_parent.borrow_mut();
-                real_parent_inner.children.push(Arc::clone(&child));
+                real_parent_inner.add_child(Arc::clone(&child));
             }
         }
     }
