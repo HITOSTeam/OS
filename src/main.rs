@@ -60,16 +60,14 @@ fn clear_bss() {
 
 #[cfg(target_arch = "riscv64")]
 fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
-    // Mark boot hart online; secondary harts will be marked online after successful HSM start.
+    // Mark the boot hart online immediately. Secondary harts become online only
+    // after they finish their own trap/timer setup and are about to enter idle.
     task::manager::mark_hart_online(boot_hart_id);
     for hart_id in 0..config::MAX_HARTS {
         if hart_id == boot_hart_id {
             continue;
         }
-        // Only consider harts that OpenSBI successfully started as online.
-        if arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa) == 0 {
-            task::manager::mark_hart_online(hart_id);
-        }
+        let _ = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
     }
 }
 

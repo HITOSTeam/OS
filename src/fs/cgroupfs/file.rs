@@ -464,6 +464,7 @@ impl CgroupFile {
                 drop(registry);
                 for pid in affected {
                     if let Some(process) = pid2process(pid) {
+                        refresh_process_legacy_cpu_fair_group_cache(&process);
                         refresh_process_runqueues(&process);
                     }
                 }
@@ -582,6 +583,7 @@ impl CgroupFile {
                 drop(registry);
                 if should_refresh {
                     if let Some(process) = pid2process(pid) {
+                        refresh_process_legacy_cpu_fair_group_cache(&process);
                         refresh_process_runqueues(&process);
                     }
                 }
@@ -626,6 +628,7 @@ impl CgroupFile {
                 drop(registry);
                 if should_refresh {
                     if let Some(process) = pid2process(thread_id.tgid) {
+                        refresh_process_legacy_cpu_fair_group_cache(&process);
                         refresh_process_runqueues(&process);
                     }
                 }

@@ -5,15 +5,20 @@ use crate::{
     debug_config::DEBUG_CYCLICTEST,
     mm::{try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value},
     syscall::misc::decode_linux_tid,
+    syscall::{CyclicDiagEvent, cyclic_diag_note},
     task::{
         ProcessControlBlock,
-        manager::{online_hart_mask, pid2process, refresh_process_runqueues},
-        processor::{current_process, hart_id, suspend_current_and_run_next},
+        manager::{online_hart_mask, pid2process, refresh_task_runqueue},
+        processor::{
+            current_process, current_task, hart_id, request_reschedule_current_hart,
+            request_reschedule_harts, suspend_current_and_run_next,
+        },
         sched::{
             SCHED_BATCH, SCHED_DEADLINE, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_OTHER,
             SCHED_RESET_ON_FORK, SchedClass, check_policy, clamp_nice, policy_priority_max,
             policy_priority_min, rr_timeslice_ms, sched_class, valid_priority_for_policy,
         },
+        task_block::TaskControlBlock,
     },
     trap::get_current_token,
 };
@@ -79,36 +84,53 @@ fn full_affinity_mask() -> usize {
     online_hart_mask()
 }
 
-fn resolve_process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
+fn task_is_current(task: &Arc<TaskControlBlock>) -> bool {
+    current_task()
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, task))
+}
+
+fn request_reschedule_for_running_task(task: &Arc<TaskControlBlock>) {
+    let running_hart = task.on_cpu.load(core::sync::atomic::Ordering::Acquire);
+    if running_hart == TaskControlBlock::OFF_CPU {
+        return;
+    }
+    if task_is_current(task) {
+        request_reschedule_current_hart();
+    } else if running_hart < usize::BITS as usize {
+        request_reschedule_harts(1usize << running_hart);
+    }
+}
+
+fn task_from_process(
+    process: &Arc<ProcessControlBlock>,
+    tid: usize,
+) -> Option<Arc<TaskControlBlock>> {
+    let inner = process.borrow_mut();
+    inner.tasks.get(tid).and_then(|task| task.as_ref()).cloned()
+}
+
+fn resolve_task(pid: usize) -> Option<(Arc<ProcessControlBlock>, Arc<TaskControlBlock>)> {
     let cur = current_process();
     if pid == 0 {
-        Some(cur)
-    } else {
-        // glibc often passes a thread ID (TID) to sched_* syscalls.
-        // Accept both:
-        // - plain TGIDs (process PIDs), and
-        // - encoded TIDs produced by our `gettid()` compatibility layer.
-        let cur_pid = cur.getpid();
-        if pid == cur_pid {
-            Some(cur)
-        } else {
-            if decode_linux_tid(cur_pid, pid).is_some() {
-                return Some(cur);
+        return current_task().map(|task| (cur, task));
+    }
+    let cur_pid = cur.getpid();
+    if let Some(tid) = decode_linux_tid(cur_pid, pid) {
+        return task_from_process(&cur, tid).map(|task| (cur, task));
+    }
+    {
+        let inner = cur.borrow_mut();
+        if pid < inner.tasks.len() {
+            if let Some(task) = inner.tasks[pid].as_ref().cloned() {
+                drop(inner);
+                return Some((cur, task));
             }
-            // Accept raw TIDs from the current process (pthread APIs may pass plain tid indexes).
-            let has_task = {
-                let inner = cur.borrow_mut();
-                pid < inner.tasks.len() && inner.tasks[pid].is_some()
-            };
-            if has_task {
-                return Some(cur);
-            }
-            if let Some(proc) = pid2process(pid) {
-                return Some(proc);
-            }
-            None
         }
     }
+    let process = pid2process(pid)?;
+    let task = task_from_process(&process, 0)?;
+    Some((process, task))
 }
 
 pub fn syscall_sched_getscheduler(pid: usize) -> isize {
@@ -118,11 +140,11 @@ pub fn syscall_sched_getscheduler(pid: usize) -> isize {
     if invalid_pid(pid) {
         return err(SyscallError::EINVAL);
     }
-    let Some(process) = resolve_process(pid) else {
+    let Some((_process, task)) = resolve_task(pid) else {
         return err(SyscallError::ESRCH);
     };
     let (policy, reset_on_fork) = {
-        let inner = process.borrow_mut();
+        let inner = task.borrow_mut();
         (
             inner.scheduling.sched_policy,
             inner.scheduling.reset_on_fork,
@@ -156,7 +178,7 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
     if invalid_pid(pid) {
         return err(SyscallError::EINVAL);
     }
-    let Some(process) = resolve_process(pid) else {
+    let Some((_process, task)) = resolve_task(pid) else {
         if DEBUG_CYCLICTEST {
             log::warn!(
                 "[sched_getparam] err(SyscallError::ESRCH) pid={} param_ptr={:#x}",
@@ -167,7 +189,7 @@ pub fn syscall_sched_getparam(pid: usize, param_ptr: usize) -> isize {
         return err(SyscallError::ESRCH);
     };
     let prio = {
-        let inner = process.borrow_mut();
+        let inner = task.borrow_mut();
         inner.scheduling.sched_priority
     };
     let token = get_current_token();
@@ -205,7 +227,7 @@ pub fn syscall_sched_setparam(pid: usize, param_ptr: usize) -> isize {
     if invalid_pid(pid) {
         return err(SyscallError::EINVAL);
     }
-    let Some(process) = resolve_process(pid) else {
+    let Some((process, task)) = resolve_task(pid) else {
         return err(SyscallError::ESRCH);
     };
     let token = get_current_token();
@@ -216,12 +238,13 @@ pub fn syscall_sched_setparam(pid: usize, param_ptr: usize) -> isize {
         return err(SyscallError::EPERM);
     }
     let prio = param.sched_priority;
-    let policy = process.borrow_mut().scheduling.sched_policy;
+    let policy = task.borrow_mut().scheduling.sched_policy;
     if !check_policy(policy) || !valid_priority_for_policy(policy, prio) {
         return err(SyscallError::EINVAL);
     }
-    process.borrow_mut().scheduling.sched_priority = prio;
-    refresh_process_runqueues(&process);
+    task.borrow_mut().scheduling.sched_priority = prio;
+    refresh_task_runqueue(&task);
+    request_reschedule_for_running_task(&task);
     0
 }
 
@@ -232,7 +255,7 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
     if invalid_pid(pid) {
         return err(SyscallError::EINVAL);
     }
-    let Some(process) = resolve_process(pid) else {
+    let Some((process, task)) = resolve_task(pid) else {
         return err(SyscallError::ESRCH);
     };
     let reset_on_fork = (policy & SCHED_RESET_ON_FORK as usize) != 0;
@@ -258,7 +281,27 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
     if !valid_priority_for_policy(policy, prio) {
         return err(SyscallError::EINVAL);
     }
-    let mut inner = process.borrow_mut();
+    if DEBUG_CYCLICTEST {
+        let caller_tid = current_task()
+            .and_then(|task| task.borrow_mut().res.as_ref().map(|r| r.tid))
+            .unwrap_or(usize::MAX);
+        let target_tid = task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
+        log::warn!(
+            "[sched_setscheduler] pid_arg={} caller_tid={} target_tid={} policy={} prio={}",
+            pid,
+            caller_tid,
+            target_tid,
+            policy,
+            prio
+        );
+        cyclic_diag_note(CyclicDiagEvent::SetScheduler, process.getpid(), target_tid);
+    }
+    let mut inner = task.borrow_mut();
     inner.scheduling.sched_policy = policy;
     inner.scheduling.sched_priority = prio;
     inner.scheduling.reset_on_fork = reset_on_fork;
@@ -268,7 +311,8 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
         inner.scheduling.sched_period = 0;
     }
     drop(inner);
-    refresh_process_runqueues(&process);
+    refresh_task_runqueue(&task);
+    request_reschedule_for_running_task(&task);
     0
 }
 
@@ -282,11 +326,11 @@ pub fn syscall_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     // Avoid large kernel allocations from bogus cpusetsize values.
     const MAX_CPUSET_BYTES: usize = 128;
     let cpusetsize = core::cmp::min(cpusetsize, MAX_CPUSET_BYTES);
-    let Some(process) = resolve_process(pid) else {
+    let Some((_process, task)) = resolve_task(pid) else {
         return err(SyscallError::ESRCH);
     };
     let affinity_mask = {
-        let inner = process.borrow_mut();
+        let inner = task.borrow_mut();
         let mask = inner.scheduling.cpu_affinity_mask;
         if mask == 0 {
             full_affinity_mask()
@@ -325,7 +369,7 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
     // Avoid large allocations from bogus cpusetsize values.
     const MAX_CPUSET_BYTES: usize = 128;
     let cpusetsize = core::cmp::min(cpusetsize, MAX_CPUSET_BYTES);
-    let Some(process) = resolve_process(pid) else {
+    let Some((process, task)) = resolve_task(pid) else {
         if DEBUG_CYCLICTEST {
             log::warn!(
                 "[sched_setaffinity] err(SyscallError::ESRCH) pid={} cpusetsize={} mask_ptr={:#x}",
@@ -366,21 +410,26 @@ pub fn syscall_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize)
         requested_mask.trailing_zeros() as usize
     };
 
-    let tasks = {
-        let mut inner = process.borrow_mut();
+    {
+        let mut inner = task.borrow_mut();
         inner.scheduling.cpu_affinity_mask = requested_mask;
-        inner
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().cloned())
-            .collect::<alloc::vec::Vec<_>>()
-    };
-    for task in tasks {
-        task.set_cpu_id(preferred_cpu);
     }
-    refresh_process_runqueues(&process);
+    task.set_cpu_id(preferred_cpu);
+    refresh_task_runqueue(&task);
+    if DEBUG_CYCLICTEST {
+        let target_tid = task
+            .borrow_mut()
+            .res
+            .as_ref()
+            .map(|r| r.tid)
+            .unwrap_or(usize::MAX);
+        cyclic_diag_note(CyclicDiagEvent::SetAffinity, process.getpid(), target_tid);
+    }
 
-    if Arc::ptr_eq(&current_process(), &process) && (requested_mask & (1usize << current_hart)) == 0
+    if current_task()
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &task))
+        && (requested_mask & (1usize << current_hart)) == 0
     {
         suspend_current_and_run_next();
     }
@@ -402,10 +451,10 @@ pub fn syscall_sched_rr_get_interval(pid: usize, interval_ptr: usize) -> isize {
     if invalid_pid(pid) {
         return err(SyscallError::EINVAL);
     }
-    let Some(process) = resolve_process(pid) else {
+    let Some((_process, task)) = resolve_task(pid) else {
         return err(SyscallError::ESRCH);
     };
-    let policy = process.borrow_mut().scheduling.sched_policy;
+    let policy = task.borrow_mut().scheduling.sched_policy;
     let interval_ms = match sched_class(policy) {
         Some(SchedClass::Rr) => rr_timeslice_ms(),
         _ => 0,
@@ -428,11 +477,11 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
     if invalid_pid(pid) {
         return err(SyscallError::EINVAL);
     }
-    let Some(process) = resolve_process(pid) else {
+    let Some((_process, task)) = resolve_task(pid) else {
         return err(SyscallError::ESRCH);
     };
     let (policy, prio, flags, nice, runtime, deadline, period) = {
-        let inner = process.borrow_mut();
+        let inner = task.borrow_mut();
         (
             inner.scheduling.sched_policy as u32,
             inner.scheduling.sched_priority as u32,
@@ -441,7 +490,7 @@ pub fn syscall_sched_getattr(pid: usize, attr_ptr: usize, size: usize, flags: us
             } else {
                 0
             },
-            inner.scheduling.nice,
+            inner.nice,
             inner.scheduling.sched_runtime,
             inner.scheduling.sched_deadline,
             inner.scheduling.sched_period,
@@ -478,7 +527,7 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
     if flags != 0 {
         return err(SyscallError::EINVAL);
     }
-    let Some(process) = resolve_process(pid) else {
+    let Some((process, task)) = resolve_task(pid) else {
         return err(SyscallError::ESRCH);
     };
     if !can_control_target(&process) {
@@ -529,10 +578,11 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
     {
         return err(SyscallError::EINVAL);
     }
-    let mut inner = process.borrow_mut();
+    let mut inner = task.borrow_mut();
     inner.scheduling.sched_policy = policy;
     inner.scheduling.sched_priority = prio;
     inner.scheduling.nice = nice;
+    inner.nice = nice;
     inner.scheduling.reset_on_fork = (attr.sched_flags & SCHED_FLAG_RESET_ON_FORK) != 0;
     if policy == SCHED_DEADLINE {
         inner.scheduling.sched_runtime = attr.sched_runtime;
@@ -544,6 +594,7 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
         inner.scheduling.sched_period = 0;
     }
     drop(inner);
-    refresh_process_runqueues(&process);
+    refresh_task_runqueue(&task);
+    request_reschedule_for_running_task(&task);
     0
 }

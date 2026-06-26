@@ -19,6 +19,7 @@ use crate::fs::{File, PseudoDir, PseudoDirent};
 use crate::mm::UserBuffer;
 use crate::syscall::misc::{decode_linux_tid_strict, encode_linux_tid};
 use crate::task::{
+    ProcessControlBlock,
     manager::{PID2PCB, pid2process},
     manager::{refresh_process_runqueues, wakeup_task},
     process_visible_in_pid_namespace,
@@ -235,12 +236,28 @@ impl CgroupMountSpec {
 
 /// 在指定挂载目标上挂载 cgroup 层次结构，委托给全局注册表处理
 pub fn cgroup_mount(target: &str, spec: &CgroupMountSpec) -> isize {
-    CGROUP_REGISTRY.lock().mount(target, spec)
+    let rc = CGROUP_REGISTRY.lock().mount(target, spec);
+    if rc == 0 && spec.kind() == CgroupMountKind::LegacyCpu {
+        refresh_all_legacy_cpu_fair_group_caches();
+    }
+    rc
 }
 
 /// 卸载指定挂载目标上的 cgroup 层次结构
 pub fn cgroup_umount(target: &str) -> isize {
-    CGROUP_REGISTRY.lock().umount(target)
+    let was_legacy_cpu = {
+        let registry = CGROUP_REGISTRY.lock();
+        registry
+            .mounts
+            .get(target)
+            .and_then(|key| registry.hierarchies.get(key))
+            .is_some_and(|state| state.kind == CgroupMountKind::LegacyCpu)
+    };
+    let rc = CGROUP_REGISTRY.lock().umount(target);
+    if rc == 0 && was_legacy_cpu {
+        refresh_all_legacy_cpu_fair_group_caches();
+    }
+    rc
 }
 
 /// 判断给定绝对路径是否位于 cgroup 伪文件系统的挂载点下
@@ -623,10 +640,15 @@ pub fn cgroup_fork_precheck(parent_pid: usize) -> Result<(), isize> {
 
 /// 将 fork 产生的子进程关联到父进程所在的所有 cgroup 层次结构中
 pub fn cgroup_attach_fork_child(parent_pid: usize, child_pid: usize) {
-    let mut registry = CGROUP_REGISTRY.lock();
-    for state in registry.hierarchies.values_mut() {
-        let path = state.path_for_pid(parent_pid);
-        state.attach_process(child_pid, &path);
+    {
+        let mut registry = CGROUP_REGISTRY.lock();
+        for state in registry.hierarchies.values_mut() {
+            let path = state.path_for_pid(parent_pid);
+            state.attach_process(child_pid, &path);
+        }
+    }
+    if let Some(process) = pid2process(child_pid) {
+        refresh_process_legacy_cpu_fair_group_cache(&process);
     }
 }
 
@@ -711,12 +733,10 @@ pub fn cgroup_exit_thread(process_pid: usize, tid_index: usize) {
     }
 }
 
-/// 获取 legacy cpu 调度中指定线程的 cgroup inode 和 shares 权重
-///
-/// 用于计算 CFS 的组调度权重，若节点不存在则返回根节点的值或默认值。
-pub fn legacy_cpu_fair_group(tgid: usize, tid_index: usize) -> (u64, u64) {
-    let thread_id = CgroupThreadId::new(tgid, tid_index);
-    let registry = CGROUP_REGISTRY.lock();
+fn legacy_cpu_fair_group_from_registry(
+    registry: &CgroupRegistry,
+    thread_id: CgroupThreadId,
+) -> (u64, u64) {
     for state in registry.hierarchies.values() {
         if state.kind != CgroupMountKind::LegacyCpu {
             continue;
@@ -725,28 +745,103 @@ pub fn legacy_cpu_fair_group(tgid: usize, tid_index: usize) -> (u64, u64) {
         if let Some(node) = state.nodes.get(&path) {
             return (node.ino, node.cpu_shares);
         }
-        // 若线程没有明确的 cgroup 关联，回退到根节点的 shares
         if let Some(root) = state.nodes.get("/") {
             return (root.ino, root.cpu_shares);
         }
     }
-    // 未找到任何 LegacyCpu 层次结构时返回默认值
     (0, LEGACY_CPU_SHARES_DEFAULT)
+}
+
+fn set_task_legacy_cpu_fair_group(
+    task: &Arc<crate::task::task_block::TaskControlBlock>,
+    group_id: u64,
+    shares: u64,
+) {
+    let mut inner = task.borrow_mut();
+    inner.fair_group_id = group_id;
+    inner.fair_group_shares = shares.max(1);
+}
+
+pub fn refresh_thread_legacy_cpu_fair_group_cache(process_pid: usize, tid_index: usize) {
+    let Some(process) = pid2process(process_pid) else {
+        return;
+    };
+    let task = {
+        let inner = process.borrow_mut();
+        inner
+            .tasks
+            .get(tid_index)
+            .and_then(|slot| slot.as_ref().cloned())
+    };
+    let Some(task) = task else {
+        return;
+    };
+    let (group_id, shares) = legacy_cpu_fair_group(process_pid, tid_index);
+    set_task_legacy_cpu_fair_group(&task, group_id, shares);
+}
+
+pub fn refresh_process_legacy_cpu_fair_group_cache(process: &Arc<ProcessControlBlock>) {
+    let pid = process.getpid();
+    let tasks = {
+        let inner = process.borrow_mut();
+        let mut tasks = Vec::new();
+        for slot in inner.tasks.iter() {
+            let Some(task) = slot.as_ref().cloned() else {
+                continue;
+            };
+            let Some(tid) = task.borrow_mut().res.as_ref().map(|res| res.tid) else {
+                continue;
+            };
+            tasks.push((task, tid));
+        }
+        tasks
+    };
+    if tasks.is_empty() {
+        return;
+    }
+    let memberships = {
+        let registry = CGROUP_REGISTRY.lock();
+        tasks
+            .iter()
+            .map(|(_, tid)| {
+                legacy_cpu_fair_group_from_registry(&registry, CgroupThreadId::new(pid, *tid))
+            })
+            .collect::<Vec<_>>()
+    };
+    for ((task, _), (group_id, shares)) in tasks.into_iter().zip(memberships.into_iter()) {
+        set_task_legacy_cpu_fair_group(&task, group_id, shares);
+    }
+}
+
+fn refresh_all_legacy_cpu_fair_group_caches() {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    for process in processes {
+        refresh_process_legacy_cpu_fair_group_cache(&process);
+        refresh_process_runqueues(&process);
+    }
+}
+
+/// 获取 legacy cpu 调度中指定线程的 cgroup inode 和 shares 权重
+///
+/// 用于计算 CFS 的组调度权重，若节点不存在则返回根节点的值或默认值。
+pub fn legacy_cpu_fair_group(tgid: usize, tid_index: usize) -> (u64, u64) {
+    let thread_id = CgroupThreadId::new(tgid, tid_index);
+    let registry = CGROUP_REGISTRY.lock();
+    legacy_cpu_fair_group_from_registry(&registry, thread_id)
 }
 
 /// 进程退出时清理其所有 cgroup 关联、CPU 使用统计和匿名页计费
 pub fn cgroup_exit_process(pid: usize) {
     let mut registry = CGROUP_REGISTRY.lock();
     for state in registry.hierarchies.values_mut() {
-        // 收集该进程的所有线程 ID，避免遍历时修改 map
-        let thread_ids = state
-            .thread_assignments
-            .keys()
-            .copied()
-            .filter(|thread_id| thread_id.tgid == pid)
-            .collect::<Vec<_>>();
-        for thread_id in thread_ids {
-            let path = state.path_for_thread(thread_id);
+        // `thread_assignments` is keyed by (tgid, tid). Use the ordered PID
+        // range instead of scanning every live task on each exit; fork-heavy
+        // workloads such as hackbench otherwise turn cgroup cleanup into O(N^2).
+        let thread_assignments = state.process_thread_assignments(pid);
+        for (thread_id, path) in thread_assignments {
             state.flush_thread_cpu_usage(thread_id, &path);
             state.remove_thread(thread_id);
         }

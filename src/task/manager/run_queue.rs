@@ -285,15 +285,20 @@ impl TaskManager {
         None
     }
 
-    /// 使用紧凑的 EEVDF 可选资格规则，从一个组中挑选公平调度任务。
+    ///使用紧凑的 EEVDF 可选资格规则，从一个组中挑选公平调度任务。
     ///
     /// Linux `pick_eevdf()` 会先查找具备可选资格的实体，然后才回退到当前/最左选择。
     /// 我们的 per-group 队列简单得多，但在 fork-heavy 压力下同样需要这个规则：
     /// `vruntime` 超过组虚拟时间的实体，不应仅因 deadline 排在前面就遮住
     /// 具备可选资格的新可运行工作线程。
+    /// tldr:
+    /// 为hart 选择任务,同时移除所有非法的 group 内任务
     fn prune_fair_group_front(group: &mut FairGroupQueue, hart_id: usize) -> Option<u64> {
+        // 只有不足平均 的 才有资格 加入,
         let eligible_vruntime = group.avg_task_vruntime().unwrap_or(group.min_task_vruntime);
         loop {
+            // task order 按照 deadline ,runtime 顺序排列
+            // deadline 先行
             let Some((deadline, vruntime, task_id)) = group.task_order.iter().next().copied()
             else {
                 return None;
@@ -302,6 +307,7 @@ impl TaskManager {
                 group.task_order.remove(&(deadline, vruntime, task_id));
                 continue;
             };
+            // 可能的防御
             if entity.vruntime != vruntime || entity.deadline != deadline {
                 group.task_order.remove(&(deadline, vruntime, task_id));
                 group
@@ -318,8 +324,10 @@ impl TaskManager {
                 == hart_id;
             if queued_here && status == TaskStatus::Ready {
                 if entity.vruntime <= eligible_vruntime {
+                    //deadline 已经是最小的了，task_order保证
                     return Some(task_id);
                 }
+                // 如果默认最优选择不行，那就逐个遍历
                 let fallback = Some(task_id);
                 for (deadline, vruntime, task_id) in group
                     .task_order
@@ -350,8 +358,11 @@ impl TaskManager {
                 return fallback;
             }
 
+            /// 这个任务不对，既没有准备好，也不在我们的hart上
             let _ = group.unlink_task(task_id);
+            // 清理计数
             dec_ready_fair_count(hart_id);
+            // 如果 没有就绪，释放任务
             if queued_here {
                 let _ = candidate.ready_queue_hart.compare_exchange(
                     hart_id,
@@ -360,6 +371,7 @@ impl TaskManager {
                     core::sync::atomic::Ordering::Acquire,
                 );
             }
+            // 移除任务本身 的 记录
             candidate
                 .in_ready_queue
                 .store(false, core::sync::atomic::Ordering::Release);
@@ -381,11 +393,13 @@ impl TaskManager {
         }
     }
 
+    /// 弹出就绪任务,按照EEVDF
     fn pop_ready_fair_candidate(
         rq: &mut HartRunQueue,
         hart_id: usize,
     ) -> Option<Arc<TaskControlBlock>> {
         loop {
+            // 先弹出对应的组
             let Some((indexed_vruntime, group_id)) = rq.fair_order.iter().next().copied() else {
                 return None;
             };
@@ -403,6 +417,7 @@ impl TaskManager {
                     should_relink_group = !group.is_empty();
                     None
                 } else {
+                    // 弹出组之后，从组中选择任务了
                     match Self::prune_fair_group_front(group, hart_id) {
                         Some(task_id) => {
                             let entity = group.unlink_task(task_id);
@@ -465,6 +480,7 @@ impl TaskManager {
         let t = {
             let mut rq = self.ready_queues[hart_id].lock();
             let mut picked = None;
+            // RT-RUNTIME 还没用完 ，那就直接从rt中拿取
             if !rt_bandwidth_throttled(hart_id) {
                 for (rt_idx, rtq) in rq.rt_queues.iter_mut().enumerate() {
                     if let Some(task) = Self::pop_ready_rt_candidate(rtq, hart_id, rt_idx) {

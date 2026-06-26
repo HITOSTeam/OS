@@ -208,6 +208,7 @@ impl HartRunQueue {
         }
     }
 
+    /// 重排序 group 因为 group 更新了，所以原先order不再 适合
     pub(super) fn relink_fair_group_if_runnable(&mut self, group_id: u64) {
         if let Some(group) = self.fair_groups.get(&group_id) {
             if !group.is_empty() {
@@ -254,6 +255,8 @@ pub(super) fn fair_task_id(task: &Arc<TaskControlBlock>) -> u64 {
     Arc::as_ptr(task) as usize as u64
 }
 
+/// nice weight 转换，越nice 越倾向于给别人，所以运行时的 vruntime要积攒的比较快，对应weight(分母
+/// 就要小)
 pub(super) fn fair_nice_weight(nice: i32) -> u128 {
     // Linux sched_prio_to_weight[-20..19]。
     const NICE_WEIGHTS: [u32; 40] = [
@@ -265,6 +268,7 @@ pub(super) fn fair_nice_weight(nice: i32) -> u128 {
     u128::from(NICE_WEIGHTS[idx])
 }
 
+/// 计算vruntime = 时间 /weight
 fn scale_fair_delta(delta_ns: u64, weight: u128) -> u128 {
     const NICE_0_LOAD: u128 = 1024;
     ((u128::from(delta_ns) * NICE_0_LOAD) / weight.max(1)).max(1)
@@ -307,11 +311,13 @@ pub(super) fn place_fair_task_entity(
         .avg_task_vruntime_with(current_entity)
         .unwrap_or(group.min_task_vruntime);
     let mut inner = task.borrow_mut();
+    // group 限制最低 vruntime,防止 新进入任务亏欠太多
     if inner.fair_vruntime_ns < group.min_task_vruntime {
         inner.fair_vruntime_ns = group.min_task_vruntime;
     }
     let current_ns = inner.cpu_time_ns;
     let delta_ns = current_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
+    // 任务之前被运行过，那么vruntime需要更新，
     if delta_ns > 0 {
         // vruntime += delta_ns * 1024 / shares，即权重越大 vruntime 增长越慢，从而获得更多 CPU
         group.vruntime = group
@@ -321,8 +327,10 @@ pub(super) fn place_fair_task_entity(
             .fair_vruntime_ns
             .saturating_add(scale_fair_delta(delta_ns, fair_nice_weight(inner.nice)));
     }
+    // 新加入任务的基准 这与上面的不是重复 (min_task_vruntime的更新 )
     let placement_vruntime = avg_vruntime.max(group.min_task_vruntime);
     let weight = fair_nice_weight(inner.nice);
+    // 是否是重复进入，如果是重复进入，那么会有lag （之前推出时候保存的）
     let saved_vlag = core::mem::take(&mut inner.fair_vlag_ns).min(fair_lag_limit_ns(inner.nice));
     if kind == EnqueueKind::Initial {
         // Linux 的 fork placement 会让子任务靠近运行队列虚拟时间，并依赖
@@ -331,7 +339,11 @@ pub(super) fn place_fair_task_entity(
         // 负载挡住。
         inner.fair_vruntime_ns = placement_vruntime;
     } else if kind == EnqueueKind::Wakeup {
+        // 对于重新入队的，我们使用
+        // 之前保存的vlag对新进入的vruntime进行修正，亏欠（lag)越多，placement_vruntime被减去的越多，从而
+        // 能够更有机会的被调度到
         let current_weight = current_entity.map(|(_, weight)| weight).unwrap_or(0);
+        // 当前任务的权重，参与新补偿（vruntime-补偿）的计算
         let load = group.weight_sum.saturating_add(current_weight);
         if saved_vlag > 0 && load > 0 {
             // Linux PLACE_LAG 会补偿被唤醒实体对 V 的影响，
@@ -346,18 +358,39 @@ pub(super) fn place_fair_task_entity(
             // Linux EEVDF 会在唤醒时保留有界 lag，而不是让之前睡眠的任务携带
             // 无界旧 vruntime。将其限制到运行队列虚拟时间，可以让短控制任务
             // （例如 cyclictest 后的 shell 清理）在 fork-heavy 公平调度负载下仍保持可选资格。
+            //tldr:防止一个任务长时间死亡
             inner.fair_vruntime_ns = placement_vruntime;
         }
     }
     inner.fair_runtime_checkpoint_ns = current_ns;
     let vruntime = inner.fair_vruntime_ns;
+    /// elgible 之后看的标准
     let deadline = vruntime.saturating_add(fair_entity_vslice_ns(inner.nice, kind));
     inner.fair_deadline_ns = deadline;
     (vruntime, deadline)
 }
 
+/// 实时估算任务在此刻的 (vruntime, deadline)，包含尚未入队记账的运行时间。
+///
+/// vruntime 只在任务入队（`place_fair_task_entity`）时累加，但任务正在运行时
+/// vruntime 已经过时——它跑了一段时间但 `fair_vruntime_ns` 还没更新。这个函数
+/// 用于抢占判定路径（tick / 唤醒），需要知道"此刻的真实 vruntime"才能准确
+/// 比较 deadline。
+///
+/// 计算方式：
+/// - 若任务正在运行（`on_cpu != OFF_CPU`）：`cpu_time_ns + (now_ns - runtime_start_ns)`，
+///   即已记账的 CPU 时间加上从上次 tick 到现在的未记账片段。
+/// - 若任务不在运行：直接用 `cpu_time_ns`。
+///
+/// 然后用与 `place_fair_task_entity` 相同的 `scale_fair_delta` 公式把
+/// `delta = current_runtime - checkpoint` 按权重缩放后累加到 `fair_vruntime_ns` 上，
+/// 得到实时估算值。`fair_deadline_ns` 直接从 TCB 读取（deadline 只在入队时设置）。
+///
+/// 注意：这个函数**不修改** TCB 状态，只做只读估算。真正的 vruntime 累加
+/// 发生在下一次入队时的 `place_fair_task_entity`。
 fn fair_task_vruntime_deadline_at(task: &Arc<TaskControlBlock>, now_ns: u64) -> (u128, u128) {
     let inner = task.borrow_mut();
+    // 若任务正在运行，补上从 runtime_start_ns 到 now 的未记账片段。
     let current_runtime_ns =
         if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
             inner
@@ -366,13 +399,27 @@ fn fair_task_vruntime_deadline_at(task: &Arc<TaskControlBlock>, now_ns: u64) -> 
         } else {
             inner.cpu_time_ns
         };
+    // delta = 本次估算的运行时间 - 上次入队时的快照。
     let delta_ns = current_runtime_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
+    // 按权重缩放后累加，得到实时 vruntime。
     let vruntime = inner
         .fair_vruntime_ns
         .saturating_add(scale_fair_delta(delta_ns, fair_nice_weight(inner.nice)));
     (vruntime, inner.fair_deadline_ns)
 }
 
+/// 获取指定 hart 上当前正在运行的 fair 任务实体信息（vruntime, weight），
+/// 且仅当该任务属于指定的 `group_id` 时返回。
+///
+/// 用于 `place_fair_task_entity` 的 `current_entity` 参数：当新任务入队时，
+/// 需要把"当前正在跑的同组任务"纳入 `avg_task_vruntime` 计算，否则 avg 会偏低
+/// 导致新实体被放置到不合理位置。
+///
+/// 返回 `None` 的情况：
+/// - 该 hart 没有当前任务；
+/// - 当前任务不在运行（`on_cpu == OFF_CPU`）；
+/// - 当前任务不属于 `group_id`（不同 cgroup 的任务不参与彼此的 avg）；
+/// - 当前任务不是 fair 类（RT 任务不参与 fair avg）。
 pub(super) fn current_fair_entity_for_group(
     hart_id: usize,
     group_id: u64,
@@ -384,6 +431,7 @@ pub(super) fn current_fair_entity_for_group(
     }
     let weight = {
         let inner = current.borrow_mut();
+        // 当前任务必须属于同一个 fair group 且是 fair 类，否则不纳入 avg。
         if inner.fair_group_id != group_id
             || !matches!(
                 sched_class(inner.scheduling.sched_policy),
@@ -398,26 +446,54 @@ pub(super) fn current_fair_entity_for_group(
     Some((vruntime, weight))
 }
 
-/// 返回当前公平调度任务是否已经耗尽自己的 EEVDF 请求。
+/// 返回当前 fair 任务是否已耗尽自己的 EEVDF 虚拟请求（tick 抢冒判据）。
 ///
-/// Linux `update_deadline()` 会在 `se->vruntime` 到达 `se->deadline` 时请求重调度。
-/// 我们在调度器 tick 和显式唤醒/抢占路径做同样检查；syscall 返回只消费由此产生的
-/// NEED_RESCHED 位，而不是每次 syscall 都重新计算公平调度 deadline。
+/// 对应 Linux `update_deadline()`：在 `se->vruntime` 到达 `se->deadline` 时
+/// 请求重调度。我们在调度器 tick（`should_preempt_current_on_tick`）和
+/// 显式唤醒/抢占路径做同样检查；syscall 返回只消费由此产生的 `NEED_RESCHED`
+/// 位，而不是每次 syscall 都重新计算 fair deadline。
+///
+/// 判定逻辑：
+/// 1. **先检查有没有 fair 竞争者**（`ready_fair_count`）：如果本 hart 没有
+///    其他就绪的 fair 任务，即使 deadline 到了也不让出——让出了也没人接，
+///    不如继续跑。这是无锁快路径，避免获取调度器锁。
+/// 2. **vruntime >= deadline**：用 `fair_task_vruntime_deadline_at` 实时估算
+///    当前 vruntime，与 `fair_deadline_ns` 比较。`deadline == 0` 是未初始化
+///    的防御性判定，也视为该让出。
 pub fn fair_current_deadline_expired(task: &Arc<TaskControlBlock>, now_ns: u64) -> bool {
     let hart_id = crate::task::processor::hart_id() % MAX_HARTS;
+    // 无 fair 竞争者 → 不让出（没有其他人可换）。
     if ready_fair_count(hart_id) == 0 {
         return false;
     }
     let (vruntime, deadline) = fair_task_vruntime_deadline_at(task, now_ns);
+    // deadline 未初始化或 vruntime 已追上 deadline → 本轮请求耗尽。
     deadline == 0 || vruntime >= deadline
 }
 
-/// 两个公平调度任务之间的 Linux EEVDF 唤醒抢占近似。
+/// 两个 fair 任务之间的 EEVDF 唤醒抢占近似判定。
 ///
-/// 公平调度类不会仅仅因为被唤醒者有更早的虚拟 deadline 就抢占。
-/// `wakeup_preempt_fair()` 会在启用保护的情况下调用 `pick_next_entity()`，
-/// 而 `pick_eevdf()` 会在当前实体仍处于受保护请求内时保留它。只有真正更短的
-/// 被唤醒者时间片才可以提前取消该保护。
+/// 当一个 fair 任务被唤醒时，判断它是否应该抢占当前正在运行的 fair 任务。
+/// 对应 Linux `wakeup_preempt_fair()` + `pick_eevdf()` 的保护逻辑：fair 类
+/// 不会仅仅因为被唤醒者有更早的虚拟 deadline 就抢占——当前实体仍处于
+/// 受保护请求内时会保留它，只有真正更短的被唤醒者切片才可以取消保护。
+///
+/// 判定分三步：
+///
+/// 1. **当前任务 deadline 已到** → 直接抢（当前任务自己的请求耗尽，换谁都行）。
+///
+/// 2. **被唤醒者是否 eligible**：查被唤醒者所在组的 `avg_vruntime`，
+///    `woken_vruntime <= avg` 则 eligible。若当前任务与被唤醒者同组，则把
+///    当前任务也纳入 avg 计算（因为它还没出队）；不同组则只用被唤醒者
+///    自己组的 avg。若被唤醒者的组不存在（刚创建等），退化为与当前
+///    vruntime 直接比较。
+///
+/// 3. **两个抢占条件**（均要求 eligible）：
+///    - **deadline 更早**：`woken_deadline < current_deadline`——标准 EEVDF
+///      "该被唤醒者先跑"。
+///    - **剩余切片更短**：`woken_deadline - woken_vruntime < current_full_slice`——
+///      即使 deadline 没更早，但被唤醒者需求量更小，让它先跑完再回来更高效。
+///      这对应 Linux 的"只有更短切片才能打破当前任务的保护"。
 pub fn fair_wakeup_preempts_current_on_hart(
     current: &Arc<TaskControlBlock>,
     woken: &Arc<TaskControlBlock>,
@@ -425,6 +501,7 @@ pub fn fair_wakeup_preempts_current_on_hart(
     now_ns: u64,
 ) -> bool {
     let (current_vruntime, current_deadline) = fair_task_vruntime_deadline_at(current, now_ns);
+    // 步骤 1：当前任务自己的 deadline 已到 → 直接抢。
     if current_deadline == 0 || current_vruntime >= current_deadline {
         return true;
     }
@@ -438,9 +515,11 @@ pub fn fair_wakeup_preempts_current_on_hart(
         )
     };
     let woken_group_id = woken.borrow_mut().fair_group_id;
+    // 步骤 2：判定被唤醒者是否 eligible。
     let woken_eligible = {
         let rq = TASK_MANAGER.ready_queues[hart_id % MAX_HARTS].lock();
         if let Some(group) = rq.fair_groups.get(&woken_group_id) {
+            // 同组时把当前任务纳入 avg（它还没出队）；不同组则不算。
             let current_for_group = if current_group_id == woken_group_id {
                 Some((current_vruntime, current_weight))
             } else {
@@ -451,13 +530,17 @@ pub fn fair_wakeup_preempts_current_on_hart(
                 .unwrap_or(group.min_task_vruntime);
             woken_vruntime <= avg_vruntime
         } else {
+            // 被唤醒者的组不存在（刚创建等），退化为与当前 vruntime 比较。
             woken_vruntime <= current_vruntime
         }
     };
 
+    // 步骤 3：两个抢占条件（均要求 eligible）。
+    // 条件 A：eligible 且 deadline 更早 → 标准 EEVDF 抢占。
     if woken_eligible && woken_deadline < current_deadline {
         return true;
     }
+    // 条件 B：eligible 且被唤醒者剩余切片 < 当前完整切片 → 更短需求可打破保护。
     let woken_slice = woken_deadline.saturating_sub(woken_vruntime);
     if woken_eligible && woken_slice < current_full_slice {
         return true;
@@ -465,25 +548,36 @@ pub fn fair_wakeup_preempts_current_on_hart(
     false
 }
 
-/// 在公平调度任务阻塞前捕获有界的正 EEVDF lag。
+/// 在 fair 任务阻塞前捕获有界的正 EEVDF lag，供唤醒时补偿使用。
 ///
-/// Linux 会在出队时保存 `se->vlag`，并在唤醒时的 `place_entity()` 中使用它。
-/// 没有这个机制时，反复阻塞在大量可运行工作线程后面的短生命周期控制线程会丢失
-/// 睡眠者信用，恢复运行可能需要数百毫秒。
+/// 对应 Linux 在出队时保存 `se->vlag`、在唤醒时的 `place_entity()` 中使用它
+///（`PLACE_LAG` 机制）。没有这个机制时，反复阻塞在大量可运行工作线程后面的
+/// 短生命周期控制线程会丢失睡眠者信用，恢复运行可能需要数百毫秒。
+///
+/// 流程：
+/// 1. 只对 fair 类任务做（RT 类不参与）。
+/// 2. 用 `fair_task_vruntime_deadline_at` 估算任务当前真实 vruntime。
+/// 3. 取任务所在组的 `avg_vruntime`（把任务自己也算进去，因为它还没出队）。
+/// 4. `vlag = avg - task_vruntime`，取正值（被欠才存），封顶到 `fair_lag_limit_ns`
+///    （约一个切片 + 一个 tick），防止睡很久的任务带巨额 lag 回来。
+/// 5. 存入 `fair_vlag_ns`，唤醒时由 `place_fair_task_entity` 的 Wakeup 分支消费。
 pub fn record_fair_sleep_lag(task: &Arc<TaskControlBlock>) {
     let policy = task.borrow_mut().scheduling.sched_policy;
+    // 只对 fair 类任务保存 lag；RT 类不参与 EEVDF。
     if !matches!(sched_class(policy), Some(SchedClass::Fair)) {
         return;
     }
 
     let hart_id = crate::task::processor::hart_id() % MAX_HARTS;
     let now_ns = current_time_ns_usize() as u64;
+    // 估算任务此刻的真实 vruntime（含未记账的运行片段）。
     let (task_vruntime, _) = fair_task_vruntime_deadline_at(task, now_ns);
     let (group_id, _) = fair_group_id_and_shares(task);
     let task_weight = {
         let inner = task.borrow_mut();
         fair_nice_weight(inner.nice)
     };
+    // 取组 avg（含本任务），因为任务此刻还在队列里，即将被移出。
     let avg_vruntime = {
         let rq = TASK_MANAGER.ready_queues[hart_id].lock();
         rq.fair_groups
@@ -494,5 +588,7 @@ pub fn record_fair_sleep_lag(task: &Arc<TaskControlBlock>) {
 
     let mut inner = task.borrow_mut();
     let limit = fair_lag_limit_ns(inner.nice);
+    // lag = avg - vruntime，取正值（saturating_sub 在 avg < vruntime 时得 0），
+    // 封顶到 limit，存入 fair_vlag_ns 供唤醒时 PLACE_LAG 补偿使用。
     inner.fair_vlag_ns = avg_vruntime.saturating_sub(task_vruntime).min(limit);
 }
