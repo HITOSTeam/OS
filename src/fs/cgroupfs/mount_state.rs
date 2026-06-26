@@ -166,6 +166,15 @@ impl CgroupMountState {
             .unwrap_or_else(|| self.path_for_pid(thread_id.tgid))
     }
 
+    pub(crate) fn process_thread_assignments(&self, pid: usize) -> Vec<(CgroupThreadId, String)> {
+        let first = CgroupThreadId::new(pid, 0);
+        let last = CgroupThreadId::new(pid, usize::MAX);
+        self.thread_assignments
+            .range(first..=last)
+            .map(|(thread_id, path)| (*thread_id, path.clone()))
+            .collect()
+    }
+
     fn adjust_subtree_thread_count(&mut self, path: &str, add: bool) {
         for ancestor in Self::ancestor_paths(path) {
             let Some(node) = self.nodes.get_mut(&ancestor) else {

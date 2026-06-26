@@ -9,7 +9,7 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, PageTable, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
-use crate::task::block_sleep::check_timer;
+use crate::task::block_sleep::{check_timer, timer_work_pending_for_user_return};
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
@@ -55,6 +55,7 @@ static TRAP_HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 type KernelTrap = Trap<usize, usize>;
 
+/// 内核态中断启用
 pub fn init_trap() {
     set_kernel_trap_entry();
 }
@@ -123,7 +124,7 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
                 log::debug!("[trap_from_kernel] hart={} timer interrupt", hart);
             }
             set_next_trigger();
-            check_timer();
+            crate::task::block_sleep::note_kernel_timer_tick();
         }
         //
         Trap::Interrupt(_) => {
@@ -311,7 +312,7 @@ pub fn trap_handler() {
             // Without this, CPU-bound tasks that never enter syscalls would never observe
             // signals like SIGINT/SIGKILL and could run forever.
             if let Some((errno, msg)) = check_if_current_signals_error() {
-                println!("[kernel] {}", msg);
+                crate::task::signal::log_signal_exit(msg);
                 exit_group_and_run_next(errno);
             }
             crate::fs::cgroup_maybe_block_current();
@@ -333,13 +334,15 @@ pub fn trap_handler() {
     }
 
     if let Some((errno, msg)) = check_if_current_signals_error() {
-        println!("[kernel] {}", msg);
+        crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
     // Progress timers even if S-mode timer interrupts are disabled during syscalls.
     // This avoids long-running syscall-heavy workloads (e.g., hackbench fork storms)
     // from starving `sleep()/nanosleep()` wakeups.
-    check_timer();
+    if timer_work_pending_for_user_return() {
+        check_timer();
+    }
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
     if syscall_return && crate::task::processor::should_preempt_current_on_syscall_return() {

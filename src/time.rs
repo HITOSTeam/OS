@@ -8,6 +8,7 @@ use crate::{
 ///默认一秒钟执行100个时钟中断
 const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
+const NSEC_PER_SEC: u128 = 1_000_000_000;
 
 #[cfg(target_arch = "loongarch64")]
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -82,6 +83,54 @@ pub fn set_next_trigger() {
             get_time()
         );
         set_timer(next);
+    }
+}
+
+fn periodic_tick_delta() -> usize {
+    (clock_freq() / TICKS_PER_SEC).max(1)
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn ns_delta_to_ticks_ceil(delta_ns: u64) -> usize {
+    let ticks = (delta_ns as u128)
+        .saturating_mul(clock_freq() as u128)
+        .saturating_add(NSEC_PER_SEC - 1)
+        / NSEC_PER_SEC;
+    ticks.clamp(1, usize::MAX as u128) as usize
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn deadline_ns_to_ticks_ceil(deadline_ns: u64) -> usize {
+    let ticks = (deadline_ns as u128)
+        .saturating_mul(clock_freq() as u128)
+        .saturating_add(NSEC_PER_SEC - 1)
+        / NSEC_PER_SEC;
+    ticks.min(usize::MAX as u128) as usize
+}
+
+/// Program the timer for a sub-tick sleep deadline when it is earlier than the
+/// normal scheduler tick. This is a small hrtimer-style fast path used by
+/// nanosleep/clock_nanosleep while preserving the periodic tick fallback.
+pub fn arm_timer_for_deadline_ns(deadline_ns: u64) {
+    let periodic_delta = periodic_tick_delta();
+
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let now_ns = get_time_ns();
+        let desired_delta = if deadline_ns <= now_ns {
+            1
+        } else {
+            ns_delta_to_ticks_ceil(deadline_ns - now_ns)
+        };
+        set_timer(desired_delta.min(periodic_delta).max(1));
+    }
+
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        let now_ticks = get_time();
+        let desired = deadline_ns_to_ticks_ceil(deadline_ns).max(now_ticks.saturating_add(1));
+        let periodic = now_ticks.saturating_add(periodic_delta);
+        set_timer(desired.min(periodic));
     }
 }
 

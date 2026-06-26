@@ -7,7 +7,7 @@ use crate::{
     mm::PhysPageNum,
     task::{
         id::{KernelStack, TaskUserRes, kstack_alloc},
-        process_block::ProcessControlBlock,
+        process_block::{ProcessControlBlock, ProcessScheduling},
         signal::RT_SIG_MAX,
         task_context::TaskContext,
     },
@@ -15,24 +15,25 @@ use crate::{
 };
 
 pub struct TaskControlBlock {
-    // immutable
+    // 不可变字段
     // 对于所有的线程,共享一个父进程
     pub process: Weak<ProcessControlBlock>,
-    // Keep kernel-stack ownership separate so exited tasks can release stack
-    // pages even if some metadata Arc references linger for a while.
+    // 将内核栈所有权单独保存，这样即使部分元数据 Arc 引用暂时残留，
+    // 已退出任务也能释放内核栈页。
     pub kstack: Mutex<Option<KernelStack>>,
-    /// Preferred CPU (hart) to run this task on.
+    /// 当前任务偏好的运行 CPU（hart）。
     ///
-    /// This is used by the scheduler to decide which per-hart run queue the task should be
-    /// enqueued into when it becomes runnable.
+    /// 调度器在任务变为可运行时，用它决定应放入哪个每 hart 运行队列。
     pub cpu_id: AtomicUsize,
-    /// The hart id currently running this task, or OFF_CPU if none.
+    /// 当前正在运行该任务的 hart id；如果没有运行在任何 hart 上，则为 OFF_CPU。
     pub on_cpu: AtomicUsize,
-    /// Set by a waker if it tried to wake while the task was still on_cpu.
+    /// 当唤醒方尝试唤醒仍处于 `on_cpu` 状态的任务时置位。
     pub wakeup_pending: AtomicBool,
-    /// Whether this task is currently enqueued in the global ready queue.
+    /// 当前任务是否已经进入某个每 hart 就绪队列。
     pub in_ready_queue: AtomicBool,
-    // mutable
+    /// 当前持有该任务的 hart 运行队列；未入队时为 `OFF_CPU`。
+    pub ready_queue_hart: AtomicUsize,
+    // 可变字段
     inner: Mutex<TaskControlBlockInner>,
 }
 
@@ -71,7 +72,7 @@ impl TaskControlBlock {
     pub fn mark_on_cpu(&self, hart_id: usize) {
         self.cpu_id.store(hart_id, Ordering::Release);
         self.on_cpu.store(hart_id, Ordering::Release);
-        // Once running, no wakeup should be pending.
+        // 一旦已经运行，就不应再保留待处理唤醒。
         self.wakeup_pending.store(false, Ordering::Release);
     }
 
@@ -105,9 +106,9 @@ impl TaskControlBlock {
         inner.memory_set.token()
     }
 
-    /// Reset the saved user floating-point state to the Linux exec/thread
-    /// initial state: all FP registers and control bits are zero.
-    /// 初始化fp 相关 寄存器
+    /// 将保存的用户态浮点状态重置为 Linux exec/线程初始状态：
+    /// 所有 FP 寄存器和控制位均为 0。
+    /// 初始化 fp 相关寄存器。
     pub fn reset_fp_state(&self) {
         let mut inner = self.borrow_mut();
         inner.fp_regs = [0; 32];
@@ -116,10 +117,10 @@ impl TaskControlBlock {
         inner.fp_valid = true;
     }
 
-    /// Copy the parent's saved user floating-point state into a freshly
-    /// forked/cloned child. The caller must first save the current hardware FPU
-    /// state into `parent`, matching Linux arch_dup_task_struct()/copy_thread().
-    /// 继承 父亲的 寄存器
+    /// 将父任务保存的用户态浮点状态复制到刚 fork/clone 出来的子任务。
+    /// 调用方必须先把当前硬件 FPU 状态保存到 `parent` 中，这与 Linux 的
+    /// arch_dup_task_struct()/copy_thread() 语义一致。
+    /// 继承父任务的寄存器。
     pub fn inherit_fp_state_from(&self, parent: &TaskControlBlock) {
         let (fp_regs, fp_fcsr, fp_fcc, fp_valid) = {
             let parent_inner = parent.borrow_mut();
@@ -136,6 +137,31 @@ impl TaskControlBlock {
         inner.fp_fcc = fp_fcc;
         inner.fp_valid = fp_valid;
     }
+
+    pub fn scheduling_snapshot(&self) -> ProcessScheduling {
+        self.borrow_mut().scheduling.clone()
+    }
+
+    pub fn set_scheduling_snapshot(&self, scheduling: ProcessScheduling) {
+        let mut inner = self.borrow_mut();
+        inner.nice = scheduling.nice;
+        inner.scheduling = scheduling;
+    }
+
+    pub fn next_sleep_timer_seq(&self) -> u64 {
+        let mut inner = self.borrow_mut();
+        inner.sleep_timer_seq = inner.sleep_timer_seq.wrapping_add(1);
+        inner.sleep_timer_seq
+    }
+
+    pub fn sleep_timer_seq(&self) -> u64 {
+        self.borrow_mut().sleep_timer_seq
+    }
+
+    pub fn cancel_sleep_timers(&self) {
+        let mut inner = self.borrow_mut();
+        inner.sleep_timer_seq = inner.sleep_timer_seq.wrapping_add(1);
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -146,67 +172,92 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     pub exit_code: Option<i32>,
     pub join_waiters: VecDeque<Arc<TaskControlBlock>>,
-    /// Linux `CLONE_CHILD_CLEARTID`/`set_tid_address` target address (user VA).
+    /// Linux `CLONE_CHILD_CLEARTID`/`set_tid_address` 的目标地址（用户虚拟地址）。
     pub clear_child_tid: Option<usize>,
-    /// Linux robust futex list head (user VA) and length.
+    /// Linux robust futex 链表头（用户虚拟地址）及长度。
     pub robust_list_head: usize,
     pub robust_list_len: usize,
-    /// Pending POSIX signals for this thread (bitmask).
+    /// 当前线程的待处理 POSIX 信号（位图）。
     pub pending_signals: u64,
-    /// Best-effort sender metadata for pending signals (indexed by signum).
+    /// 待处理信号的发送方元数据（按信号编号索引，尽力保存）。
     pub pending_signal_pid: [i32; RT_SIG_MAX + 1],
     pub pending_signal_uid: [u32; RT_SIG_MAX + 1],
     pub pending_signal_code: [i32; RT_SIG_MAX + 1],
     pub pending_signal_value: [usize; RT_SIG_MAX + 1],
-    /// Signal mask for this thread (bitmask of blocked signals).
+    /// 当前线程的信号屏蔽字（被阻塞信号的位图）。
     pub signal_mask: u64,
-    /// Active `sigwaitinfo()/sigtimedwait()/sigwait()` interest set.
-    /// While present, normal signal delivery defers matching and interrupting
-    /// signals back to the waiting syscall so it can return Linux-like
-    /// results instead of consuming them via handlers first.
+    /// 当前活跃的 `sigwaitinfo()/sigtimedwait()/sigwait()` 关注信号集合。
+    /// 存在该集合时，普通信号投递会把匹配且可中断的信号交还给正在等待的系统调用，
+    /// 让它返回 Linux 风格结果，而不是先被信号处理函数消费。
     pub sigwait_mask: Option<u64>,
-    /// Saved mask to restore after a `sigsuspend`-delivered signal.
+    /// `sigsuspend` 投递信号后需要恢复的旧信号屏蔽字。
     pub sigsuspend_old_mask: Option<u64>,
-    /// Saved user contexts when running nested signal handlers (stack).
+    /// 运行嵌套信号处理函数时保存的用户上下文栈。
     pub sig_saved_ctx: alloc::vec::Vec<SigSavedContext>,
-    /// Alternate signal stack state (`sigaltstack`).
+    /// 备用信号栈状态（`sigaltstack`）。
     pub sigaltstack_sp: usize,
     pub sigaltstack_size: usize,
     pub sigaltstack_enabled: bool,
     pub on_sigaltstack: bool,
-    /// Last syscall info for restartable syscalls (SA_RESTART).
+    /// 可重启系统调用（SA_RESTART）使用的最近一次 syscall 信息。
     pub last_syscall_id: usize,
     pub last_syscall_args: [usize; 6],
     pub last_syscall_valid: bool,
-    /// Task was blocked due to a job-control stop signal.
+    /// 任务因作业控制停止信号而阻塞。
     pub stopped_by_signal: bool,
-    /// Task is logically frozen by the cgroup freezer.
+    /// 任务在逻辑上被 cgroup freezer 冻结。
     pub cgroup_frozen: bool,
-    /// Task was runnable but parked by the cgroup freezer.
+    /// 任务原本可运行，但被 cgroup freezer 暂停放置。
     pub parked_by_cgroup: bool,
-    /// A wakeup event happened while the task was cgroup-frozen.
+    /// 任务处于 cgroup 冻结状态期间发生过唤醒事件。
     pub wake_on_cgroup_thaw: bool,
-    /// Number of timer ticks consumed in current SCHED_RR round.
+    /// 当前 SCHED_RR 轮次中已经消耗的 timer tick 数。
     pub rr_ticks: usize,
-    /// Best-effort per-thread CPU runtime used for *_CPUTIME clocks.
-    /// 每次时钟中断时候更新,
+    /// `*_CPUTIME` 时钟使用的线程级 CPU 运行时间（尽力统计）。
+    /// 每次时钟中断时更新。
     pub cpu_time_ns: u64,
-    /// Monotonic timestamp captured when the task most recently started running.
+    /// 任务最近一次开始运行时记录的单调时间戳。
     pub runtime_start_ns: u64,
-    /// CPU runtime snapshot used to charge fair-group virtual runtime when the
-    /// task returns to a runqueue.
+    /// 任务返回运行队列时，用于向公平组虚拟运行时间记账的 CPU 运行时间快照。
     pub fair_runtime_checkpoint_ns: u64,
-    /// Per-thread nice value (Linux/NPTL semantics).
+    /// 当前任务的 EEVDF 调度实体虚拟运行时间。
+    ///
+    /// Linux 将 vruntime 保存在 `task_struct::se` 中；这里按任务保存，
+    /// 避免把公平组中的所有任务当作 FIFO 队列项处理。
+    pub fair_vruntime_ns: u128,
+    /// 当前公平调度请求的 EEVDF 虚拟截止时间。
+    ///
+    /// Linux 将它保存在 `task_struct::se.deadline` 中；时钟 tick 和 syscall 返回路径
+    /// 会用当前 vruntime 与它比较，而不是等待粗粒度的整 tick 轮转时间片。
+    pub fair_deadline_ns: u128,
+    /// 公平调度任务阻塞时捕获的正 EEVDF 滞后值。
+    ///
+    /// Linux 会在 sleep/wakeup 之间保留有界的 `se->vlag`（`PLACE_LAG`），
+    /// 使短控制线程在 fork-heavy 负载下不会丢失全部公平调度信用。
+    pub fair_vlag_ns: u128,
+    /// 公平调度使用的 legacy CPU cgroup 身份缓存。
+    ///
+    /// Linux 会让 cgroup/task-group 调度状态可从任务的调度实体访问；
+    /// 入队路径不应再查询 cgroup 文件系统注册表。
+    pub fair_group_id: u64,
+    pub fair_group_shares: u64,
+    /// 通用睡眠定时器的代数。递增它即可取消旧定时器堆项，
+    /// 无需扫描堆，对应 Linux hrtimer_cancel() 的形态。
+    pub sleep_timer_seq: u64,
+    /// 线程级 nice 值（Linux/NPTL 语义）。
     pub nice: i32,
-    /// Hint that libc just queried self priority and may issue `nice()`.
+    /// libc 刚查询过自身优先级、可能接着调用 `nice()` 的提示位。
     pub nice_query_hint: bool,
-    /// Saved user floating-point registers (`f0..f31`) for context switches.
+    /// 任务级调度属性。Linux 将调度策略、RT 优先级和 CPU 亲和性保存在
+    /// `task_struct` 中；PCB 中的字段只作为创建新任务时使用的默认值。
+    pub scheduling: ProcessScheduling,
+    /// 上下文切换时保存的用户态浮点寄存器（`f0..f31`）。
     pub fp_regs: [u64; 32],
-    /// Saved floating-point control/status register.
+    /// 保存的浮点控制/状态寄存器。
     pub fp_fcsr: u32,
-    /// Saved floating-point condition code registers (LoongArch FCC0-FCC7).
+    /// 保存的浮点条件码寄存器（LoongArch FCC0-FCC7）。
     pub fp_fcc: u8,
-    /// Whether `fp_regs/fp_fcsr` contain a valid snapshot.
+    /// `fp_regs/fp_fcsr` 是否包含有效快照。
     pub fp_valid: bool,
 }
 
@@ -231,12 +282,12 @@ impl TaskControlBlockInner {
     }
 }
 
-/// Reason why `TaskControlBlock` allocation failed.
+/// `TaskControlBlock` 分配失败的原因。
 #[derive(Debug, Clone, Copy)]
 pub enum TaskAllocError {
-    /// Mapping the per-thread trap-context (or user-stack) page failed (OOM).
+    /// 映射线程级 trap-context（或用户栈）页面失败（OOM）。
     TrapCxAllocFailed,
-    /// Kernel-stack frame allocation failed (OOM).
+    /// 内核栈帧分配失败（OOM）。
     KernelStackOom,
 }
 
@@ -251,9 +302,9 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
-        let process_nice = {
+        let process_scheduling = {
             let inner = process.borrow_mut();
-            inner.scheduling.nice
+            inner.scheduling.clone()
         };
         let tcb = Self {
             process: Arc::downgrade(&process),
@@ -262,10 +313,11 @@ impl TaskControlBlock {
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             wakeup_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
+            ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
-                //创建应用的时候把他设置为trap_return,这样第一次switch的时候就会从trap_return进入
+                //创建应用的时候把它设置为 trap_return，这样第一次切换时会从 trap_return 进入
                 task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
                 task_status: TaskStatus::Ready,
                 exit_code: None,
@@ -297,8 +349,15 @@ impl TaskControlBlock {
                 cpu_time_ns: 0,
                 runtime_start_ns: 0,
                 fair_runtime_checkpoint_ns: 0,
-                nice: process_nice,
+                fair_vruntime_ns: 0,
+                fair_deadline_ns: 0,
+                fair_vlag_ns: 0,
+                fair_group_id: 0,
+                fair_group_shares: 1024,
+                sleep_timer_seq: 0,
+                nice: process_scheduling.nice,
                 nice_query_hint: false,
+                scheduling: process_scheduling,
                 fp_regs: [0; 32],
                 fp_fcsr: 0,
                 fp_fcc: 0,
@@ -324,7 +383,7 @@ impl TaskControlBlock {
     /// - 不再为线程分配独立的用户栈：父子共享地址空间，用户栈由调用方
     ///   （glibc/musl 的 pthread_create）从堆里自行划分并通过 clone 的 stack 参数传入。
     /// - 仍然需要独占的 trap_cx 帧和内核栈：每个线程在内核态都要有自己的现场。
-    /// - 不参与 user resource 的 ustack/entry 分配流程，因此用 `try_new_trap_cx_only`。
+    /// - 不参与用户资源中的 ustack/entry 分配流程，因此用 `try_new_trap_cx_only`。
     ///
     /// 失败原因：trap_cx 物理页分配失败、内核栈 OOM 等，全部以 `TaskAllocError` 透出。
     pub fn try_new_linux_thread(process: Arc<ProcessControlBlock>) -> Result<Self, TaskAllocError> {
@@ -337,9 +396,9 @@ impl TaskControlBlock {
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
         // 继承进程当前的 nice 值，避免新线程上调度器后 nice 不一致
-        let process_nice = {
+        let process_scheduling = {
             let inner = process.borrow_mut();
-            inner.scheduling.nice
+            inner.scheduling.clone()
         };
         let tcb = Self {
             // 用 Weak 反指回所属进程，避免线程 TCB 与进程 PCB 之间形成 Arc 循环引用
@@ -353,6 +412,7 @@ impl TaskControlBlock {
             // 唤醒标记/就绪队列标记的初值均为 false：刚创建还未排队
             wakeup_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
+            ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -396,9 +456,16 @@ impl TaskControlBlock {
                 cpu_time_ns: 0,
                 runtime_start_ns: 0,
                 fair_runtime_checkpoint_ns: 0,
+                fair_vruntime_ns: 0,
+                fair_deadline_ns: 0,
+                fair_vlag_ns: 0,
+                fair_group_id: 0,
+                fair_group_shares: 1024,
+                sleep_timer_seq: 0,
                 // 继承父进程的 nice，新线程从同一起跑线开始竞争 CPU
-                nice: process_nice,
+                nice: process_scheduling.nice,
                 nice_query_hint: false,
+                scheduling: process_scheduling,
                 // 浮点寄存器初值是有效的全零快照，避免首次调度继承 hart 残留状态
                 fp_regs: [0; 32],
                 fp_fcsr: 0,
@@ -426,8 +493,8 @@ impl Drop for TaskControlBlock {
 }
 
 impl TaskControlBlock {
-    /// Account runtime consumed since the last charge point while the task is running.
-    ///  退出 时 调用。 任务的运行时间
+    /// 统计任务运行期间自上一次记账点以来消耗的运行时间。
+    /// 退出时调用，用于记录任务的运行时间。
     pub(crate) fn account_runtime_until(&self, now_ns: u64) -> u64 {
         let mut inner = self.borrow_mut();
         let delta_ns = now_ns.saturating_sub(inner.runtime_start_ns);
@@ -438,17 +505,17 @@ impl TaskControlBlock {
         delta_ns
     }
 
-    /// Mark the task as newly running from `now_ns`.
-    /// 开始时 调用 更新任务开始时间。
+    /// 标记任务从 `now_ns` 开始新一段运行。
+    /// 开始运行时调用，用于更新任务开始时间。
     pub(crate) fn begin_runtime_slice(&self, now_ns: u64) {
         self.borrow_mut().runtime_start_ns = now_ns;
     }
 
-    /// Return total charged CPU time, including the currently running slice.
+    /// 返回已记账的 CPU 总时间，包括当前正在运行的时间片。
     pub(crate) fn cpu_time_total_ns(&self, now_ns: u64) -> u64 {
         let inner = self.borrow_mut();
-        // 当前CPU 仍在调度
-        // 当前 时间 + 累计时间
+        // 当前 CPU 仍在调度。
+        // 当前时间 + 累计时间。
         if self.on_cpu.load(Ordering::Acquire) != Self::OFF_CPU {
             inner
                 .cpu_time_ns

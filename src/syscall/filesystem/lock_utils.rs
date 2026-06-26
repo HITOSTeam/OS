@@ -1,7 +1,7 @@
 use super::{
     Arc, BTreeMap, BTreeSet, File, Mutex, OSInode, PID2PCB, ProcessControlBlock, SIGIO_NUM,
     SyscallError, TaskControlBlock, Vec, VecDeque, current_task, err,
-    has_wait_interrupting_pending, inode_visible_size, queue_process_signal, wakeup_task,
+    has_wait_interrupting_pending, inode_visible_size, queue_process_signal, wakeup_tasks,
 };
 use lazy_static::lazy_static;
 
@@ -421,9 +421,7 @@ pub(crate) fn take_record_lock_waiters(key: FileLockKey) -> Vec<Arc<TaskControlB
 
 /// Wakes every task currently blocked on a record-lock key.
 pub(crate) fn wake_record_lock_waiters(key: FileLockKey) {
-    for waiter in take_record_lock_waiters(key) {
-        wakeup_task(waiter);
-    }
+    wakeup_tasks(take_record_lock_waiters(key));
 }
 
 /// Removes all process-owned locks for `key` and wakes waiters if anything changed.

@@ -197,10 +197,11 @@ pub fn syscall_setpriority(which: isize, who: isize, prio: isize) -> isize {
         {
             let mut inner = task.borrow_mut();
             inner.nice = new_nice;
+            inner.scheduling.nice = new_nice;
         }
         // Keep process-level default nice in sync for newly created threads.
         caller.borrow_mut().scheduling.nice = new_nice;
-        crate::task::manager::refresh_process_runqueues(&caller);
+        crate::task::manager::refresh_task_runqueue(&task);
         return 0;
     }
 

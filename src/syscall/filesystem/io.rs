@@ -1,26 +1,30 @@
 use super::{
-    CgroupFile, EventFdFile, FifoDuplexFile, IOV_MAX, MapPermission, OSInode, PIPE_BUF, Pipe,
-    ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, SIGXFSZ_NUM, SPLICE_F_GIFT,
-    SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK, SocketPairEnd, SyscallError, TimerFdFile,
-    UserBuffer, Vec, cgroup_charge_file_write, current_process, err, ext4_err_to_errno, ext4_lock,
-    fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe,
-    file_is_seekable_for_preadwrite, get_current_token, maybe_update_inode_atime,
-    mirror_inode_kernel_write_to_shared_mmaps, mirror_inode_write_to_current_mmaps,
-    pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal, read_optional_offset,
-    read_vm_iovec, require_fd_file, socketpair_write_from_kernel, touch_inode_mtime_ctime_now,
-    try_copy_from_user, try_copy_to_user, try_read_user_value, try_translated_byte_buffer,
-    try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
-    write_optional_offset,
+    CgroupFile, EventFdFile, FifoDuplexFile, IOV_MAX, MapPermission, O_NOATIME, O_NONBLOCK, O_PATH,
+    OSInode, PIPE_BUF, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
+    SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK, SocketPairEnd,
+    SyscallError, TimerFdFile, UserBuffer, Vec, cgroup_charge_file_write, current_process, err,
+    ext4_err_to_errno, ext4_lock, fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path,
+    file_is_pipe, file_is_seekable_for_preadwrite, get_current_token, get_fd_file_and_flags,
+    maybe_update_inode_atime, mirror_inode_kernel_write_to_shared_mmaps,
+    mirror_inode_write_to_current_mmaps, pipe_read_to_kernel, pipe_write_from_kernel,
+    queue_process_signal, read_optional_offset, read_vm_iovec, require_fd_file,
+    socketpair_write_from_kernel, touch_inode_mtime_ctime_now, try_copy_from_user,
+    try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_proc_pseudo_file,
+    try_write_user_value, validate_direct_io_request, write_optional_offset,
 };
-use crate::fs::{PtyMasterFile, PtySlaveFile, TunTapFile};
+use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, TunTapFile};
 use alloc::vec;
 
 /// Reads from regular files and special waitable descriptors into a user buffer.
 pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
-    if fd_has_o_path(fd) {
+    let Some((file, descriptor_flags)) = get_fd_file_and_flags(fd) else {
+        return err(SyscallError::EBADF);
+    };
+    if (descriptor_flags & O_PATH as u32) != 0 {
         return err(SyscallError::EBADF);
     }
-    let file = require_fd_file!(fd);
+    let nonblock = (descriptor_flags & O_NONBLOCK as u32) != 0;
+    let noatime = (descriptor_flags & O_NOATIME as u32) != 0;
     if !file.readable() {
         return err(SyscallError::EBADF);
     }
@@ -29,6 +33,11 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if crate::syscall::net::socket_read_uses_recvfrom(file.as_ref()) {
         return crate::syscall::net::syscall_recvfrom(fd, buffer, len, 0, 0, 0);
+    }
+    if let Some(pseudo) = file.as_any().downcast_ref::<PseudoFile>()
+        && pseudo.kind_tag() == PseudoKindTag::Zero
+    {
+        return read_zero_to_user(buffer, len);
     }
     if let Some(pty) = file.as_any().downcast_ref::<PtyMasterFile>() {
         let Ok(user_bufs) = try_translated_byte_buffer(
@@ -60,7 +69,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if let Some(tun) = file.as_any().downcast_ref::<TunTapFile>() {
         if len > 0
-            && let Err(e) = tun.wait_readable(fd_has_nonblock(fd))
+            && let Err(e) = tun.wait_readable(nonblock)
         {
             return e;
         }
@@ -97,7 +106,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             return err(SyscallError::EISDIR);
         }
     }
-    if fd_has_nonblock(fd) {
+    if nonblock {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
             if !pipe.poll_readable() {
                 return err(SyscallError::EAGAIN);
@@ -124,7 +133,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         if len < core::mem::size_of::<u64>() {
             return err(SyscallError::EINVAL);
         }
-        let value = match eventfd.read_counter(fd_has_nonblock(fd)) {
+        let value = match eventfd.read_counter(nonblock) {
             Ok(value) => value,
             Err(e) => return e,
         };
@@ -137,7 +146,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         if len < core::mem::size_of::<u64>() {
             return err(SyscallError::EINVAL);
         }
-        let value = match timerfd.read_counter(fd_has_nonblock(fd)) {
+        let value = match timerfd.read_counter(nonblock) {
             Ok(value) => value,
             Err(e) => return e,
         };
@@ -145,6 +154,20 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             return err(SyscallError::EFAULT);
         }
         return core::mem::size_of::<u64>() as isize;
+    }
+    if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        return match pipe.read_user_result(UserBuffer::new(user_bufs), nonblock) {
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
     }
     let Ok(user_bufs) = try_translated_byte_buffer(
         get_current_token(),
@@ -156,7 +179,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     };
     let buf = UserBuffer::new(user_bufs);
     let read_len = file.read(buf) as isize;
-    if read_len >= 0 && !fd_has_noatime(fd) {
+    if read_len >= 0 && !noatime {
         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
             let inode = os_inode.ext4_inode();
             maybe_update_inode_atime(&inode, false);
@@ -165,20 +188,60 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     read_len
 }
 
+fn read_zero_to_user(buffer: usize, len: usize) -> isize {
+    if buffer.checked_add(len).is_none() {
+        return err(SyscallError::EFAULT);
+    }
+
+    let token = get_current_token();
+    if len == 1 {
+        let zero = 0u8;
+        return if try_write_user_value(token, buffer as *mut u8, &zero).is_ok() {
+            1
+        } else {
+            err(SyscallError::EFAULT)
+        };
+    }
+
+    static ZERO_CHUNK: [u8; 256] = [0; 256];
+    let mut copied = 0usize;
+    while copied < len {
+        let n = core::cmp::min(len - copied, ZERO_CHUNK.len());
+        let dst = (buffer + copied) as *mut u8;
+        if try_copy_to_user(token, dst, &ZERO_CHUNK[..n]).is_err() {
+            return if copied > 0 {
+                copied as isize
+            } else {
+                err(SyscallError::EFAULT)
+            };
+        }
+        copied += n;
+    }
+    copied as isize
+}
+
 /// Writes to regular files and special descriptors with nonblocking and rlimit handling.
 pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
-    if fd_has_o_path(fd) {
+    let Some((file, descriptor_flags)) = get_fd_file_and_flags(fd) else {
+        return err(SyscallError::EBADF);
+    };
+    if (descriptor_flags & O_PATH as u32) != 0 {
         return err(SyscallError::EBADF);
     }
-    let file = require_fd_file!(fd);
+    let nonblock = (descriptor_flags & O_NONBLOCK as u32) != 0;
     if file.as_any().downcast_ref::<TimerFdFile>().is_some() {
         return err(SyscallError::EINVAL);
+    }
+    if crate::syscall::net::socket_write_uses_sendto(file.as_ref()) {
+        return crate::syscall::net::syscall_sendto(fd, buffer, len, 0, 0, 0);
     }
     if !file.writable() {
         return err(SyscallError::EBADF);
     }
-    if crate::syscall::net::socket_write_uses_sendto(file.as_ref()) {
-        return crate::syscall::net::syscall_sendto(fd, buffer, len, 0, 0, 0);
+    if let Some(pseudo) = file.as_any().downcast_ref::<PseudoFile>()
+        && pseudo.kind_tag() == PseudoKindTag::Null
+    {
+        return len as isize;
     }
     if let Some(pty) = file.as_any().downcast_ref::<PtyMasterFile>() {
         let Ok(user_bufs) = try_translated_byte_buffer(
@@ -283,7 +346,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         .downcast_ref::<OSInode>()
         .map(|inode| inode.offset());
     let mut write_len = len;
-    if fd_has_nonblock(fd) {
+    if nonblock {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
             if pipe.all_read_ends_closed() {
                 return err(SyscallError::EPIPE);
@@ -331,10 +394,25 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         let Some(value) = try_read_user_value(get_current_token(), buffer as *const u64) else {
             return err(SyscallError::EFAULT);
         };
-        match eventfd.write_counter(value, fd_has_nonblock(fd)) {
+        match eventfd.write_counter(value, nonblock) {
             Ok(()) => return core::mem::size_of::<u64>() as isize,
             Err(e) => return e,
         }
+    }
+    if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::R,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        return match pipe.write_user_result(UserBuffer::new(user_bufs), nonblock) {
+            Ok(0) if len > 0 && pipe.all_read_ends_closed() => err(SyscallError::EPIPE),
+            Ok(n) => n as isize,
+            Err(e) => e,
+        };
     }
     let mut hit_fsize_limit = false;
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {

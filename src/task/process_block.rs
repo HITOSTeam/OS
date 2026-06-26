@@ -916,19 +916,26 @@ pub struct ProcessResourceLimits {
     pub rlimit_rttime_max: u64,
 }
 
-/// Linux-like scheduler parameters: policy, RT priority, deadline attrs, nice, affinity.
+/// Linux 风格调度参数：调度策略、RT 优先级、deadline 属性、nice 和 CPU 亲和性。
 #[derive(Clone)]
 pub struct ProcessScheduling {
+    /// 调度策略，对应 Linux `SCHED_OTHER`/`SCHED_FIFO`/`SCHED_RR` 等。
     pub sched_policy: i32,
-    /// Process-wide CPU affinity mask used by `sched_*affinity` and `getcpu`.
+    /// CPU 亲和性掩码，供 `sched_*affinity` 和 `getcpu` 使用。
+    ///
+    /// 对 PCB 来说这是新建 task 继承的默认值；实际运行时的 per-task 值保存在 TCB 中。
     pub cpu_affinity_mask: usize,
+    /// 实时调度优先级；普通 fair 调度策略下通常为 0。
     pub sched_priority: i32,
+    /// `SCHED_DEADLINE` 的运行时间参数。
     pub sched_runtime: u64,
+    /// `SCHED_DEADLINE` 的相对截止时间参数。
     pub sched_deadline: u64,
+    /// `SCHED_DEADLINE` 的周期参数。
     pub sched_period: u64,
-    /// POSIX nice value used by getpriority/setpriority.
+    /// POSIX nice 值，供 getpriority/setpriority 使用。
     pub nice: i32,
-    /// Linux SCHED_RESET_ON_FORK / SCHED_FLAG_RESET_ON_FORK state.
+    /// Linux SCHED_RESET_ON_FORK / SCHED_FLAG_RESET_ON_FORK 状态。
     pub reset_on_fork: bool,
 }
 
@@ -947,110 +954,133 @@ pub struct ProcessControlBlock {
 // 里面存放线程共用的 资源
 pub struct ProcessControlBlockInner {
     pub is_zombie: bool,
-    /// Whether the terminating signal should be reported as a core-dumping one.
+    /// 终止进程的信号是否应报告为会产生 core dump 的信号。
     pub dumped_core: bool,
-    /// Process group ID (PGID).
+    /// 进程组 ID（PGID）。
     pub pgid: usize,
-    /// Session ID (SID).
+    /// 会话 ID（SID）。
     pub sid: usize,
-    /// True after the process has performed at least one execve().
+    /// 进程至少执行过一次 execve() 后置为 true。
     pub did_exec: bool,
-    /// Stop/continue state for waitpid job-control.
+    /// waitpid 作业控制使用的停止/继续状态。
     pub stopped: bool,
     pub stop_signal: i32,
     pub stop_pending: bool,
     pub continued: bool,
-    /// Tracer pid for basic ptrace support (`PTRACE_TRACEME`).
+    /// 基础 ptrace 支持使用的 tracer pid（`PTRACE_TRACEME`）。
     pub ptrace_tracer_pid: Option<usize>,
+    /// 当前进程作为 tracer 时，仍然存活并指向它的 tracee 数量。
+    ///
+    /// Linux 会把被追踪进程挂在父进程/tracer 本地链表上，因此 wait 路径在
+    /// 调用者没有 ptrace 子进程时，不需要扫描全局进程表。这个计数器保留了
+    /// `wait4()` 同样的“没有 tracee 就快速跳过”判断，同时仍让每个 tracee
+    /// 通过自己的 `ptrace_tracer_pid` 记录所属 tracer。
+    pub ptrace_tracee_count: usize,
     pub memory_set: MmRef,
     pub parent: Option<Weak<ProcessControlBlock>>,
+    /// 当前进程在父进程 `children` 向量中的下标；`None` 表示当前未挂在父进程子列表中。
+    ///
+    /// Linux 使用侵入式 child/sibling 链表，所以 wait/reparent 可以在不扫描
+    /// 所有兄弟进程的情况下摘除已知子进程。这里缓存 Vec 下标，并在删除时使用
+    /// `swap_remove`，在不保留子进程顺序的前提下实现 O(1) 摘除，而不需要为
+    /// 每个父进程维护额外 map。
+    pub child_parent_index: Option<usize>,
     pub children: Vec<Arc<ProcessControlBlock>>,
+    /// 已进入 zombie 状态、可被 wait4(-1) 回收的子进程。
+    ///
+    /// Linux 会让可 wait 的子进程可直接发现，避免反复扫描整个进程列表。这里把它
+    /// 作为父进程本地的加速队列；规范的父子所有权仍然保存在 `children` 中。
+    pub exited_children: VecDeque<Arc<ProcessControlBlock>>,
+    /// 当前拥有这个 zombie 条目的 `exited_children` 队列所属父进程 PID。
+    ///
+    /// 相比每次退出时扫描父进程队列去重，这更接近 Linux 中 waitable child
+    /// 的单向状态转移。
+    pub exited_parent_queue_pid: Option<usize>,
     pub exit_code: i32,
-    /// Signal delivered to the parent when this child becomes waitable.
+    /// 当前子进程变为可 wait 状态时发送给父进程的信号。
     pub exit_signal: i32,
-    /// Linux-like argv for `/proc/<pid>/cmdline` and ps.
+    /// 用于 `/proc/<pid>/cmdline` 和 ps 的 Linux 风格 argv。
     pub argv: Vec<String>,
-    /// Thread-group command name shown in /proc/*/{stat,status,comm}.
+    /// 显示在 /proc/*/{stat,status,comm} 中的线程组命令名。
     pub comm: String,
-    /// `PR_SET_PDEATHSIG` setting for this process.
+    /// 当前进程的 `PR_SET_PDEATHSIG` 设置。
     pub pdeath_signal: i32,
-    /// Executable inode identity for ETXTBSY checks on writable opens.
+    /// 可执行文件 inode 身份，用于可写打开时的 ETXTBSY 检查。
     pub exec_inode_dev: usize,
     pub exec_inode_num: u32,
-    /// Current/default timer slack used by `prctl(PR_*_TIMERSLACK)`.
+    /// `prctl(PR_*_TIMERSLACK)` 使用的当前/默认 timer slack。
     pub timer_slack_ns: u64,
     pub timer_slack_default_ns: u64,
-    /// Process creation time since boot (ms).
+    /// 从启动开始计算的进程创建时间（ms）。
     pub start_time_ms: usize,
     /// 本进程已退出线程或 zombie 快照中的 CPU 时间（ns）。
     pub cpu_time_ns: u64,
     /// 已 wait 子进程及其后代的 CPU 时间（ns），用于 `times(2)`/`getrusage`。
     pub child_cpu_time_ns: u64,
-    /// Real/effective/saved user IDs and filesystem UID.
+    /// 真实/有效/保存的用户 ID，以及文件系统 UID。
     pub uid: u32,
     pub euid: u32,
     pub suid: u32,
     pub fsuid: u32,
-    /// Real/effective/saved group IDs and filesystem GID.
+    /// 真实/有效/保存的组 ID，以及文件系统 GID。
     pub gid: u32,
     pub egid: u32,
     pub sgid: u32,
     pub fsgid: u32,
-    /// Supplementary group IDs.
+    /// 附加组 ID 列表。
     pub supplementary_gids: Vec<u32>,
-    /// Linux capability sets (v2/v3 user API stores up to 64 bits).
+    /// Linux capability 集合（v2/v3 用户 API 最多保存 64 位）。
     pub cap_effective: u64,
     pub cap_permitted: u64,
     pub cap_inheritable: u64,
-    /// Capability bounding set used by PR_CAPBSET_DROP checks.
+    /// PR_CAPBSET_DROP 检查使用的 capability bounding set。
     pub cap_bounding: u64,
-    /// `PR_SET_KEEPCAPS` / `SECBIT_KEEP_CAPS` state.
+    /// `PR_SET_KEEPCAPS` / `SECBIT_KEEP_CAPS` 状态。
     pub keep_caps: bool,
-    /// Linux personality(2) flags (PER_LINUX by default).
+    /// Linux personality(2) 标志（默认 PER_LINUX）。
     pub personality: u32,
-    /// Per-process I/O priority encoded like Linux `ioprio_get/set(2)`.
+    /// 按 Linux `ioprio_get/set(2)` 编码的进程级 I/O 优先级。
     pub ioprio: u16,
-    /// Per-process file mode creation mask (umask).
+    /// 进程级文件创建模式掩码（umask）。
     pub umask: usize,
-    /// File descriptor table.  Regular fork snapshots this object; CLONE_FILES
-    /// shares the Arc, which lets lifetime follow references instead of a
-    /// process-owner forwarding model.
+    /// 文件描述符表。普通 fork 会快照这个对象；CLONE_FILES 共享同一个 Arc，
+    /// 让生命周期跟随引用，而不是依赖进程所有者转发模型。
     pub(crate) files: Arc<SpinMutex<FilesStruct>>,
-    /// All POSIX resource limits.
+    /// 所有 POSIX 资源限制。
     pub rlimits: ProcessResourceLimits,
-    /// Process root directory (host-absolute path), used for `chroot`.
+    /// 进程根目录（宿主绝对路径），用于 `chroot`。
     pub root: String,
     pub cwd: String,
-    /// IPC namespace id used by SysV IPC / POSIX MQ isolation.
+    /// SysV IPC / POSIX MQ 隔离使用的 IPC namespace id。
     pub ipc_ns_id: usize,
-    /// User namespace id.  Full uid/gid translation is not implemented yet;
-    /// this tracks Linux's namespace control plane for unshare/procfs tests.
+    /// 用户 namespace id。完整的 uid/gid 转换尚未实现；这里用于跟踪 Linux
+    /// namespace 控制面，以支持 unshare/procfs 测试。
     pub user_ns_id: usize,
     pub userns_uid_map: String,
     pub userns_gid_map: String,
     pub userns_setgroups: String,
-    /// Network namespace id.  Net devices are still globally shared; the id
-    /// exists so Linux namespace handles and setns/clone3 ABI behave correctly.
+    /// 网络 namespace id。网络设备目前仍全局共享；保留这个 id 是为了让
+    /// Linux namespace 句柄以及 setns/clone3 ABI 行为正确。
     pub net_ns_id: usize,
-    /// Shared UTS namespace state (hostname/domainname).
+    /// 共享的 UTS namespace 状态（hostname/domainname）。
     pub uts_ns: Arc<SpinMutex<UtsNamespaceState>>,
-    /// Shared mount namespace state used by mount/umount/path view syscalls.
+    /// mount/umount/path 视图系统调用使用的共享 mount namespace 状态。
     pub mnt_ns: MountNamespace,
-    /// cgroup namespace root path. "/" means the initial namespace.
+    /// cgroup namespace 根路径。"/" 表示初始 namespace。
     pub cgroup_ns_root: String,
-    /// PID namespace id; 0 is the initial namespace.
+    /// PID namespace id；0 表示初始 namespace。
     pub pid_ns_id: usize,
-    /// PID visible from within the process's own PID namespace.
+    /// 在进程自身 PID namespace 内可见的 PID。
     pub pid_ns_vpid: usize,
-    /// Whether this process is PID 1 inside its PID namespace.
+    /// 当前进程是否是其 PID namespace 内的 PID 1。
     pub pid_ns_init: bool,
     pub signals: SignalFlags,
     pub signals_actions: SignalActions,
     pub signals_masks: SignalFlags,
     pub handling_signal: i32,
-    /// Linux rt_sigaction handlers indexed by signal number.
+    /// 按信号编号索引的 Linux rt_sigaction 处理器。
     pub rt_sig_handlers: Vec<RtSigAction>,
-    /// Linux-like scheduler state used by rt-tests (cyclictest/hackbench).
+    /// rt-tests（cyclictest/hackbench）使用的 Linux 风格调度状态。
     pub scheduling: ProcessScheduling,
     // TaskControlBlock实际上现在是线程
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
@@ -1059,13 +1089,63 @@ pub struct ProcessControlBlockInner {
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
-    /// Tasks waiting in `waitpid(-1/...)` for this process's children.
+    /// 在 `waitpid(-1/...)` 中等待当前进程子进程状态变化的 task。
     pub wait_queue: VecDeque<Arc<TaskControlBlock>>,
-    /// Tasks waiting on pidfd readiness for this process to become waitable.
+    /// 等待当前进程变为可 wait 状态、从而让 pidfd 就绪的 task。
     pub pidfd_poll_waiters: PollWaitQueue,
 }
 
 impl ProcessControlBlockInner {
+    /// 添加 child 进程
+    pub fn add_child(&mut self, child: Arc<ProcessControlBlock>) {
+        child.borrow_mut().child_parent_index = Some(self.children.len());
+        self.children.push(child);
+    }
+
+    /// 移除  index 处的child 进程,这里使用了 swap_remove 将最后一个元素换入的方式来提高速度
+    pub fn remove_child_at(&mut self, index: usize) -> Arc<ProcessControlBlock> {
+        let child = self.children.swap_remove(index);
+        child.borrow_mut().child_parent_index = None;
+        /// 记得 更新下 标
+        if index < self.children.len() {
+            self.children[index].borrow_mut().child_parent_index = Some(index);
+        }
+        child
+    }
+
+    /// 使用child 中的 记录下标，快速定位 要删除的 child
+    pub fn remove_child(
+        &mut self,
+        child: &Arc<ProcessControlBlock>,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        let cached_index = {
+            let child_inner = child.borrow_mut();
+            child_inner.child_parent_index
+        };
+        if let Some(index) = cached_index {
+            if index < self.children.len() && Arc::ptr_eq(&self.children[index], child) {
+                return Some(self.remove_child_at(index));
+            }
+            debug_assert!(
+                index >= self.children.len() || Arc::ptr_eq(&self.children[index], child),
+                "stale child_parent_index"
+            );
+        }
+        // TODO: REMOVE
+        let Some(index) = self
+            .children
+            .iter()
+            .position(|owned| Arc::ptr_eq(owned, child))
+        else {
+            return None;
+        };
+        Some(self.remove_child_at(index))
+    }
+
+    pub fn clear_children(&mut self) {
+        self.children.clear();
+    }
+
     #[allow(unused)]
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
@@ -1208,9 +1288,13 @@ impl ProcessControlBlock {
                 stop_pending: false,
                 continued: false,
                 ptrace_tracer_pid: None,
+                ptrace_tracee_count: 0,
                 memory_set: MmRef::new(memory_set),
                 parent: None,
+                child_parent_index: None,
                 children: Vec::new(),
+                exited_children: VecDeque::new(),
+                exited_parent_queue_pid: None,
                 exit_code: 0,
                 exit_signal: SIGCHLD_NUM as i32,
                 argv: args.clone(),
@@ -1625,6 +1709,7 @@ impl ProcessControlBlock {
         if let Some(task) = caller_task.as_ref() {
             crate::arch::save_user_fp_state(task);
         }
+        let caller_scheduling = caller_task.as_ref().map(|task| task.scheduling_snapshot());
         let caller_task_res = caller_task.as_ref().and_then(|t| {
             let inner = t.borrow_mut();
             inner.res.as_ref().map(|r| (r.tid, r.ustack_base()))
@@ -1649,13 +1734,14 @@ impl ProcessControlBlock {
                 thread_count
             );
         }
-        let sched_policy = parent.scheduling.sched_policy;
-        let sched_priority = parent.scheduling.sched_priority;
-        let sched_runtime = parent.scheduling.sched_runtime;
-        let sched_deadline = parent.scheduling.sched_deadline;
-        let sched_period = parent.scheduling.sched_period;
-        let nice = parent.scheduling.nice;
-        let reset_on_fork = parent.scheduling.reset_on_fork;
+        let parent_scheduling = caller_scheduling.unwrap_or_else(|| parent.scheduling.clone());
+        let sched_policy = parent_scheduling.sched_policy;
+        let sched_priority = parent_scheduling.sched_priority;
+        let sched_runtime = parent_scheduling.sched_runtime;
+        let sched_deadline = parent_scheduling.sched_deadline;
+        let sched_period = parent_scheduling.sched_period;
+        let nice = parent_scheduling.nice;
+        let reset_on_fork = parent_scheduling.reset_on_fork;
         let (
             child_sched_policy,
             child_sched_priority,
@@ -1685,7 +1771,7 @@ impl ProcessControlBlock {
                 nice,
             )
         };
-        let cpu_affinity_mask = parent.scheduling.cpu_affinity_mask;
+        let cpu_affinity_mask = parent_scheduling.cpu_affinity_mask;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
         let inherited_shm = parent.memory_set.sysv_shm_attaches_snapshot();
@@ -1818,9 +1904,13 @@ impl ProcessControlBlock {
                 stop_pending: false,
                 continued: false,
                 ptrace_tracer_pid: None,
+                ptrace_tracee_count: 0,
                 memory_set,
                 parent: Some(Arc::downgrade(self)),
+                child_parent_index: None,
                 children: Vec::new(),
+                exited_children: VecDeque::new(),
+                exited_parent_queue_pid: None,
                 exit_code: 0,
                 exit_signal: SIGCHLD_NUM as i32,
                 argv,
@@ -1965,7 +2055,7 @@ impl ProcessControlBlock {
             );
         }
         // add child to parent's children list (after success)
-        self.borrow_mut().children.push(Arc::clone(&child));
+        self.borrow_mut().add_child(Arc::clone(&child));
         if diag_enabled {
             let end_cycles = crate::arch::read_time();
             let seq = FORK_IMPL_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;

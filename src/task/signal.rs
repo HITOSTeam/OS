@@ -27,11 +27,11 @@ use crate::{
     println,
     task::processor::current_process,
     task::{
-        manager::{pid2process, wakeup_task},
+        manager::{pid2process, wakeup_task, wakeup_tasks},
         pid_namespace_member_pids,
         process_block::ProcessControlBlock,
         process_visible_in_pid_namespace,
-        processor::{current_task, suspend_current_and_run_next},
+        processor::{current_task, hart_id, suspend_current_and_run_next},
         resolve_process_in_pid_namespace,
         task_block::{TaskControlBlock, TaskControlBlockInner},
     },
@@ -44,6 +44,23 @@ pub fn signal_bit(signum: usize) -> Option<u64> {
         return None;
     }
     Some(1u64 << (signum - 1))
+}
+
+fn hart_mask_bit(hart: usize) -> usize {
+    if hart < usize::BITS as usize {
+        1usize << hart
+    } else {
+        0
+    }
+}
+
+fn send_signal_ipis(mask: usize) {
+    let local_hart = hart_id();
+    for target_hart in 0..crate::config::MAX_HARTS {
+        if target_hart != local_hart && (mask & hart_mask_bit(target_hart)) != 0 {
+            arch::send_ipi(target_hart);
+        }
+    }
 }
 
 pub fn signal_has_core_dump(signum: usize) -> bool {
@@ -385,6 +402,10 @@ pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
     }
     None
 }
+
+pub fn log_signal_exit(msg: &'static str) {
+    crate::log_if!(DEBUG_SIGNAL, info, "[signal-exit] {}", msg);
+}
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct SignalAction {
@@ -586,6 +607,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
         tasks.len(),
         get_time_ms()
     );
+    let mut running_signal_ipi_mask = 0usize;
     if sig_bit != 0 {
         for t in tasks.iter() {
             let (tid, pending, mask) = {
@@ -594,6 +616,10 @@ pub fn kill(pid: usize, signum: i32) -> isize {
                 let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 (tid, inner.pending_signals, inner.signal_mask)
             };
+            let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
+            if on_cpu != TaskControlBlock::OFF_CPU {
+                running_signal_ipi_mask |= hart_mask_bit(on_cpu);
+            }
             crate::log_if!(
                 DEBUG_SIGNAL,
                 debug,
@@ -606,19 +632,9 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             );
         }
     }
-    let current = current_task();
-    let mut signal_sent_to_other_task = false;
-    for t in tasks {
-        if current
-            .as_ref()
-            .is_none_or(|current| !Arc::ptr_eq(current, &t))
-        {
-            signal_sent_to_other_task = true;
-        }
-        wakeup_task(t);
-    }
-    if sig_bit != 0 && signal_sent_to_other_task {
-        crate::task::processor::request_reschedule_current_hart();
+    wakeup_tasks(tasks);
+    if running_signal_ipi_mask != 0 {
+        send_signal_ipis(running_signal_ipi_mask);
     }
     0
 }
@@ -648,12 +664,20 @@ pub fn kill_current(signum: i32) -> isize {
             .filter_map(|t| t.as_ref().cloned())
             .collect::<alloc::vec::Vec<_>>()
     };
-    for t in tasks {
+    let mut running_signal_ipi_mask = 0usize;
+    for t in tasks.iter() {
         {
             let mut inner = t.borrow_mut();
             mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0, 0);
         }
-        wakeup_task(t);
+        let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
+        if on_cpu != TaskControlBlock::OFF_CPU {
+            running_signal_ipi_mask |= hart_mask_bit(on_cpu);
+        }
+    }
+    wakeup_tasks(tasks);
+    if running_signal_ipi_mask != 0 {
+        send_signal_ipis(running_signal_ipi_mask);
     }
     0
 }

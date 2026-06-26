@@ -263,7 +263,7 @@ pub fn maybe_deliver_signal() {
             if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
                 if let Some((errno, msg)) = flag.check_error() {
                     let _ = kill_current(signum as i32);
-                    crate::println!("[kernel] {}", msg);
+                    crate::task::signal::log_signal_exit(msg);
                     exit_group_and_run_next(errno);
                 }
             }

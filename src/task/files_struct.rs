@@ -16,6 +16,7 @@ pub struct FilesStruct {
     fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     fd_flags: Vec<u32>,
     next_fd_hint: usize,
+    close_cursor: Option<usize>,
 }
 
 impl FilesStruct {
@@ -35,6 +36,7 @@ impl FilesStruct {
             ],
             fd_flags: vec![0; 3],
             next_fd_hint: 3,
+            close_cursor: None,
         }
     }
 
@@ -49,6 +51,7 @@ impl FilesStruct {
             fd_table,
             fd_flags,
             next_fd_hint,
+            close_cursor: None,
         }
     }
 
@@ -112,6 +115,41 @@ impl FilesStruct {
             .enumerate()
             .filter_map(|(fd, file)| file.as_ref().map(|file| (fd, Arc::clone(file))))
             .collect()
+    }
+
+    /// Detach up to `limit` files while tearing down an exited process' file table.
+    ///
+    /// Linux `close_files()` advances one descriptor at a time and calls
+    /// `cond_resched()` after each close.  Keeping a close cursor gives our idle
+    /// cleanup path the same shape: make progress on the old descriptor table,
+    /// then return to the scheduler before draining the next batch.
+    pub fn take_file_close_batch(&mut self, limit: usize) -> Vec<Arc<dyn File + Send + Sync>> {
+        let mut files = Vec::new();
+        if limit == 0 {
+            return files;
+        }
+
+        let mut cursor = self.close_cursor.unwrap_or(0);
+        while cursor < self.fd_table.len() && files.len() < limit {
+            if let Some(file) = self.fd_table[cursor].take() {
+                files.push(file);
+            }
+            if let Some(flag) = self.fd_flags.get_mut(cursor) {
+                *flag = 0;
+            }
+            cursor += 1;
+        }
+
+        if cursor >= self.fd_table.len() {
+            self.fd_table.clear();
+            self.fd_flags.clear();
+            self.next_fd_hint = 0;
+            self.close_cursor = None;
+        } else {
+            self.close_cursor = Some(cursor);
+        }
+
+        files
     }
 
     /// 按 fd 编号取出 File 引用；fd 不存在或已关闭返回 None。
@@ -178,6 +216,7 @@ impl FilesStruct {
         flags: u32,
         limit: usize,
     ) -> Option<usize> {
+        self.close_cursor = None;
         let fd = self.alloc_fd(limit)?;
         self.fd_table[fd] = Some(file);
         self.fd_flags[fd] = flags;
@@ -196,6 +235,7 @@ impl FilesStruct {
         if fd >= limit {
             return false;
         }
+        self.close_cursor = None;
         if self.fd_table.len() <= fd {
             self.fd_table.resize(fd + 1, None);
             self.fd_flags.resize(fd + 1, 0);
@@ -225,6 +265,7 @@ impl FilesStruct {
         let file = self.fd_table[fd].take();
         self.ensure_flags_len();
         self.fd_flags[fd] = 0;
+        self.close_cursor = None;
         if file.is_some() {
             self.next_fd_hint = self.next_fd_hint.min(fd);
         }
@@ -270,6 +311,7 @@ impl Default for FilesStruct {
             fd_table: Vec::new(),
             fd_flags: Vec::new(),
             next_fd_hint: 0,
+            close_cursor: None,
         }
     }
 }

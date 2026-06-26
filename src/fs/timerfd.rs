@@ -3,7 +3,11 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, cmp::Ordering};
+use core::{
+    any::Any,
+    cmp::Ordering,
+    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -25,6 +29,8 @@ lazy_static! {
     static ref TIMERFD_SCHEDULE: Mutex<TimerFdScheduleState> =
         Mutex::new(TimerFdScheduleState::default());
 }
+
+static TIMERFD_ARMED_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 struct TimerFdScheduleEntry {
@@ -76,13 +82,15 @@ impl TimerFdScheduleState {
         };
         if is_armed {
             *armed = armed.saturating_add(1);
+            TIMERFD_ARMED_TOTAL.fetch_add(1, AtomicOrdering::AcqRel);
         } else {
             *armed = armed.saturating_sub(1);
+            TIMERFD_ARMED_TOTAL
+                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .ok();
         }
-    }
-
-    fn has_live_timers(&self) -> bool {
-        self.monotonic_armed != 0 || self.realtime_armed != 0
     }
 
     fn live_realtime_files(&self) -> Vec<Arc<TimerFdFile>> {
@@ -146,6 +154,14 @@ impl TimerFdFile {
             }
             _ => None,
         }
+    }
+
+    fn arm_clockevent_for_deadline(clock_id: usize, deadline_ns: u64) {
+        let Some(clock_now_ns) = Self::now_ns(clock_id) else {
+            return;
+        };
+        let delta_ns = deadline_ns.saturating_sub(clock_now_ns).max(1);
+        crate::time::arm_timer_for_deadline_ns(crate::time::get_time_ns().saturating_add(delta_ns));
     }
 
     fn add_waiter_once(
@@ -219,6 +235,8 @@ impl TimerFdFile {
             sequence: inner.schedule_seq,
             file: self.self_ref.clone(),
         });
+        drop(state);
+        Self::arm_clockevent_for_deadline(self.clock_id, deadline_ns);
     }
 
     fn update_expirations_locked(inner: &mut TimerFdInner, now_ns: u64) -> bool {
@@ -482,8 +500,28 @@ pub(crate) fn process_timerfd_expirations() {
     }
 }
 
-pub(crate) fn has_pending_timerfds() -> bool {
-    TIMERFD_SCHEDULE.lock().has_live_timers()
+pub(crate) fn timerfd_work_pending_for_user_return() -> bool {
+    if TIMERFD_ARMED_TOTAL.load(AtomicOrdering::Acquire) == 0 {
+        return false;
+    }
+    let monotonic_now_ns = TimerFdFile::now_ns(CLOCK_MONOTONIC);
+    let realtime_now_ns = TimerFdFile::now_ns(CLOCK_REALTIME);
+    let state = TIMERFD_SCHEDULE.lock();
+    let monotonic_due = state.monotonic_armed != 0
+        && monotonic_now_ns.is_some_and(|now_ns| {
+            state
+                .monotonic
+                .peek()
+                .is_some_and(|entry| entry.deadline_ns <= now_ns)
+        });
+    let realtime_due = state.realtime_armed != 0
+        && realtime_now_ns.is_some_and(|now_ns| {
+            state
+                .realtime
+                .peek()
+                .is_some_and(|entry| entry.deadline_ns <= now_ns)
+        });
+    monotonic_due || realtime_due
 }
 
 pub(crate) fn cancel_realtime_timerfds_on_set() {

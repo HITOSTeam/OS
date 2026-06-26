@@ -7,7 +7,7 @@ use crate::{
     fs::{OpenFlags, open_file},
     println,
     task::{
-        manager::{TASK_MANAGER, add_task},
+        manager::add_task,
         processor::{current_task, go_to_first_task},
         task_context::TaskContext,
     },
