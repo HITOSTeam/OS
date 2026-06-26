@@ -5,10 +5,11 @@
 
 use core::sync::atomic::{AtomicI64, AtomicIsize, Ordering};
 
-/// 调度类别：CFS 公平调度、FIFO 实时、RR 实时。
+/// 调度类别：EEVDF 公平调度、FIFO 实时、RR 实时。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SchedClass {
-    /// CFS 完全公平调度，对应 Linux SCHED_OTHER/SCHED_BATCH/SCHED_IDLE
+    /// 公平调度类，内部采用 EEVDF 算法（vruntime/vlag/deadline/eligible），
+    /// 对应 Linux SCHED_OTHER/SCHED_BATCH/SCHED_IDLE。
     Fair,
     /// 实时 FIFO：一旦获得 CPU 就运行直到主动放弃或被更高优先级 RT 任务抢占
     Fifo,
@@ -16,15 +17,15 @@ pub enum SchedClass {
     Rr,
 }
 
-/// SCHED_OTHER — Linux 默认调度策略，即 CFS 完全公平调度。
+/// SCHED_OTHER — Linux 默认调度策略，即 EEVDF 公平调度。
 pub const SCHED_OTHER: i32 = 0;
 /// SCHED_FIFO — 实时先进先出调度策略，优先级范围 1-99。
 pub const SCHED_FIFO: i32 = 1;
 /// SCHED_RR — 实时时间片轮转调度策略，优先级范围 1-99。
 pub const SCHED_RR: i32 = 2;
-/// SCHED_BATCH — 批处理调度策略（CFS 子类），不抢占、适合吞吐量优先的负载。
+/// SCHED_BATCH — 批处理调度策略（公平调度子类），不抢占、适合吞吐量优先的负载。
 pub const SCHED_BATCH: i32 = 3;
-/// SCHED_IDLE — 空闲优先级调度策略（CFS 子类），仅在系统完全空闲时运行。
+/// SCHED_IDLE — 空闲优先级调度策略（公平调度子类），仅在系统完全空闲时运行。
 pub const SCHED_IDLE: i32 = 5;
 /// SCHED_DEADLINE — 实时 deadline 调度策略（目前仅做参数校验，未实际调度）。
 pub const SCHED_DEADLINE: i32 = 6;
@@ -57,10 +58,13 @@ const RT_SYSCTL_MAX_US: i64 = i32::MAX as i64;
 // 这三个调度参数通过 /proc/sys/kernel/{sched_rr_timeslice_ms,sched_rt_period_us,
 // sched_rt_runtime_us} 暴露给用户态、可在运行时修改（proc_sched_rt01 依赖）。
 // 用原子量保存当前生效值，初值取上方的 Linux 默认常量。
+/// RR 时间片长度
 static RR_TIMESLICE_MS_CURRENT: AtomicIsize = AtomicIsize::new(RR_TIMESLICE_MS);
+//. 每个period里 ，最多跑 runtime 个 时间,二者配合
 static RT_PERIOD_US_CURRENT: AtomicI64 = AtomicI64::new(RT_PERIOD_US_DEFAULT);
 static RT_RUNTIME_US_CURRENT: AtomicI64 = AtomicI64::new(RT_RUNTIME_US_DEFAULT);
 
+/// RR 时间片长度，可设置
 pub fn rr_timeslice_ms() -> isize {
     RR_TIMESLICE_MS_CURRENT.load(Ordering::Relaxed)
 }
@@ -72,10 +76,14 @@ pub fn rr_timeslice_ticks() -> usize {
 
 /// 写 `sched_rr_timeslice_ms`：`-1` 复位为默认值 `RR_TIMESLICE_MS`，否则取
 /// `[1, i32::MAX]` 内的毫秒值；越界返回 `None`（上层转成 EINVAL）。
+/// tldr:
+/// 动态设置rr 时间片 长度
 pub fn set_rr_timeslice_ms_from_procfs(value: i64) -> Option<isize> {
     let applied = if value == -1 {
+        // 默认值
         RR_TIMESLICE_MS
     } else if (1..=RT_SYSCTL_MAX_US).contains(&value) {
+        // 处于合法区间
         value as isize
     } else {
         return None;
@@ -84,10 +92,12 @@ pub fn set_rr_timeslice_ms_from_procfs(value: i64) -> Option<isize> {
     Some(applied)
 }
 
+/// RT 时间片长度，可设置
 pub fn rt_period_us() -> i64 {
     RT_PERIOD_US_CURRENT.load(Ordering::Relaxed)
 }
 
+/// RT 时间片运行时支持的最大 长度，可设置
 pub fn rt_runtime_us() -> i64 {
     RT_RUNTIME_US_CURRENT.load(Ordering::Relaxed)
 }
@@ -108,6 +118,7 @@ pub fn set_rt_period_us_from_procfs(value: i64) -> Option<i64> {
 
 /// 写 `sched_rt_runtime_us`：`-1` 表示关闭 RT 带宽限制（不 throttle），其余取
 /// `[-1, i32::MAX]` 微秒且不得大于当前 period；违反约束返回 `None`。
+/// tldr:设置rt 最大运行时
 pub fn set_rt_runtime_us_from_procfs(value: i64) -> Option<i64> {
     if !(-1..=RT_SYSCTL_MAX_US).contains(&value) {
         return None;
@@ -176,7 +187,7 @@ pub fn valid_priority_for_policy(policy: i32, priority: i32) -> bool {
     }
 }
 
-/// 将 RT 优先级钳制在 [1, 99] 范围内。
+/// 将 RT 优先级钳制在 [1, 99] 范围内。clamp,大于最大就是 最大
 pub fn normalized_rt_priority(priority: i32) -> i32 {
     priority.clamp(RT_PRIO_MIN, RT_PRIO_MAX)
 }
