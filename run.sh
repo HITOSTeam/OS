@@ -11,5 +11,6 @@ fi
 cd os
 
 EXT4_SIZE=${EXT4_SIZE:-4G}
+SMP=${SMP:-1}
 
-ARCH=$ARCH SUBMIT=1 make run_ext4 LOG=warn SMP=1 MEM=1G EXT4_REBUILD=1 EXT4_SIZE=$EXT4_SIZE > ../output.md 
+ARCH=$ARCH SUBMIT=1 make run_ext4 LOG=warn SMP=$SMP MEM=1G EXT4_REBUILD=1 EXT4_SIZE=$EXT4_SIZE > ../output.md

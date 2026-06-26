@@ -54,7 +54,7 @@ pub const DEBUG_NET: bool = false;
 pub const DEBUG_UNIXBENCH: bool = false;
 
 /// Targeted logs for cyclictest hangs (clock_nanosleep/affinity/sleep).
-pub const DEBUG_CYCLICTEST: bool = false;
+pub const DEBUG_CYCLICTEST: bool = true;
 
 /// Verbose signal delivery/kill debug logs.
 pub const DEBUG_SIGNAL: bool = false;
