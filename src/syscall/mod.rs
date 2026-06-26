@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub mod error;
 pub(crate) mod filesystem;
 
@@ -32,6 +32,88 @@ static LAST_SYSCALL_A2: AtomicUsize = AtomicUsize::new(0);
 static LAST_SYSCALL_A3: AtomicUsize = AtomicUsize::new(0);
 static LAST_SYSCALL_A4: AtomicUsize = AtomicUsize::new(0);
 static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_PID: AtomicUsize = AtomicUsize::new(usize::MAX);
+static CYCLIC_DIAG_CLONES: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_AFFINITY: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_SETSCHED: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_SLEEP: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_CLONE_TIDS: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_AFFINITY_TIDS: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_SETSCHED_TIDS: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_SLEEP_TIDS: AtomicUsize = AtomicUsize::new(0);
+static CYCLIC_DIAG_START_NS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+pub(crate) enum CyclicDiagEvent {
+    Clone,
+    SetAffinity,
+    SetScheduler,
+    ClockNanosleep,
+}
+
+fn cyclic_diag_reset(pid: usize, start_ns: u64) {
+    CYCLIC_DIAG_PID.store(pid, Ordering::Relaxed);
+    CYCLIC_DIAG_CLONES.store(0, Ordering::Relaxed);
+    CYCLIC_DIAG_AFFINITY.store(0, Ordering::Relaxed);
+    CYCLIC_DIAG_SETSCHED.store(0, Ordering::Relaxed);
+    CYCLIC_DIAG_SLEEP.store(0, Ordering::Relaxed);
+    CYCLIC_DIAG_CLONE_TIDS.store(0, Ordering::Relaxed);
+    CYCLIC_DIAG_AFFINITY_TIDS.store(0, Ordering::Relaxed);
+    CYCLIC_DIAG_SETSCHED_TIDS.store(0, Ordering::Relaxed);
+    CYCLIC_DIAG_SLEEP_TIDS.store(0, Ordering::Relaxed);
+    CYCLIC_DIAG_START_NS.store(start_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn cyclic_diag_note(event: CyclicDiagEvent, pid: usize, tid: usize) {
+    if !crate::debug_config::DEBUG_CYCLICTEST {
+        return;
+    }
+    let now_ns = crate::time::get_time_ns();
+    if CYCLIC_DIAG_PID.load(Ordering::Relaxed) != pid {
+        cyclic_diag_reset(pid, now_ns);
+    }
+    let (name, counter, tid_mask) = match event {
+        CyclicDiagEvent::Clone => ("clone", &CYCLIC_DIAG_CLONES, &CYCLIC_DIAG_CLONE_TIDS),
+        CyclicDiagEvent::SetAffinity => (
+            "setaffinity",
+            &CYCLIC_DIAG_AFFINITY,
+            &CYCLIC_DIAG_AFFINITY_TIDS,
+        ),
+        CyclicDiagEvent::SetScheduler => (
+            "setscheduler",
+            &CYCLIC_DIAG_SETSCHED,
+            &CYCLIC_DIAG_SETSCHED_TIDS,
+        ),
+        CyclicDiagEvent::ClockNanosleep => (
+            "clock_nanosleep",
+            &CYCLIC_DIAG_SLEEP,
+            &CYCLIC_DIAG_SLEEP_TIDS,
+        ),
+    };
+    let delta_us = now_ns.saturating_sub(CYCLIC_DIAG_START_NS.load(Ordering::Relaxed)) / 1_000;
+    if tid < usize::BITS as usize {
+        tid_mask.fetch_or(1usize << tid, Ordering::Relaxed);
+    }
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 16 || count.is_power_of_two() {
+        log::warn!(
+            "[cyclic_diag] pid={} t_us={} event={} tid={} count={} clone_threads={} affinity_threads={} setsched_threads={} sleep_threads={}",
+            pid,
+            delta_us,
+            name,
+            tid,
+            count,
+            CYCLIC_DIAG_CLONE_TIDS.load(Ordering::Relaxed).count_ones(),
+            CYCLIC_DIAG_AFFINITY_TIDS
+                .load(Ordering::Relaxed)
+                .count_ones(),
+            CYCLIC_DIAG_SETSCHED_TIDS
+                .load(Ordering::Relaxed)
+                .count_ones(),
+            CYCLIC_DIAG_SLEEP_TIDS.load(Ordering::Relaxed).count_ones()
+        );
+    }
+}
 
 // The base image ships `/bin/busybox` but not individual applet symlinks.
 // Allow a conservative subset of common LTP shell dependencies to fall back
