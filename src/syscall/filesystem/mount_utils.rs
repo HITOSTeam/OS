@@ -674,11 +674,26 @@ fn collect_subtree_mount_clones(
     let ns = current_mount_namespace();
     let state = ns.lock();
     let mut out = Vec::new();
+    let mut unbindable_prefixes = Vec::new();
+    for record in state.mounts() {
+        if record.target != source_display
+            && path_under_mount(&record.target, source_display)
+            && record.propagation == MountPropagation::Unbindable
+        {
+            unbindable_prefixes.push(record.target.clone());
+        }
+    }
     for record in state.mounts() {
         if record.target == source_display || !path_under_mount(&record.target, source_display) {
             continue;
         }
         if excluded_source_prefixes
+            .iter()
+            .any(|prefix| path_under_mount(&record.target, prefix))
+        {
+            continue;
+        }
+        if unbindable_prefixes
             .iter()
             .any(|prefix| path_under_mount(&record.target, prefix))
         {
