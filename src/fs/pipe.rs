@@ -488,9 +488,7 @@ impl Pipe {
             }
             // 到这里说明可以读，我们即将写入
             let to_read = core::cmp::min(avail, out.len());
-            for byte in out.iter_mut().take(to_read) {
-                *byte = ring_buffer.read_byte();
-            }
+            let read_now = ring_buffer.read_into_slice(&mut out[..to_read]);
 
             // 通知 写者，和 epoll
             let writer = ring_buffer.pop_writer();
@@ -500,7 +498,7 @@ impl Pipe {
                 wakeups.push(writer);
             }
             wake_tasks(wakeups);
-            return Ok(to_read);
+            return Ok(read_now);
         }
     }
 
@@ -564,7 +562,11 @@ impl Pipe {
                     task.borrow_mut().pending_signals |= bit;
                 }
                 ring_buffer.remove_writer(&task);
-                return Ok(written);
+                return if written == 0 {
+                    Err(err(SyscallError::EPIPE))
+                } else {
+                    Ok(written)
+                };
             }
             let avail = ring_buffer.available_write();
             let remaining = data.len() - written;
@@ -602,7 +604,7 @@ impl Pipe {
                 block_current_and_run_next();
                 continue;
             }
-            let mut to_write = remaining;
+            let mut to_write = remaining.min(avail);
             if nonblock && to_write > PIPE_BUF {
                 to_write = to_write.min(avail);
             }
@@ -626,9 +628,7 @@ impl Pipe {
                 filter_truncated |= filter_len < to_write;
                 to_write = to_write.min(filter_len);
             }
-            for byte in write_slice[..to_write].iter().copied() {
-                ring_buffer.write_byte(byte);
-            }
+            let to_write = ring_buffer.write_from_slice_bytes(&write_slice[..to_write]);
             written += to_write;
             let reader_to_wake = if to_write > 0 {
                 ring_buffer.pop_reader()
@@ -702,18 +702,14 @@ impl Pipe {
                 continue;
             }
 
-            let mut buf_iter = buf.into_iter();
             let mut read_now = 0usize;
             let to_read = core::cmp::min(avail, want_to_read);
-            for _ in 0..to_read {
-                let Some(byte_ref) = buf_iter.next() else {
+            for dst in buf.buffers {
+                if read_now >= to_read {
                     break;
-                };
-                // Safety: UserBuffer exposes already translated user pages.
-                unsafe {
-                    *byte_ref = ring_buffer.read_byte();
                 }
-                read_now += 1;
+                let n = core::cmp::min(dst.len(), to_read - read_now);
+                read_now += ring_buffer.read_into_slice(&mut dst[..n]);
             }
             let writer = if read_now > 0 {
                 ring_buffer.pop_writer()
@@ -744,19 +740,16 @@ impl Pipe {
         if want_to_write <= INLINE_PIPE_WRITE_BYTES {
             let mut data = [0u8; INLINE_PIPE_WRITE_BYTES];
             let mut written = 0usize;
-            for byte_ref in buf.into_iter() {
-                unsafe {
-                    data[written] = *byte_ref;
-                }
-                written += 1;
+            for src in buf.buffers {
+                let n = src.len();
+                data[written..written + n].copy_from_slice(src);
+                written += n;
             }
             return self.write_from_slice_with_deadline(&data[..written], nonblock, None);
         }
         let mut data = Vec::with_capacity(want_to_write);
-        for byte_ref in buf.into_iter() {
-            unsafe {
-                data.push(*byte_ref);
-            }
+        for src in buf.buffers {
+            data.extend_from_slice(src);
         }
         self.write_from_slice_with_deadline(data.as_slice(), nonblock, None)
     }
@@ -933,26 +926,56 @@ impl PipeRingBuffer {
         }
     }
 
-    /// 环状队列 读取字节
-    /// 此部分设计细节请参考rCore
-    pub fn read_byte(&mut self) -> u8 {
-        self.status = RingBufferStatus::NORMAL;
-        let c = self.data()[self.head];
-        self.head = (self.head + 1) % self.capacity;
-        if self.head == self.tail {
-            self.status = RingBufferStatus::EMPTY;
+    /// Copy queued pipe bytes into `dst` in up to two contiguous chunks.
+    ///
+    /// Linux stores pipe data in page-backed pipe buffers and moves whole
+    /// spans rather than updating ring state per byte.  This ring still uses a
+    /// byte array, but keeping the hot path chunked avoids one status/head
+    /// update per byte for lmbench's pipe bandwidth workload.
+    fn read_into_slice(&mut self, dst: &mut [u8]) -> usize {
+        let n = core::cmp::min(dst.len(), self.available_read());
+        if n == 0 {
+            return 0;
         }
-        c
+        let first = core::cmp::min(n, self.capacity - self.head);
+        let head = self.head;
+        let arr = self.data();
+        dst[..first].copy_from_slice(&arr[head..head + first]);
+        if n > first {
+            dst[first..n].copy_from_slice(&arr[..n - first]);
+        }
+        self.head = (self.head + n) % self.capacity;
+        self.status = if self.head == self.tail {
+            RingBufferStatus::EMPTY
+        } else {
+            RingBufferStatus::NORMAL
+        };
+        n
     }
-    pub fn write_byte(&mut self, byte: u8) {
-        self.status = RingBufferStatus::NORMAL;
-        self.ensure_backing();
-        let tail = self.tail;
-        self.data_mut()[tail] = byte;
-        self.tail = (self.tail + 1) % self.capacity;
-        if self.tail == self.head {
-            self.status = RingBufferStatus::FULL;
+
+    /// Copy `src` into free pipe space in up to two contiguous chunks.
+    fn write_from_slice_bytes(&mut self, src: &[u8]) -> usize {
+        let n = core::cmp::min(src.len(), self.available_write());
+        if n == 0 {
+            return 0;
         }
+        self.ensure_backing();
+        let first = core::cmp::min(n, self.capacity - self.tail);
+        let tail = self.tail;
+        {
+            let arr = self.data_mut();
+            arr[tail..tail + first].copy_from_slice(&src[..first]);
+            if n > first {
+                arr[..n - first].copy_from_slice(&src[first..n]);
+            }
+        }
+        self.tail = (self.tail + n) % self.capacity;
+        self.status = if self.tail == self.head {
+            RingBufferStatus::FULL
+        } else {
+            RingBufferStatus::NORMAL
+        };
+        n
     }
     //. 队列是否有可读字节
     pub fn available_read(&self) -> usize {
@@ -1389,7 +1412,7 @@ impl File for Pipe {
     /// `File::read` 的管道实现：从用户态 `UserBuffer` 接收目标地址，阻塞读取。
     ///
     /// 与 `read_to_slice` 逻辑相同，但目标是散布的用户页帧（`UserBuffer`），
-    /// 通过迭代器逐字节写入（内核已映射用户页，此处直接 unsafe 写指针）。
+    /// 读取时按每段用户页帧批量拷贝，避免在 pipe 热路径逐字节更新环形队列。
     /// 读到数据后返回短读（short read）而非等满 `want_to_read`，符合 POSIX 管道语义。
     fn read(&self, buf: UserBuffer) -> usize {
         self.read_user_result(buf, false).unwrap_or(0)
@@ -1399,32 +1422,7 @@ impl File for Pipe {
     /// 大写入仍使用 `Vec`。预先拷贝是因为 `write_from_slice` 在阻塞期间需要
     /// 释放 buffer 锁，此时不能持有对用户页面的引用。
     fn write(&self, buf: UserBuffer) -> usize {
-        assert!(self.writable());
-        let want_to_write = buf.len();
-        if want_to_write == 0 {
-            return 0;
-        }
-        if want_to_write <= INLINE_PIPE_WRITE_BYTES {
-            let mut data = [0u8; INLINE_PIPE_WRITE_BYTES];
-            let mut written = 0usize;
-            for byte_ref in buf.into_iter() {
-                unsafe {
-                    data[written] = *byte_ref;
-                }
-                written += 1;
-            }
-            return self
-                .write_from_slice_with_deadline(&data[..written], false, None)
-                .unwrap_or(0);
-        }
-        let mut data = Vec::with_capacity(want_to_write);
-        for byte_ref in buf.into_iter() {
-            unsafe {
-                data.push(*byte_ref);
-            }
-        }
-        self.write_from_slice_with_deadline(data.as_slice(), false, None)
-            .unwrap_or(0)
+        self.write_user_result(buf, false).unwrap_or(0)
     }
 
     fn poll_mask(&self) -> i16 {
