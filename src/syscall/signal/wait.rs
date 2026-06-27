@@ -157,6 +157,7 @@ fn take_pending_in_set(
     let sig = pending.trailing_zeros() as usize + 1;
     if let Some(bit) = sig_bit(sig) {
         inner.pending_signals &= !bit;
+        task.refresh_signal_pending(inner.pending_signals);
     }
     let mut sender_pid = 0;
     let mut sender_uid = 0;

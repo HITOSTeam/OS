@@ -300,6 +300,7 @@ fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
     if clear_bits != 0 {
         let mut inner = task.borrow_mut();
         inner.pending_signals &= !clear_bits;
+        task.refresh_signal_pending(inner.pending_signals);
     }
     if saw_interrupt || saw_restart {
         let pid = current_process().getpid();

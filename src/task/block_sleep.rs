@@ -5,7 +5,10 @@ use core::{cmp::Ordering, time};
 use crate::task::signal::{SIGALRM_NUM, pick_task_for_signal, queue_process_signal, signal_bit};
 use crate::{
     config::MAX_HARTS,
-    task::{manager::wakeup_task, task_block::TaskControlBlock},
+    task::{
+        manager::{prime_fair_timer_wakeup_lag, wakeup_task},
+        task_block::TaskControlBlock,
+    },
     time::{arm_timer_for_deadline_ns, get_time_ms, get_time_ns},
 };
 use alloc::{
@@ -1018,6 +1021,7 @@ fn deliver_alarm(pid: usize) {
             inner.pending_signals,
         )
     };
+    task.mark_signal_pending();
     crate::log_if!(
         DEBUG_UNIXBENCH,
         info,
@@ -1309,6 +1313,7 @@ pub fn check_timer() {
                 timer.time_expired_ns,
                 current_ns
             );
+            prime_fair_timer_wakeup_lag(&task);
             wakeup_task(task);
             // Continue looping in case more timers have expired at the same tick.
             continue;

@@ -9,11 +9,15 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, PageTable, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
-use crate::task::block_sleep::{check_timer, timer_work_pending_for_user_return};
+use crate::task::block_sleep::{
+    check_timer, take_deferred_kernel_timer_tick, timer_work_pending_for_user_return,
+};
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
-use crate::task::signal::{MAX_SIG, SIG_DFL, SIG_IGN, check_if_current_signals_error, signal_bit};
+use crate::task::signal::{
+    MAX_SIG, SIG_DFL, SIG_IGN, check_if_current_signals_error, check_task_signals_error, signal_bit,
+};
 use crate::time::set_next_trigger;
 use riscv::{
     interrupt::Trap,
@@ -337,11 +341,26 @@ pub fn trap_handler() {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
-    // Progress timers even if S-mode timer interrupts are disabled during syscalls.
-    // This avoids long-running syscall-heavy workloads (e.g., hackbench fork storms)
-    // from starving `sleep()/nanosleep()` wakeups.
-    if timer_work_pending_for_user_return() {
+    // Progress timers even if S-mode timer interrupts are deferred during syscalls.
+    // When a tick did arrive in kernel mode, mirror the user-mode timer interrupt
+    // scheduler work before returning: charge runtime, process RT bandwidth/fair
+    // deadline expiry, and reschedule if needed.  This is the local equivalent of
+    // Linux's scheduler_tick() setting TIF_NEED_RESCHED for syscall-heavy tasks.
+    let deferred_scheduler_tick = take_deferred_kernel_timer_tick();
+    if deferred_scheduler_tick || timer_work_pending_for_user_return() {
         check_timer();
+    }
+    if deferred_scheduler_tick {
+        crate::task::processor::account_current_task_tick();
+        crate::syscall::misc::check_current_rlimit_cpu();
+        if let Some((errno, msg)) = check_if_current_signals_error() {
+            crate::task::signal::log_signal_exit(msg);
+            exit_group_and_run_next(errno);
+        }
+        crate::fs::cgroup_maybe_block_current();
+        if crate::task::processor::should_preempt_current_on_tick() {
+            suspend_current_and_run_next();
+        }
     }
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
@@ -604,6 +623,7 @@ fn handle_user_exception(code: usize, stval: usize) {
         if let Some(task) = crate::task::processor::current_task() {
             if let Some(bit) = signal_bit(sig) {
                 task.borrow_mut().pending_signals |= bit;
+                task.mark_signal_pending();
             }
         }
         return;
@@ -639,6 +659,19 @@ pub fn trap_return() -> ! {
             unsafe { asm!("mv {}, sp", out(reg) s) };
             s
         });
+    }
+    // A task may receive a signal while it is already runnable and waiting in
+    // the scheduler queue. Such a task reaches this path directly from the
+    // scheduler, bypassing `trap_handler()`, so handle pending user-return
+    // signals here as Linux does before returning to userspace.
+    if let Some(task) = crate::task::processor::current_task()
+        && task.has_signal_pending()
+    {
+        if let Some((errno, msg)) = check_task_signals_error(&task) {
+            crate::task::signal::log_signal_exit(msg);
+            exit_group_and_run_next(errno);
+        }
+        crate::syscall::signal::maybe_deliver_signal();
     }
     // this shouln't be interrupted
     disable_supervisor_interrupt();

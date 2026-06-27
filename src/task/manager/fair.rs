@@ -275,12 +275,11 @@ fn scale_fair_delta(delta_ns: u64, weight: u128) -> u128 {
 }
 
 fn fair_entity_vslice_ns(nice: i32, kind: EnqueueKind) -> u128 {
-    // Linux EEVDF 使用 sysctl_sched_base_slice 作为实体请求大小。我们还没有
-    // hrtick/update_curr 驱动的公平抢占，因此实际公平抢占点是调度器 tick。
-    // 让虚拟请求与这个粒度对齐；否则刚 clone 出来的公平调度工作线程只会落后创建者
-    // 约 0.7ms，而创建者在重新入队前可能被记满一个 10ms tick，这会破坏 fork-heavy
-    // 负载下 WF_FORK 的父任务继续运行行为。
-    const FAIR_BASE_SLICE_NS: u64 = 10_000_000;
+    // Linux EEVDF 使用 sysctl_sched_base_slice 作为实体请求大小，默认量级
+    // 是亚毫秒到数毫秒。当前内核还没有 hrtick，实际公平抢占仍主要受
+    // 100Hz tick 约束；这里用 2ms request，而不是旧的 10ms tick 宽度，
+    // 避免 400 个 fair hackbench 实体把短控制任务的等待放大到数秒。
+    const FAIR_BASE_SLICE_NS: u64 = 2_000_000;
     let mut vslice = scale_fair_delta(FAIR_BASE_SLICE_NS, fair_nice_weight(nice));
     if kind == EnqueueKind::Initial {
         // Linux PLACE_DEADLINE_INITIAL 让新任务以半个 slice 起步，
@@ -292,11 +291,13 @@ fn fair_entity_vslice_ns(nice: i32, kind: EnqueueKind) -> u128 {
 
 fn fair_lag_limit_ns(nice: i32) -> u128 {
     // Linux 的 entity_lag() 会把虚拟 lag 限制在大约 max_slice + TICK_NSEC。
-    // 我们的周期 tick 是 10ms，而 EEVDF 请求是亚毫秒级。
-    fair_entity_vslice_ns(nice, EnqueueKind::Requeue).saturating_add(10_000_000)
+    fair_entity_vslice_ns(nice, EnqueueKind::Requeue)
+        .saturating_add(u128::from(crate::time::tick_period_ns()))
 }
 
-pub(super) const FAIR_PICK_SCAN_LIMIT: usize = 32;
+fn fair_wakeup_lag_cap_ns(nice: i32) -> u128 {
+    fair_lag_limit_ns(nice).saturating_mul(2)
+}
 
 /// 任务重新入队时根据已消耗的 CPU 时间累加 vruntime，并执行一个简化版
 /// Linux `place_entity()`：按 avg/min vruntime 放置实体，再用
@@ -330,14 +331,22 @@ pub(super) fn place_fair_task_entity(
     // 新加入任务的基准 这与上面的不是重复 (min_task_vruntime的更新 )
     let placement_vruntime = avg_vruntime.max(group.min_task_vruntime);
     let weight = fair_nice_weight(inner.nice);
-    // 是否是重复进入，如果是重复进入，那么会有lag （之前推出时候保存的）
-    let saved_vlag = core::mem::take(&mut inner.fair_vlag_ns).min(fair_lag_limit_ns(inner.nice));
+    // 是否是重复进入，如果是重复进入，那么会有 lag（之前退出或显式 wakeup
+    // prime 保存的）。普通 sleep lag 仍在 record_fair_sleep_lag() 中按
+    // entity_lag() 封顶；这里允许 timer 到期路径写入的额外有界 credit 生效。
+    let saved_vlag =
+        core::mem::take(&mut inner.fair_vlag_ns).min(fair_wakeup_lag_cap_ns(inner.nice));
     if kind == EnqueueKind::Initial {
-        // Linux 的 fork placement 会让子任务靠近运行队列虚拟时间，并依赖
-        // WF_FORK 唤醒抢占规则，而不是额外背上一个本地 tick 的 vruntime 债务。
-        // 如果在这里记上这笔债，短 setup 线程在提升自身策略/优先级前会被无关公平调度
-        // 负载挡住。
-        inner.fair_vruntime_ns = placement_vruntime;
+        // Linux `wake_up_new_task()`/`place_entity()` 会把 fork 出来的实体放在
+        // 当前 rq 的虚拟时间附近；当父任务仍是当前实体时，子任务不能无条件落到
+        // 已有数百个 wakeup 实体的平均值后面。取当前同组实体与 avg 中较小者，
+        // 再配合 Initial 半 slice deadline，使短控制进程在 fork-heavy 压力下
+        // 能尽快完成 exec/setup，但仍不在 add_task() 中立即抢占父任务。
+        let fork_base = current_entity
+            .map(|(current_vruntime, _)| current_vruntime)
+            .unwrap_or(placement_vruntime)
+            .min(placement_vruntime);
+        inner.fair_vruntime_ns = fork_base.max(group.min_task_vruntime);
     } else if kind == EnqueueKind::Wakeup {
         // 对于重新入队的，我们使用
         // 之前保存的vlag对新进入的vruntime进行修正，亏欠（lag)越多，placement_vruntime被减去的越多，从而
@@ -591,4 +600,78 @@ pub fn record_fair_sleep_lag(task: &Arc<TaskControlBlock>) {
     // lag = avg - vruntime，取正值（saturating_sub 在 avg < vruntime 时得 0），
     // 封顶到 limit，存入 fair_vlag_ns 供唤醒时 PLACE_LAG 补偿使用。
     inner.fair_vlag_ns = avg_vruntime.saturating_sub(task_vruntime).min(limit);
+}
+
+/// 给到期的 timer sleeper 一个有界的 wakeup lag。
+///
+/// Linux 的 CFS/EEVDF 通过 `PLACE_LAG`、wakeup preempt 和细粒度 tick/hrtick
+/// 让短睡眠控制线程在唤醒后很快重新参与运行。本内核目前没有完整 hrtick，
+/// 在 400 个 fair 实体的 hackbench 负载下，timer sleeper 即使被按时唤醒，
+/// 也可能因为没有正 lag 而被放到平均虚拟时间附近，随后排队几十秒。
+///
+/// 这里只在睡眠定时器真正到期时补一个与 `entity_lag()` 同量级的有界 credit；
+/// 由于当前没有 hrtick，再额外给一个 tick 量级的余量以补偿粗粒度抢占，
+/// 仍然由 `place_fair_task_entity(Wakeup)` 做最终放置，避免把这个策略扩散到
+/// pipe/socket/futex 等普通同步或 I/O 唤醒。
+pub fn prime_fair_timer_wakeup_lag(task: &Arc<TaskControlBlock>) {
+    let mut inner = task.borrow_mut();
+    if !matches!(
+        sched_class(inner.scheduling.sched_policy),
+        Some(SchedClass::Fair)
+    ) {
+        return;
+    }
+    let credit = fair_wakeup_lag_cap_ns(inner.nice);
+    inner.fair_vlag_ns = inner.fair_vlag_ns.max(credit);
+}
+
+/// 给同步等待者一个保守的 wakeup lag。
+///
+/// futex/join/wait4 这类唤醒通常是控制线程等待某个明确事件完成；在 hackbench
+/// 这类 400 个 fair pipe worker 的压力下，如果这些控制线程按普通 I/O wakeup
+/// 放置，就容易在事件已经完成后仍长时间排队。这里不碰 pipe/socket 数据唤醒，
+/// 只给同步完成路径一个 `entity_lag()` 级别的有界 credit。
+pub fn prime_fair_sync_wakeup_lag(task: &Arc<TaskControlBlock>) {
+    let mut inner = task.borrow_mut();
+    if !matches!(
+        sched_class(inner.scheduling.sched_policy),
+        Some(SchedClass::Fair)
+    ) {
+        return;
+    }
+    let limit = fair_lag_limit_ns(inner.nice);
+    inner.fair_vlag_ns = inner.fair_vlag_ns.max(limit);
+}
+
+/// 保护正在 fork/clone 的 fair 父任务，避免 WF_FORK 场景被刚创建的 fair
+/// 子任务或无关 fair 负载在下一个 tick 立即打断。
+///
+/// Linux 的 `wake_up_new_task(WF_FORK)` 不会让 fair 子任务直接抢占父任务；
+/// 在本内核没有 hrtick/load-balance 细节时，如果父任务创建 cyclictest 线程组时
+/// 太早让出，首个子线程升到 SCHED_FIFO 后会反过来饿住仍在创建后续线程的父任务。
+/// 这里仅延长当前 fair 父任务的本轮 deadline，不给子任务额外信用，也不越过
+/// RT 抢占规则。
+pub fn protect_fair_fork_parent(task: &Arc<TaskControlBlock>) {
+    let now_ns = current_time_ns_usize() as u64;
+    let mut inner = task.borrow_mut();
+    if !matches!(
+        sched_class(inner.scheduling.sched_policy),
+        Some(SchedClass::Fair)
+    ) {
+        return;
+    }
+    let current_runtime_ns =
+        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
+            inner
+                .cpu_time_ns
+                .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
+        } else {
+            inner.cpu_time_ns
+        };
+    let delta_ns = current_runtime_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
+    let vruntime = inner
+        .fair_vruntime_ns
+        .saturating_add(scale_fair_delta(delta_ns, fair_nice_weight(inner.nice)));
+    let protected_deadline = vruntime.saturating_add(fair_wakeup_lag_cap_ns(inner.nice));
+    inner.fair_deadline_ns = inner.fair_deadline_ns.max(protected_deadline);
 }

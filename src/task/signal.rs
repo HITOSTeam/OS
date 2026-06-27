@@ -27,7 +27,7 @@ use crate::{
     println,
     task::processor::current_process,
     task::{
-        manager::{pid2process, wakeup_task, wakeup_tasks},
+        manager::{pid2process, wakeup_signal_tasks, wakeup_task, wakeup_tasks},
         pid_namespace_member_pids,
         process_block::ProcessControlBlock,
         process_visible_in_pid_namespace,
@@ -336,10 +336,10 @@ impl SignalFlags {
         }
     }
 }
-pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
-    let Some(task) = current_task() else {
+pub fn check_task_signals_error(task: &Arc<TaskControlBlock>) -> Option<(i32, &'static str)> {
+    if !task.has_signal_pending() {
         return None;
-    };
+    }
     let (pending, mask) = {
         let inner = task.borrow_mut();
         (inner.pending_signals, inner.signal_mask)
@@ -386,6 +386,7 @@ pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
             // Ignored signals are discarded.
             let mut inner = task.borrow_mut();
             inner.pending_signals &= !bit;
+            task.refresh_signal_pending(inner.pending_signals);
             continue;
         }
         if handler != SIG_DFL {
@@ -401,6 +402,11 @@ pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
         }
     }
     None
+}
+
+pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
+    let task = current_task()?;
+    check_task_signals_error(&task)
 }
 
 pub fn log_signal_exit(msg: &'static str) {
@@ -616,6 +622,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
                 let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 (tid, inner.pending_signals, inner.signal_mask)
             };
+            t.mark_signal_pending();
             let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
             if on_cpu != TaskControlBlock::OFF_CPU {
                 running_signal_ipi_mask |= hart_mask_bit(on_cpu);
@@ -632,7 +639,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             );
         }
     }
-    wakeup_tasks(tasks);
+    wakeup_signal_tasks(tasks);
     if running_signal_ipi_mask != 0 {
         send_signal_ipis(running_signal_ipi_mask);
     }
@@ -670,6 +677,7 @@ pub fn kill_current(signum: i32) -> isize {
             let mut inner = t.borrow_mut();
             mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0, 0);
         }
+        t.mark_signal_pending();
         let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
         if on_cpu != TaskControlBlock::OFF_CPU {
             running_signal_ipi_mask |= hart_mask_bit(on_cpu);
@@ -741,6 +749,7 @@ pub fn queue_process_signal_info(
             !already,
         )
     };
+    task.mark_signal_pending();
     crate::log_if!(
         DEBUG_UNIXBENCH,
         info,

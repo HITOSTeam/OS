@@ -9,11 +9,13 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
-use crate::task::block_sleep::{check_timer, timer_work_pending_for_user_return};
+use crate::task::block_sleep::{
+    check_timer, take_deferred_kernel_timer_tick, timer_work_pending_for_user_return,
+};
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
-use crate::task::signal::check_if_current_signals_error;
+use crate::task::signal::{check_if_current_signals_error, check_task_signals_error};
 use crate::time::set_next_trigger;
 
 const ECODE_SYSCALL: usize = 0xB;
@@ -300,8 +302,21 @@ pub fn trap_handler() {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
-    if timer_work_pending_for_user_return() {
+    let deferred_scheduler_tick = take_deferred_kernel_timer_tick();
+    if deferred_scheduler_tick || timer_work_pending_for_user_return() {
         check_timer();
+    }
+    if deferred_scheduler_tick {
+        crate::task::processor::account_current_task_tick();
+        crate::syscall::misc::check_current_rlimit_cpu();
+        if let Some((errno, msg)) = check_if_current_signals_error() {
+            crate::task::signal::log_signal_exit(msg);
+            exit_group_and_run_next(errno);
+        }
+        crate::fs::cgroup_maybe_block_current();
+        if crate::task::processor::should_preempt_current_on_tick() {
+            suspend_current_and_run_next();
+        }
     }
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
@@ -323,6 +338,18 @@ pub fn trap_return() -> ! {
     }
     // Keep kernel trap entry active while we are still running in kernel mode.
     set_kernel_trap_entry();
+    // A task can receive a signal while it is already runnable. When the
+    // scheduler later restores it, execution reaches this path directly without
+    // another trap handler pass, so honor pending signals before userspace.
+    if let Some(task) = crate::task::processor::current_task()
+        && task.has_signal_pending()
+    {
+        if let Some((errno, msg)) = check_task_signals_error(&task) {
+            crate::task::signal::log_signal_exit(msg);
+            exit_group_and_run_next(errno);
+        }
+        crate::syscall::signal::maybe_deliver_signal();
+    }
     {
         let cx = get_trap_context();
         cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;

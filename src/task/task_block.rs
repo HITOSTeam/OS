@@ -29,12 +29,27 @@ pub struct TaskControlBlock {
     pub on_cpu: AtomicUsize,
     /// 当唤醒方尝试唤醒仍处于 `on_cpu` 状态的任务时置位。
     pub wakeup_pending: AtomicBool,
+    /// 线程存在待处理信号的快速标志。
+    ///
+    /// 对应 Linux 的 `TIF_SIGPENDING` 思路：返回用户态前先看这个原子标志，
+    /// 无信号的热路径不需要进入 TCB 内层锁。
+    signal_pending: AtomicBool,
     /// 当前任务是否已经进入某个每 hart 就绪队列。
     pub in_ready_queue: AtomicBool,
     /// 当前持有该任务的 hart 运行队列；未入队时为 `OFF_CPU`。
     pub ready_queue_hart: AtomicUsize,
+    /// futex wait 入队后的反向句柄。
+    ///
+    /// 退出清理可凭它直接进入对应 futex bucket 删除 waiter，避免扫描所有
+    /// futex 队列；正常 wake/timeout/signal 路径会清掉这个句柄。
+    futex_wait: Mutex<Option<FutexWaitHandle>>,
     // 可变字段
     inner: Mutex<TaskControlBlockInner>,
+}
+
+pub struct FutexWaitHandle {
+    pub key: (usize, usize),
+    pub in_queue: Arc<AtomicBool>,
 }
 
 static TASK_TCB_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -78,6 +93,18 @@ impl TaskControlBlock {
 
     pub fn clear_on_cpu(&self) {
         self.on_cpu.store(Self::OFF_CPU, Ordering::Release);
+    }
+
+    pub fn mark_signal_pending(&self) {
+        self.signal_pending.store(true, Ordering::Release);
+    }
+
+    pub fn refresh_signal_pending(&self, pending: u64) {
+        self.signal_pending.store(pending != 0, Ordering::Release);
+    }
+
+    pub fn has_signal_pending(&self) -> bool {
+        self.signal_pending.load(Ordering::Acquire)
     }
 
     pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
@@ -161,6 +188,34 @@ impl TaskControlBlock {
     pub fn cancel_sleep_timers(&self) {
         let mut inner = self.borrow_mut();
         inner.sleep_timer_seq = inner.sleep_timer_seq.wrapping_add(1);
+    }
+
+    pub fn set_futex_wait(&self, key: (usize, usize), in_queue: Arc<AtomicBool>) {
+        *self.futex_wait.lock() = Some(FutexWaitHandle { key, in_queue });
+    }
+
+    pub fn update_futex_wait_key(&self, in_queue: &Arc<AtomicBool>, key: (usize, usize)) {
+        let mut handle = self.futex_wait.lock();
+        if let Some(handle) = handle.as_mut()
+            && Arc::ptr_eq(&handle.in_queue, in_queue)
+        {
+            handle.key = key;
+        }
+    }
+
+    pub fn clear_futex_wait(&self, in_queue: &Arc<AtomicBool>) {
+        let mut handle = self.futex_wait.lock();
+        if handle
+            .as_ref()
+            .map(|handle| Arc::ptr_eq(&handle.in_queue, in_queue))
+            .unwrap_or(false)
+        {
+            *handle = None;
+        }
+    }
+
+    pub fn take_futex_wait(&self) -> Option<FutexWaitHandle> {
+        self.futex_wait.lock().take()
     }
 }
 
@@ -312,8 +367,10 @@ impl TaskControlBlock {
             cpu_id: AtomicUsize::new(0),
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             wakeup_pending: AtomicBool::new(false),
+            signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
+            futex_wait: Mutex::new(None),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -411,8 +468,10 @@ impl TaskControlBlock {
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             // 唤醒标记/就绪队列标记的初值均为 false：刚创建还未排队
             wakeup_pending: AtomicBool::new(false),
+            signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
+            futex_wait: Mutex::new(None),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,

@@ -5,7 +5,7 @@ use crate::{
     config::clock_freq,
 };
 
-///默认一秒钟执行100个时钟中断
+/// 默认一秒钟执行 100 个时钟中断。
 const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
 const NSEC_PER_SEC: u128 = 1_000_000_000;
@@ -88,6 +88,10 @@ pub fn set_next_trigger() {
 
 fn periodic_tick_delta() -> usize {
     (clock_freq() / TICKS_PER_SEC).max(1)
+}
+
+pub fn tick_period_ns() -> u64 {
+    (1_000_000_000u64 / TICKS_PER_SEC as u64).max(1)
 }
 
 #[cfg(target_arch = "loongarch64")]

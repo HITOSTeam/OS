@@ -12,9 +12,9 @@ use crate::{
             PID2PCB, account_rt_runtime, fair_current_deadline_expired,
             fair_wakeup_preempts_current_on_hart, fetch_task, has_ready_rt_any_at_or_above,
             has_ready_rt_at_or_above, has_ready_rt_higher_than, has_ready_tasks,
-            ready_queue_lengths, record_fair_sleep_lag, remove_inactive_task,
-            remove_sched_timer_refs, requeue_task, rt_bandwidth_throttled, wakeup_task,
-            wakeup_tasks,
+            prime_fair_sync_wakeup_lag, ready_queue_lengths, record_fair_sleep_lag,
+            remove_inactive_task, remove_sched_timer_refs, requeue_task, rt_bandwidth_throttled,
+            wakeup_task, wakeup_tasks,
         },
         process_block::ProcessControlBlock,
         runtime::{monotonic_time_ns, start_task_runtime_slice},
@@ -378,6 +378,9 @@ fn finish_thread_exit_cleanup(
             res.detach_for_process_exit();
         }
     }
+    for waiter in &cleanup.join_waiters {
+        prime_fair_sync_wakeup_lag(waiter);
+    }
     wakeup_tasks(cleanup.join_waiters);
 
     (
@@ -421,7 +424,11 @@ fn queue_exited_child_and_drain_waiters(
     if should_queue {
         parent_inner.exited_children.push_back(Arc::clone(child));
     }
-    parent_inner.wait_queue.drain(..).collect::<Vec<_>>()
+    let waiters = parent_inner.wait_queue.drain(..).collect::<Vec<_>>();
+    for waiter in &waiters {
+        prime_fair_sync_wakeup_lag(waiter);
+    }
+    waiters
 }
 
 /// 进程组退出时清理同组所有其他线程，回收它们的用户态资源。
