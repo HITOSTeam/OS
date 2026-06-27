@@ -455,6 +455,69 @@ pub(super) fn current_fair_entity_for_group(
     Some((vruntime, weight))
 }
 
+fn peek_fair_group_task(group: &FairGroupQueue, hart_id: usize) -> Option<u64> {
+    let eligible_vruntime = group.avg_task_vruntime().unwrap_or(group.min_task_vruntime);
+    let mut fallback = None;
+
+    for (_deadline, vruntime, task_id) in group.task_order.iter().copied() {
+        let Some(entity) = group.tasks.get(&task_id) else {
+            continue;
+        };
+        if entity.vruntime != vruntime {
+            continue;
+        }
+        let candidate = Arc::clone(&entity.task);
+        let status = candidate.borrow_mut().task_status;
+        let queued_here = candidate
+            .ready_queue_hart
+            .load(core::sync::atomic::Ordering::Acquire)
+            == hart_id;
+        if !queued_here || status != crate::task::task_block::TaskStatus::Ready {
+            continue;
+        }
+        if entity.vruntime <= eligible_vruntime {
+            return Some(task_id);
+        }
+        if fallback
+            .map(|(fallback_vruntime, _)| entity.vruntime < fallback_vruntime)
+            .unwrap_or(true)
+        {
+            fallback = Some((entity.vruntime, task_id));
+        }
+    }
+
+    fallback.map(|(_, task_id)| task_id)
+}
+
+/// Return whether `task` is already the entity the fair runqueue would pick next.
+///
+/// Linux's wakeup preemption path enqueues the wakee and then asks EEVDF's
+/// picker whether that wakee became the next entity. Our older approximation
+/// only compared the current and wakee deadlines, which misses cases where a
+/// timer/control task is correctly placed at the front of a large runqueue but
+/// the direct pairwise comparison still preserves the current task.
+pub fn fair_task_is_next_on_hart(task: &Arc<TaskControlBlock>, hart_id: usize) -> bool {
+    let hart_id = hart_id % MAX_HARTS;
+    let task_id = fair_task_id(task);
+    let group_id = task.borrow_mut().fair_group_id;
+    let rq = TASK_MANAGER.ready_queues[hart_id].lock();
+
+    for (indexed_vruntime, candidate_group_id) in rq.fair_order.iter().copied() {
+        let Some(group) = rq.fair_groups.get(&candidate_group_id) else {
+            continue;
+        };
+        if group.vruntime != indexed_vruntime {
+            continue;
+        }
+        let Some(candidate_task_id) = peek_fair_group_task(group, hart_id) else {
+            continue;
+        };
+        return candidate_group_id == group_id && candidate_task_id == task_id;
+    }
+
+    false
+}
+
 /// 返回当前 fair 任务是否已耗尽自己的 EEVDF 虚拟请求（tick 抢冒判据）。
 ///
 /// 对应 Linux `update_deadline()`：在 `se->vruntime` 到达 `se->deadline` 时

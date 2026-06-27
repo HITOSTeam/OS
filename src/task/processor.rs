@@ -9,7 +9,7 @@ use crate::{
         FilesStruct, INITPROC,
         id::{KernelStack, TaskUserRes},
         manager::{
-            PID2PCB, account_rt_runtime, fair_current_deadline_expired,
+            PID2PCB, account_rt_runtime, fair_current_deadline_expired, fair_task_is_next_on_hart,
             fair_wakeup_preempts_current_on_hart, fetch_task, has_ready_rt_any_at_or_above,
             has_ready_rt_at_or_above, has_ready_rt_higher_than, has_ready_tasks,
             prime_fair_sync_wakeup_lag, ready_queue_lengths, record_fair_sleep_lag,
@@ -689,6 +689,7 @@ fn wakeup_should_preempt_task(
         }
         (SchedClass::Fair, SchedClass::Fair) => {
             fair_wakeup_should_preempt_current(&current, woken, target_hart)
+                || fair_task_is_next_on_hart(woken, target_hart)
         }
         (SchedClass::Fair, SchedClass::Fifo | SchedClass::Rr) => false,
     }

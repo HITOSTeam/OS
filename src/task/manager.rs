@@ -20,7 +20,7 @@ mod run_queue;
 pub use self::cleanup::{remove_inactive_task, remove_sched_timer_refs, remove_timer};
 pub use self::diagnostics::dump_system_state;
 pub use self::fair::{
-    fair_current_deadline_expired, fair_wakeup_preempts_current_on_hart,
+    fair_current_deadline_expired, fair_task_is_next_on_hart, fair_wakeup_preempts_current_on_hart,
     prime_fair_sync_wakeup_lag, prime_fair_timer_wakeup_lag, protect_fair_fork_parent,
     record_fair_sleep_lag,
 };
