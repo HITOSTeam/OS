@@ -251,11 +251,30 @@ pub(crate) fn move_mount_subtree_with_propagation(
         return true;
     }
 
-    let event_peer_group = next_mount_peer_group_id();
-    for dest in shared_group_destinations(&base, new_target, event_peer_group, None) {
+    let moved_root = moved_records
+        .iter()
+        .find(|record| record.target == new_target && record.stack_seq == root_stack_seq)
+        .cloned();
+    let preserve_moved_root_group = moved_root
+        .as_ref()
+        .is_some_and(|record| record.peer_group_id.is_some());
+    let event_peer_group = moved_root
+        .as_ref()
+        .and_then(|record| record.peer_group_id)
+        .unwrap_or_else(next_mount_peer_group_id);
+    let origin_master_group = moved_root
+        .as_ref()
+        .and_then(|record| record.master_group_id)
+        .filter(|_| preserve_moved_root_group);
+
+    for dest in shared_group_destinations(&base, new_target, event_peer_group, origin_master_group)
+    {
         let dest_ns_id = mount_namespace_id(&dest.ns);
         let current_ns_id = mount_namespace_id(&current_ns);
         if dest_ns_id == current_ns_id && dest.target == new_target {
+            if preserve_moved_root_group {
+                continue;
+            }
             with_mount_namespace_mut(&current_ns, |state| {
                 if let Some(record) = state.mounts_mut().iter_mut().find(|record| {
                     record.target == new_target && record.stack_seq == root_stack_seq
@@ -274,9 +293,17 @@ pub(crate) fn move_mount_subtree_with_propagation(
             cloned.target = rebase_mount_path(&record.target, new_target, &dest.target);
             cloned.stack_seq = next_mount_stack_seq();
             if record.target == new_target && record.stack_seq == root_stack_seq {
-                cloned.propagation = dest.propagation;
-                cloned.peer_group_id = dest.peer_group_id;
-                cloned.master_group_id = dest.master_group_id;
+                if preserve_moved_root_group {
+                    if let Some(root) = &moved_root {
+                        cloned.propagation = root.propagation;
+                        cloned.peer_group_id = root.peer_group_id;
+                        cloned.master_group_id = root.master_group_id;
+                    }
+                } else {
+                    cloned.propagation = dest.propagation;
+                    cloned.peer_group_id = dest.peer_group_id;
+                    cloned.master_group_id = dest.master_group_id;
+                }
             }
             cloned_records.push(cloned);
         }
@@ -622,6 +649,26 @@ fn collect_subtree_mount_clones(
     out
 }
 
+fn bind_should_clone_subtree(recursive_bind: bool, source_mount: Option<&MountRecord>) -> bool {
+    recursive_bind
+        || source_mount
+            .is_some_and(|mount| mount.peer_group_id.is_some() || mount.master_group_id.is_some())
+}
+
+fn collect_bind_subtree_mount_clones(
+    source_display: &str,
+    event_id: usize,
+    excluded_source_prefixes: &[String],
+    recursive_bind: bool,
+    source_mount: Option<&MountRecord>,
+) -> Vec<MountSubtreeClone> {
+    if bind_should_clone_subtree(recursive_bind, source_mount) {
+        collect_subtree_mount_clones(source_display, event_id, excluded_source_prefixes)
+    } else {
+        Vec::new()
+    }
+}
+
 fn push_subtree_mount_clones(
     ns: &MountNamespace,
     target: &str,
@@ -893,6 +940,7 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     source_display: &str,
     fs_type: &str,
     flags: usize,
+    recursive_bind: bool,
 ) {
     let source_mount = mount_lookup_for_abs(source_display);
     let source_is_exact_mount = source_mount
@@ -917,7 +965,13 @@ pub(crate) fn create_bind_mount_record_with_propagation(
             } else {
                 Vec::new()
             };
-            let subtree_clones = collect_subtree_mount_clones(source_display, event_id, &excluded);
+            let subtree_clones = collect_bind_subtree_mount_clones(
+                source_display,
+                event_id,
+                &excluded,
+                recursive_bind,
+                source_mount.as_ref(),
+            );
             let event_peer_group = source_peer_group.unwrap_or_else(next_mount_peer_group_id);
             let origin_master_group = source_master_group;
             let mut created_any = false;
@@ -959,7 +1013,13 @@ pub(crate) fn create_bind_mount_record_with_propagation(
         } else {
             Vec::new()
         };
-        let subtree_clones = collect_subtree_mount_clones(source_display, event_id, &excluded);
+        let subtree_clones = collect_bind_subtree_mount_clones(
+            source_display,
+            event_id,
+            &excluded,
+            recursive_bind,
+            source_mount.as_ref(),
+        );
         push_mount_record(
             target,
             source,
@@ -983,7 +1043,13 @@ pub(crate) fn create_bind_mount_record_with_propagation(
         } else {
             Vec::new()
         };
-        let subtree_clones = collect_subtree_mount_clones(source_display, event_id, &excluded);
+        let subtree_clones = collect_bind_subtree_mount_clones(
+            source_display,
+            event_id,
+            &excluded,
+            recursive_bind,
+            source_mount.as_ref(),
+        );
         push_mount_record(
             target,
             source,
@@ -1006,7 +1072,13 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     } else {
         Vec::new()
     };
-    let subtree_clones = collect_subtree_mount_clones(source_display, event_id, &excluded);
+    let subtree_clones = collect_bind_subtree_mount_clones(
+        source_display,
+        event_id,
+        &excluded,
+        recursive_bind,
+        source_mount.as_ref(),
+    );
     push_mount_record(
         target,
         source,
@@ -1305,6 +1377,7 @@ pub(crate) fn syscall_mount_impl(
                     &source_abs,
                     fsname,
                     bind_flags,
+                    (flags & MS_REC) != 0,
                 );
                 with_mount_namespace_mut(&current_mount_namespace(), |state| {
                     state.bind_file(&target, Arc::clone(&source_file));
@@ -1347,6 +1420,7 @@ pub(crate) fn syscall_mount_impl(
             &source_abs,
             fsname,
             bind_flags,
+            (flags & MS_REC) != 0,
         );
         if (flags & propagation_flags) != 0 {
             return match apply_mount_propagation_change(
