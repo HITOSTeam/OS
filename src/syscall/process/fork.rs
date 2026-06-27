@@ -693,6 +693,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     const CLONE_PARENT: usize = 0x0000_8000; // 子进程父亲指向调用者的父亲（兄弟关系）
     const CLONE_THREAD: usize = 0x0001_0000; // 创建同线程组线程
     const CLONE_NEWNS: usize = 0x0002_0000; // 新建 mount namespace
+    const CLONE_SYSVSEM: usize = 0x0004_0000; // 共享 System V semaphore undo state
     const CLONE_SETTLS: usize = 0x0008_0000; // 设置子进程 TLS
     const CLONE_PARENT_SETTID: usize = 0x0010_0000; // 将子 TID 写回父进程指针
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000; // 子线程退出时清零并 futex 唤醒
@@ -714,6 +715,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
         | CLONE_PARENT
         | CLONE_THREAD
         | CLONE_NEWNS
+        | CLONE_SYSVSEM
         | CLONE_SETTLS
         | CLONE_PARENT_SETTID
         | CLONE_CHILD_CLEARTID
