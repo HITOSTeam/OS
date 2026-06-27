@@ -1202,14 +1202,53 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     clone_subtree_mount_records_for_bind(target, source_display, event_id, &subtree_clones);
 }
 
+fn downstream_unmount_peer_groups(
+    start_peer_group: usize,
+    namespaces: &[MountNamespace],
+) -> BTreeSet<usize> {
+    let mut groups = BTreeSet::new();
+    let mut pending = Vec::new();
+    pending.push(start_peer_group);
+    while let Some(group) = pending.pop() {
+        if !groups.insert(group) {
+            continue;
+        }
+        for ns in namespaces {
+            for top in top_mounts_for_namespace(ns) {
+                if top.master_group_id != Some(group) {
+                    continue;
+                }
+                if let Some(child_peer_group) = top.peer_group_id {
+                    pending.push(child_peer_group);
+                }
+            }
+        }
+    }
+    groups
+}
+
+fn mount_record_in_unmount_domain(record: &MountRecord, peer_groups: &BTreeSet<usize>) -> bool {
+    if record
+        .peer_group_id
+        .is_some_and(|peer_group| peer_groups.contains(&peer_group))
+    {
+        return true;
+    }
+    record.peer_group_id.is_none()
+        && record
+            .master_group_id
+            .is_some_and(|master_group| peer_groups.contains(&master_group))
+}
+
 pub(crate) fn remove_top_mount_records_by_event(
     event_id: usize,
-    peer_group_id: Option<usize>,
+    peer_group_id: usize,
     origin_target: &str,
     origin_source: &str,
     origin_source_display: &str,
 ) -> usize {
     let namespaces = collect_live_mount_namespaces();
+    let peer_groups = downstream_unmount_peer_groups(peer_group_id, &namespaces);
     let mut removed = 0usize;
     for ns in namespaces {
         let mut affected_targets: BTreeMap<String, usize> = BTreeMap::new();
@@ -1230,14 +1269,17 @@ pub(crate) fn remove_top_mount_records_by_event(
                     let rewritten_clone_source = origin_source_display == origin_target
                         && origin_source != origin_target
                         && record.source == origin_source;
-                    let covered_peer = peer_group_id.is_some()
+                    let covered_peer = record
+                        .peer_group_id
+                        .is_some_and(|peer_group| peer_groups.contains(&peer_group))
                         && record.target != origin_target
                         && !path_under_mount(origin_target, &record.target)
                         && (record.source_display == origin_source_display
                             || rewritten_clone_source)
-                        && record.peer_group_id == peer_group_id
                         && covered;
-                    if !same_event_top && !covered_peer {
+                    if !(same_event_top && mount_record_in_unmount_domain(record, &peer_groups))
+                        && !covered_peer
+                    {
                         continue;
                     }
                     affected_targets
@@ -1807,19 +1849,19 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
     if record.fs_type == "cgroup2" || record.fs_type == "cgroup" {
         let _ = cgroup_umount(&abs);
     }
-    if record.propagation == MountPropagation::Slave {
+    if let Some(peer_group_id) = record.peer_group_id {
+        let _ = remove_top_mount_records_by_event(
+            record.event_id,
+            peer_group_id,
+            &record.target,
+            &record.source,
+            &record.source_display,
+        );
+    } else {
         let _ = remove_mount_record_by_stack(
             &current_mount_namespace(),
             &record.target,
             record.stack_seq,
-        );
-    } else {
-        let _ = remove_top_mount_records_by_event(
-            record.event_id,
-            record.peer_group_id,
-            &record.target,
-            &record.source,
-            &record.source_display,
         );
     }
     0
