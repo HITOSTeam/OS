@@ -246,6 +246,10 @@ fn mount_subtree_contains_unbindable(target: &str) -> bool {
     })
 }
 
+fn path_strictly_under_mount(path: &str, base: &str) -> bool {
+    path != base && path_under_mount(path, base)
+}
+
 pub(crate) fn move_mount_subtree_with_propagation(
     old_target: &str,
     new_target: &str,
@@ -659,11 +663,12 @@ fn propagation_destination_target(top: &MountRecord, event_source: &str, suffix:
 struct MountSubtreeClone {
     record: MountRecord,
     suffix: String,
+    event_id: usize,
+    propagated_peer_group_id: Option<usize>,
 }
 
 fn collect_subtree_mount_clones(
     source_display: &str,
-    event_id: usize,
     excluded_source_prefixes: &[String],
 ) -> Vec<MountSubtreeClone> {
     let ns = current_mount_namespace();
@@ -679,11 +684,13 @@ fn collect_subtree_mount_clones(
         {
             continue;
         }
-        let mut clone = record.clone();
-        clone.event_id = event_id;
+        let needs_propagated_peer =
+            record.peer_group_id.is_none() && record.master_group_id.is_none();
         out.push(MountSubtreeClone {
-            record: clone,
+            record: record.clone(),
             suffix: mount_target_suffix(source_display, &record.target),
+            event_id: next_mount_event_id(),
+            propagated_peer_group_id: needs_propagated_peer.then(next_mount_peer_group_id),
         });
     }
     out
@@ -697,13 +704,12 @@ fn bind_should_clone_subtree(recursive_bind: bool, source_mount: Option<&MountRe
 
 fn collect_bind_subtree_mount_clones(
     source_display: &str,
-    event_id: usize,
     excluded_source_prefixes: &[String],
     recursive_bind: bool,
     source_mount: Option<&MountRecord>,
 ) -> Vec<MountSubtreeClone> {
     if bind_should_clone_subtree(recursive_bind, source_mount) {
-        collect_subtree_mount_clones(source_display, event_id, excluded_source_prefixes)
+        collect_subtree_mount_clones(source_display, excluded_source_prefixes)
     } else {
         Vec::new()
     }
@@ -714,7 +720,7 @@ fn push_subtree_mount_clones(
     target: &str,
     source_display: &str,
     clones: &[MountSubtreeClone],
-    event_id: usize,
+    propagation_dest: Option<&MountPropagationDestination>,
 ) {
     if clones.is_empty() {
         return;
@@ -734,7 +740,24 @@ fn push_subtree_mount_clones(
                 record.source_display.clone()
             };
             record.stack_seq = next_mount_stack_seq();
-            record.event_id = event_id;
+            record.event_id = item.event_id;
+            if record.peer_group_id.is_none() && record.master_group_id.is_none() {
+                if let Some(dest) = propagation_dest {
+                    match dest.propagation {
+                        MountPropagation::Shared => {
+                            record.propagation = MountPropagation::Shared;
+                            record.peer_group_id = item.propagated_peer_group_id;
+                            record.master_group_id = dest.master_group_id;
+                        }
+                        MountPropagation::Slave => {
+                            record.propagation = MountPropagation::Slave;
+                            record.peer_group_id = None;
+                            record.master_group_id = dest.master_group_id;
+                        }
+                        MountPropagation::Private | MountPropagation::Unbindable => {}
+                    }
+                }
+            }
             state.push_record(record);
         }
     });
@@ -890,7 +913,7 @@ pub(crate) fn push_mount_to_destination(
 fn clone_subtree_mount_records_for_bind(
     target: &str,
     source_display: &str,
-    event_id: usize,
+    _event_id: usize,
     clones: &[MountSubtreeClone],
 ) {
     push_subtree_mount_clones(
@@ -898,17 +921,17 @@ fn clone_subtree_mount_records_for_bind(
         target,
         source_display,
         clones,
-        event_id,
+        None,
     );
 }
 
 fn clone_subtree_mount_records_to_destination(
     dest: &MountPropagationDestination,
     source_display: &str,
-    event_id: usize,
+    _event_id: usize,
     clones: &[MountSubtreeClone],
 ) {
-    push_subtree_mount_clones(&dest.ns, &dest.target, source_display, clones, event_id);
+    push_subtree_mount_clones(&dest.ns, &dest.target, source_display, clones, Some(dest));
 }
 
 pub(crate) fn create_mount_record_with_propagation(
@@ -1007,7 +1030,6 @@ pub(crate) fn create_bind_mount_record_with_propagation(
             };
             let subtree_clones = collect_bind_subtree_mount_clones(
                 source_display,
-                event_id,
                 &excluded,
                 recursive_bind,
                 source_mount.as_ref(),
@@ -1040,8 +1062,13 @@ pub(crate) fn create_bind_mount_record_with_propagation(
                     event_id,
                 );
                 sync_mount_record_rofs(target);
+                clone_subtree_mount_records_for_bind(
+                    target,
+                    source_display,
+                    event_id,
+                    &subtree_clones,
+                );
             }
-            clone_subtree_mount_records_for_bind(target, source_display, event_id, &subtree_clones);
             return;
         }
     }
@@ -1055,7 +1082,6 @@ pub(crate) fn create_bind_mount_record_with_propagation(
         };
         let subtree_clones = collect_bind_subtree_mount_clones(
             source_display,
-            event_id,
             &excluded,
             recursive_bind,
             source_mount.as_ref(),
@@ -1085,7 +1111,6 @@ pub(crate) fn create_bind_mount_record_with_propagation(
         };
         let subtree_clones = collect_bind_subtree_mount_clones(
             source_display,
-            event_id,
             &excluded,
             recursive_bind,
             source_mount.as_ref(),
@@ -1114,7 +1139,6 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     };
     let subtree_clones = collect_bind_subtree_mount_clones(
         source_display,
-        event_id,
         &excluded,
         recursive_bind,
         source_mount.as_ref(),
@@ -1137,6 +1161,8 @@ pub(crate) fn create_bind_mount_record_with_propagation(
 pub(crate) fn remove_top_mount_records_by_event(
     event_id: usize,
     peer_group_id: Option<usize>,
+    origin_target: &str,
+    origin_source_display: &str,
 ) -> usize {
     let namespaces = collect_live_mount_namespaces();
     let mut removed = 0usize;
@@ -1156,8 +1182,12 @@ pub(crate) fn remove_top_mount_records_by_event(
                             && !remove_keys.contains(&(other.target.clone(), other.stack_seq))
                     });
                     let same_event_top = record.event_id == event_id && !covered;
-                    let covered_peer =
-                        peer_group_id.is_some() && record.peer_group_id == peer_group_id && covered;
+                    let covered_peer = peer_group_id.is_some()
+                        && record.target != origin_target
+                        && !path_under_mount(origin_target, &record.target)
+                        && record.source_display == origin_source_display
+                        && record.peer_group_id == peer_group_id
+                        && covered;
                     if !same_event_top && !covered_peer {
                         continue;
                     }
@@ -1170,6 +1200,18 @@ pub(crate) fn remove_top_mount_records_by_event(
             }
             if remove_keys.is_empty() {
                 return 0;
+            }
+            for record in state.mounts() {
+                if remove_keys.contains(&(record.target.clone(), record.stack_seq)) {
+                    continue;
+                }
+                if affected_targets
+                    .iter()
+                    .any(|target| path_strictly_under_mount(&record.target, target))
+                {
+                    affected_targets.insert(record.target.clone());
+                    remove_keys.insert((record.target.clone(), record.stack_seq));
+                }
             }
             let before = state.mounts().len();
             state
@@ -1196,18 +1238,45 @@ pub(crate) fn remove_mount_record_by_stack(
     target: &str,
     stack_seq: usize,
 ) -> usize {
+    let mut affected_targets = BTreeSet::new();
     let removed = with_mount_namespace_mut(ns, |state| {
+        let mut remove_keys = BTreeSet::new();
+        for record in state.mounts() {
+            if record.target == target && record.stack_seq == stack_seq {
+                affected_targets.insert(record.target.clone());
+                remove_keys.insert((record.target.clone(), record.stack_seq));
+            }
+        }
+        if remove_keys.is_empty() {
+            return 0;
+        }
+        for record in state.mounts() {
+            if remove_keys.contains(&(record.target.clone(), record.stack_seq)) {
+                continue;
+            }
+            if affected_targets
+                .iter()
+                .any(|target| path_strictly_under_mount(&record.target, target))
+            {
+                affected_targets.insert(record.target.clone());
+                remove_keys.insert((record.target.clone(), record.stack_seq));
+            }
+        }
         let before = state.mounts().len();
         state
             .mounts_mut()
-            .retain(|record| !(record.target == target && record.stack_seq == stack_seq));
+            .retain(|record| !remove_keys.contains(&(record.target.clone(), record.stack_seq)));
         if before != state.mounts().len() {
-            state.remove_bound_file(target);
+            for target in &affected_targets {
+                state.remove_bound_file(target);
+            }
         }
         before.saturating_sub(state.mounts().len())
     });
     if removed != 0 {
-        sync_mount_record_rofs_in(ns, target);
+        for target in affected_targets {
+            sync_mount_record_rofs_in(ns, &target);
+        }
     }
     removed
 }
@@ -1694,7 +1763,12 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
             record.stack_seq,
         );
     } else {
-        let _ = remove_top_mount_records_by_event(record.event_id, record.peer_group_id);
+        let _ = remove_top_mount_records_by_event(
+            record.event_id,
+            record.peer_group_id,
+            &record.target,
+            &record.source_display,
+        );
     }
     0
 }
