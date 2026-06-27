@@ -242,17 +242,6 @@ impl MountNamespaceState {
         true
     }
 
-    pub(crate) fn move_top_mount_target(&mut self, old_target: &str, new_target: &str) -> bool {
-        let Some(idx) = self.top_mount_index_for_target(old_target) else {
-            return false;
-        };
-        self.mounts[idx].target = String::from(new_target);
-        if let Some(file) = self.file_binds.remove(old_target) {
-            self.file_binds.insert(String::from(new_target), file);
-        }
-        true
-    }
-
     pub(crate) fn sync_rofs_mount_flag(&mut self, target: &str, flags: usize) {
         self.rofs_mounts.retain(|mount| mount != target);
         if flags != 0 {
