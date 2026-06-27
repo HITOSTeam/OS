@@ -217,30 +217,70 @@ fn rebase_mount_path(path: &str, old_root: &str, new_root: &str) -> String {
     }
 }
 
+fn mount_parent_path(target: &str) -> Option<String> {
+    let target = target.trim_end_matches('/');
+    if target.is_empty() || target == "/" {
+        return None;
+    }
+    let idx = target.rfind('/')?;
+    if idx == 0 {
+        Some(String::from("/"))
+    } else {
+        Some(String::from(&target[..idx]))
+    }
+}
+
+fn mount_parent_is_shared(target: &str) -> bool {
+    let Some(parent) = mount_parent_path(target) else {
+        return false;
+    };
+    mount_lookup_for_abs(&parent).is_some_and(|mount| mount.peer_group_id.is_some())
+}
+
+fn mount_subtree_contains_unbindable(target: &str) -> bool {
+    let ns = current_mount_namespace();
+    let state = ns.lock();
+    state.mounts().iter().any(|record| {
+        path_under_mount(&record.target, target)
+            && record.propagation == MountPropagation::Unbindable
+    })
+}
+
 pub(crate) fn move_mount_subtree_with_propagation(
     old_target: &str,
     new_target: &str,
     dest_base: Option<MountRecord>,
+    stack_on_existing_target: bool,
 ) -> bool {
     let current_ns = current_mount_namespace();
-    let Some((root_stack_seq, moved_records)) = with_mount_namespace_mut(&current_ns, |state| {
-        let root_idx = state.top_mount_index_for_target(old_target)?;
-        let root_stack_seq = state.mounts()[root_idx].stack_seq;
-        let mut moved_records = Vec::new();
-        for record in state.mounts_mut().iter_mut() {
-            if !path_under_mount(&record.target, old_target) {
-                continue;
+    let Some((moved_root_stack_seq, moved_records)) =
+        with_mount_namespace_mut(&current_ns, |state| {
+            let root_idx = state.top_mount_index_for_target(old_target)?;
+            let root_stack_seq = state.mounts()[root_idx].stack_seq;
+            let moved_root_stack_seq = if stack_on_existing_target {
+                next_mount_stack_seq()
+            } else {
+                root_stack_seq
+            };
+            let mut moved_records = Vec::new();
+            for record in state.mounts_mut().iter_mut() {
+                if !path_under_mount(&record.target, old_target) {
+                    continue;
+                }
+                if record.target == old_target && record.stack_seq == root_stack_seq {
+                    record.stack_seq = moved_root_stack_seq;
+                }
+                record.target = rebase_mount_path(&record.target, old_target, new_target);
+                moved_records.push(record.clone());
             }
-            record.target = rebase_mount_path(&record.target, old_target, new_target);
-            moved_records.push(record.clone());
-        }
-        for mount in state.rofs_mounts_mut().iter_mut() {
-            if path_under_mount(mount, old_target) {
-                *mount = rebase_mount_path(mount, old_target, new_target);
+            for mount in state.rofs_mounts_mut().iter_mut() {
+                if path_under_mount(mount, old_target) {
+                    *mount = rebase_mount_path(mount, old_target, new_target);
+                }
             }
-        }
-        Some((root_stack_seq, moved_records))
-    }) else {
+            Some((moved_root_stack_seq, moved_records))
+        })
+    else {
         return false;
     };
 
@@ -253,7 +293,7 @@ pub(crate) fn move_mount_subtree_with_propagation(
 
     let moved_root = moved_records
         .iter()
-        .find(|record| record.target == new_target && record.stack_seq == root_stack_seq)
+        .find(|record| record.target == new_target && record.stack_seq == moved_root_stack_seq)
         .cloned();
     let preserve_moved_root_group = moved_root
         .as_ref()
@@ -277,7 +317,7 @@ pub(crate) fn move_mount_subtree_with_propagation(
             }
             with_mount_namespace_mut(&current_ns, |state| {
                 if let Some(record) = state.mounts_mut().iter_mut().find(|record| {
-                    record.target == new_target && record.stack_seq == root_stack_seq
+                    record.target == new_target && record.stack_seq == moved_root_stack_seq
                 }) {
                     record.propagation = dest.propagation;
                     record.peer_group_id = dest.peer_group_id;
@@ -292,7 +332,7 @@ pub(crate) fn move_mount_subtree_with_propagation(
             let mut cloned = record.clone();
             cloned.target = rebase_mount_path(&record.target, new_target, &dest.target);
             cloned.stack_seq = next_mount_stack_seq();
-            if record.target == new_target && record.stack_seq == root_stack_seq {
+            if record.target == new_target && record.stack_seq == moved_root_stack_seq {
                 if preserve_moved_root_group {
                     if let Some(root) = &moved_root {
                         cloned.propagation = root.propagation;
@@ -1449,14 +1489,27 @@ pub(crate) fn syscall_mount_impl(
         let Some(old_record) = mount_record_for_target(&old_target) else {
             return err(SyscallError::EINVAL);
         };
-        if mount_record_for_target(&target).is_some() {
-            return err(SyscallError::EBUSY);
-        }
         if path_under_mount(&target, &old_target) {
             return err(SyscallError::EINVAL);
         }
+        if mount_parent_is_shared(&old_target) {
+            return err(SyscallError::EINVAL);
+        }
         let dest_base = mount_lookup_for_abs(&target);
-        if !move_mount_subtree_with_propagation(&old_target, &target, dest_base) {
+        if dest_base
+            .as_ref()
+            .is_some_and(|base| base.peer_group_id.is_some())
+            && mount_subtree_contains_unbindable(&old_target)
+        {
+            return err(SyscallError::EINVAL);
+        }
+        let stack_on_existing_target = mount_record_for_target(&target).is_some();
+        if !move_mount_subtree_with_propagation(
+            &old_target,
+            &target,
+            dest_base,
+            stack_on_existing_target,
+        ) {
             return err(SyscallError::EINVAL);
         }
         sync_rofs_mount_flag(&old_target, 0);
