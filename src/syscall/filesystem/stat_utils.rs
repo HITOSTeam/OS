@@ -3,7 +3,7 @@ use super::{
     OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile,
     PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SyscallError, TtyFile, current_fsuid_gid,
     err, ext4_lock, get_current_token, get_fd_file, get_inode_times, inode_fs_flags,
-    inode_rdev_for_mode, inode_visible_size, linux_dev_major, linux_dev_minor, open_pseudo,
+    inode_visible_size_with_disk_size, linux_dev_major, linux_dev_minor, open_pseudo,
     resolve_at_inode, resolve_at_path, translated_mutref, try_read_user_value,
     try_write_user_value,
 };
@@ -303,6 +303,39 @@ pub(crate) fn kstat_from_dev_pts_path(path: &str) -> Option<KStat> {
     })
 }
 
+/// Builds ext4 `stat` metadata from a single inode metadata snapshot.
+pub(crate) fn kstat_from_ext4_snapshot(
+    meta: ext4_fs::InodeStatSnapshot,
+    visible_size: usize,
+) -> KStat {
+    let mode = meta.mode as u32;
+    let size = visible_size as i64;
+    let blocks = stat_blocks_for_mode_size(mode, size);
+    let times = get_inode_times(meta.inode_num as u64);
+
+    KStat {
+        st_dev: EXT4_ST_DEV,
+        st_ino: meta.inode_num as u64,
+        st_mode: mode,
+        st_nlink: meta.nlink,
+        st_uid: meta.uid,
+        st_gid: meta.gid,
+        st_rdev: meta.rdev_for_mode(),
+        __pad: 0,
+        st_size: size,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: blocks,
+        st_atime_sec: times.atime_sec,
+        st_atime_nsec: times.atime_nsec,
+        st_mtime_sec: times.mtime_sec,
+        st_mtime_nsec: times.mtime_nsec,
+        st_ctime_sec: times.ctime_sec,
+        st_ctime_nsec: times.ctime_nsec,
+        __unused: [0, 0],
+    }
+}
+
 /// Synthesizes `stat` metadata for open descriptors across pseudo, proc, and ext4 files.
 pub(crate) fn kstat_from_file(
     file: &alloc::sync::Arc<dyn File + Send + Sync>,
@@ -458,38 +491,10 @@ pub(crate) fn kstat_from_file(
     let inode = os_inode.ext4_inode();
 
     let _ext4_guard = ext4_lock();
-    let mode_raw = inode.mode();
-    let mode = mode_raw as u32;
-    let uid = inode.uid();
-    let gid = inode.gid();
-    let nlink = inode.link_count();
-    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
-    let disk_size = inode.size() as usize;
-    let size = core::cmp::max(disk_size, os_inode.pending_write_end()) as i64;
-    let blocks = stat_blocks_for_mode_size(mode, size);
-    let times = get_inode_times(inode.inode_num() as u64);
-
-    Ok(KStat {
-        st_dev: EXT4_ST_DEV,
-        st_ino: inode.inode_num() as u64,
-        st_mode: mode,
-        st_nlink: nlink,
-        st_uid: uid,
-        st_gid: gid,
-        st_rdev,
-        __pad: 0,
-        st_size: size,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: blocks,
-        st_atime_sec: times.atime_sec,
-        st_atime_nsec: times.atime_nsec,
-        st_mtime_sec: times.mtime_sec,
-        st_mtime_nsec: times.mtime_nsec,
-        st_ctime_sec: times.ctime_sec,
-        st_ctime_nsec: times.ctime_nsec,
-        __unused: [0, 0],
-    })
+    let meta = inode.stat_snapshot();
+    let disk_size = meta.size as usize;
+    let visible_size = core::cmp::max(disk_size, os_inode.pending_write_end());
+    Ok(kstat_from_ext4_snapshot(meta, visible_size))
 }
 
 pub(crate) fn kstat_from_proc_pseudo_path(
@@ -541,37 +546,10 @@ pub(crate) fn kstat_from_abs_path(abs: &str) -> Result<KStat, isize> {
     let (fsuid, fsgid) = current_fsuid_gid();
     let _ext4_guard = ext4_lock();
     let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
-    let mode_raw = inode.mode();
-    let mode = mode_raw as u32;
-    let uid = inode.uid();
-    let gid = inode.gid();
-    let nlink = inode.link_count();
-    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
-    let size = inode_visible_size(&inode) as i64;
-    let blocks = stat_blocks_for_mode_size(mode, size);
-    let times = get_inode_times(inode.inode_num() as u64);
-
-    Ok(KStat {
-        st_dev: EXT4_ST_DEV,
-        st_ino: inode.inode_num() as u64,
-        st_mode: mode,
-        st_nlink: nlink,
-        st_uid: uid,
-        st_gid: gid,
-        st_rdev,
-        __pad: 0,
-        st_size: size,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: blocks,
-        st_atime_sec: times.atime_sec,
-        st_atime_nsec: times.atime_nsec,
-        st_mtime_sec: times.mtime_sec,
-        st_mtime_nsec: times.mtime_nsec,
-        st_ctime_sec: times.ctime_sec,
-        st_ctime_nsec: times.ctime_nsec,
-        __unused: [0, 0],
-    })
+    let meta = inode.stat_snapshot();
+    let disk_size = meta.size as usize;
+    let visible_size = inode_visible_size_with_disk_size(&inode, disk_size);
+    Ok(kstat_from_ext4_snapshot(meta, visible_size))
 }
 
 /// Resolves the effective target metadata exposed by a proc magic link.

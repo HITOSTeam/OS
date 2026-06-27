@@ -1,6 +1,5 @@
 use super::{
-    BTreeSet, OSInode, PID2PCB, ProcessControlBlock, S_IFBLK, S_IFCHR, S_IFMT, SyscallError, Vec,
-    current_process, err,
+    BTreeSet, OSInode, PID2PCB, ProcessControlBlock, SyscallError, Vec, current_process, err,
 };
 
 /// Converts ext4 backend errors into Linux-style `errno` values.
@@ -177,14 +176,6 @@ pub(crate) fn mode_for_created_file(mut mode: u16, gid: u32) -> u16 {
     mode
 }
 
-/// Returns the device number that should surface through `stat` for special files.
-pub(crate) fn inode_rdev_for_mode(inode: &ext4_fs::Inode, mode: u16) -> u64 {
-    match mode & S_IFMT {
-        S_IFCHR | S_IFBLK => inode.special_rdev(),
-        _ => 0,
-    }
-}
-
 /// Extracts the Linux major number from an encoded device id.
 pub(crate) fn linux_dev_major(dev: u64) -> u32 {
     ((((dev >> 8) & 0x0fff) | ((dev >> 32) & 0xffff_f000)) & 0xffff_ffff) as u32
@@ -197,7 +188,12 @@ pub(crate) fn linux_dev_minor(dev: u64) -> u32 {
 
 /// Reports the largest visible size across disk state and open writable views of an inode.
 pub(crate) fn inode_visible_size(inode: &ext4_fs::Inode) -> usize {
-    let mut size = inode.size() as usize;
+    inode_visible_size_with_disk_size(inode, inode.size() as usize)
+}
+
+/// Same as `inode_visible_size`, using an already-read on-disk size.
+pub(crate) fn inode_visible_size_with_disk_size(inode: &ext4_fs::Inode, disk_size: usize) -> usize {
+    let mut size = disk_size;
     let target_ino = inode.inode_num();
     let target_dev = inode.device_id();
 
