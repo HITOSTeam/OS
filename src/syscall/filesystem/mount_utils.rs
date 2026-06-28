@@ -142,6 +142,26 @@ pub(crate) fn push_mount_record_in(
     });
 }
 
+fn ensure_root_mount_record(state: &mut MountNamespaceState) {
+    if state.mount_record_for_target("/").is_some() {
+        return;
+    }
+    state.push_record(MountRecord {
+        target: String::from("/"),
+        source: String::from("/"),
+        source_display: String::from("/dev/root"),
+        fs_type: String::from("ext4"),
+        flags: 0,
+        stack_seq: next_mount_stack_seq(),
+        event_id: next_mount_event_id(),
+        propagation: MountPropagation::Private,
+        peer_group_id: None,
+        master_group_id: None,
+        access_seq: 0,
+        expire_mark_seq: None,
+    });
+}
+
 pub(crate) fn mount_record_for_target(target: &str) -> Option<MountRecord> {
     let state = current_mount_namespace();
     let state = state.lock();
@@ -1073,12 +1093,18 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     let self_bind_of_covered_path = source_display == target && !source_is_exact_mount;
     let source_peer_group = if self_bind_of_covered_path {
         None
-    } else {
+    } else if source_is_exact_mount {
         source_mount.as_ref().and_then(|mount| mount.peer_group_id)
+    } else {
+        None
     };
-    let source_master_group = source_mount
-        .as_ref()
-        .and_then(|mount| mount.master_group_id);
+    let source_master_group = if source_is_exact_mount {
+        source_mount
+            .as_ref()
+            .and_then(|mount| mount.master_group_id)
+    } else {
+        None
+    };
 
     if let Some(base) = mount_lookup_for_abs(target) {
         if base.peer_group_id.is_some() {
@@ -1390,6 +1416,9 @@ pub(crate) fn apply_mount_propagation_change(target: &str, flags: usize) -> Resu
     let recursive = (flags & MS_REC) != 0;
     let mut changed = false;
     with_mount_namespace_mut(&current_mount_namespace(), |state| {
+        if target == "/" {
+            ensure_root_mount_record(state);
+        }
         let mut apply_keys = BTreeSet::new();
         if recursive {
             for record in state.top_mounts() {
@@ -1878,13 +1907,29 @@ fn proc_mounts_source_name(mount: &MountRecord) -> &str {
 }
 
 pub(crate) fn proc_mounts_snapshot_for_namespace(ns: &MountNamespace) -> String {
-    let mut out = String::from("/dev/root / ext4 rw,relatime 0 0\n");
     let mut mounts = {
         let state = ns.lock();
         state.top_mounts()
     };
+    let root = mounts.iter().find(|mount| mount.target == "/").cloned();
+    let root_source = root
+        .as_ref()
+        .map(proc_mounts_source_name)
+        .unwrap_or("/dev/root");
+    let root_fs_type = root
+        .as_ref()
+        .map(|mount| mount.fs_type.as_str())
+        .unwrap_or("ext4");
+    let root_opts = root
+        .as_ref()
+        .map(|mount| mount_flags_to_proc_opts(mount.flags))
+        .unwrap_or_else(|| String::from("rw,relatime"));
+    let mut out = alloc::format!("{root_source} / {root_fs_type} {root_opts} 0 0\n");
     mounts.sort_by(|a, b| a.target.cmp(&b.target));
     for mount in mounts {
+        if mount.target == "/" {
+            continue;
+        }
         let mut opts = mount_flags_to_proc_opts(mount.flags);
         if mount.fs_type == "cgroup" && !mount.source_display.is_empty() {
             opts.push(',');
@@ -1967,6 +2012,32 @@ fn push_mountinfo_line(
 
 pub(crate) fn proc_mountinfo_snapshot_for_namespace(ns: &MountNamespace) -> String {
     let mut out = String::new();
+    let root = {
+        let state = ns.lock();
+        state.mount_record_for_target("/")
+    };
+    let root_source = root
+        .as_ref()
+        .map(|mount| {
+            if mount.source_display.is_empty() {
+                mount.source.as_str()
+            } else {
+                mount.source_display.as_str()
+            }
+        })
+        .unwrap_or("/dev/root");
+    let root_fs_type = root
+        .as_ref()
+        .map(|mount| mount.fs_type.as_str())
+        .unwrap_or("ext4");
+    let root_opts = root
+        .as_ref()
+        .map(|mount| mount_flags_to_proc_opts(mount.flags))
+        .unwrap_or_else(|| String::from("rw,relatime"));
+    let root_optional = root
+        .as_ref()
+        .map(mountinfo_optional_fields)
+        .unwrap_or_default();
     push_mountinfo_line(
         &mut out,
         1,
@@ -1974,10 +2045,10 @@ pub(crate) fn proc_mountinfo_snapshot_for_namespace(ns: &MountNamespace) -> Stri
         "8:1",
         "/",
         "/",
-        "ext4",
-        "/dev/root",
-        "rw,relatime",
-        "",
+        root_fs_type,
+        root_source,
+        &root_opts,
+        &root_optional,
     );
 
     let mut mounts = {
@@ -1985,7 +2056,12 @@ pub(crate) fn proc_mountinfo_snapshot_for_namespace(ns: &MountNamespace) -> Stri
         state.mounts().to_vec()
     };
     mounts.sort_by(|a, b| a.target.cmp(&b.target));
-    for (idx, mount) in mounts.iter().enumerate() {
+    let mut idx = 0;
+    for mount in &mounts {
+        if mount.target == "/" {
+            continue;
+        }
+        idx += 1;
         let opts = mount_flags_to_proc_opts(mount.flags);
         let optional = mountinfo_optional_fields(mount);
         let source = if mount.source_display.is_empty() {

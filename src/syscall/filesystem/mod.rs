@@ -296,6 +296,6 @@ pub(crate) const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
 pub(crate) const FALLOC_FL_SUPPORTED_MASK: usize = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
 
 pub(crate) static TMPFILE_SEQ: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static NEXT_MOUNT_STACK_SEQ: AtomicUsize = AtomicUsize::new(1);
-pub(crate) static NEXT_MOUNT_EVENT_ID: AtomicUsize = AtomicUsize::new(1);
-pub(crate) static NEXT_MOUNT_PEER_GROUP_ID: AtomicUsize = AtomicUsize::new(1);
+pub(crate) static NEXT_MOUNT_STACK_SEQ: AtomicUsize = AtomicUsize::new(2);
+pub(crate) static NEXT_MOUNT_EVENT_ID: AtomicUsize = AtomicUsize::new(2);
+pub(crate) static NEXT_MOUNT_PEER_GROUP_ID: AtomicUsize = AtomicUsize::new(2);

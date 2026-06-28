@@ -8,6 +8,8 @@ use spin::Mutex;
 
 use super::File;
 
+const INITIAL_ROOT_PEER_GROUP_ID: usize = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MountPropagation {
     Private,
@@ -63,9 +65,24 @@ pub(crate) struct MountNamespaceState {
 
 impl MountNamespaceState {
     fn new(id: usize) -> Self {
+        let mut mounts = Vec::new();
+        mounts.push(MountRecord {
+            target: String::from("/"),
+            source: String::from("/"),
+            source_display: String::from("/dev/root"),
+            fs_type: String::from("ext4"),
+            flags: 0,
+            stack_seq: 1,
+            event_id: 1,
+            propagation: MountPropagation::Shared,
+            peer_group_id: Some(INITIAL_ROOT_PEER_GROUP_ID),
+            master_group_id: None,
+            access_seq: 0,
+            expire_mark_seq: None,
+        });
         Self {
             id,
-            mounts: Vec::new(),
+            mounts,
             rofs_mounts: Vec::new(),
             file_binds: BTreeMap::new(),
         }

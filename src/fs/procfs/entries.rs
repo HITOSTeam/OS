@@ -269,7 +269,7 @@ pub(crate) fn proc_sys_net_ipv6_conf_if_entries() -> Vec<PseudoDirent> {
 }
 
 pub(crate) fn proc_sys_user_entries() -> Vec<PseudoDirent> {
-    proc_dir_entries(&[("max_user_namespaces", 8)])
+    proc_dir_entries(&[("max_user_namespaces", 8), ("max_mnt_namespaces", 8)])
 }
 
 fn proc_sys_net_ipv4_conf_simple_path(path: &str) -> Option<&'static str> {
@@ -335,6 +335,7 @@ fn proc_simple_text_path(path: &str) -> Option<&'static str> {
         "/proc/sys/fs/pipe-user-pages-hard" => Some("/proc/sys/fs/pipe-user-pages-hard"),
         "/proc/sys/fs/lease-break-time" => Some("/proc/sys/fs/lease-break-time"),
         "/proc/sys/user/max_user_namespaces" => Some("/proc/sys/user/max_user_namespaces"),
+        "/proc/sys/user/max_mnt_namespaces" => Some("/proc/sys/user/max_mnt_namespaces"),
         "/proc/sys/vm/vfs_cache_pressure" => Some("/proc/sys/vm/vfs_cache_pressure"),
         "/proc/sys/vm/min_free_kbytes" => Some("/proc/sys/vm/min_free_kbytes"),
         "/proc/sys/vm/nr_hugepages" => Some("/proc/sys/vm/nr_hugepages"),
@@ -417,6 +418,7 @@ fn proc_simple_text_default(path: &'static str) -> Vec<u8> {
         "/proc/sys/fs/pipe-user-pages-hard" => b"0\n".to_vec(),
         "/proc/sys/fs/lease-break-time" => b"45\n".to_vec(),
         "/proc/sys/user/max_user_namespaces" => b"1024\n".to_vec(),
+        "/proc/sys/user/max_mnt_namespaces" => b"1024\n".to_vec(),
         "/proc/sys/vm/vfs_cache_pressure" => b"100\n".to_vec(),
         "/proc/sys/vm/nr_hugepages" => b"0\n".to_vec(),
         "/proc/sys/vm/nr_overcommit_hugepages" => b"0\n".to_vec(),
