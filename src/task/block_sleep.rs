@@ -781,17 +781,27 @@ fn push_sleep_timer(timer: TimeWrap, wait_ms: Option<usize>) {
         wait_ms,
         timer.time_expired_ns
     );
-    let next_deadline = {
+    let (next_deadline, reprogram_clockevent) = {
         let mut timers = TIMERS.lock();
+        let old_head_deadline = timers.peek().map(|head| head.time_expired_ns);
         timers.push(timer);
         SLEEP_TIMER_ACTIVE_COUNT.fetch_add(1, AtomicOrdering::AcqRel);
-        timers.peek().map(|head| head.time_expired_ns)
+        let new_head_deadline = timers.peek().map(|head| head.time_expired_ns);
+        // A later sleep request must not postpone an already-armed short
+        // deadline. Reprogram the hardware clockevent only when the heap head
+        // moves earlier, matching the usual clockevent/hrtimer contract.
+        let reprogram_clockevent = match (old_head_deadline, new_head_deadline) {
+            (None, Some(_)) => true,
+            (Some(old), Some(new)) => new < old,
+            _ => false,
+        };
+        (new_head_deadline, reprogram_clockevent)
     };
     SLEEP_TIMER_NEXT_DEADLINE_NS.store(
         next_deadline.unwrap_or(u64::MAX) as usize,
         AtomicOrdering::Release,
     );
-    if let Some(deadline_ns) = next_deadline {
+    if reprogram_clockevent && let Some(deadline_ns) = next_deadline {
         arm_timer_for_deadline_ns(deadline_ns);
     }
 }
