@@ -167,6 +167,17 @@ impl MemorySet {
         }
     }
 
+    /// 仅 VMA 集合变化时刷新 backing 的范围状态。
+    ///
+    /// 新插入的 lazy file mapping 还没有 resident 页；只需要更新 backing
+    /// 的 mapped/valid 文件范围，不应为此扫描 MapArea/PTE。
+    pub(super) fn refresh_mmap_backing_vm_state(&mut self, backing_id: usize) {
+        let vm_state = self.collect_mmap_backing_vm_state(backing_id);
+        if let Some(backing) = self.mmap_backings.get_mut(&backing_id) {
+            backing.replace_vm_state(vm_state);
+        }
+    }
+
     /// 批量刷新多个 backing 的状态。
     pub(super) fn refresh_mmap_backing_states(&mut self, backing_ids: Vec<usize>) {
         for backing_id in backing_ids {

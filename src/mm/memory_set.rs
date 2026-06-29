@@ -887,15 +887,52 @@ impl MemorySet {
             .all(Self::vm_region_is_private_anonymous)
     }
 
+    fn push_vm_region_raw(&mut self, region: VmRegion) {
+        self.vm_regions.push_merged(region);
+    }
+
     pub fn push_vm_region(&mut self, region: VmRegion) {
         // VMA 新增后统一合并，并刷新 file backing 的派生状态。
         let backing_id = region.backing_id;
-        self.vm_regions.push_merged(region);
+        self.push_vm_region_raw(region);
         if backing_id != 0 {
             self.refresh_mmap_backing_state(backing_id);
         }
         self.debug_assert_user_vm_invariants();
     }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_range_has_no_resident_pages(&self, start: usize, end: usize) {
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).ceil();
+        for area in self
+            .areas
+            .iter()
+            .filter(|area| area.overlaps_vpn_range(start_vpn, end_vpn))
+        {
+            let ov_start = core::cmp::max(start_vpn, area.start_vpn());
+            let ov_end = core::cmp::min(end_vpn, area.end_vpn());
+            for vpn in VPNRange::new(ov_start, ov_end) {
+                debug_assert!(
+                    area.tracked_frame(vpn).is_none(),
+                    "new lazy VMA range unexpectedly owns a resident frame"
+                );
+                debug_assert!(
+                    !area.has_saved_pte_flags(vpn),
+                    "new lazy VMA range unexpectedly owns saved PTE flags"
+                );
+                if let Some(pte) = self.page_table.translate(vpn) {
+                    debug_assert!(
+                        !pte.is_valid(),
+                        "new lazy VMA range unexpectedly has a valid PTE"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_range_has_no_resident_pages(&self, _start: usize, _end: usize) {}
 
     fn static_user_region(
         kind: VmRegionKind,
@@ -1109,13 +1146,20 @@ impl MemorySet {
             }
         }
         let backing_id = region.backing_id;
-        self.push_vm_region(region);
+        let lazy_backing_insert = backing_id != 0 && region.map_type == MapType::Lazy;
+        self.push_vm_region_raw(region);
         if backing_id != 0 {
-            self.refresh_mmap_backing_state(backing_id);
+            if lazy_backing_insert {
+                self.debug_assert_range_has_no_resident_pages(start, end);
+                self.refresh_mmap_backing_vm_state(backing_id);
+            } else {
+                self.refresh_mmap_backing_state(backing_id);
+            }
         }
         if lock_range {
             self.add_locked_range(start, end);
         }
+        self.debug_assert_user_vm_invariants();
         true
     }
 
