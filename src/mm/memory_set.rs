@@ -2878,10 +2878,11 @@ impl MemorySet {
                             src_flags.insert(PTEFlags::COW);
                             // Apply parent PTE demotion immediately to minimize the window where
                             // another thread could write through a still-writable PTE on another hart.
-                            #[cfg(target_arch = "loongarch64")]
-                            let changed = user_space.page_table.set_flags_deferred(vpn, src_flags);
-                            #[cfg(not(target_arch = "loongarch64"))]
-                            let changed = user_space.page_table.set_flags(vpn, src_flags);
+                            let changed = user_space.page_table.set_flags_cached(
+                                vpn,
+                                src_flags,
+                                &mut src_walk_cache,
+                            );
                             if changed {
                                 parent_update_count = parent_update_count.saturating_add(1);
                             }

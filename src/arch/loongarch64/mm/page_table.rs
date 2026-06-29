@@ -389,6 +389,48 @@ impl PageTable {
         true
     }
 
+    /// Batched flag update for sorted/nearby VPN streams.
+    ///
+    /// This is the cached equivalent of `set_flags_deferred()`: it only edits
+    /// the page table. The owning `MemorySet` must invalidate its ASID or flush
+    /// affected translations before returning to user mode.
+    pub fn set_flags_cached(
+        &mut self,
+        vpn: VirtPageNum,
+        flags: PTEFlags,
+        cache: &mut PageWalkCache,
+    ) -> bool {
+        let idxs = vpn.indexes();
+        if !cache.l0_valid || cache.l0_idx != idxs[0] {
+            let pte_l0 = &mut self.root_ppn.get_pte_array()[idxs[0]];
+            if !pte_l0.is_valid() {
+                cache.reset();
+                return false;
+            }
+            cache.l0_idx = idxs[0];
+            cache.l0_ppn = pte_l0.ppn();
+            cache.l0_valid = true;
+            cache.l1_valid = false;
+        }
+        if !cache.l1_valid || cache.l1_idx != idxs[1] {
+            let pte_l1 = &mut cache.l0_ppn.get_pte_array()[idxs[1]];
+            if !pte_l1.is_valid() {
+                cache.l1_valid = false;
+                return false;
+            }
+            cache.l1_idx = idxs[1];
+            cache.l1_ppn = pte_l1.ppn();
+            cache.l1_valid = true;
+        }
+        let pte_leaf = &mut cache.l1_ppn.get_pte_array()[idxs[2]];
+        if !pte_leaf.is_valid() {
+            return false;
+        }
+        let ppn = pte_leaf.ppn();
+        *pte_leaf = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
+    }
+
     /// Update an existing leaf PTE's mapped PPN and flags.
     ///
     /// Returns `false` if the vpn is not mapped.
