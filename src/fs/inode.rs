@@ -1,6 +1,6 @@
 //! Inode abstraction for ext4 filesystem
 
-use super::File;
+use super::{File, POLLIN, POLLOUT};
 use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
 use crate::mm::UserBuffer;
 use crate::println;
@@ -281,6 +281,7 @@ fn debug_iozone_tracked(inode_num: u32) -> bool {
 pub struct OSInode {
     readable: bool,
     writable: bool,
+    regular_file_poll_ready: bool,
     append: bool,
     readonly_fs: bool,
     replace_on_write: bool,
@@ -356,9 +357,11 @@ impl OSInode {
         replace_on_write: bool,
         tmpfile_cleanup: Option<(Arc<Inode>, String)>,
     ) -> Self {
+        let regular_file_poll_ready = inode.is_file();
         Self {
             readable,
             writable,
+            regular_file_poll_ready,
             append,
             readonly_fs,
             replace_on_write,
@@ -949,6 +952,20 @@ impl File for OSInode {
 
     fn writable(&self) -> bool {
         self.writable
+    }
+
+    fn poll_mask(&self) -> i16 {
+        if self.regular_file_poll_ready {
+            return POLLIN | POLLOUT;
+        }
+        let mut mask = 0;
+        if self.readable {
+            mask |= POLLIN;
+        }
+        if self.writable {
+            mask |= POLLOUT;
+        }
+        mask
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
