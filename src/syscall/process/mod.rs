@@ -38,8 +38,8 @@ use crate::{
     task::{
         ProcessControlBlock,
         manager::{
-            PID2PCB, add_task, pid2process, remove_inactive_task, remove_sched_timer_refs,
-            select_hart_for_new_task, wakeup_task,
+            PID2PCB, add_task, pid2process, register_shared_mm_process_owner, remove_inactive_task,
+            remove_sched_timer_refs, select_hart_for_new_task, wakeup_task,
         },
         processor::{
             block_current_and_run_next, current_files, current_files_and_nofile_limit,

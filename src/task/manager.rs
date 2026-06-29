@@ -25,7 +25,8 @@ pub use self::fair::{
     prime_fair_timer_wakeup_lag, protect_fair_fork_parent, record_fair_sleep_lag,
 };
 pub use self::pid_map::{
-    insert_into_pid2process, live_process_uses_net_namespace, pid2process, remove_from_pid2process,
+    insert_into_pid2process, live_process_uses_net_namespace, pid2process,
+    register_shared_mm_process_owner, release_process_mm_owner, remove_from_pid2process,
 };
 pub use self::rt::{account_rt_runtime, rt_bandwidth_throttled};
 pub use self::run_queue::TaskManager;

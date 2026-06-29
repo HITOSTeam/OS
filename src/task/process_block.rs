@@ -21,8 +21,8 @@ use crate::task::FilesStruct;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidAllocError, PidHandle, pid_alloc};
 use crate::task::manager::{
-    PID2PCB, add_task, insert_into_pid2process, prime_fair_exec_start, remove_inactive_task,
-    select_hart_for_new_task, wakeup_task,
+    PID2PCB, add_task, insert_into_pid2process, prime_fair_exec_start, release_process_mm_owner,
+    remove_inactive_task, select_hart_for_new_task, wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::sched::{SCHED_DEADLINE, SCHED_FIFO, SCHED_OTHER, SCHED_RR};
@@ -1590,9 +1590,12 @@ impl ProcessControlBlock {
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
         };
-        self.wake_vfork_parent_waiters_after_exec();
         task.set_memory_set(new_memory_set);
-        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        let old_mm_still_owned = release_process_mm_owner(old_mm_token);
+        self.wake_vfork_parent_waiters_after_exec();
+        if !old_mm_still_owned {
+            crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        }
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
@@ -1696,9 +1699,12 @@ impl ProcessControlBlock {
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
         };
-        self.wake_vfork_parent_waiters_after_exec();
         task.set_memory_set(new_memory_set);
-        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        let old_mm_still_owned = release_process_mm_owner(old_mm_token);
+        self.wake_vfork_parent_waiters_after_exec();
+        if !old_mm_still_owned {
+            crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        }
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }

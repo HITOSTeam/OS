@@ -13,8 +13,8 @@ use crate::{
             fair_wakeup_preempts_current_on_hart, fetch_task, has_ready_rt_any_at_or_above,
             has_ready_rt_at_or_above, has_ready_rt_higher_than, has_ready_tasks,
             prime_fair_sync_wakeup_lag, ready_queue_lengths, record_fair_sleep_lag,
-            remove_inactive_task, remove_sched_timer_refs, requeue_task, rt_bandwidth_throttled,
-            wakeup_task, wakeup_tasks,
+            release_process_mm_owner, remove_inactive_task, remove_sched_timer_refs, requeue_task,
+            rt_bandwidth_throttled, wakeup_task, wakeup_tasks,
         },
         process_block::ProcessControlBlock,
         runtime::{monotonic_time_ns, start_task_runtime_slice},
@@ -468,7 +468,8 @@ fn cleanup_process_threads_for_group_exit(
         }
         remove_inactive_task(Arc::clone(member));
         let cleanup = take_thread_exit_cleanup(member, exit_code);
-        let _ = finish_thread_exit_cleanup(process, cleanup, false);
+        let drop_user_res = cleanup.is_linux_thread;
+        let _ = finish_thread_exit_cleanup(process, cleanup, drop_user_res);
     }
     for member in members {
         let mut member_inner = member.borrow_mut();
@@ -1512,6 +1513,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // holding the TCB lock so the same logic can be reused by exit_group().
     let cleanup = take_thread_exit_cleanup(&task, exit_code);
     let drop_user_res = cleanup.tid != 0;
+    let drop_user_res = drop_user_res || cleanup.is_linux_thread;
     let (tid, is_linux_thread, clear_child_tid_addr) =
         finish_thread_exit_cleanup(&process, cleanup, drop_user_res);
 
@@ -1676,7 +1678,9 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
                 old_files,
             )
         };
-        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        if !release_process_mm_owner(old_mm_token) {
+            crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        }
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
@@ -1719,8 +1723,10 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         unreachable!("schedule should not return after group exit");
     };
 
+    let cleanup = take_thread_exit_cleanup(&task, exit_code);
+    let drop_user_res = cleanup.is_linux_thread;
     let (tid, _is_linux_thread, _clear_child_tid_addr) =
-        finish_thread_exit_cleanup(&process, take_thread_exit_cleanup(&task, exit_code), false);
+        finish_thread_exit_cleanup(&process, cleanup, drop_user_res);
 
     log::debug!(
         "[exit_group] pid={} tid={} exit_code={}",
@@ -1831,7 +1837,9 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
             old_files,
         )
     };
-    crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+    if !release_process_mm_owner(old_mm_token) {
+        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+    }
     if let Some(old_shm) = old_shm_cleanup {
         crate::syscall::sysv_shm::exit_cleanup(&old_shm);
     }
