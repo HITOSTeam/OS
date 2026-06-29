@@ -760,6 +760,60 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
     0
 }
 
+fn kstat_from_ext4_inode_locked(inode: &alloc::sync::Arc<ext4_fs::Inode>) -> KStat {
+    let meta = inode.stat_snapshot();
+    let visible_size = inode_visible_size_with_disk_size(inode, meta.size as usize);
+    kstat_from_ext4_snapshot(meta, visible_size)
+}
+
+fn resolve_ext4_stat_kstat(
+    at: &AtPath,
+    dirfd: isize,
+    path: &str,
+    fsuid: u32,
+    fsgid: u32,
+    follow_final: bool,
+) -> Result<KStat, isize> {
+    if !follow_final {
+        let _ext4_guard = ext4_lock();
+        let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
+        return Ok(kstat_from_ext4_inode_locked(&inode));
+    }
+
+    let _ext4_guard = ext4_lock();
+    let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
+    if !inode.is_symlink() {
+        return Ok(kstat_from_ext4_inode_locked(&inode));
+    }
+    drop(_ext4_guard);
+
+    if let Some(abs) = resolve_abs_path(dirfd, path)? {
+        if let Some(st) = kstat_from_followed_proc_symlink(&abs)? {
+            return Ok(st);
+        }
+    }
+
+    let _ext4_guard = ext4_lock();
+    let inode = resolve_at_inode(at, fsuid, fsgid, true)?;
+    Ok(kstat_from_ext4_inode_locked(&inode))
+}
+
+fn busybox_fallback_kstat() -> Option<KStat> {
+    let candidates = [
+        "/musl/busybox",
+        "/glibc/busybox",
+        "/bin/busybox",
+        "/busybox",
+    ];
+    let _ext4_guard = ext4_lock();
+    for cand in candidates {
+        if let Some(inode) = find_path_in_roots(cand) {
+            return Some(kstat_from_ext4_inode_locked(&inode));
+        }
+    }
+    None
+}
+
 /// Returns `newfstatat(2)` metadata for ext4, pseudo, and proc magic-link paths.
 pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: usize) -> isize {
     if st_ptr == 0 {
@@ -784,10 +838,6 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return err(SyscallError::ENOENT);
     }
 
-    let raw_abs = match resolve_abs_path(dirfd, &path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
@@ -795,6 +845,10 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     // Pseudo nodes: return minimal metadata.
     if let AtPath::PseudoAbs(abs) = &at {
+        let raw_abs = match resolve_abs_path(dirfd, &path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
             if crate::fs::proc_magic_link_exists(proc_path) {
                 let st = if (_flags & AT_SYMLINK_NOFOLLOW) != 0 {
@@ -835,51 +889,19 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
-    if follow_final {
-        if let Some(abs) = raw_abs.as_deref() {
-            match kstat_from_followed_proc_symlink(abs) {
-                Ok(Some(st)) => {
-                    if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-                        return err(SyscallError::EFAULT);
-                    }
-                    return 0;
-                }
-                Ok(None) => {}
-                Err(e) => return e,
-            }
-        }
-    }
-    let _ext4_guard = ext4_lock();
-    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+    let st = match resolve_ext4_stat_kstat(&at, dirfd, &path, fsuid, fsgid, follow_final) {
         Ok(v) => v,
         Err(e)
             if e == err(SyscallError::ENOENT)
                 && matches!(path.as_str(), "busybox" | "./busybox") =>
         {
-            let candidates = [
-                "/musl/busybox",
-                "/glibc/busybox",
-                "/bin/busybox",
-                "/busybox",
-            ];
-            let mut found = None;
-            for cand in candidates {
-                if let Some(inode) = find_path_in_roots(cand) {
-                    found = Some(inode);
-                    break;
-                }
-            }
-            match found {
+            match busybox_fallback_kstat() {
                 Some(v) => v,
                 None => return err(SyscallError::ENOENT),
             }
         }
         Err(e) => return e,
     };
-
-    let meta = inode.stat_snapshot();
-    let visible_size = inode_visible_size_with_disk_size(&inode, meta.size as usize);
-    let st = kstat_from_ext4_snapshot(meta, visible_size);
 
     if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
         return err(SyscallError::EFAULT);
@@ -932,18 +954,17 @@ pub fn syscall_statx(
     if dirfd < 0 && dirfd != AT_FDCWD {
         return err(SyscallError::EBADF);
     }
-    let effective_dirfd = dirfd;
-    let raw_abs = match resolve_abs_path(effective_dirfd, &path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let at = match resolve_at_path(effective_dirfd, &path) {
+    let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
     // Pseudo nodes: return minimal metadata.
     if let AtPath::PseudoAbs(abs) = &at {
+        let raw_abs = match resolve_abs_path(dirfd, &path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
             if crate::fs::proc_magic_link_exists(proc_path) {
                 let st = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
@@ -985,47 +1006,21 @@ pub fn syscall_statx(
     }
 
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    if follow_final {
-        if let Some(abs) = raw_abs.as_deref() {
-            match kstat_from_followed_proc_symlink(abs) {
-                Ok(Some(st)) => {
-                    let stx = statx_from_kstat(&st);
-                    if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
-                        return err(SyscallError::EFAULT);
-                    }
-                    return 0;
-                }
-                Ok(None) => {}
-                Err(e) => return e,
-            }
-        }
-    }
-
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
-    let mut inode = resolve_at_inode(&at, fsuid, fsgid, follow_final).ok();
-    if inode.is_none() && matches!(path.as_str(), "busybox" | "./busybox") {
-        let candidates = [
-            "/musl/busybox",
-            "/glibc/busybox",
-            "/bin/busybox",
-            "/busybox",
-        ];
-        for cand in candidates {
-            if let Some(found) = find_path_in_roots(cand) {
-                inode = Some(found);
-                break;
+    let st = match resolve_ext4_stat_kstat(&at, dirfd, &path, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(e)
+            if e == err(SyscallError::ENOENT)
+                && matches!(path.as_str(), "busybox" | "./busybox") =>
+        {
+            match busybox_fallback_kstat() {
+                Some(v) => v,
+                None => return err(SyscallError::ENOENT),
             }
         }
-    }
-
-    let Some(inode) = inode else {
-        return err(SyscallError::ENOENT);
+        Err(e) => return e,
     };
 
-    let meta = inode.stat_snapshot();
-    let visible_size = inode_visible_size_with_disk_size(&inode, meta.size as usize);
-    let st = kstat_from_ext4_snapshot(meta, visible_size);
     let stx = statx_from_kstat(&st);
     if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
         return err(SyscallError::EFAULT);
