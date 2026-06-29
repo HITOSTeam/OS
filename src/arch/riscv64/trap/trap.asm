@@ -36,23 +36,26 @@ alltraps:
     # read user stack from sscratch and save it in TrapContext
     csrr t2, sscratch
     sd t2, 2*8(sp)
-    # load kernel_satp into t0
-    ld t0, 34*8(sp)
     # load trap_handler into t1
     ld t1, 36*8(sp)
     # move to kernel_sp
     ld sp, 35*8(sp)
-    # switch to kernel space
-    csrw satp, t0
-    sfence.vma
+    # Stay on the current user SATP on trap entry. User page tables share the
+    # kernel roots needed for trap_handler and the current kstack; code that
+    # needs the full direct map switches explicitly with KernelPageTableGuard.
     # jump to trap_handler
     jr t1
-#  0xfffffffffffff06c: 
+#  0xfffffffffffff06c:
 restore:
-    # a0: *TrapContext in user space(Constant); a1: user space token
-    # switch to user space
+    # a0: *TrapContext in user space(Constant); a1: user space token; a2: need_flush
+    # switch to user space; only flush after ASID rollover or when hardware ASID is unavailable
+    csrr t2, satp
+    beq t2, a1, 1f
     csrw satp, a1
+1:
+    beqz a2, 2f
     sfence.vma
+2:
     csrw sscratch, a0
     mv sp, a0
     # now sp points to TrapContext in user space, start restoring based on it

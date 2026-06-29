@@ -1,7 +1,7 @@
 use alloc::{collections::BTreeSet, sync::Arc, sync::Weak};
 
 use crate::{
-    config::{KERNEL_STACK_SIZE, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
+    config::{KERNEL_STACK_SIZE, KERNEL_STACK_TOP, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
     mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr},
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
@@ -142,13 +142,14 @@ impl KernelStack {
         let (_, kernel_stack_top) = kernel_stack_position(self.0);
         kernel_stack_top
     }
+
+    pub fn bounds(&self) -> (usize, usize) {
+        kernel_stack_position(self.0)
+    }
 }
 /// Return (bottom, top) of a kernel stack in kernel space.
 pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
-    #[cfg(target_arch = "loongarch64")]
-    let top = crate::config::KERNEL_STACK_TOP - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
-    #[cfg(not(target_arch = "loongarch64"))]
-    let top = TRAMPOLINE - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
+    let top = KERNEL_STACK_TOP - kstack_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
     let bottom = top - KERNEL_STACK_SIZE;
     (bottom, top)
 }
@@ -172,12 +173,20 @@ pub fn kstack_alloc() -> Option<KernelStack> {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        let (kernel_stack_bottom, kernel_stack_top) = kernel_stack_position(self.0);
+        let (kernel_stack_bottom, kernel_stack_top) = self.bounds();
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
         let kernel_stack_top_va: VirtAddr = kernel_stack_top.into();
         KERNEL_SPACE
             .lock()
             .remove_area(kernel_stack_bottom_va.into(), kernel_stack_top_va.into());
+        #[cfg(target_arch = "riscv64")]
+        {
+            // RISC-V user page tables share the kernel-stack root entries with
+            // KERNEL_SPACE. After removing a stack PTE from that shared subtree,
+            // every hart must drop any stale stack translation before the frame
+            // can be reused for a future stack.
+            crate::mm::flush_kernel_shared_tlb();
+        }
         KSTACK_ALLOCATOR.lock().dealloc(self.0);
         KSTACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         maybe_log_kstack_inflight("drop");

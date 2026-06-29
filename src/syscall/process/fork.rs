@@ -298,6 +298,11 @@ fn clone_from_parts(
             }
         }
 
+        // The creating thread is still fair until the new pthreads finish their
+        // scheduler setup. Give that control path one bounded startup credit so
+        // it is not buried behind a large hackbench-style fair runqueue.
+        crate::task::manager::prime_fair_thread_group_start(&task, _tid_index);
+
         // 将新线程加入调度队列；线程路径不走下方进程 fork 流程，直接返回
         add_task(new_task);
         return linux_tid as isize;
@@ -499,7 +504,7 @@ fn clone_from_parts(
     // 是否抢占由调度器决定；这里主动让父进程让出会把 fork-heavy 程序
     // 串行化，例如 mmapstress09 需要父进程先完成一批 fork 再设置 alarm。
 
-    // CLONE_VFORK：父需阻塞直到子调用 execve 或退出；本实现以 wait_queue + 自检的方式模拟
+    // CLONE_VFORK：父需阻塞直到子调用 execve 或退出。
     if (flags & CLONE_VFORK) != 0 {
         let parent_task = current_task().unwrap();
         loop {
@@ -511,17 +516,17 @@ fn clone_from_parts(
             if done {
                 break;
             }
-            // 在父进程的 wait_queue 上挂载一次性等待者，再切走
+            // 在父进程的 vfork 专用等待队列上挂载一次性等待者，再切走。
             {
                 let mut inner = process.borrow_mut();
-                super::wait::enqueue_waiter_once(&mut inner.wait_queue, &parent_task);
+                super::wait::enqueue_waiter_once(&mut inner.vfork_wait_queue, &parent_task);
             }
             block_current_and_run_next();
         }
-        // 唤醒后清理 wait_queue 残留，避免悬挂引用
+        // 唤醒后清理等待队列残留，避免悬挂引用。
         {
             let mut inner = process.borrow_mut();
-            super::wait::remove_wait_queue_entry(&mut inner.wait_queue, &parent_task);
+            super::wait::remove_wait_queue_entry(&mut inner.vfork_wait_queue, &parent_task);
         }
     }
 
@@ -693,6 +698,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     const CLONE_PARENT: usize = 0x0000_8000; // 子进程父亲指向调用者的父亲（兄弟关系）
     const CLONE_THREAD: usize = 0x0001_0000; // 创建同线程组线程
     const CLONE_NEWNS: usize = 0x0002_0000; // 新建 mount namespace
+    const CLONE_SYSVSEM: usize = 0x0004_0000; // 共享 System V semaphore undo state
     const CLONE_SETTLS: usize = 0x0008_0000; // 设置子进程 TLS
     const CLONE_PARENT_SETTID: usize = 0x0010_0000; // 将子 TID 写回父进程指针
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000; // 子线程退出时清零并 futex 唤醒
@@ -714,6 +720,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
         | CLONE_PARENT
         | CLONE_THREAD
         | CLONE_NEWNS
+        | CLONE_SYSVSEM
         | CLONE_SETTLS
         | CLONE_PARENT_SETTID
         | CLONE_CHILD_CLEARTID
@@ -853,11 +860,6 @@ pub fn syscall_vfork() -> isize {
                 process.getpid(),
                 child.getpid()
             );
-            if sched_class(process.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair)
-                && sched_class(child.borrow_mut().scheduling.sched_policy) == Some(SchedClass::Fair)
-            {
-                suspend_current_and_run_next();
-            }
             child.getpid() as isize
         }
         Err(e) => err(SyscallError::from(e)),

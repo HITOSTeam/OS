@@ -9,11 +9,13 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
-use crate::task::block_sleep::{check_timer, timer_work_pending_for_user_return};
+use crate::task::block_sleep::{
+    check_timer, take_deferred_kernel_timer_tick, timer_work_pending_for_user_return,
+};
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
-use crate::task::signal::check_if_current_signals_error;
+use crate::task::signal::{check_if_current_signals_error, check_task_signals_error};
 use crate::time::set_next_trigger;
 
 const ECODE_SYSCALL: usize = 0xB;
@@ -26,12 +28,12 @@ const ECODE_PAGE_NON_EXEC: usize = 0x6;
 const ECODE_PAGE_PRIV: usize = 0x7;
 const ECODE_ADDR_ERROR: usize = 0x8;
 const ECODE_ADDR_ALIGN: usize = 0x9;
+const ECODE_FP_DISABLED: usize = 0xf;
 
 use super::super::csr_defs::{
-    ECFG_LIE_TI, ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, PRMD_USER_IE, PRMD_USER_IE_MASK,
+    ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, ESTAT_IS_IPI, ESTAT_IS_TIMER, PRMD_USER_IE,
+    PRMD_USER_IE_MASK,
 };
-
-const ESTAT_TIMER_BIT: usize = 11;
 
 /// Log only the first trap_return to see initial user entry.
 static FIRST_TRAP_RETURN_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -106,11 +108,17 @@ pub fn init_trap() {
 pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     let estat = read_estat();
     let ecode = (estat >> ESTAT_ECODE_SHIFT) & ESTAT_ECODE_MASK;
-    if ecode == 0 && (estat & (1 << ESTAT_TIMER_BIT)) != 0 {
-        super::super::clear_timer_interrupt();
-        set_next_trigger();
-        crate::task::block_sleep::note_kernel_timer_tick();
-        return;
+    if ecode == 0 {
+        if (estat & ESTAT_IS_TIMER) != 0 {
+            super::super::clear_timer_interrupt();
+            set_next_trigger();
+            crate::task::block_sleep::note_kernel_timer_tick();
+            return;
+        }
+        if (estat & ESTAT_IS_IPI) != 0 {
+            super::super::clear_ipi_interrupt();
+            return;
+        }
     }
     panic!(
         "Unhandled kernel trap: ecode={} badv={:#x} badi={:#x} era={:#x}",
@@ -205,10 +213,12 @@ fn handle_user_exception(ecode: usize, badv: usize) {
 
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
-    let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
-    if DEBUG_TRAP && idx < 4 {
-        let hart = super::super::hart_id();
-        println!("[trap_handler#{}] hart={}", idx, hart);
+    if DEBUG_TRAP {
+        let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
+        if idx < 4 {
+            let hart = super::super::hart_id();
+            println!("[trap_handler#{}] hart={}", idx, hart);
+        }
     }
 
     //从用户态上来的时候需要设置trap入口,不然等下容易死循环
@@ -229,7 +239,7 @@ pub fn trap_handler() {
        其他 ecode              -> 用户异常，例如缺页、非法访问、权限错误、地址未对齐
     */
     if ecode == 0 {
-        if (estat & (1 << ESTAT_TIMER_BIT)) != 0 {
+        if (estat & ESTAT_IS_TIMER) != 0 {
             //清理对应的寄存器,否则返回用户态之后即使计时器没有到,还会继续触发时钟中断
             super::super::clear_timer_interrupt();
             crate::time::loongarch_record_timer_tick();
@@ -266,6 +276,8 @@ pub fn trap_handler() {
             if crate::task::processor::should_preempt_current_on_tick() {
                 suspend_current_and_run_next();
             }
+        } else if (estat & ESTAT_IS_IPI) != 0 {
+            super::super::clear_ipi_interrupt();
         } else {
             //非时钟中断目前先panic
             panic!(
@@ -289,6 +301,10 @@ pub fn trap_handler() {
         let result = syscall(syscall_id, args);
         let cx = get_trap_context();
         cx.x[super::super::REG_A0] = result as usize;
+    } else if ecode == ECODE_FP_DISABLED {
+        // Lazy-FPU path: enable/restore the task's FP state and retry the
+        // trapped user instruction instead of saving FP on every context switch.
+        super::super::handle_user_fp_disabled();
     } else {
         match ecode {
             ECODE_ADDR_ERROR | ECODE_ADDR_ALIGN => handle_user_exception(ecode, badv),
@@ -300,8 +316,21 @@ pub fn trap_handler() {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
-    if timer_work_pending_for_user_return() {
+    let deferred_scheduler_tick = take_deferred_kernel_timer_tick();
+    if deferred_scheduler_tick || timer_work_pending_for_user_return() {
         check_timer();
+    }
+    if deferred_scheduler_tick {
+        crate::task::processor::account_current_task_tick();
+        crate::syscall::misc::check_current_rlimit_cpu();
+        if let Some((errno, msg)) = check_if_current_signals_error() {
+            crate::task::signal::log_signal_exit(msg);
+            exit_group_and_run_next(errno);
+        }
+        crate::fs::cgroup_maybe_block_current();
+        if crate::task::processor::should_preempt_current_on_tick() {
+            suspend_current_and_run_next();
+        }
     }
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
@@ -314,21 +343,40 @@ pub fn trap_handler() {
     trap_return();
 }
 pub fn trap_return() -> ! {
-    if DEBUG_TRAP && !TRAP_RETURN_ENTER_LOGGED.swap(true, Ordering::SeqCst) {
-        println!(
-            "[trap_return] enter hart={} trap_return_va={:#x}",
-            super::super::hart_id(),
-            trap_return as usize
-        );
+    if DEBUG_TRAP {
+        if !TRAP_RETURN_ENTER_LOGGED.swap(true, Ordering::SeqCst) {
+            println!(
+                "[trap_return] enter hart={} trap_return_va={:#x}",
+                super::super::hart_id(),
+                trap_return as usize
+            );
+        }
     }
     // Keep kernel trap entry active while we are still running in kernel mode.
     set_kernel_trap_entry();
+    // A task can receive a signal while it is already runnable. When the
+    // scheduler later restores it, execution reaches this path directly without
+    // another trap handler pass, so honor pending signals before userspace.
+    if let Some(task) = crate::task::processor::current_task()
+        && task.has_signal_pending()
+    {
+        if let Some((errno, msg)) = check_task_signals_error(&task) {
+            crate::task::signal::log_signal_exit(msg);
+            exit_group_and_run_next(errno);
+        }
+        crate::syscall::signal::maybe_deliver_signal();
+    }
     {
         let cx = get_trap_context();
         cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
     }
+    if let Some(task) = crate::task::processor::current_task() {
+        // LoongArch returns with the user ASID programmed in the trampoline.
+        // Prepare the lazy-FPU gate before switching away from kernel ASID 0.
+        super::super::prepare_user_fp_state(&task);
+    }
     // IMPORTANT: `trap_return()` diverges, so keep Arc owners in a short scope.
-    let (trap_cx_ptr, user_token) = {
+    let (trap_cx_ptr, user_token, user_asid, need_flush) = {
         let task = crate::task::processor::current_task().unwrap();
         let trap_cx_ptr = {
             let task_inner = task.borrow_mut();
@@ -339,50 +387,49 @@ pub fn trap_return() -> ! {
                 exit_current_and_run_next(-1)
             }
         };
-        let user_token = task
-            .process
-            .upgrade()
-            .unwrap()
-            .borrow_mut()
-            .memory_set
-            .token();
-        (trap_cx_ptr, user_token)
+        let user_token = task.get_user_token();
+        // ASID allocation can request a one-time flush after generation wrap;
+        // normal context switches keep tagged user translations hot.
+        let (user_asid, need_flush) = task.prepare_user_asid();
+        (trap_cx_ptr, user_token, user_asid, need_flush)
     };
 
-    let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
-    if DEBUG_TRAP && cnt < 4 {
-        let hart = super::super::hart_id();
-        if !FIRST_TRAP_RETURN_LOGGED.swap(true, Ordering::SeqCst) {
-            let cx = get_trap_context();
-            println!(
-                "[trap_return#{}] hart={} trap_cx_ptr={:#x} era={:#x} user_token={:#x}",
-                cnt, hart, trap_cx_ptr, cx.sepc, user_token
-            );
-            let user_pt = crate::mm::PageTable::from_token(user_token);
-            let tramp_pte = user_pt.translate(VirtAddr::from(TRAMPOLINE).floor());
-            let entry_pte = user_pt.translate(VirtAddr::from(cx.sepc).floor());
-            let trap_pte = user_pt.translate(VirtAddr::from(trap_cx_ptr).floor());
-            let sp = cx.x[super::super::REG_SP];
-            let sp_pte = user_pt.translate(VirtAddr::from(sp).floor());
-            let kernel_token = crate::mm::cached_kernel_token();
-            let kernel_pt = crate::mm::PageTable::from_token(kernel_token);
-            let k_tramp_pte = kernel_pt.translate(VirtAddr::from(TRAMPOLINE).floor());
-            println!(
-                "[trap_return#{}] pte tramp={:?} entry={:?} trapcx={:?} sp={:?}",
-                cnt,
-                tramp_pte.map(|pte| (pte.ppn().0, pte.flags().bits())),
-                entry_pte.map(|pte| (pte.ppn().0, pte.flags().bits())),
-                trap_pte.map(|pte| (pte.ppn().0, pte.flags().bits())),
-                sp_pte.map(|pte| (pte.ppn().0, pte.flags().bits()))
-            );
-            println!(
-                "[trap_return#{}] prmd={:#x} sp={:#x} ktramp={:?} ktoken={:#x}",
-                cnt,
-                cx.sstatus,
-                sp,
-                k_tramp_pte.map(|pte| (pte.ppn().0, pte.flags().bits())),
-                kernel_token
-            );
+    if DEBUG_TRAP {
+        let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
+        if cnt < 4 {
+            let hart = super::super::hart_id();
+            if !FIRST_TRAP_RETURN_LOGGED.swap(true, Ordering::SeqCst) {
+                let cx = get_trap_context();
+                println!(
+                    "[trap_return#{}] hart={} trap_cx_ptr={:#x} era={:#x} user_token={:#x} asid={} need_flush={}",
+                    cnt, hart, trap_cx_ptr, cx.sepc, user_token, user_asid, need_flush
+                );
+                let user_pt = crate::mm::PageTable::from_token(user_token);
+                let tramp_pte = user_pt.translate(VirtAddr::from(TRAMPOLINE).floor());
+                let entry_pte = user_pt.translate(VirtAddr::from(cx.sepc).floor());
+                let trap_pte = user_pt.translate(VirtAddr::from(trap_cx_ptr).floor());
+                let sp = cx.x[super::super::REG_SP];
+                let sp_pte = user_pt.translate(VirtAddr::from(sp).floor());
+                let kernel_token = crate::mm::cached_kernel_token();
+                let kernel_pt = crate::mm::PageTable::from_token(kernel_token);
+                let k_tramp_pte = kernel_pt.translate(VirtAddr::from(TRAMPOLINE).floor());
+                println!(
+                    "[trap_return#{}] pte tramp={:?} entry={:?} trapcx={:?} sp={:?}",
+                    cnt,
+                    tramp_pte.map(|pte| (pte.ppn().0, pte.flags().bits())),
+                    entry_pte.map(|pte| (pte.ppn().0, pte.flags().bits())),
+                    trap_pte.map(|pte| (pte.ppn().0, pte.flags().bits())),
+                    sp_pte.map(|pte| (pte.ppn().0, pte.flags().bits()))
+                );
+                println!(
+                    "[trap_return#{}] prmd={:#x} sp={:#x} ktramp={:?} ktoken={:#x}",
+                    cnt,
+                    cx.sstatus,
+                    sp,
+                    k_tramp_pte.map(|pte| (pte.ppn().0, pte.flags().bits())),
+                    kernel_token
+                );
+            }
         }
     }
 
@@ -402,6 +449,8 @@ pub fn trap_return() -> ! {
             restore_va = in(reg) restore_va,
             in("$r4") trap_cx_ptr,
             in("$r5") user_token,
+            in("$r6") user_asid,
+            in("$r7") usize::from(need_flush),
             options(noreturn)
         );
     }

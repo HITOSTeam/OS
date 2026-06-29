@@ -560,6 +560,7 @@ impl Pipe {
             if ring_buffer.all_read_ends_closed() {
                 if let Some(bit) = signal_bit(SIGPIPE_NUM) {
                     task.borrow_mut().pending_signals |= bit;
+                    task.mark_signal_pending();
                 }
                 ring_buffer.remove_writer(&task);
                 return if written == 0 {

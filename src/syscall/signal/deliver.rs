@@ -4,10 +4,13 @@ pub fn maybe_deliver_signal() {
     let Some(task) = current_task() else {
         return;
     };
+    if !task.has_signal_pending() {
+        return;
+    }
     const MAX_SIGNAL_DEPTH: usize = 8;
     static SIGALRM_LOG_LEFT: AtomicUsize = AtomicUsize::new(16);
     let sigalrm_bit = signal_bit(SIGALRM_NUM).unwrap_or(0);
-    let (signum, sender_pid, sender_uid, si_code, sig_value) = {
+    let (signum, sender_pid, sender_uid, si_code, sig_value, remaining_pending) = {
         let mut inner = task.borrow_mut();
         if inner.sig_saved_ctx.len() >= MAX_SIGNAL_DEPTH {
             // User handlers may escape via longjmp() instead of rt_sigreturn().
@@ -23,12 +26,14 @@ pub fn maybe_deliver_signal() {
             let sigstop_bit = signal_bit(SIGSTOP_NUM).unwrap_or(0);
             let sigcont_bit = signal_bit(SIGCONT_NUM).unwrap_or(0);
             if (pending & (sigkill_bit | sigstop_bit | sigcont_bit)) == 0 {
+                task.refresh_signal_pending(pending);
                 return;
             }
         }
         let mask = inner.signal_mask;
         let pending = inner.pending_signals;
         let Some(sig) = take_first_unmasked(&mut inner.pending_signals, mask) else {
+            task.refresh_signal_pending(pending);
             if DEBUG_UNIXBENCH
                 && sigalrm_bit != 0
                 && (pending & sigalrm_bit) != 0
@@ -48,6 +53,7 @@ pub fn maybe_deliver_signal() {
             }
             return;
         };
+        let remaining_pending = inner.pending_signals;
         let mut sender_pid = 0;
         let mut sender_uid = 0;
         let mut si_code = 0;
@@ -62,8 +68,16 @@ pub fn maybe_deliver_signal() {
             inner.pending_signal_code[sig] = 0;
             inner.pending_signal_value[sig] = 0;
         }
-        (sig, sender_pid, sender_uid, si_code, sig_value)
+        (
+            sig,
+            sender_pid,
+            sender_uid,
+            si_code,
+            sig_value,
+            remaining_pending,
+        )
     };
+    task.refresh_signal_pending(remaining_pending);
     if DEBUG_UNIXBENCH && signum == 14 {
         let pid = current_process().getpid();
         let tid = task

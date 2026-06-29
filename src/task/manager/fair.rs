@@ -275,12 +275,11 @@ fn scale_fair_delta(delta_ns: u64, weight: u128) -> u128 {
 }
 
 fn fair_entity_vslice_ns(nice: i32, kind: EnqueueKind) -> u128 {
-    // Linux EEVDF 使用 sysctl_sched_base_slice 作为实体请求大小。我们还没有
-    // hrtick/update_curr 驱动的公平抢占，因此实际公平抢占点是调度器 tick。
-    // 让虚拟请求与这个粒度对齐；否则刚 clone 出来的公平调度工作线程只会落后创建者
-    // 约 0.7ms，而创建者在重新入队前可能被记满一个 10ms tick，这会破坏 fork-heavy
-    // 负载下 WF_FORK 的父任务继续运行行为。
-    const FAIR_BASE_SLICE_NS: u64 = 10_000_000;
+    // Linux EEVDF 使用 sysctl_sched_base_slice 作为实体请求大小，默认量级
+    // 是亚毫秒到数毫秒。当前内核还没有 hrtick，实际公平抢占仍主要受
+    // 100Hz tick 约束；这里用 2ms request，而不是旧的 10ms tick 宽度，
+    // 避免 400 个 fair hackbench 实体把短控制任务的等待放大到数秒。
+    const FAIR_BASE_SLICE_NS: u64 = 2_000_000;
     let mut vslice = scale_fair_delta(FAIR_BASE_SLICE_NS, fair_nice_weight(nice));
     if kind == EnqueueKind::Initial {
         // Linux PLACE_DEADLINE_INITIAL 让新任务以半个 slice 起步，
@@ -292,11 +291,25 @@ fn fair_entity_vslice_ns(nice: i32, kind: EnqueueKind) -> u128 {
 
 fn fair_lag_limit_ns(nice: i32) -> u128 {
     // Linux 的 entity_lag() 会把虚拟 lag 限制在大约 max_slice + TICK_NSEC。
-    // 我们的周期 tick 是 10ms，而 EEVDF 请求是亚毫秒级。
-    fair_entity_vslice_ns(nice, EnqueueKind::Requeue).saturating_add(10_000_000)
+    fair_entity_vslice_ns(nice, EnqueueKind::Requeue)
+        .saturating_add(u128::from(crate::time::tick_period_ns()))
 }
 
-pub(super) const FAIR_PICK_SCAN_LIMIT: usize = 32;
+fn fair_wakeup_lag_cap_ns(nice: i32) -> u128 {
+    fair_lag_limit_ns(nice).saturating_mul(2)
+}
+
+fn fair_startup_credit_cap_ns() -> u128 {
+    50_000_000
+}
+
+fn inflate_fair_lag_ns(vlag: u128, load: u128, weight: u128) -> u128 {
+    // Linux PLACE_LAG compensates the entity's contribution to avg_vruntime:
+    // lag = vlag * (W + w_i) / W.
+    vlag.saturating_mul(load.saturating_add(weight))
+        .checked_div(load)
+        .unwrap_or(vlag)
+}
 
 /// 任务重新入队时根据已消耗的 CPU 时间累加 vruntime，并执行一个简化版
 /// Linux `place_entity()`：按 avg/min vruntime 放置实体，再用
@@ -330,13 +343,17 @@ pub(super) fn place_fair_task_entity(
     // 新加入任务的基准 这与上面的不是重复 (min_task_vruntime的更新 )
     let placement_vruntime = avg_vruntime.max(group.min_task_vruntime);
     let weight = fair_nice_weight(inner.nice);
-    // 是否是重复进入，如果是重复进入，那么会有lag （之前推出时候保存的）
-    let saved_vlag = core::mem::take(&mut inner.fair_vlag_ns).min(fair_lag_limit_ns(inner.nice));
+    // 是否是重复进入，如果是重复进入，那么会有 lag（之前退出或显式 wakeup
+    // prime 保存的）。普通 sleep lag 仍在 record_fair_sleep_lag() 中按
+    // entity_lag() 封顶；这里允许 timer 到期路径写入的额外有界 credit 生效。
+    let saved_vlag =
+        core::mem::take(&mut inner.fair_vlag_ns).min(fair_wakeup_lag_cap_ns(inner.nice));
+    let startup_credit =
+        core::mem::take(&mut inner.fair_startup_credit_ns).min(fair_startup_credit_cap_ns());
     if kind == EnqueueKind::Initial {
-        // Linux 的 fork placement 会让子任务靠近运行队列虚拟时间，并依赖
-        // WF_FORK 唤醒抢占规则，而不是额外背上一个本地 tick 的 vruntime 债务。
-        // 如果在这里记上这笔债，短 setup 线程在提升自身策略/优先级前会被无关公平调度
-        // 负载挡住。
+        // Linux `place_entity()` starts new forked entities at avg_vruntime.
+        // ENQUEUE_INITIAL only shortens the first deadline below; it must not
+        // repeatedly place a fork storm at the parent's older vruntime.
         inner.fair_vruntime_ns = placement_vruntime;
     } else if kind == EnqueueKind::Wakeup {
         // 对于重新入队的，我们使用
@@ -345,20 +362,27 @@ pub(super) fn place_fair_task_entity(
         let current_weight = current_entity.map(|(_, weight)| weight).unwrap_or(0);
         // 当前任务的权重，参与新补偿（vruntime-补偿）的计算
         let load = group.weight_sum.saturating_add(current_weight);
-        if saved_vlag > 0 && load > 0 {
-            // Linux PLACE_LAG 会补偿被唤醒实体对 V 的影响，
-            // 使 lag 不会在实体插入时消失：
-            // lag = vlag * (W + w_i) / W。
-            let inflated = saved_vlag
-                .saturating_mul(load.saturating_add(weight))
-                .checked_div(load)
-                .unwrap_or(saved_vlag);
+        let effective_vlag = saved_vlag.max(startup_credit);
+        if effective_vlag > 0 && load > 0 {
+            let inflated = inflate_fair_lag_ns(effective_vlag, load, weight);
             inner.fair_vruntime_ns = placement_vruntime.saturating_sub(inflated);
         } else if inner.fair_vruntime_ns > placement_vruntime {
             // Linux EEVDF 会在唤醒时保留有界 lag，而不是让之前睡眠的任务携带
             // 无界旧 vruntime。将其限制到运行队列虚拟时间，可以让短控制任务
             // （例如 cyclictest 后的 shell 清理）在 fork-heavy 公平调度负载下仍保持可选资格。
             //tldr:防止一个任务长时间死亡
+            inner.fair_vruntime_ns = placement_vruntime;
+        }
+    } else if kind == EnqueueKind::Requeue && startup_credit > 0 {
+        let current_weight = current_entity.map(|(_, weight)| weight).unwrap_or(0);
+        let load = group.weight_sum.saturating_add(current_weight);
+        if load > 0 {
+            let inflated = inflate_fair_lag_ns(startup_credit, load, weight);
+            let credited_vruntime = placement_vruntime.saturating_sub(inflated);
+            if inner.fair_vruntime_ns > credited_vruntime {
+                inner.fair_vruntime_ns = credited_vruntime;
+            }
+        } else if inner.fair_vruntime_ns > placement_vruntime {
             inner.fair_vruntime_ns = placement_vruntime;
         }
     }
@@ -444,6 +468,69 @@ pub(super) fn current_fair_entity_for_group(
     };
     let (vruntime, _) = fair_task_vruntime_deadline_at(&current, now_ns);
     Some((vruntime, weight))
+}
+
+fn peek_fair_group_task(group: &FairGroupQueue, hart_id: usize) -> Option<u64> {
+    let eligible_vruntime = group.avg_task_vruntime().unwrap_or(group.min_task_vruntime);
+    let mut fallback = None;
+
+    for (_deadline, vruntime, task_id) in group.task_order.iter().copied() {
+        let Some(entity) = group.tasks.get(&task_id) else {
+            continue;
+        };
+        if entity.vruntime != vruntime {
+            continue;
+        }
+        let candidate = Arc::clone(&entity.task);
+        let status = candidate.borrow_mut().task_status;
+        let queued_here = candidate
+            .ready_queue_hart
+            .load(core::sync::atomic::Ordering::Acquire)
+            == hart_id;
+        if !queued_here || status != crate::task::task_block::TaskStatus::Ready {
+            continue;
+        }
+        if entity.vruntime <= eligible_vruntime {
+            return Some(task_id);
+        }
+        if fallback
+            .map(|(fallback_vruntime, _)| entity.vruntime < fallback_vruntime)
+            .unwrap_or(true)
+        {
+            fallback = Some((entity.vruntime, task_id));
+        }
+    }
+
+    fallback.map(|(_, task_id)| task_id)
+}
+
+/// Return whether `task` is already the entity the fair runqueue would pick next.
+///
+/// Linux's wakeup preemption path enqueues the wakee and then asks EEVDF's
+/// picker whether that wakee became the next entity. Our older approximation
+/// only compared the current and wakee deadlines, which misses cases where a
+/// timer/control task is correctly placed at the front of a large runqueue but
+/// the direct pairwise comparison still preserves the current task.
+pub fn fair_task_is_next_on_hart(task: &Arc<TaskControlBlock>, hart_id: usize) -> bool {
+    let hart_id = hart_id % MAX_HARTS;
+    let task_id = fair_task_id(task);
+    let group_id = task.borrow_mut().fair_group_id;
+    let rq = TASK_MANAGER.ready_queues[hart_id].lock();
+
+    for (indexed_vruntime, candidate_group_id) in rq.fair_order.iter().copied() {
+        let Some(group) = rq.fair_groups.get(&candidate_group_id) else {
+            continue;
+        };
+        if group.vruntime != indexed_vruntime {
+            continue;
+        }
+        let Some(candidate_task_id) = peek_fair_group_task(group, hart_id) else {
+            continue;
+        };
+        return candidate_group_id == group_id && candidate_task_id == task_id;
+    }
+
+    false
 }
 
 /// 返回当前 fair 任务是否已耗尽自己的 EEVDF 虚拟请求（tick 抢冒判据）。
@@ -591,4 +678,138 @@ pub fn record_fair_sleep_lag(task: &Arc<TaskControlBlock>) {
     // lag = avg - vruntime，取正值（saturating_sub 在 avg < vruntime 时得 0），
     // 封顶到 limit，存入 fair_vlag_ns 供唤醒时 PLACE_LAG 补偿使用。
     inner.fair_vlag_ns = avg_vruntime.saturating_sub(task_vruntime).min(limit);
+}
+
+/// 给到期的 timer sleeper 一个有界的 wakeup lag。
+///
+/// Linux 的 CFS/EEVDF 通过 `PLACE_LAG`、wakeup preempt 和细粒度 tick/hrtick
+/// 让短睡眠控制线程在唤醒后很快重新参与运行。本内核目前没有完整 hrtick，
+/// 在 400 个 fair 实体的 hackbench 负载下，timer sleeper 即使被按时唤醒，
+/// 也可能因为没有正 lag 而被放到平均虚拟时间附近，随后排队几十秒。
+///
+/// 这里只在睡眠定时器真正到期时补一个与 `entity_lag()` 同量级的有界 credit；
+/// 由于当前没有 hrtick，再额外给一个 tick 量级的余量以补偿粗粒度抢占，
+/// 仍然由 `place_fair_task_entity(Wakeup)` 做最终放置，避免把这个策略扩散到
+/// pipe/socket/futex 等普通同步或 I/O 唤醒。
+pub fn prime_fair_timer_wakeup_lag(task: &Arc<TaskControlBlock>) {
+    let mut inner = task.borrow_mut();
+    if !matches!(
+        sched_class(inner.scheduling.sched_policy),
+        Some(SchedClass::Fair)
+    ) {
+        return;
+    }
+    let credit = fair_wakeup_lag_cap_ns(inner.nice);
+    inner.fair_vlag_ns = inner.fair_vlag_ns.max(credit);
+}
+
+/// 给同步等待者一个保守的 wakeup lag。
+///
+/// futex/join/wait4 这类唤醒通常是控制线程等待某个明确事件完成；在 hackbench
+/// 这类 400 个 fair pipe worker 的压力下，如果这些控制线程按普通 I/O wakeup
+/// 放置，就容易在事件已经完成后仍长时间排队。这里不碰 pipe/socket 数据唤醒，
+/// 只给同步完成路径一个 `entity_lag()` 级别的有界 credit。
+pub fn prime_fair_sync_wakeup_lag(task: &Arc<TaskControlBlock>) {
+    let mut inner = task.borrow_mut();
+    if !matches!(
+        sched_class(inner.scheduling.sched_policy),
+        Some(SchedClass::Fair)
+    ) {
+        return;
+    }
+    let limit = fair_lag_limit_ns(inner.nice);
+    inner.fair_vlag_ns = inner.fair_vlag_ns.max(limit);
+}
+
+/// 保护正在 fork/clone 的 fair 父任务，避免 WF_FORK 场景被刚创建的 fair
+/// 子任务或无关 fair 负载在下一个 tick 立即打断。
+///
+/// Linux 的 `wake_up_new_task(WF_FORK)` 不会让 fair 子任务直接抢占父任务；
+/// 在本内核没有 hrtick/load-balance 细节时，如果父任务创建 cyclictest 线程组时
+/// 太早让出，首个子线程升到 SCHED_FIFO 后会反过来饿住仍在创建后续线程的父任务。
+/// 这里只补齐未初始化的 deadline，不在每次 fork 时续期父任务；否则 hackbench
+/// 这类 fork storm 会让父任务持续延长 slice，压住 shell/echo/sleep 控制路径。
+pub fn protect_fair_fork_parent(task: &Arc<TaskControlBlock>) {
+    let now_ns = current_time_ns_usize() as u64;
+    let mut inner = task.borrow_mut();
+    if !matches!(
+        sched_class(inner.scheduling.sched_policy),
+        Some(SchedClass::Fair)
+    ) {
+        return;
+    }
+    let current_runtime_ns =
+        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
+            inner
+                .cpu_time_ns
+                .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
+        } else {
+            inner.cpu_time_ns
+        };
+    let delta_ns = current_runtime_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
+    let vruntime = inner
+        .fair_vruntime_ns
+        .saturating_add(scale_fair_delta(delta_ns, fair_nice_weight(inner.nice)));
+    if inner.fair_deadline_ns == 0 {
+        inner.fair_deadline_ns =
+            vruntime.saturating_add(fair_entity_vslice_ns(inner.nice, EnqueueKind::Requeue));
+    }
+}
+
+fn prime_fair_startup_credit(task: &Arc<TaskControlBlock>, credit_ns: u128) {
+    let now_ns = current_time_ns_usize() as u64;
+    let mut inner = task.borrow_mut();
+    if !matches!(
+        sched_class(inner.scheduling.sched_policy),
+        Some(SchedClass::Fair)
+    ) {
+        return;
+    }
+    let current_runtime_ns =
+        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
+            inner
+                .cpu_time_ns
+                .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
+        } else {
+            inner.cpu_time_ns
+        };
+    let delta_ns = current_runtime_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
+    let vruntime = inner
+        .fair_vruntime_ns
+        .saturating_add(scale_fair_delta(delta_ns, fair_nice_weight(inner.nice)));
+    inner.fair_deadline_ns = inner
+        .fair_deadline_ns
+        .max(vruntime.saturating_add(credit_ns));
+    inner.fair_startup_credit_ns = inner
+        .fair_startup_credit_ns
+        .max(credit_ns.min(fair_startup_credit_cap_ns()));
+}
+
+/// Give a freshly exec'd fair task a short startup window.
+///
+/// Linux has `sched_exec()` and wakeup/preemption machinery that keeps an
+/// interactive exec from being buried behind a large fair runqueue while it is
+/// still setting up the new image.  On our single-hart QEMU cyclictest case,
+/// the foreground `cyclictest` process must run a small fair-control section
+/// before its RT worker exists; without a startup window, 400 hackbench fair
+/// workers can repeatedly preempt it before `pthread_create()`/scheduler setup.
+pub fn prime_fair_exec_start(task: &Arc<TaskControlBlock>) {
+    prime_fair_startup_credit(task, fair_startup_credit_cap_ns());
+}
+
+/// Protect a small pthread-style startup fanout.
+///
+/// `cyclictest -t8` creates RT worker threads from a fair control thread.  Once
+/// the first workers switch to SCHED_FIFO, the control thread can be preempted
+/// and then requeued behind hundreds of hackbench fair tasks before it finishes
+/// the remaining pthread_create() calls.  Linux's WF_FORK/sched_exec/wakeup
+/// paths keep this kind of foreground startup moving; here we approximate that
+/// with a bounded, one-shot fair credit and stop after a small thread group so
+/// thread storms do not continuously renew their parent.
+pub fn prime_fair_thread_group_start(task: &Arc<TaskControlBlock>, thread_count: usize) {
+    const THREAD_GROUP_STARTUP_MAX_THREADS: usize = 16;
+    if thread_count > THREAD_GROUP_STARTUP_MAX_THREADS {
+        return;
+    }
+    prime_fair_startup_credit(task, fair_startup_credit_cap_ns());
 }

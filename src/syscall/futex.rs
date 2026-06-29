@@ -16,7 +16,7 @@ use crate::{
     syscall::time_sys::realtime_now_timespec,
     task::block_sleep::add_timer,
     task::{
-        manager::wakeup_task,
+        manager::{prime_fair_sync_wakeup_lag, wakeup_task},
         processor::{block_current_and_run_next, current_process, current_task},
         signal::has_wait_interrupting_pending,
         task_block::TaskControlBlock,
@@ -161,6 +161,9 @@ fn remove_waiter(in_queue: &Arc<AtomicBool>) -> Option<FutexKey> {
 }
 
 pub fn remove_futex_waiters(task: &Arc<TaskControlBlock>) {
+    if remove_tracked_futex_waiter(task).is_some() {
+        return;
+    }
     let mut map = FUTEX_QUEUES.lock();
     map.retain(|_, queue| {
         queue.retain(|w| {
@@ -172,6 +175,42 @@ pub fn remove_futex_waiters(task: &Arc<TaskControlBlock>) {
         });
         !queue.is_empty()
     });
+}
+
+fn remove_tracked_futex_waiter(task: &Arc<TaskControlBlock>) -> Option<FutexKey> {
+    let handle = task.take_futex_wait()?;
+    let mut removed = false;
+    let mut map = FUTEX_QUEUES.lock();
+    if let Some(queue) = map.get_mut(&handle.key) {
+        queue.retain(|waiter| {
+            let keep = !Arc::ptr_eq(&waiter.in_queue, &handle.in_queue);
+            if !keep {
+                removed = true;
+                waiter.in_queue.store(false, Ordering::Release);
+            }
+            keep
+        });
+        if queue.is_empty() {
+            map.remove(&handle.key);
+        }
+    }
+    if !removed {
+        // It may have been dequeued by wake/timeout/signal just before exit
+        // cleanup. Mark the local waiter flag false so a blocked waiter will not
+        // continue sleeping on a logically detached entry.
+        handle.in_queue.store(false, Ordering::Release);
+        return None;
+    }
+    Some(handle.key)
+}
+
+fn detach_futex_waiter(
+    task: &Arc<TaskControlBlock>,
+    in_queue: &Arc<AtomicBool>,
+) -> Option<FutexKey> {
+    let removed_key = remove_tracked_futex_waiter(task).or_else(|| remove_waiter(in_queue));
+    task.clear_futex_wait(in_queue);
+    removed_key
 }
 
 pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
@@ -214,7 +253,7 @@ fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask
             }
             if woke < nr_wake && (waiter.bitset & bitset_mask) != 0 {
                 waiter.in_queue.store(false, Ordering::Release);
-                wake_list.push(waiter.task);
+                wake_list.push((waiter.task, waiter.in_queue));
                 woke += 1;
             } else {
                 remain.push_back(waiter);
@@ -226,7 +265,9 @@ fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask
         }
         woke
     };
-    for task in wake_list {
+    for (task, in_queue) in wake_list {
+        task.clear_futex_wait(&in_queue);
+        prime_fair_sync_wakeup_lag(&task);
         wakeup_task(task);
     }
     woke as isize
@@ -376,6 +417,7 @@ pub fn syscall_futex(
                     bitset,
                     in_queue: Arc::clone(&in_queue),
                 });
+            task.set_futex_wait(key, Arc::clone(&in_queue));
             if DEBUG_FUTEX && queue_len_before == 0 {
                 FUTEX_WAIT_DIAG_BASE_NS.store(monotonic_now_ns() as usize, Ordering::Relaxed);
             }
@@ -418,7 +460,7 @@ pub fn syscall_futex(
             if let Some(deadline_ns) = deadline_ns {
                 let now_ns = futex_wait_now_ns(cmd, clock_realtime);
                 if now_ns >= deadline_ns {
-                    let _ = remove_waiter(&in_queue);
+                    let _ = detach_futex_waiter(&task, &in_queue);
                     return err(SyscallError::ETIMEDOUT);
                 }
                 let wait_ms = ns_to_ms_ceil(deadline_ns.saturating_sub(now_ns)).max(1);
@@ -445,10 +487,11 @@ pub fn syscall_futex(
                 }
                 // Fast waiter-local check: dequeue side clears this bit before waking us.
                 if !in_queue.load(Ordering::Acquire) {
+                    task.clear_futex_wait(&in_queue);
                     return 0;
                 }
                 if pending_unmasked_signal() {
-                    if let Some(removed_key) = remove_waiter(&in_queue) {
+                    if let Some(removed_key) = detach_futex_waiter(&task, &in_queue) {
                         if DEBUG_FUTEX {
                             let seq = FUTEX_TIMEOUT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
                             if seq <= 8 || seq % 64 == 0 {
@@ -465,6 +508,7 @@ pub fn syscall_futex(
                         return err(SyscallError::EINTR);
                     }
                     if !in_queue.load(Ordering::Acquire) {
+                        task.clear_futex_wait(&in_queue);
                         return 0;
                     }
                     return err(SyscallError::EINTR);
@@ -472,7 +516,7 @@ pub fn syscall_futex(
                 if let Some(deadline_ns) = deadline_ns {
                     let now_ns = futex_wait_now_ns(cmd, clock_realtime);
                     if now_ns >= deadline_ns {
-                        if let Some(removed_key) = remove_waiter(&in_queue) {
+                        if let Some(removed_key) = detach_futex_waiter(&task, &in_queue) {
                             if DEBUG_FUTEX {
                                 let seq = FUTEX_TIMEOUT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
                                 let waited_ms = now_ns
@@ -493,6 +537,7 @@ pub fn syscall_futex(
                             return err(SyscallError::ETIMEDOUT);
                         }
                         if !in_queue.load(Ordering::Acquire) {
+                            task.clear_futex_wait(&in_queue);
                             return 0;
                         }
                         return err(SyscallError::ETIMEDOUT);
@@ -538,6 +583,11 @@ pub fn syscall_futex(
             }
             let pid = current_process().getpid();
             let token = get_current_token();
+            // Shared futex keys are PA based.  Fault both addresses in before
+            // computing keys so requeue cannot move waiters to a VA fallback
+            // key that a later wake on uaddr2 will never look up.
+            let cur = read_user_value(token, uaddr as *const i32);
+            let _ = read_user_value(token, _uaddr2 as *const i32);
             let key1 = futex_key(pid, token, uaddr, _private);
             let key2 = futex_key(pid, token, _uaddr2, _private);
             if DEBUG_FUTEX {
@@ -558,7 +608,6 @@ pub fn syscall_futex(
                 );
             }
             if cmd == FUTEX_CMP_REQUEUE {
-                let cur = read_user_value(token, uaddr as *const i32);
                 if DEBUG_FUTEX {
                     log::warn!(
                         "[futex_cmp_requeue_cmp] pid={} uaddr={:#x} key1=({:#x},{:#x}) cur={} expected={}",
@@ -583,6 +632,7 @@ pub fn syscall_futex(
             }
             let val2 = nr_requeue as usize;
             let mut wake_list = Vec::new();
+            let mut requeue_updates = Vec::new();
             let (woke, moved) = {
                 let mut map = FUTEX_QUEUES.lock();
                 let key1_len_before = map.get(&key1).map(VecDeque::len).unwrap_or(0);
@@ -611,7 +661,7 @@ pub fn syscall_futex(
                         continue;
                     }
                     waiter.in_queue.store(false, Ordering::Release);
-                    wake_list.push(waiter.task);
+                    wake_list.push((waiter.task, waiter.in_queue));
                     woke += 1;
                 }
                 let skipped_same_key = val2 > 0 && !queue1.is_empty() && key2 == key1;
@@ -625,6 +675,11 @@ pub fn syscall_futex(
                         if !waiter.in_queue.load(Ordering::Acquire) {
                             continue;
                         }
+                        requeue_updates.push((
+                            Arc::clone(&waiter.task),
+                            Arc::clone(&waiter.in_queue),
+                            key2,
+                        ));
                         target.push_back(waiter);
                         moved += 1;
                     }
@@ -655,7 +710,12 @@ pub fn syscall_futex(
                 }
                 (woke, moved)
             };
-            for task in wake_list {
+            for (task, in_queue, key) in requeue_updates {
+                task.update_futex_wait_key(&in_queue, key);
+            }
+            for (task, in_queue) in wake_list {
+                task.clear_futex_wait(&in_queue);
+                prime_fair_sync_wakeup_lag(&task);
                 wakeup_task(task);
             }
             woke.saturating_add(moved) as isize

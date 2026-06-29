@@ -43,9 +43,8 @@ use crate::{
         },
         processor::{
             block_current_and_run_next, current_files, current_files_and_nofile_limit,
-            current_process, current_task, suspend_current_and_run_next,
+            current_process, current_task,
         },
-        sched::{SchedClass, sched_class},
         signal::{
             RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,
             pending_unmasked_bits, queue_process_signal, sig_default_interrupts_wait,
@@ -109,6 +108,15 @@ pub(super) fn debug_task_ref_breakdown(
         wait_queue_refs = wait_queue_refs.saturating_add(
             inner
                 .wait_queue
+                .iter()
+                .filter(|holder| alloc::sync::Arc::ptr_eq(holder, task))
+                .count(),
+        );
+        // vfork waiters hold task Arcs just like wait4 waiters, so include
+        // them in leak/refcount diagnostics before blaming scheduler queues.
+        wait_queue_refs = wait_queue_refs.saturating_add(
+            inner
+                .vfork_wait_queue
                 .iter()
                 .filter(|holder| alloc::sync::Arc::ptr_eq(holder, task))
                 .count(),

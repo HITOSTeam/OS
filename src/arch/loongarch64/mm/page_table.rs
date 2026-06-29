@@ -240,10 +240,12 @@ impl PageTable {
     /// v is added inside.
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        // New mappings do not need a local flush unless a stale invalid entry
+        // could already be cached. User mapping changes that may leave stale
+        // translations invalidate the owning ASID at the MemorySet layer.
         let pte = self.find_pte_create(vpn).unwrap();
         debug_assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
-        flush_tlb_vaddr(vpn.0 << 12);
     }
 
     /// Fast-path map for sorted/nearby VPN streams.
@@ -285,20 +287,35 @@ impl PageTable {
             vpn
         );
         *pte_leaf = PageTableEntry::new(ppn, flags | PTEFlags::V);
-        flush_tlb_vaddr(vpn.0 << 12);
     }
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
+        self.unmap_deferred(vpn);
+        flush_tlb_vaddr(vpn.0 << 12);
+    }
+
+    #[allow(unused)]
+    pub fn unmap_deferred(&mut self, vpn: VirtPageNum) {
+        // Callers using the deferred variant must either flush this VA
+        // themselves or drop the owning user ASID before returning to user mode.
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
-        flush_tlb_vaddr(vpn.0 << 12);
     }
 
     /// Unmap an existing leaf PTE if it is present and valid.
     ///
     /// Returns `true` if an entry was unmapped.
     pub fn unmap_if_mapped(&mut self, vpn: VirtPageNum) -> bool {
+        if !self.unmap_if_mapped_deferred(vpn) {
+            return false;
+        }
+        flush_tlb_vaddr(vpn.0 << 12);
+        true
+    }
+
+    pub fn unmap_if_mapped_deferred(&mut self, vpn: VirtPageNum) -> bool {
+        // See `unmap_deferred`: this only edits the page table.
         let Some(pte) = self.find_pte(vpn) else {
             return false;
         };
@@ -306,7 +323,6 @@ impl PageTable {
             return false;
         }
         *pte = PageTableEntry::empty();
-        flush_tlb_vaddr(vpn.0 << 12);
         true
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
@@ -352,6 +368,16 @@ impl PageTable {
     ///
     /// Returns `false` if the vpn is not mapped.
     pub fn set_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
+        if !self.set_flags_deferred(vpn, flags) {
+            return false;
+        }
+        flush_tlb_vaddr(vpn.0 << 12);
+        true
+    }
+
+    pub fn set_flags_deferred(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
+        // Used by fork/mprotect paths that batch PTE edits and invalidate the
+        // mm ASID once, avoiding one invtlb per page.
         let Some(pte) = self.find_pte(vpn) else {
             return false;
         };
@@ -360,7 +386,6 @@ impl PageTable {
         }
         let ppn = pte.ppn();
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
-        flush_tlb_vaddr(vpn.0 << 12);
         true
     }
 
@@ -368,6 +393,16 @@ impl PageTable {
     ///
     /// Returns `false` if the vpn is not mapped.
     pub fn remap(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        if !self.remap_deferred(vpn, ppn, flags) {
+            return false;
+        }
+        flush_tlb_vaddr(vpn.0 << 12);
+        true
+    }
+
+    pub fn remap_deferred(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        // Used by COW fault handling to edit the PTE first and flush/drop ASID
+        // only after the frame metadata is also consistent.
         let Some(pte) = self.find_pte(vpn) else {
             return false;
         };
@@ -375,7 +410,6 @@ impl PageTable {
             return false;
         }
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
-        flush_tlb_vaddr(vpn.0 << 12);
         true
     }
     /// Translate `VirtAddr` to `PhysAddr`
@@ -397,6 +431,7 @@ impl PageTable {
             write_pgdh(base);
         }
         write_pgdl(base);
+        super::asid::write_kernel_asid();
         flush_tlb_all();
     }
     pub fn clone(&self) -> Self {
