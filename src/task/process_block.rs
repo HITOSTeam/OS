@@ -252,11 +252,8 @@ fn should_report_fork_impl_diag(seq: usize, total_us: usize) -> bool {
     seq <= 16 || seq % 128 == 0 || total_us >= 50_000
 }
 
-fn process_comm_from_argv(argv: &[String]) -> String {
-    let src = argv
-        .first()
-        .map(|s| s.rsplit('/').next().unwrap_or(s.as_str()))
-        .unwrap_or("CongCore");
+fn process_comm_from_name(name: &str) -> String {
+    let src = name.rsplit('/').next().unwrap_or(name);
     let mut out = String::new();
     for b in src.as_bytes().iter().copied().take(15) {
         if b == 0 {
@@ -269,6 +266,11 @@ fn process_comm_from_argv(argv: &[String]) -> String {
     } else {
         out
     }
+}
+
+fn process_comm_from_argv(argv: &[String]) -> String {
+    let src = argv.first().map(|s| s.as_str()).unwrap_or("CongCore");
+    process_comm_from_name(src)
 }
 
 lazy_static! {
@@ -1458,6 +1460,7 @@ impl ProcessControlBlock {
         elf_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
+        comm_override: Option<String>,
     ) -> Result<(), isize> {
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)?;
         self.exec_with_memory_set(
@@ -1468,6 +1471,7 @@ impl ProcessControlBlock {
             envs,
             elf_aux,
             (0, 0),
+            comm_override,
         );
         Ok(())
     }
@@ -1481,6 +1485,7 @@ impl ProcessControlBlock {
         interp_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
+        comm_override: Option<String>,
     ) -> Result<(), isize> {
         let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
             MemorySet::from_elf_with_interp(elf_data, interp_data)?;
@@ -1495,6 +1500,7 @@ impl ProcessControlBlock {
             args,
             envs,
             (0, 0),
+            comm_override,
         );
         Ok(())
     }
@@ -1508,6 +1514,7 @@ impl ProcessControlBlock {
         envs: Vec<String>,
         elf_aux: ElfAux,
         exec_inode: (usize, u32),
+        comm_override: Option<String>,
     ) {
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
@@ -1543,7 +1550,10 @@ impl ProcessControlBlock {
             inner.scheduling.reset_on_fork = false;
             inner.keep_caps = false;
             inner.argv = args.clone();
-            inner.comm = process_comm_from_argv(&args);
+            inner.comm = comm_override
+                .as_deref()
+                .map(process_comm_from_name)
+                .unwrap_or_else(|| process_comm_from_argv(&args));
             let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
             crate::syscall::process::unregister_executing_inode_locked(
                 &mut executing_inodes,
@@ -1606,6 +1616,7 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
         exec_inode: (usize, u32),
+        comm_override: Option<String>,
     ) {
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
@@ -1641,7 +1652,10 @@ impl ProcessControlBlock {
             inner.scheduling.reset_on_fork = false;
             inner.keep_caps = false;
             inner.argv = args.clone();
-            inner.comm = process_comm_from_argv(&args);
+            inner.comm = comm_override
+                .as_deref()
+                .map(process_comm_from_name)
+                .unwrap_or_else(|| process_comm_from_argv(&args));
             let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
             crate::syscall::process::unregister_executing_inode_locked(
                 &mut executing_inodes,

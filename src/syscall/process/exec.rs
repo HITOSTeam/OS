@@ -184,8 +184,7 @@ fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static st
         interp_name
     };
     match shell_name {
-        "bash" => "bash",
-        "dash" | "sh" => "sh",
+        "bash" | "dash" | "sh" => "sh",
         "busybox" => "sh",
         _ => "sh",
     }
@@ -206,7 +205,12 @@ fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> O
 }
 /// 将当前进程替换为已在内存中的解释器镜像（`interp_data`）。
 /// 若解释器本身也有 `PT_INTERP`（即 glibc 动态链接的 ld.so），则走动态加载路径。
-fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) -> isize {
+fn exec_interpreter(
+    interp_data: Vec<u8>,
+    args: Vec<String>,
+    envs: Vec<String>,
+    comm_override: Option<String>,
+) -> isize {
     if let Err(e) = validate_exec_stack_args(&args, &envs) {
         return e;
     }
@@ -217,11 +221,13 @@ fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) 
             Ok(data) => data,
             Err(e) => return e,
         };
-        if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, args, envs) {
+        if let Err(e) =
+            process.exec_dyn(&interp_data, &interp_interp_data, args, envs, comm_override)
+        {
             return e;
         }
     } else {
-        if let Err(e) = process.exec(&interp_data, args, envs) {
+        if let Err(e) = process.exec(&interp_data, args, envs, comm_override) {
             return e;
         }
     }
@@ -416,7 +422,7 @@ fn try_exec_busybox_applet(path: &str, args: &[String], envs: &[String]) -> Opti
     for a in args.iter().skip(1) {
         new_args.push(a.clone());
     }
-    Some(exec_interpreter(bb_data, new_args, envs.to_vec()))
+    Some(exec_interpreter(bb_data, new_args, envs.to_vec(), None))
 }
 
 pub(super) fn path_basename(path: &str) -> &str {
@@ -686,6 +692,7 @@ fn execve_with_inode(
                 args_vec,
                 envs_vec,
                 exec_inode,
+                None,
             );
             maybe_stop_after_ptrace_exec();
             return 0;
@@ -710,6 +717,7 @@ fn execve_with_inode(
             envs_vec,
             elf_aux,
             exec_inode,
+            None,
         );
         maybe_stop_after_ptrace_exec();
         return 0;
@@ -726,6 +734,7 @@ fn execve_with_inode(
     // Script with shebang: emulate Linux `#!` handling in-kernel so that
     // busybox/ash can run `./script.sh` directly.
     if let Some((interp, opt_arg)) = parse_shebang(head) {
+        let script_comm = Some(String::from(path_basename(&path)));
         let interp_name = interp.rsplit('/').next().unwrap_or(interp.as_str());
         let env_shell =
             interp_name == "env" && matches!(opt_arg.as_deref(), Some("sh") | Some("bash"));
@@ -743,7 +752,7 @@ fn execve_with_inode(
                 for a in args_vec.iter().skip(1) {
                     new_args.push(a.clone());
                 }
-                return exec_interpreter(interp_data, new_args, envs_vec);
+                return exec_interpreter(interp_data, new_args, envs_vec, script_comm.clone());
             }
             Ok(_) => {}
             Err(e) if e == err(SyscallError::ENOENT) => {}
@@ -761,7 +770,7 @@ fn execve_with_inode(
                 for a in args_vec.iter().skip(1) {
                     new_args.push(a.clone());
                 }
-                return exec_interpreter(bb_data, new_args, envs_vec);
+                return exec_interpreter(bb_data, new_args, envs_vec, script_comm.clone());
             }
         }
         if wants_shell {
@@ -781,7 +790,7 @@ fn execve_with_inode(
                 for a in args_vec.iter().skip(1) {
                     new_args.push(a.clone());
                 }
-                return exec_interpreter(interp_data, new_args, envs_vec);
+                return exec_interpreter(interp_data, new_args, envs_vec, script_comm.clone());
             }
         }
         match load_file_from_path(&interp) {
@@ -798,7 +807,7 @@ fn execve_with_inode(
                     for a in args_vec.iter().skip(1) {
                         new_args.push(a.clone());
                     }
-                    return exec_interpreter(interp_data, new_args, envs_vec);
+                    return exec_interpreter(interp_data, new_args, envs_vec, script_comm.clone());
                 }
                 if !wants_shell {
                     return ENOEXEC;
@@ -843,13 +852,17 @@ fn execve_with_inode(
                     Ok(data) => data,
                     Err(e) => return e,
                 };
-                if let Err(e) =
-                    process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec)
-                {
+                if let Err(e) = process.exec_dyn(
+                    &interp_data,
+                    &interp_interp_data,
+                    new_args,
+                    envs_vec,
+                    script_comm,
+                ) {
                     return e;
                 }
             } else {
-                if let Err(e) = process.exec(&interp_data, new_args, envs_vec) {
+                if let Err(e) = process.exec(&interp_data, new_args, envs_vec, script_comm) {
                     return e;
                 }
             }
@@ -863,6 +876,7 @@ fn execve_with_inode(
     // Note: this diverges from Linux (which returns ENOEXEC) but keeps OSComp
     // scripts working when shells don't retry on ENOEXEC.
     if path.ends_with(".sh") {
+        let script_comm = Some(String::from(path_basename(&path)));
         let interp = match find_shell_interpreter() {
             Ok(v) => v,
             Err(e) => return e,
@@ -892,12 +906,17 @@ fn execve_with_inode(
                 Ok(data) => data,
                 Err(e) => return e,
             };
-            if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec)
-            {
+            if let Err(e) = process.exec_dyn(
+                &interp_data,
+                &interp_interp_data,
+                new_args,
+                envs_vec,
+                script_comm.clone(),
+            ) {
                 return e;
             }
         } else {
-            if let Err(e) = process.exec(&interp_data, new_args, envs_vec) {
+            if let Err(e) = process.exec(&interp_data, new_args, envs_vec, script_comm) {
                 return e;
             }
         }
@@ -941,7 +960,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
             for a in args_vec.iter().skip(1) {
                 new_args.push(a.clone());
             }
-            return exec_interpreter(bb_data, new_args, envs_vec);
+            return exec_interpreter(bb_data, new_args, envs_vec, None);
         }
     }
 
