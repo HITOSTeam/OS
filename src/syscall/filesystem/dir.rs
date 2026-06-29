@@ -1,16 +1,16 @@
 use super::{
     AT_EMPTY_PATH, AT_SYMLINK_FOLLOW, AtPath, MapPermission, OSInode, ProcMagicLinkFile, PseudoDir,
     S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, SyscallError, align_up, apply_umask,
-    cgroup_mkdir, cgroup_rmdir, current_effective_uid_gid, current_fsuid_gid, current_process,
-    defer_unlink_open_file, do_renameat, do_renameat_exchange, dt_type_from_ext4, err,
-    ext4_err_to_errno, ext4_lock, final_non_empty_component, get_current_token, get_fd_file,
-    gid_for_created_inode, hardlink_cross_mount, inode_is_immutable_or_append,
-    inode_is_rofs_mount_root, inode_logical_path, inode_mode_allows_uid_gid,
-    maybe_update_inode_atime, min, mode_for_created_file, open_pseudo, parent_forces_gid_inherit,
-    parse_proc_fd_for_current_process, path_is_mount_point, proc_path_for_at, read_u16_le,
-    read_u32_le, read_user_cstring, resolve_abs_path, resolve_at_inode, resolve_at_path,
-    resolve_parent_and_name, rofs_for_path, shm_object_name, shm_remove, sticky_rename_allowed,
-    translated_byte_buffer, try_copy_to_user,
+    cgroup_mkdir, cgroup_rmdir, clear_ext4_path_cache, current_effective_uid_gid,
+    current_fsuid_gid, current_process, defer_unlink_open_file, do_renameat, do_renameat_exchange,
+    dt_type_from_ext4, err, ext4_err_to_errno, ext4_lock, final_non_empty_component,
+    get_current_token, get_fd_file, gid_for_created_inode, hardlink_cross_mount,
+    inode_is_immutable_or_append, inode_is_rofs_mount_root, inode_logical_path,
+    inode_mode_allows_uid_gid, maybe_update_inode_atime, min, mode_for_created_file, open_pseudo,
+    parent_forces_gid_inherit, parse_proc_fd_for_current_process, path_is_mount_point,
+    proc_path_for_at, read_u16_le, read_u32_le, read_user_cstring, resolve_abs_path,
+    resolve_at_inode, resolve_at_path, resolve_parent_and_name, rofs_for_path, shm_object_name,
+    shm_remove, sticky_rename_allowed, translated_byte_buffer, try_copy_to_user,
 };
 
 /// Reads a symlink target by pathname or, with `AT_EMPTY_PATH`, directly from an fd.
@@ -151,6 +151,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
 
     match parent.create_symlink(&name, &target_path) {
         Ok(inode) => {
+            clear_ext4_path_cache();
             let gid = gid_for_created_inode(Some(&parent), fsgid);
             inode.set_uid_gid(fsuid, gid);
             inode.set_mode(0o777);
@@ -297,7 +298,10 @@ pub fn syscall_linkat(
     }
 
     match parent.link_inode(&name, &source) {
-        Ok(_) => 0,
+        Ok(_) => {
+            clear_ext4_path_cache();
+            0
+        }
         Err(ext4_fs::Ext4Error::Unsupported) => err(SyscallError::EPERM),
         Err(e) => ext4_err_to_errno(e),
     }
@@ -439,6 +443,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
 
     match create_result {
         Ok(inode) => {
+            clear_ext4_path_cache();
             inode.set_uid_gid(fsuid, gid);
             inode.set_mode(create_mode);
             0
@@ -531,6 +536,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     }
     match parent.create_dir(&name) {
         Ok(dir) => {
+            clear_ext4_path_cache();
             let gid = gid_for_created_inode(Some(&parent), fsgid);
             let mut dir_mode = create_mode;
             if parent_forces_gid_inherit(&parent) {
@@ -707,7 +713,10 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     }
 
     match parent.unlink(&name) {
-        Ok(_) => 0,
+        Ok(_) => {
+            clear_ext4_path_cache();
+            0
+        }
         Err(ext4_fs::Ext4Error::Unsupported) => err(SyscallError::ENOTEMPTY),
         Err(e) => ext4_err_to_errno(e),
     }

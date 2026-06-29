@@ -3,10 +3,11 @@ use super::{
     INODE_XATTRS, MAX_SYMLINKS, NAME_MAX, O_TRUNC, OSInode, PATH_MAX, PseudoDir, PseudoDirent,
     PseudoShmFile, String, SyscallError, Vec, XATTR_CREATE, XATTR_NAME_MAX, XATTR_REPLACE,
     XATTR_SIZE_MAX, current_cwd_path, current_files, current_fsuid_gid, current_mount_namespace,
-    current_process, dt_type_from_ext4, err, ext4_lock, fd_has_o_path, find_path_in_roots,
-    get_current_token, get_fd_file, inode_is_immutable_or_append, inode_mode_allows_uid_gid,
-    install_open_file_fd, logical_path_for_inode, logical_path_for_open_fd, mount_lookup_for_abs,
-    open_pseudo, path_is_noexec, path_is_rofs, pseudo_abs_for_ext4_dirfd,
+    current_process, dt_type_from_ext4, err, ext4_lock, ext4_path_cache_lookup, fd_has_o_path,
+    find_path_in_roots, get_current_token, get_fd_file, inode_is_immutable_or_append,
+    inode_mode_allows_uid_gid, install_open_file_fd, logical_path_for_inode,
+    logical_path_for_open_fd, mount_lookup_for_abs, note_ext4_path_cache, open_pseudo,
+    path_is_noexec, path_is_rofs, pseudo_abs_for_ext4_dirfd,
     resolve_proc_magic_intermediate_abs_path, secondary_root_inode, shm_get, shm_object_name,
     syscall_ftruncate, touch_inode_mtime_ctime_now, translate_mount_abs, try_copy_from_user,
     try_copy_to_user, try_read_user_value,
@@ -407,14 +408,55 @@ pub(crate) fn resolve_ext4_abs_path(
     seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let abs = crate::fs::normalize_proc_magic_path(path).into_owned();
+    if let Some(inode) = ext4_path_cache_lookup(&abs, uid, gid, follow_final) {
+        return Ok(inode);
+    }
 
     let primary = crate::fs::root_inode_for_path(&abs);
+    if let Some(result) =
+        resolve_ext4_abs_path_fast_cached(primary.clone(), &abs, uid, gid, follow_final)
+    {
+        return match result {
+            Ok(v) => Ok(v),
+            Err(e) if e == err(SyscallError::ENOENT) => {
+                let Some(secondary) = secondary_root_inode() else {
+                    return Err(err(SyscallError::ENOENT));
+                };
+                if let Some(sec_result) = resolve_ext4_abs_path_fast_cached(
+                    secondary.clone(),
+                    &abs,
+                    uid,
+                    gid,
+                    follow_final,
+                ) {
+                    return sec_result;
+                }
+                let mut sec_depth = 0usize;
+                let mut sec_seen = Vec::new();
+                resolve_ext4_path(
+                    secondary,
+                    &abs,
+                    uid,
+                    gid,
+                    follow_final,
+                    &mut sec_depth,
+                    &mut sec_seen,
+                )
+            }
+            Err(e) => Err(e),
+        };
+    }
     match resolve_ext4_path(primary, &abs, uid, gid, follow_final, depth, seen_symlinks) {
         Ok(v) => Ok(v),
         Err(e) if e == err(SyscallError::ENOENT) => {
             let Some(secondary) = secondary_root_inode() else {
                 return Err(err(SyscallError::ENOENT));
             };
+            if let Some(sec_result) =
+                resolve_ext4_abs_path_fast_cached(secondary.clone(), &abs, uid, gid, follow_final)
+            {
+                return sec_result;
+            }
             let mut sec_depth = 0usize;
             let mut sec_seen = Vec::new();
             resolve_ext4_path(
@@ -429,6 +471,20 @@ pub(crate) fn resolve_ext4_abs_path(
         }
         Err(e) => Err(e),
     }
+}
+
+fn resolve_ext4_abs_path_fast_cached(
+    start: alloc::sync::Arc<ext4_fs::Inode>,
+    abs: &str,
+    uid: u32,
+    gid: u32,
+    follow_final: bool,
+) -> Option<Result<alloc::sync::Arc<ext4_fs::Inode>, isize>> {
+    let result = resolve_ext4_path_fast_no_symlink(start, abs, uid, gid, follow_final)?;
+    if let Ok(inode) = &result {
+        note_ext4_path_cache(abs, uid, gid, follow_final, inode);
+    }
+    Some(result)
 }
 
 /// 若 `path` 是当前进程的 `/proc/self/fd/<n>` 或 `/proc/<pid>/fd/<n>`，

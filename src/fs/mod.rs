@@ -820,7 +820,8 @@ pub use eventfd::EventFdFile;
 #[allow(unused_imports)]
 pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
-    debug_track_iozone_inode, ext4_lock, find_path_in_roots, inode_path_hint, inode_path_in_roots,
+    clear_ext4_path_cache, debug_track_iozone_inode, ext4_lock, ext4_path_cache_lookup,
+    find_path_in_roots, inode_path_hint, inode_path_in_roots, note_ext4_path_cache,
     note_inode_path_hint, path_resolves_to_inode, register_deferred_unlink_cleanup,
     resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked, root_inode_for_path,
     secondary_root_inode,

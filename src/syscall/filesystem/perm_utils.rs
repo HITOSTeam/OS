@@ -1,5 +1,6 @@
 use super::{
-    BTreeSet, OSInode, PID2PCB, ProcessControlBlock, SyscallError, Vec, current_process, err,
+    BTreeSet, OSInode, PID2PCB, ProcessControlBlock, SyscallError, Vec, clear_ext4_path_cache,
+    current_process, err,
 };
 
 /// Converts ext4 backend errors into Linux-style `errno` values.
@@ -89,6 +90,9 @@ pub(crate) fn apply_chown_to_inode(inode: &ext4_fs::Inode, uid: usize, gid: usiz
     let new_gid = gid_req.unwrap_or_else(|| inode.gid());
     inode.set_uid_gid(new_uid, new_gid);
     maybe_clear_suid_sgid_after_chown(inode, uid_req.is_some() || gid_req.is_some());
+    if uid_req.is_some() || gid_req.is_some() {
+        clear_ext4_path_cache();
+    }
     0
 }
 

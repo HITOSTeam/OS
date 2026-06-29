@@ -2,16 +2,16 @@ use super::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, BTreeSet, FS_APPEND_FL,
     FS_IMMUTABLE_FL, Mutex, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOATIME, O_NONBLOCK, O_RDONLY,
     O_TMPFILE, O_TRUNC, O_WRONLY, OSInode, Ordering, PID2PCB, S_IFBLK, S_IFCHR, S_IFMT,
-    SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec, cgroup_rename, current_effective_uid_gid,
-    current_files, current_fsuid_gid, current_in_group, current_process, current_timespec,
-    empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock, fchmod_fd_for_at_empty_path,
-    fifo_pipe_state_for_inode, file_lock_key_from_inode, get_current_token, inode_mode_allows,
-    inode_mode_allows_uid_gid, install_open_file_fd, is_inode_currently_executed_locked,
-    lock_executing_inodes, maybe_dispatch_proc_fd_at, maybe_signal_lease_break,
-    note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs, pseudo_path_exists_result,
-    queue_process_signal, read_user_cstring, register_deferred_unlink_cleanup, resolve_at_inode,
-    resolve_at_path, resolve_parent_and_name, rofs_for_path, syscall_fchmod, try_copy_from_user,
-    try_copy_to_user_unchecked,
+    SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec, cgroup_rename, clear_ext4_path_cache,
+    current_effective_uid_gid, current_files, current_fsuid_gid, current_in_group, current_process,
+    current_timespec, empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock,
+    fchmod_fd_for_at_empty_path, fifo_pipe_state_for_inode, file_lock_key_from_inode,
+    get_current_token, inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
+    is_inode_currently_executed_locked, lock_executing_inodes, maybe_dispatch_proc_fd_at,
+    maybe_signal_lease_break, note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs,
+    pseudo_path_exists_result, queue_process_signal, read_user_cstring,
+    register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
+    rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
 };
 use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
 use alloc::vec;
@@ -330,6 +330,7 @@ pub(crate) fn do_fchmodat(
         new_mode &= !0o2000;
     }
     inode.set_mode(new_mode);
+    clear_ext4_path_cache();
     0
 }
 
@@ -415,7 +416,10 @@ pub(crate) fn sticky_rename_allowed(
 
 pub(crate) fn remove_rename_target(parent: &Arc<ext4_fs::Inode>, name: &str) -> isize {
     match parent.unlink(name) {
-        Ok(()) => 0,
+        Ok(()) => {
+            clear_ext4_path_cache();
+            0
+        }
         Err(ext4_fs::Ext4Error::Unsupported) => err(SyscallError::ENOTEMPTY),
         Err(e) => ext4_err_to_errno(e),
     }
@@ -513,6 +517,7 @@ pub(crate) fn do_renameat(
     }
 
     let same_parent = inode_eq(&old_parent, &new_parent);
+    clear_ext4_path_cache();
     if !same_parent {
         if source.is_dir() {
             if new_parent.link_count() >= u16::MAX as u32 {
@@ -629,6 +634,7 @@ pub(crate) fn do_renameat_exchange(
         return err(SyscallError::EBUSY);
     }
 
+    clear_ext4_path_cache();
     if let Err(e) = old_parent.link_inode(&tmp_name, &old_inode) {
         return ext4_err_to_errno(e);
     }
@@ -939,6 +945,7 @@ pub(crate) fn defer_unlink_open_file(
         if parent.find(&hidden).is_some() {
             continue;
         }
+        clear_ext4_path_cache();
         match parent.rename(name, &hidden) {
             Ok(_) => {
                 register_deferred_unlink_cleanup(child, Arc::clone(parent), hidden);

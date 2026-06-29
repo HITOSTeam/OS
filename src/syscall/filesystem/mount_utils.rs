@@ -6,11 +6,11 @@ use super::{
     NEXT_MOUNT_EVENT_ID, NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ, OSInode, Ordering,
     PID2PCB, ProcessControlBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile, ST_NOSYMFOLLOW,
     String, SyscallError, TMPFILE_SEQ, UMOUNT_NOFOLLOW, Vec, cgroup_logical_path_for_file,
-    cgroup_mount, cgroup_umount, current_fsuid_gid, current_process, current_timespec, err,
-    ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token, get_inode_times,
-    inode_logical_path, inode_raw_logical_path, mount_namespace_id, normalize_path, open_pseudo,
-    pseudo_block_is_read_only, read_user_cstring, resolve_at_inode, resolve_at_path,
-    set_inode_times,
+    cgroup_mount, cgroup_umount, clear_ext4_path_cache, current_fsuid_gid, current_process,
+    current_timespec, err, ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token,
+    get_inode_times, inode_logical_path, inode_raw_logical_path, mount_namespace_id,
+    normalize_path, open_pseudo, pseudo_block_is_read_only, read_user_cstring, resolve_at_inode,
+    resolve_at_path, set_inode_times,
 };
 use lazy_static::lazy_static;
 
@@ -354,6 +354,7 @@ pub(crate) fn ensure_mount_source_root() -> Result<Arc<ext4_fs::Inode>, isize> {
     }
     match root.create_dir(".ltp_mounts") {
         Ok(dir) => {
+            clear_ext4_path_cache();
             dir.set_uid_gid(0, 0);
             dir.set_mode(0o700);
             Ok(dir)
@@ -381,6 +382,7 @@ pub(crate) fn source_for_device_mount(key: &str) -> Result<String, isize> {
         }
         match root.create_dir(&name) {
             Ok(dir) => {
+                clear_ext4_path_cache();
                 dir.set_uid_gid(0, 0);
                 if fresh_instance {
                     // Linux tmpfs defaults its root to 1777, so unprivileged

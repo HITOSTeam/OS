@@ -69,6 +69,15 @@ impl Drop for Ext4Guard {
     }
 }
 
+const EXT4_PATH_CACHE_MAX: usize = 512;
+
+struct Ext4PathCacheEntry {
+    uid: u32,
+    gid: u32,
+    follow_final: bool,
+    inode: Arc<Inode>,
+}
+
 // Serialize ext4 operations across harts.
 lazy_static! {
     static ref EXT4_LOCK: Arc<Ext4Lock> = Arc::new(Ext4Lock::new());
@@ -77,12 +86,64 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> =
         Mutex::new(BTreeMap::new());
+    static ref EXT4_PATH_CACHE: Mutex<BTreeMap<String, Vec<Ext4PathCacheEntry>>> =
+        Mutex::new(BTreeMap::new());
 }
 
 pub(crate) fn ext4_lock() -> Ext4Guard {
     let lock = Arc::clone(&EXT4_LOCK);
     lock.lock();
     Ext4Guard { lock }
+}
+
+pub(crate) fn clear_ext4_path_cache() {
+    let mut cache = EXT4_PATH_CACHE.lock();
+    if !cache.is_empty() {
+        cache.clear();
+    }
+}
+
+pub(crate) fn ext4_path_cache_lookup(
+    path: &str,
+    uid: u32,
+    gid: u32,
+    follow_final: bool,
+) -> Option<Arc<Inode>> {
+    EXT4_PATH_CACHE.lock().get(path).and_then(|entries| {
+        entries
+            .iter()
+            .find(|entry| {
+                entry.uid == uid && entry.gid == gid && entry.follow_final == follow_final
+            })
+            .map(|entry| Arc::clone(&entry.inode))
+    })
+}
+
+pub(crate) fn note_ext4_path_cache(
+    path: &str,
+    uid: u32,
+    gid: u32,
+    follow_final: bool,
+    inode: &Arc<Inode>,
+) {
+    let mut cache = EXT4_PATH_CACHE.lock();
+    if !cache.contains_key(path) && cache.len() >= EXT4_PATH_CACHE_MAX {
+        cache.clear();
+    }
+    let entries = cache.entry(String::from(path)).or_default();
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.uid == uid && entry.gid == gid && entry.follow_final == follow_final)
+    {
+        entry.inode = Arc::clone(inode);
+        return;
+    }
+    entries.push(Ext4PathCacheEntry {
+        uid,
+        gid,
+        follow_final,
+        inode: Arc::clone(inode),
+    });
 }
 
 pub(crate) fn debug_track_iozone_inode(path: &str, inode_num: u32) {
@@ -728,7 +789,9 @@ fn sweep_deferred_unlinks() {
         if !has_open_inode_fd_refs(key.0, key.1) {
             if let Some(cleanup) = DEFERRED_UNLINK_CLEANUP.lock().remove(&key) {
                 let _fs_guard = ext4_lock();
-                let _ = cleanup.parent.unlink(&cleanup.name);
+                if cleanup.parent.unlink(&cleanup.name).is_ok() {
+                    clear_ext4_path_cache();
+                }
             }
         }
     }
@@ -933,6 +996,9 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             base_dir.find_path(parent_path)?
         };
         inode = parent.create_file(file_name).ok();
+        if inode.is_some() {
+            clear_ext4_path_cache();
+        }
     }
 
     let inode = inode?;
@@ -1179,20 +1245,28 @@ impl Drop for OSInode {
         }
         drop(inner);
         if let Some(cleanup) = self.tmpfile_cleanup.take() {
-            let _ = {
+            if {
                 let _fs_guard = ext4_lock();
                 cleanup.parent.unlink(&cleanup.name)
-            };
+            }
+            .is_ok()
+            {
+                clear_ext4_path_cache();
+            }
         }
         let deferred_cleanup = { DEFERRED_UNLINK_CLEANUP.lock().remove(&inode_key) };
         if let Some(cleanup) = deferred_cleanup {
             if has_open_inode_fd_refs(inode_key.0, inode_key.1) {
                 DEFERRED_UNLINK_CLEANUP.lock().insert(inode_key, cleanup);
             } else {
-                let _ = {
+                if {
                     let _fs_guard = ext4_lock();
                     cleanup.parent.unlink(&cleanup.name)
-                };
+                }
+                .is_ok()
+                {
+                    clear_ext4_path_cache();
+                }
                 // Opportunistically clean up other lingering deferred entries.
                 sweep_deferred_unlinks();
             }
