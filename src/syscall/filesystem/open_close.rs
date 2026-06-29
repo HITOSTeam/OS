@@ -672,18 +672,20 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let Some((file, old_flags)) = files.get_file_and_flags(oldfd) else {
         return err(SyscallError::EBADF);
     };
-    let replaced_lock_key = files.get_file(newfd).and_then(|file| file_lock_key(&file));
     let mut new_flags = old_flags;
     if (flags & O_CLOEXEC) != 0 {
         new_flags |= FD_CLOEXEC;
     } else {
         new_flags &= !FD_CLOEXEC;
     }
-    let _ = files.install_fd_at(newfd, file, new_flags, limit);
+    let replaced_file = files.replace_fd_at(newfd, file, new_flags, limit).flatten();
     drop(files);
-    if let Some(key) = replaced_lock_key {
-        remove_process_record_locks_for_key(owner_pid, key);
-        remove_owner_file_lease_for_key(owner_pid, key);
+    if let Some(replaced_file) = replaced_file {
+        if let Some(key) = file_lock_key(&replaced_file) {
+            remove_process_record_locks_for_key(owner_pid, key);
+            remove_owner_file_lease_for_key(owner_pid, key);
+        }
+        drop(replaced_file);
     }
     newfd as isize
 }

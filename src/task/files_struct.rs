@@ -232,8 +232,23 @@ impl FilesStruct {
         flags: u32,
         limit: usize,
     ) -> bool {
+        self.replace_fd_at(fd, file, flags, limit).is_some()
+    }
+
+    /// Replace a fixed descriptor and return the previously installed file.
+    ///
+    /// Syscall paths such as dup2/dup3 must not drop the replaced file while
+    /// holding the descriptor-table lock, because file destructors can wake
+    /// waiters and take unrelated subsystem locks.
+    pub fn replace_fd_at(
+        &mut self,
+        fd: usize,
+        file: Arc<dyn File + Send + Sync>,
+        flags: u32,
+        limit: usize,
+    ) -> Option<Option<Arc<dyn File + Send + Sync>>> {
         if fd >= limit {
-            return false;
+            return None;
         }
         self.close_cursor = None;
         if self.fd_table.len() <= fd {
@@ -242,7 +257,7 @@ impl FilesStruct {
         } else {
             self.ensure_flags_len();
         }
-        self.fd_table[fd] = Some(file);
+        let old_file = self.fd_table[fd].replace(file);
         self.fd_flags[fd] = flags;
         if fd == self.next_fd_hint {
             while self
@@ -253,7 +268,7 @@ impl FilesStruct {
                 self.next_fd_hint += 1;
             }
         }
-        true
+        Some(old_file)
     }
 
     /// 关闭并移除指定 fd，返回被移除的 File Arc（调用方可按需 drop 或等待引用归零）。
