@@ -33,14 +33,17 @@ pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
 /// 从全局 PID->PCB 映射表中移除指定 PID，找不到时输出警告
 pub fn remove_from_pid2process(pid: usize) {
     let mut map = PID2PCB.lock();
-    if map.remove(&pid).is_none() {
+    let removed = map.remove(&pid);
+    let len = map.len();
+    drop(map);
+    let Some(process) = removed else {
         log::warn!(
             "remove_from_pid2process: pid {} not found (already reaped?)",
             pid
         );
         return;
-    }
-    let len = map.len();
+    };
+    crate::task::unregister_pid_namespace_reaper_for_process(&process);
     if crate::debug_config::DEBUG_PID_MAP && len >= 64 && (len & (len - 1)) == 0 {
         crate::println!("[pid-debug] remove pid={} map_len={}", pid, len);
     }

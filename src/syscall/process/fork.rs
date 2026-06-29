@@ -383,10 +383,14 @@ fn clone_from_parts(
         let parent_ns_id = process.pid_namespace_id();
         let child_ns_id = crate::task::alloc_pid_namespace_id();
         crate::task::register_pid_namespace(parent_ns_id, child_ns_id);
-        let mut child_inner = child.borrow_mut();
-        child_inner.pid_ns_id = child_ns_id;
-        child_inner.pid_ns_vpid = 1;
-        child_inner.pid_ns_init = true;
+        {
+            let mut child_inner = child.borrow_mut();
+            child_inner.pid_ns_id = child_ns_id;
+            child_inner.pid_ns_vpid = 1;
+            child_inner.pid_ns_init = true;
+            child.update_parent_visible_pid_from_locked_child(child_ns_id, parent_ns_id, 0);
+        }
+        crate::task::register_pid_namespace_reaper(child_ns_id, child.getpid());
     }
     // 计算本次 fork 实际耗时（微秒），用于诊断慢 fork（仅 DEBUG_FUTEX 时启用）
     let fork_elapsed_us = if DEBUG_FUTEX {
@@ -442,6 +446,8 @@ fn clone_from_parts(
             inner.parent.as_ref().and_then(|p| p.upgrade())
         };
         if let Some(real_parent) = real_parent {
+            let real_parent_pid_ns_id = real_parent.pid_namespace_id();
+            let real_parent_visible_pid = real_parent.visible_pid();
             // 1) 从调用者的子列表里移除新子
             {
                 let mut caller_inner = process.borrow_mut();
@@ -451,6 +457,11 @@ fn clone_from_parts(
             {
                 let mut child_inner = child.borrow_mut();
                 child_inner.parent = Some(Arc::downgrade(&real_parent));
+                child.update_parent_visible_pid_from_locked_child(
+                    child_inner.pid_ns_id,
+                    real_parent_pid_ns_id,
+                    real_parent_visible_pid,
+                );
             }
             // 3) 把新子挂到真父的子列表
             {

@@ -154,6 +154,74 @@ fn kill_pid_namespace_members_on_init_exit(process: &Arc<ProcessControlBlock>) {
     }
 }
 
+fn try_reparent_child_to(
+    child: &Arc<ProcessControlBlock>,
+    reaper: &Arc<ProcessControlBlock>,
+) -> bool {
+    let mut reaper_inner = reaper.borrow_mut();
+    if reaper_inner.is_zombie {
+        return false;
+    }
+    let reaper_pid = reaper.getpid();
+    let reaper_pid_ns_id = reaper_inner.pid_ns_id;
+    let reaper_visible_pid = reaper_inner.pid_ns_vpid;
+    let queue_for_reaper = {
+        let mut child_inner = child.borrow_mut();
+        child_inner.parent = Some(Arc::downgrade(reaper));
+        child.update_parent_visible_pid_from_locked_child(
+            child_inner.pid_ns_id,
+            reaper_pid_ns_id,
+            reaper_visible_pid,
+        );
+        if child_inner.is_zombie && child_inner.exited_parent_queue_pid != Some(reaper_pid) {
+            child_inner.exited_parent_queue_pid = Some(reaper_pid);
+            true
+        } else {
+            false
+        }
+    };
+    reaper_inner.add_child(child.clone());
+    if queue_for_reaper {
+        reaper_inner.exited_children.push_back(child.clone());
+    }
+    true
+}
+
+fn try_reparent_child_to_namespace_reaper(
+    child: &Arc<ProcessControlBlock>,
+    exiting_process: &Arc<ProcessControlBlock>,
+    namespace_id: usize,
+) -> bool {
+    let mut current_namespace = Some(namespace_id);
+    while let Some(ns_id) = current_namespace {
+        if let Some(reaper) = crate::task::pid_namespace_reaper(ns_id)
+            && !Arc::ptr_eq(&reaper, exiting_process)
+            && !Arc::ptr_eq(&reaper, child)
+            && try_reparent_child_to(child, &reaper)
+        {
+            return true;
+        }
+        current_namespace = crate::task::pid_namespace_parent(ns_id);
+    }
+    false
+}
+
+fn reparent_orphaned_children(process: &Arc<ProcessControlBlock>) {
+    let (children, namespace_id) = {
+        let process_inner = process.borrow_mut();
+        (process_inner.children.clone(), process_inner.pid_ns_id)
+    };
+    for child in children {
+        if try_reparent_child_to_namespace_reaper(&child, process, namespace_id) {
+            continue;
+        }
+        let initproc = INITPROC.clone();
+        if !Arc::ptr_eq(&initproc, process) && !Arc::ptr_eq(&initproc, &child) {
+            let _ = try_reparent_child_to(&child, &initproc);
+        }
+    }
+}
+
 fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
     if crate::debug_config::DEBUG_TASK_LIFECYCLE {
         let seq = TASK_DROP_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
@@ -1616,29 +1684,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             wakeup_tasks(waiters);
         }
 
-        {
-            let process_inner = process.borrow_mut();
-            let mut initproc_inner = INITPROC.borrow_mut();
-            let init_pid = INITPROC.getpid();
-            for child in process_inner.children.iter() {
-                let queue_for_init = {
-                    let mut child_inner = child.borrow_mut();
-                    child_inner.parent = Some(Arc::downgrade(&INITPROC));
-                    if child_inner.is_zombie
-                        && child_inner.exited_parent_queue_pid != Some(init_pid)
-                    {
-                        child_inner.exited_parent_queue_pid = Some(init_pid);
-                        true
-                    } else {
-                        false
-                    }
-                };
-                initproc_inner.add_child(child.clone());
-                if queue_for_init {
-                    initproc_inner.exited_children.push_back(child.clone());
-                }
-            }
-        }
+        reparent_orphaned_children(&process);
 
         // Deallocate user-thread resources only after each member has run the
         // same exit-side futex/join cleanup as the current thread.
@@ -1769,6 +1815,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     };
     crate::syscall::process::release_ptrace_tracer(&process);
     crate::fs::wake_pidfd_poll_waiters(pid);
+    kill_pid_namespace_members_on_init_exit(&process);
     cgroup_exit_process(pid);
     crate::syscall::sysv_ipc::exit_cleanup(pid);
     crate::syscall::filesystem::acct_process_exit(&process, exit_code);
@@ -1783,27 +1830,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         wakeup_tasks(waiters);
     }
 
-    {
-        let process_inner = process.borrow_mut();
-        let mut initproc_inner = INITPROC.borrow_mut();
-        let init_pid = INITPROC.getpid();
-        for child in process_inner.children.iter() {
-            let queue_for_init = {
-                let mut child_inner = child.borrow_mut();
-                child_inner.parent = Some(Arc::downgrade(&INITPROC));
-                if child_inner.is_zombie && child_inner.exited_parent_queue_pid != Some(init_pid) {
-                    child_inner.exited_parent_queue_pid = Some(init_pid);
-                    true
-                } else {
-                    false
-                }
-            };
-            initproc_inner.add_child(child.clone());
-            if queue_for_init {
-                initproc_inner.exited_children.push_back(child.clone());
-            }
-        }
-    }
+    reparent_orphaned_children(&process);
 
     let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();

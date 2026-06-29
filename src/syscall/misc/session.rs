@@ -2,7 +2,7 @@ use crate::{
     syscall::error::{SyscallError, err},
     task::{
         manager::{PID2PCB, pid2process},
-        processor::current_process,
+        processor::{current_process, current_task},
     },
 };
 use alloc::sync::Arc;
@@ -20,20 +20,10 @@ pub(super) fn normalized_sid(pid: usize, sid: usize, pgid: usize) -> usize {
 }
 
 pub fn syscall_getppid() -> isize {
-    let process = current_process();
-    let (pid_ns_id, parent) = {
-        let inner = process.borrow_mut();
-        (
-            inner.pid_ns_id,
-            inner.parent.as_ref().and_then(|p| p.upgrade()),
-        )
-    };
-    match parent {
-        Some(parent) if pid_ns_id == 0 || parent.pid_namespace_id() == pid_ns_id => {
-            parent.visible_pid() as isize
-        }
-        Some(_) | None => 0,
-    }
+    current_task()
+        .and_then(|task| task.process.upgrade())
+        .map(|process| process.fast_parent_visible_pid() as isize)
+        .unwrap_or(0)
 }
 
 /// Linux `setpgid(2)` (syscall 154 on riscv64).
