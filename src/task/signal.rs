@@ -63,6 +63,37 @@ fn send_signal_ipis(mask: usize) {
     }
 }
 
+pub(crate) fn request_reschedule_for_signal_target(task: &Arc<TaskControlBlock>) {
+    let local_hart = hart_id() % crate::config::MAX_HARTS;
+    let running_hart = task.on_cpu.load(core::sync::atomic::Ordering::Acquire);
+    if running_hart != TaskControlBlock::OFF_CPU {
+        if running_hart == local_hart {
+            crate::task::processor::request_reschedule_current_hart();
+        } else if running_hart < crate::config::MAX_HARTS {
+            crate::task::processor::request_reschedule_harts(1usize << running_hart);
+        }
+        return;
+    }
+
+    if !task
+        .in_ready_queue
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    let ready_hart = task
+        .ready_queue_hart
+        .load(core::sync::atomic::Ordering::Acquire);
+    if ready_hart >= crate::config::MAX_HARTS {
+        return;
+    }
+    if ready_hart == local_hart {
+        crate::task::processor::request_reschedule_current_hart();
+    } else {
+        crate::task::processor::request_reschedule_harts(1usize << ready_hart);
+    }
+}
+
 pub fn signal_has_core_dump(signum: usize) -> bool {
     matches!(
         signum,
@@ -616,6 +647,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
                 let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 (tid, inner.pending_signals, inner.signal_mask)
             };
+            request_reschedule_for_signal_target(t);
             let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
             if on_cpu != TaskControlBlock::OFF_CPU {
                 running_signal_ipi_mask |= hart_mask_bit(on_cpu);
@@ -632,7 +664,10 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             );
         }
     }
-    wakeup_tasks(tasks);
+    wakeup_tasks(tasks.clone());
+    for task in tasks.iter() {
+        request_reschedule_for_signal_target(task);
+    }
     if running_signal_ipi_mask != 0 {
         send_signal_ipis(running_signal_ipi_mask);
     }
@@ -670,12 +705,16 @@ pub fn kill_current(signum: i32) -> isize {
             let mut inner = t.borrow_mut();
             mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0, 0);
         }
+        request_reschedule_for_signal_target(t);
         let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
         if on_cpu != TaskControlBlock::OFF_CPU {
             running_signal_ipi_mask |= hart_mask_bit(on_cpu);
         }
     }
-    wakeup_tasks(tasks);
+    wakeup_tasks(tasks.clone());
+    for task in tasks.iter() {
+        request_reschedule_for_signal_target(task);
+    }
     if running_signal_ipi_mask != 0 {
         send_signal_ipis(running_signal_ipi_mask);
     }
@@ -752,7 +791,9 @@ pub fn queue_process_signal_info(
         on_cpu
     );
     if queued {
+        request_reschedule_for_signal_target(&task);
         wakeup_task(task.clone());
+        request_reschedule_for_signal_target(&task);
         if on_cpu != TaskControlBlock::OFF_CPU {
             arch::send_ipi(on_cpu);
         }
