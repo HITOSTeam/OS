@@ -30,12 +30,34 @@ pub const ECFG_VS_SHIFT: usize = 16;
 pub const ECFG_VS_MASK: usize = 0x7;
 /// Bit [11] — Timer Interrupt local enable (LIE.TI).
 pub const ECFG_LIE_TI: usize = 1 << 11;
+/// Bit [12] — IPI local enable (LIE.IPI).
+pub const ECFG_LIE_IPI: usize = 1 << 12;
 
 // ── ESTAT (Exception Status, CSR 0x5) ─────────────────────────────────────
 /// Bits [21:16] — Exception Code shift.
 pub const ESTAT_ECODE_SHIFT: usize = 16;
 /// 6-bit mask for the exception code field.
 pub const ESTAT_ECODE_MASK: usize = 0x3f;
+/// Bit [11] — Timer interrupt pending.
+pub const ESTAT_IS_TIMER: usize = 1 << 11;
+/// Bit [12] — IPI interrupt pending.
+pub const ESTAT_IS_IPI: usize = 1 << 12;
+
+// ── IOCSR IPI registers ─────────────────────────────────────────────────
+/// Per-core IPI pending action register.
+pub const IOCSR_IPI_STATUS: usize = 0x1000;
+/// Per-core IPI enable register.
+pub const IOCSR_IPI_EN: usize = 0x1004;
+/// Per-core IPI clear register.
+pub const IOCSR_IPI_CLEAR: usize = 0x100c;
+/// Cross-core IPI send register.
+pub const IOCSR_IPI_SEND: usize = 0x1040;
+/// IPI send payload bit 31, matching Linux's IOCSR_IPI_SEND_BLOCKING.
+pub const IOCSR_IPI_SEND_BLOCKING: usize = 1 << 31;
+/// IPI send target CPU shift.
+pub const IOCSR_IPI_SEND_CPU_SHIFT: usize = 16;
+/// Linux ACTION_RESCHEDULE/SMP_RESCHEDULE bit.
+pub const IPI_ACTION_RESCHEDULE: usize = 1 << 0;
 
 // ── TCFG (Timer Config, CSR 0x41) ─────────────────────────────────────────
 /// Bit [0] — Timer Enable (also doubles as periodic-mode flag on some revisions).

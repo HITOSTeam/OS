@@ -12,6 +12,12 @@ use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
+#[cfg(target_arch = "loongarch64")]
+use crate::arch::loongarch64::mm::AsidContext;
+#[cfg(target_arch = "riscv64")]
+use crate::arch::riscv64::mm::AsidContext;
+#[cfg(target_arch = "riscv64")]
+use crate::config::{KERNEL_STACK_TOP, phys_mem_start};
 use crate::config::{
     MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
     USER_STACK_SIZE, phys_mem_end,
@@ -22,6 +28,7 @@ use crate::utils::RecycleAllocator;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(target_arch = "riscv64")]
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::*;
@@ -71,6 +78,24 @@ lazy_static! {
     pub static ref KERNEL_SPACE: Mutex<MemorySet> = Mutex::new(MemorySet::new_kernel());
 }
 
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn riscv_satp_asid(token: usize) -> usize {
+    (token >> 44) & 0xffff
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn riscv_write_satp_and_flush_asid(token: usize) {
+    let asid = riscv_satp_asid(token);
+    // SAFETY: `token` is a kernel-created SATP value. Using a non-x0 rs2 keeps
+    // RISC-V global mappings valid while flushing non-global entries for this ASID.
+    unsafe {
+        satp::write(Satp::from_bits(token));
+        asm!("sfence.vma x0, {asid}", asid = in(reg) asid, options(nostack));
+    }
+}
+
 pub(crate) fn update_shared_file_page_cache(dev: usize, ino: u32, write_off: usize, data: &[u8]) {
     backing::shared_file_page_cache_write(dev, ino, write_off, data);
 }
@@ -91,6 +116,8 @@ pub(crate) fn allocate_shared_anon_id() -> u64 {
 pub struct MemorySet {
     /// 页表是真正给硬件使用的映射结果。
     page_table: PageTable,
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    asid: Arc<AsidContext>,
     /// 已物化页的跟踪表，包括 frame、COW 和 PROT_NONE 保存的 PTE 标志。
     areas: Vec<MapArea>,
     /// 用户态 VMA 的权威元数据，类似 Linux mm_struct 里的 VMA 集合。
@@ -111,6 +138,11 @@ pub struct MemorySet {
     /// Mm-local trap-context VA slot allocator. Linux-style CLONE_VM needs this
     /// to be tied to the address space rather than to per-PCB thread indexes.
     trap_context_slots: RecycleAllocator,
+    /// RISC-V user page tables share kernel-only root entries with KERNEL_SPACE.
+    /// These mappings are intentionally not represented in `areas`, otherwise
+    /// fork/COW would walk the whole physical direct map for every child.
+    #[cfg(target_arch = "riscv64")]
+    has_user_kernel_mappings: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,9 +277,16 @@ impl ShmAttach {
 }
 
 impl MemorySet {
+    #[cfg(target_arch = "riscv64")]
+    const RISCV_ROOT_ENTRY_SIZE: usize = 1 << 30;
+    #[cfg(target_arch = "riscv64")]
+    const RISCV_SHARED_KSTACK_ROOT_COUNT: usize = 1;
+
     pub fn new_bare() -> Self {
         Self {
             page_table: PageTable::new(),
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            asid: Arc::new(AsidContext::new()),
             areas: Vec::new(),
             vm_regions: VmRegionSet::new(),
             sysv_shm_attaches: Vec::new(),
@@ -261,10 +300,33 @@ impl MemorySet {
             mlocked_ranges: Vec::new(),
             mlockall_future: false,
             trap_context_slots: RecycleAllocator::new(),
+            #[cfg(target_arch = "riscv64")]
+            has_user_kernel_mappings: false,
         }
     }
     pub fn token(&self) -> usize {
         self.page_table.token()
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn drop_user_asid(&self) {
+        crate::arch::loongarch64::mm::drop_user_asid(self.asid.as_ref());
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn drop_user_asid(&self) {
+        crate::arch::riscv64::mm::drop_user_asid(self.asid.as_ref());
+        crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn flush_user_page(&self, va: usize) {
+        crate::arch::loongarch64::mm::flush_user_page(self.asid.as_ref(), va);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn flush_user_page(&self, va: usize) {
+        crate::arch::riscv64::mm::flush_user_page(self.asid.as_ref(), va);
     }
 
     fn inherit_user_vm_metadata_from(&mut self, parent: &MemorySet) {
@@ -1871,19 +1933,209 @@ impl MemorySet {
         }
         self.areas.push(map_area);
         self.sort_user_areas();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        self.drop_user_asid();
         true
     }
 
     fn push_mapped_raw(&mut self, map_area: MapArea) {
         self.areas.push(map_area);
         self.sort_user_areas();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        self.drop_user_asid();
     }
+
+    #[cfg(target_arch = "riscv64")]
+    fn riscv_kernel_stack_root_range() -> (usize, usize) {
+        // Keep all kernel stacks under a small high-root window that can be
+        // shared into user page tables without sharing the trampoline root.
+        let end = PageTable::root_index_of_va(KERNEL_STACK_TOP - 1) + 1;
+        let start = end.saturating_sub(Self::RISCV_SHARED_KSTACK_ROOT_COUNT);
+        debug_assert_ne!(
+            PageTable::root_index_of_va(KERNEL_STACK_TOP - 1),
+            PageTable::root_index_of_va(TRAMPOLINE),
+            "RISC-V kernel stacks must not share the trampoline root entry"
+        );
+        (start, end)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn riscv_kernel_direct_root_range() -> (usize, usize) {
+        // Share only the physical direct-map roots actually covering RAM.
+        // Device/MMIO mappings stay kernel-only unless explicitly mapped.
+        let start = PageTable::root_index_of_va(phys_mem_start());
+        let end = PageTable::root_index_of_va(phys_mem_end().saturating_sub(1)) + 1;
+        (start, end)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn riscv_root_range_overlaps(index: usize, start: usize, end: usize) -> bool {
+        let root_start = PageTable::root_entry_start(index);
+        let root_end = PageTable::root_entry_end(index);
+        end > root_start && start < root_end
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn riscv_high_stack_window_overlaps(start: usize, end: usize) -> bool {
+        let (root_start, root_end) = Self::riscv_kernel_stack_root_range();
+        let window_pages = root_end.saturating_sub(root_start);
+        let window_size = window_pages.saturating_mul(Self::RISCV_ROOT_ENTRY_SIZE);
+        let window_start = KERNEL_STACK_TOP.saturating_sub(window_size);
+        end > window_start && start < KERNEL_STACK_TOP
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn riscv_shared_kernel_range_overlaps(&self, start: usize, end: usize) -> bool {
+        if !self.has_user_kernel_mappings || end <= start {
+            return false;
+        }
+
+        let (direct_start, direct_end) = Self::riscv_kernel_direct_root_range();
+        for index in direct_start..direct_end {
+            if Self::riscv_root_range_overlaps(index, start, end) {
+                return true;
+            }
+        }
+        if Self::riscv_high_stack_window_overlaps(start, end) {
+            return true;
+        }
+        false
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn riscv_shared_kernel_overlap_end(&self, start: usize, end: usize) -> Option<usize> {
+        if !self.has_user_kernel_mappings || end <= start {
+            return None;
+        }
+
+        let mut overlap_end = None;
+        let mut record = |candidate_end: usize| {
+            overlap_end = Some(
+                overlap_end
+                    .map(|old: usize| old.min(candidate_end))
+                    .unwrap_or(candidate_end),
+            );
+        };
+
+        let (direct_start, direct_end) = Self::riscv_kernel_direct_root_range();
+        for index in direct_start..direct_end {
+            if Self::riscv_root_range_overlaps(index, start, end) {
+                record(PageTable::root_entry_end(index));
+            }
+        }
+
+        let (stack_root_start, stack_root_end) = Self::riscv_kernel_stack_root_range();
+        let stack_window_pages = stack_root_end.saturating_sub(stack_root_start);
+        let stack_window_size = stack_window_pages.saturating_mul(Self::RISCV_ROOT_ENTRY_SIZE);
+        let stack_window_start = KERNEL_STACK_TOP.saturating_sub(stack_window_size);
+        if end > stack_window_start && start < KERNEL_STACK_TOP {
+            record(KERNEL_STACK_TOP);
+        }
+
+        overlap_end
+    }
+
+    fn page_align_up(value: usize) -> usize {
+        value.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    }
+
+    fn place_initial_user_stack_bottom(&self, requested_bottom: usize) -> usize {
+        let mut bottom = requested_bottom;
+        #[cfg(target_arch = "riscv64")]
+        if self.has_user_kernel_mappings {
+            // ELF stacks are normally placed after the last PT_LOAD segment.
+            // With shared kernel roots, skip over any shared high-root window so
+            // user VMAs never overlap kernel-only page-table subtrees.
+            loop {
+                let end = bottom.saturating_add(USER_STACK_SIZE);
+                let Some(conflict_end) = self.riscv_shared_kernel_overlap_end(bottom, end) else {
+                    break;
+                };
+                bottom = Self::page_align_up(conflict_end.saturating_add(PAGE_SIZE));
+            }
+        }
+        bottom
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn prepare_riscv_kernel_shared_roots(&mut self) -> bool {
+        let (direct_start, direct_end) = Self::riscv_kernel_direct_root_range();
+        for index in direct_start..direct_end {
+            if !self.page_table.mark_root_entry_global(index) {
+                return false;
+            }
+        }
+        let (stack_start, stack_end) = Self::riscv_kernel_stack_root_range();
+        for index in stack_start..stack_end {
+            if !self.page_table.ensure_root_entry(index) {
+                return false;
+            }
+            if !self.page_table.mark_root_entry_global(index) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn map_riscv_user_kernel_mappings(&mut self) -> bool {
+        if self.has_user_kernel_mappings {
+            return true;
+        }
+
+        // Trap entry now stays on the current SATP until scheduling, so user
+        // page tables need the direct map and kernel-stack roots required to
+        // run kernel code safely before switching to the full kernel SATP.
+        {
+            let kernel_space = KERNEL_SPACE.lock();
+            let (direct_start, direct_end) = Self::riscv_kernel_direct_root_range();
+            for index in direct_start..direct_end {
+                if !self
+                    .page_table
+                    .share_root_entry_from(index, &kernel_space.page_table)
+                {
+                    return false;
+                }
+            }
+            let (stack_start, stack_end) = Self::riscv_kernel_stack_root_range();
+            for index in stack_start..stack_end {
+                if !self
+                    .page_table
+                    .share_root_entry_from(index, &kernel_space.page_table)
+                {
+                    return false;
+                }
+            }
+        }
+
+        self.has_user_kernel_mappings = true;
+        true
+    }
+
+    fn map_user_trampoline_pages(&mut self) -> bool {
+        self.map_trampoline();
+        self.map_sigreturn_trampoline_user();
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.map_riscv_user_kernel_mappings()
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            true
+        }
+    }
+
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
+        let mut flags = PTEFlags::from(MapPermission::R | MapPermission::X);
+        #[cfg(target_arch = "riscv64")]
+        {
+            flags |= PTEFlags::G;
+        }
         self.page_table.map(
             VirtAddr::from(TRAMPOLINE).into(),
             PhysAddr::from(strampoline as usize).into(),
-            PTEFlags::from(MapPermission::R | MapPermission::X),
+            flags,
         );
     }
 
@@ -1985,6 +2237,11 @@ impl MemorySet {
             let dtb_end = dtb_start + crate::config::DEVICE_TREE_MAX_SIZE;
             memory_set.map_identical_range_skip_mapped(dtb_start, dtb_end, MapPermission::R);
         }
+        #[cfg(target_arch = "riscv64")]
+        assert!(
+            memory_set.prepare_riscv_kernel_shared_roots(),
+            "OOM while preparing RISC-V shared kernel root entries"
+        );
         memory_set
     }
     /// Include sections in elf and trampoline and TrapContext and user stack,
@@ -1993,8 +2250,9 @@ impl MemorySet {
     pub fn from_elf(elf_data: &[u8]) -> Result<(Self, usize, usize, ElfAux), isize> {
         let mut memory_set = Self::new_bare();
         // map trap trampoline (kernel-only) and sigreturn trampoline (user accessible)
-        memory_set.map_trampoline();
-        memory_set.map_sigreturn_trampoline_user();
+        if !memory_set.map_user_trampoline_pages() {
+            return Err(ENOMEM);
+        }
         // map program headers of elf, with U flag
         validate_elf_arch_abi(elf_arch_abi_from_bytes(elf_data)?)?;
         let elf = xmas_elf::ElfFile::new(elf_data).map_err(|_| -8isize)?;
@@ -2070,6 +2328,7 @@ impl MemorySet {
         let mut user_stack_bottom: usize = max_end_va.into();
         // guard page
         user_stack_bottom += PAGE_SIZE;
+        user_stack_bottom = memory_set.place_initial_user_stack_bottom(user_stack_bottom);
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
 
         // use crate::println;
@@ -2126,8 +2385,9 @@ impl MemorySet {
         let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
         validate_elf_arch_abi(hdr.arch_abi())?;
         let mut memory_set = Self::new_bare();
-        memory_set.map_trampoline();
-        memory_set.map_sigreturn_trampoline_user();
+        if !memory_set.map_user_trampoline_pages() {
+            return Err(ENOMEM);
+        }
 
         let load_bias = if hdr.e_type == ET_DYN { 0x2000_0000 } else { 0 };
         let mut max_end_vpn = VirtPageNum(0);
@@ -2143,6 +2403,7 @@ impl MemorySet {
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_bottom: usize = max_end_va.into();
         user_stack_bottom += PAGE_SIZE;
+        user_stack_bottom = memory_set.place_initial_user_stack_bottom(user_stack_bottom);
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
 
         if memory_set
@@ -2358,8 +2619,9 @@ impl MemorySet {
         interp_elf: &[u8],
     ) -> Result<(Self, usize, usize, usize, ElfAux, usize), isize> {
         let mut memory_set = Self::new_bare();
-        memory_set.map_trampoline();
-        memory_set.map_sigreturn_trampoline_user();
+        if !memory_set.map_user_trampoline_pages() {
+            return Err(ENOMEM);
+        }
 
         validate_elf_interp_abi(
             elf_arch_abi_from_bytes(main_elf)?,
@@ -2397,6 +2659,7 @@ impl MemorySet {
         let mut user_stack_bottom: usize = max_end_va.into();
         // guard page
         user_stack_bottom += PAGE_SIZE;
+        user_stack_bottom = memory_set.place_initial_user_stack_bottom(user_stack_bottom);
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
 
         if memory_set
@@ -2447,8 +2710,9 @@ impl MemorySet {
         let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
         validate_elf_interp_abi(hdr.arch_abi(), elf_arch_abi_from_bytes(interp_elf)?)?;
         let mut memory_set = Self::new_bare();
-        memory_set.map_trampoline();
-        memory_set.map_sigreturn_trampoline_user();
+        if !memory_set.map_user_trampoline_pages() {
+            return Err(ENOMEM);
+        }
 
         let main_bias = if hdr.e_type == ET_DYN { 0x2000_0000 } else { 0 };
         #[cfg(target_arch = "loongarch64")]
@@ -2475,6 +2739,7 @@ impl MemorySet {
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_bottom: usize = max_end_va.into();
         user_stack_bottom += PAGE_SIZE;
+        user_stack_bottom = memory_set.place_initial_user_stack_bottom(user_stack_bottom);
         let user_stack_top = user_stack_bottom + USER_STACK_SIZE;
 
         if memory_set
@@ -2528,8 +2793,7 @@ impl MemorySet {
             0
         };
         let mut memory_set = Self::new_bare();
-        memory_set.map_trampoline();
-        memory_set.map_sigreturn_trampoline_user();
+        assert!(memory_set.map_user_trampoline_pages());
 
         let mut parent_update_count = 0usize;
         let mut src_walk_cache = PageWalkCache::new();
@@ -2614,8 +2878,13 @@ impl MemorySet {
                             src_flags.insert(PTEFlags::COW);
                             // Apply parent PTE demotion immediately to minimize the window where
                             // another thread could write through a still-writable PTE on another hart.
-                            user_space.page_table.set_flags(vpn, src_flags);
-                            parent_update_count = parent_update_count.saturating_add(1);
+                            #[cfg(target_arch = "loongarch64")]
+                            let changed = user_space.page_table.set_flags_deferred(vpn, src_flags);
+                            #[cfg(not(target_arch = "loongarch64"))]
+                            let changed = user_space.page_table.set_flags(vpn, src_flags);
+                            if changed {
+                                parent_update_count = parent_update_count.saturating_add(1);
+                            }
                         }
                         memory_set.page_table.map_cached(
                             vpn,
@@ -2637,9 +2906,13 @@ impl MemorySet {
             0
         };
         if parent_update_count != 0 {
-            // SAFETY: after fork demotes parent PTEs from writable to read-only+COW,
-            // every hart running the parent must drop stale writable TLB entries
-            // before it can resume, or it may keep writing shared pages behind COW.
+            // After fork demotes parent PTEs from writable to read-only+COW,
+            // the parent must not resume with stale writable translations.
+            //
+            // RISC-V updates the parent's active page table in-place, so the
+            // current hart must flush stale writable translations immediately.
+            // Other harts that may already be executing the same mm need a
+            // remote shootdown as well.
             #[cfg(target_arch = "riscv64")]
             {
                 let remote_hart_mask =
@@ -2652,11 +2925,12 @@ impl MemorySet {
                 }
             }
             // SAFETY: LoongArch64 currently runs single-core only (no SMP boot),
-            // so a local full TLB flush is sufficient. When SMP is added, a
-            // remote TLB shootdown (IPI + invtlb on each hart) will be needed.
+            // so dropping this address space's ASID is sufficient. When SMP is
+            // added, a remote TLB shootdown (IPI + invtlb on each hart) will be
+            // needed for a task that is concurrently running on another hart.
             #[cfg(target_arch = "loongarch64")]
-            unsafe {
-                asm!("invtlb 0x1, $r0, $r0");
+            {
+                user_space.drop_user_asid();
             }
         }
         if diag_enabled {
@@ -2700,8 +2974,7 @@ impl MemorySet {
     #[allow(dead_code)]
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
         let mut memory_set = Self::new_bare();
-        memory_set.map_trampoline();
-        memory_set.map_sigreturn_trampoline_user();
+        assert!(memory_set.map_user_trampoline_pages());
         let mut src_walk_cache = PageWalkCache::new();
         let mut dst_walk_cache = PageWalkCache::new();
 
@@ -2840,11 +3113,7 @@ impl MemorySet {
         #[cfg(target_arch = "riscv64")]
         {
             let satp = self.page_table.token();
-            // SAFETY: satp is a valid page table token; sfence.vma flushes TLB after satp change.
-            unsafe {
-                satp::write(Satp::from_bits(satp));
-                asm!("sfence.vma");
-            }
+            riscv_write_satp_and_flush_asid(satp);
         }
         #[cfg(target_arch = "loongarch64")]
         {
@@ -2856,7 +3125,27 @@ impl MemorySet {
     }
 
     pub fn set_pte_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
-        self.page_table.set_flags(vpn, flags)
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let changed = self.page_table.set_flags_deferred(vpn, flags);
+            if changed {
+                self.drop_user_asid();
+            }
+            changed
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            let changed = self.page_table.set_flags(vpn, flags);
+            if changed {
+                self.drop_user_asid();
+            }
+            changed
+        }
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+        {
+            let changed = self.page_table.set_flags(vpn, flags);
+            changed
+        }
     }
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
@@ -2867,6 +3156,8 @@ impl MemorySet {
         {
             area.shrink_to(&mut self.page_table, new_end.ceil());
             self.sort_user_areas();
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            self.drop_user_asid();
             self.debug_assert_user_vm_invariants();
             true
         } else {
@@ -2883,6 +3174,8 @@ impl MemorySet {
             let appended = area.append_to(&mut self.page_table, new_end.ceil());
             if appended {
                 self.sort_user_areas();
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                self.drop_user_asid();
                 self.debug_assert_user_vm_invariants();
             }
             appended
@@ -2900,6 +3193,8 @@ impl MemorySet {
         {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            self.drop_user_asid();
             self.debug_assert_user_vm_invariants();
         };
     }
@@ -2953,6 +3248,9 @@ impl MemorySet {
                             return false;
                         };
                         moved_ptes.push((new_vpn, pte.ppn(), pte.flags()));
+                        #[cfg(target_arch = "loongarch64")]
+                        self.page_table.unmap_if_mapped_deferred(vpn);
+                        #[cfg(not(target_arch = "loongarch64"))]
                         self.page_table.unmap_if_mapped(vpn);
                     }
                 }
@@ -2986,6 +3284,8 @@ impl MemorySet {
         }
         self.areas.extend(moved_areas);
         self.sort_user_areas();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        self.drop_user_asid();
         true
     }
 
@@ -3007,9 +3307,13 @@ impl MemorySet {
         }) {
             let mut area = self.areas.remove(idx);
             area.unmap(&mut self.page_table);
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            self.drop_user_asid();
             return;
         }
 
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut changed = false;
         let mut new_areas: Vec<MapArea> = Vec::new();
         let mut areas = core::mem::take(&mut self.areas);
         for mut area in areas.drain(..) {
@@ -3029,6 +3333,10 @@ impl MemorySet {
             let ov_end = core::cmp::min(end_vpn, area_end);
 
             area.unmap_range_maybe(&mut self.page_table, ov_start, ov_end);
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            {
+                changed = true;
+            }
 
             let (left, _mid, right) = area.split_around(ov_start, ov_end);
             if let Some(left) = left {
@@ -3040,6 +3348,10 @@ impl MemorySet {
         }
         self.areas = new_areas;
         self.sort_user_areas();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        if changed {
+            self.drop_user_asid();
+        }
     }
 
     /// Update concrete user mapping permissions in `[start_va, end_va)`.
@@ -3084,12 +3396,18 @@ impl MemorySet {
                         if new_perm == MapPermission::U {
                             // PROT_NONE: unmap but keep the frame tracker.
                             mid.save_pte_flags(vpn, pte.flags());
+                            #[cfg(target_arch = "loongarch64")]
+                            self.page_table.unmap_deferred(vpn);
+                            #[cfg(not(target_arch = "loongarch64"))]
                             self.page_table.unmap(vpn);
                             continue;
                         }
                         let old_flags = pte.flags();
                         let pte_flags = pte_flags_for_mprotect(new_perm, Some(old_flags));
                         let _ = mid.take_saved_pte_flags(vpn);
+                        #[cfg(target_arch = "loongarch64")]
+                        let _ = self.page_table.set_flags_deferred(vpn, pte_flags);
+                        #[cfg(not(target_arch = "loongarch64"))]
                         let _ = self.page_table.set_flags(vpn, pte_flags);
                         continue;
                     }
@@ -3116,6 +3434,10 @@ impl MemorySet {
         }
         self.areas = new_areas;
         self.sort_user_areas();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        if touched_area {
+            self.drop_user_asid();
+        }
         debug_assert!(
             touched_area || start_vpn >= end_vpn,
             "mprotect concrete update had no MapArea coverage for {:?}..{:?}",
@@ -3131,6 +3453,8 @@ impl MemorySet {
         if start_vpn >= end_vpn {
             return;
         }
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut changed = false;
         for area in self.areas.iter_mut() {
             if !area.is_lazy() {
                 continue;
@@ -3146,6 +3470,14 @@ impl MemorySet {
             let ov_start = core::cmp::max(start_vpn, area_start);
             let ov_end = core::cmp::min(end_vpn, area_end);
             area.unmap_range_maybe(&mut self.page_table, ov_start, ov_end);
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            {
+                changed = true;
+            }
+        }
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        if changed {
+            self.drop_user_asid();
         }
     }
 
@@ -3162,6 +3494,8 @@ impl MemorySet {
         }
 
         let mut new_areas: Vec<MapArea> = Vec::new();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut changed = false;
         let mut areas = core::mem::take(&mut self.areas);
         for area in areas.drain(..) {
             if !area.contains_perm(MapPermission::U)
@@ -3177,6 +3511,10 @@ impl MemorySet {
             let ov_end = core::cmp::min(end_vpn, area.end_vpn());
             let (left, mut mid, right) = area.split_around(ov_start, ov_end);
             mid.unmap(&mut self.page_table);
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            {
+                changed = true;
+            }
 
             if let Some(left) = left {
                 new_areas.push(left);
@@ -3193,6 +3531,10 @@ impl MemorySet {
         }
         self.areas = new_areas;
         self.sort_user_areas();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        if changed {
+            self.drop_user_asid();
+        }
     }
 
     /// Discard pages for `madvise(MADV_DONTNEED)`.
@@ -3239,9 +3581,20 @@ impl MemorySet {
     pub fn concrete_range_overlaps(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
-        self.areas
+        if self
+            .areas
             .iter()
             .any(|area| area.overlaps_vpn_range(start_vpn, end_vpn))
+        {
+            return true;
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            if self.riscv_shared_kernel_range_overlaps(start_va.0, end_va.0) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Return merged user virtual-memory ranges from current VMAs.
@@ -3280,6 +3633,8 @@ impl MemorySet {
         {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            self.drop_user_asid();
             self.debug_assert_user_vm_invariants();
         };
     }
@@ -3291,9 +3646,10 @@ impl MemorySet {
             .areas
             .iter()
             .any(|area| area.contains_perm(MapPermission::U));
-        new_memory_set.map_trampoline();
         if has_user {
-            new_memory_set.map_sigreturn_trampoline_user();
+            assert!(new_memory_set.map_user_trampoline_pages());
+        } else {
+            new_memory_set.map_trampoline();
         }
         for area in &self.areas {
             let mut new_area = MapArea::new(
@@ -3355,11 +3711,7 @@ pub fn kernel_token() -> usize {
 #[allow(dead_code)]
 pub fn activate_token(token: usize) {
     #[cfg(target_arch = "riscv64")]
-    // SAFETY: token is a valid satp value; sfence.vma flushes TLB after satp change.
-    unsafe {
-        satp::write(Satp::from_bits(token));
-        asm!("sfence.vma");
-    }
+    riscv_write_satp_and_flush_asid(token);
     #[cfg(target_arch = "loongarch64")]
     {
         let page_table = PageTable::from_token(token);

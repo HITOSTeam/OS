@@ -215,5 +215,44 @@ pub fn syscall_reboot(_magic1: usize, _magic2: usize, _cmd: usize, _arg: usize) 
     if current_process().borrow_mut().euid != 0 {
         return err(SyscallError::EPERM);
     }
+    drain_live_processes_before_shutdown();
     arch::shutdown();
+}
+
+fn drain_live_processes_before_shutdown() {
+    const SHUTDOWN_DRAIN_TIMEOUT_MS: usize = 10_000;
+
+    // The submit runner calls poweroff immediately after the script prints
+    // "ALL TESTS DONE". Background jobs such as hackbench may still be in their
+    // signal handler/reap path; give live non-init processes a bounded chance
+    // to finish so user-visible output is not truncated by shutdown.
+    let start_ms = get_time_ms();
+    loop {
+        if live_processes_requiring_shutdown_drain() == 0 {
+            return;
+        }
+        if get_time_ms().saturating_sub(start_ms) >= SHUTDOWN_DRAIN_TIMEOUT_MS {
+            return;
+        }
+        crate::task::processor::suspend_current_and_run_next();
+    }
+}
+
+fn live_processes_requiring_shutdown_drain() -> usize {
+    let current_pid = current_process().getpid();
+    let map = PID2PCB.lock();
+    map.values()
+        .filter(|process| {
+            let pid = process.getpid();
+            // PID 0/1 and the caller itself are part of shutdown machinery, not
+            // background test work to drain.
+            if pid == 0 || pid == 1 || pid == current_pid {
+                return false;
+            }
+            let Some(inner) = process.try_borrow_mut() else {
+                return true;
+            };
+            !inner.is_zombie
+        })
+        .count()
 }

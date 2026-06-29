@@ -5,13 +5,27 @@ use spin::MutexGuard;
 #[derive(Clone)]
 pub struct MmRef {
     inner: Arc<Mutex<MemorySet>>,
+    /// Stable page-table token cached outside the large mm lock. Trap return
+    /// uses this on the hot path; page-table root replacement creates a new
+    /// MmRef instead of mutating the token in place.
+    token: usize,
+    /// ASID ownership is tied to the address space lifetime, not to transient
+    /// MemorySet locks. Cloned MmRef handles therefore share the same context.
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    asid: Arc<AsidContext>,
 }
 
 impl MmRef {
     /// 将 MemorySet 包装为 MmRef（用于进程创建时）。
     pub fn new(memory_set: MemorySet) -> Self {
+        let token = memory_set.token();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let asid = Arc::clone(&memory_set.asid);
         Self {
             inner: Arc::new(Mutex::new(memory_set)),
+            token,
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            asid,
         }
     }
 
@@ -22,7 +36,17 @@ impl MmRef {
 
     /// 返回页表根地址 token（用于切换地址空间）。
     pub fn token(&self) -> usize {
-        self.lock().token()
+        self.token
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn prepare_user_asid(&self) -> (usize, bool) {
+        crate::arch::loongarch64::mm::prepare_user_asid(self.asid.as_ref())
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn prepare_user_satp(&self) -> (usize, bool, bool) {
+        crate::arch::riscv64::mm::prepare_user_satp(self.asid.as_ref(), self.token)
     }
 
     /// 为新线程分配 TrapContext 槽位，返回槽号。

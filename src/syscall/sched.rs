@@ -102,6 +102,26 @@ fn request_reschedule_for_running_task(task: &Arc<TaskControlBlock>) {
     }
 }
 
+/// RT 任务切回 Fair 时，切断 RT 运行时间对 Fair vruntime 的追算。
+///
+/// `cpu_time_ns` 是跨调度类累计的总 CPU 时间，而
+/// `fair_runtime_checkpoint_ns` 只应用来记录 Fair 类已经结算到的位置。
+/// 如果线程在 SCHED_FIFO/RR 中运行后切回 Fair，不能把 RT 期间消耗的时间
+/// 继续折算成 EEVDF vruntime。
+fn reset_fair_runtime_after_rt(task: &Arc<TaskControlBlock>, old_policy: i32, new_policy: i32) {
+    let old_class = sched_class(old_policy);
+    let new_class = sched_class(new_policy);
+    if !matches!(old_class, Some(SchedClass::Fifo) | Some(SchedClass::Rr))
+        || !matches!(new_class, Some(SchedClass::Fair))
+    {
+        return;
+    }
+
+    let mut inner = task.borrow_mut();
+    inner.fair_runtime_checkpoint_ns = inner.cpu_time_ns;
+    inner.fair_vlag_ns = 0;
+}
+
 fn task_from_process(
     process: &Arc<ProcessControlBlock>,
     tid: usize,
@@ -301,16 +321,20 @@ pub fn syscall_sched_setscheduler(pid: usize, policy: usize, param_ptr: usize) -
         );
         cyclic_diag_note(CyclicDiagEvent::SetScheduler, process.getpid(), target_tid);
     }
-    let mut inner = task.borrow_mut();
-    inner.scheduling.sched_policy = policy;
-    inner.scheduling.sched_priority = prio;
-    inner.scheduling.reset_on_fork = reset_on_fork;
-    if policy != SCHED_DEADLINE {
-        inner.scheduling.sched_runtime = 0;
-        inner.scheduling.sched_deadline = 0;
-        inner.scheduling.sched_period = 0;
-    }
-    drop(inner);
+    let old_policy = {
+        let mut inner = task.borrow_mut();
+        let old_policy = inner.scheduling.sched_policy;
+        inner.scheduling.sched_policy = policy;
+        inner.scheduling.sched_priority = prio;
+        inner.scheduling.reset_on_fork = reset_on_fork;
+        if policy != SCHED_DEADLINE {
+            inner.scheduling.sched_runtime = 0;
+            inner.scheduling.sched_deadline = 0;
+            inner.scheduling.sched_period = 0;
+        }
+        old_policy
+    };
+    reset_fair_runtime_after_rt(&task, old_policy, policy);
     refresh_task_runqueue(&task);
     request_reschedule_for_running_task(&task);
     0
@@ -578,22 +602,26 @@ pub fn syscall_sched_setattr(pid: usize, attr_ptr: usize, flags: usize, _unused:
     {
         return err(SyscallError::EINVAL);
     }
-    let mut inner = task.borrow_mut();
-    inner.scheduling.sched_policy = policy;
-    inner.scheduling.sched_priority = prio;
-    inner.scheduling.nice = nice;
-    inner.nice = nice;
-    inner.scheduling.reset_on_fork = (attr.sched_flags & SCHED_FLAG_RESET_ON_FORK) != 0;
-    if policy == SCHED_DEADLINE {
-        inner.scheduling.sched_runtime = attr.sched_runtime;
-        inner.scheduling.sched_deadline = attr.sched_deadline;
-        inner.scheduling.sched_period = attr.sched_period;
-    } else {
-        inner.scheduling.sched_runtime = 0;
-        inner.scheduling.sched_deadline = 0;
-        inner.scheduling.sched_period = 0;
-    }
-    drop(inner);
+    let old_policy = {
+        let mut inner = task.borrow_mut();
+        let old_policy = inner.scheduling.sched_policy;
+        inner.scheduling.sched_policy = policy;
+        inner.scheduling.sched_priority = prio;
+        inner.scheduling.nice = nice;
+        inner.nice = nice;
+        inner.scheduling.reset_on_fork = (attr.sched_flags & SCHED_FLAG_RESET_ON_FORK) != 0;
+        if policy == SCHED_DEADLINE {
+            inner.scheduling.sched_runtime = attr.sched_runtime;
+            inner.scheduling.sched_deadline = attr.sched_deadline;
+            inner.scheduling.sched_period = attr.sched_period;
+        } else {
+            inner.scheduling.sched_runtime = 0;
+            inner.scheduling.sched_deadline = 0;
+            inner.scheduling.sched_period = 0;
+        }
+        old_policy
+    };
+    reset_fair_runtime_after_rt(&task, old_policy, policy);
     refresh_task_runqueue(&task);
     request_reschedule_for_running_task(&task);
     0

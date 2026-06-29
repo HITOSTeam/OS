@@ -43,6 +43,10 @@ mod virtio_mmio {
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
             let start = crate::perf::block_read_begin();
+            // The virtio driver dereferences physical/direct-map DMA buffers.
+            // RISC-V user page tables share only selected kernel roots, so enter
+            // the full kernel page table around the MMIO driver call.
+            let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
             self.0
                 .lock()
                 .read_blocks(base_sector, buf)
@@ -54,6 +58,8 @@ mod virtio_mmio {
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
             let start = crate::perf::block_write_begin();
+            // See read path: the driver must run with the kernel direct map active.
+            let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
             self.0
                 .lock()
                 .write_blocks(base_sector, buf)

@@ -10,9 +10,9 @@ use crate::task::task_block::{TaskControlBlock, TaskStatus};
 use super::TASK_MANAGER;
 use super::current_time_ns_usize;
 use super::fair::{
-    EnqueueKind, FAIR_PICK_SCAN_LIMIT, FairGroupQueue, HartRunQueue, ReadyQueueSlot,
-    current_fair_entity_for_group, fair_group_id_and_shares, fair_nice_weight, fair_task_id,
-    place_fair_task_entity, task_queue_slot,
+    EnqueueKind, FairGroupQueue, HartRunQueue, ReadyQueueSlot, current_fair_entity_for_group,
+    fair_group_id_and_shares, fair_nice_weight, fair_task_id, place_fair_task_entity,
+    task_queue_slot,
 };
 use super::pick_online_hart;
 use super::rt::{
@@ -30,6 +30,7 @@ pub(super) fn resolve_enqueue_hart(
     task: &Arc<TaskControlBlock>,
     current_hart: usize,
     mask: usize,
+    kind: EnqueueKind,
 ) -> usize {
     let affinity_mask = {
         let inner = task.borrow_mut();
@@ -45,6 +46,10 @@ pub(super) fn resolve_enqueue_hart(
         affinity_mask
     };
     if matches!(task_queue_slot(task), ReadyQueueSlot::Fair) {
+        if kind == EnqueueKind::Initial && (allowed_mask & (1usize << current_hart)) != 0 {
+            task.set_cpu_id(current_hart);
+            return current_hart;
+        }
         let picked = pick_least_loaded_hart_from_mask(allowed_mask);
         task.set_cpu_id(picked);
         return picked;
@@ -224,7 +229,8 @@ impl TaskManager {
                     let inner = task.borrow_mut();
                     fair_nice_weight(inner.nice)
                 };
-                group.insert_task(fair_task_id(&task), task, task_vruntime, deadline, weight);
+                let task_id = fair_task_id(&task);
+                group.insert_task(task_id, task, task_vruntime, deadline, weight);
                 hart_rq.relink_fair_group_if_runnable(group_id);
                 inc_ready_fair_count(hart_id);
             }
@@ -327,15 +333,13 @@ impl TaskManager {
                     //deadline 已经是最小的了，task_order保证
                     return Some(task_id);
                 }
-                // 如果默认最优选择不行，那就逐个遍历
-                let fallback = Some(task_id);
-                for (deadline, vruntime, task_id) in group
-                    .task_order
-                    .iter()
-                    .copied()
-                    .skip(1)
-                    .take(FAIR_PICK_SCAN_LIMIT.saturating_sub(1))
-                {
+                // 如果默认最优选择不行，那就逐个遍历。Linux 的
+                // pick_eevdf() 会从树中寻找 eligible 且 deadline 最早的实体；
+                // 这里没有 rb-tree 增强索引，不能用固定扫描窗口截断，否则
+                // hackbench 这类数百实体负载会把刚唤醒/刚创建的短控制任务
+                // 挡在窗口外。
+                let mut fallback = Some((entity.vruntime, task_id));
+                for (deadline, vruntime, task_id) in group.task_order.iter().copied().skip(1) {
                     let Some(entity) = group.tasks.get(&task_id) else {
                         continue;
                     };
@@ -348,14 +352,19 @@ impl TaskManager {
                         .ready_queue_hart
                         .load(core::sync::atomic::Ordering::Acquire)
                         == hart_id;
-                    if queued_here
-                        && status == TaskStatus::Ready
-                        && entity.vruntime <= eligible_vruntime
-                    {
-                        return Some(task_id);
+                    if queued_here && status == TaskStatus::Ready {
+                        if entity.vruntime <= eligible_vruntime {
+                            return Some(task_id);
+                        }
+                        if fallback
+                            .map(|(fallback_vruntime, _)| entity.vruntime < fallback_vruntime)
+                            .unwrap_or(true)
+                        {
+                            fallback = Some((entity.vruntime, task_id));
+                        }
                     }
                 }
-                return fallback;
+                return fallback.map(|(_, task_id)| task_id);
             }
 
             /// 这个任务不对，既没有准备好，也不在我们的hart上

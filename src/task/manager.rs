@@ -20,7 +20,9 @@ mod run_queue;
 pub use self::cleanup::{remove_inactive_task, remove_sched_timer_refs, remove_timer};
 pub use self::diagnostics::dump_system_state;
 pub use self::fair::{
-    fair_current_deadline_expired, fair_wakeup_preempts_current_on_hart, record_fair_sleep_lag,
+    fair_current_deadline_expired, fair_task_is_next_on_hart, fair_wakeup_preempts_current_on_hart,
+    prime_fair_exec_start, prime_fair_sync_wakeup_lag, prime_fair_thread_group_start,
+    prime_fair_timer_wakeup_lag, protect_fair_fork_parent, record_fair_sleep_lag,
 };
 pub use self::pid_map::{
     insert_into_pid2process, live_process_uses_net_namespace, pid2process, remove_from_pid2process,
@@ -88,11 +90,10 @@ fn enqueue_task(task: Arc<TaskControlBlock>, kind: EnqueueKind) -> Option<(usize
     let cur = crate::task::processor::hart_id() % MAX_HARTS;
     let hart_id = if kind == EnqueueKind::Wakeup {
         // Linux 唤醒具有 CPU 亲和性：睡眠任务通常会重新入队到上一次运行的 CPU，
-        // 除非 affinity 禁止。新建/fork 出来的公平调度工作仍可使用
-        // `resolve_enqueue_hart()` 中的负载分散路径。
+        // 除非 affinity 禁止。
         resolve_wakeup_hart(&task, cur, mask)
     } else {
-        resolve_enqueue_hart(&task, cur, mask)
+        resolve_enqueue_hart(&task, cur, mask, kind)
     };
     let queued = TASK_MANAGER.add(Arc::clone(&task), hart_id, kind);
     arch::restore_interrupts(prev_sie);
@@ -107,6 +108,10 @@ fn enqueue_task(task: Arc<TaskControlBlock>, kind: EnqueueKind) -> Option<(usize
 /// 队列中、未重复入队（调用方据此决定是否触发唤醒抢占）。
 pub fn add_task(task: Arc<TaskControlBlock>) -> Option<usize> {
     let local_hart = crate::task::processor::hart_id() % MAX_HARTS;
+    let protect_parent = matches!(task_queue_slot(&task), ReadyQueueSlot::Fair);
+    if protect_parent && let Some(parent) = crate::task::processor::current_task() {
+        protect_fair_fork_parent(&parent);
+    }
     let Some((hart_id, was_empty)) = enqueue_task(Arc::clone(&task), EnqueueKind::Initial) else {
         return None;
     };
@@ -146,12 +151,34 @@ struct WakeupBatch {
 }
 
 impl WakeupBatch {
-    fn note_enqueued(&mut self, task: &Arc<TaskControlBlock>, target_hart: usize, was_empty: bool) {
+    fn note_idle_kick(&mut self, target_hart: usize, was_empty: bool) {
         let local_hart = crate::task::processor::hart_id() % MAX_HARTS;
         if target_hart != local_hart && was_empty {
             self.kick_mask |= hart_bit(target_hart);
         }
+    }
+
+    fn note_enqueued(&mut self, task: &Arc<TaskControlBlock>, target_hart: usize, was_empty: bool) {
+        self.note_idle_kick(target_hart, was_empty);
         if crate::task::processor::wakeup_should_preempt_target_hart(task, target_hart) {
+            self.resched_mask |= hart_bit(target_hart);
+        }
+    }
+
+    fn note_signal_enqueued(
+        &mut self,
+        task: &Arc<TaskControlBlock>,
+        target_hart: usize,
+        was_empty: bool,
+    ) {
+        self.note_idle_kick(target_hart, was_empty);
+        // Linux keeps signal wakeups prompt, but a fair signal receiver should
+        // not split a fair sender's batch-control path into hundreds of
+        // immediate reschedules. Preserve RT preemption while letting fair
+        // signal targets run at the next normal scheduling point.
+        if matches!(task_queue_slot(task), ReadyQueueSlot::Rt(_))
+            && crate::task::processor::wakeup_should_preempt_target_hart(task, target_hart)
+        {
             self.resched_mask |= hart_bit(target_hart);
         }
     }
@@ -174,7 +201,31 @@ impl WakeupBatch {
 }
 
 fn wakeup_task_with_batch(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
+    wakeup_task_with_batch_inner(task, batch, true);
+}
+
+fn wakeup_signal_task_with_batch(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
+    wakeup_task_with_batch_inner(task, batch, false);
+}
+
+fn wakeup_task_with_batch_inner(
+    task: Arc<TaskControlBlock>,
+    batch: &mut WakeupBatch,
+    allow_fair_preempt: bool,
+) {
     fn wake_if_blocked(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
+        wake_if_blocked_inner(task, batch, true);
+    }
+
+    fn wake_if_blocked_signal(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
+        wake_if_blocked_inner(task, batch, false);
+    }
+
+    fn wake_if_blocked_inner(
+        task: Arc<TaskControlBlock>,
+        batch: &mut WakeupBatch,
+        allow_fair_preempt: bool,
+    ) {
         let mut task_inner = task.borrow_mut();
         if task_inner.res.is_none() {
             return;
@@ -194,7 +245,11 @@ fn wakeup_task_with_batch(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) 
             drop(task_inner);
             if let Some((hart_id, was_empty)) = enqueue_task(Arc::clone(&task), EnqueueKind::Wakeup)
             {
-                batch.note_enqueued(&task, hart_id, was_empty);
+                if allow_fair_preempt {
+                    batch.note_enqueued(&task, hart_id, was_empty);
+                } else {
+                    batch.note_signal_enqueued(&task, hart_id, was_empty);
+                }
             }
         }
     }
@@ -206,12 +261,20 @@ fn wakeup_task_with_batch(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) 
         task.wakeup_pending
             .store(true, core::sync::atomic::Ordering::Release);
         if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) == TaskControlBlock::OFF_CPU {
-            wake_if_blocked(task, batch);
+            if allow_fair_preempt {
+                wake_if_blocked(task, batch);
+            } else {
+                wake_if_blocked_signal(task, batch);
+            }
         }
         return;
     }
 
-    wake_if_blocked(task, batch);
+    if allow_fair_preempt {
+        wake_if_blocked(task, batch);
+    } else {
+        wake_if_blocked_signal(task, batch);
+    }
 }
 
 /// 在进程调度策略/优先级/nice 值变更后，重新将其所有可运行线程入队到正确的位置
@@ -241,7 +304,7 @@ pub fn refresh_process_runqueues(process: &Arc<ProcessControlBlock>) {
         if TASK_MANAGER.remove(Arc::clone(&task)) == 0 {
             continue;
         }
-        let hart_id = resolve_enqueue_hart(&task, cur, mask);
+        let hart_id = resolve_enqueue_hart(&task, cur, mask, EnqueueKind::Requeue);
         if TASK_MANAGER
             .add(Arc::clone(&task), hart_id, EnqueueKind::Requeue)
             .is_some()
@@ -269,7 +332,7 @@ pub fn refresh_task_runqueue(task: &Arc<TaskControlBlock>) {
     if TASK_MANAGER.remove(Arc::clone(task)) != 0 {
         let cur = crate::task::processor::hart_id() % MAX_HARTS;
         let mask = online_hart_mask();
-        let hart_id = resolve_enqueue_hart(task, cur, mask);
+        let hart_id = resolve_enqueue_hart(task, cur, mask, EnqueueKind::Requeue);
         if TASK_MANAGER
             .add(Arc::clone(task), hart_id, EnqueueKind::Requeue)
             .is_some()
@@ -298,6 +361,20 @@ pub fn wakeup_tasks(tasks: alloc::vec::Vec<Arc<TaskControlBlock>>) {
     let mut batch = WakeupBatch::default();
     for task in tasks {
         wakeup_task_with_batch(task, &mut batch);
+    }
+    batch.flush();
+}
+
+/// Signal delivery wakeup variant.
+///
+/// Fatal signal storms (for example hackbench reaping 400 workers) should make
+/// every target runnable, but fair-class targets do not need to preempt the
+/// sender after each individual kill. RT signal targets still use the normal
+/// preemption check.
+pub fn wakeup_signal_tasks(tasks: alloc::vec::Vec<Arc<TaskControlBlock>>) {
+    let mut batch = WakeupBatch::default();
+    for task in tasks {
+        wakeup_signal_task_with_batch(task, &mut batch);
     }
     batch.flush();
 }
