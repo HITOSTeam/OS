@@ -164,6 +164,7 @@ pub(crate) fn proc_sys_kernel_keys_entries() -> Vec<PseudoDirent> {
 pub(crate) fn proc_sys_fs_entries() -> Vec<PseudoDirent> {
     proc_dir_entries(&[
         ("file-max", 8),
+        ("fanotify", 4),
         ("inotify", 4),
         ("mqueue", 4),
         ("pipe-max-size", 8),
@@ -326,6 +327,9 @@ fn proc_simple_text_path(path: &str) -> Option<&'static str> {
         "/proc/sys/kernel/keys/maxbytes" => Some("/proc/sys/kernel/keys/maxbytes"),
         "/proc/sys/kernel/keys/root_maxkeys" => Some("/proc/sys/kernel/keys/root_maxkeys"),
         "/proc/sys/kernel/keys/root_maxbytes" => Some("/proc/sys/kernel/keys/root_maxbytes"),
+        "/proc/sys/fs/fanotify/max_queued_events" => {
+            Some("/proc/sys/fs/fanotify/max_queued_events")
+        }
         "/proc/sys/fs/inotify/max_queued_events" => Some("/proc/sys/fs/inotify/max_queued_events"),
         "/proc/sys/fs/inotify/max_user_instances" => {
             Some("/proc/sys/fs/inotify/max_user_instances")
@@ -411,6 +415,9 @@ fn proc_simple_text_default(path: &'static str) -> Vec<u8> {
         "/proc/sys/kernel/keys/maxbytes" => b"20000\n".to_vec(),
         "/proc/sys/kernel/keys/root_maxkeys" => b"100000\n".to_vec(),
         "/proc/sys/kernel/keys/root_maxbytes" => b"25000000\n".to_vec(),
+        "/proc/sys/fs/fanotify/max_queued_events" => {
+            alloc::format!("{}\n", crate::fs::fanotify_max_queued_events_for_procfs()).into_bytes()
+        }
         "/proc/sys/fs/inotify/max_queued_events" => b"16384\n".to_vec(),
         "/proc/sys/fs/inotify/max_user_instances" => b"128\n".to_vec(),
         "/proc/sys/fs/inotify/max_user_watches" => b"8192\n".to_vec(),
@@ -550,6 +557,7 @@ pub(crate) fn managed_proc_sys_file_kind(path: &str) -> Option<ProcFileKind> {
         "/proc/sys/vm/overcommit_ratio" => Some(ProcFileKind::VmOvercommitRatio),
         "/proc/sys/fs/file-max" => Some(ProcFileKind::FsFileMax),
         "/proc/sys/fs/pipe-max-size" => Some(ProcFileKind::FsPipeMaxSize),
+        "/proc/sys/fs/fanotify/max_queued_events" => Some(ProcFileKind::FsFanotifyMaxQueuedEvents),
         "/proc/sys/fs/mqueue/queues_max" => Some(ProcFileKind::FsMqueueQueuesMax),
         "/proc/sys/kernel/pid_max" => Some(ProcFileKind::KernelPidMax),
         "/proc/sys/kernel/msgmax" => Some(ProcFileKind::KernelMsgmax),
@@ -607,6 +615,11 @@ pub(crate) fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
     });
     entries.push(PseudoDirent {
         name: String::from("fd"),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("fdinfo"),
         ino: pid as u64,
         dtype: 4,
     });
@@ -708,6 +721,49 @@ pub(crate) fn proc_pid_fd_entries(pid: u32) -> Vec<PseudoDirent> {
                 dtype: 10,
             });
         }
+    }
+    entries
+}
+
+pub(crate) fn proc_pid_fd_exists(pid: u32, fd: usize) -> bool {
+    let Some(proc) = pid2process(pid as usize) else {
+        return false;
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        return false;
+    };
+    let files = alloc::sync::Arc::clone(&inner.files);
+    drop(inner);
+    files.lock().is_fd_open(fd)
+}
+
+pub(crate) fn proc_pid_fdinfo_entries(pid: u32) -> Vec<PseudoDirent> {
+    let mut entries = Vec::new();
+    entries.push(PseudoDirent {
+        name: String::from("."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from(".."),
+        ino: pid as u64,
+        dtype: 4,
+    });
+    let Some(proc) = pid2process(pid as usize) else {
+        return entries;
+    };
+    let Some(inner) = proc.try_borrow_mut() else {
+        return entries;
+    };
+    let files = alloc::sync::Arc::clone(&inner.files);
+    drop(inner);
+    let files_guard = files.lock();
+    for (fd, _file) in files_guard.iter_files_snapshot() {
+        entries.push(PseudoDirent {
+            name: alloc::format!("{fd}"),
+            ino: (fd + 1) as u64,
+            dtype: 8,
+        });
     }
     entries
 }
@@ -823,6 +879,11 @@ pub(crate) fn proc_pid_task_tid_entries(pid: u32, tid: u32) -> Vec<PseudoDirent>
     });
     entries.push(PseudoDirent {
         name: String::from("fd"),
+        ino: tid as u64,
+        dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("fdinfo"),
         ino: tid as u64,
         dtype: 4,
     });
