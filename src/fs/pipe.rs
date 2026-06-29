@@ -19,7 +19,7 @@ use crate::{
     },
     task::{
         block_sleep::add_timer,
-        manager::PID2PCB,
+        manager::{PID2PCB, prime_fair_sync_wakeup_lag},
         processor::{block_current_and_run_next, current_process, current_task},
         signal::{
             SIGPIPE_NUM, has_wait_interrupting_pending, queue_process_signal_info, signal_bit,
@@ -502,12 +502,9 @@ impl Pipe {
 
             // 通知 写者，和 epoll
             let writer = ring_buffer.pop_writer();
-            let mut wakeups = ring_buffer.drain_poll_waiters();
+            let wakeups = ring_buffer.drain_poll_waiters();
             drop(ring_buffer);
-            if let Some(writer) = writer {
-                wakeups.push(writer);
-            }
-            wake_tasks(wakeups);
+            wake_pipe_waiters(wakeups, writer);
             return Ok(read_now);
         }
     }
@@ -643,7 +640,7 @@ impl Pipe {
             } else {
                 None
             };
-            let mut wakeups = if to_write > 0 {
+            let wakeups = if to_write > 0 {
                 ring_buffer.drain_poll_waiters()
             } else {
                 Vec::new()
@@ -657,10 +654,7 @@ impl Pipe {
             if let Some((owner_type, owner_pid, sig, fd)) = async_notify {
                 notify_async_io(owner_type, owner_pid, sig, fd);
             }
-            if let Some(reader) = reader_to_wake {
-                wakeups.push(reader);
-            }
-            wake_tasks(wakeups);
+            wake_pipe_waiters(wakeups, reader_to_wake);
             if filter_truncated {
                 return Ok(data.len());
             }
@@ -724,16 +718,13 @@ impl Pipe {
             } else {
                 None
             };
-            let mut wakeups = if read_now > 0 {
+            let wakeups = if read_now > 0 {
                 ring_buffer.drain_poll_waiters()
             } else {
                 Vec::new()
             };
             drop(ring_buffer);
-            if let Some(writer) = writer {
-                wakeups.push(writer);
-            }
-            wake_tasks(wakeups);
+            wake_pipe_waiters(wakeups, writer);
             return Ok(read_now);
         }
     }
@@ -837,7 +828,7 @@ impl Pipe {
             } else {
                 None
             };
-            let mut wakeups = if write_now > 0 {
+            let wakeups = if write_now > 0 {
                 ring_buffer.drain_poll_waiters()
             } else {
                 Vec::new()
@@ -851,10 +842,7 @@ impl Pipe {
             if let Some((owner_type, owner_pid, sig, fd)) = async_notify {
                 notify_async_io(owner_type, owner_pid, sig, fd);
             }
-            if let Some(reader) = reader_to_wake {
-                wakeups.push(reader);
-            }
-            wake_tasks(wakeups);
+            wake_pipe_waiters(wakeups, reader_to_wake);
 
             if written == want_to_write || nonblock {
                 return Ok(written);
@@ -1407,6 +1395,28 @@ fn queue_sigpipe(task: &Arc<crate::task::task_block::TaskControlBlock>) {
         task.borrow_mut().pending_signals |= bit;
         task.mark_signal_pending();
     }
+}
+
+/// Wake poll waiters normally and direct pipe read/write waiters as a sync wakeup.
+///
+/// Linux pipe read/write wakeups use the synchronous wakeup variant for the
+/// opposite endpoint: the waker is usually about to block or hand control back
+/// to its peer, so the scheduler should preserve a small amount of wakeup lag
+/// for that peer. Readiness waiters (`poll`/`epoll`/`select`) are notification
+/// waiters rather than the direct pipe endpoint, so keep their ordinary wakeup
+/// placement.
+fn wake_pipe_waiters(
+    mut poll_waiters: Vec<Arc<TaskControlBlock>>,
+    direct_waiter: Option<Arc<TaskControlBlock>>,
+) {
+    if poll_waiters.is_empty() && direct_waiter.is_none() {
+        return;
+    }
+    if let Some(waiter) = direct_waiter {
+        prime_fair_sync_wakeup_lag(&waiter);
+        poll_waiters.push(waiter);
+    }
+    wake_tasks(poll_waiters);
 }
 
 /// 向管道异步 IO 属主（`F_SETOWN`）投递就绪信号（默认 `SIGIO`，可由 `F_SETSIG` 自定义）。
