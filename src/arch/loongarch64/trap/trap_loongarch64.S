@@ -14,6 +14,10 @@
     .globl sigreturn_trampoline
     # loongarch指令都是4字节对齐
     .align 2
+.equ CSR_ASID, 0x18
+.equ CSR_PGDL, 0x19
+.equ CSR_PGDH, 0x1a
+.equ INVTLB_CURRENT_GFALSE, 0x3
 alltraps:
     # Swap sp with SAVE0 (CSR 0x30): sp->TrapContext, SAVE0->user sp.
     csrwr $sp, 0x30
@@ -36,7 +40,7 @@ alltraps:
     # Load kernel_tp, kernel_sp, trap_handler, kernel page table.
     # t开头的寄存器是temp,是caller saved
     # 37是 kernel_tp
-    ld.d $t0, $sp, 37*8 
+    ld.d $t0, $sp, 37*8
     ld.d $t1, $sp, 35*8
     ld.d $t2, $sp, 36*8
     ld.d $t3, $sp, 34*8
@@ -44,18 +48,18 @@ alltraps:
     # 一个复制,进入内核态的时候,两个寄存器都写成内核页表
     add.d $t4, $t3, $r0
     # Switch to kernel page table so trap_handler/kstack are mapped.
-    # CSR 0x19 = PGDL
-    # CSR 0x1a = PGDH
-    csrwr $t3, 0x19
-    csrwr $t4, 0x1a
-    # 刷新TLB
-    invtlb 0x3, $r0, $r0
+    csrwr $t3, CSR_PGDL
+    csrwr $t4, CSR_PGDH
+    # Kernel translations use ASID 0; user ASIDs are restored only on the final
+    # return path so a kernel trap does not inherit a stale user tag.
+    csrwr $r0, CSR_ASID
     add.d $r2, $t0, $r0
     add.d $sp, $t1, $r0
     jirl $r0, $t2, 0
 
 restore:
     # a0: TrapContext pointer, a1: user page table token
+    # a2: user ASID, a3: flush current user TLB after ASID wrap
     # Set EENTRY first so any interrupt during page-table switch still
     # vectors to the trampoline handler (which is mapped in both page tables).
     # Reconstruct the trampoline page base from the current PC so we stay
@@ -74,8 +78,13 @@ restore:
     csrwr $t0, 0xc
     # Now switch PGDL to user page table.
     slli.d $t0, $a1, 12
-    csrwr $t0, 0x19
-    invtlb 0x3, $r0, $r0
+    csrwr $t0, CSR_PGDL
+    csrwr $a2, CSR_ASID
+    # Normal context switches keep ASID-tagged translations. Flush only when
+    # the allocator reports that this ASID generation may alias older entries.
+    beqz $a3, 1f
+    invtlb INVTLB_CURRENT_GFALSE, $r0, $r0
+1:
     add.d $sp, $a0, $r0
     # Keep SAVE0 as the TrapContext pointer for the next trap entry.
     csrwr $a0, 0x30

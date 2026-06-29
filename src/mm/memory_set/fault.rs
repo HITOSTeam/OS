@@ -125,8 +125,20 @@ impl MemorySet {
         new_flags.remove(PTEFlags::COW);
         new_flags.insert(PTEFlags::W);
         new_flags.insert(PTEFlags::D);
-        if !self.page_table.remap(vpn, frame.ppn, new_flags) {
-            return false;
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // Keep the COW remap and the visible TLB invalidation separate:
+            // the ASID helper below can invalidate exactly this user address
+            // without falling back to a full context-switch flush.
+            if !self.page_table.remap_deferred(vpn, frame.ppn, new_flags) {
+                return false;
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            if !self.page_table.remap(vpn, frame.ppn, new_flags) {
+                return false;
+            }
         }
 
         // 更新 MapArea 的 frame tracker，旧共享帧引用计数随之减少。
@@ -142,16 +154,8 @@ impl MemorySet {
         }
 
         // 刷新 TLB，使新 PTE 立即生效。
-        #[cfg(target_arch = "riscv64")]
-        // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.
-        unsafe {
-            core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
-        }
-        #[cfg(target_arch = "loongarch64")]
-        // SAFETY: invtlb is valid in S-mode; fault_va is the address to flush from TLB.
-        unsafe {
-            core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
-        }
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        self.flush_user_page(fault_va);
         true
     }
 
@@ -296,6 +300,13 @@ impl MemorySet {
                 area.set_charged_pages(accounted_pages.saturating_add(new_charge_pages));
             }
             self.page_table.map(vpn, frame.ppn, pte_flags);
+            #[cfg(target_arch = "riscv64")]
+            if pte_flags.contains(PTEFlags::X) {
+                // Newly faulted executable pages may contain instructions from
+                // a file mapping. Defer the fence.i to the next return to this
+                // mm instead of issuing it for every lazy fault.
+                crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
+            }
             area.insert_tracked_frame(vpn, frame);
             if region.backing_id != 0 {
                 if let Some(file_page) = file_page {
@@ -315,16 +326,10 @@ impl MemorySet {
                     }
                 }
             }
-            #[cfg(target_arch = "riscv64")]
-            // SAFETY: sfence.vma is valid in S-mode; fault_va is the address to flush from TLB.
-            unsafe {
-                core::arch::asm!("sfence.vma {0}, zero", in(reg) fault_va);
-            }
             #[cfg(target_arch = "loongarch64")]
-            // SAFETY: invtlb is valid in S-mode; fault_va is the address to flush from TLB.
-            unsafe {
-                core::arch::asm!("invtlb 0x4, $r0, {}", in(reg) fault_va);
-            }
+            self.flush_user_page(fault_va);
+            #[cfg(target_arch = "riscv64")]
+            self.flush_user_page(fault_va);
             return LazyFaultResult::Resolved;
         }
         LazyFaultResult::Invalid

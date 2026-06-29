@@ -130,6 +130,9 @@ impl PageWalkCache {
 
 /// Assume that it won't oom when creating/mapping.
 impl PageTable {
+    const ROOT_ENTRIES: usize = 512;
+    const ROOT_ENTRY_SHIFT: usize = 30;
+
     pub fn new() -> Self {
         let frame = frame_alloc().unwrap();
         PageTable {
@@ -137,6 +140,69 @@ impl PageTable {
             frames: vec![frame],
         }
     }
+
+    pub fn root_index_of_va(va: usize) -> usize {
+        (va >> Self::ROOT_ENTRY_SHIFT) & (Self::ROOT_ENTRIES - 1)
+    }
+
+    pub fn root_entry_start(index: usize) -> usize {
+        index << Self::ROOT_ENTRY_SHIFT
+    }
+
+    pub fn root_entry_end(index: usize) -> usize {
+        (index + 1) << Self::ROOT_ENTRY_SHIFT
+    }
+
+    /// Ensure a top-level Sv39 entry exists for kernel-only shared subtrees.
+    pub fn ensure_root_entry(&mut self, index: usize) -> bool {
+        if index >= Self::ROOT_ENTRIES {
+            return false;
+        }
+        let pte = &mut self.root_ppn.get_pte_array()[index];
+        if pte.is_valid() {
+            return true;
+        }
+        let Some(frame) = frame_alloc() else {
+            return false;
+        };
+        *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+        self.frames.push(frame);
+        true
+    }
+
+    /// Share one top-level root entry from another page table.
+    ///
+    /// This is used only for kernel direct-map / kernel-stack subtrees that are
+    /// marked global and not represented as user VMAs.
+    pub fn share_root_entry_from(&mut self, index: usize, source: &PageTable) -> bool {
+        if index >= Self::ROOT_ENTRIES {
+            return false;
+        }
+        let src = source.root_ppn.get_pte_array()[index];
+        if !src.is_valid() {
+            return false;
+        }
+        let dst = &mut self.root_ppn.get_pte_array()[index];
+        if dst.is_valid() {
+            return dst.bits == src.bits;
+        }
+        *dst = src;
+        true
+    }
+
+    /// Mark a root subtree global so ASID-specific TLB flushes keep it alive.
+    pub fn mark_root_entry_global(&mut self, index: usize) -> bool {
+        if index >= Self::ROOT_ENTRIES {
+            return false;
+        }
+        let pte = &mut self.root_ppn.get_pte_array()[index];
+        if !pte.is_valid() {
+            return false;
+        }
+        pte.bits |= PTEFlags::G.bits as usize;
+        true
+    }
+
     /// Temporarily used to get arguments from user space.
     pub fn from_token(satp: usize) -> Self {
         Self {

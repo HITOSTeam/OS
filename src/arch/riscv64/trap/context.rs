@@ -9,7 +9,7 @@ use riscv::register::sstatus::{self, FS, SPP, Sstatus};
 pub struct TrapContext {
     /// general regs[0..31]
     pub x: [usize; 32],
-    /// CSR sstatus      
+    /// CSR sstatus
     pub sstatus: Sstatus,
     /// CSR sepc
     pub sepc: usize,
@@ -38,7 +38,10 @@ impl TrapContext {
     ) -> Self {
         let mut sstatus = sstatus::read(); // CSR sstatus
         sstatus.set_spp(SPP::User); //previous privilege mode: user mode
-        sstatus.set_fs(FS::Dirty);
+        // Keep user FP disabled until a real FP instruction is executed. Linux
+        // can eagerly restore fstate in switch_to(), but doing that for every
+        // hackbench process is expensive under this QEMU target.
+        sstatus.set_fs(FS::Off);
         // Enable interrupts when we enter user mode for the first time.
         // Without setting SPIE, S-mode interrupts (timer) stay disabled in U-mode,
         // so sleeping tasks would never be woken if another runnable task spins.

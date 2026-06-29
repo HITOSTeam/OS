@@ -4,11 +4,17 @@ pub mod trap;
 
 use alloc::sync::Arc;
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use riscv::register::sstatus;
+use riscv::register::sstatus::{self, FS};
 use spin::MutexGuard;
 
 use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
+
+static RISCV_HAS_SSTC: AtomicBool = AtomicBool::new(false);
+// Detect Sstc for future use, but keep SBI set_timer as the active clockevent
+// path while this branch is focused on scheduler/mm latency changes.
+const RISCV_USE_SSTC_CLOCKEVENT: bool = false;
 
 #[allow(dead_code)]
 fn detect_timebase_frequency(dtb_pa: usize) -> Option<usize> {
@@ -22,11 +28,45 @@ fn detect_timebase_frequency(dtb_pa: usize) -> Option<usize> {
         .filter(|freq| *freq != 0)
 }
 
+fn detect_isa_extension(dtb_pa: usize, extension: &[u8]) -> bool {
+    if dtb_pa == 0 {
+        return false;
+    }
+    let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(dtb_pa as *const u8) }) else {
+        return false;
+    };
+    let Some(cpus) = fdt.find_node("/cpus") else {
+        return false;
+    };
+    for cpu in cpus.children() {
+        if cpu.property("riscv,isa").is_some_and(|prop| {
+            prop.value
+                .windows(extension.len())
+                .any(|window| window == extension)
+        }) {
+            return true;
+        }
+        if cpu.property("riscv,isa-extensions").is_some_and(|prop| {
+            prop.value
+                .windows(extension.len())
+                .any(|window| window == extension)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(dead_code)]
 pub fn bootstrap_init(dtb_pa: usize) {
     if let Some(freq) = detect_timebase_frequency(dtb_pa) {
         crate::config::set_clock_freq(freq);
         crate::println!("[kernel] riscv timebase frequency: {} Hz", freq);
+    }
+    let has_sstc = detect_isa_extension(dtb_pa, b"sstc");
+    RISCV_HAS_SSTC.store(has_sstc, Ordering::Release);
+    if has_sstc {
+        crate::println!("[kernel] riscv sstc timer enabled");
     }
 }
 
@@ -99,8 +139,24 @@ pub fn console_getchar() -> usize {
     crate::sbi::console_getchar()
 }
 
+#[inline]
+fn program_timer_deadline(timer: usize) {
+    if RISCV_USE_SSTC_CLOCKEVENT && RISCV_HAS_SSTC.load(Ordering::Acquire) {
+        // SAFETY: Sstc exposes stimecmp (CSR 0x14d) to S-mode. The flag is set
+        // only after the DTB advertises the extension; otherwise we keep using SBI.
+        unsafe { asm!("csrw 0x14d, {}", in(reg) timer, options(nostack)) };
+    } else {
+        crate::sbi::set_timer(timer);
+    }
+}
+
 pub fn set_timer(timer: usize) {
-    crate::sbi::set_timer(timer);
+    program_timer_deadline(timer);
+}
+
+#[allow(dead_code)]
+pub fn stop_timer() {
+    program_timer_deadline(usize::MAX);
 }
 
 pub fn send_ipi(hart_id: usize) {
@@ -130,6 +186,22 @@ fn ensure_fs_enabled() {
         asm!("csrr {}, sstatus", out(reg) sstatus_bits, options(nostack));
         if (sstatus_bits & SSTATUS_FS_DIRTY) != SSTATUS_FS_DIRTY {
             sstatus_bits |= SSTATUS_FS_DIRTY;
+            asm!("csrw sstatus, {}", in(reg) sstatus_bits, options(nostack));
+        }
+    }
+}
+
+#[inline]
+fn disable_fp() {
+    const SSTATUS_FS_MASK: usize = 0x6000;
+    // SAFETY: clearing sstatus.FS disables S-mode floating point access until
+    // the next explicit save/restore. User FS is restored from TrapContext by
+    // the trampoline, so this only gates accidental kernel FP use.
+    unsafe {
+        let mut sstatus_bits: usize;
+        asm!("csrr {}, sstatus", out(reg) sstatus_bits, options(nostack));
+        if (sstatus_bits & SSTATUS_FS_MASK) != 0 {
+            sstatus_bits &= !SSTATUS_FS_MASK;
             asm!("csrw sstatus, {}", in(reg) sstatus_bits, options(nostack));
         }
     }
@@ -237,10 +309,46 @@ fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
 
 pub fn save_user_fp_state(task: &Arc<TaskControlBlock>) {
     let mut inner = task.borrow_mut();
-    save_fp_registers(&mut inner);
+    let fs = inner.get_trap_cx().sstatus.fs();
+    if fs == FS::Dirty {
+        // RISC-V FS=Dirty is the architectural "hardware fstate changed"
+        // signal. Clean/Initial states can be left in the saved TrapContext.
+        save_fp_registers(&mut inner);
+        inner.get_trap_cx().sstatus.set_fs(FS::Clean);
+    }
+    drop(inner);
+    disable_fp();
 }
 
 pub fn restore_user_fp_state(task: &Arc<TaskControlBlock>) {
     let inner = task.borrow_mut();
+    if inner.get_trap_cx().sstatus.fs() != FS::Off {
+        restore_fp_registers(&inner);
+        inner.get_trap_cx().sstatus.set_fs(FS::Clean);
+    }
+    drop(inner);
+    disable_fp();
+}
+
+pub fn handle_user_fp_disabled() -> bool {
+    let Some(task) = crate::task::processor::current_task() else {
+        return false;
+    };
+    let mut inner = task.borrow_mut();
+    if inner.get_trap_cx().sstatus.fs() != FS::Off {
+        return false;
+    }
+    if !inner.fp_valid {
+        // First FP use after exec starts from a clean zeroed fstate.
+        inner.fp_regs = [0; 32];
+        inner.fp_fcsr = 0;
+        inner.fp_fcc = 0;
+        inner.fp_valid = true;
+    }
     restore_fp_registers(&inner);
+    inner.fp_used = true;
+    inner.get_trap_cx().sstatus.set_fs(FS::Clean);
+    drop(inner);
+    disable_fp();
+    true
 }

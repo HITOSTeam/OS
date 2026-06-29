@@ -207,6 +207,13 @@ fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
                             .filter(|holder| Arc::ptr_eq(holder, &task))
                             .count(),
                     );
+                    wait_queues = wait_queues.saturating_add(
+                        inner
+                            .vfork_wait_queue
+                            .iter()
+                            .filter(|holder| Arc::ptr_eq(holder, &task))
+                            .count(),
+                    );
                     for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
                         if Arc::ptr_eq(holder, &task) {
                             continue;
@@ -401,10 +408,10 @@ fn process_dumped_core(process: &Arc<ProcessControlBlock>, exit_code: i32) -> bo
 }
 
 /// 把已退出的子进程加入父进程的 exited_children 队列，并取出全部
-/// 等待 wait4 的阻塞线程用于唤醒。
+/// 等待 wait4/vfork 的阻塞线程用于唤醒。
 ///
 /// 用 `exited_parent_queue_pid` 去重，防止同一子进程被重复入队
-///（exit 与 group_exit 可能并发）。返回 drain 出的 wait_queue，
+///（exit 与 group_exit 可能并发）。返回 drain 出的等待队列，
 /// 调用方负责唤醒它们。
 fn queue_exited_child_and_drain_waiters(
     parent: &Arc<ProcessControlBlock>,
@@ -424,7 +431,8 @@ fn queue_exited_child_and_drain_waiters(
     if should_queue {
         parent_inner.exited_children.push_back(Arc::clone(child));
     }
-    let waiters = parent_inner.wait_queue.drain(..).collect::<Vec<_>>();
+    let mut waiters = parent_inner.wait_queue.drain(..).collect::<Vec<_>>();
+    waiters.extend(parent_inner.vfork_wait_queue.drain(..));
     for waiter in &waiters {
         prime_fair_sync_wakeup_lag(waiter);
     }
@@ -903,6 +911,11 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
 /// 调度核心函数,直接完成任务的切换，传入参数为我们需要切换的任务的上下文
 /// 完毕之后，该hart 进入idle_task,idle-Task会进入调度循环idle_task()
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+    #[cfg(target_arch = "riscv64")]
+    // The RISC-V trap path runs part of the kernel on the current user SATP
+    // with shared kernel roots. Switch to the full kernel SATP before the idle
+    // scheduler can drop or recycle the outgoing task's address space.
+    crate::mm::activate_kernel_space();
     let mut processor = local_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_ptr();
     drop(processor);

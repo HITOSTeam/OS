@@ -11,7 +11,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::MutexGuard;
 
 use csr_defs::{
-    CRMD_DA, CRMD_IE, CRMD_PG, ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT, TCFG_EN, TCFG_INITVAL_MASK,
+    CRMD_DA, CRMD_IE, CRMD_PG, ECFG_LIE_IPI, ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT,
+    IOCSR_IPI_CLEAR, IOCSR_IPI_EN, IOCSR_IPI_SEND, IOCSR_IPI_SEND_BLOCKING,
+    IOCSR_IPI_SEND_CPU_SHIFT, IOCSR_IPI_STATUS, IPI_ACTION_RESCHEDULE, TCFG_EN, TCFG_INITVAL_MASK,
 };
 
 global_asm!(include_str!("tlb_refill.S"));
@@ -33,6 +35,8 @@ pub const REG_A4: usize = 8;
 pub const REG_A5: usize = 9;
 pub const REG_A6: usize = 10;
 pub const REG_A7: usize = 11;
+
+const EUEN_FPEN: usize = 1 << 0;
 
 #[cfg(feature = "loongarch_board")]
 const UART_BASE: usize = 0x8000_0000_1fe2_0000;
@@ -140,7 +144,53 @@ pub fn set_tp(hart_id: usize) {
     }
 }
 
-pub fn send_ipi(_hart_id: usize) {}
+#[inline(always)]
+fn iocsr_write32(reg: usize, value: u32) {
+    // SAFETY: IOCSR writes are privileged LoongArch operations. Callers pass
+    // kernel-selected register offsets and values matching Linux's CSR-IPI ABI.
+    unsafe {
+        asm!("iocsrwr.w {}, {}", in(reg) value, in(reg) reg, options(nostack));
+    }
+}
+
+#[inline(always)]
+fn iocsr_read32(reg: usize) -> u32 {
+    let value: u32;
+    // SAFETY: IOCSR reads are privileged LoongArch operations. The register
+    // offset is controlled by the kernel.
+    unsafe {
+        asm!("iocsrrd.w {}, {}", out(reg) value, in(reg) reg, options(nostack));
+    }
+    value
+}
+
+pub fn send_ipi(hart_id: usize) {
+    // We only need Linux's reschedule action for now: it breaks a remote hart
+    // out of user/kernel execution so pending scheduler work is observed.
+    let value = (IOCSR_IPI_SEND_BLOCKING
+        | IPI_ACTION_RESCHEDULE
+        | (hart_id << IOCSR_IPI_SEND_CPU_SHIFT)) as u32;
+    iocsr_write32(IOCSR_IPI_SEND, value);
+}
+
+pub fn enable_ipi_interrupt() {
+    let mut ecfg: usize;
+    // SAFETY: ECFG read/write is valid in kernel mode.
+    unsafe { asm!("csrrd {}, 0x4", out(reg) ecfg) };
+    ecfg &= !(ECFG_VS_MASK << ECFG_VS_SHIFT);
+    ecfg |= ECFG_LIE_IPI;
+    // SAFETY: This only changes the local IPI interrupt-enable bit.
+    unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
+    iocsr_write32(IOCSR_IPI_EN, u32::MAX);
+}
+
+pub fn clear_ipi_interrupt() -> u32 {
+    let action = iocsr_read32(IOCSR_IPI_STATUS);
+    if action != 0 {
+        iocsr_write32(IOCSR_IPI_CLEAR, action);
+    }
+    action
+}
 
 pub fn hart_start(_hart_id: usize, _start_addr: usize, _opaque: usize) -> usize {
     1
@@ -164,6 +214,7 @@ pub fn enable_timer_interrupt() {
     // SAFETY: This writes back a kernel-constructed ECFG value that only changes timer interrupt
     // delivery bits. A malformed write would route interrupts incorrectly on this hart.
     unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
+    enable_ipi_interrupt();
 }
 
 pub fn clear_timer_interrupt() {
@@ -201,8 +252,22 @@ fn ensure_fp_enabled() {
     unsafe {
         let mut euen: usize;
         asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
-        if (euen & 1) == 0 {
-            euen |= 1;
+        if (euen & EUEN_FPEN) == 0 {
+            euen |= EUEN_FPEN;
+            asm!("csrwr {}, 0x2", in(reg) euen, options(nostack));
+        }
+    }
+}
+
+#[inline]
+fn disable_fp() {
+    // SAFETY: Clearing EUEN.FPEN is the LoongArch lazy-FPU gate. User FP instructions will trap
+    // with FPDIS until the task first owns FPU state.
+    unsafe {
+        let mut euen: usize;
+        asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
+        if (euen & EUEN_FPEN) != 0 {
+            euen &= !EUEN_FPEN;
             asm!("csrwr {}, 0x2", in(reg) euen, options(nostack));
         }
     }
@@ -377,12 +442,46 @@ fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
 
 pub fn save_user_fp_state(task: &Arc<TaskControlBlock>) {
     let mut inner = task.borrow_mut();
+    if !inner.fp_used {
+        // Lazy-FPU tasks that never trapped on FP have no live hardware state.
+        return;
+    }
     save_fp_registers(&mut inner);
+    inner.fp_used = false;
+    drop(inner);
+    disable_fp();
 }
 
 pub fn restore_user_fp_state(task: &Arc<TaskControlBlock>) {
     let inner = task.borrow_mut();
+    if inner.fp_used {
+        restore_fp_registers(&inner);
+    } else {
+        drop(inner);
+        disable_fp();
+    }
+}
+
+pub fn handle_user_fp_disabled() {
+    let task = crate::task::processor::current_task().unwrap();
+    let mut inner = task.borrow_mut();
+    if !inner.fp_valid {
+        // First FP use after exec starts from the architectural zeroed state.
+        inner.fp_regs = [0; 32];
+        inner.fp_fcsr = 0;
+        inner.fp_fcc = 0;
+        inner.fp_valid = true;
+    }
     restore_fp_registers(&inner);
+    inner.fp_used = true;
+}
+
+pub fn prepare_user_fp_state(task: &Arc<TaskControlBlock>) {
+    if task.borrow_mut().fp_used {
+        ensure_fp_enabled();
+    } else {
+        disable_fp();
+    }
 }
 
 fn read_cpucfg(index: u32) -> u32 {
@@ -417,10 +516,10 @@ pub fn bootstrap_init() {
     // target machine-defined paging state for the current hart. Programming inconsistent values
     // here would break address translation or trap refill before the kernel can recover.
     unsafe {
-        // Enable base floating-point instructions for user programs (needed by busybox/musl).
+        // Start with FP disabled. User FP instructions trap once and lazily acquire state.
         let mut euen: usize;
         asm!("csrrd {}, 0x2", out(reg) euen);
-        euen |= 1 << 0;
+        euen &= !EUEN_FPEN;
         asm!("csrwr {}, 0x2", in(reg) euen);
 
         // Clear pending timer interrupt and disable timer while bootstrapping.
@@ -466,4 +565,5 @@ pub fn bootstrap_init() {
     if let Some(freq) = detect_clock_freq() {
         crate::config::set_clock_freq(freq);
     }
+    enable_ipi_interrupt();
 }

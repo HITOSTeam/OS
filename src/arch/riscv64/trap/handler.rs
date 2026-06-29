@@ -18,7 +18,7 @@ use crate::task::processor::{
 use crate::task::signal::{
     MAX_SIG, SIG_DFL, SIG_IGN, check_if_current_signals_error, check_task_signals_error, signal_bit,
 };
-use crate::time::set_next_trigger;
+use crate::time::{set_next_trigger, stop_current_clockevent};
 use riscv::{
     interrupt::Trap,
     register::{scause, sstatus, stval},
@@ -116,17 +116,20 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
     let cause = scause.cause();
     match cause {
         Trap::Interrupt(TIME_INTERVAL) => {
-            let hart = {
-                let h: usize;
-                // SAFETY: tp register holds the current hart ID in our convention.
-                unsafe { asm!("mv {}, tp", out(reg) h) };
-                h
-            };
-            static KERNEL_TIMER_LOG: AtomicUsize = AtomicUsize::new(0);
-            let kcnt = KERNEL_TIMER_LOG.fetch_add(1, Ordering::SeqCst);
-            if DEBUG_TRAP && kcnt < 4 {
-                log::debug!("[trap_from_kernel] hart={} timer interrupt", hart);
+            if DEBUG_TRAP {
+                let hart = {
+                    let h: usize;
+                    // SAFETY: tp register holds the current hart ID in our convention.
+                    unsafe { asm!("mv {}, tp", out(reg) h) };
+                    h
+                };
+                static KERNEL_TIMER_LOG: AtomicUsize = AtomicUsize::new(0);
+                let kcnt = KERNEL_TIMER_LOG.fetch_add(1, Ordering::SeqCst);
+                if kcnt < 4 {
+                    log::debug!("[trap_from_kernel] hart={} timer interrupt", hart);
+                }
             }
+            stop_current_clockevent();
             set_next_trigger();
             crate::task::block_sleep::note_kernel_timer_tick();
         }
@@ -241,21 +244,23 @@ pub fn get_current_token() -> usize {
 }
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
-    let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
-    if DEBUG_TRAP && idx < 6 {
-        let hart = {
-            let h: usize;
-            // SAFETY: tp register holds the current hart ID in our convention.
-            unsafe { asm!("mv {}, tp", out(reg) h) };
-            h
-        };
-        log::debug!(
-            "[trap_handler#{}] hart={} scause={:?} stval={:#x}",
-            idx,
-            hart,
-            scause::read().cause(),
-            stval::read()
-        );
+    if DEBUG_TRAP {
+        let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
+        if idx < 6 {
+            let hart = {
+                let h: usize;
+                // SAFETY: tp register holds the current hart ID in our convention.
+                unsafe { asm!("mv {}, tp", out(reg) h) };
+                h
+            };
+            log::debug!(
+                "[trap_handler#{}] hart={} scause={:?} stval={:#x}",
+                idx,
+                hart,
+                scause::read().cause(),
+                stval::read()
+            );
+        }
     }
     // now is kernel space
     set_kernel_trap_entry();
@@ -308,6 +313,7 @@ pub fn trap_handler() {
             handle_user_exception(code, stval);
         }
         Trap::Interrupt(TIME_INTERVAL) => {
+            stop_current_clockevent();
             set_next_trigger();
             check_timer();
             crate::task::processor::account_current_task_tick();
@@ -462,6 +468,12 @@ fn handle_user_exception(code: usize, stval: usize) {
         if crate::syscall::signal::try_sigreturn_from_fault() {
             return;
         }
+    }
+    // RISC-V Linux avoids unconditional FPU save/restore by relying on FS
+    // state. We keep user FS=Off until the first FP instruction traps, then
+    // restore the saved FP state and retry the instruction.
+    if code == ILLEGAL_INSTRUCTION && crate::arch::handle_user_fp_disabled() {
+        return;
     }
     // 2. Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
     if code == STORE_PAGE_FAULT {
@@ -645,20 +657,22 @@ fn handle_user_exception(code: usize, stval: usize) {
 /// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
 /// finally, jump to new addr of __restore asm function
 pub fn trap_return() -> ! {
-    let entered = TRAP_RETURN_COUNT.load(Ordering::SeqCst);
-    if DEBUG_TRAP && entered < 4 {
-        let hart = {
-            let h: usize;
-            // SAFETY: tp register holds the current hart ID in our convention.
-            unsafe { asm!("mv {}, tp", out(reg) h) };
-            h
-        };
-        log::debug!("[trap_return entry#{}] hart={} sp={:#x}", entered, hart, {
-            let s: usize;
-            // SAFETY: sp register read is always valid.
-            unsafe { asm!("mv {}, sp", out(reg) s) };
-            s
-        });
+    if DEBUG_TRAP {
+        let entered = TRAP_RETURN_COUNT.load(Ordering::SeqCst);
+        if entered < 4 {
+            let hart = {
+                let h: usize;
+                // SAFETY: tp register holds the current hart ID in our convention.
+                unsafe { asm!("mv {}, tp", out(reg) h) };
+                h
+            };
+            log::debug!("[trap_return entry#{}] hart={} sp={:#x}", entered, hart, {
+                let s: usize;
+                // SAFETY: sp register read is always valid.
+                unsafe { asm!("mv {}, sp", out(reg) s) };
+                s
+            });
+        }
     }
     // A task may receive a signal while it is already runnable and waiting in
     // the scheduler queue. Such a task reaches this path directly from the
@@ -684,7 +698,7 @@ pub fn trap_return() -> ! {
 
     // IMPORTANT: `trap_return()` never returns. Keep `Arc` owners in a short scope,
     // otherwise every trap leaks one strong reference.
-    let (trap_cx_ptr, user_satp) = {
+    let (trap_cx_ptr, user_satp, need_flush, need_icache_flush) = {
         let task = crate::task::processor::current_task().unwrap();
         let trap_cx_ptr = {
             let task_inner = task.borrow_mut();
@@ -695,68 +709,71 @@ pub fn trap_return() -> ! {
                 exit_current_and_run_next(-1)
             }
         };
-        let user_satp = task
-            .process
-            .upgrade()
-            .unwrap()
-            .borrow_mut()
-            .memory_set
-            .token();
-        (trap_cx_ptr, user_satp)
+        let (user_satp, need_flush, need_icache_flush) = task.prepare_user_satp();
+        // `need_flush` is set only after ASID rollover/no-ASID fallback; the
+        // trampoline keeps normal ASID-tagged translations across switches.
+        // `need_icache_flush` is per-mm executable mapping state.
+        (trap_cx_ptr, user_satp, need_flush, need_icache_flush)
     };
 
-    let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
-    if DEBUG_TRAP && cnt < 4 {
-        let hart = {
-            let h: usize;
-            // SAFETY: tp register holds the current hart ID in our convention.
-            unsafe { asm!("mv {}, tp", out(reg) h) };
-            h
-        };
-        if !FIRST_TRAP_RETURN_LOGGED.swap(true, Ordering::SeqCst) {
-            let cx = get_trap_context();
-            let tp_kernel: usize;
-            // SAFETY: tp register read is always valid.
-            unsafe { asm!("mv {}, tp", out(reg) tp_kernel) };
+    if DEBUG_TRAP {
+        let cnt = TRAP_RETURN_COUNT.fetch_add(1, Ordering::SeqCst);
+        if cnt < 4 {
+            let hart = {
+                let h: usize;
+                // SAFETY: tp register holds the current hart ID in our convention.
+                unsafe { asm!("mv {}, tp", out(reg) h) };
+                h
+            };
+            if !FIRST_TRAP_RETURN_LOGGED.swap(true, Ordering::SeqCst) {
+                let cx = get_trap_context();
+                let tp_kernel: usize;
+                // SAFETY: tp register read is always valid.
+                unsafe { asm!("mv {}, tp", out(reg) tp_kernel) };
+                log::debug!(
+                    "[trap_return#{}] hart={} trap_cx_ptr={:#x} sepc={:#x} user_satp={:#x} need_flush={} need_icache_flush={} tp={:#x}",
+                    cnt,
+                    hart,
+                    trap_cx_ptr,
+                    cx.sepc,
+                    user_satp,
+                    need_flush,
+                    need_icache_flush,
+                    tp_kernel
+                );
+            } else {
+                log::debug!(
+                    "[trap_return#{}] hart={} trap_cx_ptr={:#x} user_satp={:#x} need_flush={} need_icache_flush={}",
+                    cnt,
+                    hart,
+                    trap_cx_ptr,
+                    user_satp,
+                    need_flush,
+                    need_icache_flush,
+                );
+            }
+            let tramp_vpn = VirtAddr::from(TRAMPOLINE).floor();
+            let kernel_satp = riscv::register::satp::read().bits();
+            let kernel_pt = PageTable::from_token(kernel_satp);
+            let user_pt = PageTable::from_token(user_satp);
+            let kernel_pte = kernel_pt
+                .translate(tramp_vpn)
+                .filter(|pte| pte.is_valid())
+                .map(|pte| (pte.ppn(), pte.flags()));
+            let user_pte = user_pt
+                .translate(tramp_vpn)
+                .filter(|pte| pte.is_valid())
+                .map(|pte| (pte.ppn(), pte.flags()));
             log::debug!(
-                "[trap_return#{}] hart={} trap_cx_ptr={:#x} sepc={:#x} user_satp={:#x} tp={:#x}",
+                "[trap_return#{}] tramp vpn={:?} kernel_satp={:#x} user_satp={:#x} kernel_pte={:?} user_pte={:?}",
                 cnt,
-                hart,
-                trap_cx_ptr,
-                cx.sepc,
+                tramp_vpn,
+                kernel_satp,
                 user_satp,
-                tp_kernel
-            );
-        } else {
-            log::debug!(
-                "[trap_return#{}] hart={} trap_cx_ptr={:#x} user_satp={:#x}",
-                cnt,
-                hart,
-                trap_cx_ptr,
-                user_satp,
+                kernel_pte,
+                user_pte
             );
         }
-        let tramp_vpn = VirtAddr::from(TRAMPOLINE).floor();
-        let kernel_satp = riscv::register::satp::read().bits();
-        let kernel_pt = PageTable::from_token(kernel_satp);
-        let user_pt = PageTable::from_token(user_satp);
-        let kernel_pte = kernel_pt
-            .translate(tramp_vpn)
-            .filter(|pte| pte.is_valid())
-            .map(|pte| (pte.ppn(), pte.flags()));
-        let user_pte = user_pt
-            .translate(tramp_vpn)
-            .filter(|pte| pte.is_valid())
-            .map(|pte| (pte.ppn(), pte.flags()));
-        log::debug!(
-            "[trap_return#{}] tramp vpn={:?} kernel_satp={:#x} user_satp={:#x} kernel_pte={:?} user_pte={:?}",
-            cnt,
-            tramp_vpn,
-            kernel_satp,
-            user_satp,
-            kernel_pte,
-            user_pte
-        );
     }
 
     unsafe extern "C" {
@@ -766,13 +783,22 @@ pub fn trap_return() -> ! {
     let restore_va = restore as usize - alltraps as usize + TRAMPOLINE;
     // SAFETY: restore_va points to valid trampoline code; trap_cx_ptr and user_satp are valid.
     // This asm block never returns; control transfers to user mode via sret in the trampoline.
+    if need_icache_flush {
+        // SAFETY: a local RISC-V instruction-cache flush is required before
+        // resuming a user mm whose executable mappings were newly installed or
+        // changed. Linux defers this per mm/hart instead of doing it on every
+        // return to userspace.
+        unsafe {
+            asm!("fence.i", options(nostack));
+        }
+    }
     unsafe {
         asm!(
-            "fence.i",
             "jr {restore_va}",             // jump to new addr of __restore asm function
             restore_va = in(reg) restore_va,
             in("a0") trap_cx_ptr,      // a0 = virt addr of Trap Context
             in("a1") user_satp,        // a1 = phy addr of usr page table
+            in("a2") usize::from(need_flush),
             options(noreturn)
         );
     }
