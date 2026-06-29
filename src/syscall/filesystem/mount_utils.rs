@@ -1869,11 +1869,23 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
         return err(SyscallError::EBUSY);
     }
 
-    if (flags & MNT_DETACH) != 0 && record.fs_type == "tmpfs" {
-        let key = alloc::format!("{}:{}", record.fs_type, record.source_display);
-        TMPFS_REATTACH_SOURCES
-            .lock()
-            .insert(key, record.source.clone());
+    if record.fs_type == "tmpfs" {
+        let reattach_key = if (flags & MNT_DETACH) != 0 || record.source_display == "/dev/root" {
+            Some(alloc::format!(
+                "{}:{}",
+                record.fs_type,
+                record.source_display
+            ))
+        } else if record.source_display == "ltp-tmpfs" {
+            Some(String::from("tmpfs:/dev/root"))
+        } else {
+            None
+        };
+        if let Some(key) = reattach_key {
+            TMPFS_REATTACH_SOURCES
+                .lock()
+                .insert(key, record.source.clone());
+        }
     }
     if record.fs_type == "cgroup2" || record.fs_type == "cgroup" {
         let _ = cgroup_umount(&abs);
