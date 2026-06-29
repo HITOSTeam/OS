@@ -849,6 +849,16 @@ pub(crate) fn resolve_ext4_path(
     depth: &mut usize,
     seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
+    if let Some(result) = resolve_ext4_path_fast_no_symlink(
+        alloc::sync::Arc::clone(&start),
+        path,
+        uid,
+        gid,
+        follow_final,
+    ) {
+        return result;
+    }
+
     let mut stack: Vec<alloc::sync::Arc<ext4_fs::Inode>> = alloc::vec![start];
     let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let mut idx = 0usize;
@@ -934,6 +944,37 @@ pub(crate) fn resolve_ext4_path(
         idx += 1;
     }
     Ok(stack.last().unwrap().clone())
+}
+
+fn resolve_ext4_path_fast_no_symlink(
+    start: alloc::sync::Arc<ext4_fs::Inode>,
+    path: &str,
+    uid: u32,
+    gid: u32,
+    follow_final: bool,
+) -> Option<Result<alloc::sync::Arc<ext4_fs::Inode>, isize>> {
+    let mut cur = start;
+    let mut components = path.split('/').filter(|s| !s.is_empty()).peekable();
+    while let Some(seg) = components.next() {
+        if seg == "." || seg == ".." {
+            return None;
+        }
+        if !cur.is_dir() {
+            return Some(Err(err(SyscallError::ENOTDIR)));
+        }
+        if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
+            return Some(Err(err(SyscallError::EACCES)));
+        }
+        let Some(next) = cur.find(seg) else {
+            return Some(Err(err(SyscallError::ENOENT)));
+        };
+        let is_last = components.peek().is_none();
+        if next.is_symlink() && (follow_final || !is_last) {
+            return None;
+        }
+        cur = next;
+    }
+    Some(Ok(cur))
 }
 
 /// 将 `AtPath` 解析为 ext4 inode，统一分发到绝对路径或相对 inode 两条路径。
