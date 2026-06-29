@@ -429,6 +429,32 @@ impl OSInode {
         inner.write_buf_off.saturating_add(inner.write_buf.len())
     }
 
+    fn write_at_zeroing_gap(
+        inode: &Arc<Inode>,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize, ext4_fs::Ext4Error> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let size = inode.size() as usize;
+        if offset > size {
+            let zeros = [0u8; 4096];
+            let mut off = size;
+            while off < offset {
+                let chunk = core::cmp::min(zeros.len(), offset - off);
+                match inode.write_at(off, &zeros[..chunk]) {
+                    Ok(0) => return Err(ext4_fs::Ext4Error::NoSpace),
+                    Ok(written) => off += written,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        inode.write_at(offset, data)
+    }
+
     /// Read from this inode at the given offset without updating the file offset.
     pub fn pread_at(&self, offset: usize, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
@@ -505,7 +531,7 @@ impl OSInode {
             }
             let result = {
                 let _fs_guard = ext4_lock();
-                inner.inode.write_at(offset, buf)
+                Self::write_at_zeroing_gap(&inner.inode, offset, buf)
             };
             if debug_iozone_tracked(inode_num) {
                 let size_after = inner.inode.size() as usize;
@@ -571,7 +597,7 @@ impl OSInode {
         let size_before = inner.inode.size() as usize;
         let result = {
             let _fs_guard = ext4_lock();
-            inner.inode.write_at(off, &data)
+            Self::write_at_zeroing_gap(&inner.inode, off, &data)
         };
         if debug_iozone_tracked(inode_num) {
             let size_after = inner.inode.size() as usize;
@@ -1026,7 +1052,7 @@ impl File for OSInode {
                 let size_before = inner.inode.size() as usize;
                 let result = {
                     let _fs_guard = ext4_lock();
-                    inner.inode.write_at(off, &inner.write_buf)
+                    Self::write_at_zeroing_gap(&inner.inode, off, &inner.write_buf)
                 };
                 if debug_iozone_tracked(inode_num) {
                     let size_after = inner.inode.size() as usize;
@@ -1071,7 +1097,7 @@ impl File for OSInode {
                 let size_before = inner.inode.size() as usize;
                 let result = {
                     let _fs_guard = ext4_lock();
-                    inner.inode.write_at(off, &inner.write_buf)
+                    Self::write_at_zeroing_gap(&inner.inode, off, &inner.write_buf)
                 };
                 if debug_iozone_tracked(inode_num) {
                     let size_after = inner.inode.size() as usize;
@@ -1113,7 +1139,7 @@ impl File for OSInode {
                 let size_before = inner.inode.size() as usize;
                 let result = {
                     let _fs_guard = ext4_lock();
-                    inner.inode.write_at(off, &inner.write_buf)
+                    Self::write_at_zeroing_gap(&inner.inode, off, &inner.write_buf)
                 };
                 if debug_iozone_tracked(inode_num) {
                     let size_after = inner.inode.size() as usize;
@@ -1157,7 +1183,7 @@ impl Drop for OSInode {
             let data = core::mem::take(&mut inner.write_buf);
             let _ = {
                 let _fs_guard = ext4_lock();
-                inner.inode.write_at(off, &data)
+                Self::write_at_zeroing_gap(&inner.inode, off, &data)
             };
         }
         drop(inner);
