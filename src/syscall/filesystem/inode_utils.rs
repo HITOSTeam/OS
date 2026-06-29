@@ -206,15 +206,18 @@ pub(crate) fn open_existing_ext4_inode(
     }
 
     let inode_num = inode.inode_num();
-    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs_tmp_cleanup(
-        readable,
-        writable,
-        append,
-        inode,
-        readonly_fs,
-        false,
-        None,
-    ));
+    let os_inode = alloc::sync::Arc::new(
+        OSInode::new_with_append_rofs_tmp_cleanup(
+            readable,
+            writable,
+            append,
+            inode,
+            readonly_fs,
+            false,
+            None,
+        )
+        .with_fanotify_path(raw_abs.map(alloc::string::String::from)),
+    );
     drop(exec_inode_guard);
     crate::fs::debug_track_iozone_inode(path, inode_num);
     drop(ext4_guard);

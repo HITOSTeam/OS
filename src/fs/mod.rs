@@ -8,6 +8,7 @@
 mod cgroupfs; // cgroup v2 伪文件系统
 mod dummy; // 占位/哑文件
 mod eventfd; // eventfd
+mod fanotify; // fanotify notification groups
 mod inode; // ext4 真实文件 inode 与打开逻辑
 mod mountns; // 挂载命名空间
 mod namespace_file; // /proc/[pid]/ns/* 命名空间文件
@@ -817,6 +818,14 @@ pub use cgroupfs::{
 };
 pub use dummy::{DummyFile, SignalfdFile};
 pub use eventfd::EventFdFile;
+pub(crate) use fanotify::{
+    FanotifyFile, fanotify_descriptor_flags,
+    max_queued_events_for_procfs as fanotify_max_queued_events_for_procfs,
+    notify_access as fanotify_notify_access, notify_close as fanotify_notify_close,
+    notify_modify as fanotify_notify_modify, notify_open as fanotify_notify_open,
+    notify_open_exec as fanotify_notify_open_exec, permission_access as fanotify_permission_access,
+    permission_open as fanotify_permission_open,
+};
 #[allow(unused_imports)]
 pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{

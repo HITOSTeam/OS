@@ -10,17 +10,20 @@ use spin::Mutex;
 use crate::task::manager::{PID2PCB, wakeup_tasks};
 use crate::{
     fs::{
-        CgroupFile, CgroupMountSpec, ClassifiedAbsPath, EventFdFile, File, MountNamespace,
-        MountNamespaceState, MountPropagation, MountRecord, NamespaceFile, NetSocketFile, OSInode,
-        Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoDirent, PseudoFile,
-        PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TimerFdFile, TtyFile,
-        cgroup_charge_file_write, cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount,
-        cgroup_rename, cgroup_rmdir, cgroup_umount, ext4_lock, find_path_in_roots,
-        inode_logical_path, inode_raw_logical_path, make_pipe, mount_namespace_id,
-        note_inode_path_hint, open_pseudo, pseudo_block_is_read_only, pseudo_block_note_sync,
-        register_deferred_unlink_cleanup, resolve_final_symlink_abs_path,
-        resolve_final_symlink_abs_path_locked, resolve_proc_magic_intermediate_abs_path,
-        secondary_root_inode, shm_create, shm_get, shm_object_name, shm_remove,
+        CgroupFile, CgroupMountSpec, ClassifiedAbsPath, EventFdFile, FanotifyFile, File,
+        MountNamespace, MountNamespaceState, MountPropagation, MountRecord, NamespaceFile,
+        NetSocketFile, OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir,
+        PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
+        SocketPairEnd, TimerFdFile, TtyFile, cgroup_charge_file_write,
+        cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
+        cgroup_umount, ext4_lock, fanotify_notify_access, fanotify_notify_close,
+        fanotify_notify_modify, fanotify_notify_open, fanotify_permission_access,
+        fanotify_permission_open, find_path_in_roots, inode_logical_path, inode_raw_logical_path,
+        make_pipe, mount_namespace_id, note_inode_path_hint, open_pseudo,
+        pseudo_block_is_read_only, pseudo_block_note_sync, register_deferred_unlink_cleanup,
+        resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked,
+        resolve_proc_magic_intermediate_abs_path, secondary_root_inode, shm_create, shm_get,
+        shm_object_name, shm_remove,
     },
     mm::{
         MapPermission, UserBuffer, translated_byte_buffer, translated_mutref, try_copy_from_user,
@@ -60,6 +63,8 @@ mod stat;
 pub use stat::*;
 mod mount;
 pub use mount::*;
+mod fanotify;
+pub use fanotify::*;
 mod stat_utils;
 pub(crate) use stat_utils::*;
 mod ctx_utils;

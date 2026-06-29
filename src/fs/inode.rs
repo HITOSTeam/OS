@@ -284,6 +284,8 @@ pub struct OSInode {
     append: bool,
     readonly_fs: bool,
     replace_on_write: bool,
+    fanotify_silent: bool,
+    fanotify_path: Option<String>,
     tmpfile_cleanup: Option<TmpfileCleanup>,
     inner: Mutex<OSInodeInner>,
 }
@@ -347,6 +349,12 @@ impl OSInode {
         Self::new_with_append_rofs_tmp_cleanup(readable, writable, false, inode, false, true, None)
     }
 
+    pub(crate) fn new_fanotify_event(inode: Arc<Inode>) -> Self {
+        let mut file = Self::new(true, false, inode);
+        file.fanotify_silent = true;
+        file
+    }
+
     pub fn new_with_append_rofs_tmp_cleanup(
         readable: bool,
         writable: bool,
@@ -362,6 +370,8 @@ impl OSInode {
             append,
             readonly_fs,
             replace_on_write,
+            fanotify_silent: false,
+            fanotify_path: None,
             tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
             inner: Mutex::new(OSInodeInner {
                 offset: 0,
@@ -376,12 +386,25 @@ impl OSInode {
         }
     }
 
+    pub(crate) fn with_fanotify_path(mut self, path: Option<String>) -> Self {
+        self.fanotify_path = path;
+        self
+    }
+
     pub fn append(&self) -> bool {
         self.append
     }
 
     pub fn readonly_fs(&self) -> bool {
         self.readonly_fs
+    }
+
+    pub(crate) fn fanotify_silent(&self) -> bool {
+        self.fanotify_silent
+    }
+
+    pub(crate) fn fanotify_path(&self) -> Option<String> {
+        self.fanotify_path.clone()
     }
 
     /// Read all data inside an inode into vector

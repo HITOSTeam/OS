@@ -998,6 +998,11 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     if is_inode_open_for_write(inode.inode_num()) {
         return err(SyscallError::ETXTBSY);
     }
+    let fanotify_path = resolve_abs_path(AT_FDCWD, &path).ok().flatten();
+    if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
+        return e;
+    }
+    fanotify_notify_open_exec(&inode, false, fanotify_path.as_deref());
 
     execve_with_inode(path, args_vec, envs_vec, inode)
 }
@@ -1029,5 +1034,10 @@ pub fn syscall_execveat(
     if is_inode_open_for_write(inode.inode_num()) {
         return err(SyscallError::ETXTBSY);
     }
+    let fanotify_path = resolve_abs_path(dirfd, &path).ok().flatten();
+    if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
+        return e;
+    }
+    fanotify_notify_open_exec(&inode, false, fanotify_path.as_deref());
     execve_with_inode(path, args_vec, envs_vec, inode)
 }

@@ -4,16 +4,17 @@ use super::{
     O_WRONLY, OSInode, Ordering, ProcMagicLinkFile, PseudoDir, PseudoShmFile, S_IFBLK, S_IFCHR,
     S_IFMT, SyscallError, TMPFILE_SEQ, apply_umask, current_effective_uid_gid, current_files,
     current_files_and_nofile_limit, current_fsuid_gid, current_process, err, ext4_err_to_errno,
-    ext4_lock, fifo_pipe_state_for_inode, file_lock_key, file_lock_key_from_inode,
-    get_current_token, gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid,
-    install_open_file_fd, is_inode_currently_executed_locked, is_privileged_or_owner,
-    lock_executing_inodes, make_pipe, maybe_signal_lease_break, mode_for_created_file,
-    note_inode_path_hint, open_existing_target_path, open_pseudo, path_is_nodev,
-    path_is_nosymfollow, path_is_rofs, proc_path_for_at, read_user_cstring,
-    remove_owner_file_lease_for_key, remove_process_record_locks_for_key, reopen_proc_link_file,
-    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
-    secondary_root_inode, set_inode_all_times_now, shm_create, shm_get, shm_object_name,
-    touch_inode_mtime_ctime_now, try_write_user_value, union_root_dir_entries,
+    ext4_lock, fanotify_notify_close, fanotify_notify_open, fanotify_permission_open,
+    fifo_pipe_state_for_inode, file_lock_key, file_lock_key_from_inode, get_current_token,
+    gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
+    is_inode_currently_executed_locked, is_privileged_or_owner, lock_executing_inodes, make_pipe,
+    maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint,
+    open_existing_target_path, open_pseudo, path_is_nodev, path_is_nosymfollow, path_is_rofs,
+    proc_path_for_at, read_user_cstring, remove_owner_file_lease_for_key,
+    remove_process_record_locks_for_key, reopen_proc_link_file, resolve_abs_path, resolve_at_inode,
+    resolve_at_path, resolve_parent_and_name, secondary_root_inode, set_inode_all_times_now,
+    shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, try_write_user_value,
+    union_root_dir_entries,
 };
 
 /// Opens or creates a filesystem object across ext4, proc, pseudo-fs, and tmpfile paths.
@@ -498,22 +499,41 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     } else {
         None
     };
-    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs_tmp_cleanup(
-        readable,
-        writable,
-        append,
-        inode,
-        readonly_fs,
-        false,
-        tmpfile_cleanup,
-    ));
+    let os_inode = alloc::sync::Arc::new(
+        OSInode::new_with_append_rofs_tmp_cleanup(
+            readable,
+            writable,
+            append,
+            inode,
+            readonly_fs,
+            false,
+            tmpfile_cleanup,
+        )
+        .with_fanotify_path(raw_abs.clone()),
+    );
+    let fanotify_inode = os_inode.ext4_inode();
+    let fanotify_is_dir = fanotify_inode.is_dir();
+    let fanotify_path = os_inode.fanotify_path();
     drop(exec_inode_guard);
     crate::fs::debug_track_iozone_inode(&path, inode_num);
     drop(ext4_guard);
+    if !o_path
+        && let Err(e) = fanotify_permission_open(
+            &fanotify_inode,
+            false,
+            fanotify_is_dir,
+            fanotify_path.as_deref(),
+        )
+    {
+        return e;
+    }
     let fd = match install_open_file_fd(os_inode, flags, o_path) {
         Ok(fd) => fd,
         Err(e) => return e,
     };
+    if !o_path {
+        fanotify_notify_open(&fanotify_inode, fanotify_is_dir, fanotify_path.as_deref());
+    }
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
         if path == "." || path == "/proc" || path == "/proc/" {
@@ -531,8 +551,24 @@ pub fn syscall_close(fd: usize) -> isize {
         return err(SyscallError::EBADF);
     };
     let lock_key = file_lock_key(&file);
+    let fanotify_close = file
+        .as_any()
+        .downcast_ref::<OSInode>()
+        .filter(|os_inode| !os_inode.fanotify_silent())
+        .map(|os_inode| {
+            let inode = os_inode.ext4_inode();
+            let path = os_inode.fanotify_path();
+            let is_dir = {
+                let _guard = ext4_lock();
+                inode.is_dir()
+            };
+            (inode, file.writable(), is_dir, path)
+        });
     let _ = files.clear_fd(fd);
     drop(files);
+    if let Some((inode, writable, is_dir, path)) = fanotify_close {
+        fanotify_notify_close(&inode, writable, is_dir, path.as_deref());
+    }
     if let Some(key) = lock_key {
         remove_process_record_locks_for_key(current_process().getpid(), key);
         remove_owner_file_lease_for_key(current_process().getpid(), key);

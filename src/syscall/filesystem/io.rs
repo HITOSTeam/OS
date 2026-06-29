@@ -3,14 +3,16 @@ use super::{
     OSInode, PIPE_BUF, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
     SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK, SocketPairEnd,
     SyscallError, TimerFdFile, UserBuffer, Vec, cgroup_charge_file_write, current_process, err,
-    ext4_err_to_errno, ext4_lock, fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path,
-    file_is_pipe, file_is_seekable_for_preadwrite, get_current_token, get_fd_file_and_flags,
-    maybe_update_inode_atime, mirror_inode_kernel_write_to_shared_mmaps,
-    mirror_inode_write_to_current_mmaps, pipe_read_to_kernel, pipe_write_from_kernel,
-    queue_process_signal, read_optional_offset, read_vm_iovec, require_fd_file,
-    socketpair_write_from_kernel, touch_inode_mtime_ctime_now, try_copy_from_user,
-    try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_proc_pseudo_file,
-    try_write_user_value, validate_direct_io_request, write_optional_offset,
+    ext4_err_to_errno, ext4_lock, fanotify_notify_access, fanotify_notify_modify,
+    fanotify_permission_access, fanotify_read_result, fanotify_write_result, fd_has_append,
+    fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe, file_is_seekable_for_preadwrite,
+    get_current_token, get_fd_file_and_flags, maybe_update_inode_atime,
+    mirror_inode_kernel_write_to_shared_mmaps, mirror_inode_write_to_current_mmaps,
+    pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal, read_optional_offset,
+    read_vm_iovec, require_fd_file, socketpair_write_from_kernel, touch_inode_mtime_ctime_now,
+    try_copy_from_user, try_copy_to_user, try_read_user_value, try_translated_byte_buffer,
+    try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
+    write_optional_offset,
 };
 use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, TunTapFile};
 use alloc::vec;
@@ -33,6 +35,9 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if crate::syscall::net::socket_read_uses_recvfrom(file.as_ref()) {
         return crate::syscall::net::syscall_recvfrom(fd, buffer, len, 0, 0, 0);
+    }
+    if let Some(ret) = fanotify_read_result(&file, buffer, len, nonblock) {
+        return ret;
     }
     if let Some(pseudo) = file.as_any().downcast_ref::<PseudoFile>()
         && pseudo.kind_tag() == PseudoKindTag::Zero
@@ -96,7 +101,11 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             return e;
         }
     }
-    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+    if let Some(os_inode) = file
+        .as_any()
+        .downcast_ref::<OSInode>()
+        .filter(|os_inode| !os_inode.fanotify_silent())
+    {
         let inode = os_inode.ext4_inode();
         let is_dir = {
             let _ext4_guard = ext4_lock();
@@ -169,6 +178,21 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             Err(e) => e,
         };
     }
+    if let Some(os_inode) = file
+        .as_any()
+        .downcast_ref::<OSInode>()
+        .filter(|os_inode| !os_inode.fanotify_silent())
+    {
+        let inode = os_inode.ext4_inode();
+        let fanotify_path = os_inode.fanotify_path();
+        let is_dir = {
+            let _ext4_guard = ext4_lock();
+            inode.is_dir()
+        };
+        if let Err(e) = fanotify_permission_access(&inode, is_dir, fanotify_path.as_deref()) {
+            return e;
+        }
+    }
     let Ok(user_bufs) = try_translated_byte_buffer(
         get_current_token(),
         buffer as *mut u8,
@@ -180,9 +204,21 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     let buf = UserBuffer::new(user_bufs);
     let read_len = file.read(buf) as isize;
     if read_len >= 0 && !noatime {
-        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if let Some(os_inode) = file
+            .as_any()
+            .downcast_ref::<OSInode>()
+            .filter(|os_inode| !os_inode.fanotify_silent())
+        {
             let inode = os_inode.ext4_inode();
             maybe_update_inode_atime(&inode, false);
+            if read_len > 0 {
+                let fanotify_path = os_inode.fanotify_path();
+                let is_dir = {
+                    let _ext4_guard = ext4_lock();
+                    inode.is_dir()
+                };
+                fanotify_notify_access(&inode, is_dir, fanotify_path.as_deref());
+            }
         }
     }
     read_len
@@ -237,6 +273,9 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if !file.writable() {
         return err(SyscallError::EBADF);
+    }
+    if let Some(ret) = fanotify_write_result(&file, buffer, len) {
+        return ret;
     }
     if let Some(pseudo) = file.as_any().downcast_ref::<PseudoFile>()
         && pseudo.kind_tag() == PseudoKindTag::Null
@@ -468,7 +507,11 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         }
     }
     if written > 0 {
-        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        if let Some(os_inode) = file
+            .as_any()
+            .downcast_ref::<OSInode>()
+            .filter(|os_inode| !os_inode.fanotify_silent())
+        {
             cgroup_charge_file_write(current_process().getpid(), written as usize);
             mirror_inode_write_to_current_mmaps(
                 os_inode,
@@ -479,6 +522,13 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             if let Err(e) = os_inode.flush_with_error() {
                 return ext4_err_to_errno(e);
             }
+            let inode = os_inode.ext4_inode();
+            let fanotify_path = os_inode.fanotify_path();
+            let is_dir = {
+                let _ext4_guard = ext4_lock();
+                inode.is_dir()
+            };
+            fanotify_notify_modify(&inode, is_dir, fanotify_path.as_deref());
         }
     }
     if hit_fsize_limit {
