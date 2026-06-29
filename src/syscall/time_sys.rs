@@ -3,7 +3,7 @@ use crate::task::task_block::TaskControlBlock;
 use crate::{
     config::clock_freq,
     debug_config::{DEBUG_CYCLICTEST, DEBUG_SIGNAL, DEBUG_UNIXBENCH},
-    fs::{NetSocketFile, POLLIN, POLLOUT, POLLPRI},
+    fs::{File, NetSocketFile, POLLIN, POLLOUT, POLLPRI},
     mm::{
         try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
         write_user_value,
@@ -1377,6 +1377,11 @@ pub fn syscall_pselect6(
         want_e: bool,
     }
 
+    struct SelectPollTarget {
+        file: Option<Arc<dyn File + Send + Sync>>,
+        fixed_mask: Option<i16>,
+    }
+
     let mut watched = alloc::vec::Vec::new();
     for fd in 0..nfds {
         let byte = fd / 8;
@@ -1424,12 +1429,16 @@ pub fn syscall_pselect6(
             let files_guard = files.lock();
             watched
                 .iter()
-                .map(|watch| files_guard.get_file(watch.fd))
+                .map(|watch| {
+                    files_guard
+                        .get_poll_snapshot(watch.fd)
+                        .map(|(file, fixed_mask, _flags)| SelectPollTarget { file, fixed_mask })
+                })
                 .collect::<alloc::vec::Vec<_>>()
         };
         let mut bad_fd = false;
-        for (watch, file) in watched.iter().zip(file_snapshot.iter()) {
-            let Some(file) = file.as_ref() else {
+        for (watch, target) in watched.iter().zip(file_snapshot.iter()) {
+            let Some(target) = target.as_ref() else {
                 // user 让我们监听一个不存在的 fd → 整次 select 返回 EBADF。
                 bad_fd = true;
                 break;
@@ -1437,7 +1446,14 @@ pub fn syscall_pselect6(
 
             // 统一通过 poll_mask() 拿到当前 fd 的可读 / 可写 / 错误位,把 select 的
             // 三集合语义复用到 poll 的实现上。
-            let mask_now = file.poll_mask();
+            let mask_now = match target.fixed_mask {
+                Some(mask) => mask,
+                None => target
+                    .file
+                    .as_ref()
+                    .map(|file| file.poll_mask())
+                    .unwrap_or(0),
+            };
             // POLLHUP(对端关闭)在 select 语义里也算"可读",且要优先于普通 POLLIN
             // 判断:这样 user 的 read() 才会拿到 EOF 而不是一直阻塞。
             if watch.want_r && (mask_now & crate::fs::POLLHUP) != 0 {
@@ -1485,11 +1501,14 @@ pub fn syscall_pselect6(
 
         if readfds != 0 {
             let mut polled = false;
-            for (watch, file) in watched.iter().zip(file_snapshot.iter()) {
+            for (watch, target) in watched.iter().zip(file_snapshot.iter()) {
                 if !watch.want_r {
                     continue;
                 }
-                let Some(file) = file.as_ref() else {
+                let Some(target) = target.as_ref() else {
+                    continue;
+                };
+                let Some(file) = target.file.as_ref() else {
                     continue;
                 };
                 let Some(sock) = file.as_any().downcast_ref::<NetSocketFile>() else {

@@ -101,6 +101,13 @@ pub trait File: Send + Sync {
         }
         mask
     }
+    /// Return a readiness mask that is stable for this file object without
+    /// consulting mutable device state.  Callers may use this while holding the
+    /// descriptor-table lock to avoid cloning file references for always-ready
+    /// files such as regular inodes.
+    fn fixed_poll_mask(&self) -> Option<i16> {
+        None
+    }
     /// Whether this file can be registered in an epoll set.
     fn supports_poll(&self) -> bool {
         false

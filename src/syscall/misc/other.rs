@@ -176,6 +176,7 @@ struct PollFd {
 
 struct PollTarget {
     file: Option<Arc<dyn File + Send + Sync>>,
+    fixed_mask: Option<i16>,
     flags: u32,
 }
 
@@ -297,16 +298,19 @@ pub fn syscall_ppoll(
                 if pfd.fd < 0 {
                     PollTarget {
                         file: None,
+                        fixed_mask: None,
                         flags: 0,
                     }
                 } else {
-                    match files_guard.get_file_and_flags(pfd.fd as usize) {
-                        Some((file, flags)) => PollTarget {
-                            file: Some(file),
+                    match files_guard.get_poll_snapshot(pfd.fd as usize) {
+                        Some((file, fixed_mask, flags)) => PollTarget {
+                            file,
+                            fixed_mask,
                             flags,
                         },
                         None => PollTarget {
                             file: None,
+                            fixed_mask: None,
                             flags: 0,
                         },
                     }
@@ -322,18 +326,25 @@ pub fn syscall_ppoll(
             if pfd.fd < 0 {
                 continue;
             }
-            let Some(file) = target.file.as_ref() else {
+            if target.file.is_none() && target.fixed_mask.is_none() {
                 pfd.revents = POLLNVAL;
                 ready += 1;
                 continue;
-            };
+            }
             if (target.flags & O_PATH as u32) != 0 {
                 pfd.revents = POLLNVAL;
                 ready += 1;
                 continue;
             }
 
-            let mask = file.poll_mask();
+            let mask = match target.fixed_mask {
+                Some(mask) => mask,
+                None => target
+                    .file
+                    .as_ref()
+                    .map(|file| file.poll_mask())
+                    .unwrap_or(0),
+            };
             pfd.revents = mask & (pfd.events | POLLERR | POLLHUP);
             if pfd.revents != 0 {
                 ready += 1;

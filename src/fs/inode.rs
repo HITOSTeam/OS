@@ -1201,8 +1201,8 @@ impl File for OSInode {
     }
 
     fn poll_mask(&self) -> i16 {
-        if self.regular_file_poll_ready {
-            return POLLIN | POLLOUT;
+        if let Some(mask) = self.fixed_poll_mask() {
+            return mask;
         }
         let mut mask = 0;
         if self.readable {
@@ -1212,6 +1212,10 @@ impl File for OSInode {
             mask |= POLLOUT;
         }
         mask
+    }
+
+    fn fixed_poll_mask(&self) -> Option<i16> {
+        self.regular_file_poll_ready.then_some(POLLIN | POLLOUT)
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {

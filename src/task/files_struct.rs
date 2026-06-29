@@ -189,6 +189,23 @@ impl FilesStruct {
         Some((file, self.get_flags(fd)))
     }
 
+    /// Return the descriptor state needed by select/poll style syscalls.
+    ///
+    /// Always-ready files can provide a fixed mask, allowing the caller to
+    /// validate the descriptor without cloning the underlying file reference.
+    pub fn get_poll_snapshot(
+        &self,
+        fd: usize,
+    ) -> Option<(Option<Arc<dyn File + Send + Sync>>, Option<i16>, u32)> {
+        let file = self.fd_table.get(fd)?.as_ref()?;
+        let flags = self.fd_flags.get(fd).copied().unwrap_or(0);
+        if let Some(mask) = file.fixed_poll_mask() {
+            Some((None, Some(mask), flags))
+        } else {
+            Some((Some(Arc::clone(file)), None, flags))
+        }
+    }
+
     /// 判断 fd 是否已打开（表内存在且非 None）。
     pub fn is_fd_open(&self, fd: usize) -> bool {
         self.fd_table.get(fd).is_some_and(Option::is_some)
