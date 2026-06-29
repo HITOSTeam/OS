@@ -22,6 +22,10 @@ pub(super) fn pte_flags_for_mprotect(
         }
         if old_flags.contains(PTEFlags::SHARED) {
             pte_flags.insert(PTEFlags::SHARED);
+            #[cfg(target_arch = "riscv64")]
+            if old_flags.contains(PTEFlags::D) {
+                pte_flags.insert(PTEFlags::D);
+            }
         }
     }
     pte_flags
@@ -186,6 +190,7 @@ impl MapArea {
         self.saved_pte_flags.get(&vpn).copied()
     }
 
+    #[cfg(target_arch = "riscv64")]
     pub(super) fn set_saved_pte_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
         if let Some(saved) = self.saved_pte_flags.get_mut(&vpn) {
             *saved = flags;
