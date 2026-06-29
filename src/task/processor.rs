@@ -371,9 +371,16 @@ fn queue_files_struct_drop(files: Arc<spin::Mutex<FilesStruct>>) {
         return;
     }
 
+    close_files_struct_fd_refs_if_unshared(&files);
     local_processor()
         .lock()
         .set_pending_files_struct_drop(files);
+}
+
+fn close_files_struct_fd_refs_if_unshared(files: &Arc<spin::Mutex<FilesStruct>>) {
+    if Arc::strong_count(files) == 1 {
+        files.lock().close_all_fd_refs();
+    }
 }
 
 /// 将一个地址空间（mm）延迟到 idle 循环释放。
@@ -1650,13 +1657,20 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
                 arch::shutdown();
             }
         }
-        // Mark zombie and capture parent pointer first...
-        let (parent, exit_signal) = {
+        // Detach and semantically close this process' fd table before the
+        // zombie becomes visible to waiters.  Heavy file object drops remain
+        // deferred below.
+        let (parent, exit_signal, old_files) = {
             let mut process_inner = process.borrow_mut();
             crate::syscall::process::unregister_executing_inode(
                 process_inner.exec_inode_dev,
                 process_inner.exec_inode_num,
             );
+            let old_files = core::mem::replace(
+                &mut process_inner.files,
+                Arc::new(spin::Mutex::new(FilesStruct::new())),
+            );
+            close_files_struct_fd_refs_if_unshared(&old_files);
             process_inner.is_zombie = true;
             process_inner.dumped_core = dumped_core;
             process_inner.exit_code = exit_code;
@@ -1664,6 +1678,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             (
                 process_inner.parent.as_ref().and_then(|p| p.upgrade()),
                 process_inner.exit_signal,
+                old_files,
             )
         }; // drop child PCB lock before touching parent to avoid lock inversion
         crate::syscall::process::release_ptrace_tracer(&process);
@@ -1690,7 +1705,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // same exit-side futex/join cleanup as the current thread.
         let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
         recycle_res.clear();
-        let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm, old_files) = {
+        let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
             let mut process_inner = process.borrow_mut();
             process_inner.clear_children();
             process_inner.exited_children.clear();
@@ -1708,21 +1723,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             );
             crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
             crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-            // Detach the file table under the PCB lock, then drop/close it
-            // outside the lock. Linux exit_files() follows the same shape:
-            // publish an empty files_struct first, then perform expensive fd
-            // close and pipe wakeups without holding process metadata locks.
-            let old_files = core::mem::replace(
-                &mut process_inner.files,
-                Arc::new(spin::Mutex::new(FilesStruct::new())),
-            );
-            (
-                old_shm_cleanup,
-                old_mm_token,
-                old_net_ns_id,
-                old_mm,
-                old_files,
-            )
+            (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
         };
         if !release_process_mm_owner(old_mm_token) {
             crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
@@ -1798,12 +1799,17 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         }
     }
 
-    let (parent, exit_signal) = {
+    let (parent, exit_signal, old_files) = {
         let mut process_inner = process.borrow_mut();
         crate::syscall::process::unregister_executing_inode(
             process_inner.exec_inode_dev,
             process_inner.exec_inode_num,
         );
+        let old_files = core::mem::replace(
+            &mut process_inner.files,
+            Arc::new(spin::Mutex::new(FilesStruct::new())),
+        );
+        close_files_struct_fd_refs_if_unshared(&old_files);
         process_inner.is_zombie = true;
         process_inner.dumped_core = dumped_core;
         process_inner.exit_code = exit_code;
@@ -1811,6 +1817,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         (
             process_inner.parent.as_ref().and_then(|p| p.upgrade()),
             process_inner.exit_signal,
+            old_files,
         )
     };
     crate::syscall::process::release_ptrace_tracer(&process);
@@ -1834,7 +1841,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
 
     let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();
-    let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm, old_files) = {
+    let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
         let mut process_inner = process.borrow_mut();
         process_inner.clear_children();
         process_inner.exited_children.clear();
@@ -1851,18 +1858,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         );
         crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
         crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-        // See exit_current_and_run_next(): detach under PCB lock, close/drop outside.
-        let old_files = core::mem::replace(
-            &mut process_inner.files,
-            Arc::new(spin::Mutex::new(FilesStruct::new())),
-        );
-        (
-            old_shm_cleanup,
-            old_mm_token,
-            old_net_ns_id,
-            old_mm,
-            old_files,
-        )
+        (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
     };
     if !release_process_mm_owner(old_mm_token) {
         crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);

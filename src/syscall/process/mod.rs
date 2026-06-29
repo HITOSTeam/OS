@@ -7,13 +7,11 @@ pub use fork::*;
 pub use wait::*;
 
 use crate::syscall::error::{SyscallError, err};
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use core::{
     mem::size_of,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use lazy_static::lazy_static;
-use spin::{Mutex, MutexGuard};
 
 use crate::{
     arch::{REG_A0, REG_SP, REG_TP},
@@ -53,12 +51,6 @@ use crate::{
     },
     trap::{get_current_token, trap_handler},
 };
-
-lazy_static! {
-    static ref EXECUTING_INODES: Mutex<BTreeMap<(usize, u32), usize>> = Mutex::new(BTreeMap::new());
-}
-
-pub(crate) type ExecutingInodesGuard = MutexGuard<'static, BTreeMap<(usize, u32), usize>>;
 
 #[allow(clippy::type_complexity)]
 pub(super) fn debug_task_ref_breakdown(
@@ -178,60 +170,15 @@ pub(super) fn debug_task_ref_breakdown(
 
 #[allow(dead_code)]
 pub(crate) fn is_inode_currently_executed(device_id: usize, inode_num: u32) -> bool {
-    if device_id == 0 && inode_num == 0 {
-        return false;
-    }
-    let guard = lock_executing_inodes();
-    is_inode_currently_executed_locked(&guard, device_id, inode_num)
-}
-
-pub(crate) fn lock_executing_inodes() -> ExecutingInodesGuard {
-    EXECUTING_INODES.lock()
-}
-
-pub(crate) fn is_inode_currently_executed_locked(
-    guard: &ExecutingInodesGuard,
-    device_id: usize,
-    inode_num: u32,
-) -> bool {
-    guard.get(&(device_id, inode_num)).copied().unwrap_or(0) > 0
+    crate::fs::is_inode_currently_executed(device_id, inode_num)
 }
 
 pub(crate) fn register_executing_inode(dev: usize, ino: u32) {
-    let mut guard = lock_executing_inodes();
-    register_executing_inode_locked(&mut guard, dev, ino);
+    crate::fs::register_executing_inode(dev, ino);
 }
 
 pub(crate) fn unregister_executing_inode(dev: usize, ino: u32) {
-    let mut guard = lock_executing_inodes();
-    unregister_executing_inode_locked(&mut guard, dev, ino);
-}
-
-pub(crate) fn register_executing_inode_locked(
-    guard: &mut ExecutingInodesGuard,
-    dev: usize,
-    ino: u32,
-) {
-    if dev != 0 || ino != 0 {
-        let count = guard.entry((dev, ino)).or_insert(0);
-        *count = count.saturating_add(1);
-    }
-}
-
-pub(crate) fn unregister_executing_inode_locked(
-    guard: &mut ExecutingInodesGuard,
-    dev: usize,
-    ino: u32,
-) {
-    if dev != 0 || ino != 0 {
-        if let Some(count) = guard.get_mut(&(dev, ino)) {
-            if *count > 1 {
-                *count -= 1;
-            } else {
-                guard.remove(&(dev, ino));
-            }
-        }
-    }
+    crate::fs::unregister_executing_inode(dev, ino);
 }
 
 /// 从用户地址空间读取一个 `usize` 指针/整数。

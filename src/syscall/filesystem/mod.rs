@@ -28,7 +28,6 @@ use crate::{
         try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
         try_translated_byte_buffer, try_write_user_value,
     },
-    syscall::process::{is_inode_currently_executed_locked, lock_executing_inodes},
     task::processor::{
         block_current_and_run_next, current_files, current_files_and_nofile_limit, current_process,
         current_task,

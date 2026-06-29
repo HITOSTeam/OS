@@ -111,6 +111,10 @@ pub trait File: Send + Sync {
     fn register_poll_waiter(&self, _task: &Arc<TaskControlBlock>) -> bool {
         false
     }
+    /// Called when this file object is installed into a descriptor table.
+    fn on_fd_install(&self) {}
+    /// Called when a descriptor table semantically closes one reference to this file object.
+    fn on_fd_close(&self) {}
     /// 向下转型支持：返回 `&dyn Any`，便于按具体文件类型 downcast。
     fn as_any(&self) -> &dyn Any;
 }
@@ -820,11 +824,12 @@ pub use eventfd::EventFdFile;
 #[allow(unused_imports)]
 pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
-    clear_ext4_path_cache, debug_track_iozone_inode, ext4_lock, ext4_path_cache_lookup,
-    find_path_in_roots, inode_path_hint, inode_path_in_roots, note_ext4_path_cache,
-    note_inode_path_hint, path_resolves_to_inode, register_deferred_unlink_cleanup,
+    ExecInodeReservation, clear_ext4_path_cache, debug_track_iozone_inode, ext4_lock,
+    ext4_path_cache_lookup, find_path_in_roots, inode_path_hint, inode_path_in_roots,
+    is_inode_currently_executed, note_ext4_path_cache, note_inode_path_hint,
+    path_resolves_to_inode, register_deferred_unlink_cleanup, register_executing_inode,
     resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked, root_inode_for_path,
-    secondary_root_inode,
+    secondary_root_inode, unregister_executing_inode,
 };
 pub(crate) use mountns::{
     ClassifiedAbsPath, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,

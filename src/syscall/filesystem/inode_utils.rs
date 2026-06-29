@@ -7,11 +7,11 @@ use super::{
     current_timespec, empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock,
     fchmod_fd_for_at_empty_path, fifo_pipe_state_for_inode, file_lock_key_from_inode,
     get_current_token, inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
-    is_inode_currently_executed_locked, lock_executing_inodes, maybe_dispatch_proc_fd_at,
-    maybe_signal_lease_break, note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs,
-    pseudo_path_exists_result, queue_process_signal, read_user_cstring,
-    register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
-    rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
+    maybe_dispatch_proc_fd_at, maybe_signal_lease_break, note_inode_path_hint, open_pseudo,
+    path_is_nodev, path_is_rofs, pseudo_path_exists_result, queue_process_signal,
+    read_user_cstring, register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path,
+    resolve_parent_and_name, rofs_for_path, syscall_fchmod, try_copy_from_user,
+    try_copy_to_user_unchecked,
 };
 use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
 use alloc::vec;
@@ -161,17 +161,33 @@ pub(crate) fn open_existing_ext4_inode(
         return Err(err(SyscallError::ENOTDIR));
     }
 
-    let text_write_intent = writable || (flags & O_TRUNC) != 0;
-    let exec_inode_guard = if !o_path && inode.is_file() && text_write_intent {
-        let guard = lock_executing_inodes();
-        let exec_busy =
-            is_inode_currently_executed_locked(&guard, inode.device_id(), inode.inode_num());
-        if exec_busy {
-            return Err(err(SyscallError::ETXTBSY));
+    if !o_path && inode.is_fifo() {
+        let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
+        let accmode = flags & O_ACCMODE;
+        if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
+            drop(ext4_guard);
+            return Err(err(SyscallError::ENXIO));
         }
-        Some(guard)
-    } else {
-        None
+        let Some(file) = state.open_file(accmode) else {
+            drop(ext4_guard);
+            return Err(err(SyscallError::EINVAL));
+        };
+        drop(ext4_guard);
+        return install_open_file_fd(file, flags, o_path);
+    }
+
+    let inode_num = inode.inode_num();
+    let os_inode = match OSInode::new_with_append_rofs_tmp_cleanup(
+        readable,
+        writable,
+        append,
+        alloc::sync::Arc::clone(&inode),
+        readonly_fs,
+        false,
+        None,
+    ) {
+        Ok(file) => alloc::sync::Arc::new(file),
+        Err(e) => return Err(e),
     };
 
     if !o_path && inode.is_file() {
@@ -190,32 +206,6 @@ pub(crate) fn open_existing_ext4_inode(
         touch_inode_mtime_ctime_now(&inode);
     }
 
-    if !o_path && inode.is_fifo() {
-        let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
-        let accmode = flags & O_ACCMODE;
-        if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
-            drop(ext4_guard);
-            return Err(err(SyscallError::ENXIO));
-        }
-        let Some(file) = state.open_file(accmode) else {
-            drop(ext4_guard);
-            return Err(err(SyscallError::EINVAL));
-        };
-        drop(ext4_guard);
-        return install_open_file_fd(file, flags, o_path);
-    }
-
-    let inode_num = inode.inode_num();
-    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs_tmp_cleanup(
-        readable,
-        writable,
-        append,
-        inode,
-        readonly_fs,
-        false,
-        None,
-    ));
-    drop(exec_inode_guard);
     crate::fs::debug_track_iozone_inode(path, inode_num);
     drop(ext4_guard);
     install_open_file_fd(os_inode, flags, o_path)

@@ -88,6 +88,8 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref EXT4_PATH_CACHE: Mutex<BTreeMap<String, Vec<Ext4PathCacheEntry>>> =
         Mutex::new(BTreeMap::new());
+    static ref INODE_TEXT_ACCESS: Mutex<BTreeMap<(usize, u32), InodeTextAccess>> =
+        Mutex::new(BTreeMap::new());
 }
 
 pub(crate) fn ext4_lock() -> Ext4Guard {
@@ -100,6 +102,151 @@ pub(crate) fn clear_ext4_path_cache() {
     let mut cache = EXT4_PATH_CACHE.lock();
     if !cache.is_empty() {
         cache.clear();
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InodeTextAccess {
+    write_open: usize,
+    executing: usize,
+}
+
+fn valid_text_key(dev: usize, ino: u32) -> bool {
+    dev != 0 || ino != 0
+}
+
+fn prune_text_access_entry(
+    access: &mut BTreeMap<(usize, u32), InodeTextAccess>,
+    key: (usize, u32),
+) {
+    if access
+        .get(&key)
+        .is_some_and(|state| state.write_open == 0 && state.executing == 0)
+    {
+        access.remove(&key);
+    }
+}
+
+fn register_write_open_inode(dev: usize, ino: u32) -> Result<(), isize> {
+    if dev == 0 && ino == 0 {
+        return Ok(());
+    }
+    let mut access = INODE_TEXT_ACCESS.lock();
+    let state = access.entry((dev, ino)).or_default();
+    if state.executing > 0 {
+        return Err(ETXTBSY_ERR);
+    }
+    state.write_open = state.write_open.saturating_add(1);
+    Ok(())
+}
+
+fn unregister_write_open_inode(dev: usize, ino: u32) {
+    if !valid_text_key(dev, ino) {
+        return;
+    }
+    let key = (dev, ino);
+    let mut access = INODE_TEXT_ACCESS.lock();
+    if let Some(state) = access.get_mut(&key) {
+        if state.write_open > 0 {
+            state.write_open -= 1;
+        }
+    }
+    prune_text_access_entry(&mut access, key);
+}
+
+pub(crate) fn is_inode_currently_executed(dev: usize, ino: u32) -> bool {
+    if !valid_text_key(dev, ino) {
+        return false;
+    }
+    INODE_TEXT_ACCESS
+        .lock()
+        .get(&(dev, ino))
+        .copied()
+        .unwrap_or_default()
+        .executing
+        > 0
+}
+
+pub(crate) fn register_executing_inode(dev: usize, ino: u32) {
+    if !valid_text_key(dev, ino) {
+        return;
+    }
+    let mut access = INODE_TEXT_ACCESS.lock();
+    let state = access.entry((dev, ino)).or_default();
+    state.executing = state.executing.saturating_add(1);
+}
+
+pub(crate) fn try_register_executing_inode(dev: usize, ino: u32) -> Result<(), isize> {
+    if !valid_text_key(dev, ino) {
+        return Ok(());
+    }
+    let key = (dev, ino);
+    let mut access = INODE_TEXT_ACCESS.lock();
+    if access.get(&key).is_some_and(|state| state.write_open > 0) {
+        return Err(ETXTBSY_ERR);
+    }
+    let state = access.entry(key).or_default();
+    state.executing = state.executing.saturating_add(1);
+    Ok(())
+}
+
+pub(crate) fn unregister_executing_inode(dev: usize, ino: u32) {
+    if !valid_text_key(dev, ino) {
+        return;
+    }
+    let key = (dev, ino);
+    let mut access = INODE_TEXT_ACCESS.lock();
+    if let Some(state) = access.get_mut(&key) {
+        if state.executing > 0 {
+            state.executing -= 1;
+        }
+    }
+    prune_text_access_entry(&mut access, key);
+}
+
+pub(crate) struct ExecInodeReservation {
+    key: Option<(usize, u32)>,
+}
+
+impl ExecInodeReservation {
+    pub(crate) fn new(dev: usize, ino: u32) -> Result<Self, isize> {
+        try_register_executing_inode(dev, ino)?;
+        Ok(Self {
+            key: valid_text_key(dev, ino).then_some((dev, ino)),
+        })
+    }
+
+    pub(crate) fn key(&self) -> (usize, u32) {
+        self.key.unwrap_or((0, 0))
+    }
+}
+
+impl Drop for ExecInodeReservation {
+    fn drop(&mut self) {
+        if let Some((dev, ino)) = self.key.take() {
+            unregister_executing_inode(dev, ino);
+        }
+    }
+}
+
+#[derive(Default)]
+struct WriteOpenState {
+    key: Option<(usize, u32)>,
+    fd_refs: usize,
+}
+
+impl WriteOpenState {
+    fn register_for_inode(writable: bool, inode: &Inode) -> Result<Self, isize> {
+        if writable && inode.is_file() {
+            let key = (inode.device_id(), inode.inode_num());
+            register_write_open_inode(key.0, key.1)?;
+            Ok(Self {
+                key: Some(key),
+                fd_refs: 0,
+            })
+        } else {
+            Ok(Self::default())
+        }
     }
 }
 
@@ -347,6 +494,7 @@ pub struct OSInode {
     readonly_fs: bool,
     replace_on_write: bool,
     tmpfile_cleanup: Option<TmpfileCleanup>,
+    write_open: Mutex<WriteOpenState>,
     inner: Mutex<OSInodeInner>,
 }
 
@@ -370,10 +518,11 @@ pub struct OSInodeInner {
 const READBUF_MAX: usize = 128 * 1024;
 const READBUF_MIN: usize = 4 * 1024;
 const WRITEBUF_MAX: usize = 128 * 1024;
+const ETXTBSY_ERR: isize = -26;
 
 impl OSInode {
     /// Construct an OS inode from an inode
-    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
+    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Result<Self, isize> {
         Self::new_with_append(readable, writable, false, inode)
     }
 
@@ -382,7 +531,7 @@ impl OSInode {
         writable: bool,
         append: bool,
         inode: Arc<Inode>,
-    ) -> Self {
+    ) -> Result<Self, isize> {
         Self::new_with_append_rofs(readable, writable, append, inode, false)
     }
 
@@ -392,7 +541,7 @@ impl OSInode {
         append: bool,
         inode: Arc<Inode>,
         readonly_fs: bool,
-    ) -> Self {
+    ) -> Result<Self, isize> {
         Self::new_with_append_rofs_tmp_cleanup(
             readable,
             writable,
@@ -405,7 +554,11 @@ impl OSInode {
     }
 
     #[allow(dead_code)]
-    pub fn new_replace_on_write(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
+    pub fn new_replace_on_write(
+        readable: bool,
+        writable: bool,
+        inode: Arc<Inode>,
+    ) -> Result<Self, isize> {
         Self::new_with_append_rofs_tmp_cleanup(readable, writable, false, inode, false, true, None)
     }
 
@@ -417,9 +570,10 @@ impl OSInode {
         readonly_fs: bool,
         replace_on_write: bool,
         tmpfile_cleanup: Option<(Arc<Inode>, String)>,
-    ) -> Self {
+    ) -> Result<Self, isize> {
         let regular_file_poll_ready = inode.is_file();
-        Self {
+        let write_open = WriteOpenState::register_for_inode(writable, &inode)?;
+        Ok(Self {
             readable,
             writable,
             regular_file_poll_ready,
@@ -427,6 +581,7 @@ impl OSInode {
             readonly_fs,
             replace_on_write,
             tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
+            write_open: Mutex::new(write_open),
             inner: Mutex::new(OSInodeInner {
                 offset: 0,
                 dir_offset: 0,
@@ -437,7 +592,7 @@ impl OSInode {
                 read_buf_valid: 0,
                 read_buf: Vec::new(),
             }),
-        }
+        })
     }
 
     pub fn append(&self) -> bool {
@@ -1008,7 +1163,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         let _ = inode.clear();
     }
 
-    Some(Arc::new(OSInode::new(readable, writable, inode)))
+    Some(Arc::new(OSInode::new(readable, writable, inode).ok()?))
 }
 
 impl File for OSInode {
@@ -1018,6 +1173,31 @@ impl File for OSInode {
 
     fn writable(&self) -> bool {
         self.writable
+    }
+
+    fn on_fd_install(&self) {
+        let mut write_open = self.write_open.lock();
+        if write_open.key.is_some() {
+            write_open.fd_refs = write_open.fd_refs.saturating_add(1);
+        }
+    }
+
+    fn on_fd_close(&self) {
+        let key = {
+            let mut write_open = self.write_open.lock();
+            if write_open.fd_refs == 0 {
+                return;
+            }
+            write_open.fd_refs -= 1;
+            if write_open.fd_refs == 0 {
+                write_open.key.take()
+            } else {
+                None
+            }
+        };
+        if let Some((dev, ino)) = key {
+            unregister_write_open_inode(dev, ino);
+        }
     }
 
     fn poll_mask(&self) -> i16 {
@@ -1270,6 +1450,14 @@ impl Drop for OSInode {
                 // Opportunistically clean up other lingering deferred entries.
                 sweep_deferred_unlinks();
             }
+        }
+        let key = {
+            let mut write_open = self.write_open.lock();
+            write_open.fd_refs = 0;
+            write_open.key.take()
+        };
+        if let Some((dev, ino)) = key {
+            unregister_write_open_inode(dev, ino);
         }
     }
 }

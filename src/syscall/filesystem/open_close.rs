@@ -6,14 +6,14 @@ use super::{
     current_effective_uid_gid, current_files, current_files_and_nofile_limit, current_fsuid_gid,
     current_process, err, ext4_err_to_errno, ext4_lock, fifo_pipe_state_for_inode, file_lock_key,
     file_lock_key_from_inode, get_current_token, gid_for_created_inode, inode_mode_allows,
-    inode_mode_allows_uid_gid, install_open_file_fd, is_inode_currently_executed_locked,
-    is_privileged_or_owner, lock_executing_inodes, make_pipe, maybe_signal_lease_break,
-    mode_for_created_file, note_inode_path_hint, open_existing_target_path, open_pseudo,
-    path_is_nodev, path_is_nosymfollow, path_is_rofs, proc_path_for_at, read_user_cstring,
-    remove_owner_file_lease_for_key, remove_process_record_locks_for_key, reopen_proc_link_file,
-    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
-    secondary_root_inode, set_inode_all_times_now, shm_create, shm_get, shm_object_name,
-    touch_inode_mtime_ctime_now, try_write_user_value, union_root_dir_entries,
+    inode_mode_allows_uid_gid, install_open_file_fd, is_privileged_or_owner, make_pipe,
+    maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint,
+    open_existing_target_path, open_pseudo, path_is_nodev, path_is_nosymfollow, path_is_rofs,
+    proc_path_for_at, read_user_cstring, remove_owner_file_lease_for_key,
+    remove_process_record_locks_for_key, reopen_proc_link_file, resolve_abs_path, resolve_at_inode,
+    resolve_at_path, resolve_parent_and_name, secondary_root_inode, set_inode_all_times_now,
+    shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, try_write_user_value,
+    union_root_dir_entries,
 };
 
 /// Opens or creates a filesystem object across ext4, proc, pseudo-fs, and tmpfile paths.
@@ -442,35 +442,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         return err(SyscallError::ENOTDIR);
     }
 
-    let text_write_intent = writable || (flags & O_TRUNC) != 0;
-    let exec_inode_guard = if !o_path && inode.is_file() && text_write_intent {
-        let guard = lock_executing_inodes();
-        let exec_busy =
-            is_inode_currently_executed_locked(&guard, inode.device_id(), inode.inode_num());
-        if exec_busy {
-            return err(SyscallError::ETXTBSY);
-        }
-        Some(guard)
-    } else {
-        None
-    };
-
-    if !o_path && inode.is_file() {
-        maybe_signal_lease_break(
-            file_lock_key_from_inode(&inode),
-            writable,
-            false,
-            current_process().getpid(),
-        );
-    }
-
-    if !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file() {
-        if let Err(e) = inode.clear() {
-            return ext4_err_to_errno(e);
-        }
-        touch_inode_mtime_ctime_now(&inode);
-    }
-
     if !o_path && inode.is_fifo() {
         let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
         let accmode = flags & O_ACCMODE;
@@ -502,16 +473,35 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     } else {
         None
     };
-    let os_inode = alloc::sync::Arc::new(OSInode::new_with_append_rofs_tmp_cleanup(
+    let os_inode = match OSInode::new_with_append_rofs_tmp_cleanup(
         readable,
         writable,
         append,
-        inode,
+        alloc::sync::Arc::clone(&inode),
         readonly_fs,
         false,
         tmpfile_cleanup,
-    ));
-    drop(exec_inode_guard);
+    ) {
+        Ok(file) => alloc::sync::Arc::new(file),
+        Err(e) => return e,
+    };
+
+    if !o_path && inode.is_file() {
+        maybe_signal_lease_break(
+            file_lock_key_from_inode(&inode),
+            writable,
+            false,
+            current_process().getpid(),
+        );
+    }
+
+    if !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file() {
+        if let Err(e) = inode.clear() {
+            return ext4_err_to_errno(e);
+        }
+        touch_inode_mtime_ctime_now(&inode);
+    }
+
     crate::fs::debug_track_iozone_inode(&path, inode_num);
     drop(ext4_guard);
     let fd = match install_open_file_fd(os_inode, flags, o_path) {

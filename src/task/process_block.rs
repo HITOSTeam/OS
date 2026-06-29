@@ -1565,6 +1565,7 @@ impl ProcessControlBlock {
         elf_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
+        exec_inode: (usize, u32),
     ) -> Result<(), isize> {
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)?;
         self.exec_with_memory_set(
@@ -1574,7 +1575,7 @@ impl ProcessControlBlock {
             args,
             envs,
             elf_aux,
-            (0, 0),
+            exec_inode,
         );
         Ok(())
     }
@@ -1588,6 +1589,7 @@ impl ProcessControlBlock {
         interp_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
+        exec_inode: (usize, u32),
     ) -> Result<(), isize> {
         let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
             MemorySet::from_elf_with_interp(elf_data, interp_data)?;
@@ -1601,7 +1603,7 @@ impl ProcessControlBlock {
             interp_data,
             args,
             envs,
-            (0, 0),
+            exec_inode,
         );
         Ok(())
     }
@@ -1656,19 +1658,13 @@ impl ProcessControlBlock {
             inner.keep_caps = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
-            let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
-            crate::syscall::process::unregister_executing_inode_locked(
-                &mut executing_inodes,
+            crate::syscall::process::unregister_executing_inode(
                 inner.exec_inode_dev,
                 inner.exec_inode_num,
             );
             inner.exec_inode_dev = exec_inode.0;
             inner.exec_inode_num = exec_inode.1;
-            crate::syscall::process::register_executing_inode_locked(
-                &mut executing_inodes,
-                exec_inode.0,
-                exec_inode.1,
-            );
+            crate::syscall::process::register_executing_inode(exec_inode.0, exec_inode.1);
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
         };
@@ -1765,19 +1761,13 @@ impl ProcessControlBlock {
             inner.keep_caps = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
-            let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
-            crate::syscall::process::unregister_executing_inode_locked(
-                &mut executing_inodes,
+            crate::syscall::process::unregister_executing_inode(
                 inner.exec_inode_dev,
                 inner.exec_inode_num,
             );
             inner.exec_inode_dev = exec_inode.0;
             inner.exec_inode_num = exec_inode.1;
-            crate::syscall::process::register_executing_inode_locked(
-                &mut executing_inodes,
-                exec_inode.0,
-                exec_inode.1,
-            );
+            crate::syscall::process::register_executing_inode(exec_inode.0, exec_inode.1);
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
         };

@@ -17,6 +17,7 @@ pub struct FilesStruct {
     fd_flags: Vec<u32>,
     next_fd_hint: usize,
     close_cursor: Option<usize>,
+    fd_refs_closed: bool,
 }
 
 impl FilesStruct {
@@ -37,6 +38,7 @@ impl FilesStruct {
             fd_flags: vec![0; 3],
             next_fd_hint: 3,
             close_cursor: None,
+            fd_refs_closed: false,
         }
     }
 
@@ -46,12 +48,16 @@ impl FilesStruct {
     /// 也就是 表独立，而不是底层资源独立
     pub fn clone_private(&self) -> Self {
         let (fd_table, fd_flags) = self.snapshot_fd_state();
+        for file in fd_table.iter().flatten() {
+            file.on_fd_install();
+        }
         let next_fd_hint = self.next_fd_hint.min(fd_table.len());
         Self {
             fd_table,
             fd_flags,
             next_fd_hint,
             close_cursor: None,
+            fd_refs_closed: false,
         }
     }
 
@@ -132,6 +138,9 @@ impl FilesStruct {
         let mut cursor = self.close_cursor.unwrap_or(0);
         while cursor < self.fd_table.len() && files.len() < limit {
             if let Some(file) = self.fd_table[cursor].take() {
+                if !self.fd_refs_closed {
+                    file.on_fd_close();
+                }
                 files.push(file);
             }
             if let Some(flag) = self.fd_flags.get_mut(cursor) {
@@ -150,6 +159,20 @@ impl FilesStruct {
         }
 
         files
+    }
+
+    /// Mark all descriptor references as semantically closed without dropping
+    /// the underlying file objects yet.  Exit uses this before deferring heavy
+    /// object destruction, matching Linux's "close fd table before wait is
+    /// visible" semantics for lightweight per-file accounting.
+    pub fn close_all_fd_refs(&mut self) {
+        if self.fd_refs_closed {
+            return;
+        }
+        for file in self.fd_table.iter().flatten() {
+            file.on_fd_close();
+        }
+        self.fd_refs_closed = true;
     }
 
     /// 按 fd 编号取出 File 引用；fd 不存在或已关闭返回 None。
@@ -218,6 +241,7 @@ impl FilesStruct {
     ) -> Option<usize> {
         self.close_cursor = None;
         let fd = self.alloc_fd(limit)?;
+        file.on_fd_install();
         self.fd_table[fd] = Some(file);
         self.fd_flags[fd] = flags;
         Some(fd)
@@ -242,6 +266,12 @@ impl FilesStruct {
         } else {
             self.ensure_flags_len();
         }
+        if let Some(old_file) = self.fd_table[fd].take() {
+            if !self.fd_refs_closed {
+                old_file.on_fd_close();
+            }
+        }
+        file.on_fd_install();
         self.fd_table[fd] = Some(file);
         self.fd_flags[fd] = flags;
         if fd == self.next_fd_hint {
@@ -263,6 +293,11 @@ impl FilesStruct {
             return None;
         }
         let file = self.fd_table[fd].take();
+        if let Some(file) = file.as_ref() {
+            if !self.fd_refs_closed {
+                file.on_fd_close();
+            }
+        }
         self.ensure_flags_len();
         self.fd_flags[fd] = 0;
         self.close_cursor = None;
@@ -296,7 +331,11 @@ impl FilesStruct {
             if (*flags & FD_CLOEXEC) != 0 {
                 // fd flags and file slots are disjoint fields; closing and
                 // clearing the CLOEXEC bit in one pass keeps exec cleanup simple.
-                self.fd_table[idx] = None;
+                if let Some(file) = self.fd_table[idx].take() {
+                    if !self.fd_refs_closed {
+                        file.on_fd_close();
+                    }
+                }
                 *flags = 0;
                 self.next_fd_hint = self.next_fd_hint.min(idx);
             }
@@ -312,6 +351,13 @@ impl Default for FilesStruct {
             fd_flags: Vec::new(),
             next_fd_hint: 0,
             close_cursor: None,
+            fd_refs_closed: false,
         }
+    }
+}
+
+impl Drop for FilesStruct {
+    fn drop(&mut self) {
+        self.close_all_fd_refs();
     }
 }
