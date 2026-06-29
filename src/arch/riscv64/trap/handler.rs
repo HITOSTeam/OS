@@ -235,6 +235,7 @@ pub fn get_current_token() -> usize {
     let process_inner = process.borrow_mut();
     process_inner.memory_set.token()
 }
+
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
     let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -337,11 +338,16 @@ pub fn trap_handler() {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
-    // Progress timers even if S-mode timer interrupts are disabled during syscalls.
-    // This avoids long-running syscall-heavy workloads (e.g., hackbench fork storms)
-    // from starving `sleep()/nanosleep()` wakeups.
+    // Progress full scheduler ticks even if S-mode timer interrupts arrived
+    // while syscalls kept interrupts disabled. Syscall-heavy fair workloads
+    // must not bypass CPU accounting and time-slice preemption.
     if timer_work_pending_for_user_return() {
         check_timer();
+        crate::task::processor::account_current_task_tick();
+        crate::syscall::misc::check_current_rlimit_cpu();
+        if crate::task::processor::should_preempt_current_on_tick() {
+            suspend_current_and_run_next();
+        }
     }
     crate::syscall::signal::maybe_deliver_signal();
     crate::fs::cgroup_maybe_block_current();
