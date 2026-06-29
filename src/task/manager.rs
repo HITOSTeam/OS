@@ -21,8 +21,8 @@ pub use self::cleanup::{remove_inactive_task, remove_sched_timer_refs, remove_ti
 pub use self::diagnostics::dump_system_state;
 pub use self::fair::{
     fair_current_deadline_expired, fair_task_is_next_on_hart, fair_wakeup_preempts_current_on_hart,
-    prime_fair_sync_wakeup_lag, prime_fair_timer_wakeup_lag, protect_fair_fork_parent,
-    record_fair_sleep_lag,
+    prime_fair_exec_start, prime_fair_sync_wakeup_lag, prime_fair_thread_group_start,
+    prime_fair_timer_wakeup_lag, protect_fair_fork_parent, record_fair_sleep_lag,
 };
 pub use self::pid_map::{
     insert_into_pid2process, live_process_uses_net_namespace, pid2process, remove_from_pid2process,
