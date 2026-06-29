@@ -345,18 +345,26 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         .as_any()
         .downcast_ref::<OSInode>()
         .map(|inode| inode.offset());
+    if let Some(pipe) = file.as_any().downcast_ref::<Pipe>()
+        && let Some(e) = pipe.closed_read_end_write_error()
+    {
+        return e;
+    }
     let mut write_len = len;
     if nonblock {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
-            if pipe.all_read_ends_closed() {
-                return err(SyscallError::EPIPE);
-            }
             let avail = pipe.available_write();
             if avail == 0 {
+                if let Some(e) = pipe.closed_read_end_write_error() {
+                    return e;
+                }
                 return err(SyscallError::EAGAIN);
             }
             if write_len <= PIPE_BUF {
                 if avail < write_len {
+                    if let Some(e) = pipe.closed_read_end_write_error() {
+                        return e;
+                    }
                     return err(SyscallError::EAGAIN);
                 }
             } else {

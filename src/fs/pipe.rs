@@ -32,7 +32,6 @@ use crate::{
 // A small pipe buffer makes typical shell pipelines (busybox/ash, rt-tests) extremely
 // slow and can even deadlock if producers/consumers don't run concurrently.
 const PIPE_BUF: usize = 4096;
-const INLINE_PIPE_WRITE_BYTES: usize = 256;
 const DEFAULT_PIPE_CAPACITY: usize = 16 * PIPE_BUF;
 const MAX_PIPE_CAPACITY: usize = DEFAULT_PIPE_CAPACITY;
 static PIPE_MAX_SIZE_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_PIPE_CAPACITY);
@@ -369,6 +368,17 @@ impl Pipe {
         self.buffer.lock().all_read_ends_closed()
     }
 
+    pub fn closed_read_end_write_error(&self) -> Option<isize> {
+        let mut ring = self.buffer.lock();
+        if !ring.all_read_ends_closed() {
+            return None;
+        }
+        let task = current_task().unwrap();
+        queue_sigpipe(&task);
+        ring.remove_writer(&task);
+        Some(err(SyscallError::EPIPE))
+    }
+
     pub fn all_write_ends_closed(&self) -> bool {
         self.buffer.lock().all_write_ends_closed()
     }
@@ -558,10 +568,7 @@ impl Pipe {
         loop {
             let mut ring_buffer = self.buffer.lock();
             if ring_buffer.all_read_ends_closed() {
-                if let Some(bit) = signal_bit(SIGPIPE_NUM) {
-                    task.borrow_mut().pending_signals |= bit;
-                    task.mark_signal_pending();
-                }
+                queue_sigpipe(&task);
                 ring_buffer.remove_writer(&task);
                 return if written == 0 {
                     Err(err(SyscallError::EPIPE))
@@ -733,26 +740,126 @@ impl Pipe {
 
     /// Write from a user buffer while preserving Linux syscall errors.
     pub fn write_user_result(&self, buf: UserBuffer, nonblock: bool) -> Result<usize, isize> {
+        const EAGAIN: isize = -11;
         assert!(self.writable());
         let want_to_write = buf.len();
         if want_to_write == 0 {
             return Ok(0);
         }
-        if want_to_write <= INLINE_PIPE_WRITE_BYTES {
-            let mut data = [0u8; INLINE_PIPE_WRITE_BYTES];
-            let mut written = 0usize;
-            for src in buf.buffers {
-                let n = src.len();
-                data[written..written + n].copy_from_slice(src);
-                written += n;
+
+        let buffers = buf.buffers;
+        let task = current_task().unwrap();
+        let has_pending_signal = || {
+            let inner = task.borrow_mut();
+            has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
+        };
+        let mut written = 0usize;
+        let mut buffer_index = 0usize;
+        let mut offset_in_buffer = 0usize;
+
+        loop {
+            let mut ring_buffer = self.buffer.lock();
+            if ring_buffer.has_filter() {
+                ring_buffer.remove_writer(&task);
+                drop(ring_buffer);
+                let data = collect_user_buffer_tail(
+                    &buffers,
+                    buffer_index,
+                    offset_in_buffer,
+                    want_to_write - written,
+                );
+                return match self.write_from_slice_with_deadline(data.as_slice(), nonblock, None) {
+                    Ok(n) => Ok(written + n),
+                    Err(_e) if written > 0 => Ok(written),
+                    Err(e) => Err(e),
+                };
             }
-            return self.write_from_slice_with_deadline(&data[..written], nonblock, None);
+            if ring_buffer.all_read_ends_closed() {
+                queue_sigpipe(&task);
+                ring_buffer.remove_writer(&task);
+                return if written == 0 {
+                    Err(err(SyscallError::EPIPE))
+                } else {
+                    Ok(written)
+                };
+            }
+
+            let avail = ring_buffer.available_write();
+            let remaining = want_to_write - written;
+            if avail == 0 || (remaining <= PIPE_BUF && avail < remaining && written == 0) {
+                if nonblock {
+                    ring_buffer.remove_writer(&task);
+                    return if written > 0 {
+                        Ok(written)
+                    } else {
+                        Err(EAGAIN)
+                    };
+                }
+                if has_pending_signal() {
+                    ring_buffer.remove_writer(&task);
+                    return if written > 0 {
+                        Ok(written)
+                    } else {
+                        Err(err(SyscallError::EINTR))
+                    };
+                }
+                ring_buffer.push_writer(task.clone());
+                drop(ring_buffer);
+                block_current_and_run_next();
+                continue;
+            }
+
+            let to_write = remaining.min(avail);
+            let mut write_now = 0usize;
+            while write_now < to_write {
+                while buffer_index < buffers.len()
+                    && offset_in_buffer >= buffers[buffer_index].len()
+                {
+                    buffer_index += 1;
+                    offset_in_buffer = 0;
+                }
+                if buffer_index >= buffers.len() {
+                    break;
+                }
+                let src = &buffers[buffer_index][offset_in_buffer..];
+                let chunk = core::cmp::min(src.len(), to_write - write_now);
+                let copied = ring_buffer.write_from_slice_bytes(&src[..chunk]);
+                if copied == 0 {
+                    break;
+                }
+                write_now += copied;
+                written += copied;
+                offset_in_buffer += copied;
+            }
+
+            let reader_to_wake = if write_now > 0 {
+                ring_buffer.pop_reader()
+            } else {
+                None
+            };
+            let mut wakeups = if write_now > 0 {
+                ring_buffer.drain_poll_waiters()
+            } else {
+                Vec::new()
+            };
+            let async_notify = if write_now > 0 {
+                ring_buffer.async_target()
+            } else {
+                None
+            };
+            drop(ring_buffer);
+            if let Some((owner_type, owner_pid, sig, fd)) = async_notify {
+                notify_async_io(owner_type, owner_pid, sig, fd);
+            }
+            if let Some(reader) = reader_to_wake {
+                wakeups.push(reader);
+            }
+            wake_tasks(wakeups);
+
+            if written == want_to_write || nonblock {
+                return Ok(written);
+            }
         }
-        let mut data = Vec::with_capacity(want_to_write);
-        for src in buf.buffers {
-            data.extend_from_slice(src);
-        }
-        self.write_from_slice_with_deadline(data.as_slice(), nonblock, None)
     }
 
     /// 窥看（peek）管道数据到 `out`，**不消费**缓冲区内容（head/tail 不移动）。
@@ -1265,6 +1372,41 @@ impl PipeRingBuffer {
             self.async_fd,
         ))
     }
+
+    fn has_filter(&self) -> bool {
+        self.classic_filter.is_some() || self.attached_bpf.is_some()
+    }
+}
+
+fn collect_user_buffer_tail(
+    buffers: &[&'static mut [u8]],
+    mut buffer_index: usize,
+    mut offset_in_buffer: usize,
+    len: usize,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len);
+    let mut remaining = len;
+    while remaining > 0 && buffer_index < buffers.len() {
+        if offset_in_buffer >= buffers[buffer_index].len() {
+            buffer_index += 1;
+            offset_in_buffer = 0;
+            continue;
+        }
+        let src = &buffers[buffer_index][offset_in_buffer..];
+        let n = core::cmp::min(src.len(), remaining);
+        data.extend_from_slice(&src[..n]);
+        remaining -= n;
+        offset_in_buffer += n;
+    }
+    debug_assert_eq!(data.len(), len);
+    data
+}
+
+fn queue_sigpipe(task: &Arc<crate::task::task_block::TaskControlBlock>) {
+    if let Some(bit) = signal_bit(SIGPIPE_NUM) {
+        task.borrow_mut().pending_signals |= bit;
+        task.mark_signal_pending();
+    }
 }
 
 /// 向管道异步 IO 属主（`F_SETOWN`）投递就绪信号（默认 `SIGIO`，可由 `F_SETSIG` 自定义）。
@@ -1418,10 +1560,9 @@ impl File for Pipe {
     fn read(&self, buf: UserBuffer) -> usize {
         self.read_user_result(buf, false).unwrap_or(0)
     }
-    /// `File::write` 的管道实现：先将用户态 `UserBuffer` 拷贝到内核缓冲区，
-    /// 再委托给 `write_from_slice` 完成阻塞写入。小写入走栈缓冲以避开堆分配；
-    /// 大写入仍使用 `Vec`。预先拷贝是因为 `write_from_slice` 在阻塞期间需要
-    /// 释放 buffer 锁，此时不能持有对用户页面的引用。
+    /// `File::write` 的管道实现：从用户态 `UserBuffer` 分段拷贝到管道环形缓冲区。
+    /// 普通 pipe 写入不再为整个请求预先分配内核暂存区；带 classic/BPF filter 的
+    /// pipe 仍回退到切片写入路径，以保留过滤器按写包处理的语义。
     fn write(&self, buf: UserBuffer) -> usize {
         self.write_user_result(buf, false).unwrap_or(0)
     }
