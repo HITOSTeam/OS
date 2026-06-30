@@ -4,7 +4,8 @@ use super::{
     O_WRONLY, OSInode, Ordering, ProcMagicLinkFile, PseudoDir, PseudoShmFile, S_IFBLK, S_IFCHR,
     S_IFMT, SyscallError, TMPFILE_SEQ, apply_umask, clear_ext4_path_cache,
     current_effective_uid_gid, current_files, current_files_and_nofile_limit, current_fsuid_gid,
-    current_process, err, ext4_err_to_errno, ext4_lock, fifo_pipe_state_for_inode, file_lock_key,
+    current_process, err, ext4_err_to_errno, ext4_lock, fanotify_notify_close,
+    fanotify_notify_open, fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key,
     file_lock_key_from_inode, get_current_token, gid_for_created_inode, inode_mode_allows,
     inode_mode_allows_uid_gid, install_open_file_fd, invalidate_ext4_path_cache_for_at,
     is_privileged_or_owner, make_pipe, maybe_signal_lease_break, mode_for_created_file,
@@ -483,9 +484,12 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         false,
         tmpfile_cleanup,
     ) {
-        Ok(file) => alloc::sync::Arc::new(file),
+        Ok(file) => alloc::sync::Arc::new(file.with_fanotify_path(raw_abs.clone())),
         Err(e) => return e,
     };
+    let fanotify_inode = os_inode.ext4_inode();
+    let fanotify_is_dir = fanotify_inode.is_dir();
+    let fanotify_path = os_inode.fanotify_path();
 
     if !o_path && inode.is_file() {
         maybe_signal_lease_break(
@@ -507,10 +511,23 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     crate::fs::debug_track_iozone_inode(&path, inode_num);
+    if !o_path
+        && let Err(e) = fanotify_permission_open(
+            &fanotify_inode,
+            false,
+            fanotify_is_dir,
+            fanotify_path.as_deref(),
+        )
+    {
+        return e;
+    }
     let fd = match install_open_file_fd(os_inode, flags, o_path) {
         Ok(fd) => fd,
         Err(e) => return e,
     };
+    if !o_path {
+        fanotify_notify_open(&fanotify_inode, fanotify_is_dir, fanotify_path.as_deref());
+    }
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
         if path == "." || path == "/proc" || path == "/proc/" {
@@ -528,8 +545,24 @@ pub fn syscall_close(fd: usize) -> isize {
         return err(SyscallError::EBADF);
     };
     let lock_key = file_lock_key(&file);
+    let fanotify_close = file
+        .as_any()
+        .downcast_ref::<OSInode>()
+        .filter(|os_inode| !os_inode.fanotify_silent())
+        .map(|os_inode| {
+            let inode = os_inode.ext4_inode();
+            let path = os_inode.fanotify_path();
+            let is_dir = {
+                let _guard = ext4_lock();
+                inode.is_dir()
+            };
+            (inode, file.writable(), is_dir, path)
+        });
     let _ = files.clear_fd(fd);
     drop(files);
+    if let Some((inode, writable, is_dir, path)) = fanotify_close {
+        fanotify_notify_close(&inode, writable, is_dir, path.as_deref());
+    }
     if let Some(key) = lock_key {
         remove_process_record_locks_for_key(current_process().getpid(), key);
         remove_owner_file_lease_for_key(current_process().getpid(), key);
@@ -669,18 +702,20 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let Some((file, old_flags)) = files.get_file_and_flags(oldfd) else {
         return err(SyscallError::EBADF);
     };
-    let replaced_lock_key = files.get_file(newfd).and_then(|file| file_lock_key(&file));
     let mut new_flags = old_flags;
     if (flags & O_CLOEXEC) != 0 {
         new_flags |= FD_CLOEXEC;
     } else {
         new_flags &= !FD_CLOEXEC;
     }
-    let _ = files.install_fd_at(newfd, file, new_flags, limit);
+    let replaced_file = files.replace_fd_at(newfd, file, new_flags, limit).flatten();
     drop(files);
-    if let Some(key) = replaced_lock_key {
-        remove_process_record_locks_for_key(owner_pid, key);
-        remove_owner_file_lease_for_key(owner_pid, key);
+    if let Some(replaced_file) = replaced_file {
+        if let Some(key) = file_lock_key(&replaced_file) {
+            remove_process_record_locks_for_key(owner_pid, key);
+            remove_owner_file_lease_for_key(owner_pid, key);
+        }
+        drop(replaced_file);
     }
     newfd as isize
 }

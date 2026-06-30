@@ -8,22 +8,67 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 const NGROUPS_MAX: usize = 65536;
+const OVERFLOW_ID: u32 = 65534;
+
+fn map_id_to_user_namespace(id: u32, map: &str) -> u32 {
+    for line in map.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(ns_first) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(parent_first) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(count) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+            continue;
+        };
+        if parts.next().is_some() || count == 0 {
+            continue;
+        }
+        let id = id as u64;
+        if id >= parent_first && id < parent_first.saturating_add(count) {
+            let mapped = ns_first.saturating_add(id - parent_first);
+            return u32::try_from(mapped).unwrap_or(OVERFLOW_ID);
+        }
+    }
+    OVERFLOW_ID
+}
 
 pub fn syscall_getuid() -> isize {
     let process = current_process();
-    process.borrow_mut().uid as isize
+    let inner = process.borrow_mut();
+    if inner.user_ns_id == 0 {
+        inner.uid as isize
+    } else {
+        map_id_to_user_namespace(inner.uid, &inner.userns_uid_map) as isize
+    }
 }
 pub fn syscall_geteuid() -> isize {
     let process = current_process();
-    process.borrow_mut().euid as isize
+    let inner = process.borrow_mut();
+    if inner.user_ns_id == 0 {
+        inner.euid as isize
+    } else {
+        map_id_to_user_namespace(inner.euid, &inner.userns_uid_map) as isize
+    }
 }
 pub fn syscall_getgid() -> isize {
     let process = current_process();
-    process.borrow_mut().gid as isize
+    let inner = process.borrow_mut();
+    if inner.user_ns_id == 0 {
+        inner.gid as isize
+    } else {
+        map_id_to_user_namespace(inner.gid, &inner.userns_gid_map) as isize
+    }
 }
 pub fn syscall_getegid() -> isize {
     let process = current_process();
-    process.borrow_mut().egid as isize
+    let inner = process.borrow_mut();
+    if inner.user_ns_id == 0 {
+        inner.egid as isize
+    } else {
+        map_id_to_user_namespace(inner.egid, &inner.userns_gid_map) as isize
+    }
 }
 
 /// Linux `getgroups(2)` (syscall 158 on riscv64).

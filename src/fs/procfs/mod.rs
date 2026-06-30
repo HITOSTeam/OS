@@ -62,6 +62,7 @@ pub enum ProcFileKind {
     VmCompactMemory,
     FsFileMax,
     FsPipeMaxSize,
+    FsFanotifyMaxQueuedEvents,
     FsMqueueQueuesMax,
     KernelPidMax,
     KernelMsgmax,
@@ -89,6 +90,7 @@ pub enum ProcFileKind {
     PidMounts(u32),
     PidMountinfo(u32),
     PidCgroup(u32),
+    PidFdInfo(u32, usize),
     PidTaskStat(u32, u32),
     PidTaskComm(u32, u32),
 }
@@ -161,6 +163,7 @@ impl ProcPseudoFile {
             ProcFileKind::FsPipeMaxSize => {
                 crate::fs::write_pipe_sysctl("/proc/sys/fs/pipe-max-size", data)?
             }
+            ProcFileKind::FsFanotifyMaxQueuedEvents => return Err(err(SyscallError::EINVAL)),
             ProcFileKind::FsMqueueQueuesMax => crate::syscall::posix_mq::write_mqueue_sysctl(
                 "/proc/sys/fs/mqueue/queues_max",
                 data,
