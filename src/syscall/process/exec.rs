@@ -153,8 +153,8 @@ fn find_busybox_shell() -> Result<Option<(String, LoadedExecImage)>, isize> {
     Ok(None)
 }
 
-/// 根据 shebang 解释器名称（如 `bash`、`dash`、`env`）返回对应的 busybox applet 名。
-/// 用于将 `#!/bin/bash` 等 shebang 映射到 `busybox sh/bash`。
+/// 根据 shebang 解释器名称（如 `sh`、`dash`、`env`）返回对应的 busybox applet 名。
+/// 用于将缺失的系统 `/bin/sh`/`dash` 解释器映射到 `busybox sh`。
 fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static str {
     let shell_name = if interp_name == "env" {
         opt_arg.unwrap_or("sh")
@@ -162,7 +162,6 @@ fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static st
         interp_name
     };
     match shell_name {
-        "bash" => "bash",
         "dash" | "sh" => "sh",
         "busybox" => "sh",
         _ => "sh",
@@ -174,9 +173,7 @@ fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static st
 /// 决定 shebang 的可选参数（如 `#!/usr/bin/env sh` 中的 `sh`）是否应透传给解释器。
 /// 当解释器是 `env` 且参数已被识别为 shell 名称时，不再重复传递。
 fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> Option<&'a str> {
-    if matches!(interp_name, "busybox" | "env")
-        && matches!(opt_arg, Some("sh") | Some("bash") | Some("dash"))
-    {
+    if matches!(interp_name, "busybox" | "env") && matches!(opt_arg, Some("sh") | Some("dash")) {
         None
     } else {
         opt_arg
@@ -184,7 +181,12 @@ fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> O
 }
 /// 将当前进程替换为已在内存中的解释器镜像（`interp_data`）。
 /// 若解释器本身也有 `PT_INTERP`（即 glibc 动态链接的 ld.so），则走动态加载路径。
-fn exec_interpreter(interp: LoadedExecImage, args: Vec<String>, envs: Vec<String>) -> isize {
+fn exec_interpreter(
+    interp: LoadedExecImage,
+    args: Vec<String>,
+    envs: Vec<String>,
+    comm_override: Option<String>,
+) -> isize {
     if let Err(e) = validate_exec_stack_args(&args, &envs) {
         return e;
     }
@@ -201,11 +203,12 @@ fn exec_interpreter(interp: LoadedExecImage, args: Vec<String>, envs: Vec<String
             args,
             envs,
             interp.exec_inode,
+            comm_override,
         ) {
             return e;
         }
     } else {
-        if let Err(e) = process.exec(&interp.data, args, envs, interp.exec_inode) {
+        if let Err(e) = process.exec(&interp.data, args, envs, interp.exec_inode, comm_override) {
             return e;
         }
     }
@@ -400,7 +403,7 @@ fn try_exec_busybox_applet(path: &str, args: &[String], envs: &[String]) -> Opti
     for a in args.iter().skip(1) {
         new_args.push(a.clone());
     }
-    Some(exec_interpreter(bb_data, new_args, envs.to_vec()))
+    Some(exec_interpreter(bb_data, new_args, envs.to_vec(), None))
 }
 
 pub(super) fn path_basename(path: &str) -> &str {
@@ -672,6 +675,7 @@ fn execve_with_inode(
                 args_vec,
                 envs_vec,
                 exec_inode,
+                None,
             );
             maybe_stop_after_ptrace_exec();
             return 0;
@@ -696,6 +700,7 @@ fn execve_with_inode(
             envs_vec,
             elf_aux,
             exec_inode,
+            None,
         );
         maybe_stop_after_ptrace_exec();
         return 0;
@@ -712,11 +717,13 @@ fn execve_with_inode(
     // Script with shebang: emulate Linux `#!` handling in-kernel so that
     // busybox/ash can run `./script.sh` directly.
     if let Some((interp, opt_arg)) = parse_shebang(head) {
+        let script_comm = Some(String::from(path_basename(&path)));
         let interp_name = interp.rsplit('/').next().unwrap_or(interp.as_str());
-        let env_shell =
-            interp_name == "env" && matches!(opt_arg.as_deref(), Some("sh") | Some("bash"));
-        let wants_shell = matches!(interp_name, "sh" | "bash" | "busybox") || env_shell;
         let opt_arg_ref = opt_arg.as_deref();
+        let env_shell = interp_name == "env" && matches!(opt_arg_ref, Some("sh") | Some("dash"));
+        let busybox_shell =
+            interp_name == "busybox" && matches!(opt_arg_ref, Some("sh") | Some("dash"));
+        let wants_shell = matches!(interp_name, "sh" | "dash") || env_shell || busybox_shell;
         let extra_shell_arg = shebang_shell_extra_arg(interp_name, opt_arg_ref);
         match load_file_from_path(&interp) {
             Ok(interp_data) if is_elf(&interp_data.data) => {
@@ -729,7 +736,7 @@ fn execve_with_inode(
                 for a in args_vec.iter().skip(1) {
                     new_args.push(a.clone());
                 }
-                return exec_interpreter(interp_data, new_args, envs_vec);
+                return exec_interpreter(interp_data, new_args, envs_vec, script_comm.clone());
             }
             Ok(_) => {}
             Err(e) if e == err(SyscallError::ENOENT) => {}
@@ -747,7 +754,7 @@ fn execve_with_inode(
                 for a in args_vec.iter().skip(1) {
                     new_args.push(a.clone());
                 }
-                return exec_interpreter(bb_data, new_args, envs_vec);
+                return exec_interpreter(bb_data, new_args, envs_vec, script_comm.clone());
             }
         }
         if wants_shell {
@@ -767,7 +774,7 @@ fn execve_with_inode(
                 for a in args_vec.iter().skip(1) {
                     new_args.push(a.clone());
                 }
-                return exec_interpreter(interp_data, new_args, envs_vec);
+                return exec_interpreter(interp_data, new_args, envs_vec, script_comm.clone());
             }
         }
         match load_file_from_path(&interp) {
@@ -784,7 +791,7 @@ fn execve_with_inode(
                     for a in args_vec.iter().skip(1) {
                         new_args.push(a.clone());
                     }
-                    return exec_interpreter(interp_data, new_args, envs_vec);
+                    return exec_interpreter(interp_data, new_args, envs_vec, script_comm.clone());
                 }
                 if !wants_shell {
                     return ENOEXEC;
@@ -822,7 +829,7 @@ fn execve_with_inode(
             if let Err(e) = validate_exec_stack_args(&new_args, &envs_vec) {
                 return e;
             }
-            return exec_interpreter(interp_data, new_args, envs_vec);
+            return exec_interpreter(interp_data, new_args, envs_vec, script_comm);
         }
         return ENOEXEC;
     }
@@ -831,6 +838,7 @@ fn execve_with_inode(
     // Note: this diverges from Linux (which returns ENOEXEC) but keeps OSComp
     // scripts working when shells don't retry on ENOEXEC.
     if path.ends_with(".sh") {
+        let script_comm = Some(String::from(path_basename(&path)));
         let interp = match find_shell_interpreter() {
             Ok(v) => v,
             Err(e) => return e,
@@ -853,7 +861,7 @@ fn execve_with_inode(
         if let Err(e) = validate_exec_stack_args(&new_args, &envs_vec) {
             return e;
         }
-        return exec_interpreter(interp_data, new_args, envs_vec);
+        return exec_interpreter(interp_data, new_args, envs_vec, script_comm);
     }
 
     // Non-ELF without shebang: let shells interpret it.
@@ -892,7 +900,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
             for a in args_vec.iter().skip(1) {
                 new_args.push(a.clone());
             }
-            return exec_interpreter(bb_data, new_args, envs_vec);
+            return exec_interpreter(bb_data, new_args, envs_vec, None);
         }
     }
 
@@ -927,11 +935,16 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
             return e;
         }
     };
+    let fanotify_path = resolve_abs_path(AT_FDCWD, &path).ok().flatten();
+    if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
+        return e;
+    }
     let exec_reservation =
         match crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num()) {
             Ok(reservation) => reservation,
             Err(e) => return e,
         };
+    fanotify_notify_open_exec(&inode, false, fanotify_path.as_deref());
 
     execve_with_inode(path, args_vec, envs_vec, inode, exec_reservation)
 }
@@ -960,10 +973,15 @@ pub fn syscall_execveat(
         Ok(inode) => inode,
         Err(e) => return e,
     };
+    let fanotify_path = resolve_abs_path(dirfd, &path).ok().flatten();
+    if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
+        return e;
+    }
     let exec_reservation =
         match crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num()) {
             Ok(reservation) => reservation,
             Err(e) => return e,
         };
+    fanotify_notify_open_exec(&inode, false, fanotify_path.as_deref());
     execve_with_inode(path, args_vec, envs_vec, inode, exec_reservation)
 }

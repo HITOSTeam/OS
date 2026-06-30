@@ -7,13 +7,13 @@ use crate::fs::{File, NamespaceKind, PseudoDir, PseudoDirent, PseudoFile};
 
 use super::entries::{
     managed_proc_sys_file_kind, proc_dir_entries, proc_irq_entries, proc_irq_number_entries,
-    proc_pid_entries, proc_pid_exists, proc_pid_fd_entries, proc_pid_ns_entries,
-    proc_pid_task_alive, proc_pid_task_entries, proc_pid_task_tid_entries, proc_root_entries,
-    proc_sys_fs_entries, proc_sys_kernel_entries, proc_sys_kernel_keys_entries,
-    proc_sys_net_core_entries, proc_sys_net_entries, proc_sys_net_ipv4_conf_entries,
-    proc_sys_net_ipv4_conf_if_entries, proc_sys_net_ipv4_entries, proc_sys_net_ipv6_conf_entries,
-    proc_sys_net_ipv6_conf_if_entries, proc_sys_net_ipv6_entries, proc_sys_user_entries,
-    proc_sys_vm_entries,
+    proc_pid_entries, proc_pid_exists, proc_pid_fd_entries, proc_pid_fd_exists,
+    proc_pid_fdinfo_entries, proc_pid_ns_entries, proc_pid_task_alive, proc_pid_task_entries,
+    proc_pid_task_tid_entries, proc_root_entries, proc_sys_fs_entries, proc_sys_kernel_entries,
+    proc_sys_kernel_keys_entries, proc_sys_net_core_entries, proc_sys_net_entries,
+    proc_sys_net_ipv4_conf_entries, proc_sys_net_ipv4_conf_if_entries, proc_sys_net_ipv4_entries,
+    proc_sys_net_ipv6_conf_entries, proc_sys_net_ipv6_conf_if_entries, proc_sys_net_ipv6_entries,
+    proc_sys_user_entries, proc_sys_vm_entries,
 };
 use super::magic_link::{
     normalize_proc_magic_path, proc_pid_from_path_with_rest, proc_pid_namespace_file,
@@ -31,6 +31,13 @@ const PROC_CONFIG_GZ: &[u8] = &[
     111, 215, 144, 96, 76, 145, 120, 31, 127, 255, 0, 39, 71, 103, 111, 160, 20, 0, 92, 222, 90,
     238, 210, 0, 0, 0,
 ];
+
+fn parse_proc_fd_component(fd_name: &str) -> Option<usize> {
+    if fd_name.is_empty() || fd_name.contains('/') || !fd_name.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    fd_name.parse::<usize>().ok()
+}
 
 /// procfs 的统一入口：将绝对路径映射到对应的伪文件或伪目录对象。
 ///
@@ -83,6 +90,12 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             return Some(Arc::new(PseudoDir::new(
                 "/proc/sys/fs",
                 proc_sys_fs_entries(),
+            )));
+        }
+        "/proc/sys/fs/fanotify" => {
+            return Some(Arc::new(PseudoDir::new(
+                "/proc/sys/fs/fanotify",
+                proc_dir_entries(&[("max_queued_events", 8)]),
             )));
         }
         "/proc/sys/fs/inotify" => {
@@ -342,6 +355,19 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             proc_pid_fd_entries(pid),
         )));
     }
+    if rest == "fdinfo" {
+        return Some(Arc::new(PseudoDir::new(
+            &alloc::format!("/proc/{pid}/fdinfo"),
+            proc_pid_fdinfo_entries(pid),
+        )));
+    }
+    if let Some(fd_name) = rest.strip_prefix("fdinfo/") {
+        let fd = parse_proc_fd_component(fd_name)?;
+        if proc_pid_fd_exists(pid, fd) {
+            return Some(ProcPseudoFile::new(ProcFileKind::PidFdInfo(pid, fd)));
+        }
+        return None;
+    }
     if rest == "task" {
         return Some(Arc::new(PseudoDir::new(
             &alloc::format!("/proc/{pid}/task"),
@@ -373,6 +399,12 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
                     proc_pid_fd_entries(pid),
                 )));
             }
+            "fdinfo" => {
+                return Some(Arc::new(PseudoDir::new(
+                    &alloc::format!("/proc/{pid}/task/{tid}/fdinfo"),
+                    proc_pid_fdinfo_entries(pid),
+                )));
+            }
             "ns" => {
                 return Some(Arc::new(PseudoDir::new(
                     &alloc::format!("/proc/{pid}/task/{tid}/ns"),
@@ -391,6 +423,13 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
                 "net" => proc_pid_namespace_file(pid, NamespaceKind::Net),
                 _ => None,
             };
+        }
+        if let Some(fd_name) = tail.strip_prefix("fdinfo/") {
+            let fd = parse_proc_fd_component(fd_name)?;
+            if proc_pid_fd_exists(pid, fd) {
+                return Some(ProcPseudoFile::new(ProcFileKind::PidFdInfo(pid, fd)));
+            }
+            return None;
         }
         return None;
     }
