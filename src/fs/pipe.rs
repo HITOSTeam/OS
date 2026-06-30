@@ -19,7 +19,7 @@ use crate::{
     },
     task::{
         block_sleep::add_timer,
-        manager::{PID2PCB, prime_fair_sync_wakeup_lag},
+        manager::{PID2PCB, prime_fair_sync_wakeup_lag, wakeup_sync_task},
         processor::{block_current_and_run_next, current_process, current_task},
         signal::{
             SIGPIPE_NUM, has_wait_interrupting_pending, queue_process_signal_info, signal_bit,
@@ -1406,7 +1406,7 @@ fn queue_sigpipe(task: &Arc<crate::task::task_block::TaskControlBlock>) {
 /// waiters rather than the direct pipe endpoint, so keep their ordinary wakeup
 /// placement.
 fn wake_pipe_waiters(
-    mut poll_waiters: Vec<Arc<TaskControlBlock>>,
+    poll_waiters: Vec<Arc<TaskControlBlock>>,
     direct_waiter: Option<Arc<TaskControlBlock>>,
 ) {
     if poll_waiters.is_empty() && direct_waiter.is_none() {
@@ -1414,9 +1414,11 @@ fn wake_pipe_waiters(
     }
     if let Some(waiter) = direct_waiter {
         prime_fair_sync_wakeup_lag(&waiter);
-        poll_waiters.push(waiter);
+        wakeup_sync_task(waiter);
     }
-    wake_tasks(poll_waiters);
+    if !poll_waiters.is_empty() {
+        wake_tasks(poll_waiters);
+    }
 }
 
 /// 向管道异步 IO 属主（`F_SETOWN`）投递就绪信号（默认 `SIGIO`，可由 `F_SETSIG` 自定义）。

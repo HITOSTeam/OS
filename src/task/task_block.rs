@@ -32,6 +32,12 @@ pub struct TaskControlBlock {
     pub on_cpu: AtomicUsize,
     /// 当唤醒方尝试唤醒仍处于 `on_cpu` 状态的任务时置位。
     pub wakeup_pending: AtomicBool,
+    /// `wakeup_pending` 对应的同步唤醒来源 hart。
+    ///
+    /// Linux `WF_SYNC` 风格 handoff 可能发生在目标任务还位于自己的内核栈上时。
+    /// 此时只能延迟到目标切回 idle 后入队；这里保留原始 waker hart，避免
+    /// 补唤醒退化成“贴近 wakee 原 CPU”。
+    pub wakeup_sync_hart: AtomicUsize,
     /// 线程存在待处理信号的快速标志。
     ///
     /// 对应 Linux 的 `TIF_SIGPENDING` 思路：返回用户态前先看这个原子标志，
@@ -92,6 +98,8 @@ impl TaskControlBlock {
         self.on_cpu.store(hart_id, Ordering::Release);
         // 一旦已经运行，就不应再保留待处理唤醒。
         self.wakeup_pending.store(false, Ordering::Release);
+        self.wakeup_sync_hart
+            .store(Self::OFF_CPU, Ordering::Release);
     }
 
     pub fn clear_on_cpu(&self) {
@@ -399,6 +407,7 @@ impl TaskControlBlock {
             cpu_id: AtomicUsize::new(0),
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             wakeup_pending: AtomicBool::new(false),
+            wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
@@ -503,6 +512,7 @@ impl TaskControlBlock {
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             // 唤醒标记/就绪队列标记的初值均为 false：刚创建还未排队
             wakeup_pending: AtomicBool::new(false),
+            wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),

@@ -14,7 +14,7 @@ use crate::{
             has_ready_rt_at_or_above, has_ready_rt_higher_than, has_ready_tasks,
             prime_fair_sync_wakeup_lag, ready_queue_lengths, record_fair_sleep_lag,
             release_process_mm_owner, remove_inactive_task, remove_sched_timer_refs, requeue_task,
-            rt_bandwidth_throttled, wakeup_task, wakeup_tasks,
+            rt_bandwidth_throttled, wakeup_sync_task_on_hart, wakeup_task, wakeup_tasks,
         },
         process_block::ProcessControlBlock,
         runtime::{monotonic_time_ns, start_task_runtime_slice},
@@ -1172,7 +1172,15 @@ pub fn idle_task() {
                 .wakeup_pending
                 .swap(false, core::sync::atomic::Ordering::AcqRel)
             {
-                wakeup_task(task);
+                let sync_hart = task.wakeup_sync_hart.swap(
+                    TaskControlBlock::OFF_CPU,
+                    core::sync::atomic::Ordering::AcqRel,
+                );
+                if sync_hart < MAX_HARTS {
+                    wakeup_sync_task_on_hart(task, sync_hart);
+                } else {
+                    wakeup_task(task);
+                }
             }
         }
 
@@ -1183,6 +1191,10 @@ pub fn idle_task() {
             task.clear_on_cpu();
             task.wakeup_pending
                 .store(false, core::sync::atomic::Ordering::Release);
+            task.wakeup_sync_hart.store(
+                TaskControlBlock::OFF_CPU,
+                core::sync::atomic::Ordering::Release,
+            );
             requeue_task(task);
         }
 
