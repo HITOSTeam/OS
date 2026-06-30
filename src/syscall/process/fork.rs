@@ -145,13 +145,15 @@ fn clone_from_parts(
         // Linux clone(2) permits fork-like clone(SIGCHLD, NULL, ...) but rejects
         // clone(0, NULL, ...). clone3 split exit_signal out of flags and allows
         // exit_signal=0 with NULL stack for fork-like, non-CLONE_VM processes.
+        // vfork(2) is the special CLONE_VM | CLONE_VFORK case: the child starts
+        // on the caller's stack and the parent remains blocked until exec/exit.
         // Linux clone(2) 允许 fork 形式的 clone(SIGCHLD, NULL, ...)，但拒绝
         // clone(0, NULL, ...)。clone3 将 exit_signal 独立成字段后，允许
         // exit_signal=0 的非 CLONE_VM 进程 clone 使用 NULL stack 来禁止父进程通知。
         let exit_signal = flags & 0xff;
         // 这些强制要求栈
-        let requires_child_stack =
-            (flags & (CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS)) != 0;
+        let requires_child_stack = (flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS)) != 0
+            || ((flags & CLONE_VM) != 0 && (flags & CLONE_VFORK) == 0);
         let detached_fork_like_clone3 = allow_detached_null_stack && exit_signal == 0;
         if requires_child_stack || (exit_signal == 0 && !detached_fork_like_clone3) {
             return err(SyscallError::EINVAL);
@@ -381,10 +383,14 @@ fn clone_from_parts(
         let parent_ns_id = process.pid_namespace_id();
         let child_ns_id = crate::task::alloc_pid_namespace_id();
         crate::task::register_pid_namespace(parent_ns_id, child_ns_id);
-        let mut child_inner = child.borrow_mut();
-        child_inner.pid_ns_id = child_ns_id;
-        child_inner.pid_ns_vpid = 1;
-        child_inner.pid_ns_init = true;
+        {
+            let mut child_inner = child.borrow_mut();
+            child_inner.pid_ns_id = child_ns_id;
+            child_inner.pid_ns_vpid = 1;
+            child_inner.pid_ns_init = true;
+            child.update_parent_visible_pid_from_locked_child(child_ns_id, parent_ns_id, 0);
+        }
+        crate::task::register_pid_namespace_reaper(child_ns_id, child.getpid());
     }
     // 计算本次 fork 实际耗时（微秒），用于诊断慢 fork（仅 DEBUG_FUTEX 时启用）
     let fork_elapsed_us = if DEBUG_FUTEX {
@@ -440,6 +446,8 @@ fn clone_from_parts(
             inner.parent.as_ref().and_then(|p| p.upgrade())
         };
         if let Some(real_parent) = real_parent {
+            let real_parent_pid_ns_id = real_parent.pid_namespace_id();
+            let real_parent_visible_pid = real_parent.visible_pid();
             // 1) 从调用者的子列表里移除新子
             {
                 let mut caller_inner = process.borrow_mut();
@@ -449,6 +457,11 @@ fn clone_from_parts(
             {
                 let mut child_inner = child.borrow_mut();
                 child_inner.parent = Some(Arc::downgrade(&real_parent));
+                child.update_parent_visible_pid_from_locked_child(
+                    child_inner.pid_ns_id,
+                    real_parent_pid_ns_id,
+                    real_parent_visible_pid,
+                );
             }
             // 3) 把新子挂到真父的子列表
             {
@@ -495,6 +508,10 @@ fn clone_from_parts(
             Arc::strong_count(&task)
         );
     }
+    if share_vm {
+        let shared_mm_token = child.borrow_mut().memory_set.token();
+        register_shared_mm_process_owner(shared_mm_token);
+    }
     // 将子任务推入调度队列；至此子才真正可被调度执行
     add_task(task);
     // 落入 fork 诊断统计（按 parent_pid 聚合，节流输出）
@@ -508,18 +525,30 @@ fn clone_from_parts(
     if (flags & CLONE_VFORK) != 0 {
         let parent_task = current_task().unwrap();
         loop {
-            // 子 exec/退出后即满足 vfork 唤醒条件
-            let done = {
+            let should_block = {
+                let mut parent_inner = process.borrow_mut();
                 let inner = child.borrow_mut();
-                inner.is_zombie || inner.did_exec
+                let done = inner.is_zombie || inner.did_exec;
+                drop(inner);
+                if done {
+                    super::wait::remove_wait_queue_entry(
+                        &mut parent_inner.vfork_wait_queue,
+                        &parent_task,
+                    );
+                    false
+                } else {
+                    super::wait::enqueue_waiter_once(
+                        &mut parent_inner.vfork_wait_queue,
+                        &parent_task,
+                    );
+                    true
+                }
             };
-            if done {
+            if !should_block {
+                parent_task
+                    .wakeup_pending
+                    .store(false, core::sync::atomic::Ordering::Release);
                 break;
-            }
-            // 在父进程的 vfork 专用等待队列上挂载一次性等待者，再切走。
-            {
-                let mut inner = process.borrow_mut();
-                super::wait::enqueue_waiter_once(&mut inner.vfork_wait_queue, &parent_task);
             }
             block_current_and_run_next();
         }
@@ -842,26 +871,18 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
 }
 
 /// Linux `vfork(2)` compatibility.
-///
-/// For now, treat it as a normal `fork(2)` (copy address space). This is
-/// sufficient for busybox/ash and many OSComp scripts, and avoids the strict
-/// parent-blocking/VM-sharing semantics of true vfork.
 pub fn syscall_vfork() -> isize {
-    let process = current_process();
-    if let Err(e) = cgroup_fork_precheck(process.getpid()) {
-        return e;
-    }
-    match process.fork() {
-        Ok(child) => {
-            crate::log_if!(
-                DEBUG_SIGNAL,
-                info,
-                "[vfork] parent_pid={} child_pid={}",
-                process.getpid(),
-                child.getpid()
-            );
-            child.getpid() as isize
-        }
-        Err(e) => err(SyscallError::from(e)),
-    }
+    const CLONE_VM: usize = 0x0000_0100;
+    const CLONE_VFORK: usize = 0x0000_4000;
+
+    clone_from_parts(
+        CLONE_VM | CLONE_VFORK | SIGCHLD_NUM,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        false,
+    )
 }

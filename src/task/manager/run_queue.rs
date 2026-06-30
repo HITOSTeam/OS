@@ -146,6 +146,32 @@ pub(super) fn resolve_wakeup_hart(
     picked
 }
 
+pub(super) fn resolve_sync_wakeup_hart(
+    task: &Arc<TaskControlBlock>,
+    source_hart: usize,
+    mask: usize,
+) -> usize {
+    let allowed_mask = allowed_hart_mask_for_task(task, mask);
+    if matches!(task_queue_slot(task), ReadyQueueSlot::Fair) {
+        // Linux WF_SYNC biases a wakee toward the waker CPU because the waker is
+        // expected to sleep or hand off control soon. Keep this limited to
+        // explicit sync wakeups; ordinary fair I/O wakeups still use the
+        // load-spreading path above.
+        if (allowed_mask & hart_bit(source_hart)) != 0 {
+            task.set_cpu_id(source_hart);
+            return source_hart;
+        }
+        let previous = task.get_cpu_id() % MAX_HARTS;
+        if (allowed_mask & hart_bit(previous)) != 0 {
+            return previous;
+        }
+        let picked = pick_online_hart_from_mask(allowed_mask);
+        task.set_cpu_id(picked);
+        return picked;
+    }
+    resolve_wakeup_hart(task, source_hart, mask)
+}
+
 /// Linux 风格的拆分运行队列：RT 队列 + 公平队列。
 impl TaskManager {
     /// 为每个 hart 创建一个空就绪队列

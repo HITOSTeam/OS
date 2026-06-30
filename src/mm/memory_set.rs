@@ -4,7 +4,7 @@
 //! `MapArea` 记录已经物化的页，`PageTable` 是硬件最终看到的映射。
 
 use super::elf_loader::{
-    ENOMEM, ET_DYN, ElfHeader64, ElfPhdr64, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
+    ENOMEM, ET_DYN, ElfHeader64, ElfLoadInfo, ElfPhdr64, PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR,
     elf_arch_abi_from_bytes, parse_elf_headers, read_exact_with, validate_elf_arch_abi,
     validate_elf_interp_abi,
 };
@@ -887,15 +887,52 @@ impl MemorySet {
             .all(Self::vm_region_is_private_anonymous)
     }
 
+    fn push_vm_region_raw(&mut self, region: VmRegion) {
+        self.vm_regions.push_merged(region);
+    }
+
     pub fn push_vm_region(&mut self, region: VmRegion) {
         // VMA 新增后统一合并，并刷新 file backing 的派生状态。
         let backing_id = region.backing_id;
-        self.vm_regions.push_merged(region);
+        self.push_vm_region_raw(region);
         if backing_id != 0 {
             self.refresh_mmap_backing_state(backing_id);
         }
         self.debug_assert_user_vm_invariants();
     }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_range_has_no_resident_pages(&self, start: usize, end: usize) {
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).ceil();
+        for area in self
+            .areas
+            .iter()
+            .filter(|area| area.overlaps_vpn_range(start_vpn, end_vpn))
+        {
+            let ov_start = core::cmp::max(start_vpn, area.start_vpn());
+            let ov_end = core::cmp::min(end_vpn, area.end_vpn());
+            for vpn in VPNRange::new(ov_start, ov_end) {
+                debug_assert!(
+                    area.tracked_frame(vpn).is_none(),
+                    "new lazy VMA range unexpectedly owns a resident frame"
+                );
+                debug_assert!(
+                    !area.has_saved_pte_flags(vpn),
+                    "new lazy VMA range unexpectedly owns saved PTE flags"
+                );
+                if let Some(pte) = self.page_table.translate(vpn) {
+                    debug_assert!(
+                        !pte.is_valid(),
+                        "new lazy VMA range unexpectedly has a valid PTE"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_range_has_no_resident_pages(&self, _start: usize, _end: usize) {}
 
     fn static_user_region(
         kind: VmRegionKind,
@@ -1109,13 +1146,20 @@ impl MemorySet {
             }
         }
         let backing_id = region.backing_id;
-        self.push_vm_region(region);
+        let lazy_backing_insert = backing_id != 0 && region.map_type == MapType::Lazy;
+        self.push_vm_region_raw(region);
         if backing_id != 0 {
-            self.refresh_mmap_backing_state(backing_id);
+            if lazy_backing_insert {
+                self.debug_assert_range_has_no_resident_pages(start, end);
+                self.refresh_mmap_backing_vm_state(backing_id);
+            } else {
+                self.refresh_mmap_backing_state(backing_id);
+            }
         }
         if lock_range {
             self.add_locked_range(start, end);
         }
+        self.debug_assert_user_vm_invariants();
         true
     }
 
@@ -2378,12 +2422,36 @@ impl MemorySet {
     }
 
     /// Build a user address space from an ELF reader to avoid loading the full file into memory.
+    #[allow(dead_code)]
     pub fn from_elf_reader<F>(mut read_at: F) -> Result<(Self, usize, usize, ElfAux), isize>
     where
         F: FnMut(usize, &mut [u8]) -> usize,
     {
         let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
         validate_elf_arch_abi(hdr.arch_abi())?;
+        Self::from_parsed_elf_reader(&mut read_at, &hdr, &phdrs)
+    }
+
+    /// Build a user address space from ELF metadata parsed earlier in the same exec.
+    pub(crate) fn from_elf_info_reader<F>(
+        mut read_at: F,
+        info: &ElfLoadInfo,
+    ) -> Result<(Self, usize, usize, ElfAux), isize>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        validate_elf_arch_abi(info.arch_abi)?;
+        Self::from_parsed_elf_reader(&mut read_at, &info.header, &info.phdrs)
+    }
+
+    fn from_parsed_elf_reader<F>(
+        read_at: &mut F,
+        hdr: &ElfHeader64,
+        phdrs: &[ElfPhdr64],
+    ) -> Result<(Self, usize, usize, ElfAux), isize>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
         let mut memory_set = Self::new_bare();
         if !memory_set.map_user_trampoline_pages() {
             return Err(ENOMEM);
@@ -2393,9 +2461,9 @@ impl MemorySet {
         let mut max_end_vpn = VirtPageNum(0);
         let elf_aux = Self::map_elf_segments_from_reader(
             &mut memory_set,
-            &mut read_at,
-            &hdr,
-            &phdrs,
+            read_at,
+            hdr,
+            phdrs,
             load_bias,
             &mut max_end_vpn,
         )?;
@@ -2700,6 +2768,7 @@ impl MemorySet {
     }
 
     /// Build a user address space from a main ELF reader and an in-memory interpreter.
+    #[allow(dead_code)]
     pub fn from_elf_with_interp_reader<F>(
         mut read_at: F,
         interp_elf: &[u8],
@@ -2709,6 +2778,36 @@ impl MemorySet {
     {
         let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
         validate_elf_interp_abi(hdr.arch_abi(), elf_arch_abi_from_bytes(interp_elf)?)?;
+        Self::from_parsed_elf_with_interp_reader(&mut read_at, &hdr, &phdrs, interp_elf)
+    }
+
+    /// Build a dynamically-linked address space from ELF metadata parsed earlier in the same exec.
+    pub(crate) fn from_elf_with_interp_info_reader<F>(
+        mut read_at: F,
+        info: &ElfLoadInfo,
+        interp_elf: &[u8],
+    ) -> Result<(Self, usize, usize, usize, ElfAux, usize), isize>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
+        validate_elf_interp_abi(info.arch_abi, elf_arch_abi_from_bytes(interp_elf)?)?;
+        Self::from_parsed_elf_with_interp_reader(
+            &mut read_at,
+            &info.header,
+            &info.phdrs,
+            interp_elf,
+        )
+    }
+
+    fn from_parsed_elf_with_interp_reader<F>(
+        read_at: &mut F,
+        hdr: &ElfHeader64,
+        phdrs: &[ElfPhdr64],
+        interp_elf: &[u8],
+    ) -> Result<(Self, usize, usize, usize, ElfAux, usize), isize>
+    where
+        F: FnMut(usize, &mut [u8]) -> usize,
+    {
         let mut memory_set = Self::new_bare();
         if !memory_set.map_user_trampoline_pages() {
             return Err(ENOMEM);
@@ -2723,9 +2822,9 @@ impl MemorySet {
         let mut max_end_vpn = VirtPageNum(0);
         let main_aux = Self::map_elf_segments_from_reader(
             &mut memory_set,
-            &mut read_at,
-            &hdr,
-            &phdrs,
+            read_at,
+            hdr,
+            phdrs,
             main_bias,
             &mut max_end_vpn,
         )?;
@@ -2878,10 +2977,11 @@ impl MemorySet {
                             src_flags.insert(PTEFlags::COW);
                             // Apply parent PTE demotion immediately to minimize the window where
                             // another thread could write through a still-writable PTE on another hart.
-                            #[cfg(target_arch = "loongarch64")]
-                            let changed = user_space.page_table.set_flags_deferred(vpn, src_flags);
-                            #[cfg(not(target_arch = "loongarch64"))]
-                            let changed = user_space.page_table.set_flags(vpn, src_flags);
+                            let changed = user_space.page_table.set_flags_cached(
+                                vpn,
+                                src_flags,
+                                &mut src_walk_cache,
+                            );
                             if changed {
                                 parent_update_count = parent_update_count.saturating_add(1);
                             }

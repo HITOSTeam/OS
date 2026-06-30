@@ -67,6 +67,10 @@ pub(crate) struct ElfLoadInfo {
     pub interp: Option<String>,
     /// 该 ELF 文件的体系结构与 ABI 标识，用于校验兼容性。
     pub arch_abi: ElfArchAbi,
+    /// 已解析的 ELF 文件头，供同一次 exec 后续建地址空间时复用。
+    pub(super) header: ElfHeader64,
+    /// 已解析的程序头表，避免同一次 exec 重复读取/解析 program headers。
+    pub(super) phdrs: Vec<ElfPhdr64>,
 }
 
 impl ElfHeader64 {
@@ -274,11 +278,11 @@ pub(crate) fn elf_load_info_from_reader<F>(mut read_at: F) -> Result<ElfLoadInfo
 where
     F: FnMut(usize, &mut [u8]) -> usize,
 {
-    let (hdr, phdrs) = parse_elf_headers(&mut read_at)?;
-    let arch_abi = hdr.arch_abi();
+    let (header, phdrs) = parse_elf_headers(&mut read_at)?;
+    let arch_abi = header.arch_abi();
     validate_elf_arch_abi(arch_abi)?;
     let mut interp = None;
-    for ph in phdrs {
+    for ph in phdrs.iter() {
         if ph.p_type != PT_INTERP {
             continue;
         }
@@ -289,5 +293,10 @@ where
         interp = Some(String::from(s));
         break;
     }
-    Ok(ElfLoadInfo { interp, arch_abi })
+    Ok(ElfLoadInfo {
+        interp,
+        arch_abi,
+        header,
+        phdrs,
+    })
 }

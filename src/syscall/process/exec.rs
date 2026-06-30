@@ -1,43 +1,30 @@
 use super::*;
 use alloc::sync::Arc;
 
-/// 检查系统中是否有进程以可写方式打开了指定 inode。
-/// 用于 `execve` 前的 ETXTBSY 检查：正在被写入的文件不允许执行。
-fn is_inode_open_for_write(inode_num: u32) -> bool {
-    let processes: Vec<_> = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect()
+struct LoadedExecImage {
+    data: Vec<u8>,
+    exec_inode: (usize, u32),
+    _reservation: crate::fs::ExecInodeReservation,
+}
+
+fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>) -> Result<LoadedExecImage, isize> {
+    let reservation = crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num())?;
+    let exec_inode = reservation.key();
+    let data = {
+        let _ext4_guard = ext4_lock();
+        inode.read_all()
     };
-    let mut seen_tables = alloc::collections::BTreeSet::new();
-    for process in processes {
-        let inner = process.borrow_mut();
-        let files = Arc::clone(&inner.files);
-        drop(inner);
-        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
-            continue;
-        }
-        for (_fd, file) in files.lock().iter_files_snapshot() {
-            if !file.writable() {
-                continue;
-            }
-            let Some(inode_file) = file.as_any().downcast_ref::<crate::fs::OSInode>() else {
-                continue;
-            };
-            if inode_file.ext4_inode().inode_num() == inode_num {
-                return true;
-            }
-        }
-    }
-    false
+    Ok(LoadedExecImage {
+        data,
+        exec_inode,
+        _reservation: reservation,
+    })
 }
 
 /// This function tries to load a file from the given path.
-fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
+fn load_file_from_path(path: &str) -> Result<LoadedExecImage, isize> {
     match resolve_exec_inode(path) {
-        Ok(inode) => {
-            let _ext4_guard = ext4_lock();
-            return Ok(inode.read_all());
-        }
+        Ok(inode) => return load_exec_inode_image(inode),
         Err(e) if e != err(SyscallError::ENOENT) => return Err(e),
         Err(_) => {}
     }
@@ -50,10 +37,7 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
         ];
         for cand in fallbacks {
             match resolve_exec_inode(cand) {
-                Ok(inode) => {
-                    let _ext4_guard = ext4_lock();
-                    return Ok(inode.read_all());
-                }
+                Ok(inode) => return load_exec_inode_image(inode),
                 Err(e) if e == err(SyscallError::ENOENT) => {}
                 Err(e) => return Err(e),
             }
@@ -63,10 +47,7 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
         let mut with_bin = String::from(path);
         with_bin.push_str(".bin");
         return match resolve_exec_inode(&with_bin) {
-            Ok(inode) => {
-                let _ext4_guard = ext4_lock();
-                Ok(inode.read_all())
-            }
+            Ok(inode) => load_exec_inode_image(inode),
             Err(e) => Err(e),
         };
     }
@@ -75,12 +56,9 @@ fn load_file_from_path(path: &str) -> Result<Vec<u8>, isize> {
 
 /// 以只读方式加载文件内容，不做可执行权限检查。
 /// 用于加载动态链接器（`ld.so`）等不需要执行权限的场景。
-fn load_file_readonly(path: &str) -> Result<Vec<u8>, isize> {
+fn load_file_readonly(path: &str) -> Result<LoadedExecImage, isize> {
     match resolve_read_inode(path) {
-        Ok(inode) => {
-            let _ext4_guard = ext4_lock();
-            Ok(inode.read_all())
-        }
+        Ok(inode) => load_exec_inode_image(inode),
         Err(e) => Err(e),
     }
 }
@@ -117,7 +95,7 @@ fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, i
 
 /// 按优先级搜索系统中可用的 shell 解释器（优先 busybox，其次 `/bin/sh`）。
 /// 返回 `(路径, 文件内容, 是否需要额外传入 "sh" applet 参数)`。
-fn find_shell_interpreter() -> Result<Option<(String, Vec<u8>, bool)>, isize> {
+fn find_shell_interpreter() -> Result<Option<(String, LoadedExecImage, bool)>, isize> {
     let candidates = [
         ("./busybox", true),
         ("busybox", true),
@@ -152,7 +130,7 @@ fn is_system_shell_path(path: &str) -> bool {
 }
 
 /// 在常见路径中搜索 busybox 可执行文件，返回第一个找到的 `(路径, 文件内容)`。
-fn find_busybox_shell() -> Result<Option<(String, Vec<u8>)>, isize> {
+fn find_busybox_shell() -> Result<Option<(String, LoadedExecImage)>, isize> {
     let candidates = [
         "./busybox",
         "busybox",
@@ -206,22 +184,28 @@ fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> O
 }
 /// 将当前进程替换为已在内存中的解释器镜像（`interp_data`）。
 /// 若解释器本身也有 `PT_INTERP`（即 glibc 动态链接的 ld.so），则走动态加载路径。
-fn exec_interpreter(interp_data: Vec<u8>, args: Vec<String>, envs: Vec<String>) -> isize {
+fn exec_interpreter(interp: LoadedExecImage, args: Vec<String>, envs: Vec<String>) -> isize {
     if let Err(e) = validate_exec_stack_args(&args, &envs) {
         return e;
     }
     let process = current_process();
-    let interp_abi = crate::mm::elf_arch_abi_from_bytes(&interp_data).ok();
-    if let Some(interp_interp) = elf_interp_path(&interp_data) {
+    let interp_abi = crate::mm::elf_arch_abi_from_bytes(&interp.data).ok();
+    if let Some(interp_interp) = elf_interp_path(&interp.data) {
         let interp_interp_data = match load_interp_data(&interp_interp, interp_abi) {
             Ok(data) => data,
             Err(e) => return e,
         };
-        if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, args, envs) {
+        if let Err(e) = process.exec_dyn(
+            &interp.data,
+            &interp_interp_data.data,
+            args,
+            envs,
+            interp.exec_inode,
+        ) {
             return e;
         }
     } else {
-        if let Err(e) = process.exec(&interp_data, args, envs) {
+        if let Err(e) = process.exec(&interp.data, args, envs, interp.exec_inode) {
             return e;
         }
     }
@@ -246,7 +230,7 @@ fn check_interp_abi(
 /// - `ENOENT`：文件不存在，返回 `Ok(None)` 让调用方继续尝试下一个候选。
 /// - `EACCES`：无执行权限，回退到只读加载（`ld.so` 有时权限位不含 x）。
 /// - 其他错误：直接向上传播。
-fn load_interp_candidate(path: &str) -> Result<Option<Vec<u8>>, isize> {
+fn load_interp_candidate(path: &str) -> Result<Option<LoadedExecImage>, isize> {
     match load_file_from_path(path) {
         Ok(data) => Ok(Some(data)),
         Err(e) if e == err(SyscallError::EACCES) => match load_file_readonly(path) {
@@ -265,16 +249,16 @@ fn load_interp_candidate(path: &str) -> Result<Option<Vec<u8>>, isize> {
 fn load_interp_data(
     interp: &str,
     expected_main_abi: Option<crate::mm::ElfArchAbi>,
-) -> Result<Vec<u8>, isize> {
+) -> Result<LoadedExecImage, isize> {
     match load_file_from_path(interp) {
-        Ok(data) => {
-            check_interp_abi(&data, expected_main_abi)?;
-            return Ok(data);
+        Ok(image) => {
+            check_interp_abi(&image.data, expected_main_abi)?;
+            return Ok(image);
         }
         Err(e) if e == err(SyscallError::EACCES) => {
-            if let Ok(data) = load_file_readonly(interp) {
-                check_interp_abi(&data, expected_main_abi)?;
-                return Ok(data);
+            if let Ok(image) = load_file_readonly(interp) {
+                check_interp_abi(&image.data, expected_main_abi)?;
+                return Ok(image);
             }
         }
         Err(e) if e == err(SyscallError::ENOENT) => {}
@@ -318,7 +302,7 @@ fn load_interp_data(
         let Some(data) = load_interp_candidate(cand)? else {
             continue;
         };
-        match check_interp_abi(&data, expected_main_abi) {
+        match check_interp_abi(&data.data, expected_main_abi) {
             Ok(()) => return Ok(data),
             Err(e) if e == err(SyscallError::ENOEXEC) => {
                 found_wrong_abi = true;
@@ -633,6 +617,7 @@ fn execve_with_inode(
     args_vec: Vec<String>,
     envs_vec: Vec<String>,
     inode: Arc<ext4_fs::Inode>,
+    _exec_reservation: crate::fs::ExecInodeReservation,
 ) -> isize {
     const ENOEXEC: isize = -8;
     if let Err(e) = validate_exec_stack_args(&args_vec, &envs_vec) {
@@ -656,12 +641,12 @@ fn execve_with_inode(
         (inode.device_id(), inode.inode_num())
     };
     if let Some(info) = elf_info {
-        if let Some(interp) = info.interp {
-            let interp_data = match load_interp_data(&interp, Some(info.arch_abi)) {
+        if let Some(interp) = info.interp.as_deref() {
+            let interp_data = match load_interp_data(interp, Some(info.arch_abi)) {
                 Ok(data) => data,
                 Err(e) => return e,
             };
-            if !is_elf(&interp_data) {
+            if !is_elf(&interp_data.data) {
                 return ENOEXEC;
             }
             let inode = Arc::clone(&inode);
@@ -670,7 +655,8 @@ fn execve_with_inode(
                 inode.read_at(offset, buf)
             };
             let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
-                match MemorySet::from_elf_with_interp_reader(loader, &interp_data) {
+                match MemorySet::from_elf_with_interp_info_reader(loader, &info, &interp_data.data)
+                {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
@@ -682,7 +668,7 @@ fn execve_with_inode(
                 main_entry,
                 main_aux,
                 interp_base,
-                &interp_data,
+                &interp_data.data,
                 args_vec,
                 envs_vec,
                 exec_inode,
@@ -697,7 +683,7 @@ fn execve_with_inode(
             inode.read_at(offset, buf)
         };
         let (memory_set, ustack_base, entry_point, elf_aux) =
-            match MemorySet::from_elf_reader(loader) {
+            match MemorySet::from_elf_info_reader(loader, &info) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
@@ -733,7 +719,7 @@ fn execve_with_inode(
         let opt_arg_ref = opt_arg.as_deref();
         let extra_shell_arg = shebang_shell_extra_arg(interp_name, opt_arg_ref);
         match load_file_from_path(&interp) {
-            Ok(interp_data) if is_elf(&interp_data) => {
+            Ok(interp_data) if is_elf(&interp_data.data) => {
                 let mut new_args: Vec<String> = Vec::new();
                 new_args.push(interp.clone());
                 if let Some(a) = opt_arg_ref {
@@ -766,7 +752,7 @@ fn execve_with_inode(
         }
         if wants_shell {
             if let Ok(Some((interp_path, interp_data, needs_sh_arg))) = find_shell_interpreter() {
-                if !is_elf(&interp_data) {
+                if !is_elf(&interp_data.data) {
                     return ENOEXEC;
                 }
                 let mut new_args: Vec<String> = Vec::new();
@@ -786,7 +772,7 @@ fn execve_with_inode(
         }
         match load_file_from_path(&interp) {
             Ok(interp_data) => {
-                if is_elf(&interp_data) {
+                if is_elf(&interp_data.data) {
                     let mut new_args: Vec<String> = Vec::new();
                     new_args.push(interp.clone());
                     if let Some(a) = opt_arg_ref {
@@ -818,7 +804,7 @@ fn execve_with_inode(
             let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
                 return err(SyscallError::ENOENT);
             };
-            if !is_elf(&interp_data) {
+            if !is_elf(&interp_data.data) {
                 return ENOEXEC;
             }
             let mut new_args: Vec<String> = Vec::new();
@@ -836,25 +822,7 @@ fn execve_with_inode(
             if let Err(e) = validate_exec_stack_args(&new_args, &envs_vec) {
                 return e;
             }
-            let process = current_process();
-            let interp_abi = crate::mm::elf_arch_abi_from_bytes(&interp_data).ok();
-            if let Some(interp_interp) = elf_interp_path(&interp_data) {
-                let interp_interp_data = match load_interp_data(&interp_interp, interp_abi) {
-                    Ok(data) => data,
-                    Err(e) => return e,
-                };
-                if let Err(e) =
-                    process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec)
-                {
-                    return e;
-                }
-            } else {
-                if let Err(e) = process.exec(&interp_data, new_args, envs_vec) {
-                    return e;
-                }
-            }
-            maybe_stop_after_ptrace_exec();
-            return 0;
+            return exec_interpreter(interp_data, new_args, envs_vec);
         }
         return ENOEXEC;
     }
@@ -870,7 +838,7 @@ fn execve_with_inode(
         let Some((interp_path, interp_data, needs_sh_arg)) = interp else {
             return err(SyscallError::ENOENT);
         };
-        if !is_elf(&interp_data) {
+        if !is_elf(&interp_data.data) {
             return ENOEXEC;
         }
         let mut new_args: Vec<String> = Vec::new();
@@ -885,24 +853,7 @@ fn execve_with_inode(
         if let Err(e) = validate_exec_stack_args(&new_args, &envs_vec) {
             return e;
         }
-        let process = current_process();
-        let interp_abi = crate::mm::elf_arch_abi_from_bytes(&interp_data).ok();
-        if let Some(interp_interp) = elf_interp_path(&interp_data) {
-            let interp_interp_data = match load_interp_data(&interp_interp, interp_abi) {
-                Ok(data) => data,
-                Err(e) => return e,
-            };
-            if let Err(e) = process.exec_dyn(&interp_data, &interp_interp_data, new_args, envs_vec)
-            {
-                return e;
-            }
-        } else {
-            if let Err(e) = process.exec(&interp_data, new_args, envs_vec) {
-                return e;
-            }
-        }
-        maybe_stop_after_ptrace_exec();
-        return 0;
+        return exec_interpreter(interp_data, new_args, envs_vec);
     }
 
     // Non-ELF without shebang: let shells interpret it.
@@ -976,11 +927,13 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
             return e;
         }
     };
-    if is_inode_open_for_write(inode.inode_num()) {
-        return err(SyscallError::ETXTBSY);
-    }
+    let exec_reservation =
+        match crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num()) {
+            Ok(reservation) => reservation,
+            Err(e) => return e,
+        };
 
-    execve_with_inode(path, args_vec, envs_vec, inode)
+    execve_with_inode(path, args_vec, envs_vec, inode, exec_reservation)
 }
 
 pub fn syscall_execveat(
@@ -1007,8 +960,10 @@ pub fn syscall_execveat(
         Ok(inode) => inode,
         Err(e) => return e,
     };
-    if is_inode_open_for_write(inode.inode_num()) {
-        return err(SyscallError::ETXTBSY);
-    }
-    execve_with_inode(path, args_vec, envs_vec, inode)
+    let exec_reservation =
+        match crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num()) {
+            Ok(reservation) => reservation,
+            Err(e) => return e,
+        };
+    execve_with_inode(path, args_vec, envs_vec, inode, exec_reservation)
 }

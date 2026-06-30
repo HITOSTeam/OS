@@ -21,8 +21,8 @@ use crate::task::FilesStruct;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidAllocError, PidHandle, pid_alloc};
 use crate::task::manager::{
-    PID2PCB, add_task, insert_into_pid2process, prime_fair_exec_start, remove_inactive_task,
-    select_hart_for_new_task, wakeup_task,
+    PID2PCB, add_task, insert_into_pid2process, prime_fair_exec_start, release_process_mm_owner,
+    remove_inactive_task, select_hart_for_new_task, wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::sched::{SCHED_DEADLINE, SCHED_FIFO, SCHED_OTHER, SCHED_RR};
@@ -102,6 +102,45 @@ pub fn register_pid_namespace(parent_ns_id: usize, child_ns_id: usize) {
     PID_NAMESPACE_PARENTS
         .write()
         .insert(child_ns_id, parent_ns_id);
+}
+
+pub fn pid_namespace_parent(namespace_id: usize) -> Option<usize> {
+    if namespace_id == 0 {
+        return None;
+    }
+    PID_NAMESPACE_PARENTS.read().get(&namespace_id).copied()
+}
+
+pub fn register_pid_namespace_reaper(namespace_id: usize, reaper_pid: usize) {
+    PID_NAMESPACE_REAPERS
+        .write()
+        .insert(namespace_id, reaper_pid);
+}
+
+pub fn unregister_pid_namespace_reaper(namespace_id: usize, reaper_pid: usize) {
+    let mut reapers = PID_NAMESPACE_REAPERS.write();
+    if reapers
+        .get(&namespace_id)
+        .is_some_and(|registered| *registered == reaper_pid)
+    {
+        reapers.remove(&namespace_id);
+    }
+}
+
+pub fn unregister_pid_namespace_reaper_for_process(process: &ProcessControlBlock) {
+    let (namespace_id, is_namespace_init) = {
+        let inner = process.borrow_mut();
+        (inner.pid_ns_id, inner.pid_ns_init)
+    };
+    if is_namespace_init {
+        unregister_pid_namespace_reaper(namespace_id, process.getpid());
+    }
+}
+
+pub fn pid_namespace_reaper(namespace_id: usize) -> Option<Arc<ProcessControlBlock>> {
+    let reaper_pid = PID_NAMESPACE_REAPERS.read().get(&namespace_id).copied()?;
+    let map = PID2PCB.lock();
+    map.get(&reaper_pid).map(Arc::clone)
 }
 
 pub fn pid_namespace_descends_from(ns_id: usize, ancestor_ns_id: usize) -> bool {
@@ -275,6 +314,9 @@ fn process_comm_from_argv(argv: &[String]) -> String {
 lazy_static! {
     /// child pid namespace id -> parent pid namespace id.
     static ref PID_NAMESPACE_PARENTS: RwLock<BTreeMap<usize, usize>> =
+        RwLock::new(BTreeMap::new());
+    /// pid namespace id -> namespace init/reaper global pid.
+    static ref PID_NAMESPACE_REAPERS: RwLock<BTreeMap<usize, usize>> =
         RwLock::new(BTreeMap::new());
 }
 
@@ -947,6 +989,7 @@ pub struct ProcessScheduling {
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
+    parent_visible_pid: AtomicUsize,
     // mutable
     inner: SpinMutex<ProcessControlBlockInner>,
 }
@@ -1181,6 +1224,43 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    fn cached_parent_visible_pid(
+        child_pid_ns_id: usize,
+        parent_pid_ns_id: usize,
+        parent_visible_pid: usize,
+    ) -> usize {
+        if child_pid_ns_id == 0 || child_pid_ns_id == parent_pid_ns_id {
+            parent_visible_pid
+        } else {
+            0
+        }
+    }
+
+    pub fn fast_parent_visible_pid(&self) -> usize {
+        self.parent_visible_pid.load(Ordering::Acquire)
+    }
+
+    pub fn update_parent_visible_pid(&self, parent_pid_ns_id: usize, parent_visible_pid: usize) {
+        let child_pid_ns_id = {
+            let inner = self.borrow_mut();
+            inner.pid_ns_id
+        };
+        let cached =
+            Self::cached_parent_visible_pid(child_pid_ns_id, parent_pid_ns_id, parent_visible_pid);
+        self.parent_visible_pid.store(cached, Ordering::Release);
+    }
+
+    pub fn update_parent_visible_pid_from_locked_child(
+        &self,
+        child_pid_ns_id: usize,
+        parent_pid_ns_id: usize,
+        parent_visible_pid: usize,
+    ) {
+        let cached =
+            Self::cached_parent_visible_pid(child_pid_ns_id, parent_pid_ns_id, parent_visible_pid);
+        self.parent_visible_pid.store(cached, Ordering::Release);
+    }
+
     /// CLONE_VFORK blocks the parent until the child either execs or exits.
     /// Exit wakes this queue through the normal child-exit path; exec must
     /// drain the same parent-owned queue before replacing the child's mm.
@@ -1300,6 +1380,7 @@ impl ProcessControlBlock {
         );
         let process = Arc::new(Self {
             pid: pid_handle,
+            parent_visible_pid: AtomicUsize::new(0),
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
                 dumped_core: false,
@@ -1398,7 +1479,7 @@ impl ProcessControlBlock {
                 cgroup_ns_root: String::from("/"),
                 pid_ns_id: 0,
                 pid_ns_vpid: pid,
-                pid_ns_init: false,
+                pid_ns_init: true,
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
                 signals_masks: SignalFlags::empty(),
@@ -1462,6 +1543,7 @@ impl ProcessControlBlock {
         process_inner.tasks.push(Some(Arc::clone(&task)));
         drop(process_inner);
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
+        register_pid_namespace_reaper(0, process.getpid());
         // add main thread to scheduler
         crate::println!(
             "[proc] init main thread pid={} tid=0 entry={:#x} ustack_top={:#x} kstack_top={:#x}",
@@ -1483,6 +1565,7 @@ impl ProcessControlBlock {
         elf_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
+        exec_inode: (usize, u32),
     ) -> Result<(), isize> {
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)?;
         self.exec_with_memory_set(
@@ -1492,7 +1575,7 @@ impl ProcessControlBlock {
             args,
             envs,
             elf_aux,
-            (0, 0),
+            exec_inode,
         );
         Ok(())
     }
@@ -1506,6 +1589,7 @@ impl ProcessControlBlock {
         interp_data: &[u8],
         args: Vec<String>,
         envs: Vec<String>,
+        exec_inode: (usize, u32),
     ) -> Result<(), isize> {
         let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
             MemorySet::from_elf_with_interp(elf_data, interp_data)?;
@@ -1519,7 +1603,7 @@ impl ProcessControlBlock {
             interp_data,
             args,
             envs,
-            (0, 0),
+            exec_inode,
         );
         Ok(())
     }
@@ -1574,25 +1658,22 @@ impl ProcessControlBlock {
             inner.keep_caps = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
-            let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
-            crate::syscall::process::unregister_executing_inode_locked(
-                &mut executing_inodes,
+            crate::syscall::process::unregister_executing_inode(
                 inner.exec_inode_dev,
                 inner.exec_inode_num,
             );
             inner.exec_inode_dev = exec_inode.0;
             inner.exec_inode_num = exec_inode.1;
-            crate::syscall::process::register_executing_inode_locked(
-                &mut executing_inodes,
-                exec_inode.0,
-                exec_inode.1,
-            );
+            crate::syscall::process::register_executing_inode(exec_inode.0, exec_inode.1);
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
         };
-        self.wake_vfork_parent_waiters_after_exec();
         task.set_memory_set(new_memory_set);
-        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        let old_mm_still_owned = release_process_mm_owner(old_mm_token);
+        self.wake_vfork_parent_waiters_after_exec();
+        if !old_mm_still_owned {
+            crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        }
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
@@ -1680,25 +1761,22 @@ impl ProcessControlBlock {
             inner.keep_caps = false;
             inner.argv = args.clone();
             inner.comm = process_comm_from_argv(&args);
-            let mut executing_inodes = crate::syscall::process::lock_executing_inodes();
-            crate::syscall::process::unregister_executing_inode_locked(
-                &mut executing_inodes,
+            crate::syscall::process::unregister_executing_inode(
                 inner.exec_inode_dev,
                 inner.exec_inode_num,
             );
             inner.exec_inode_dev = exec_inode.0;
             inner.exec_inode_num = exec_inode.1;
-            crate::syscall::process::register_executing_inode_locked(
-                &mut executing_inodes,
-                exec_inode.0,
-                exec_inode.1,
-            );
+            crate::syscall::process::register_executing_inode(exec_inode.0, exec_inode.1);
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
         };
-        self.wake_vfork_parent_waiters_after_exec();
         task.set_memory_set(new_memory_set);
-        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        let old_mm_still_owned = release_process_mm_owner(old_mm_token);
+        self.wake_vfork_parent_waiters_after_exec();
+        if !old_mm_still_owned {
+            crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        }
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
@@ -1873,6 +1951,7 @@ impl ProcessControlBlock {
         // alloc a pid
         let pid = pid_alloc()?;
         let pid_value = pid.0;
+        let parent_visible_pid = parent.pid_ns_vpid;
         let parent_files = Arc::clone(&parent.files);
         let pgid = parent.pgid;
         let sid = parent.sid;
@@ -1934,6 +2013,7 @@ impl ProcessControlBlock {
         // create child process pcb
         let child = Arc::new(Self {
             pid,
+            parent_visible_pid: AtomicUsize::new(parent_visible_pid),
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
                 dumped_core: false,

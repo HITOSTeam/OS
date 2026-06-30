@@ -19,8 +19,8 @@ use spin::Mutex;
 
 use crate::bpf::BpfProgFile;
 use crate::fs::{
-    File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, ext4_lock,
-    find_path_in_roots, make_socketpair, wake_tasks,
+    File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, clear_ext4_path_cache,
+    ext4_lock, find_path_in_roots, make_socketpair, wake_tasks,
 };
 use crate::mm::{
     UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
@@ -1331,10 +1331,13 @@ pub(super) fn bind_unix_socket(
             }
             return err(SyscallError::EINVAL);
         }
+        clear_ext4_path_cache();
         let reg_result = register_unix_bound_socket(sock.net_ns_id, &bound, file);
         if reg_result != 0 {
             // 注册失败（如另一个 socket 已占用此路径），回滚删除刚创建的占位文件
-            let _ = parent.unlink(name);
+            if parent.unlink(name).is_ok() {
+                clear_ext4_path_cache();
+            }
             return reg_result;
         }
     } else {

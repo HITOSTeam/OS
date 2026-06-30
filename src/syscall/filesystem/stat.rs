@@ -1,21 +1,21 @@
 use super::{
     AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE, AT_SYMLINK_NOFOLLOW, AtPath,
-    BTreeSet, CgroupFile, EXT4_ST_DEV, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE,
-    FALLOC_FL_SUPPORTED_MASK, FS_APPEND_FL, FS_IMMUTABLE_FL, FifoDuplexFile, File, KStat,
-    NetSocketFile, OSInode, PID2PCB, Pipe, ProcPseudoFile, ProcessControlBlock, PseudoBlock,
-    PseudoDir, PseudoFile, PseudoShmFile, RtcFile, Statx, String, SyscallError, TimeSpec, Vec,
-    current_effective_uid_gid, current_fsuid_gid, current_process, current_timespec, err,
-    ext4_lock, fd_has_o_path, file_lock_key_from_inode, fill_statfs, find_path_in_roots,
-    flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file, get_inode_times,
-    inode_fs_flags, inode_mode_allows_uid_gid, inode_rdev_for_mode, inode_visible_size,
-    is_privileged_or_owner, kstat_from_dev_pts_path, kstat_from_fd, kstat_from_file,
+    BTreeSet, CgroupFile, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_SUPPORTED_MASK,
+    FS_APPEND_FL, FS_IMMUTABLE_FL, FifoDuplexFile, File, KStat, NetSocketFile, OSInode, PID2PCB,
+    Pipe, ProcPseudoFile, ProcessControlBlock, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
+    RtcFile, Statx, String, SyscallError, TimeSpec, Vec, current_effective_uid_gid,
+    current_fsuid_gid, current_process, current_timespec, err, ext4_lock, fd_has_o_path,
+    file_lock_key_from_inode, fill_statfs, find_path_in_roots, flush_open_inode_views,
+    fsize_limit_allows, get_current_token, get_fd_file, get_inode_times, inode_fs_flags,
+    inode_mode_allows_uid_gid, inode_visible_size_with_disk_size, is_privileged_or_owner,
+    kstat_from_dev_pts_path, kstat_from_ext4_snapshot, kstat_from_fd, kstat_from_file,
     kstat_from_followed_proc_symlink, maybe_signal_lease_break, open_pseudo,
     proc_magic_link_target_kstat, proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync,
     punch_hole_keep_size, read_user_cstring, require_fd_file, resolve_abs_path, resolve_at_inode,
-    resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, stat_blocks_for_mode_size,
-    statfs_mount_flags_for_abs, statx_from_kstat, sync_all, touch_inode_mtime_ctime_now,
-    truncate_regular_inode, try_copy_to_user, try_read_user_value, try_write_user_value,
-    update_current_inode_mmaps_size, update_current_os_inode_mmaps_size, write_zeros_range,
+    resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, statfs_mount_flags_for_abs,
+    statx_from_kstat, sync_all, touch_inode_mtime_ctime_now, truncate_regular_inode,
+    try_copy_to_user, try_read_user_value, try_write_user_value, update_current_inode_mmaps_size,
+    update_current_os_inode_mmaps_size, write_zeros_range,
 };
 use crate::fs::TunTapFile;
 
@@ -760,6 +760,73 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
     0
 }
 
+fn kstat_from_ext4_inode(inode: &alloc::sync::Arc<ext4_fs::Inode>) -> KStat {
+    let meta = {
+        let _ext4_guard = ext4_lock();
+        inode.stat_snapshot()
+    };
+    let visible_size = inode_visible_size_with_disk_size(inode, meta.size as usize);
+    kstat_from_ext4_snapshot(meta, visible_size)
+}
+
+fn resolve_ext4_stat_kstat(
+    at: &AtPath,
+    dirfd: isize,
+    path: &str,
+    fsuid: u32,
+    fsgid: u32,
+    follow_final: bool,
+) -> Result<KStat, isize> {
+    if !follow_final {
+        let inode = {
+            let _ext4_guard = ext4_lock();
+            resolve_at_inode(at, fsuid, fsgid, false)?
+        };
+        return Ok(kstat_from_ext4_inode(&inode));
+    }
+
+    let (inode, is_symlink) = {
+        let _ext4_guard = ext4_lock();
+        let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
+        let is_symlink = inode.is_symlink();
+        (inode, is_symlink)
+    };
+    if !is_symlink {
+        return Ok(kstat_from_ext4_inode(&inode));
+    }
+
+    if let Some(abs) = resolve_abs_path(dirfd, path)? {
+        if let Some(st) = kstat_from_followed_proc_symlink(&abs)? {
+            return Ok(st);
+        }
+    }
+
+    let inode = {
+        let _ext4_guard = ext4_lock();
+        resolve_at_inode(at, fsuid, fsgid, true)?
+    };
+    Ok(kstat_from_ext4_inode(&inode))
+}
+
+fn busybox_fallback_kstat() -> Option<KStat> {
+    let candidates = [
+        "/musl/busybox",
+        "/glibc/busybox",
+        "/bin/busybox",
+        "/busybox",
+    ];
+    for cand in candidates {
+        let inode = {
+            let _ext4_guard = ext4_lock();
+            find_path_in_roots(cand)
+        };
+        if let Some(inode) = inode {
+            return Some(kstat_from_ext4_inode(&inode));
+        }
+    }
+    None
+}
+
 /// Returns `newfstatat(2)` metadata for ext4, pseudo, and proc magic-link paths.
 pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: usize) -> isize {
     if st_ptr == 0 {
@@ -784,10 +851,6 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
         return err(SyscallError::ENOENT);
     }
 
-    let raw_abs = match resolve_abs_path(dirfd, &path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
@@ -795,6 +858,10 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     // Pseudo nodes: return minimal metadata.
     if let AtPath::PseudoAbs(abs) = &at {
+        let raw_abs = match resolve_abs_path(dirfd, &path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
             if crate::fs::proc_magic_link_exists(proc_path) {
                 let st = if (_flags & AT_SYMLINK_NOFOLLOW) != 0 {
@@ -835,78 +902,18 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
-    if follow_final {
-        if let Some(abs) = raw_abs.as_deref() {
-            match kstat_from_followed_proc_symlink(abs) {
-                Ok(Some(st)) => {
-                    if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
-                        return err(SyscallError::EFAULT);
-                    }
-                    return 0;
-                }
-                Ok(None) => {}
-                Err(e) => return e,
-            }
-        }
-    }
-    let _ext4_guard = ext4_lock();
-    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+    let st = match resolve_ext4_stat_kstat(&at, dirfd, &path, fsuid, fsgid, follow_final) {
         Ok(v) => v,
         Err(e)
             if e == err(SyscallError::ENOENT)
                 && matches!(path.as_str(), "busybox" | "./busybox") =>
         {
-            let candidates = [
-                "/musl/busybox",
-                "/glibc/busybox",
-                "/bin/busybox",
-                "/busybox",
-            ];
-            let mut found = None;
-            for cand in candidates {
-                if let Some(inode) = find_path_in_roots(cand) {
-                    found = Some(inode);
-                    break;
-                }
-            }
-            match found {
+            match busybox_fallback_kstat() {
                 Some(v) => v,
                 None => return err(SyscallError::ENOENT),
             }
         }
         Err(e) => return e,
-    };
-
-    let mode_raw = inode.mode();
-    let mode = mode_raw as u32;
-    let uid = inode.uid();
-    let gid = inode.gid();
-    let nlink = inode.link_count();
-    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
-    let size = inode_visible_size(&inode) as i64;
-    let blocks = stat_blocks_for_mode_size(mode, size);
-    let times = get_inode_times(inode.inode_num() as u64);
-
-    let st = KStat {
-        st_dev: EXT4_ST_DEV,
-        st_ino: inode.inode_num() as u64,
-        st_mode: mode,
-        st_nlink: nlink,
-        st_uid: uid,
-        st_gid: gid,
-        st_rdev,
-        __pad: 0,
-        st_size: size,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: blocks,
-        st_atime_sec: times.atime_sec,
-        st_atime_nsec: times.atime_nsec,
-        st_mtime_sec: times.mtime_sec,
-        st_mtime_nsec: times.mtime_nsec,
-        st_ctime_sec: times.ctime_sec,
-        st_ctime_nsec: times.ctime_nsec,
-        __unused: [0, 0],
     };
 
     if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
@@ -960,18 +967,17 @@ pub fn syscall_statx(
     if dirfd < 0 && dirfd != AT_FDCWD {
         return err(SyscallError::EBADF);
     }
-    let effective_dirfd = dirfd;
-    let raw_abs = match resolve_abs_path(effective_dirfd, &path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let at = match resolve_at_path(effective_dirfd, &path) {
+    let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
     // Pseudo nodes: return minimal metadata.
     if let AtPath::PseudoAbs(abs) = &at {
+        let raw_abs = match resolve_abs_path(dirfd, &path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
             if crate::fs::proc_magic_link_exists(proc_path) {
                 let st = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
@@ -1013,75 +1019,21 @@ pub fn syscall_statx(
     }
 
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    if follow_final {
-        if let Some(abs) = raw_abs.as_deref() {
-            match kstat_from_followed_proc_symlink(abs) {
-                Ok(Some(st)) => {
-                    let stx = statx_from_kstat(&st);
-                    if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
-                        return err(SyscallError::EFAULT);
-                    }
-                    return 0;
-                }
-                Ok(None) => {}
-                Err(e) => return e,
-            }
-        }
-    }
-
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
-    let mut inode = resolve_at_inode(&at, fsuid, fsgid, follow_final).ok();
-    if inode.is_none() && matches!(path.as_str(), "busybox" | "./busybox") {
-        let candidates = [
-            "/musl/busybox",
-            "/glibc/busybox",
-            "/bin/busybox",
-            "/busybox",
-        ];
-        for cand in candidates {
-            if let Some(found) = find_path_in_roots(cand) {
-                inode = Some(found);
-                break;
+    let st = match resolve_ext4_stat_kstat(&at, dirfd, &path, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(e)
+            if e == err(SyscallError::ENOENT)
+                && matches!(path.as_str(), "busybox" | "./busybox") =>
+        {
+            match busybox_fallback_kstat() {
+                Some(v) => v,
+                None => return err(SyscallError::ENOENT),
             }
         }
-    }
-
-    let Some(inode) = inode else {
-        return err(SyscallError::ENOENT);
+        Err(e) => return e,
     };
 
-    let mode_raw = inode.mode();
-    let mode = mode_raw as u32;
-    let uid = inode.uid();
-    let gid = inode.gid();
-    let nlink = inode.link_count();
-    let st_rdev = inode_rdev_for_mode(&inode, mode_raw);
-    let size = inode_visible_size(&inode) as i64;
-    let blocks = stat_blocks_for_mode_size(mode, size);
-    let times = get_inode_times(inode.inode_num() as u64);
-
-    let st = KStat {
-        st_dev: EXT4_ST_DEV,
-        st_ino: inode.inode_num() as u64,
-        st_mode: mode,
-        st_nlink: nlink,
-        st_uid: uid,
-        st_gid: gid,
-        st_rdev,
-        __pad: 0,
-        st_size: size,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: blocks,
-        st_atime_sec: times.atime_sec,
-        st_atime_nsec: times.atime_nsec,
-        st_mtime_sec: times.mtime_sec,
-        st_mtime_nsec: times.mtime_nsec,
-        st_ctime_sec: times.ctime_sec,
-        st_ctime_nsec: times.ctime_nsec,
-        __unused: [0, 0],
-    };
     let stx = statx_from_kstat(&st);
     if try_write_user_value(token, stx_ptr as *mut Statx, &stx).is_err() {
         return err(SyscallError::EFAULT);

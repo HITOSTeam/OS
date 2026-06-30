@@ -109,13 +109,14 @@ impl MmapSource<'_> {
         match self {
             Self::Anonymous | Self::DevZero => map_len,
             Self::RegularFile { inode_file, .. } => {
-                let pending_end = inode_file.pending_write_end();
                 let inode = inode_file.ext4_inode();
                 let file_size = {
                     let _ext4_guard = ext4_lock();
                     inode.size() as usize
-                }
-                .max(pending_end);
+                };
+                let file_size = crate::syscall::filesystem::inode_visible_size_with_disk_size(
+                    &inode, file_size,
+                );
                 file_size.saturating_sub(off).min(map_len)
             }
             Self::Shm { shm, .. } => shm.len().saturating_sub(off).min(map_len),
@@ -1073,13 +1074,13 @@ pub fn syscall_mremap(
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
             return err(SyscallError::ENOMEM);
         };
-        let pending_end = os_inode.pending_write_end();
         let inode = os_inode.ext4_inode();
         let file_size = {
             let _ext4_guard = ext4_lock();
             inode.size() as usize
-        }
-        .max(pending_end);
+        };
+        let file_size =
+            crate::syscall::filesystem::inode_visible_size_with_disk_size(&inode, file_size);
         let old_slice_file_valid_len = src_region
             .file_valid_end()
             .saturating_sub(old_addr)

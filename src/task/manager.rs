@@ -25,14 +25,17 @@ pub use self::fair::{
     prime_fair_timer_wakeup_lag, protect_fair_fork_parent, record_fair_sleep_lag,
 };
 pub use self::pid_map::{
-    insert_into_pid2process, live_process_uses_net_namespace, pid2process, remove_from_pid2process,
+    insert_into_pid2process, live_process_uses_net_namespace, pid2process,
+    register_shared_mm_process_owner, release_process_mm_owner, remove_from_pid2process,
 };
 pub use self::rt::{account_rt_runtime, rt_bandwidth_throttled};
 pub use self::run_queue::TaskManager;
 
 use self::fair::{EnqueueKind, ReadyQueueSlot, task_queue_slot};
 use self::rt::{has_ready_rt_count_at_or_above, has_ready_rt_count_higher_than, ready_fair_count};
-use self::run_queue::{hart_bit, resolve_enqueue_hart, resolve_wakeup_hart};
+use self::run_queue::{
+    hart_bit, resolve_enqueue_hart, resolve_sync_wakeup_hart, resolve_wakeup_hart,
+};
 
 /// 轮询分配的下一个 hart 计数器，用于新任务在不同 hart 间实现简单负载均衡
 static NEXT_HART: AtomicUsize = AtomicUsize::new(0);
@@ -83,12 +86,20 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
 }
 
-fn enqueue_task(task: Arc<TaskControlBlock>, kind: EnqueueKind) -> Option<(usize, bool)> {
+fn enqueue_task_with_wakeup_flags(
+    task: Arc<TaskControlBlock>,
+    kind: EnqueueKind,
+    sync_source_hart: Option<usize>,
+) -> Option<(usize, bool)> {
     // 保护就绪队列，避免 timer 中断重入；随后恢复先前的 SIE 状态。
     let prev_sie = arch::disable_interrupts();
     let mask = online_hart_mask();
     let cur = crate::task::processor::hart_id() % MAX_HARTS;
-    let hart_id = if kind == EnqueueKind::Wakeup {
+    let hart_id = if kind == EnqueueKind::Wakeup
+        && let Some(sync_source_hart) = sync_source_hart.filter(|hart| *hart < MAX_HARTS)
+    {
+        resolve_sync_wakeup_hart(&task, sync_source_hart, mask)
+    } else if kind == EnqueueKind::Wakeup {
         // Linux 唤醒具有 CPU 亲和性：睡眠任务通常会重新入队到上一次运行的 CPU，
         // 除非 affinity 禁止。
         resolve_wakeup_hart(&task, cur, mask)
@@ -98,6 +109,10 @@ fn enqueue_task(task: Arc<TaskControlBlock>, kind: EnqueueKind) -> Option<(usize
     let queued = TASK_MANAGER.add(Arc::clone(&task), hart_id, kind);
     arch::restore_interrupts(prev_sie);
     queued.map(|was_empty| (hart_id, was_empty))
+}
+
+fn enqueue_task(task: Arc<TaskControlBlock>, kind: EnqueueKind) -> Option<(usize, bool)> {
+    enqueue_task_with_wakeup_flags(task, kind, None)
 }
 
 /// 将新创建的任务加入某个在线 hart 的就绪队列。
@@ -201,30 +216,37 @@ impl WakeupBatch {
 }
 
 fn wakeup_task_with_batch(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
-    wakeup_task_with_batch_inner(task, batch, true);
+    wakeup_task_with_batch_inner(task, batch, true, None);
+}
+
+fn wakeup_sync_task_with_batch(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
+    let source_hart = crate::task::processor::hart_id() % MAX_HARTS;
+    wakeup_sync_task_on_hart_with_batch(task, source_hart, batch);
+}
+
+fn wakeup_sync_task_on_hart_with_batch(
+    task: Arc<TaskControlBlock>,
+    source_hart: usize,
+    batch: &mut WakeupBatch,
+) {
+    wakeup_task_with_batch_inner(task, batch, true, Some(source_hart));
 }
 
 fn wakeup_signal_task_with_batch(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
-    wakeup_task_with_batch_inner(task, batch, false);
+    wakeup_task_with_batch_inner(task, batch, false, None);
 }
 
 fn wakeup_task_with_batch_inner(
     task: Arc<TaskControlBlock>,
     batch: &mut WakeupBatch,
     allow_fair_preempt: bool,
+    sync_source_hart: Option<usize>,
 ) {
-    fn wake_if_blocked(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
-        wake_if_blocked_inner(task, batch, true);
-    }
-
-    fn wake_if_blocked_signal(task: Arc<TaskControlBlock>, batch: &mut WakeupBatch) {
-        wake_if_blocked_inner(task, batch, false);
-    }
-
     fn wake_if_blocked_inner(
         task: Arc<TaskControlBlock>,
         batch: &mut WakeupBatch,
         allow_fair_preempt: bool,
+        sync_source_hart: Option<usize>,
     ) {
         let mut task_inner = task.borrow_mut();
         if task_inner.res.is_none() {
@@ -235,6 +257,10 @@ fn wakeup_task_with_batch_inner(
                 task_inner.wake_on_cgroup_thaw = true;
                 task.wakeup_pending
                     .store(false, core::sync::atomic::Ordering::Release);
+                task.wakeup_sync_hart.store(
+                    TaskControlBlock::OFF_CPU,
+                    core::sync::atomic::Ordering::Release,
+                );
                 return;
             }
             task_inner.task_status = TaskStatus::Ready;
@@ -242,9 +268,16 @@ fn wakeup_task_with_batch_inner(
             task_inner.wake_on_cgroup_thaw = false;
             task.wakeup_pending
                 .store(false, core::sync::atomic::Ordering::Release);
+            task.wakeup_sync_hart.store(
+                TaskControlBlock::OFF_CPU,
+                core::sync::atomic::Ordering::Release,
+            );
             drop(task_inner);
-            if let Some((hart_id, was_empty)) = enqueue_task(Arc::clone(&task), EnqueueKind::Wakeup)
-            {
+            if let Some((hart_id, was_empty)) = enqueue_task_with_wakeup_flags(
+                Arc::clone(&task),
+                EnqueueKind::Wakeup,
+                sync_source_hart,
+            ) {
                 if allow_fair_preempt {
                     batch.note_enqueued(&task, hart_id, was_empty);
                 } else {
@@ -254,27 +287,33 @@ fn wakeup_task_with_batch_inner(
         }
     }
 
+    fn take_pending_sync_hart(task: &Arc<TaskControlBlock>) -> Option<usize> {
+        let hart = task.wakeup_sync_hart.swap(
+            TaskControlBlock::OFF_CPU,
+            core::sync::atomic::Ordering::AcqRel,
+        );
+        (hart < MAX_HARTS).then_some(hart)
+    }
+
     // SMP 安全性：如果任务确实仍在某个 hart 上执行，不要直接入队
     // （否则会在同一个内核栈上竞争）。改为标记待处理唤醒，让该 hart
     // 切回 idle 后再把任务入队。
     if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
+        if let Some(source_hart) = sync_source_hart.filter(|hart| *hart < MAX_HARTS) {
+            task.wakeup_sync_hart
+                .store(source_hart, core::sync::atomic::Ordering::Release);
+        }
         task.wakeup_pending
             .store(true, core::sync::atomic::Ordering::Release);
         if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) == TaskControlBlock::OFF_CPU {
-            if allow_fair_preempt {
-                wake_if_blocked(task, batch);
-            } else {
-                wake_if_blocked_signal(task, batch);
-            }
+            let effective_sync_source = sync_source_hart.or_else(|| take_pending_sync_hart(&task));
+            wake_if_blocked_inner(task, batch, allow_fair_preempt, effective_sync_source);
         }
         return;
     }
 
-    if allow_fair_preempt {
-        wake_if_blocked(task, batch);
-    } else {
-        wake_if_blocked_signal(task, batch);
-    }
+    let effective_sync_source = sync_source_hart.or_else(|| take_pending_sync_hart(&task));
+    wake_if_blocked_inner(task, batch, allow_fair_preempt, effective_sync_source);
 }
 
 /// 在进程调度策略/优先级/nice 值变更后，重新将其所有可运行线程入队到正确的位置
@@ -354,6 +393,23 @@ pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     batch.flush();
 }
 
+/// 同步唤醒一个阻塞中的任务。
+///
+/// 对应 Linux `WF_SYNC`/`wake_up_interruptible_sync*` 这类 handoff：调用者确信
+/// wakee 是直接同步等待者，且当前任务很可能马上阻塞或交出控制权。fair wakee
+/// 在 affinity 允许时优先回到当前 hart，普通通知型 waiter 不应使用该入口。
+pub fn wakeup_sync_task(task: Arc<TaskControlBlock>) {
+    let mut batch = WakeupBatch::default();
+    wakeup_sync_task_with_batch(task, &mut batch);
+    batch.flush();
+}
+
+pub fn wakeup_sync_task_on_hart(task: Arc<TaskControlBlock>, source_hart: usize) {
+    let mut batch = WakeupBatch::default();
+    wakeup_sync_task_on_hart_with_batch(task, source_hart, &mut batch);
+    batch.flush();
+}
+
 /// `wakeup_task` 的批量版本，用于 Linux 风格的信号扇出和 wake_q 使用者。
 /// 它保留每个任务的阻塞/on-cpu 竞态处理，但会把远端 idle kick 和重调度 IPI
 /// 合并到最后一次 flush 中。
@@ -361,6 +417,14 @@ pub fn wakeup_tasks(tasks: alloc::vec::Vec<Arc<TaskControlBlock>>) {
     let mut batch = WakeupBatch::default();
     for task in tasks {
         wakeup_task_with_batch(task, &mut batch);
+    }
+    batch.flush();
+}
+
+pub fn wakeup_sync_tasks(tasks: alloc::vec::Vec<Arc<TaskControlBlock>>) {
+    let mut batch = WakeupBatch::default();
+    for task in tasks {
+        wakeup_sync_task_with_batch(task, &mut batch);
     }
     batch.flush();
 }

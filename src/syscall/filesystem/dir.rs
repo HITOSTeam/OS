@@ -6,7 +6,8 @@ use super::{
     ext4_err_to_errno, ext4_lock, final_non_empty_component, get_current_token, get_fd_file,
     gid_for_created_inode, hardlink_cross_mount, inode_is_immutable_or_append,
     inode_is_rofs_mount_root, inode_logical_path, inode_mode_allows_uid_gid,
-    maybe_update_inode_atime, min, mode_for_created_file, open_pseudo, parent_forces_gid_inherit,
+    invalidate_ext4_path_cache_for_at, invalidate_ext4_path_cache_inode, maybe_update_inode_atime,
+    min, mode_for_created_file, open_pseudo, parent_forces_gid_inherit,
     parse_proc_fd_for_current_process, path_is_mount_point, proc_path_for_at, read_u16_le,
     read_u32_le, read_user_cstring, resolve_abs_path, resolve_at_inode, resolve_at_path,
     resolve_parent_and_name, rofs_for_path, shm_object_name, shm_remove, sticky_rename_allowed,
@@ -151,6 +152,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
 
     match parent.create_symlink(&name, &target_path) {
         Ok(inode) => {
+            invalidate_ext4_path_cache_for_at(&at, false);
             let gid = gid_for_created_inode(Some(&parent), fsgid);
             inode.set_uid_gid(fsuid, gid);
             inode.set_mode(0o777);
@@ -297,7 +299,10 @@ pub fn syscall_linkat(
     }
 
     match parent.link_inode(&name, &source) {
-        Ok(_) => 0,
+        Ok(_) => {
+            invalidate_ext4_path_cache_for_at(&new_at, false);
+            0
+        }
         Err(ext4_fs::Ext4Error::Unsupported) => err(SyscallError::EPERM),
         Err(e) => ext4_err_to_errno(e),
     }
@@ -439,6 +444,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
 
     match create_result {
         Ok(inode) => {
+            invalidate_ext4_path_cache_for_at(&at, false);
             inode.set_uid_gid(fsuid, gid);
             inode.set_mode(create_mode);
             0
@@ -531,6 +537,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     }
     match parent.create_dir(&name) {
         Ok(dir) => {
+            invalidate_ext4_path_cache_for_at(&at, false);
             let gid = gid_for_created_inode(Some(&parent), fsgid);
             let mut dir_mode = create_mode;
             if parent_forces_gid_inherit(&parent) {
@@ -707,7 +714,11 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     }
 
     match parent.unlink(&name) {
-        Ok(_) => 0,
+        Ok(_) => {
+            invalidate_ext4_path_cache_for_at(&at, remove_dir);
+            invalidate_ext4_path_cache_inode(&child);
+            0
+        }
         Err(ext4_fs::Ext4Error::Unsupported) => err(SyscallError::ENOTEMPTY),
         Err(e) => ext4_err_to_errno(e),
     }

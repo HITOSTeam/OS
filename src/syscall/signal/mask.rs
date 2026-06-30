@@ -1,5 +1,12 @@
 use super::*;
 
+fn rt_sigmask_to_legacy_flags(mask: u64) -> SignalFlags {
+    // rt sigset uses bit (signum - 1); the legacy SignalFlags table uses
+    // bit signum with bit 0 reserved for SIGDEF.
+    let legacy_bits = ((mask & ((1u64 << crate::task::signal::MAX_SIG) - 1)) << 1) as u32;
+    SignalFlags::from_bits_truncate(legacy_bits)
+}
+
 #[allow(dead_code)]
 pub fn syscall_sigaction(
     signum: i32,
@@ -33,27 +40,16 @@ pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize
     if signum == 0 || signum > RT_SIG_MAX {
         return err(SyscallError::EINVAL);
     }
-    if signum == crate::task::signal::SIGKILL_NUM || signum == crate::task::signal::SIGSTOP_NUM {
-        return err(SyscallError::EINVAL);
-    }
     if !valid_sigset_size(sigsetsize) {
         return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
-    let process = current_process();
-    let mut inner = process.borrow_mut();
-    if oldact != 0 {
-        let cur = inner
-            .rt_sig_handlers
-            .get(signum)
-            .copied()
-            .unwrap_or_default();
-        if try_write_user_value(token, oldact as *mut RtSigAction, &cur).is_err() {
-            return err(SyscallError::EFAULT);
+    let new_action = if act != 0 {
+        if signum == crate::task::signal::SIGKILL_NUM || signum == crate::task::signal::SIGSTOP_NUM
+        {
+            return err(SyscallError::EINVAL);
         }
-    }
-    if act != 0 {
-        let Some(new) = try_read_user_value(token, act as *const RtSigAction) else {
+        let Some(new_action) = try_read_user_value(token, act as *const RtSigAction) else {
             return err(SyscallError::EFAULT);
         };
         if DEBUG_UNIXBENCH && signum == 14 {
@@ -62,24 +58,57 @@ pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize
                 info,
                 "[signal] sigaction sig={} handler={:#x} flags={:#x} restorer={:#x} mask={:#x}",
                 signum,
-                new.handler,
-                new.flags,
-                new.restorer,
-                new.mask
+                new_action.handler,
+                new_action.flags,
+                new_action.restorer,
+                new_action.mask
             );
         }
         if DEBUG_PTHREAD {
             crate::println!(
                 "[rt_sigaction] signo={} handler={:#x} flags={:#x} restorer={:#x} mask={:#x}",
                 signum,
-                new.handler,
-                new.flags,
-                new.restorer,
-                new.mask
+                new_action.handler,
+                new_action.flags,
+                new_action.restorer,
+                new_action.mask
             );
         }
-        if signum < inner.rt_sig_handlers.len() {
-            inner.rt_sig_handlers[signum] = new;
+        Some(new_action)
+    } else {
+        None
+    };
+
+    let old_action = {
+        let process = current_process();
+        let mut inner = process.borrow_mut();
+        let old_action = if oldact != 0 {
+            Some(
+                inner
+                    .rt_sig_handlers
+                    .get(signum)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
+        if let Some(new_action) = new_action {
+            if signum < inner.rt_sig_handlers.len() {
+                inner.rt_sig_handlers[signum] = new_action;
+            }
+            if signum <= crate::task::signal::MAX_SIG {
+                inner.signals_actions.table[signum] = SignalAction {
+                    handler: new_action.handler,
+                    mask: rt_sigmask_to_legacy_flags(new_action.mask),
+                };
+            }
+        }
+        old_action
+    };
+    if let Some(old_action) = old_action {
+        if try_write_user_value(token, oldact as *mut RtSigAction, &old_action).is_err() {
+            return err(SyscallError::EFAULT);
         }
     }
     0
