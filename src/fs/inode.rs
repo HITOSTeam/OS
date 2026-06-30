@@ -550,6 +550,8 @@ pub struct OSInode {
     append: bool,
     readonly_fs: bool,
     replace_on_write: bool,
+    fanotify_silent: bool,
+    fanotify_path: Option<String>,
     tmpfile_cleanup: Option<TmpfileCleanup>,
     write_open: Mutex<WriteOpenState>,
     inner: Arc<Mutex<OSInodeInner>>,
@@ -740,6 +742,13 @@ impl OSInode {
         Self::new_with_append_rofs_tmp_cleanup(readable, writable, false, inode, false, true, None)
     }
 
+    pub(crate) fn new_fanotify_event(inode: Arc<Inode>) -> Self {
+        let mut file = Self::new(true, false, inode)
+            .expect("fanotify event inode open cannot fail for read-only files");
+        file.fanotify_silent = true;
+        file
+    }
+
     pub fn new_with_append_rofs_tmp_cleanup(
         readable: bool,
         writable: bool,
@@ -773,10 +782,17 @@ impl OSInode {
             append,
             readonly_fs,
             replace_on_write,
+            fanotify_silent: false,
+            fanotify_path: None,
             tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
             write_open: Mutex::new(write_open),
             inner,
         })
+    }
+
+    pub(crate) fn with_fanotify_path(mut self, path: Option<String>) -> Self {
+        self.fanotify_path = path;
+        self
     }
 
     pub fn append(&self) -> bool {
@@ -785,6 +801,14 @@ impl OSInode {
 
     pub fn readonly_fs(&self) -> bool {
         self.readonly_fs
+    }
+
+    pub(crate) fn fanotify_silent(&self) -> bool {
+        self.fanotify_silent
+    }
+
+    pub(crate) fn fanotify_path(&self) -> Option<String> {
+        self.fanotify_path.clone()
     }
 
     /// Read all data inside an inode into vector
@@ -821,6 +845,41 @@ impl OSInode {
 
     pub fn ext4_inode(&self) -> Arc<Inode> {
         self.inner.lock().inode.clone()
+    }
+
+    /// Return the end offset of buffered (not-yet-flushed) writes.
+    ///
+    /// This is used to report a correct file size to userspace (`fstat`, `lseek(SEEK_END)`)
+    /// even when we are buffering writes in memory.
+    pub fn pending_write_end(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.write_buf_off.saturating_add(inner.write_buf.len())
+    }
+
+    fn write_at_zeroing_gap(
+        inode: &Arc<Inode>,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize, ext4_fs::Ext4Error> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let size = inode.size() as usize;
+        if offset > size {
+            let zeros = [0u8; 4096];
+            let mut off = size;
+            while off < offset {
+                let chunk = core::cmp::min(zeros.len(), offset - off);
+                match inode.write_at(off, &zeros[..chunk]) {
+                    Ok(0) => return Err(ext4_fs::Ext4Error::NoSpace),
+                    Ok(written) => off += written,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        inode.write_at(offset, data)
     }
 
     /// Read from this inode at the given offset without updating the file offset.
@@ -899,7 +958,7 @@ impl OSInode {
             }
             let result = {
                 let _fs_guard = ext4_lock();
-                inner.inode.write_at(offset, buf)
+                Self::write_at_zeroing_gap(&inner.inode, offset, buf)
             };
             if debug_iozone_tracked(inode_num) {
                 let size_after = inner.inode.size() as usize;
@@ -968,7 +1027,7 @@ impl OSInode {
         let size_before = inner.inode.size() as usize;
         let result = {
             let _fs_guard = ext4_lock();
-            inner.inode.write_at(off, &data)
+            Self::write_at_zeroing_gap(&inner.inode, off, &data)
         };
         if debug_iozone_tracked(inode_num) {
             let size_after = inner.inode.size() as usize;
@@ -1585,7 +1644,7 @@ impl Drop for OSInode {
             let data = core::mem::take(&mut inner.write_buf);
             let _ = {
                 let _fs_guard = ext4_lock();
-                inner.inode.write_at(off, &data)
+                Self::write_at_zeroing_gap(&inner.inode, off, &data)
             };
             Self::mark_write_buf_clean(&mut inner);
         }

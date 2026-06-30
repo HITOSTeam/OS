@@ -319,6 +319,11 @@ pub fn trap_handler() {
     let deferred_scheduler_tick = take_deferred_kernel_timer_tick();
     if deferred_scheduler_tick || timer_work_pending_for_user_return() {
         check_timer();
+        crate::task::processor::account_current_task_tick();
+        crate::syscall::misc::check_current_rlimit_cpu();
+        if crate::task::processor::should_preempt_current_on_tick() {
+            suspend_current_and_run_next();
+        }
     }
     if deferred_scheduler_tick {
         crate::task::processor::account_current_task_tick();

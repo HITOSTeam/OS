@@ -398,6 +398,7 @@ const SYSCALL_USERFAULTFD: usize = 282;
 const SYSCALL_PERF_EVENT_OPEN: usize = 241;
 const SYSCALL_PIDFD_SEND_SIGNAL: usize = 424;
 const SYSCALL_FANOTIFY_INIT: usize = 262;
+const SYSCALL_FANOTIFY_MARK: usize = 263;
 const SYSCALL_IO_URING_SETUP: usize = 425;
 const SYSCALL_OPEN_TREE: usize = 428;
 const SYSCALL_MOVE_MOUNT: usize = 429;
@@ -905,7 +906,14 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             args[3] as isize,
             args[4],
         ),
-        SYSCALL_FANOTIFY_INIT => dummy::syscall_fanotify_init(args[0], args[1]),
+        SYSCALL_FANOTIFY_INIT => filesystem::syscall_fanotify_init(args[0], args[1]),
+        SYSCALL_FANOTIFY_MARK => filesystem::syscall_fanotify_mark(
+            args[0],
+            args[1],
+            args[2] as u64,
+            args[3] as isize,
+            args[4],
+        ),
         SYSCALL_CLOSE => filesystem::syscall_close(args[0]),
         SYSCALL_CLOSE_RANGE => filesystem::syscall_close_range(args[0], args[1], args[2]),
         SYSCALL_VFORK => process::syscall_vfork(),
