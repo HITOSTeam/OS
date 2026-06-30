@@ -36,8 +36,8 @@ use smoltcp::wire::{
 // TCP 默认收发缓冲区刻意配得较大，主要是为了让 iperf 一类大吞吐测试
 // 不会过早被 smoltcp 的用户态缓冲区限制住。
 //
-const TCP_RX_BUF_LEN_IPERF: usize = 128 * 1024;
-const TCP_TX_BUF_LEN_IPERF: usize = 128 * 1024;
+const TCP_RX_BUF_LEN_IPERF: usize = 1024 * 1024;
+const TCP_TX_BUF_LEN_IPERF: usize = 1024 * 1024;
 // Linux 的 UDP rmem/wmem 是按需消耗的；smoltcp 需要建 socket 时就给定容量。
 // 这里保持较小的初始缓冲，避免 LTP multicast 一次创建数千个 UDP socket 时
 // 因每个 socket 预分配大块内核堆而 OOM。
@@ -320,37 +320,48 @@ fn inet_bind_addr_conflicts(left: Option<IpAddress>, right: Option<IpAddress>) -
     left.is_none() || right.is_none() || left == right
 }
 
-fn tcp_bound_endpoint_conflicts(
-    endpoint: IpListenEndpoint,
-    requested_addr: Option<IpAddress>,
-    requested_port: u16,
+fn inet_bind_domains_conflict(
+    left_addr: Option<IpAddress>,
+    left_domain: u16,
+    left_v6only: bool,
+    right_addr: Option<IpAddress>,
+    right_domain: u16,
+    right_v6only: bool,
 ) -> bool {
-    endpoint.port == requested_port
-        && requested_port != 0
-        && inet_bind_addr_conflicts(endpoint.addr, requested_addr)
-}
-
-fn tcp_local_endpoint_conflicts(
-    endpoint: Option<IpEndpoint>,
-    requested_addr: Option<IpAddress>,
-    requested_port: u16,
-) -> bool {
-    let Some(endpoint) = endpoint else {
-        return false;
+    if left_domain == right_domain {
+        return inet_bind_addr_conflicts(left_addr, right_addr);
+    }
+    let (v6_addr, v6only, v4_addr) = if left_domain == AF_INET6 {
+        (left_addr, left_v6only, right_addr)
+    } else {
+        (right_addr, right_v6only, left_addr)
     };
-    endpoint.port == requested_port
-        && requested_port != 0
-        && inet_bind_addr_conflicts(Some(endpoint.addr), requested_addr)
+    if v6only {
+        return false;
+    }
+    match v6_addr {
+        None => true,
+        Some(IpAddress::Ipv4(v6_v4)) => match v4_addr {
+            None => true,
+            Some(IpAddress::Ipv4(v4)) => v6_v4 == v4,
+            Some(IpAddress::Ipv6(_)) => false,
+        },
+        Some(IpAddress::Ipv6(_)) => false,
+    }
 }
 
 #[derive(Clone, Copy)]
 struct TcpSocketMeta {
     reuseaddr: bool,
+    domain: u16,
+    ipv6_v6only: bool,
 }
 
 #[derive(Clone, Copy)]
 struct UdpSocketMeta {
     reuseaddr: bool,
+    domain: u16,
+    ipv6_v6only: bool,
 }
 
 fn tcp_port_in_use(
@@ -360,6 +371,8 @@ fn tcp_port_in_use(
     requested_addr: Option<IpAddress>,
     requested_port: u16,
     requested_reuseaddr: bool,
+    requested_domain: u16,
+    requested_v6only: bool,
 ) -> bool {
     let tcp_meta = TCP_SOCKET_META.lock();
     sockets.iter().any(|(handle, socket)| {
@@ -369,15 +382,42 @@ fn tcp_port_in_use(
         let SmolSocket::Tcp(sock) = socket else {
             return false;
         };
-        if !tcp_bound_endpoint_conflicts(sock.get_bound_endpoint(), requested_addr, requested_port)
-            && !tcp_local_endpoint_conflicts(sock.local_endpoint(), requested_addr, requested_port)
-        {
+        let peer = tcp_meta
+            .get(&(net_ns_id, handle))
+            .copied()
+            .unwrap_or(TcpSocketMeta {
+                reuseaddr: false,
+                domain: AF_INET,
+                ipv6_v6only: false,
+            });
+        let bound = sock.get_bound_endpoint();
+        let bound_conflicts = bound.port == requested_port
+            && requested_port != 0
+            && inet_bind_domains_conflict(
+                bound.addr,
+                peer.domain,
+                peer.ipv6_v6only,
+                requested_addr,
+                requested_domain,
+                requested_v6only,
+            );
+        let local_conflicts = sock.local_endpoint().is_some_and(|endpoint| {
+            endpoint.port == requested_port
+                && requested_port != 0
+                && inet_bind_domains_conflict(
+                    Some(endpoint.addr),
+                    peer.domain,
+                    peer.ipv6_v6only,
+                    requested_addr,
+                    requested_domain,
+                    requested_v6only,
+                )
+        });
+        if !bound_conflicts && !local_conflicts {
             return false;
         }
 
-        let peer_reuseaddr = tcp_meta
-            .get(&(net_ns_id, handle))
-            .is_some_and(|meta| meta.reuseaddr);
+        let peer_reuseaddr = peer.reuseaddr;
         !(requested_reuseaddr && peer_reuseaddr && sock.state() != tcp::State::Listen)
     })
 }
@@ -390,6 +430,8 @@ fn udp_port_in_use(
     requested_port: u16,
     requested_reuseaddr: bool,
     requested_protocol: IpProtocol,
+    requested_domain: u16,
+    requested_v6only: bool,
 ) -> bool {
     let udp_meta = UDP_SOCKET_META.lock();
     sockets.iter().any(|(handle, socket)| {
@@ -402,17 +444,30 @@ fn udp_port_in_use(
         if sock.transport_protocol() != requested_protocol {
             return false;
         }
+        let peer = udp_meta
+            .get(&(net_ns_id, handle))
+            .copied()
+            .unwrap_or(UdpSocketMeta {
+                reuseaddr: false,
+                domain: AF_INET,
+                ipv6_v6only: false,
+            });
         let endpoint = sock.endpoint();
         if endpoint.port != requested_port
             || requested_port == 0
-            || !inet_bind_addr_conflicts(endpoint.addr, requested_addr)
+            || !inet_bind_domains_conflict(
+                endpoint.addr,
+                peer.domain,
+                peer.ipv6_v6only,
+                requested_addr,
+                requested_domain,
+                requested_v6only,
+            )
         {
             return false;
         }
 
-        let peer_reuseaddr = udp_meta
-            .get(&(net_ns_id, handle))
-            .is_some_and(|meta| meta.reuseaddr);
+        let peer_reuseaddr = peer.reuseaddr;
         !(requested_reuseaddr && peer_reuseaddr)
     })
 }
@@ -491,6 +546,8 @@ pub struct NetSocketFile {
 pub struct SocketOptions {
     /// `SO_REUSEADDR`，TCP/UDP bind 冲突判定会按 Linux 复用规则消费。
     reuseaddr: bool,
+    /// `IPV6_V6ONLY`，AF_INET6 默认关闭，保持 Linux dual-stack 默认值。
+    ipv6_v6only: bool,
     /// `SO_DONTROUTE`，UDP 发送路径会按本链路直连语义约束选路。
     dontroute: bool,
     /// `SO_BROADCAST`，UDP 发往 IPv4 broadcast 时必须开启，否则返回 `EACCES`。
@@ -650,10 +707,20 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
 }
 
-fn set_tcp_socket_reuseaddr_meta(ns_id: usize, handles: &[SocketHandle], reuseaddr: bool) {
+fn set_tcp_socket_meta(
+    ns_id: usize,
+    handles: &[SocketHandle],
+    reuseaddr: bool,
+    domain: u16,
+    ipv6_v6only: bool,
+) {
     let mut meta = TCP_SOCKET_META.lock();
     for handle in handles {
-        meta.insert((ns_id, *handle), TcpSocketMeta { reuseaddr });
+        meta.insert((ns_id, *handle), TcpSocketMeta {
+            reuseaddr,
+            domain,
+            ipv6_v6only,
+        });
     }
 }
 
@@ -664,10 +731,20 @@ fn unregister_tcp_socket_meta(ns_id: usize, handles: &[SocketHandle]) {
     }
 }
 
-fn set_udp_socket_reuseaddr_meta(ns_id: usize, handles: &[SocketHandle], reuseaddr: bool) {
+fn set_udp_socket_meta(
+    ns_id: usize,
+    handles: &[SocketHandle],
+    reuseaddr: bool,
+    domain: u16,
+    ipv6_v6only: bool,
+) {
     let mut meta = UDP_SOCKET_META.lock();
     for handle in handles {
-        meta.insert((ns_id, *handle), UdpSocketMeta { reuseaddr });
+        meta.insert((ns_id, *handle), UdpSocketMeta {
+            reuseaddr,
+            domain,
+            ipv6_v6only,
+        });
     }
 }
 
@@ -828,7 +905,7 @@ impl NetSocketFile {
             sockets.add(tcp::Socket::new(rx, tx))
         });
         note_tcp_handle_created();
-        set_tcp_socket_reuseaddr_meta(net_ns_id, &[handle], false);
+        set_tcp_socket_meta(net_ns_id, &[handle], false, domain, false);
         let file = Arc::new(Self {
             net_ns_id,
             domain,
@@ -838,6 +915,7 @@ impl NetSocketFile {
             inner: Mutex::new(Inner::TcpStream { handle }),
             opts: Mutex::new(SocketOptions {
                 reuseaddr: false,
+                ipv6_v6only: false,
                 dontroute: false,
                 broadcast: false,
                 keepalive: false,
@@ -921,7 +999,7 @@ impl NetSocketFile {
             sockets.add(socket)
         });
         note_udp_handle_created(UDP_RX_BUF_LEN, UDP_TX_BUF_LEN);
-        set_udp_socket_reuseaddr_meta(net_ns_id, &[handle], false);
+        set_udp_socket_meta(net_ns_id, &[handle], false, domain, false);
         let file = Arc::new(Self {
             net_ns_id,
             domain,
@@ -934,6 +1012,7 @@ impl NetSocketFile {
             }),
             opts: Mutex::new(SocketOptions {
                 reuseaddr: false,
+                ipv6_v6only: false,
                 dontroute: false,
                 broadcast: false,
                 keepalive: false,
@@ -1090,6 +1169,46 @@ impl NetSocketFile {
         self.protocol
     }
 
+    pub fn ipv6_v6only(&self) -> bool {
+        self.opts.lock().ipv6_v6only
+    }
+
+    pub fn set_ipv6_v6only(&self, enabled: bool) -> Result<(), isize> {
+        const EINVAL: isize = -22;
+        if self.domain != AF_INET6 || self.is_bound_or_connected() {
+            return Err(EINVAL);
+        }
+        self.opts.lock().ipv6_v6only = enabled;
+        let (kind, handles) = match &*self.inner.lock() {
+            Inner::TcpStream { handle } => (NetSocketKind::TcpStream, vec![*handle]),
+            Inner::TcpListener { listen, .. } => (NetSocketKind::TcpListener, listen.clone()),
+            Inner::Udp { handle, .. } => (NetSocketKind::Udp, vec![*handle]),
+        };
+        let reuseaddr = self.reuseaddr();
+        if kind == NetSocketKind::Udp {
+            set_udp_socket_meta(self.net_ns_id, &handles, reuseaddr, self.domain, enabled);
+        } else {
+            set_tcp_socket_meta(self.net_ns_id, &handles, reuseaddr, self.domain, enabled);
+        }
+        Ok(())
+    }
+
+    fn is_bound_or_connected(&self) -> bool {
+        match &*self.inner.lock() {
+            Inner::TcpStream { handle } => self.with_sockets_mut(|_iface, _dev, sockets| {
+                let socket = sockets.get::<tcp::Socket>(*handle);
+                socket.get_bound_endpoint().port != 0 || socket.local_endpoint().is_some()
+            }),
+            Inner::TcpListener { .. } => true,
+            Inner::Udp { handle, connected } => {
+                connected.is_some()
+                    || self.with_sockets_mut(|_iface, _dev, sockets| {
+                        sockets.get::<udp::Socket>(*handle).endpoint().port != 0
+                    })
+            }
+        }
+    }
+
     fn ensure_udp_buffer_capacity(&self, min_rx_payload: usize, min_tx_payload: usize) {
         let handle = match &*self.inner.lock() {
             Inner::Udp { handle, .. } => *handle,
@@ -1165,10 +1284,11 @@ impl NetSocketFile {
             Inner::TcpListener { listen, .. } => (NetSocketKind::TcpListener, listen.clone()),
             Inner::Udp { handle, .. } => (NetSocketKind::Udp, vec![*handle]),
         };
+        let v6only = self.ipv6_v6only();
         if kind == NetSocketKind::Udp {
-            set_udp_socket_reuseaddr_meta(self.net_ns_id, &handles, enabled);
+            set_udp_socket_meta(self.net_ns_id, &handles, enabled, self.domain, v6only);
         } else {
-            set_tcp_socket_reuseaddr_meta(self.net_ns_id, &handles, enabled);
+            set_tcp_socket_meta(self.net_ns_id, &handles, enabled, self.domain, v6only);
         }
     }
 
@@ -2882,7 +3002,12 @@ impl NetSocketFile {
                 } else {
                     port
                 };
-                let requested_addr = (!ip_is_unspecified(ip)).then_some(ip);
+                let v6only = self.ipv6_v6only();
+                let requested_addr = if ip_is_unspecified(ip) {
+                    (self.domain == AF_INET6 && v6only).then_some(ip)
+                } else {
+                    Some(ip)
+                };
                 let requested_reuseaddr = self.reuseaddr();
                 if tcp_port_in_use(
                     self.net_ns_id,
@@ -2891,6 +3016,8 @@ impl NetSocketFile {
                     requested_addr,
                     port,
                     requested_reuseaddr,
+                    self.domain,
+                    v6only,
                 ) {
                     return Err(EADDRINUSE);
                 }
@@ -2911,7 +3038,12 @@ impl NetSocketFile {
                         } else {
                             port
                         };
-                        let requested_addr = (!ip_is_unspecified(ip)).then_some(ip);
+                        let v6only = self.ipv6_v6only();
+                        let requested_addr = if ip_is_unspecified(ip) {
+                            (self.domain == AF_INET6 && v6only).then_some(ip)
+                        } else {
+                            Some(ip)
+                        };
                         let requested_reuseaddr = self.reuseaddr();
                         if udp_port_in_use(
                             self.net_ns_id,
@@ -2925,6 +3057,8 @@ impl NetSocketFile {
                             } else {
                                 IpProtocol::Udp
                             },
+                            self.domain,
+                            v6only,
                         ) {
                             return Err(EADDRINUSE);
                         }
@@ -3034,7 +3168,13 @@ impl NetSocketFile {
             note_tcp_handle_created();
             listen_handles.push(h);
         }
-        set_tcp_socket_reuseaddr_meta(self.net_ns_id, &listen_handles, reuseaddr);
+        set_tcp_socket_meta(
+            self.net_ns_id,
+            &listen_handles,
+            reuseaddr,
+            self.domain,
+            self.ipv6_v6only(),
+        );
         *inner = Inner::TcpListener {
             endpoint,
             backlog,
@@ -3101,14 +3241,22 @@ impl NetSocketFile {
                         sockets.add(s)
                     });
                     note_tcp_handle_created();
-                    set_tcp_socket_reuseaddr_meta(
+                    set_tcp_socket_meta(
                         self.net_ns_id,
                         &[new_h],
                         accepted_opts.reuseaddr,
+                        self.domain,
+                        accepted_opts.ipv6_v6only,
                     );
                     listen.push(new_h);
                 }
-                set_tcp_socket_reuseaddr_meta(self.net_ns_id, &[h], accepted_opts.reuseaddr);
+                set_tcp_socket_meta(
+                    self.net_ns_id,
+                    &[h],
+                    accepted_opts.reuseaddr,
+                    self.domain,
+                    accepted_opts.ipv6_v6only,
+                );
                 drop(inner);
                 self.notify_poll_waiters();
                 let accepted = Arc::new(NetSocketFile {

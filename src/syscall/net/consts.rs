@@ -54,6 +54,9 @@ pub(crate) const SOL_SOCKET: usize = 1;
 pub(crate) const SOL_PACKET: usize = 263;
 pub(crate) const SOL_TCP: usize = 6;
 pub(crate) const SOL_UDP: usize = 17;
+/// Linux `IPPROTO_IPV6`/`SOL_IPV6`.
+pub(crate) const IPPROTO_IPV6: usize = 41;
+pub(crate) const SOL_IPV6: usize = IPPROTO_IPV6;
 /// SOL_UDPLITE = 136，对应 Linux UDP-Lite 协议层选项。
 pub(crate) const SOL_UDPLITE: usize = 136;
 /// SOL_NETLINK = 270，作用于 AF_NETLINK 控制面套接字。
@@ -68,6 +71,8 @@ pub(crate) const IPPROTO_UDPLITE: usize = 136;
 pub(crate) const IPPROTO_RAW: usize = 255;
 pub(crate) const IPV4_UDP_MAX_PAYLOAD: usize = 65_507;
 
+pub(crate) const IPV6_V6ONLY: usize = 26;
+
 pub(crate) const SO_VM_SOCKETS_BUFFER_SIZE: usize = 0;
 pub(crate) const SO_VM_SOCKETS_BUFFER_MIN_SIZE: usize = 1;
 pub(crate) const SO_VM_SOCKETS_BUFFER_MAX_SIZE: usize = 2;
@@ -78,10 +83,12 @@ pub(crate) const VMADDR_PORT_ANY: u32 = u32::MAX;
 pub(crate) const VMADDR_CID_LOCAL: u32 = 1;
 
 pub(crate) const TCP_NODELAY: usize = 1;
+pub(crate) const TCP_MAXSEG: usize = 2;
 pub(crate) const TCP_CORK: usize = 3;
 pub(crate) const TCP_KEEPIDLE: usize = 4;
 pub(crate) const TCP_KEEPINTVL: usize = 5;
 pub(crate) const TCP_KEEPCNT: usize = 6;
+pub(crate) const TCP_INFO: usize = 11;
 pub(crate) const UDPLITE_SEND_CSCOV: usize = 10;
 pub(crate) const UDPLITE_RECV_CSCOV: usize = 11;
 
