@@ -2,10 +2,11 @@ use super::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, BTreeMap, ClassifiedAbsPath, File,
     INODE_XATTRS, MAX_SYMLINKS, NAME_MAX, O_TRUNC, OSInode, PATH_MAX, PseudoDir, PseudoDirent,
     PseudoShmFile, String, SyscallError, Vec, XATTR_CREATE, XATTR_NAME_MAX, XATTR_REPLACE,
-    XATTR_SIZE_MAX, current_cwd_path, current_files, current_fsuid_gid, current_mount_namespace,
-    current_process, dt_type_from_ext4, err, ext4_lock, ext4_path_cache_lookup, fd_has_o_path,
-    find_path_in_roots, get_current_token, get_fd_file, inode_is_immutable_or_append,
-    inode_mode_allows_uid_gid, install_open_file_fd, logical_path_for_inode,
+    XATTR_SIZE_MAX, clear_ext4_path_cache, current_cwd_path, current_files, current_fsuid_gid,
+    current_mount_namespace, current_process, dt_type_from_ext4, err, ext4_lock,
+    ext4_path_cache_lookup, fd_has_o_path, find_path_in_roots, get_current_token, get_fd_file,
+    inode_is_immutable_or_append, inode_mode_allows_uid_gid, install_open_file_fd,
+    invalidate_ext4_path_cache, invalidate_ext4_path_cache_subtree, logical_path_for_inode,
     logical_path_for_open_fd, mount_lookup_for_abs, note_ext4_path_cache, open_pseudo,
     path_is_noexec, path_is_rofs, pseudo_abs_for_ext4_dirfd,
     resolve_proc_magic_intermediate_abs_path, secondary_root_inode, shm_get, shm_object_name,
@@ -215,6 +216,26 @@ pub(crate) enum AtPath {
     },
     /// A pseudo filesystem lookup expressed as an absolute path.
     PseudoAbs(String),
+}
+
+pub(crate) fn invalidate_ext4_path_cache_for_at(at: &AtPath, subtree: bool) {
+    let Some(path) = (match at {
+        AtPath::Ext4Abs(abs) => Some(abs.as_str()),
+        AtPath::Ext4Rel {
+            fallback_abs: Some(abs),
+            ..
+        } => Some(abs.as_str()),
+        AtPath::Ext4Rel { .. } => None,
+        AtPath::PseudoAbs(_) => return,
+    }) else {
+        clear_ext4_path_cache();
+        return;
+    };
+    if subtree {
+        invalidate_ext4_path_cache_subtree(path);
+    } else {
+        invalidate_ext4_path_cache(path);
+    }
 }
 
 /// 根据当前进程的挂载命名空间，判断绝对路径属于 ext4 还是伪文件系统。

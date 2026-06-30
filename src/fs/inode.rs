@@ -114,6 +114,43 @@ pub(crate) fn clear_ext4_path_cache() {
     }
 }
 
+pub(crate) fn invalidate_ext4_path_cache(path: &str) {
+    let path = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+    EXT4_PATH_CACHE.lock().remove(path);
+}
+
+pub(crate) fn invalidate_ext4_path_cache_subtree(path: &str) {
+    let path = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+    let mut cache = EXT4_PATH_CACHE.lock();
+    if path == "/" {
+        cache.clear();
+        return;
+    }
+    cache.retain(|candidate, _| {
+        candidate != path
+            && !candidate
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    });
+}
+
+pub(crate) fn invalidate_ext4_path_cache_inode(inode: &Inode) {
+    let key = (inode.device_id(), inode.inode_num());
+    let mut cache = EXT4_PATH_CACHE.lock();
+    cache.retain(|_, entries| {
+        entries.retain(|entry| (entry.inode.device_id(), entry.inode.inode_num()) != key);
+        !entries.is_empty()
+    });
+}
+
 #[derive(Clone, Copy, Default)]
 struct InodeTextAccess {
     write_open: usize,
