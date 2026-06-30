@@ -242,7 +242,6 @@ pub fn get_current_token() -> usize {
     let process_inner = process.borrow_mut();
     process_inner.memory_set.token()
 }
-
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
     if DEBUG_TRAP {
@@ -354,8 +353,7 @@ pub fn trap_handler() {
     // deadline expiry, and reschedule if needed.  This is the local equivalent of
     // Linux's scheduler_tick() setting TIF_NEED_RESCHED for syscall-heavy tasks.
     let deferred_scheduler_tick = take_deferred_kernel_timer_tick();
-    let timer_work_pending = timer_work_pending_for_user_return();
-    if deferred_scheduler_tick || timer_work_pending {
+    if deferred_scheduler_tick || timer_work_pending_for_user_return() {
         check_timer();
     }
     if deferred_scheduler_tick {

@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -11,8 +10,8 @@ use crate::mm::{PTEFlags, UserBuffer, VirtAddr, frame_available_pages, frame_man
 use crate::task::manager::{PID2PCB, pid2process};
 use crate::task::task_block::TaskStatus;
 
+use super::ProcFileKind;
 use super::entries::{decode_proc_linux_tid, proc_pid_task_alive, proc_simple_text_content};
-use super::{ProcFileKind, ProcPseudoFile};
 use super::{parse_proc_sys_i64, parse_proc_sys_usize};
 use crate::syscall::error::{SyscallError, err};
 
@@ -125,9 +124,6 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::FsPipeMaxSize => {
             alloc::format!("{}\n", crate::fs::pipe_max_size_limit_for_procfs())
         }
-        ProcFileKind::FsFanotifyMaxQueuedEvents => {
-            alloc::format!("{}\n", crate::fs::fanotify_max_queued_events_for_procfs())
-        }
         ProcFileKind::FsMqueueQueuesMax => alloc::format!(
             "{}\n",
             crate::syscall::posix_mq::queues_max_limit_for_procfs()
@@ -184,53 +180,9 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::PidSmaps(pid) => proc_pid_smaps(*pid),
         ProcFileKind::PidCoredumpFilter => String::from("00000033\n"),
         ProcFileKind::PidCgroup(pid) => crate::fs::cgroup_proc_pid_content(*pid as usize),
-        ProcFileKind::PidFdInfo(pid, fd) => proc_pid_fdinfo(*pid, *fd),
         ProcFileKind::PidTaskStat(pid, tid) => proc_pid_task_stat(*pid, *tid),
         ProcFileKind::PidTaskComm(pid, tid) => proc_pid_task_comm(*pid, *tid),
     }
-}
-
-fn proc_pid_fdinfo(pid: u32, fd: usize) -> String {
-    let Some(proc) = pid2process(pid as usize) else {
-        return String::new();
-    };
-    let Some(inner) = proc.try_borrow_mut() else {
-        return String::new();
-    };
-    let files = Arc::clone(&inner.files);
-    drop(inner);
-    let Some((file, descriptor_flags)) = files.lock().get_file_and_flags(fd) else {
-        return String::new();
-    };
-
-    let mut out = alloc::format!(
-        "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t1\n",
-        proc_fdinfo_pos(&file),
-        descriptor_flags
-    );
-    if let Some(fanotify) = file.as_any().downcast_ref::<crate::fs::FanotifyFile>() {
-        out.push_str(&fanotify.fdinfo_marks());
-    }
-    out
-}
-
-fn proc_fdinfo_pos(file: &Arc<dyn crate::fs::File + Send + Sync>) -> usize {
-    if let Some(inode) = file.as_any().downcast_ref::<crate::fs::OSInode>() {
-        return inode.offset();
-    }
-    if let Some(pseudo) = file.as_any().downcast_ref::<crate::fs::PseudoFile>() {
-        return pseudo.offset();
-    }
-    if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
-        return proc_file.offset();
-    }
-    if let Some(shm) = file.as_any().downcast_ref::<crate::fs::PseudoShmFile>() {
-        return shm.offset();
-    }
-    if let Some(block) = file.as_any().downcast_ref::<crate::fs::PseudoBlock>() {
-        return block.offset();
-    }
-    0
 }
 
 pub(crate) fn proc_irq_smp_affinity() -> String {
