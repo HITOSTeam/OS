@@ -305,13 +305,6 @@ pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {
     alloc_fd(Arc::new(PidFdFile::new(&process)), descriptor_flags)
 }
 
-pub fn syscall_fanotify_init(_flags: usize, _event_f_flags: usize) -> isize {
-    // We do not implement the fanotify subsystem yet. Linux reports err(SyscallError::ENOSYS)
-    // when the syscall is unavailable, which lets LTP treat fanotify cases as
-    // TCONF instead of tripping later on a dummy fd.
-    err(SyscallError::ENOSYS)
-}
-
 pub fn syscall_userfaultfd(flags: usize) -> isize {
     const UFFD_USER_MODE_ONLY: usize = 0x1;
     let known = CLOEXEC_FLAG | NONBLOCK_FLAG | UFFD_USER_MODE_ONLY;

@@ -19,6 +19,7 @@ use crate::{
     fs::{
         CgroupAttachTarget, PidFdFile, cgroup_attach_process_to_target, cgroup_attach_thread,
         cgroup_clone_into_target_from_file, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
+        fanotify_notify_open_exec, fanotify_permission_open,
         refresh_thread_legacy_cpu_fair_group_cache, root_inode_for_path, secondary_root_inode,
     },
     mm::{
@@ -28,7 +29,8 @@ use crate::{
     println,
     syscall::{
         filesystem::{
-            normalize_path, resolve_exec_inode, resolve_exec_inode_at, resolve_read_inode,
+            AT_FDCWD, normalize_path, resolve_abs_path, resolve_exec_inode, resolve_exec_inode_at,
+            resolve_read_inode,
         },
         misc::encode_linux_tid,
         signal::{ERESTARTSYS, SA_RESTART},
