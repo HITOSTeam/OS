@@ -43,11 +43,79 @@ pub(crate) fn cached_kernel_token() -> usize {
 pub fn activate_kernel_space() {
     let cached = KERNEL_SATP.load(Ordering::Acquire);
     if cached != 0 {
+        #[cfg(target_arch = "riscv64")]
+        if riscv::register::satp::read().bits() == cached {
+            // RISC-V SATP switches require sfence.vma in activate_token(); skip
+            // that cost when the caller is already running on the kernel root.
+            return;
+        }
         memory_set::activate_token(cached);
     } else {
         let token = memory_set::kernel_token();
         KERNEL_SATP.store(token, Ordering::Release);
+        #[cfg(target_arch = "riscv64")]
+        if riscv::register::satp::read().bits() == token {
+            // First caller may already be on KERNEL_SPACE during boot/init.
+            return;
+        }
         memory_set::activate_token(token);
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Temporarily switch to the full kernel page table for code that needs the
+/// physical direct map beyond the roots shared into user page tables.
+pub struct KernelPageTableGuard {
+    previous_satp: usize,
+    switched: bool,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl KernelPageTableGuard {
+    pub fn enter() -> Self {
+        let previous_satp = riscv::register::satp::read().bits();
+        let kernel_satp = {
+            let cached = KERNEL_SATP.load(Ordering::Acquire);
+            if cached != 0 {
+                cached
+            } else {
+                let token = memory_set::kernel_token();
+                KERNEL_SATP.store(token, Ordering::Release);
+                token
+            }
+        };
+        let switched = previous_satp != kernel_satp;
+        if switched {
+            memory_set::activate_token(kernel_satp);
+        }
+        Self {
+            previous_satp,
+            switched,
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl Drop for KernelPageTableGuard {
+    fn drop(&mut self) {
+        if self.switched {
+            memory_set::activate_token(self.previous_satp);
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn flush_kernel_shared_tlb() {
+    // SAFETY: sfence.vma is valid in S-mode. Kernel stack page-table entries
+    // are shared into user page tables, so stale translations must be dropped
+    // before a freed stack frame can be reused.
+    unsafe {
+        core::arch::asm!("sfence.vma");
+    }
+    let remote_hart_mask =
+        crate::task::manager::online_hart_mask() & !(1usize << crate::arch::hart_id());
+    if remote_hart_mask != 0 {
+        crate::sbi::remote_sfence_vma_all(remote_hart_mask);
     }
 }
 pub(crate) use elf_loader::{

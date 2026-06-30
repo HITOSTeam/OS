@@ -21,8 +21,8 @@ use crate::task::FilesStruct;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidAllocError, PidHandle, pid_alloc};
 use crate::task::manager::{
-    PID2PCB, add_task, insert_into_pid2process, remove_inactive_task, select_hart_for_new_task,
-    wakeup_task,
+    PID2PCB, add_task, insert_into_pid2process, prime_fair_exec_start, remove_inactive_task,
+    select_hart_for_new_task, wakeup_task,
 };
 use crate::task::processor::current_task;
 use crate::task::sched::{SCHED_DEADLINE, SCHED_FIFO, SCHED_OTHER, SCHED_RR};
@@ -206,6 +206,7 @@ pub(crate) fn remove_task_from_wait_queues(task: &Arc<TaskControlBlock>) {
             continue;
         };
         inner.wait_queue.retain(|t| !Arc::ptr_eq(t, task));
+        inner.vfork_wait_queue.retain(|t| !Arc::ptr_eq(t, task));
 
         for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
             if Arc::ptr_eq(holder, task) {
@@ -1093,6 +1094,8 @@ pub struct ProcessControlBlockInner {
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
     /// 在 `waitpid(-1/...)` 中等待当前进程子进程状态变化的 task。
     pub wait_queue: VecDeque<Arc<TaskControlBlock>>,
+    /// CLONE_VFORK 父进程等待子进程 exec/exit 的专用队列。
+    pub vfork_wait_queue: VecDeque<Arc<TaskControlBlock>>,
     /// 等待当前进程变为可 wait 状态、从而让 pidfd 就绪的 task。
     pub pidfd_poll_waiters: PollWaitQueue,
 }
@@ -1180,6 +1183,27 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    /// CLONE_VFORK blocks the parent until the child either execs or exits.
+    /// Exit wakes this queue through the normal child-exit path; exec must
+    /// drain the same parent-owned queue before replacing the child's mm.
+    fn wake_vfork_parent_waiters_after_exec(&self) {
+        let parent = {
+            let inner = self.borrow_mut();
+            inner.parent.as_ref().and_then(|parent| parent.upgrade())
+        };
+        let Some(parent) = parent else {
+            return;
+        };
+        let waiters = {
+            let mut parent_inner = parent.borrow_mut();
+            parent_inner.vfork_wait_queue.drain(..).collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            crate::task::manager::prime_fair_sync_wakeup_lag(&waiter);
+            wakeup_task(waiter);
+        }
+    }
+
     fn terminate_other_threads(&self) {
         let current = current_task();
         let current_ptr = current.as_ref().map(Arc::as_ptr);
@@ -1402,6 +1426,7 @@ impl ProcessControlBlock {
                 semaphore_list: Vec::new(),
                 condvar_list: Vec::new(),
                 wait_queue: VecDeque::new(),
+                vfork_wait_queue: VecDeque::new(),
                 pidfd_poll_waiters: PollWaitQueue::default(),
             }),
         });
@@ -1529,6 +1554,7 @@ impl ProcessControlBlock {
         }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
+        let new_memory_set = MmRef::new(memory_set);
         let task = self.borrow_mut().get_task(0);
         let old_trap_cx_slot = {
             let task_inner = task.borrow_mut();
@@ -1546,7 +1572,11 @@ impl ProcessControlBlock {
             }
             let old_shm_cleanup = inner.memory_set.take_sysv_shm_attaches_for_cleanup();
             reset_signal_handlers_on_exec(&mut inner);
-            inner.memory_set = MmRef::new(memory_set);
+            #[cfg(target_arch = "riscv64")]
+            // Trap entry may still be running on the old user SATP; switch away
+            // before replacing and potentially dropping that address space.
+            crate::mm::activate_kernel_space();
+            inner.memory_set = new_memory_set.clone();
             inner.scheduling.reset_on_fork = false;
             inner.keep_caps = false;
             inner.argv = args.clone();
@@ -1570,6 +1600,8 @@ impl ProcessControlBlock {
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
         };
+        self.wake_vfork_parent_waiters_after_exec();
+        task.set_memory_set(new_memory_set);
         crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
@@ -1602,6 +1634,7 @@ impl ProcessControlBlock {
         drop(task_inner);
         task.reset_fp_state();
         crate::arch::restore_user_fp_state(&task);
+        prime_fair_exec_start(&task);
     }
 
     pub fn exec_dyn_with_memory_set(
@@ -1631,6 +1664,7 @@ impl ProcessControlBlock {
         }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
+        let new_memory_set = MmRef::new(memory_set);
         let task = self.borrow_mut().get_task(0);
         let old_trap_cx_slot = {
             let task_inner = task.borrow_mut();
@@ -1648,7 +1682,11 @@ impl ProcessControlBlock {
             }
             let old_shm_cleanup = inner.memory_set.take_sysv_shm_attaches_for_cleanup();
             reset_signal_handlers_on_exec(&mut inner);
-            inner.memory_set = MmRef::new(memory_set);
+            #[cfg(target_arch = "riscv64")]
+            // Trap entry may still be running on the old user SATP; switch away
+            // before replacing and potentially dropping that address space.
+            crate::mm::activate_kernel_space();
+            inner.memory_set = new_memory_set.clone();
             inner.scheduling.reset_on_fork = false;
             inner.keep_caps = false;
             inner.argv = args.clone();
@@ -1672,6 +1710,8 @@ impl ProcessControlBlock {
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
         };
+        self.wake_vfork_parent_waiters_after_exec();
+        task.set_memory_set(new_memory_set);
         crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
@@ -1712,6 +1752,7 @@ impl ProcessControlBlock {
         drop(task_inner);
         task.reset_fp_state();
         crate::arch::restore_user_fp_state(&task);
+        prime_fair_exec_start(&task);
     }
 
     fn fork_impl(
@@ -1992,6 +2033,7 @@ impl ProcessControlBlock {
                 semaphore_list: Vec::new(),
                 condvar_list: Vec::new(),
                 wait_queue: VecDeque::new(),
+                vfork_wait_queue: VecDeque::new(),
                 pidfd_poll_waiters: PollWaitQueue::default(),
             }),
         });

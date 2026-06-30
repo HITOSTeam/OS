@@ -192,6 +192,7 @@ fn queue_signal_to_task(
             inner.pending_signal_value[signum] = sig_value;
         }
     }
+    task.mark_signal_pending();
     let on_cpu = task.on_cpu.load(Ordering::Acquire);
     request_reschedule_for_signal_target(&task);
     wakeup_task(task.clone());

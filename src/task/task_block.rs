@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 
 use crate::{
-    mm::PhysPageNum,
+    mm::{MmRef, PhysPageNum},
     task::{
         id::{KernelStack, TaskUserRes, kstack_alloc},
         process_block::{ProcessControlBlock, ProcessScheduling},
@@ -18,6 +18,9 @@ pub struct TaskControlBlock {
     // 不可变字段
     // 对于所有的线程,共享一个父进程
     pub process: Weak<ProcessControlBlock>,
+    /// Cached current address space. The PCB remains the authoritative owner;
+    /// this avoids taking the large process lock on every return to user mode.
+    memory_set: Mutex<MmRef>,
     // 将内核栈所有权单独保存，这样即使部分元数据 Arc 引用暂时残留，
     // 已退出任务也能释放内核栈页。
     pub kstack: Mutex<Option<KernelStack>>,
@@ -29,12 +32,27 @@ pub struct TaskControlBlock {
     pub on_cpu: AtomicUsize,
     /// 当唤醒方尝试唤醒仍处于 `on_cpu` 状态的任务时置位。
     pub wakeup_pending: AtomicBool,
+    /// 线程存在待处理信号的快速标志。
+    ///
+    /// 对应 Linux 的 `TIF_SIGPENDING` 思路：返回用户态前先看这个原子标志，
+    /// 无信号的热路径不需要进入 TCB 内层锁。
+    signal_pending: AtomicBool,
     /// 当前任务是否已经进入某个每 hart 就绪队列。
     pub in_ready_queue: AtomicBool,
     /// 当前持有该任务的 hart 运行队列；未入队时为 `OFF_CPU`。
     pub ready_queue_hart: AtomicUsize,
+    /// futex wait 入队后的反向句柄。
+    ///
+    /// 退出清理可凭它直接进入对应 futex bucket 删除 waiter，避免扫描所有
+    /// futex 队列；正常 wake/timeout/signal 路径会清掉这个句柄。
+    futex_wait: Mutex<Option<FutexWaitHandle>>,
     // 可变字段
     inner: Mutex<TaskControlBlockInner>,
+}
+
+pub struct FutexWaitHandle {
+    pub key: (usize, usize),
+    pub in_queue: Arc<AtomicBool>,
 }
 
 static TASK_TCB_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -80,6 +98,18 @@ impl TaskControlBlock {
         self.on_cpu.store(Self::OFF_CPU, Ordering::Release);
     }
 
+    pub fn mark_signal_pending(&self) {
+        self.signal_pending.store(true, Ordering::Release);
+    }
+
+    pub fn refresh_signal_pending(&self, pending: u64) {
+        self.signal_pending.store(pending != 0, Ordering::Release);
+    }
+
+    pub fn has_signal_pending(&self) -> bool {
+        self.signal_pending.load(Ordering::Acquire)
+    }
+
     pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
         self.inner.lock()
     }
@@ -101,9 +131,27 @@ impl TaskControlBlock {
     }
 
     pub fn get_user_token(&self) -> usize {
-        let process = self.process.upgrade().unwrap();
-        let inner = process.borrow_mut();
-        inner.memory_set.token()
+        self.memory_set.lock().token()
+    }
+
+    /// Clone the cached mm handle without borrowing the owning process.
+    pub fn memory_set(&self) -> MmRef {
+        self.memory_set.lock().clone()
+    }
+
+    /// Replace the task's cached mm after exec installs a new address space.
+    pub fn set_memory_set(&self, memory_set: MmRef) {
+        *self.memory_set.lock() = memory_set;
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn prepare_user_asid(&self) -> (usize, bool) {
+        self.memory_set.lock().prepare_user_asid()
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn prepare_user_satp(&self) -> (usize, bool, bool) {
+        self.memory_set.lock().prepare_user_satp()
     }
 
     /// 将保存的用户态浮点状态重置为 Linux exec/线程初始状态：
@@ -115,11 +163,13 @@ impl TaskControlBlock {
         inner.fp_fcsr = 0;
         inner.fp_fcc = 0;
         inner.fp_valid = true;
+        inner.fp_used = false;
     }
 
     /// 将父任务保存的用户态浮点状态复制到刚 fork/clone 出来的子任务。
     /// 调用方必须先把当前硬件 FPU 状态保存到 `parent` 中，这与 Linux 的
-    /// arch_dup_task_struct()/copy_thread() 语义一致。
+    /// arch_dup_task_struct()/copy_thread() 语义一致。子任务继承保存的
+    /// 快照，但不继承“当前 CPU 已加载 FPU”的 owner 状态。
     /// 继承父任务的寄存器。
     pub fn inherit_fp_state_from(&self, parent: &TaskControlBlock) {
         let (fp_regs, fp_fcsr, fp_fcc, fp_valid) = {
@@ -136,6 +186,7 @@ impl TaskControlBlock {
         inner.fp_fcsr = fp_fcsr;
         inner.fp_fcc = fp_fcc;
         inner.fp_valid = fp_valid;
+        inner.fp_used = false;
     }
 
     pub fn scheduling_snapshot(&self) -> ProcessScheduling {
@@ -161,6 +212,34 @@ impl TaskControlBlock {
     pub fn cancel_sleep_timers(&self) {
         let mut inner = self.borrow_mut();
         inner.sleep_timer_seq = inner.sleep_timer_seq.wrapping_add(1);
+    }
+
+    pub fn set_futex_wait(&self, key: (usize, usize), in_queue: Arc<AtomicBool>) {
+        *self.futex_wait.lock() = Some(FutexWaitHandle { key, in_queue });
+    }
+
+    pub fn update_futex_wait_key(&self, in_queue: &Arc<AtomicBool>, key: (usize, usize)) {
+        let mut handle = self.futex_wait.lock();
+        if let Some(handle) = handle.as_mut()
+            && Arc::ptr_eq(&handle.in_queue, in_queue)
+        {
+            handle.key = key;
+        }
+    }
+
+    pub fn clear_futex_wait(&self, in_queue: &Arc<AtomicBool>) {
+        let mut handle = self.futex_wait.lock();
+        if handle
+            .as_ref()
+            .map(|handle| Arc::ptr_eq(&handle.in_queue, in_queue))
+            .unwrap_or(false)
+        {
+            *handle = None;
+        }
+    }
+
+    pub fn take_futex_wait(&self) -> Option<FutexWaitHandle> {
+        self.futex_wait.lock().take()
     }
 }
 
@@ -235,6 +314,11 @@ pub struct TaskControlBlockInner {
     /// Linux 会在 sleep/wakeup 之间保留有界的 `se->vlag`（`PLACE_LAG`），
     /// 使短控制线程在 fork-heavy 负载下不会丢失全部公平调度信用。
     pub fair_vlag_ns: u128,
+    /// exec/小线程组启动阶段的一次性 fair credit。
+    ///
+    /// 这不是长期优先级；只在下一次重新入队时消费，用于补偿当前没有完整
+    /// wakeup-preempt/hrtick 机制时 foreground 控制线程被大 fair 队列埋住的问题。
+    pub fair_startup_credit_ns: u128,
     /// 公平调度使用的 legacy CPU cgroup 身份缓存。
     ///
     /// Linux 会让 cgroup/task-group 调度状态可从任务的调度实体访问；
@@ -259,6 +343,8 @@ pub struct TaskControlBlockInner {
     pub fp_fcc: u8,
     /// `fp_regs/fp_fcsr` 是否包含有效快照。
     pub fp_valid: bool,
+    /// 当前任务是否已经实际使用过 FP，且硬件 FPU 中可能持有它的 live 状态。
+    pub fp_used: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -302,18 +388,21 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
-        let process_scheduling = {
+        let (process_scheduling, memory_set) = {
             let inner = process.borrow_mut();
-            inner.scheduling.clone()
+            (inner.scheduling.clone(), inner.memory_set.clone())
         };
         let tcb = Self {
             process: Arc::downgrade(&process),
+            memory_set: Mutex::new(memory_set),
             kstack: Mutex::new(Some(kstack)),
             cpu_id: AtomicUsize::new(0),
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             wakeup_pending: AtomicBool::new(false),
+            signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
+            futex_wait: Mutex::new(None),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -352,6 +441,7 @@ impl TaskControlBlock {
                 fair_vruntime_ns: 0,
                 fair_deadline_ns: 0,
                 fair_vlag_ns: 0,
+                fair_startup_credit_ns: 0,
                 fair_group_id: 0,
                 fair_group_shares: 1024,
                 sleep_timer_seq: 0,
@@ -362,6 +452,7 @@ impl TaskControlBlock {
                 fp_fcsr: 0,
                 fp_fcc: 0,
                 fp_valid: true,
+                fp_used: false,
             }),
         };
         TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -396,13 +487,14 @@ impl TaskControlBlock {
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
         // 继承进程当前的 nice 值，避免新线程上调度器后 nice 不一致
-        let process_scheduling = {
+        let (process_scheduling, memory_set) = {
             let inner = process.borrow_mut();
-            inner.scheduling.clone()
+            (inner.scheduling.clone(), inner.memory_set.clone())
         };
         let tcb = Self {
             // 用 Weak 反指回所属进程，避免线程 TCB 与进程 PCB 之间形成 Arc 循环引用
             process: Arc::downgrade(&process),
+            memory_set: Mutex::new(memory_set),
             // 内核栈所有权交给 TCB，drop 时一并回收
             kstack: Mutex::new(Some(kstack)),
             // 初始未绑定 hart，调用方随后通过 set_cpu_id 指定运行核
@@ -411,8 +503,10 @@ impl TaskControlBlock {
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             // 唤醒标记/就绪队列标记的初值均为 false：刚创建还未排队
             wakeup_pending: AtomicBool::new(false),
+            signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
+            futex_wait: Mutex::new(None),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
                 trap_cx_ppn,
@@ -459,6 +553,7 @@ impl TaskControlBlock {
                 fair_vruntime_ns: 0,
                 fair_deadline_ns: 0,
                 fair_vlag_ns: 0,
+                fair_startup_credit_ns: 0,
                 fair_group_id: 0,
                 fair_group_shares: 1024,
                 sleep_timer_seq: 0,
@@ -471,6 +566,7 @@ impl TaskControlBlock {
                 fp_fcsr: 0,
                 fp_fcc: 0,
                 fp_valid: true,
+                fp_used: false,
             }),
         };
         // 全局 TCB 计数 +1，配合 drop 端的减法可监控泄漏

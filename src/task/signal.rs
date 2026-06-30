@@ -27,7 +27,9 @@ use crate::{
     println,
     task::processor::current_process,
     task::{
-        manager::{pid2process, wakeup_task, wakeup_tasks},
+        manager::{
+            pid2process, prime_fair_sync_wakeup_lag, wakeup_signal_tasks, wakeup_task, wakeup_tasks,
+        },
         pid_namespace_member_pids,
         process_block::ProcessControlBlock,
         process_visible_in_pid_namespace,
@@ -367,10 +369,21 @@ impl SignalFlags {
         }
     }
 }
-pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
-    let Some(task) = current_task() else {
+
+fn signal_default_terminates(signum: usize) -> bool {
+    // Keep the wakeup decision aligned with the existing default-action table:
+    // only signals that would make `check_error()` terminate the task get the
+    // stronger fatal-signal wakeup path.
+    signum <= MAX_SIG
+        && SignalFlags::from_bits(1u32 << signum)
+            .and_then(|flag| flag.check_error())
+            .is_some()
+}
+
+pub fn check_task_signals_error(task: &Arc<TaskControlBlock>) -> Option<(i32, &'static str)> {
+    if !task.has_signal_pending() {
         return None;
-    };
+    }
     let (pending, mask) = {
         let inner = task.borrow_mut();
         (inner.pending_signals, inner.signal_mask)
@@ -417,6 +430,7 @@ pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
             // Ignored signals are discarded.
             let mut inner = task.borrow_mut();
             inner.pending_signals &= !bit;
+            task.refresh_signal_pending(inner.pending_signals);
             continue;
         }
         if handler != SIG_DFL {
@@ -432,6 +446,11 @@ pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
         }
     }
     None
+}
+
+pub fn check_if_current_signals_error() -> Option<(i32, &'static str)> {
+    let task = current_task()?;
+    check_task_signals_error(&task)
 }
 
 pub fn log_signal_exit(msg: &'static str) {
@@ -598,6 +617,9 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             }
         }
     }
+    let signum_usize = signum as usize;
+    let mut prompt_user_handler_wakeup = false;
+    let mut fatal_default_wakeup = false;
     let tasks = target_pids
         .into_iter()
         .filter_map(pid2process)
@@ -616,6 +638,29 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             }
             if let Some(flag) = legacy_flag {
                 process_ref.signals.insert(flag);
+            }
+            let handler = if signum_usize <= MAX_SIG {
+                let legacy = process_ref.signals_actions.table[signum_usize].handler;
+                if legacy != SIG_DFL {
+                    legacy
+                } else {
+                    process_ref
+                        .rt_sig_handlers
+                        .get(signum_usize)
+                        .map(|a| a.handler)
+                        .unwrap_or(SIG_DFL)
+                }
+            } else {
+                process_ref
+                    .rt_sig_handlers
+                    .get(signum_usize)
+                    .map(|a| a.handler)
+                    .unwrap_or(SIG_DFL)
+            };
+            if handler != SIG_DFL && handler != SIG_IGN {
+                prompt_user_handler_wakeup = true;
+            } else if handler == SIG_DFL && signal_default_terminates(signum_usize) {
+                fatal_default_wakeup = true;
             }
             Some(
                 process_ref
@@ -647,7 +692,10 @@ pub fn kill(pid: usize, signum: i32) -> isize {
                 let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 (tid, inner.pending_signals, inner.signal_mask)
             };
-            request_reschedule_for_signal_target(t);
+            t.mark_signal_pending();
+            if prompt_user_handler_wakeup || fatal_default_wakeup {
+                request_reschedule_for_signal_target(t);
+            }
             let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
             if on_cpu != TaskControlBlock::OFF_CPU {
                 running_signal_ipi_mask |= hart_mask_bit(on_cpu);
@@ -664,9 +712,29 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             );
         }
     }
-    wakeup_tasks(tasks.clone());
-    for task in tasks.iter() {
-        request_reschedule_for_signal_target(task);
+    // A user handler needs the target to reach user mode promptly so the
+    // handler can run. A fatal default signal needs the blocked task to observe
+    // pending termination promptly. Other ignored/nonfatal signals keep the
+    // cheaper normal signal wakeup behavior.
+    if prompt_user_handler_wakeup {
+        for task in tasks.iter() {
+            prime_fair_sync_wakeup_lag(task);
+        }
+        wakeup_tasks(tasks.clone());
+        crate::task::processor::request_reschedule_current_hart();
+        for task in tasks.iter() {
+            request_reschedule_for_signal_target(task);
+        }
+    } else if fatal_default_wakeup {
+        for task in tasks.iter() {
+            prime_fair_sync_wakeup_lag(task);
+        }
+        wakeup_signal_tasks(tasks.clone());
+        for task in tasks.iter() {
+            request_reschedule_for_signal_target(task);
+        }
+    } else {
+        wakeup_signal_tasks(tasks);
     }
     if running_signal_ipi_mask != 0 {
         send_signal_ipis(running_signal_ipi_mask);
@@ -705,6 +773,7 @@ pub fn kill_current(signum: i32) -> isize {
             let mut inner = t.borrow_mut();
             mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0, 0);
         }
+        t.mark_signal_pending();
         request_reschedule_for_signal_target(t);
         let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
         if on_cpu != TaskControlBlock::OFF_CPU {
@@ -780,6 +849,7 @@ pub fn queue_process_signal_info(
             !already,
         )
     };
+    task.mark_signal_pending();
     crate::log_if!(
         DEBUG_UNIXBENCH,
         info,

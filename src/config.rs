@@ -32,6 +32,11 @@ pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 pub const SIGRETURN_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
 #[cfg(not(target_arch = "loongarch64"))]
 pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
+// Keep RISC-V kernel stacks out of the top Sv39 root entry, which holds the
+// per-mm trap context and trampoline pages. The stack window starts one GiB
+// below TRAMPOLINE so it can be shared as kernel-only root entries.
+#[cfg(target_arch = "riscv64")]
+pub const KERNEL_STACK_TOP: usize = TRAMPOLINE - 0x4000_0000;
 
 // LoongArch64 uses split PGDL/PGDH and a 3-level (Sv39-style) page walk here,
 // so the user-range VA width is 39 bits. Keep trap-related pages inside the
@@ -52,9 +57,9 @@ pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;
 /// and we use top - xx to push data...
 #[allow(dead_code)]
 pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
-    #[cfg(target_arch = "loongarch64")]
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
     let top = KERNEL_STACK_TOP - app_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
-    #[cfg(not(target_arch = "loongarch64"))]
+    #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
     let top = TRAMPOLINE - app_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
     let bottom = top - KERNEL_STACK_SIZE;
     (bottom, top)

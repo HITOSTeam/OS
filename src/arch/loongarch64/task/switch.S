@@ -9,7 +9,7 @@ switch:
     st.d $ra, $a0, 0
     st.d $sp, $a0, 8
     # 保存tp(r2)
-    st.d $r2, $a0, 16 
+    st.d $r2, $a0, 16
     # 保存11个 callee-saved 寄存器
     st.d $r22, $a0, 24
     st.d $r23, $a0, 32
@@ -49,7 +49,8 @@ switch:
     csrwr $t0, CSR_PGDL
     ld.d $t0, $a1, 120
     csrwr $t0, CSR_PGDH
-    invtlb 0x3, $zero, $zero
+    # Do not flush here: user translations are tagged by ASID on trap return.
+    # Flushing on every context switch destroys the cyclictest/hackbench fast path.
 
     # 跳转到ra执行,也就是a1的最开始位置
     jirl $zero, $ra, 0
