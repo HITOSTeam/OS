@@ -186,9 +186,7 @@ pub(crate) fn open_existing_ext4_inode(
         false,
         None,
     ) {
-        Ok(file) => {
-            alloc::sync::Arc::new(file.with_fanotify_path(raw_abs.map(alloc::string::String::from)))
-        }
+        Ok(file) => alloc::sync::Arc::new(file),
         Err(e) => return Err(e),
     };
 

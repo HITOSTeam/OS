@@ -3,7 +3,7 @@
 
 use super::{PhysAddr, PhysPageNum};
 use crate::{config::phys_mem_end, println};
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::{
     fmt::{self, Debug, Formatter},
@@ -82,7 +82,6 @@ pub struct StackFrameAllocator {
     current: usize,
     end: usize,
     recycled: Vec<usize>,
-    recycled_set: BTreeSet<usize>,
     managed_pages: usize,
 }
 
@@ -100,9 +99,6 @@ impl StackFrameAllocator {
         }
         self.managed_pages = self.managed_pages.saturating_add(r.0.saturating_sub(l.0));
         for ppn in l.0..r.0 {
-            if !self.recycled_set.insert(ppn) {
-                panic!("Frame ppn={:#x} has already been recycled!", ppn);
-            }
             self.recycled.push(ppn);
         }
     }
@@ -125,13 +121,11 @@ impl FrameAllocator for StackFrameAllocator {
             current: 0,
             end: 0,
             recycled: Vec::new(),
-            recycled_set: BTreeSet::new(),
             managed_pages: 0,
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
         if let Some(ppn) = self.recycled.pop() {
-            self.recycled_set.remove(&ppn);
             Some(ppn.into())
         } else if self.current == self.end {
             None
@@ -143,11 +137,10 @@ impl FrameAllocator for StackFrameAllocator {
     fn dealloc(&mut self, ppn: PhysPageNum) {
         let ppn = ppn.0;
         // validity check
-        if ppn >= self.current || self.recycled_set.contains(&ppn) {
+        if ppn >= self.current || self.recycled.iter().any(|&v| v == ppn) {
             panic!("Frame ppn={:#x} has not been allocated!", ppn);
         }
         // recycle
-        self.recycled_set.insert(ppn);
         self.recycled.push(ppn);
     }
 }

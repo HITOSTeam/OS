@@ -18,6 +18,10 @@ const ELFDATA2LSB: u8 = 1;
 const EM_RISCV: u16 = 243;
 #[cfg(target_arch = "loongarch64")]
 const EM_LOONGARCH: u16 = 258;
+#[cfg(target_arch = "riscv64")]
+const EF_RISCV_FLOAT_ABI_MASK: u32 = 0x6;
+#[cfg(target_arch = "loongarch64")]
+const EF_LOONGARCH_ABI_MASK: u32 = 0x7;
 pub(super) const ET_DYN: u16 = 3;
 pub(super) const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
@@ -238,6 +242,16 @@ fn current_elf_machine() -> u16 {
     EM_LOONGARCH
 }
 
+#[cfg(target_arch = "riscv64")]
+fn elf_float_abi(abi: ElfArchAbi) -> u32 {
+    abi.flags & EF_RISCV_FLOAT_ABI_MASK
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn elf_float_abi(abi: ElfArchAbi) -> u32 {
+    abi.flags & EF_LOONGARCH_ABI_MASK
+}
+
 pub(crate) fn validate_elf_arch_abi(abi: ElfArchAbi) -> Result<(), isize> {
     if abi.machine != current_elf_machine() {
         return Err(ENOEXEC);
@@ -245,17 +259,17 @@ pub(crate) fn validate_elf_arch_abi(abi: ElfArchAbi) -> Result<(), isize> {
     Ok(())
 }
 
-/// Validate ELF interpreter architecture against the main program.
-///
-/// Linux checks PT_INTERP with elf_check_arch(), but does not require RISC-V
-/// e_flags float ABI bits to match the main executable. Some musl loaders are
-/// ET_DYN objects with zero e_flags while loading hard-float programs.
+/// 检查 程序拥有的ABI 与 我们实际是否一致
+/// 有些测试有问题 。
 pub(crate) fn validate_elf_interp_abi(
     main_abi: ElfArchAbi,
     interp_abi: ElfArchAbi,
 ) -> Result<(), isize> {
     validate_elf_arch_abi(main_abi)?;
     validate_elf_arch_abi(interp_abi)?;
+    if elf_float_abi(main_abi) != elf_float_abi(interp_abi) {
+        return Err(ENOEXEC);
+    }
     Ok(())
 }
 

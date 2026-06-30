@@ -35,9 +35,8 @@ use crate::{
         signal::{
             RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGKILL_NUM,
             SIGSTOP_NUM, SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags,
-            can_signal_process, has_wait_interrupting_pending, kill, kill_current,
-            request_reschedule_for_signal_target, set_signal, set_signal_mask, signal_bit,
-            take_first_unmasked,
+            can_signal_process, has_wait_interrupting_pending, kill, kill_current, set_signal,
+            set_signal_mask, signal_bit, take_first_unmasked,
         },
         task_block::{SigSavedContext, TaskControlBlock, TaskStatus},
     },
@@ -194,9 +193,7 @@ fn queue_signal_to_task(
     }
     task.mark_signal_pending();
     let on_cpu = task.on_cpu.load(Ordering::Acquire);
-    request_reschedule_for_signal_target(&task);
-    wakeup_task(task.clone());
-    request_reschedule_for_signal_target(&task);
+    wakeup_task(task);
     if on_cpu != TaskControlBlock::OFF_CPU {
         arch::send_ipi(on_cpu);
     }
