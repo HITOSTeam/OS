@@ -182,10 +182,6 @@ impl MemorySet {
         let Some((perm, pte_flags)) = region.lazy_fault_policy(fault_va, access) else {
             return LazyFaultResult::Invalid;
         };
-        let file_backing = region
-            .file_backed
-            .then(|| self.mmap_backing_file(region.backing_id))
-            .flatten();
         let page_start = vpn.0.saturating_mul(PAGE_SIZE);
         let file_page = (region.backing_id != 0).then(|| {
             region
@@ -252,8 +248,12 @@ impl MemorySet {
                 (frame, false)
             };
             if !reused_cached_frame {
-                if let Some(file) = file_backing.as_ref() {
-                    if region.file_backed {
+                if region.file_backed {
+                    if let Some(file) = self
+                        .mmap_backings
+                        .get(&region.backing_id)
+                        .map(|backing| backing.file())
+                    {
                         if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
                             // 新分配的 file-backed 页从文件读入，EOF 页尾保持零填充。
                             let region_delta = page_start.saturating_sub(region.start);
@@ -307,20 +307,15 @@ impl MemorySet {
                 // mm instead of issuing it for every lazy fault.
                 crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
             }
+            let shared_file_backing_frame = shared_inode_backed.then(|| frame.clone());
             area.insert_tracked_frame(vpn, frame);
             if region.backing_id != 0 {
                 if let Some(file_page) = file_page {
                     // 记录 resident 页，供 msync/munmap/writeback 和 debug invariant 使用。
-                    let backing_frame = area
-                        .tracked_frame(vpn)
-                        .expect("lazy fault inserted frame")
-                        .clone();
                     if let Some(backing) = self.mmap_backings.get_mut(&region.backing_id) {
-                        let cache_frame =
-                            (region.shared && region.file_backed).then_some(&backing_frame);
                         backing.add_resident_page_ref(
                             file_page,
-                            cache_frame,
+                            shared_file_backing_frame.as_ref(),
                             pte_flags.contains(PTEFlags::D),
                         );
                     }

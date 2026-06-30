@@ -2,18 +2,19 @@ use super::{
     AtPath, BTreeSet, FD_CLOEXEC, File, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY,
     O_EXCL, O_NOATIME, O_NOFOLLOW, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_TMPFILE, O_TRUNC,
     O_WRONLY, OSInode, Ordering, ProcMagicLinkFile, PseudoDir, PseudoShmFile, S_IFBLK, S_IFCHR,
-    S_IFMT, SyscallError, TMPFILE_SEQ, apply_umask, current_effective_uid_gid, current_files,
-    current_files_and_nofile_limit, current_fsuid_gid, current_process, err, ext4_err_to_errno,
-    ext4_lock, fanotify_notify_close, fanotify_notify_open, fanotify_permission_open,
-    fifo_pipe_state_for_inode, file_lock_key, file_lock_key_from_inode, get_current_token,
-    gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
-    is_inode_currently_executed_locked, is_privileged_or_owner, lock_executing_inodes, make_pipe,
-    maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint,
-    open_existing_target_path, open_pseudo, path_is_nodev, path_is_nosymfollow, path_is_rofs,
-    proc_path_for_at, read_user_cstring, remove_owner_file_lease_for_key,
-    remove_process_record_locks_for_key, reopen_proc_link_file, resolve_abs_path, resolve_at_inode,
-    resolve_at_path, resolve_parent_and_name, secondary_root_inode, set_inode_all_times_now,
-    shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, try_write_user_value,
+    S_IFMT, SyscallError, TMPFILE_SEQ, apply_umask, clear_ext4_path_cache,
+    current_effective_uid_gid, current_files, current_files_and_nofile_limit, current_fsuid_gid,
+    current_process, err, ext4_err_to_errno, ext4_lock, fanotify_notify_close,
+    fanotify_notify_open, fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key,
+    file_lock_key_from_inode, get_current_token, gid_for_created_inode, inode_mode_allows,
+    inode_mode_allows_uid_gid, install_open_file_fd, invalidate_ext4_path_cache_for_at,
+    is_privileged_or_owner, make_pipe, maybe_signal_lease_break, mode_for_created_file,
+    note_inode_path_hint, open_existing_target_path, open_pseudo, path_is_nodev,
+    path_is_nosymfollow, path_is_rofs, proc_path_for_at, read_user_cstring,
+    remove_owner_file_lease_for_key, remove_process_record_locks_for_key, reopen_proc_link_file,
+    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
+    secondary_root_inode, set_inode_all_times_now, shm_create, shm_get, shm_object_name,
+    touch_inode_mtime_ctime_now, truncate_regular_inode, try_write_user_value,
     union_root_dir_entries,
 };
 
@@ -108,6 +109,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     let (fsuid, fsgid) = current_fsuid_gid();
     if let Some(abs) = raw_abs.as_deref() {
         if path_is_nosymfollow(abs) {
+            let _ext4_guard = ext4_lock();
             if let Ok(inode) = resolve_at_inode(&at, fsuid, fsgid, false) {
                 if inode.is_symlink() {
                     return err(SyscallError::ELOOP);
@@ -278,6 +280,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         } else {
             match fs_root.create_dir(pool_name) {
                 Ok(d) => {
+                    clear_ext4_path_cache();
                     d.set_uid_gid(0, 0);
                     d.set_mode(0o1777);
                     d
@@ -296,6 +299,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             }
             match pool_dir.create_file(&name) {
                 Ok(i) => {
+                    clear_ext4_path_cache();
                     tmp_created = Some(i);
                     tmpfile_cleanup_parent = Some(alloc::sync::Arc::clone(&pool_dir));
                     tmpfile_cleanup_name = Some(name);
@@ -335,6 +339,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                 }
                 inode = match parent.create_file(&name) {
                     Ok(i) => {
+                        invalidate_ext4_path_cache_for_at(&at, false);
                         created = true;
                         created_parent = Some(alloc::sync::Arc::clone(&parent));
                         Some(i)
@@ -439,35 +444,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         return err(SyscallError::ENOTDIR);
     }
 
-    let text_write_intent = writable || (flags & O_TRUNC) != 0;
-    let exec_inode_guard = if !o_path && inode.is_file() && text_write_intent {
-        let guard = lock_executing_inodes();
-        let exec_busy =
-            is_inode_currently_executed_locked(&guard, inode.device_id(), inode.inode_num());
-        if exec_busy {
-            return err(SyscallError::ETXTBSY);
-        }
-        Some(guard)
-    } else {
-        None
-    };
-
-    if !o_path && inode.is_file() {
-        maybe_signal_lease_break(
-            file_lock_key_from_inode(&inode),
-            writable,
-            false,
-            current_process().getpid(),
-        );
-    }
-
-    if !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file() {
-        if let Err(e) = inode.clear() {
-            return ext4_err_to_errno(e);
-        }
-        touch_inode_mtime_ctime_now(&inode);
-    }
-
     if !o_path && inode.is_fifo() {
         let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
         let accmode = flags & O_ACCMODE;
@@ -499,24 +475,42 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     } else {
         None
     };
-    let os_inode = alloc::sync::Arc::new(
-        OSInode::new_with_append_rofs_tmp_cleanup(
-            readable,
-            writable,
-            append,
-            inode,
-            readonly_fs,
-            false,
-            tmpfile_cleanup,
-        )
-        .with_fanotify_path(raw_abs.clone()),
-    );
+    let os_inode = match OSInode::new_with_append_rofs_tmp_cleanup(
+        readable,
+        writable,
+        append,
+        alloc::sync::Arc::clone(&inode),
+        readonly_fs,
+        false,
+        tmpfile_cleanup,
+    ) {
+        Ok(file) => alloc::sync::Arc::new(file.with_fanotify_path(raw_abs.clone())),
+        Err(e) => return e,
+    };
     let fanotify_inode = os_inode.ext4_inode();
     let fanotify_is_dir = fanotify_inode.is_dir();
     let fanotify_path = os_inode.fanotify_path();
-    drop(exec_inode_guard);
-    crate::fs::debug_track_iozone_inode(&path, inode_num);
+
+    if !o_path && inode.is_file() {
+        maybe_signal_lease_break(
+            file_lock_key_from_inode(&inode),
+            writable,
+            false,
+            current_process().getpid(),
+        );
+    }
+
+    let needs_trunc = !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file();
     drop(ext4_guard);
+    if needs_trunc {
+        let ret = truncate_regular_inode(&inode, 0);
+        if ret != 0 {
+            return ret;
+        }
+        touch_inode_mtime_ctime_now(&inode);
+    }
+
+    crate::fs::debug_track_iozone_inode(&path, inode_num);
     if !o_path
         && let Err(e) = fanotify_permission_open(
             &fanotify_inode,

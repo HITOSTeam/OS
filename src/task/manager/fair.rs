@@ -707,8 +707,9 @@ pub fn prime_fair_timer_wakeup_lag(task: &Arc<TaskControlBlock>) {
 ///
 /// futex/join/wait4 这类唤醒通常是控制线程等待某个明确事件完成；在 hackbench
 /// 这类 400 个 fair pipe worker 的压力下，如果这些控制线程按普通 I/O wakeup
-/// 放置，就容易在事件已经完成后仍长时间排队。这里不碰 pipe/socket 数据唤醒，
-/// 只给同步完成路径一个 `entity_lag()` 级别的有界 credit。
+/// 放置，就容易在事件已经完成后仍长时间排队。调用方只应把它用于明确的同步
+/// handoff waiter，例如 futex/join/wait4 或 pipe 的直接读写等待者；poll/epoll
+/// 这类就绪通知等待者仍应使用普通 wakeup placement。
 pub fn prime_fair_sync_wakeup_lag(task: &Arc<TaskControlBlock>) {
     let mut inner = task.borrow_mut();
     if !matches!(

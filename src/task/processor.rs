@@ -13,8 +13,8 @@ use crate::{
             fair_wakeup_preempts_current_on_hart, fetch_task, has_ready_rt_any_at_or_above,
             has_ready_rt_at_or_above, has_ready_rt_higher_than, has_ready_tasks,
             prime_fair_sync_wakeup_lag, ready_queue_lengths, record_fair_sleep_lag,
-            remove_inactive_task, remove_sched_timer_refs, requeue_task, rt_bandwidth_throttled,
-            wakeup_task, wakeup_tasks,
+            release_process_mm_owner, remove_inactive_task, remove_sched_timer_refs, requeue_task,
+            rt_bandwidth_throttled, wakeup_sync_task_on_hart, wakeup_task, wakeup_tasks,
         },
         process_block::ProcessControlBlock,
         runtime::{monotonic_time_ns, start_task_runtime_slice},
@@ -151,6 +151,74 @@ fn kill_pid_namespace_members_on_init_exit(process: &Arc<ProcessControlBlock>) {
             continue;
         }
         crate::task::signal::queue_process_signal(member_pid, crate::task::signal::SIGKILL_NUM);
+    }
+}
+
+fn try_reparent_child_to(
+    child: &Arc<ProcessControlBlock>,
+    reaper: &Arc<ProcessControlBlock>,
+) -> bool {
+    let mut reaper_inner = reaper.borrow_mut();
+    if reaper_inner.is_zombie {
+        return false;
+    }
+    let reaper_pid = reaper.getpid();
+    let reaper_pid_ns_id = reaper_inner.pid_ns_id;
+    let reaper_visible_pid = reaper_inner.pid_ns_vpid;
+    let queue_for_reaper = {
+        let mut child_inner = child.borrow_mut();
+        child_inner.parent = Some(Arc::downgrade(reaper));
+        child.update_parent_visible_pid_from_locked_child(
+            child_inner.pid_ns_id,
+            reaper_pid_ns_id,
+            reaper_visible_pid,
+        );
+        if child_inner.is_zombie && child_inner.exited_parent_queue_pid != Some(reaper_pid) {
+            child_inner.exited_parent_queue_pid = Some(reaper_pid);
+            true
+        } else {
+            false
+        }
+    };
+    reaper_inner.add_child(child.clone());
+    if queue_for_reaper {
+        reaper_inner.exited_children.push_back(child.clone());
+    }
+    true
+}
+
+fn try_reparent_child_to_namespace_reaper(
+    child: &Arc<ProcessControlBlock>,
+    exiting_process: &Arc<ProcessControlBlock>,
+    namespace_id: usize,
+) -> bool {
+    let mut current_namespace = Some(namespace_id);
+    while let Some(ns_id) = current_namespace {
+        if let Some(reaper) = crate::task::pid_namespace_reaper(ns_id)
+            && !Arc::ptr_eq(&reaper, exiting_process)
+            && !Arc::ptr_eq(&reaper, child)
+            && try_reparent_child_to(child, &reaper)
+        {
+            return true;
+        }
+        current_namespace = crate::task::pid_namespace_parent(ns_id);
+    }
+    false
+}
+
+fn reparent_orphaned_children(process: &Arc<ProcessControlBlock>) {
+    let (children, namespace_id) = {
+        let process_inner = process.borrow_mut();
+        (process_inner.children.clone(), process_inner.pid_ns_id)
+    };
+    for child in children {
+        if try_reparent_child_to_namespace_reaper(&child, process, namespace_id) {
+            continue;
+        }
+        let initproc = INITPROC.clone();
+        if !Arc::ptr_eq(&initproc, process) && !Arc::ptr_eq(&initproc, &child) {
+            let _ = try_reparent_child_to(&child, &initproc);
+        }
     }
 }
 
@@ -303,9 +371,16 @@ fn queue_files_struct_drop(files: Arc<spin::Mutex<FilesStruct>>) {
         return;
     }
 
+    close_files_struct_fd_refs_if_unshared(&files);
     local_processor()
         .lock()
         .set_pending_files_struct_drop(files);
+}
+
+fn close_files_struct_fd_refs_if_unshared(files: &Arc<spin::Mutex<FilesStruct>>) {
+    if Arc::strong_count(files) == 1 {
+        files.lock().close_all_fd_refs();
+    }
 }
 
 /// 将一个地址空间（mm）延迟到 idle 循环释放。
@@ -468,7 +543,8 @@ fn cleanup_process_threads_for_group_exit(
         }
         remove_inactive_task(Arc::clone(member));
         let cleanup = take_thread_exit_cleanup(member, exit_code);
-        let _ = finish_thread_exit_cleanup(process, cleanup, false);
+        let drop_user_res = cleanup.is_linux_thread;
+        let _ = finish_thread_exit_cleanup(process, cleanup, drop_user_res);
     }
     for member in members {
         let mut member_inner = member.borrow_mut();
@@ -1096,7 +1172,15 @@ pub fn idle_task() {
                 .wakeup_pending
                 .swap(false, core::sync::atomic::Ordering::AcqRel)
             {
-                wakeup_task(task);
+                let sync_hart = task.wakeup_sync_hart.swap(
+                    TaskControlBlock::OFF_CPU,
+                    core::sync::atomic::Ordering::AcqRel,
+                );
+                if sync_hart < MAX_HARTS {
+                    wakeup_sync_task_on_hart(task, sync_hart);
+                } else {
+                    wakeup_task(task);
+                }
             }
         }
 
@@ -1107,6 +1191,10 @@ pub fn idle_task() {
             task.clear_on_cpu();
             task.wakeup_pending
                 .store(false, core::sync::atomic::Ordering::Release);
+            task.wakeup_sync_hart.store(
+                TaskControlBlock::OFF_CPU,
+                core::sync::atomic::Ordering::Release,
+            );
             requeue_task(task);
         }
 
@@ -1512,6 +1600,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // holding the TCB lock so the same logic can be reused by exit_group().
     let cleanup = take_thread_exit_cleanup(&task, exit_code);
     let drop_user_res = cleanup.tid != 0;
+    let drop_user_res = drop_user_res || cleanup.is_linux_thread;
     let (tid, is_linux_thread, clear_child_tid_addr) =
         finish_thread_exit_cleanup(&process, cleanup, drop_user_res);
 
@@ -1580,13 +1669,20 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
                 arch::shutdown();
             }
         }
-        // Mark zombie and capture parent pointer first...
-        let (parent, exit_signal) = {
+        // Detach and semantically close this process' fd table before the
+        // zombie becomes visible to waiters.  Heavy file object drops remain
+        // deferred below.
+        let (parent, exit_signal, old_files) = {
             let mut process_inner = process.borrow_mut();
             crate::syscall::process::unregister_executing_inode(
                 process_inner.exec_inode_dev,
                 process_inner.exec_inode_num,
             );
+            let old_files = core::mem::replace(
+                &mut process_inner.files,
+                Arc::new(spin::Mutex::new(FilesStruct::new())),
+            );
+            close_files_struct_fd_refs_if_unshared(&old_files);
             process_inner.is_zombie = true;
             process_inner.dumped_core = dumped_core;
             process_inner.exit_code = exit_code;
@@ -1594,6 +1690,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             (
                 process_inner.parent.as_ref().and_then(|p| p.upgrade()),
                 process_inner.exit_signal,
+                old_files,
             )
         }; // drop child PCB lock before touching parent to avoid lock inversion
         crate::syscall::process::release_ptrace_tracer(&process);
@@ -1614,35 +1711,13 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             wakeup_tasks(waiters);
         }
 
-        {
-            let process_inner = process.borrow_mut();
-            let mut initproc_inner = INITPROC.borrow_mut();
-            let init_pid = INITPROC.getpid();
-            for child in process_inner.children.iter() {
-                let queue_for_init = {
-                    let mut child_inner = child.borrow_mut();
-                    child_inner.parent = Some(Arc::downgrade(&INITPROC));
-                    if child_inner.is_zombie
-                        && child_inner.exited_parent_queue_pid != Some(init_pid)
-                    {
-                        child_inner.exited_parent_queue_pid = Some(init_pid);
-                        true
-                    } else {
-                        false
-                    }
-                };
-                initproc_inner.add_child(child.clone());
-                if queue_for_init {
-                    initproc_inner.exited_children.push_back(child.clone());
-                }
-            }
-        }
+        reparent_orphaned_children(&process);
 
         // Deallocate user-thread resources only after each member has run the
         // same exit-side futex/join cleanup as the current thread.
         let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
         recycle_res.clear();
-        let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm, old_files) = {
+        let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
             let mut process_inner = process.borrow_mut();
             process_inner.clear_children();
             process_inner.exited_children.clear();
@@ -1660,23 +1735,11 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             );
             crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
             crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-            // Detach the file table under the PCB lock, then drop/close it
-            // outside the lock. Linux exit_files() follows the same shape:
-            // publish an empty files_struct first, then perform expensive fd
-            // close and pipe wakeups without holding process metadata locks.
-            let old_files = core::mem::replace(
-                &mut process_inner.files,
-                Arc::new(spin::Mutex::new(FilesStruct::new())),
-            );
-            (
-                old_shm_cleanup,
-                old_mm_token,
-                old_net_ns_id,
-                old_mm,
-                old_files,
-            )
+            (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
         };
-        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        if !release_process_mm_owner(old_mm_token) {
+            crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+        }
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
@@ -1719,8 +1782,10 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         unreachable!("schedule should not return after group exit");
     };
 
+    let cleanup = take_thread_exit_cleanup(&task, exit_code);
+    let drop_user_res = cleanup.is_linux_thread;
     let (tid, _is_linux_thread, _clear_child_tid_addr) =
-        finish_thread_exit_cleanup(&process, take_thread_exit_cleanup(&task, exit_code), false);
+        finish_thread_exit_cleanup(&process, cleanup, drop_user_res);
 
     log::debug!(
         "[exit_group] pid={} tid={} exit_code={}",
@@ -1746,12 +1811,17 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         }
     }
 
-    let (parent, exit_signal) = {
+    let (parent, exit_signal, old_files) = {
         let mut process_inner = process.borrow_mut();
         crate::syscall::process::unregister_executing_inode(
             process_inner.exec_inode_dev,
             process_inner.exec_inode_num,
         );
+        let old_files = core::mem::replace(
+            &mut process_inner.files,
+            Arc::new(spin::Mutex::new(FilesStruct::new())),
+        );
+        close_files_struct_fd_refs_if_unshared(&old_files);
         process_inner.is_zombie = true;
         process_inner.dumped_core = dumped_core;
         process_inner.exit_code = exit_code;
@@ -1759,10 +1829,12 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         (
             process_inner.parent.as_ref().and_then(|p| p.upgrade()),
             process_inner.exit_signal,
+            old_files,
         )
     };
     crate::syscall::process::release_ptrace_tracer(&process);
     crate::fs::wake_pidfd_poll_waiters(pid);
+    kill_pid_namespace_members_on_init_exit(&process);
     cgroup_exit_process(pid);
     crate::syscall::sysv_ipc::exit_cleanup(pid);
     crate::syscall::filesystem::acct_process_exit(&process, exit_code);
@@ -1777,31 +1849,11 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         wakeup_tasks(waiters);
     }
 
-    {
-        let process_inner = process.borrow_mut();
-        let mut initproc_inner = INITPROC.borrow_mut();
-        let init_pid = INITPROC.getpid();
-        for child in process_inner.children.iter() {
-            let queue_for_init = {
-                let mut child_inner = child.borrow_mut();
-                child_inner.parent = Some(Arc::downgrade(&INITPROC));
-                if child_inner.is_zombie && child_inner.exited_parent_queue_pid != Some(init_pid) {
-                    child_inner.exited_parent_queue_pid = Some(init_pid);
-                    true
-                } else {
-                    false
-                }
-            };
-            initproc_inner.add_child(child.clone());
-            if queue_for_init {
-                initproc_inner.exited_children.push_back(child.clone());
-            }
-        }
-    }
+    reparent_orphaned_children(&process);
 
     let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();
-    let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm, old_files) = {
+    let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
         let mut process_inner = process.borrow_mut();
         process_inner.clear_children();
         process_inner.exited_children.clear();
@@ -1818,20 +1870,11 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         );
         crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
         crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-        // See exit_current_and_run_next(): detach under PCB lock, close/drop outside.
-        let old_files = core::mem::replace(
-            &mut process_inner.files,
-            Arc::new(spin::Mutex::new(FilesStruct::new())),
-        );
-        (
-            old_shm_cleanup,
-            old_mm_token,
-            old_net_ns_id,
-            old_mm,
-            old_files,
-        )
+        (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
     };
-    crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+    if !release_process_mm_owner(old_mm_token) {
+        crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
+    }
     if let Some(old_shm) = old_shm_cleanup {
         crate::syscall::sysv_shm::exit_cleanup(&old_shm);
     }

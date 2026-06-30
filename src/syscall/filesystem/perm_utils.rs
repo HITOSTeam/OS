@@ -1,7 +1,4 @@
-use super::{
-    BTreeSet, OSInode, PID2PCB, ProcessControlBlock, S_IFBLK, S_IFCHR, S_IFMT, SyscallError, Vec,
-    current_process, err,
-};
+use super::{SyscallError, clear_ext4_path_cache, current_process, err};
 
 /// Converts ext4 backend errors into Linux-style `errno` values.
 pub(crate) fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
@@ -90,6 +87,9 @@ pub(crate) fn apply_chown_to_inode(inode: &ext4_fs::Inode, uid: usize, gid: usiz
     let new_gid = gid_req.unwrap_or_else(|| inode.gid());
     inode.set_uid_gid(new_uid, new_gid);
     maybe_clear_suid_sgid_after_chown(inode, uid_req.is_some() || gid_req.is_some());
+    if uid_req.is_some() || gid_req.is_some() {
+        clear_ext4_path_cache();
+    }
     0
 }
 
@@ -177,14 +177,6 @@ pub(crate) fn mode_for_created_file(mut mode: u16, gid: u32) -> u16 {
     mode
 }
 
-/// Returns the device number that should surface through `stat` for special files.
-pub(crate) fn inode_rdev_for_mode(inode: &ext4_fs::Inode, mode: u16) -> u64 {
-    match mode & S_IFMT {
-        S_IFCHR | S_IFBLK => inode.special_rdev(),
-        _ => 0,
-    }
-}
-
 /// Extracts the Linux major number from an encoded device id.
 pub(crate) fn linux_dev_major(dev: u64) -> u32 {
     ((((dev >> 8) & 0x0fff) | ((dev >> 32) & 0xffff_f000)) & 0xffff_ffff) as u32
@@ -197,33 +189,13 @@ pub(crate) fn linux_dev_minor(dev: u64) -> u32 {
 
 /// Reports the largest visible size across disk state and open writable views of an inode.
 pub(crate) fn inode_visible_size(inode: &ext4_fs::Inode) -> usize {
-    let mut size = inode.size() as usize;
-    let target_ino = inode.inode_num();
-    let target_dev = inode.device_id();
+    inode_visible_size_with_disk_size(inode, inode.size() as usize)
+}
 
-    let processes: Vec<alloc::sync::Arc<ProcessControlBlock>> = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect()
-    };
-    let mut seen_tables = BTreeSet::new();
-    for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let table = alloc::sync::Arc::clone(&inner.files);
-        drop(inner);
-        if !seen_tables.insert(alloc::sync::Arc::as_ptr(&table) as usize) {
-            continue;
-        }
-        for (_fd, file) in table.lock().iter_files_snapshot() {
-            let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-                continue;
-            };
-            let opened_inode = os_inode.ext4_inode();
-            if opened_inode.inode_num() == target_ino && opened_inode.device_id() == target_dev {
-                size = core::cmp::max(size, os_inode.pending_write_end());
-            }
-        }
+/// Same as `inode_visible_size`, using an already-read on-disk size.
+pub(crate) fn inode_visible_size_with_disk_size(inode: &ext4_fs::Inode, disk_size: usize) -> usize {
+    match crate::fs::pending_inode_write_end(inode.device_id(), inode.inode_num()) {
+        Some(pending_end) => core::cmp::max(disk_size, pending_end),
+        None => disk_size,
     }
-    size
 }

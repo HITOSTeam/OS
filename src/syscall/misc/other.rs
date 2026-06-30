@@ -5,6 +5,7 @@ use crate::{
     mm::{MapPermission, translated_byte_buffer, try_read_user_value, try_write_user_value},
     syscall::{
         error::{SyscallError, err},
+        filesystem::O_PATH,
         robust_list::ROBUST_LIST_HEAD_LEN,
     },
     task::{
@@ -19,6 +20,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::mem::size_of;
 
 use super::{current_linux_tid, encode_linux_tid};
+use crate::fs::File;
 
 /// Linux `set_tid_address(2)` (syscall 96 on riscv64).
 ///
@@ -172,6 +174,12 @@ struct PollFd {
     revents: i16,
 }
 
+struct PollTarget {
+    file: Option<Arc<dyn File + Send + Sync>>,
+    fixed_mask: Option<i16>,
+    flags: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PollTimeSpec {
@@ -211,7 +219,7 @@ fn ppoll_write_back(token: usize, fds_ptr: usize, pfds: &[PollFd]) -> Result<(),
 /// Linux `ppoll(2)` (syscall 73 on riscv64).
 ///
 /// Minimal readiness reporting for shells (busybox/ash) and glibc helpers.
-/// We conservatively mark fds as ready if they are readable/writable.
+/// Readiness comes from each file's Linux-style `poll_mask()`.
 pub fn syscall_ppoll(
     fds_ptr: usize,
     nfds: usize,
@@ -280,22 +288,63 @@ pub fn syscall_ppoll(
         pfds.push(pfd);
     }
 
-    let scan_ready = |pfds: &mut [PollFd]| -> isize {
+    let snapshot_poll_files = |pfds: &[PollFd]| -> Vec<PollTarget> {
+        if pfds.is_empty() {
+            return Vec::new();
+        }
+        let files_guard = files.lock();
+        pfds.iter()
+            .map(|pfd| {
+                if pfd.fd < 0 {
+                    PollTarget {
+                        file: None,
+                        fixed_mask: None,
+                        flags: 0,
+                    }
+                } else {
+                    match files_guard.get_poll_snapshot(pfd.fd as usize) {
+                        Some((file, fixed_mask, flags)) => PollTarget {
+                            file,
+                            fixed_mask,
+                            flags,
+                        },
+                        None => PollTarget {
+                            file: None,
+                            fixed_mask: None,
+                            flags: 0,
+                        },
+                    }
+                }
+            })
+            .collect()
+    };
+
+    let scan_ready = |pfds: &mut [PollFd], poll_files: &[PollTarget]| -> isize {
         let mut ready = 0isize;
-        for pfd in pfds.iter_mut() {
+        for (pfd, target) in pfds.iter_mut().zip(poll_files.iter()) {
             pfd.revents = 0;
             if pfd.fd < 0 {
                 continue;
             }
-            let fd = pfd.fd as usize;
-            let file = files.lock().get_file(fd);
-            let Some(file) = file else {
+            if target.file.is_none() && target.fixed_mask.is_none() {
                 pfd.revents = POLLNVAL;
                 ready += 1;
                 continue;
-            };
+            }
+            if (target.flags & O_PATH as u32) != 0 {
+                pfd.revents = POLLNVAL;
+                ready += 1;
+                continue;
+            }
 
-            let mask = file.poll_mask();
+            let mask = match target.fixed_mask {
+                Some(mask) => mask,
+                None => target
+                    .file
+                    .as_ref()
+                    .map(|file| file.poll_mask())
+                    .unwrap_or(0),
+            };
             pfd.revents = mask & (pfd.events | POLLERR | POLLHUP);
             if pfd.revents != 0 {
                 ready += 1;
@@ -303,14 +352,13 @@ pub fn syscall_ppoll(
         }
         ready
     };
-    let busy_poll_net_read = |pfds: &mut [PollFd]| -> isize {
+    let busy_poll_net_read = |pfds: &mut [PollFd], poll_files: &[PollTarget]| -> isize {
         let mut ready = 0isize;
-        for pfd in pfds.iter_mut() {
+        for (pfd, target) in pfds.iter_mut().zip(poll_files.iter()) {
             if pfd.fd < 0 || (pfd.events & POLLIN) == 0 {
                 continue;
             }
-            let fd = pfd.fd as usize;
-            let Some(file) = files.lock().get_file(fd) else {
+            let Some(file) = target.file.as_ref() else {
                 continue;
             };
             let Some(sock) = file.as_any().downcast_ref::<NetSocketFile>() else {
@@ -336,7 +384,8 @@ pub fn syscall_ppoll(
             break EINTR;
         }
 
-        let ready = scan_ready(&mut pfds);
+        let poll_files = snapshot_poll_files(&pfds);
+        let ready = scan_ready(&mut pfds, &poll_files);
 
         if ready != 0 {
             break ready;
@@ -347,18 +396,17 @@ pub fn syscall_ppoll(
                 break 0;
             }
         }
-        let ready = busy_poll_net_read(&mut pfds);
+        let ready = busy_poll_net_read(&mut pfds, &poll_files);
         if ready != 0 {
             break ready;
         }
         let mut waiter_armed = false;
         let mut net_timer_needed = false;
-        for pfd in pfds.iter() {
+        for (pfd, target) in pfds.iter().zip(poll_files.iter()) {
             if pfd.fd < 0 {
                 continue;
             }
-            let fd = pfd.fd as usize;
-            let Some(file) = files.lock().get_file(fd) else {
+            let Some(file) = target.file.as_ref() else {
                 continue;
             };
             if file.as_any().downcast_ref::<NetSocketFile>().is_some() {
@@ -366,7 +414,7 @@ pub fn syscall_ppoll(
             }
             waiter_armed = file.register_poll_waiter(&task) || waiter_armed;
         }
-        let ready = scan_ready(&mut pfds);
+        let ready = scan_ready(&mut pfds, &poll_files);
         if ready != 0 {
             break ready;
         }

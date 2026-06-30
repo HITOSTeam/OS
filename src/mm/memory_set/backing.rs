@@ -302,6 +302,7 @@ impl MmapBacking {
     }
 
     /// msync/writeback 完成后清除 file_page 的 dirty 标记。
+    #[cfg(target_arch = "riscv64")]
     pub(super) fn clear_dirty_page(&mut self, file_page: usize) {
         if let Some(state) = self.resident_pages.get_mut(&file_page) {
             state.dirty = false;

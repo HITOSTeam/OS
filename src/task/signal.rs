@@ -31,7 +31,7 @@ use crate::{
             pid2process, prime_fair_sync_wakeup_lag, wakeup_signal_tasks, wakeup_task, wakeup_tasks,
         },
         pid_namespace_member_pids,
-        process_block::ProcessControlBlock,
+        process_block::{ProcessControlBlock, ProcessControlBlockInner},
         process_visible_in_pid_namespace,
         processor::{current_task, hart_id, suspend_current_and_run_next},
         resolve_process_in_pid_namespace,
@@ -183,6 +183,75 @@ fn mark_pending_signal(
         inner.pending_signal_code[signum] = si_code;
         inner.pending_signal_value[signum] = sig_value;
     }
+}
+
+fn process_signal_handler(inner: &ProcessControlBlockInner, signum: usize) -> usize {
+    if signum <= MAX_SIG {
+        let legacy = inner.signals_actions.table[signum].handler;
+        if legacy != SIG_DFL {
+            return legacy;
+        }
+    }
+    inner
+        .rt_sig_handlers
+        .get(signum)
+        .map(|action| action.handler)
+        .unwrap_or(SIG_DFL)
+}
+
+fn queue_current_single_thread_signal(
+    process: &Arc<ProcessControlBlock>,
+    signum: usize,
+    legacy_flag: Option<SignalFlags>,
+    sender_pid: i32,
+    sender_uid: u32,
+) -> bool {
+    let Some(current) = current_task() else {
+        return false;
+    };
+    let task = {
+        let mut process_ref = process.borrow_mut();
+        if process_ref.is_zombie {
+            return true;
+        }
+
+        let mut live_tasks = process_ref
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref().cloned());
+        let Some(task) = live_tasks.next() else {
+            return true;
+        };
+        if live_tasks.next().is_some() {
+            return false;
+        }
+        if !Arc::ptr_eq(&task, &current) {
+            return false;
+        }
+        if let Some(flag) = legacy_flag {
+            process_ref.signals.insert(flag);
+        }
+        task
+    };
+
+    let (tid, pending, mask) = {
+        let mut inner = task.borrow_mut();
+        mark_pending_signal(&mut inner, signum, sender_pid, sender_uid, 0, 0);
+        let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+        (tid, inner.pending_signals, inner.signal_mask)
+    };
+    task.mark_signal_pending();
+    crate::log_if!(
+        DEBUG_SIGNAL,
+        debug,
+        "[signal] self pid={} tid={} set_pending sig={} pending={:#x} mask={:#x}",
+        process.getpid(),
+        tid,
+        signum,
+        pending,
+        mask
+    );
+    true
 }
 
 /// 检查当前是否有 pending 且 未被 mask的信号,其中 SIG KILL 与 SIGSTOP 无法被mask
@@ -607,6 +676,17 @@ pub fn kill(pid: usize, signum: i32) -> isize {
         None
     };
     let (sender_pid, sender_uid, _, _) = current_sender_ids();
+    if Arc::ptr_eq(&current, &process)
+        && queue_current_single_thread_signal(
+            &process,
+            signum as usize,
+            legacy_flag,
+            sender_pid,
+            sender_uid,
+        )
+    {
+        return 0;
+    }
     let target_ns_id = process.pid_namespace_id();
     let target_is_ns_init = process.is_pid_namespace_init();
     let mut target_pids = vec![process.getpid()];
@@ -639,24 +719,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             if let Some(flag) = legacy_flag {
                 process_ref.signals.insert(flag);
             }
-            let handler = if signum_usize <= MAX_SIG {
-                let legacy = process_ref.signals_actions.table[signum_usize].handler;
-                if legacy != SIG_DFL {
-                    legacy
-                } else {
-                    process_ref
-                        .rt_sig_handlers
-                        .get(signum_usize)
-                        .map(|a| a.handler)
-                        .unwrap_or(SIG_DFL)
-                }
-            } else {
-                process_ref
-                    .rt_sig_handlers
-                    .get(signum_usize)
-                    .map(|a| a.handler)
-                    .unwrap_or(SIG_DFL)
-            };
+            let handler = process_signal_handler(&process_ref, signum_usize);
             if handler != SIG_DFL && handler != SIG_IGN {
                 prompt_user_handler_wakeup = true;
             } else if handler == SIG_DFL && signal_default_terminates(signum_usize) {

@@ -5,7 +5,9 @@ use super::range::{align_down_to_page, align_up_to_page, normalize_ranges};
 use super::vma::VmRegion;
 use crate::config::PAGE_SIZE;
 use crate::fs::{File, OSInode};
-use crate::mm::{FrameTracker, PTEFlags, PhysAddr, VPNRange, VirtAddr, VirtPageNum};
+use crate::mm::{
+    FrameTracker, PTEFlags, PhysAddr, PhysPageNum, VPNRange, VirtAddr, VirtPageNum, frame_refcount,
+};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -87,6 +89,11 @@ impl MemorySet {
                         .entry(file_page)
                         .or_insert_with(MmapBackingPageState::default);
                     state.ref_count = state.ref_count.saturating_add(1);
+                    state.dirty |= self
+                        .mmap_backings
+                        .get(&backing_id)
+                        .and_then(|backing| backing.resident_pages.get(&file_page))
+                        .is_some_and(|old_state| old_state.dirty);
                     state.dirty |= flags.contains(PTEFlags::D);
                     if region.shared && region.file_backed {
                         if let Some(existing) = state.frame.as_ref() {
@@ -160,6 +167,17 @@ impl MemorySet {
         }
     }
 
+    /// 仅 VMA 集合变化时刷新 backing 的范围状态。
+    ///
+    /// 新插入的 lazy file mapping 还没有 resident 页；只需要更新 backing
+    /// 的 mapped/valid 文件范围，不应为此扫描 MapArea/PTE。
+    pub(super) fn refresh_mmap_backing_vm_state(&mut self, backing_id: usize) {
+        let vm_state = self.collect_mmap_backing_vm_state(backing_id);
+        if let Some(backing) = self.mmap_backings.get_mut(&backing_id) {
+            backing.replace_vm_state(vm_state);
+        }
+    }
+
     /// 批量刷新多个 backing 的状态。
     pub(super) fn refresh_mmap_backing_states(&mut self, backing_ids: Vec<usize>) {
         for backing_id in backing_ids {
@@ -185,6 +203,7 @@ impl MemorySet {
     }
 
     /// 清除指定 backing 中 file_page 的 dirty 标记（msync 写回后调用）。
+    #[cfg(target_arch = "riscv64")]
     fn clear_mmap_backing_dirty_page(&mut self, backing_id: usize, file_page: usize) {
         if let Some(backing) = self.mmap_backings.get_mut(&backing_id) {
             backing.clear_dirty_page(file_page);
@@ -192,6 +211,7 @@ impl MemorySet {
     }
 
     /// 更新 vpn 在 MapArea 中的 saved_pte_flags（PTE 无效时用于保存 dirty 等标志）。
+    #[cfg(target_arch = "riscv64")]
     fn set_saved_pte_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
         for area in self.areas.iter_mut() {
             if !area.contains_vpn(vpn) {
@@ -202,6 +222,129 @@ impl MemorySet {
             }
         }
         false
+    }
+
+    fn shared_file_page_vpn_range(
+        region: VmRegion,
+        file_page: usize,
+    ) -> Option<(VirtPageNum, VirtPageNum)> {
+        let page_start = file_page.checked_mul(PAGE_SIZE)?;
+        let page_end = page_start.checked_add(PAGE_SIZE)?;
+        let valid_start = region.file_offset;
+        let valid_end = region.file_offset.checked_add(region.file_valid_len())?;
+        let overlap_start = core::cmp::max(page_start, valid_start);
+        let overlap_end = core::cmp::min(page_end, valid_end);
+        if overlap_start >= overlap_end {
+            return None;
+        }
+        let va_start = region
+            .start
+            .checked_add(overlap_start.saturating_sub(region.file_offset))?;
+        let va_end = region
+            .start
+            .checked_add(overlap_end.saturating_sub(region.file_offset))?;
+        Some((
+            VirtAddr::from(va_start).floor(),
+            VirtAddr::from(va_end).ceil(),
+        ))
+    }
+
+    fn shared_file_page_local_state(
+        &self,
+        backing_id: usize,
+        file_page: usize,
+        ppn: PhysPageNum,
+    ) -> (usize, bool, bool) {
+        let mut local_refs = 0usize;
+        let mut any_dirty = false;
+        let mut any_writable = false;
+
+        for region in self
+            .vm_regions
+            .iter()
+            .filter(|region| region.backing_id == backing_id && region.shared && region.file_backed)
+        {
+            let Some((start_vpn, end_vpn)) = Self::shared_file_page_vpn_range(*region, file_page)
+            else {
+                continue;
+            };
+            for area in self.areas.iter() {
+                if !area.contains_perm(MapPermission::U)
+                    || !area.overlaps_vpn_range(start_vpn, end_vpn)
+                {
+                    continue;
+                }
+                let ov_start = core::cmp::max(start_vpn, area.start_vpn());
+                let ov_end = core::cmp::min(end_vpn, area.end_vpn());
+                for vpn in VPNRange::new(ov_start, ov_end) {
+                    let Some(frame) = area.tracked_frame(vpn) else {
+                        continue;
+                    };
+                    if frame.ppn != ppn {
+                        continue;
+                    }
+                    local_refs = local_refs.saturating_add(1);
+                    any_writable |= region.map_permission().contains(MapPermission::W);
+                    let flags = self
+                        .page_table
+                        .translate(vpn)
+                        .filter(|pte| pte.is_valid())
+                        .map(|pte| pte.flags())
+                        .or_else(|| area.saved_pte_flags(vpn));
+                    any_dirty |= flags.is_some_and(|flags| flags.contains(PTEFlags::D));
+                }
+            }
+        }
+
+        (local_refs, any_dirty, any_writable)
+    }
+
+    fn shared_file_page_has_external_refs(
+        &self,
+        backing_id: usize,
+        file_page: usize,
+        ppn: PhysPageNum,
+        local_refs: usize,
+    ) -> bool {
+        let backing_state_ref = self
+            .mmap_backings
+            .get(&backing_id)
+            .and_then(|backing| backing.resident_pages.get(&file_page))
+            .and_then(|state| state.frame.as_ref())
+            .is_some_and(|frame| frame.ppn == ppn) as usize;
+        let expected_local_refs = local_refs
+            .saturating_add(1) // global shared file page cache
+            .saturating_add(backing_state_ref)
+            .saturating_add(1); // resident_page_for_vpn() clone held by the caller
+        frame_refcount(ppn) > expected_local_refs
+    }
+
+    fn shared_file_page_needs_writeback(
+        &self,
+        backing_id: usize,
+        file_page: usize,
+        frame: &FrameTracker,
+        flags: PTEFlags,
+    ) -> bool {
+        if flags.contains(PTEFlags::D) {
+            return true;
+        }
+        if self
+            .mmap_backings
+            .get(&backing_id)
+            .and_then(|backing| backing.resident_pages.get(&file_page))
+            .is_some_and(|state| state.dirty)
+        {
+            return true;
+        }
+
+        let (local_refs, local_dirty, local_writable) =
+            self.shared_file_page_local_state(backing_id, file_page, frame.ppn);
+        if local_dirty || local_writable {
+            return true;
+        }
+
+        self.shared_file_page_has_external_refs(backing_id, file_page, frame.ppn, local_refs)
     }
 
     /// 收集 [start, end) 内所有需要写回的共享文件页数据块。
@@ -246,11 +389,19 @@ impl MemorySet {
                     else {
                         continue;
                     };
-                    let off_in_page = copy_start.saturating_sub(page_start);
                     let file_offset = region
                         .file_offset
                         .saturating_add(copy_start.saturating_sub(region.start));
                     let file_page = file_offset / PAGE_SIZE;
+                    if !self.shared_file_page_needs_writeback(
+                        region.backing_id,
+                        file_page,
+                        &frame,
+                        flags,
+                    ) {
+                        continue;
+                    }
+                    let off_in_page = copy_start.saturating_sub(page_start);
                     let mut data = Vec::new();
                     data.extend_from_slice(
                         &frame.ppn.get_bytes_array()
@@ -286,7 +437,12 @@ impl MemorySet {
         for chunk in chunks.iter() {
             Self::push_unique_backing_id(&mut refreshed_backings, chunk.backing_id);
         }
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = clear_dirty;
+        #[cfg(target_arch = "riscv64")]
         let mut cleared_dirty = false;
+        #[cfg(not(target_arch = "riscv64"))]
+        let cleared_dirty = false;
         for chunk in chunks {
             let Some(os_inode) = chunk.file.as_any().downcast_ref::<OSInode>() else {
                 continue;
@@ -301,6 +457,9 @@ impl MemorySet {
             if os_inode.flush().is_err() {
                 return Err(());
             }
+            #[cfg(not(target_arch = "riscv64"))]
+            let _ = (chunk.file_page, chunk.vpn, chunk.flags, chunk.has_valid_pte);
+            #[cfg(target_arch = "riscv64")]
             if clear_dirty && chunk.flags.contains(PTEFlags::D) {
                 let mut flags = chunk.flags;
                 flags.remove(PTEFlags::D);

@@ -3,7 +3,7 @@ use super::{
     AcctState, Arc, AtPath, ClassifiedAbsPath, FILE_LEASES, FileLockKey, OSInode,
     ProcessControlBlock, PseudoDir, RECORD_LOCK_WAITERS, RECORD_LOCKS, String, SyscallError,
     TaskControlBlock, Vec, apply_chown_to_inode, apply_process_root, busybox_exists,
-    classify_current_abs_path, clear_record_lock_waiting, current_cwd_path,
+    classify_current_abs_path, clear_ext4_path_cache, clear_record_lock_waiting, current_cwd_path,
     current_effective_uid_gid, current_fsuid_gid, current_in_group, current_process,
     current_real_uid_gid, do_fchmodat, empty_path_fd_for_at_op, err, ext4_lock, fd_has_o_path,
     find_path_in_roots, get_current_token, get_fd_file, get_time_ms, inode_mode_allows,
@@ -344,6 +344,7 @@ fn chmod_fd(fd: usize, mode: usize, allow_o_path: bool) -> isize {
             new_mode &= !0o2000;
         }
         inode.set_mode(new_mode);
+        clear_ext4_path_cache();
     }
     0
 }
