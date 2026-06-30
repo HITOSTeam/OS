@@ -75,7 +75,7 @@ fn read_badi() -> usize {
 fn write_eentry(val: usize) {
     // SAFETY: `val` is a kernel trap-entry address chosen by the caller, and writing EENTRY is
     // only valid in kernel mode. A bad address here would redirect traps to invalid code.
-    unsafe { asm!("csrwr {}, 0xc", in(reg) val) };
+    unsafe { asm!("csrwr {}, 0xc", inout(reg) val => _) };
 }
 
 fn set_kernel_trap_entry() {
@@ -298,6 +298,12 @@ pub fn trap_handler() {
             cx.x[super::super::REG_A5],
         ];
         let syscall_id = cx.x[super::super::REG_A7];
+        if let Some(task) = crate::task::processor::current_task() {
+            let mut inner = task.borrow_mut();
+            inner.last_syscall_id = syscall_id;
+            inner.last_syscall_args = args;
+            inner.last_syscall_valid = true;
+        }
         let result = syscall(syscall_id, args);
         let cx = get_trap_context();
         cx.x[super::super::REG_A0] = result as usize;

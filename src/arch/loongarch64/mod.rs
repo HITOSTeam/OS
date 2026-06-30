@@ -97,7 +97,7 @@ pub fn disable_interrupts() -> bool {
     let prev = (crmd & CRMD_IE) != 0;
     crmd &= !CRMD_IE;
     // SAFETY: CRMD write disables interrupts.
-    unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
+    unsafe { asm!("csrwr {}, 0x0", inout(reg) crmd => _) };
     prev
 }
 
@@ -114,7 +114,7 @@ pub fn enable_interrupts() {
     crmd |= CRMD_IE;
     // SAFETY: This writes the updated interrupt-enable bit back to CRMD in kernel mode. Writing
     // an invalid value would leave interrupts misconfigured for the current hart.
-    unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
+    unsafe { asm!("csrwr {}, 0x0", inout(reg) crmd => _) };
 }
 
 pub fn wait_for_interrupt() {
@@ -124,8 +124,8 @@ pub fn wait_for_interrupt() {
 pub fn disable_direct_map_windows() {
     // SAFETY: DMW0/DMW1 (CSR 0x180/0x181) write and invtlb are valid in kernel mode.
     unsafe {
-        asm!("csrwr {}, 0x180", in(reg) 0usize);
-        asm!("csrwr {}, 0x181", in(reg) 0usize);
+        asm!("csrwr {}, 0x180", inout(reg) 0usize => _);
+        asm!("csrwr {}, 0x181", inout(reg) 0usize => _);
         asm!("invtlb 0x0, $r0, $r0");
     }
 }
@@ -180,7 +180,7 @@ pub fn enable_ipi_interrupt() {
     ecfg &= !(ECFG_VS_MASK << ECFG_VS_SHIFT);
     ecfg |= ECFG_LIE_IPI;
     // SAFETY: This only changes the local IPI interrupt-enable bit.
-    unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
+    unsafe { asm!("csrwr {}, 0x4", inout(reg) ecfg => _) };
     iocsr_write32(IOCSR_IPI_EN, u32::MAX);
 }
 
@@ -213,14 +213,14 @@ pub fn enable_timer_interrupt() {
     ecfg |= ECFG_LIE_TI;
     // SAFETY: This writes back a kernel-constructed ECFG value that only changes timer interrupt
     // delivery bits. A malformed write would route interrupts incorrectly on this hart.
-    unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
+    unsafe { asm!("csrwr {}, 0x4", inout(reg) ecfg => _) };
     enable_ipi_interrupt();
 }
 
 pub fn clear_timer_interrupt() {
     // SAFETY: TIClr (CSR 0x44) write is valid in kernel mode; clears timer interrupt.
     unsafe {
-        asm!("csrwr {}, 0x44", in(reg) 1usize);
+        asm!("csrwr {}, 0x44", inout(reg) 1usize => _);
     }
 }
 /// riscv 是设置绝对触发时间,设置某个tick处发生中断
@@ -232,7 +232,7 @@ pub fn set_timer(timer: usize) {
     let tcfg = (delta & TCFG_INITVAL_MASK) | TCFG_EN;
     // SAFETY: TCFG (CSR 0x41) write is valid in kernel mode; configures timer countdown.
     unsafe {
-        asm!("csrwr {}, 0x41", in(reg) tcfg);
+        asm!("csrwr {}, 0x41", inout(reg) tcfg => _);
     }
 }
 
@@ -254,7 +254,7 @@ fn ensure_fp_enabled() {
         asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
         if (euen & EUEN_FPEN) == 0 {
             euen |= EUEN_FPEN;
-            asm!("csrwr {}, 0x2", in(reg) euen, options(nostack));
+            asm!("csrwr {}, 0x2", inout(reg) euen => _, options(nostack));
         }
     }
 }
@@ -268,7 +268,7 @@ fn disable_fp() {
         asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
         if (euen & EUEN_FPEN) != 0 {
             euen &= !EUEN_FPEN;
-            asm!("csrwr {}, 0x2", in(reg) euen, options(nostack));
+            asm!("csrwr {}, 0x2", inout(reg) euen => _, options(nostack));
         }
     }
 }
@@ -520,11 +520,11 @@ pub fn bootstrap_init() {
         let mut euen: usize;
         asm!("csrrd {}, 0x2", out(reg) euen);
         euen &= !EUEN_FPEN;
-        asm!("csrwr {}, 0x2", in(reg) euen);
+        asm!("csrwr {}, 0x2", inout(reg) euen => _);
 
         // Clear pending timer interrupt and disable timer while bootstrapping.
-        asm!("csrwr {}, 0x44", in(reg) 1usize); // TIClr
-        asm!("csrwr {}, 0x41", in(reg) 0usize); // TCFG
+        asm!("csrwr {}, 0x44", inout(reg) 1usize => _); // TIClr
+        asm!("csrwr {}, 0x41", inout(reg) 0usize => _); // TCFG
 
         // Enable paging: CRMD.PG=1, CRMD.DA=0, CRMD.IE=0.
         let mut crmd: usize;
@@ -532,15 +532,15 @@ pub fn bootstrap_init() {
         crmd &= !CRMD_IE;
         crmd &= !CRMD_DA;
         crmd |= CRMD_PG;
-        asm!("csrwr {}, 0x0", in(reg) crmd);
+        asm!("csrwr {}, 0x0", inout(reg) crmd => _);
 
         // TLB refill entry (must be 4K aligned).
-        asm!("csrwr {}, 0x88", in(reg) __rfill as usize);
+        asm!("csrwr {}, 0x88", inout(reg) __rfill as usize => _);
 
         // STLB page size and refill page size (4KB).
         let page_bits = crate::config::PAGE_SIZE_BITS;
-        asm!("csrwr {}, 0x1e", in(reg) page_bits);
-        asm!("csrwr {}, 0x8e", in(reg) page_bits);
+        asm!("csrwr {}, 0x1e", inout(reg) page_bits => _);
+        asm!("csrwr {}, 0x8e", inout(reg) page_bits => _);
 
         // Configure page walk controller for 3-level, 4KB pages, 8-byte PTEs.
         let dir_width = crate::config::PAGE_SIZE_BITS - 3;
@@ -556,8 +556,8 @@ pub fn bootstrap_init() {
         pwcl |= (dir_width & 0x1f) << 25;
         // PTE width: 8 bytes -> 0
         pwcl |= 0 << 30;
-        asm!("csrwr {}, 0x1c", in(reg) pwcl);
-        asm!("csrwr {}, 0x1d", in(reg) 0usize);
+        asm!("csrwr {}, 0x1c", inout(reg) pwcl => _);
+        asm!("csrwr {}, 0x1d", inout(reg) 0usize => _);
 
         asm!("invtlb 0x0, $r0, $r0");
     }
