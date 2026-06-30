@@ -310,58 +310,58 @@ mod virtio_pci {
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
             let idx = READ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if idx < 8 {
-                println!(
-                    "[virtio_pci] read block_id={} sector={} sectors={} bytes={}",
-                    block_id,
-                    base_sector,
-                    buf.len() / 512,
-                    buf.len()
-                );
-            }
+            // if idx < 8 {
+            //     println!(
+            //         "[virtio_pci] read block_id={} sector={} sectors={} bytes={}",
+            //         block_id,
+            //         base_sector,
+            //         buf.len() / 512,
+            //         buf.len()
+            //     );
+            // }
             let start = crate::perf::block_read_begin();
             self.0
                 .lock()
                 .read_blocks(base_sector, buf)
                 .expect("Error when reading VirtIOBlk");
             crate::perf::block_read_end(start, buf.len());
-            if idx < 8 {
-                println!(
-                    "[virtio_pci] read done block_id={} sector={} bytes={}",
-                    block_id,
-                    base_sector,
-                    buf.len()
-                );
-            }
+            // if idx < 8 {
+            //     println!(
+            //         "[virtio_pci] read done block_id={} sector={} bytes={}",
+            //         block_id,
+            //         base_sector,
+            //         buf.len()
+            //     );
+            // }
         }
         fn write_blocks(&self, block_id: usize, buf: &[u8]) {
             assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
             let idx = WRITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if idx < 8 {
-                println!(
-                    "[virtio_pci] write block_id={} sector={} sectors={} bytes={}",
-                    block_id,
-                    base_sector,
-                    buf.len() / 512,
-                    buf.len()
-                );
-            }
+            // if idx < 8 {
+            //     println!(
+            //         "[virtio_pci] write block_id={} sector={} sectors={} bytes={}",
+            //         block_id,
+            //         base_sector,
+            //         buf.len() / 512,
+            //         buf.len()
+            //     );
+            // }
             let start = crate::perf::block_write_begin();
             self.0
                 .lock()
                 .write_blocks(base_sector, buf)
                 .expect("Error when writing VirtIOBlk");
             crate::perf::block_write_end(start, buf.len());
-            if idx < 8 {
-                println!(
-                    "[virtio_pci] write done block_id={} sector={} bytes={}",
-                    block_id,
-                    base_sector,
-                    buf.len()
-                );
-            }
+            // if idx < 8 {
+            //     println!(
+            //         "[virtio_pci] write done block_id={} sector={} bytes={}",
+            //         block_id,
+            //         base_sector,
+            //         buf.len()
+            //     );
+            // }
         }
     }
 
@@ -496,16 +496,16 @@ mod virtio_pci {
         let end = start.saturating_add(size);
         let mem_start = phys_mem_start();
         let mem_end = phys_mem_end();
-        println!(
-            "[virtio_pci] {} [{:#x}, {:#x}) size={:#x}",
-            label, start, end, size
-        );
-        if start < mem_end && end > mem_start {
-            println!(
-                "[virtio_pci][warn] {} overlaps RAM [{:#x}, {:#x})",
-                label, mem_start, mem_end
-            );
-        }
+        // println!(
+        //     "[virtio_pci] {} [{:#x}, {:#x}) size={:#x}",
+        //     label, start, end, size
+        // );
+        // if start < mem_end && end > mem_start {
+        //     println!(
+        //         "[virtio_pci][warn] {} overlaps RAM [{:#x}, {:#x})",
+        //         label, mem_start, mem_end
+        //     );
+        // }
     }
 
     fn map_device_bars(root: &mut PciRoot, device_function: DeviceFunction) {
