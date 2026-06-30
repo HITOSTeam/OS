@@ -838,6 +838,10 @@ pub(crate) use inode::{
     resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked, root_inode_for_path,
     secondary_root_inode, unregister_executing_inode,
 };
+pub(crate) use inode::{
+    discard_inode_pending_writes_after_truncate, flush_inode_pending_writes_before_truncate,
+    pending_inode_write_end,
+};
 pub(crate) use mountns::{
     ClassifiedAbsPath, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
     clone_mount_namespace, initial_mount_namespace, mount_namespace_id,

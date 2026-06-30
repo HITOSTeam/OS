@@ -6,12 +6,12 @@ use super::{
     current_effective_uid_gid, current_files, current_fsuid_gid, current_in_group, current_process,
     current_timespec, empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock,
     fchmod_fd_for_at_empty_path, fifo_pipe_state_for_inode, file_lock_key_from_inode,
-    get_current_token, inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
-    maybe_dispatch_proc_fd_at, maybe_signal_lease_break, note_inode_path_hint, open_pseudo,
-    path_is_nodev, path_is_rofs, pseudo_path_exists_result, queue_process_signal,
-    read_user_cstring, register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path,
-    resolve_parent_and_name, rofs_for_path, syscall_fchmod, try_copy_from_user,
-    try_copy_to_user_unchecked,
+    get_current_token, inode_mode_allows, inode_mode_allows_uid_gid,
+    inode_visible_size_with_disk_size, install_open_file_fd, maybe_dispatch_proc_fd_at,
+    maybe_signal_lease_break, note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs,
+    pseudo_path_exists_result, queue_process_signal, read_user_cstring,
+    register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
+    rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
 };
 use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
 use alloc::vec;
@@ -199,15 +199,17 @@ pub(crate) fn open_existing_ext4_inode(
         );
     }
 
-    if !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file() {
-        if let Err(e) = inode.clear() {
-            return Err(ext4_err_to_errno(e));
+    let needs_trunc = !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file();
+    drop(ext4_guard);
+    if needs_trunc {
+        let ret = truncate_regular_inode(&inode, 0);
+        if ret != 0 {
+            return Err(ret);
         }
         touch_inode_mtime_ctime_now(&inode);
     }
 
     crate::fs::debug_track_iozone_inode(path, inode_num);
-    drop(ext4_guard);
     install_open_file_fd(os_inode, flags, o_path)
 }
 
@@ -671,15 +673,11 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
     }
 
     let inode = os_inode.ext4_inode();
-    let pending_end = os_inode.pending_write_end();
-    let (dev, ino, file_size) = {
+    let (dev, ino, disk_size) = {
         let _ext4_guard = ext4_lock();
-        (
-            inode.device_id(),
-            inode.inode_num(),
-            (inode.size() as usize).max(pending_end),
-        )
+        (inode.device_id(), inode.inode_num(), inode.size() as usize)
     };
+    let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     // 当前进程的 user-buffer write 可以直接按用户地址做旧路径镜像。
     let copies: Vec<(usize, usize, usize)> = {
@@ -769,15 +767,11 @@ pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
     }
 
     let inode = os_inode.ext4_inode();
-    let pending_end = os_inode.pending_write_end();
-    let (dev, ino, file_size) = {
+    let (dev, ino, disk_size) = {
         let _ext4_guard = ext4_lock();
-        (
-            inode.device_id(),
-            inode.inode_num(),
-            (inode.size() as usize).max(pending_end),
-        )
+        (inode.device_id(), inode.inode_num(), inode.size() as usize)
     };
+    let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     // sendfile/splice/copy_file_range 等 kernel-buffer 写入也要同步 mmap 视图。
     update_shared_file_page_cache(dev, ino, write_off, data);
@@ -812,10 +806,11 @@ fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize)
 }
 
 pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
-    let (dev, ino, file_size) = {
+    let (dev, ino, disk_size) = {
         let _ext4_guard = ext4_lock();
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
     };
+    let file_size = inode_visible_size_with_disk_size(inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     let process = current_process();
     let inner = process.borrow_mut();
@@ -823,16 +818,12 @@ pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
 }
 
 pub(crate) fn update_current_os_inode_mmaps_size(os_inode: &OSInode) {
-    let pending_end = os_inode.pending_write_end();
     let inode = os_inode.ext4_inode();
-    let (dev, ino, file_size) = {
+    let (dev, ino, disk_size) = {
         let _ext4_guard = ext4_lock();
-        (
-            inode.device_id(),
-            inode.inode_num(),
-            (inode.size() as usize).max(pending_end),
-        )
+        (inode.device_id(), inode.inode_num(), inode.size() as usize)
     };
+    let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     let process = current_process();
     let inner = process.borrow_mut();
@@ -948,24 +939,42 @@ pub(crate) fn defer_unlink_open_file(
 }
 
 pub(crate) fn truncate_regular_inode(inode: &Arc<ext4_fs::Inode>, new_len: usize) -> isize {
-    let _ext4_guard = ext4_lock();
-    if inode.is_dir() {
+    let (device_id, inode_num, is_dir, is_file, disk_len) = {
+        let _ext4_guard = ext4_lock();
+        (
+            inode.device_id(),
+            inode.inode_num(),
+            inode.is_dir(),
+            inode.is_file(),
+            inode.size() as usize,
+        )
+    };
+    if is_dir {
         return err(SyscallError::EISDIR);
     }
-    if !inode.is_file() {
+    if !is_file {
         return err(SyscallError::EINVAL);
     }
-    let old_len = inode.size() as usize;
-    if new_len == old_len {
-        return 0;
+    let visible_len = inode_visible_size_with_disk_size(inode, disk_len);
+    let shrinking_visible_size = new_len < visible_len;
+    if shrinking_visible_size {
+        if let Err(e) =
+            crate::fs::flush_inode_pending_writes_before_truncate(device_id, inode_num, new_len)
+        {
+            return ext4_err_to_errno(e);
+        }
     }
-    if new_len == 0 {
-        return match inode.clear() {
+
+    let _ext4_guard = ext4_lock();
+    let old_len = inode.size() as usize;
+    let ret = if new_len == old_len {
+        0
+    } else if new_len == 0 {
+        match inode.clear() {
             Ok(_) => 0,
             Err(e) => ext4_err_to_errno(e),
-        };
-    }
-    if new_len < old_len {
+        }
+    } else if new_len < old_len {
         let mut kept = vec![0u8; new_len];
         let got = inode.read_at(0, &mut kept);
         if got < new_len {
@@ -975,26 +984,40 @@ pub(crate) fn truncate_regular_inode(inode: &Arc<ext4_fs::Inode>, new_len: usize
             return ext4_err_to_errno(e);
         }
         if kept.is_empty() {
-            return 0;
+            0
+        } else {
+            match inode.write_at(0, &kept) {
+                Ok(written) if written == kept.len() => 0,
+                Ok(_) => err(SyscallError::EIO),
+                Err(e) => ext4_err_to_errno(e),
+            }
         }
-        return match inode.write_at(0, &kept) {
-            Ok(written) if written == kept.len() => 0,
-            Ok(_) => err(SyscallError::EIO),
-            Err(e) => ext4_err_to_errno(e),
-        };
-    }
+    } else {
+        let mut off = old_len;
+        let zeros = [0u8; 4096];
+        let mut ret = 0;
+        while off < new_len {
+            let chunk = core::cmp::min(zeros.len(), new_len - off);
+            match inode.write_at(off, &zeros[..chunk]) {
+                Ok(0) => {
+                    ret = err(SyscallError::EIO);
+                    break;
+                }
+                Ok(written) => off += written,
+                Err(e) => {
+                    ret = ext4_err_to_errno(e);
+                    break;
+                }
+            }
+        }
+        ret
+    };
+    drop(_ext4_guard);
 
-    let mut off = old_len;
-    let zeros = [0u8; 4096];
-    while off < new_len {
-        let chunk = core::cmp::min(zeros.len(), new_len - off);
-        match inode.write_at(off, &zeros[..chunk]) {
-            Ok(0) => return err(SyscallError::EIO),
-            Ok(written) => off += written,
-            Err(e) => return ext4_err_to_errno(e),
-        }
+    if ret == 0 && shrinking_visible_size {
+        crate::fs::discard_inode_pending_writes_after_truncate(device_id, inode_num, new_len);
     }
-    0
+    ret
 }
 
 pub(crate) fn read_inode_range(

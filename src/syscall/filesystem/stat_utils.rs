@@ -490,10 +490,12 @@ pub(crate) fn kstat_from_file(
     };
     let inode = os_inode.ext4_inode();
 
-    let _ext4_guard = ext4_lock();
-    let meta = inode.stat_snapshot();
+    let meta = {
+        let _ext4_guard = ext4_lock();
+        inode.stat_snapshot()
+    };
     let disk_size = meta.size as usize;
-    let visible_size = core::cmp::max(disk_size, os_inode.pending_write_end());
+    let visible_size = inode_visible_size_with_disk_size(&inode, disk_size);
     Ok(kstat_from_ext4_snapshot(meta, visible_size))
 }
 
@@ -544,9 +546,12 @@ pub(crate) fn kstat_from_abs_path(abs: &str) -> Result<KStat, isize> {
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
-    let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
-    let meta = inode.stat_snapshot();
+    let (inode, meta) = {
+        let _ext4_guard = ext4_lock();
+        let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+        let meta = inode.stat_snapshot();
+        (inode, meta)
+    };
     let disk_size = meta.size as usize;
     let visible_size = inode_visible_size_with_disk_size(&inode, disk_size);
     Ok(kstat_from_ext4_snapshot(meta, visible_size))

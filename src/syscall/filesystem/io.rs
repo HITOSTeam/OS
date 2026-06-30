@@ -5,12 +5,13 @@ use super::{
     SyscallError, TimerFdFile, UserBuffer, Vec, cgroup_charge_file_write, current_process, err,
     ext4_err_to_errno, ext4_lock, fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path,
     file_is_pipe, file_is_seekable_for_preadwrite, get_current_token, get_fd_file_and_flags,
-    maybe_update_inode_atime, mirror_inode_kernel_write_to_shared_mmaps,
-    mirror_inode_write_to_current_mmaps, pipe_read_to_kernel, pipe_write_from_kernel,
-    queue_process_signal, read_optional_offset, read_vm_iovec, require_fd_file,
-    socketpair_write_from_kernel, touch_inode_mtime_ctime_now, try_copy_from_user,
-    try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_proc_pseudo_file,
-    try_write_user_value, validate_direct_io_request, write_optional_offset,
+    inode_visible_size_with_disk_size, maybe_update_inode_atime,
+    mirror_inode_kernel_write_to_shared_mmaps, mirror_inode_write_to_current_mmaps,
+    pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal, read_optional_offset,
+    read_vm_iovec, require_fd_file, socketpair_write_from_kernel, touch_inode_mtime_ctime_now,
+    try_copy_from_user, try_copy_to_user, try_read_user_value, try_translated_byte_buffer,
+    try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
+    write_optional_offset,
 };
 use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, TunTapFile};
 use alloc::vec;
@@ -336,15 +337,19 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             return ret;
         }
     }
-    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-        if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, os_inode.offset()) {
+    let write_start_off = if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+        let start = if os_inode.append() {
+            os_inode.visible_end()
+        } else {
+            os_inode.offset()
+        };
+        if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, start) {
             return e;
         }
-    }
-    let write_start_off = file
-        .as_any()
-        .downcast_ref::<OSInode>()
-        .map(|inode| inode.offset());
+        Some(start)
+    } else {
+        None
+    };
     if let Some(pipe) = file.as_any().downcast_ref::<Pipe>()
         && let Some(e) = pipe.closed_read_end_write_error()
     {
@@ -430,7 +435,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             inner.rlimits.rlimit_fsize_cur
         };
         if fsize_limit != u64::MAX {
-            let start = os_inode.offset() as u64;
+            let start = write_start_off.unwrap_or_else(|| os_inode.offset()) as u64;
             if start >= fsize_limit && len > 0 {
                 let pid = current_process().getpid();
                 queue_process_signal(pid, SIGXFSZ_NUM);
@@ -661,7 +666,7 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
                 let _ext4_guard = ext4_lock();
                 inode.size() as usize
             };
-            core::cmp::max(disk_end, os_inode.pending_write_end())
+            inode_visible_size_with_disk_size(&inode, disk_end)
         } else {
             pos as usize
         };
@@ -1522,12 +1527,11 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
 
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
-        let (is_dir, is_fifo, end) = {
+        let (is_dir, is_fifo, disk_end) = {
             let _ext4_guard = ext4_lock();
-            let disk = inode.size() as usize;
-            let end = core::cmp::max(disk, os_inode.pending_write_end()) as isize;
-            (inode.is_dir(), inode.is_fifo(), end)
+            (inode.is_dir(), inode.is_fifo(), inode.size() as usize)
         };
+        let end = inode_visible_size_with_disk_size(&inode, disk_end) as isize;
         if is_fifo {
             return err(SyscallError::ESPIPE);
         }

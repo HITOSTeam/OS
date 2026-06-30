@@ -760,8 +760,11 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
     0
 }
 
-fn kstat_from_ext4_inode_locked(inode: &alloc::sync::Arc<ext4_fs::Inode>) -> KStat {
-    let meta = inode.stat_snapshot();
+fn kstat_from_ext4_inode(inode: &alloc::sync::Arc<ext4_fs::Inode>) -> KStat {
+    let meta = {
+        let _ext4_guard = ext4_lock();
+        inode.stat_snapshot()
+    };
     let visible_size = inode_visible_size_with_disk_size(inode, meta.size as usize);
     kstat_from_ext4_snapshot(meta, visible_size)
 }
@@ -775,17 +778,22 @@ fn resolve_ext4_stat_kstat(
     follow_final: bool,
 ) -> Result<KStat, isize> {
     if !follow_final {
-        let _ext4_guard = ext4_lock();
-        let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
-        return Ok(kstat_from_ext4_inode_locked(&inode));
+        let inode = {
+            let _ext4_guard = ext4_lock();
+            resolve_at_inode(at, fsuid, fsgid, false)?
+        };
+        return Ok(kstat_from_ext4_inode(&inode));
     }
 
-    let _ext4_guard = ext4_lock();
-    let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
-    if !inode.is_symlink() {
-        return Ok(kstat_from_ext4_inode_locked(&inode));
+    let (inode, is_symlink) = {
+        let _ext4_guard = ext4_lock();
+        let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
+        let is_symlink = inode.is_symlink();
+        (inode, is_symlink)
+    };
+    if !is_symlink {
+        return Ok(kstat_from_ext4_inode(&inode));
     }
-    drop(_ext4_guard);
 
     if let Some(abs) = resolve_abs_path(dirfd, path)? {
         if let Some(st) = kstat_from_followed_proc_symlink(&abs)? {
@@ -793,9 +801,11 @@ fn resolve_ext4_stat_kstat(
         }
     }
 
-    let _ext4_guard = ext4_lock();
-    let inode = resolve_at_inode(at, fsuid, fsgid, true)?;
-    Ok(kstat_from_ext4_inode_locked(&inode))
+    let inode = {
+        let _ext4_guard = ext4_lock();
+        resolve_at_inode(at, fsuid, fsgid, true)?
+    };
+    Ok(kstat_from_ext4_inode(&inode))
 }
 
 fn busybox_fallback_kstat() -> Option<KStat> {
@@ -805,10 +815,13 @@ fn busybox_fallback_kstat() -> Option<KStat> {
         "/bin/busybox",
         "/busybox",
     ];
-    let _ext4_guard = ext4_lock();
     for cand in candidates {
-        if let Some(inode) = find_path_in_roots(cand) {
-            return Some(kstat_from_ext4_inode_locked(&inode));
+        let inode = {
+            let _ext4_guard = ext4_lock();
+            find_path_in_roots(cand)
+        };
+        if let Some(inode) = inode {
+            return Some(kstat_from_ext4_inode(&inode));
         }
     }
     None

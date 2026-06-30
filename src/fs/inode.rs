@@ -7,11 +7,11 @@ use crate::println;
 use crate::task::manager::PID2PCB;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use bitflags::*;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ext4_fs::{Ext4FileSystem, Inode};
 use lazy_static::*;
 use spin::Mutex;
@@ -78,6 +78,13 @@ struct Ext4PathCacheEntry {
     inode: Arc<Inode>,
 }
 
+struct PendingWriteRegistration {
+    device_id: usize,
+    inode_num: u32,
+    end: usize,
+    inner: Weak<Mutex<OSInodeInner>>,
+}
+
 // Serialize ext4 operations across harts.
 lazy_static! {
     static ref EXT4_LOCK: Arc<Ext4Lock> = Arc::new(Ext4Lock::new());
@@ -89,6 +96,8 @@ lazy_static! {
     static ref EXT4_PATH_CACHE: Mutex<BTreeMap<String, Vec<Ext4PathCacheEntry>>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_TEXT_ACCESS: Mutex<BTreeMap<(usize, u32), InodeTextAccess>> =
+        Mutex::new(BTreeMap::new());
+    static ref PENDING_WRITE_REGISTRY: Mutex<BTreeMap<usize, PendingWriteRegistration>> =
         Mutex::new(BTreeMap::new());
 }
 
@@ -495,7 +504,7 @@ pub struct OSInode {
     replace_on_write: bool,
     tmpfile_cleanup: Option<TmpfileCleanup>,
     write_open: Mutex<WriteOpenState>,
-    inner: Mutex<OSInodeInner>,
+    inner: Arc<Mutex<OSInodeInner>>,
 }
 
 struct TmpfileCleanup {
@@ -510,6 +519,9 @@ pub struct OSInodeInner {
     inode: Arc<Inode>,
     write_buf_off: usize,
     write_buf: Vec<u8>,
+    write_buf_counted: bool,
+    write_buf_registry_id: usize,
+    write_buf_registry_inner: Weak<Mutex<OSInodeInner>>,
     read_buf_off: usize,
     read_buf_valid: usize,
     read_buf: Vec<u8>,
@@ -519,6 +531,124 @@ const READBUF_MAX: usize = 128 * 1024;
 const READBUF_MIN: usize = 4 * 1024;
 const WRITEBUF_MAX: usize = 128 * 1024;
 const ETXTBSY_ERR: isize = -26;
+static PENDING_WRITE_BUFFERS: AtomicUsize = AtomicUsize::new(0);
+static NEXT_WRITE_BUF_REGISTRY_ID: AtomicUsize = AtomicUsize::new(1);
+
+pub(crate) fn pending_inode_write_end(device_id: usize, inode_num: u32) -> Option<usize> {
+    if PENDING_WRITE_BUFFERS.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+
+    PENDING_WRITE_REGISTRY
+        .lock()
+        .values()
+        .filter(|entry| entry.device_id == device_id && entry.inode_num == inode_num)
+        .map(|entry| entry.end)
+        .max()
+}
+
+fn pending_inode_write_inners(
+    device_id: usize,
+    inode_num: u32,
+) -> Vec<(usize, Weak<Mutex<OSInodeInner>>)> {
+    if PENDING_WRITE_BUFFERS.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+
+    PENDING_WRITE_REGISTRY
+        .lock()
+        .iter()
+        .filter(|(_, entry)| entry.device_id == device_id && entry.inode_num == inode_num)
+        .map(|(id, entry)| (*id, Weak::clone(&entry.inner)))
+        .collect()
+}
+
+fn remove_stale_pending_write_entry(id: usize) {
+    if PENDING_WRITE_REGISTRY.lock().remove(&id).is_some() {
+        PENDING_WRITE_BUFFERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn flush_inode_pending_writes_before_truncate(
+    device_id: usize,
+    inode_num: u32,
+    new_len: usize,
+) -> Result<(), ext4_fs::Ext4Error> {
+    for (id, inner_weak) in pending_inode_write_inners(device_id, inode_num) {
+        let Some(inner_arc) = inner_weak.upgrade() else {
+            remove_stale_pending_write_entry(id);
+            continue;
+        };
+        let mut inner = inner_arc.lock();
+        if inner.write_buf_registry_id != id
+            || inner.inode.device_id() != device_id
+            || inner.inode.inode_num() != inode_num
+        {
+            continue;
+        }
+        if !inner.write_buf_counted || inner.write_buf.is_empty() {
+            OSInode::mark_write_buf_clean(&mut inner);
+            continue;
+        }
+
+        let start = inner.write_buf_off;
+        let end = start.saturating_add(inner.write_buf.len());
+        if start >= new_len {
+            continue;
+        }
+        inner.read_buf_valid = 0;
+        if end <= new_len {
+            OSInode::flush_inner(&mut inner)?;
+            continue;
+        }
+
+        let keep_len = new_len - start;
+        if keep_len == 0 {
+            continue;
+        }
+        let data = inner.write_buf[..keep_len].to_vec();
+        let result = {
+            let _fs_guard = ext4_lock();
+            inner.inode.write_at(start, &data)
+        };
+        match result {
+            Ok(n) if n == data.len() => {}
+            Ok(_) => return Err(ext4_fs::Ext4Error::NoSpace),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn discard_inode_pending_writes_after_truncate(
+    device_id: usize,
+    inode_num: u32,
+    new_len: usize,
+) {
+    for (id, inner_weak) in pending_inode_write_inners(device_id, inode_num) {
+        let Some(inner_arc) = inner_weak.upgrade() else {
+            remove_stale_pending_write_entry(id);
+            continue;
+        };
+        let mut inner = inner_arc.lock();
+        if inner.write_buf_registry_id != id
+            || inner.inode.device_id() != device_id
+            || inner.inode.inode_num() != inode_num
+        {
+            continue;
+        }
+        if !inner.write_buf_counted || inner.write_buf.is_empty() {
+            OSInode::mark_write_buf_clean(&mut inner);
+            continue;
+        }
+        let end = inner.write_buf_off.saturating_add(inner.write_buf.len());
+        if end > new_len {
+            inner.write_buf.clear();
+            inner.read_buf_valid = 0;
+            OSInode::mark_write_buf_clean(&mut inner);
+        }
+    }
+}
 
 impl OSInode {
     /// Construct an OS inode from an inode
@@ -573,6 +703,21 @@ impl OSInode {
     ) -> Result<Self, isize> {
         let regular_file_poll_ready = inode.is_file();
         let write_open = WriteOpenState::register_for_inode(writable, &inode)?;
+        let inner = Arc::new_cyclic(|inner_weak| {
+            Mutex::new(OSInodeInner {
+                offset: 0,
+                dir_offset: 0,
+                inode,
+                write_buf_off: 0,
+                write_buf: Vec::new(),
+                write_buf_counted: false,
+                write_buf_registry_id: NEXT_WRITE_BUF_REGISTRY_ID.fetch_add(1, Ordering::Relaxed),
+                write_buf_registry_inner: Weak::clone(inner_weak),
+                read_buf_off: 0,
+                read_buf_valid: 0,
+                read_buf: Vec::new(),
+            })
+        });
         Ok(Self {
             readable,
             writable,
@@ -582,16 +727,7 @@ impl OSInode {
             replace_on_write,
             tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
             write_open: Mutex::new(write_open),
-            inner: Mutex::new(OSInodeInner {
-                offset: 0,
-                dir_offset: 0,
-                inode,
-                write_buf_off: 0,
-                write_buf: Vec::new(),
-                read_buf_off: 0,
-                read_buf_valid: 0,
-                read_buf: Vec::new(),
-            }),
+            inner,
         })
     }
 
@@ -637,15 +773,6 @@ impl OSInode {
 
     pub fn ext4_inode(&self) -> Arc<Inode> {
         self.inner.lock().inode.clone()
-    }
-
-    /// Return the end offset of buffered (not-yet-flushed) writes.
-    ///
-    /// This is used to report a correct file size to userspace (`fstat`, `lseek(SEEK_END)`)
-    /// even when we are buffering writes in memory.
-    pub fn pending_write_end(&self) -> usize {
-        let inner = self.inner.lock();
-        inner.write_buf_off.saturating_add(inner.write_buf.len())
     }
 
     /// Read from this inode at the given offset without updating the file offset.
@@ -769,6 +896,9 @@ impl OSInode {
         }
 
         inner.write_buf.extend_from_slice(buf);
+        if !buf.is_empty() {
+            Self::mark_write_buf_dirty(&mut inner);
+        }
         if inner.write_buf.len() >= WRITEBUF_MAX {
             if Self::flush_inner(&mut inner).is_err() {
                 return Err(());
@@ -819,18 +949,53 @@ impl OSInode {
             }
         }
         match result {
-            Ok(n) if n == data.len() => Ok(()),
+            Ok(n) if n == data.len() => {
+                Self::mark_write_buf_clean(inner);
+                Ok(())
+            }
             Ok(_) => {
                 inner.write_buf_off = off;
                 inner.write_buf = data;
+                Self::mark_write_buf_dirty(inner);
                 Err(ext4_fs::Ext4Error::NoSpace)
             }
             Err(e) => {
                 inner.write_buf_off = off;
                 inner.write_buf = data;
+                Self::mark_write_buf_dirty(inner);
                 Err(e)
             }
         }
+    }
+
+    fn mark_write_buf_dirty(inner: &mut OSInodeInner) {
+        if inner.write_buf.is_empty() {
+            Self::mark_write_buf_clean(inner);
+            return;
+        }
+        if !inner.write_buf_counted {
+            PENDING_WRITE_BUFFERS.fetch_add(1, Ordering::AcqRel);
+            inner.write_buf_counted = true;
+        }
+        PENDING_WRITE_REGISTRY.lock().insert(
+            inner.write_buf_registry_id,
+            PendingWriteRegistration {
+                device_id: inner.inode.device_id(),
+                inode_num: inner.inode.inode_num(),
+                end: inner.write_buf_off.saturating_add(inner.write_buf.len()),
+                inner: Weak::clone(&inner.write_buf_registry_inner),
+            },
+        );
+    }
+
+    fn mark_write_buf_clean(inner: &mut OSInodeInner) {
+        if inner.write_buf_counted {
+            inner.write_buf_counted = false;
+            PENDING_WRITE_BUFFERS.fetch_sub(1, Ordering::AcqRel);
+        }
+        PENDING_WRITE_REGISTRY
+            .lock()
+            .remove(&inner.write_buf_registry_id);
     }
 
     pub fn flush_with_error(&self) -> Result<(), ext4_fs::Ext4Error> {
@@ -844,6 +1009,17 @@ impl OSInode {
 
     pub fn offset(&self) -> usize {
         self.inner.lock().offset
+    }
+
+    pub fn visible_end(&self) -> usize {
+        let inode = self.ext4_inode();
+        let disk_end = {
+            let _fs_guard = ext4_lock();
+            inode.size() as usize
+        };
+        pending_inode_write_end(inode.device_id(), inode.inode_num())
+            .map(|pending_end| core::cmp::max(disk_end, pending_end))
+            .unwrap_or(disk_end)
     }
 
     pub fn set_offset(&self, offset: usize) {
@@ -1287,35 +1463,20 @@ impl File for OSInode {
         let mut inner = self.inner.lock();
         if self.append {
             if !inner.write_buf.is_empty() {
-                let off = inner.write_buf_off;
-                let len = inner.write_buf.len();
-                let inode_num = inner.inode.inode_num();
-                let size_before = inner.inode.size() as usize;
-                let result = {
-                    let _fs_guard = ext4_lock();
-                    inner.inode.write_at(off, &inner.write_buf)
-                };
-                if debug_iozone_tracked(inode_num) {
-                    let size_after = inner.inode.size() as usize;
-                    match result {
-                        Ok(n) => {
-                            println!(
-                                "[iozone-debug] write inode={} off={} len={} wrote={} size={}->{}",
-                                inode_num, off, len, n, size_before, size_after
-                            );
-                        }
-                        Err(_) => {
-                            println!(
-                                "[iozone-debug] write inode={} off={} len={} err size={}->{}",
-                                inode_num, off, len, size_before, size_after
-                            );
-                        }
-                    }
+                if Self::flush_inner(&mut inner).is_err() {
+                    println!("[ext4] Warning: write failed");
+                    return 0;
                 }
-                let _ = result;
-                inner.write_buf.clear();
+                inner.read_buf_valid = 0;
             }
-            inner.offset = inner.inode.size() as usize;
+            let disk_end = {
+                let _fs_guard = ext4_lock();
+                inner.inode.size() as usize
+            };
+            let pending_end =
+                pending_inode_write_end(inner.inode.device_id(), inner.inode.inode_num())
+                    .unwrap_or(0);
+            inner.offset = core::cmp::max(disk_end, pending_end);
         }
         let mut total_write_size = 0usize;
 
@@ -1332,36 +1493,11 @@ impl File for OSInode {
             if !inner.write_buf.is_empty()
                 && inner.offset != inner.write_buf_off.saturating_add(inner.write_buf.len())
             {
-                let off = inner.write_buf_off;
-                let len = inner.write_buf.len();
-                let inode_num = inner.inode.inode_num();
-                let size_before = inner.inode.size() as usize;
-                let result = {
-                    let _fs_guard = ext4_lock();
-                    inner.inode.write_at(off, &inner.write_buf)
-                };
-                if debug_iozone_tracked(inode_num) {
-                    let size_after = inner.inode.size() as usize;
-                    match result {
-                        Ok(n) => {
-                            println!(
-                                "[iozone-debug] write inode={} off={} len={} wrote={} size={}->{}",
-                                inode_num, off, len, n, size_before, size_after
-                            );
-                        }
-                        Err(_) => {
-                            println!(
-                                "[iozone-debug] write inode={} off={} len={} err size={}->{}",
-                                inode_num, off, len, size_before, size_after
-                            );
-                        }
-                    }
-                }
-                if result.is_err() {
+                if Self::flush_inner(&mut inner).is_err() {
                     println!("[ext4] Warning: write failed");
                     break;
                 }
-                inner.write_buf.clear();
+                inner.read_buf_valid = 0;
             }
 
             if inner.write_buf.is_empty() {
@@ -1369,41 +1505,18 @@ impl File for OSInode {
             }
 
             inner.write_buf.extend_from_slice(slice);
+            if !slice.is_empty() {
+                Self::mark_write_buf_dirty(&mut inner);
+            }
             inner.offset += slice.len();
             total_write_size += slice.len();
             inner.read_buf_valid = 0;
 
             if inner.write_buf.len() >= WRITEBUF_MAX {
-                let off = inner.write_buf_off;
-                let len = inner.write_buf.len();
-                let inode_num = inner.inode.inode_num();
-                let size_before = inner.inode.size() as usize;
-                let result = {
-                    let _fs_guard = ext4_lock();
-                    inner.inode.write_at(off, &inner.write_buf)
-                };
-                if debug_iozone_tracked(inode_num) {
-                    let size_after = inner.inode.size() as usize;
-                    match result {
-                        Ok(n) => {
-                            println!(
-                                "[iozone-debug] write inode={} off={} len={} wrote={} size={}->{}",
-                                inode_num, off, len, n, size_before, size_after
-                            );
-                        }
-                        Err(_) => {
-                            println!(
-                                "[iozone-debug] write inode={} off={} len={} err size={}->{}",
-                                inode_num, off, len, size_before, size_after
-                            );
-                        }
-                    }
-                }
-                if result.is_err() {
+                if Self::flush_inner(&mut inner).is_err() {
                     println!("[ext4] Warning: write failed");
                     break;
                 }
-                inner.write_buf.clear();
                 inner.read_buf_valid = 0;
             }
         }
@@ -1426,6 +1539,7 @@ impl Drop for OSInode {
                 let _fs_guard = ext4_lock();
                 inner.inode.write_at(off, &data)
             };
+            Self::mark_write_buf_clean(&mut inner);
         }
         drop(inner);
         if let Some(cleanup) = self.tmpfile_cleanup.take() {

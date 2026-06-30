@@ -12,8 +12,8 @@ use super::{
     proc_path_for_at, read_user_cstring, remove_owner_file_lease_for_key,
     remove_process_record_locks_for_key, reopen_proc_link_file, resolve_abs_path, resolve_at_inode,
     resolve_at_path, resolve_parent_and_name, secondary_root_inode, set_inode_all_times_now,
-    shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, try_write_user_value,
-    union_root_dir_entries,
+    shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, truncate_regular_inode,
+    try_write_user_value, union_root_dir_entries,
 };
 
 /// Opens or creates a filesystem object across ext4, proc, pseudo-fs, and tmpfile paths.
@@ -495,15 +495,17 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         );
     }
 
-    if !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file() {
-        if let Err(e) = inode.clear() {
-            return ext4_err_to_errno(e);
+    let needs_trunc = !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file();
+    drop(ext4_guard);
+    if needs_trunc {
+        let ret = truncate_regular_inode(&inode, 0);
+        if ret != 0 {
+            return ret;
         }
         touch_inode_mtime_ctime_now(&inode);
     }
 
     crate::fs::debug_track_iozone_inode(&path, inode_num);
-    drop(ext4_guard);
     let fd = match install_open_file_fd(os_inode, flags, o_path) {
         Ok(fd) => fd,
         Err(e) => return e,
