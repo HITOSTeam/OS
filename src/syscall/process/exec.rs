@@ -153,8 +153,8 @@ fn find_busybox_shell() -> Result<Option<(String, LoadedExecImage)>, isize> {
     Ok(None)
 }
 
-/// 根据 shebang 解释器名称（如 `bash`、`dash`、`env`）返回对应的 busybox applet 名。
-/// 用于将 `#!/bin/bash` 等 shebang 映射到 `busybox sh/bash`。
+/// 根据 shebang 解释器名称（如 `sh`、`dash`、`env`）返回对应的 busybox applet 名。
+/// 用于将缺失的系统 `/bin/sh`/`dash` 解释器映射到 `busybox sh`。
 fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static str {
     let shell_name = if interp_name == "env" {
         opt_arg.unwrap_or("sh")
@@ -162,7 +162,6 @@ fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static st
         interp_name
     };
     match shell_name {
-        "bash" => "bash",
         "dash" | "sh" => "sh",
         "busybox" => "sh",
         _ => "sh",
@@ -174,9 +173,7 @@ fn busybox_shell_applet(interp_name: &str, opt_arg: Option<&str>) -> &'static st
 /// 决定 shebang 的可选参数（如 `#!/usr/bin/env sh` 中的 `sh`）是否应透传给解释器。
 /// 当解释器是 `env` 且参数已被识别为 shell 名称时，不再重复传递。
 fn shebang_shell_extra_arg<'a>(interp_name: &str, opt_arg: Option<&'a str>) -> Option<&'a str> {
-    if matches!(interp_name, "busybox" | "env")
-        && matches!(opt_arg, Some("sh") | Some("bash") | Some("dash"))
-    {
+    if matches!(interp_name, "busybox" | "env") && matches!(opt_arg, Some("sh") | Some("dash")) {
         None
     } else {
         opt_arg
@@ -713,10 +710,11 @@ fn execve_with_inode(
     // busybox/ash can run `./script.sh` directly.
     if let Some((interp, opt_arg)) = parse_shebang(head) {
         let interp_name = interp.rsplit('/').next().unwrap_or(interp.as_str());
-        let env_shell =
-            interp_name == "env" && matches!(opt_arg.as_deref(), Some("sh") | Some("bash"));
-        let wants_shell = matches!(interp_name, "sh" | "bash" | "busybox") || env_shell;
         let opt_arg_ref = opt_arg.as_deref();
+        let env_shell = interp_name == "env" && matches!(opt_arg_ref, Some("sh") | Some("dash"));
+        let busybox_shell =
+            interp_name == "busybox" && matches!(opt_arg_ref, Some("sh") | Some("dash"));
+        let wants_shell = matches!(interp_name, "sh" | "dash") || env_shell || busybox_shell;
         let extra_shell_arg = shebang_shell_extra_arg(interp_name, opt_arg_ref);
         match load_file_from_path(&interp) {
             Ok(interp_data) if is_elf(&interp_data.data) => {

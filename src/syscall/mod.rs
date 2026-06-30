@@ -118,9 +118,8 @@ pub(crate) fn cyclic_diag_note(event: CyclicDiagEvent, pid: usize, tid: usize) {
 // The base image ships `/bin/busybox` but not individual applet symlinks.
 // Allow a conservative subset of common LTP shell dependencies to fall back
 // to busybox when the standalone binary path is absent.
-const BUSYBOX_APPLET_ALLOWLIST: [&str; 22] = [
+const BUSYBOX_APPLET_ALLOWLIST: [&str; 21] = [
     "awk",
-    "bash",
     "cmp",
     "dmesg",
     "find",
