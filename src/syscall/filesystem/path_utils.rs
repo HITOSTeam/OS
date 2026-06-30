@@ -297,7 +297,7 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
             return Ok(AtPath::Ext4Abs(translated));
         }
     }
-    let rel = if let Some(mount) = mount_lookup_for_abs(&abs) {
+    let rel = if let Some(mount) = mount_lookup_for_abs(&abs).filter(|mount| mount.target != "/") {
         let suffix = if abs == mount.target {
             String::new()
         } else {
