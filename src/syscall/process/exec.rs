@@ -641,8 +641,8 @@ fn execve_with_inode(
         (inode.device_id(), inode.inode_num())
     };
     if let Some(info) = elf_info {
-        if let Some(interp) = info.interp {
-            let interp_data = match load_interp_data(&interp, Some(info.arch_abi)) {
+        if let Some(interp) = info.interp.as_deref() {
+            let interp_data = match load_interp_data(interp, Some(info.arch_abi)) {
                 Ok(data) => data,
                 Err(e) => return e,
             };
@@ -655,7 +655,8 @@ fn execve_with_inode(
                 inode.read_at(offset, buf)
             };
             let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
-                match MemorySet::from_elf_with_interp_reader(loader, &interp_data.data) {
+                match MemorySet::from_elf_with_interp_info_reader(loader, &info, &interp_data.data)
+                {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
@@ -682,7 +683,7 @@ fn execve_with_inode(
             inode.read_at(offset, buf)
         };
         let (memory_set, ustack_base, entry_point, elf_aux) =
-            match MemorySet::from_elf_reader(loader) {
+            match MemorySet::from_elf_info_reader(loader, &info) {
                 Ok(v) => v,
                 Err(e) => return e,
             };

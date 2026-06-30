@@ -189,9 +189,20 @@ pub(crate) fn try_register_executing_inode(dev: usize, ino: u32) -> Result<(), i
     if !valid_text_key(dev, ino) {
         return Ok(());
     }
+    // Buffered writes remain part of the writable-open text exclusion until
+    // they are flushed or discarded; otherwise exec could parse one image and
+    // map segment bytes from a later one.
+    if pending_inode_write_end(dev, ino).is_some() {
+        return Err(ETXTBSY_ERR);
+    }
     let key = (dev, ino);
     let mut access = INODE_TEXT_ACCESS.lock();
     if access.get(&key).is_some_and(|state| state.write_open > 0) {
+        return Err(ETXTBSY_ERR);
+    }
+    // Close the race where a writer drops write-open state before its dirty
+    // buffer reaches the backing inode.
+    if pending_inode_write_end(dev, ino).is_some() {
         return Err(ETXTBSY_ERR);
     }
     let state = access.entry(key).or_default();
