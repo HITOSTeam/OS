@@ -11,11 +11,8 @@ use spin::MutexGuard;
 
 use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
 
+/// 有SSTC寄存器的话就不需要使用 SBI 来设置时钟中断了。
 static RISCV_HAS_SSTC: AtomicBool = AtomicBool::new(false);
-// Detect Sstc for future use, but keep SBI set_timer as the active clockevent
-// path while this branch is focused on scheduler/mm latency changes.
-const RISCV_USE_SSTC_CLOCKEVENT: bool = false;
-
 #[allow(dead_code)]
 fn detect_timebase_frequency(dtb_pa: usize) -> Option<usize> {
     if dtb_pa == 0 {
@@ -63,10 +60,12 @@ pub fn bootstrap_init(dtb_pa: usize) {
         crate::config::set_clock_freq(freq);
         crate::println!("[kernel] riscv timebase frequency: {} Hz", freq);
     }
+    // 一般的 RISC-V S-mode 内核通过 SBI 设置下一次 timer interrupt；
+    // 支持 Sstc 时可以直接写 stimecmp CSR，少一次 ecall/M-mode 代理。
     let has_sstc = detect_isa_extension(dtb_pa, b"sstc");
     RISCV_HAS_SSTC.store(has_sstc, Ordering::Release);
     if has_sstc {
-        crate::println!("[kernel] riscv sstc timer enabled");
+        crate::println!("[kernel] riscv sstc clockevent enabled");
     }
 }
 
@@ -141,7 +140,7 @@ pub fn console_getchar() -> usize {
 
 #[inline]
 fn program_timer_deadline(timer: usize) {
-    if RISCV_USE_SSTC_CLOCKEVENT && RISCV_HAS_SSTC.load(Ordering::Acquire) {
+    if RISCV_HAS_SSTC.load(Ordering::Acquire) {
         // SAFETY: Sstc exposes stimecmp (CSR 0x14d) to S-mode. The flag is set
         // only after the DTB advertises the extension; otherwise we keep using SBI.
         unsafe { asm!("csrw 0x14d, {}", in(reg) timer, options(nostack)) };

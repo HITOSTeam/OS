@@ -68,6 +68,7 @@ fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
         if hart_id == boot_hart_id {
             continue;
         }
+        //opaque是下一个核心启动的时候给他的a1寄存器放的值
         let _ = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
     }
 }
@@ -110,6 +111,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         .is_ok()
     {
         clear_bss();
+        //顺便标记第一个cpu核心已经进入到初始化阶段了
         BOOT_BSS_CLEARED.store(true, Ordering::SeqCst);
         let num_of_apps = unsafe { *(num_user_apps as *const i64) };
         println!(

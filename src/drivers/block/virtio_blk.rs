@@ -21,9 +21,13 @@ mod virtio_mmio {
         println,
     };
 
+    // DTB 不可用时的 QEMU virt 默认基地址。
     const VIRTIO0: usize = 0x1000_1000;
     const VIRTIO1: usize = 0x1000_2000;
-
+    const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+    const VIRTIO_MMIO_LEGACY_VERSION: u32 = 1;
+    const VIRTIO_MMIO_MODERN_VERSION: u32 = 2;
+    const VIRTIO_DEVICE_ID_BLOCK: u32 = 2;
     pub struct VirtIOBlock(Mutex<VirtIOBlk<VirtioHal, MmioTransport>>);
 
     lazy_static! {
@@ -71,12 +75,52 @@ mod virtio_mmio {
     impl VirtIOBlock {
         #[allow(unused)]
         pub fn new() -> Self {
-            Self::try_new_with_base(VIRTIO0).expect("VirtIO block device not found")
+            Self::try_new_with_index(0).expect("VirtIO block device not found")
         }
 
         #[allow(unused)]
         pub fn try_new_second() -> Option<Self> {
-            Self::try_new_with_base(VIRTIO1)
+            Self::try_new_with_index(1)
+        }
+
+        /// 按块设备序号优先从 DTB 选址，解析失败时回退到 QEMU 默认地址。
+        fn try_new_with_index(index: usize) -> Option<Self> {
+            if let Some(base) = Self::block_device_base_from_dtb(index) {
+                return Self::try_new_with_base(base);
+            }
+            match index {
+                0 => Self::try_new_with_base(VIRTIO0),
+                1 => Self::try_new_with_base(VIRTIO1),
+                _ => None,
+            }
+        }
+
+        /// 返回 DTB 中第 `index` 个经寄存器验证的 virtio-mmio 块设备基址。
+        fn block_device_base_from_dtb(index: usize) -> Option<usize> {
+            let mut bases = Vec::new();
+            crate::config::for_each_virtio_mmio_device_base(|base| {
+                if Self::is_block_device(base) {
+                    bases.push(base);
+                }
+            });
+            bases.sort_unstable();
+            bases.get(index).copied()
+        }
+
+        /// 通过 virtio-mmio 头部的 magic、version 和 device id 验证块设备。
+        fn is_block_device(base: usize) -> bool {
+            let regs = base as *const u32;
+            unsafe {
+                let magic = core::ptr::read_volatile(regs.add(0));
+                let version = core::ptr::read_volatile(regs.add(1));
+                let device_id = core::ptr::read_volatile(regs.add(2));
+                magic == VIRTIO_MMIO_MAGIC
+                    && matches!(
+                        version,
+                        VIRTIO_MMIO_LEGACY_VERSION | VIRTIO_MMIO_MODERN_VERSION
+                    )
+                    && device_id == VIRTIO_DEVICE_ID_BLOCK
+            }
         }
 
         pub fn try_new_with_base(base: usize) -> Option<Self> {
@@ -153,7 +197,7 @@ mod virtio_mmio {
 #[cfg(target_arch = "loongarch64")]
 mod virtio_pci {
     use crate::{
-        config::{DEVICE_TREE_ADDR, PAGE_SIZE, phys_mem_end, phys_mem_start},
+        config::{DEVICE_TREE_ADDR, PAGE_SIZE, phys_range_in_ram},
         mm::{
             FrameTracker, KERNEL_SPACE, MapPermission, PTEFlags, PhysAddr, VirtAddr,
             frame_alloc_contiguous,
@@ -207,11 +251,7 @@ mod virtio_pci {
         if len == 0 {
             return false;
         }
-        let end = match vaddr.checked_add(len) {
-            Some(v) => v,
-            None => return false,
-        };
-        vaddr >= phys_mem_start() && end <= phys_mem_end()
+        phys_range_in_ram(vaddr, len)
     }
 
     fn set_dma_page_flags(paddr: usize, pages: usize, io: bool) {
@@ -494,8 +534,8 @@ mod virtio_pci {
 
     fn log_pci_range(label: &str, start: usize, size: usize) {
         let end = start.saturating_add(size);
-        let mem_start = phys_mem_start();
-        let mem_end = phys_mem_end();
+        let mem_start = crate::config::phys_mem_start();
+        let mem_end = crate::config::phys_mem_end();
         // println!(
         //     "[virtio_pci] {} [{:#x}, {:#x}) size={:#x}",
         //     label, start, end, size

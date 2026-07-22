@@ -20,7 +20,7 @@ use crate::arch::riscv64::mm::AsidContext;
 use crate::config::{KERNEL_STACK_TOP, phys_mem_start};
 use crate::config::{
     MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
-    USER_STACK_SIZE, phys_mem_end,
+    USER_STACK_SIZE, for_each_dtb_mmio_range, for_each_phys_mem_range, phys_mem_end,
 };
 use crate::fs::File;
 use crate::println;
@@ -2243,26 +2243,14 @@ impl MemorySet {
             ),
             None,
         );
-        #[cfg(target_arch = "loongarch64")]
-        {
-            // Map low physical memory below the kernel image so the frame allocator
-            // can safely use it on LoongArch.
-            memory_set.map_identical_range(
-                crate::config::phys_mem_start(),
-                stext as usize,
+        println!("mapping physical memory");
+        for_each_phys_mem_range(|start, end| {
+            memory_set.map_identical_range_skip_mapped(
+                start,
+                end,
                 MapPermission::R | MapPermission::W,
             );
-        }
-        println!("mapping physical memory");
-        memory_set.push(
-            MapArea::new(
-                (ekernel as usize).into(),
-                phys_mem_end().into(),
-                MapType::Identical,
-                MapPermission::R | MapPermission::W,
-            ),
-            None,
-        );
+        });
         println!("mapping memory-mapped registers");
         for pair in MMIO {
             memory_set.push(
@@ -2275,6 +2263,13 @@ impl MemorySet {
                 None,
             );
         }
+        for_each_dtb_mmio_range(|start, end| {
+            memory_set.map_identical_range_skip_mapped(
+                start,
+                end,
+                MapPermission::R | MapPermission::W | MapPermission::IO,
+            );
+        });
         #[cfg(target_arch = "loongarch64")]
         {
             let dtb_start = crate::config::DEVICE_TREE_ADDR;

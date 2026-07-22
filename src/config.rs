@@ -1,6 +1,7 @@
 //! Constants used in rCore
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use spin::Once;
 
 // Linux userland can place MiB-scale buffers on the initial stack.
 // Keep this modest because current user stacks are eagerly framed.
@@ -70,6 +71,7 @@ pub const DEFAULT_CLOCK_FREQ: usize = 100_000_000;
 #[cfg(target_arch = "riscv64")]
 pub const DEFAULT_CLOCK_FREQ: usize = 10_000_000;
 
+///会从DTB里面更新
 static CLOCK_FREQ: AtomicUsize = AtomicUsize::new(0);
 
 #[allow(dead_code)]
@@ -87,29 +89,168 @@ pub fn clock_freq() -> usize {
 // QEMU virt RAM starts at 0x8000_0000. Default to 512MiB to match common `-m 512M`.
 pub const DEFAULT_MEMORY_START: usize = 0x8000_0000;
 pub const DEFAULT_MEMORY_END: usize = 0xA000_0000;
+/// DTB memory nodes may include firmware/boot-reserved memory without a
+/// reserved-memory node. Keep the first 2 MiB of the lowest RAM range unused.
+pub const BOOT_RESERVED_MEMORY_SIZE: usize = 0x20_0000;
 
 #[cfg(target_arch = "loongarch64")]
 pub const DEVICE_TREE_ADDR: usize = 0x100000;
 #[cfg(target_arch = "loongarch64")]
 pub const DEVICE_TREE_MAX_SIZE: usize = 0x200000;
 
-static PHYS_MEM_START: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_START);
-static PHYS_MEM_END: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_END);
+pub const MAX_PHYS_MEMORY_REGIONS: usize = 8;
+pub const MAX_DTB_MMIO_REGIONS: usize = 32;
+pub const MAX_VIRTIO_MMIO_DEVICES: usize = 8;
 
-#[allow(dead_code)]
-pub fn set_phys_mem_range(start: usize, end: usize) {
-    if end > start {
-        PHYS_MEM_START.store(start, Ordering::SeqCst);
-        PHYS_MEM_END.store(end, Ordering::SeqCst);
+/// DTB 在早期启动阶段解析出的平台资源。
+///
+/// 这些信息只由启动核写入一次，所以用 [`Once`] 整体发布即可，
+/// 无需为每个 range 的起止地址分别维护原子变量。
+struct PlatformInfo {
+    phys_mem_ranges: [(usize, usize); MAX_PHYS_MEMORY_REGIONS],
+    phys_mem_range_count: usize,
+    dtb_mmio_ranges: [(usize, usize); MAX_DTB_MMIO_REGIONS],
+    dtb_mmio_range_count: usize,
+    virtio_mmio_bases: [usize; MAX_VIRTIO_MMIO_DEVICES],
+    virtio_mmio_base_count: usize,
+}
+
+const DEFAULT_PLATFORM_INFO: PlatformInfo = PlatformInfo {
+    phys_mem_ranges: {
+        let mut ranges = [(0, 0); MAX_PHYS_MEMORY_REGIONS];
+        ranges[0] = (DEFAULT_MEMORY_START, DEFAULT_MEMORY_END);
+        ranges
+    },
+    phys_mem_range_count: 1,
+    dtb_mmio_ranges: [(0, 0); MAX_DTB_MMIO_REGIONS],
+    dtb_mmio_range_count: 0,
+    virtio_mmio_bases: [0; MAX_VIRTIO_MMIO_DEVICES],
+    virtio_mmio_base_count: 0,
+};
+
+static PLATFORM_INFO: Once<PlatformInfo> = Once::new();
+
+/// 发布从 DTB 中解析出的物理内存、MMIO 和 virtio-mmio 资源。
+///
+/// 该函数必须在堆和其他 CPU 启动前由启动核调用，且只有首次调用生效。
+/// 传入的物理内存列表为空时，保留 QEMU 的默认内存区间。
+pub fn init_platform_info(
+    phys_mem_ranges: &[(usize, usize)],
+    dtb_mmio_ranges: &[(usize, usize)],
+    virtio_mmio_bases: &[usize],
+) {
+    PLATFORM_INFO.call_once(|| {
+        let mut info = PlatformInfo {
+            ..DEFAULT_PLATFORM_INFO
+        };
+
+        let mut count = 0;
+        for &(start, end) in phys_mem_ranges {
+            if count == MAX_PHYS_MEMORY_REGIONS {
+                break;
+            }
+            if end > start {
+                info.phys_mem_ranges[count] = (start, end);
+                count += 1;
+            }
+        }
+        if count != 0 {
+            info.phys_mem_range_count = count;
+        }
+
+        info.dtb_mmio_range_count = 0;
+        for &(start, end) in dtb_mmio_ranges {
+            if info.dtb_mmio_range_count == MAX_DTB_MMIO_REGIONS {
+                break;
+            }
+            if end > start {
+                info.dtb_mmio_ranges[info.dtb_mmio_range_count] = (start, end);
+                info.dtb_mmio_range_count += 1;
+            }
+        }
+
+        for &base in virtio_mmio_bases {
+            if info.virtio_mmio_base_count == MAX_VIRTIO_MMIO_DEVICES {
+                break;
+            }
+            if base != 0 && !info.virtio_mmio_bases[..info.virtio_mmio_base_count].contains(&base) {
+                info.virtio_mmio_bases[info.virtio_mmio_base_count] = base;
+                info.virtio_mmio_base_count += 1;
+            }
+        }
+        info
+    });
+}
+
+#[inline]
+/// 读取已发布的平台信息；DTB 尚未解析时返回默认配置。
+fn platform_info() -> &'static PlatformInfo {
+    PLATFORM_INFO.get().unwrap_or(&DEFAULT_PLATFORM_INFO)
+}
+
+/// 返回所有物理内存段的最小起始地址。
+pub fn phys_mem_start() -> usize {
+    let info = platform_info();
+    info.phys_mem_ranges[..info.phys_mem_range_count]
+        .iter()
+        .map(|&(start, _)| start)
+        .min()
+        .unwrap_or(DEFAULT_MEMORY_START)
+}
+
+/// 返回所有物理内存段的最大结束地址，中间可能存在空洞。
+pub fn phys_mem_end() -> usize {
+    let info = platform_info();
+    info.phys_mem_ranges[..info.phys_mem_range_count]
+        .iter()
+        .map(|&(_, end)| end)
+        .max()
+        .unwrap_or(DEFAULT_MEMORY_END)
+}
+
+/// 依次访问 DTB 报告的每一段物理内存，不会把中间的空洞合并成 RAM。
+pub fn for_each_phys_mem_range(mut f: impl FnMut(usize, usize)) {
+    let info = platform_info();
+    for &(start, end) in &info.phys_mem_ranges[..info.phys_mem_range_count] {
+        f(start, end);
     }
 }
 
-pub fn phys_mem_start() -> usize {
-    PHYS_MEM_START.load(Ordering::SeqCst)
+/// 返回各段物理内存容量之和，不计入段之间的地址空洞。
+pub fn phys_mem_total() -> usize {
+    let info = platform_info();
+    info.phys_mem_ranges[..info.phys_mem_range_count]
+        .iter()
+        .fold(0usize, |total, &(start, end)| {
+            total.saturating_add(end - start)
+        })
 }
 
-pub fn phys_mem_end() -> usize {
-    PHYS_MEM_END.load(Ordering::SeqCst)
+/// 检查整个物理地址区间是否落在同一段 RAM 内。
+pub fn phys_range_in_ram(start: usize, len: usize) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let info = platform_info();
+    info.phys_mem_ranges[..info.phys_mem_range_count]
+        .iter()
+        .any(|&(range_start, range_end)| start >= range_start && end <= range_end)
+}
+
+/// 依次访问从 DTB 中发现、需要进行恒等映射的 MMIO 区间。
+pub fn for_each_dtb_mmio_range(mut f: impl FnMut(usize, usize)) {
+    let info = platform_info();
+    for &(start, end) in &info.dtb_mmio_ranges[..info.dtb_mmio_range_count] {
+        f(start, end);
+    }
+}
+
+/// 依次访问 DTB 中发现的 virtio-mmio 设备基地址。
+pub fn for_each_virtio_mmio_device_base(mut f: impl FnMut(usize)) {
+    let info = platform_info();
+    for &base in &info.virtio_mmio_bases[..info.virtio_mmio_base_count] {
+        f(base);
+    }
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
