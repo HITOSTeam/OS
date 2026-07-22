@@ -145,8 +145,99 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
 }
 
 #[cfg(target_arch = "loongarch64")]
+const EFI_SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
+#[cfg(target_arch = "loongarch64")]
+const EFI_DEVICE_TREE_GUID: [u8; 16] = [
+    0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
+];
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+struct EfiTableHeader {
+    /// EFI system table 的固定签名，用于确认传入地址确实指向 EFI 表。
+    signature: u64,
+    /// EFI 规范版本。
+    revision: u32,
+    /// 当前表头的字节大小。
+    header_size: u32,
+    /// 表头的 CRC32 校验值。
+    crc32: u32,
+    /// EFI 规范保留字段，必须保持在结构体中以匹配 ABI 布局。
+    reserved: u32,
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+struct EfiConfigurationTable {
+    /// 标识该配置表内容类型的 EFI GUID。
+    vendor_guid: [u8; 16],
+    /// 指向该 GUID 对应数据的启动阶段物理地址。
+    vendor_table: usize,
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+struct EfiSystemTable {
+    /// EFI system table 的公共表头。
+    header: EfiTableHeader,
+    /// 指向固件厂商名称字符串的物理地址。
+    firmware_vendor: usize,
+    /// 固件实现版本。
+    firmware_revision: u32,
+    /// 保持后续 64 位字段对齐所需的填充。
+    _firmware_revision_padding: u32,
+    /// 标准输入设备句柄。
+    console_in_handle: usize,
+    /// 指向标准输入协议对象的地址。
+    console_in: usize,
+    /// 标准输出设备句柄。
+    console_out_handle: usize,
+    /// 指向标准输出协议对象的地址。
+    console_out: usize,
+    /// 标准错误输出设备句柄。
+    stderr_handle: usize,
+    /// 指向标准错误输出协议对象的地址。
+    stderr: usize,
+    /// 指向 EFI Runtime Services 表的地址。
+    runtime_services: usize,
+    /// 指向 EFI Boot Services 表的地址。
+    boot_services: usize,
+    /// configuration table 数组中的表项数量。
+    number_of_table_entries: usize,
+    /// 指向 EFI configuration table 数组的物理地址。
+    configuration_table: *const EfiConfigurationTable,
+}
+
+#[cfg(target_arch = "loongarch64")]
+/// 从 LoongArch 启动协议传入的 EFI system table 中查找 DTB 物理地址。
+fn loongarch_dtb_from_efi(efi_system_table_pa: usize) -> Option<usize> {
+    if efi_system_table_pa == 0 {
+        return None;
+    }
+
+    // 启动协议保证 a2 指向可访问的物理 EFI system table；此时 DMW0
+    // 仍提供物理地址恒等映射，因此可以在分页初始化前直接读取该表。
+    let system_table = unsafe { &*(efi_system_table_pa as *const EfiSystemTable) };
+    if system_table.header.signature != EFI_SYSTEM_TABLE_SIGNATURE
+        || system_table.configuration_table.is_null()
+    {
+        return None;
+    }
+
+    for index in 0..system_table.number_of_table_entries {
+        // configuration_table 指针和其中的 vendor_table 都是启动阶段物理地址。
+        let entry = unsafe { &*system_table.configuration_table.add(index) };
+        if entry.vendor_guid == EFI_DEVICE_TREE_GUID && entry.vendor_table != 0 {
+            return Some(entry.vendor_table);
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "loongarch64")]
 #[unsafe(no_mangle)]
-fn rust_main(hart_id: usize) -> ! {
+// 入口汇编将 hart ID 放在 a0，将 EFI system table 物理地址放在 a1。
+fn rust_main(hart_id: usize, efi_system_table_pa: usize) -> ! {
     arch::set_tp(hart_id);
     let _ = arch::disable_interrupts();
     if BOOT_HART_INITED
@@ -159,7 +250,9 @@ fn rust_main(hart_id: usize) -> ! {
         task::manager::mark_hart_online(hart_id);
         println!("[kernel] loongarch64 boot hart {}", hart_id);
         arch::bootstrap_init();
-        mm::init_phys_mem_from_dtb(crate::config::DEVICE_TREE_ADDR);
+        // DTB 是 EFI configuration table 中的一项，先按标准 GUID 查找它。
+        let dtb_pa = loongarch_dtb_from_efi(efi_system_table_pa).unwrap_or(0);
+        mm::init_phys_mem_from_dtb(dtb_pa);
         mm::init();
         arch::disable_direct_map_windows();
         log::init();

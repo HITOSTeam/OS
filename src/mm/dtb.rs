@@ -59,27 +59,37 @@ pub fn init_phys_mem_from_dtb(dtb_pa: usize) {
 
     let mut ranges = [(0usize, 0usize); MAX_PHYS_MEMORY_REGIONS];
     let mut count = 0usize;
-    for region in fdt.memory().regions() {
-        let region_start = region.starting_address as usize;
-        let Some(size) = region.size else {
+    // let tmep = fdt.find_all_nodes("/memory");
+    // `Fdt::memory()` 只返回第一个基础名称为 `memory` 的节点。
+    // LoongArch QEMU 使用两个独立的 memory@... 节点描述低端和高端内存，
+    // 因此必须遍历所有匹配节点，并收集每个节点的全部 `reg` 区间。
+    for node in fdt.find_all_nodes("/memory") {
+        let Some(regions) = node.reg() else {
             continue;
         };
-        let region_end = region_start.saturating_add(size);
-        if region_end <= region_start {
-            continue;
-        }
-        if count < ranges.len() {
-            ranges[count] = (region_start, region_end);
-            count += 1;
-        } else {
-            crate::println!(
-                "[mm] too many DTB memory ranges; ignoring {:#x}-{:#x}",
-                region_start,
-                region_end
-            );
+        for region in regions {
+            let region_start = region.starting_address as usize;
+            let Some(size) = region.size else {
+                continue;
+            };
+            let region_end = region_start.saturating_add(size);
+            if region_end <= region_start {
+                continue;
+            }
+            if count < ranges.len() {
+                ranges[count] = (region_start, region_end);
+                count += 1;
+            } else {
+                crate::println!(
+                    "[mm] too many DTB memory ranges; ignoring {:#x}-{:#x}",
+                    region_start,
+                    region_end
+                );
+            }
         }
     }
 
+    crate::println!("[memory] we find {} regions", count);
     // 排序并合并重叠/相邻段，避免同一物理页被分配器登记两次。
     ranges[..count].sort_unstable_by_key(|&(start, _)| start);
     let mut merged_count = 0;

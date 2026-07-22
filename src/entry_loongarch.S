@@ -5,7 +5,13 @@
 .equ CSR_DMW0, 0x180
 .equ CSR_DMW1, 0x181
 
+# loongarch在qemu上执行这个entry之前  
+#  a0 = 1       # EFI 启动标志
+#  a1 = 0       # 内核命令行物理地址
+#  a2 = 0x200   # EFI system table 物理地址
+
 _start:
+    # 原先a0保存的是从EFI启动，我们不需要这个信息，直接覆盖
     csrrd $a0, CSR_CPUID
 
     li.d $t0, 4096 * 16
@@ -30,6 +36,8 @@ _start:
     csrwr       $t2,    CSR_DMW1
     csrwr       $t1,    CSR_DMW0
 
+    # LoongArch 启动协议通过 a2 传入 EFI system table 的物理地址。
+    move        $a1,    $a2
     bl rust_main
 
     .section .bss.stack

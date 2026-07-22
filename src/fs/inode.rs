@@ -87,6 +87,7 @@ struct PendingWriteRegistration {
 
 // Serialize ext4 operations across harts.
 lazy_static! {
+    ///手动实现的EXT4文件系统的锁，方便自定义获取锁失败之后的行为，比如这里是调度下一个任务
     static ref EXT4_LOCK: Arc<Ext4Lock> = Arc::new(Ext4Lock::new());
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref DEFERRED_UNLINK_CLEANUP: Mutex<BTreeMap<(usize, u32), TmpfileCleanup>> =

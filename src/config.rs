@@ -98,7 +98,7 @@ pub const DEVICE_TREE_ADDR: usize = 0x100000;
 #[cfg(target_arch = "loongarch64")]
 pub const DEVICE_TREE_MAX_SIZE: usize = 0x200000;
 
-pub const MAX_PHYS_MEMORY_REGIONS: usize = 8;
+pub const MAX_PHYS_MEMORY_REGIONS: usize = 3;
 pub const MAX_DTB_MMIO_REGIONS: usize = 32;
 pub const MAX_VIRTIO_MMIO_DEVICES: usize = 8;
 
