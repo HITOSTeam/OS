@@ -19,6 +19,8 @@
 #   SUBMIT         0|1, pass `--features submit`    [0]
 #   EXT4_REBUILD   0|1, force rebuild of fs.ext4    [0]
 #   EXT4_SIZE      packer size (e.g. 1G, 4G)        [1G]
+#   EVAL_MINIMAL_ROOT 0|1, omit the legacy base rootfs when an
+#                  official full rootfs is attached as DISK_IMG [0]
 #   DISK_IMG       extra "test-card" image path     [sdcard-<arch>.img]
 #   QEMU_TIMEOUT   seconds, 0 disables `timeout`    [0]
 # ======================================================================
@@ -78,6 +80,20 @@ QEMU_TIMEOUT ?= 0
 SUBMIT       ?= 0
 EXT4_REBUILD ?= 0
 EXT4_SIZE    ?= 1G
+
+# 这个标志位先手动设置，群里老师说后续自己主动检测
+EVAL_MINIMAL_ROOT ?= 0
+
+# BuildStorm/cagent images provide a mutually compatible /bin, /lib, /usr,
+# Rust toolchain and workload tree.  Seeding disk0 from the legacy base image
+# would let its older ld-linux shadow disk1 while libc comes from disk1.  In
+# evaluation mode disk0 therefore contains only /user plus the overlays and
+# the root-level test scripts.
+ifeq ($(EVAL_MINIMAL_ROOT),1)
+    override EXT4_BASE_IMG :=
+    override EXT4_BASE_TAR :=
+    override EXT4_BASE_TAR_XZ :=
+endif
 
 # Native host triple for tools that must run on the build machine
 # (currently just ext4-fs-packer). Resolved once at Make parse time so we

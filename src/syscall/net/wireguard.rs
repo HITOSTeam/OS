@@ -1610,11 +1610,9 @@ fn build_device_msg(
                 &allowed_ip.family.to_ne_bytes(),
             );
             append_rtattr(&mut allowed_attrs, WGALLOWEDIP_A_IPADDR, &allowed_ip.addr);
-            append_rtattr(
-                &mut allowed_attrs,
-                WGALLOWEDIP_A_CIDR_MASK,
-                &[allowed_ip.cidr],
-            );
+            append_rtattr(&mut allowed_attrs, WGALLOWEDIP_A_CIDR_MASK, &[
+                allowed_ip.cidr
+            ]);
             append_rtattr(
                 &mut allowed,
                 NLA_F_NESTED | (allowed_idx as u16 + 1),

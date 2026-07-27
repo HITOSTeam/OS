@@ -379,6 +379,18 @@ pub(crate) fn inode_path_hint(inode: &Arc<Inode>) -> Option<String> {
         .cloned()
 }
 
+/// 按 inode 身份返回最近记录的绝对路径。
+///
+/// 进程表只保存可执行文件的 `(设备号, inode 号)`，用于 ETXTBSY 记账。
+/// procfs 通过此映射实现 `/proc/<pid>/exe`，避免每次 `readlink(2)` 都递归遍历
+/// 可能很大的第二块测试镜像。
+pub(crate) fn inode_path_hint_by_identity(device_id: usize, inode_num: u32) -> Option<String> {
+    INODE_PATH_HINTS
+        .lock()
+        .get(&(device_id, inode_num))
+        .cloned()
+}
+
 fn normalize_inode_abs_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
     let absolute = path.starts_with('/');
@@ -1304,8 +1316,7 @@ pub(crate) fn find_path_in_roots(path: &str) -> Option<Arc<Inode>> {
     }
     SECONDARY_ROOT_INODE.as_ref()?.find_path(path)
 }
-//if a disk has a /user directory while the other does not, prefer the one with /user
-//todo: better solution.
+// 优先选择包含完整启动程序的磁盘，不能仅因无关测试镜像中也有 /user 目录就选错磁盘。
 struct RootSelection {
     primary_root: Arc<Inode>,
     secondary_root: Option<Arc<Inode>>,
@@ -1323,13 +1334,13 @@ impl RootSelection {
     ) -> Self {
         // Avoid taking ext4_lock() here; this may run during lazy_static initialization
         // while a caller already holds the lock.
-        let has_user0 = root0.find("user").is_some();
-        let has_user1 = root1
+        let has_init0 = root0.find_path("/user/init_proc.bin").is_some();
+        let has_init1 = root1
             .as_ref()
-            .map(|root| root.find("user").is_some())
+            .map(|root| root.find_path("/user/init_proc.bin").is_some())
             .unwrap_or(false);
 
-        if root1.is_some() && !has_user0 && has_user1 {
+        if root1.is_some() && !has_init0 && has_init1 {
             RootSelection {
                 primary_root: root1.as_ref().unwrap().clone(),
                 secondary_root: Some(root0.clone()),

@@ -488,13 +488,10 @@ pub fn detach_attaches_overlapping(
             continue;
         }
         if attach.accounted {
-            removed_accounted.push((
-                attach.attach_id,
-                ShmAttachRef {
-                    ipc_ns_id: attach.ipc_ns_id,
-                    shmid: attach.shmid,
-                },
-            ));
+            removed_accounted.push((attach.attach_id, ShmAttachRef {
+                ipc_ns_id: attach.ipc_ns_id,
+                shmid: attach.shmid,
+            }));
         }
         if start > attach.addr {
             next.push(ShmAttach {

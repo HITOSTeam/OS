@@ -1886,17 +1886,14 @@ pub(crate) fn set_primary_ipv4_addr(
         entry.broadcast_addr = broadcast_addr;
         entry.scope = scope;
     } else {
-        dev.addrs.insert(
-            0,
-            Ipv4AddrEntry {
-                addr,
-                peer_addr: addr,
-                prefix_len,
-                label: None,
-                broadcast_addr,
-                scope,
-            },
-        );
+        dev.addrs.insert(0, Ipv4AddrEntry {
+            addr,
+            peer_addr: addr,
+            prefix_len,
+            label: None,
+            broadcast_addr,
+            scope,
+        });
     }
     Ok(())
 }

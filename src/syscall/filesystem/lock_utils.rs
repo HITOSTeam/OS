@@ -531,14 +531,11 @@ pub(crate) fn set_file_lease(
             }
         }
 
-        table.insert(
-            key,
-            FileLease {
-                owner_pid,
-                lease_type,
-                pending_break_write: false,
-            },
-        );
+        table.insert(key, FileLease {
+            owner_pid,
+            lease_type,
+            pending_break_write: false,
+        });
         0
     }
 }

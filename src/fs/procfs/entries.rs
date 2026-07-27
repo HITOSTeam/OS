@@ -614,6 +614,11 @@ pub(crate) fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
         dtype: 10,
     });
     entries.push(PseudoDirent {
+        name: String::from("exe"),
+        ino: pid as u64,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
         name: String::from("fd"),
         ino: pid as u64,
         dtype: 4,
@@ -874,6 +879,11 @@ pub(crate) fn proc_pid_task_tid_entries(pid: u32, tid: u32) -> Vec<PseudoDirent>
     });
     entries.push(PseudoDirent {
         name: String::from("cwd"),
+        ino: tid as u64,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("exe"),
         ino: tid as u64,
         dtype: 10,
     });

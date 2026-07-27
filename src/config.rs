@@ -51,6 +51,12 @@ pub const SIGRETURN_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
 pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 #[cfg(target_arch = "loongarch64")]
 pub const KERNEL_STACK_TOP: usize = 0xffff_ffff_ffff_f000;
+// RISC-V BuildStorm 评测期望来宾可见 8 个 hart。entry.asm 同步预留
+// 8 份早期启动栈；修改此上限时必须同时修改该汇编常量并完成 SMP 回归。
+#[cfg(target_arch = "riscv64")]
+pub const MAX_HARTS: usize = 8;
+// LoongArch 的多核启动尚未验证，继续保守限制为 4 个 hart。
+#[cfg(target_arch = "loongarch64")]
 pub const MAX_HARTS: usize = 4;
 #[allow(dead_code)]
 pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;

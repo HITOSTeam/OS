@@ -738,6 +738,9 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     const CLONE_NEWIPC: usize = 0x0800_0000; // 新建 IPC namespace
     const CLONE_NEWPID: usize = 0x2000_0000; // 新建 PID namespace
     const CLONE_NEWNET: usize = 0x4000_0000; // 新建 network namespace
+    // glibc 的 posix_spawn 会将该标志与 CLONE_VM | CLONE_VFORK 组合使用。
+    // 子进程会立即 exec，而现有 exec 路径会重置信号处理器。
+    const CLONE_CLEAR_SIGHAND: usize = 0x0000_0001_0000_0000;
     const CLONE_INTO_CGROUP: usize = 0x0000_0002_0000_0000; // 原子性加入目标 cgroup
     const CLONE_ARGS_CGROUP_SIZE: usize = size_of::<Clone3Args>();
     const SUPPORTED_CLONE3_FLAGS: usize = CLONE_VM
@@ -759,6 +762,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
         | CLONE_NEWIPC
         | CLONE_NEWPID
         | CLONE_NEWNET
+        | CLONE_CLEAR_SIGHAND
         | CLONE_INTO_CGROUP;
 
     // 从用户空间安全读取 clone_args；按 size 兼容更短/更长版本，
@@ -848,8 +852,18 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
             None => return err(SyscallError::EINVAL),
         }
     };
-    // 把 exit_signal 合并回 flags 的低 8 位，使下层 clone_from_parts 沿用 clone(2) 的约定
-    let clone_flags = flags | exit_signal;
+    // 把 exit_signal 合并回 flags 的低 8 位，使下层 clone_from_parts 沿用 clone(2) 的约定。
+    //
+    // glibc 的 posix_spawn 使用 CLEAR_SIGHAND | VM | VFORK。父进程还有其他线程
+    // 运行时，内核的共享地址空间进程路径尚不安全；因此对这一种 spawn 形式降级为
+    // 私有地址空间的 fork。socketpair 错误通道仍会让 posix_spawn 等待 exec 失败结果，
+    // 而 exec 本身已会重置信号处理器。
+    let mut clone_flags = flags | exit_signal;
+    if (flags & CLONE_CLEAR_SIGHAND) != 0
+        && (flags & (CLONE_VM | CLONE_VFORK)) == (CLONE_VM | CLONE_VFORK)
+    {
+        clone_flags &= !(CLONE_CLEAR_SIGHAND | CLONE_VM | CLONE_VFORK);
+    }
     // 真正执行 clone：复制进程/线程、构造 trap 上下文、做命名空间分裂等
     let child_pid = clone_from_parts(
         clone_flags,

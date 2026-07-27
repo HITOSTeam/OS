@@ -149,17 +149,14 @@ pub(crate) fn busybox_applet_allowed(name: &str) -> bool {
 }
 
 pub fn last_syscall_snapshot() -> (usize, [usize; 6]) {
-    (
-        LAST_SYSCALL_ID.load(Ordering::Relaxed),
-        [
-            LAST_SYSCALL_A0.load(Ordering::Relaxed),
-            LAST_SYSCALL_A1.load(Ordering::Relaxed),
-            LAST_SYSCALL_A2.load(Ordering::Relaxed),
-            LAST_SYSCALL_A3.load(Ordering::Relaxed),
-            LAST_SYSCALL_A4.load(Ordering::Relaxed),
-            LAST_SYSCALL_A5.load(Ordering::Relaxed),
-        ],
-    )
+    (LAST_SYSCALL_ID.load(Ordering::Relaxed), [
+        LAST_SYSCALL_A0.load(Ordering::Relaxed),
+        LAST_SYSCALL_A1.load(Ordering::Relaxed),
+        LAST_SYSCALL_A2.load(Ordering::Relaxed),
+        LAST_SYSCALL_A3.load(Ordering::Relaxed),
+        LAST_SYSCALL_A4.load(Ordering::Relaxed),
+        LAST_SYSCALL_A5.load(Ordering::Relaxed),
+    ])
 }
 
 const SYSCALL_EVENTFD2: usize = 19;

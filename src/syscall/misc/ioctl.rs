@@ -9,7 +9,10 @@ use crate::{
         MapPermission, VirtAddr, try_copy_from_user, try_copy_to_user, try_read_user_value,
         try_write_user_value, write_user_value,
     },
-    syscall::error::{SyscallError, err},
+    syscall::{
+        error::{SyscallError, err},
+        filesystem::O_NONBLOCK,
+    },
     task::processor::{current_files, current_process},
     trap::get_current_token,
 };
@@ -83,6 +86,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
     const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1 << 0;
     const FIONREAD: usize = 0x541B;
+    const FIONBIO: usize = 0x5421;
     const RNDGETENTCNT: usize = 0x8004_5200;
     const BLKROSET: usize = 0x125d;
     const BLKROGET: usize = 0x125e;
@@ -176,6 +180,26 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     // Compare on low 32 bits to accept both calling conventions.
     let request = _request & 0xffff_ffffusize;
     let token = get_current_token();
+
+    if request == FIONBIO {
+        if _argp == 0 {
+            return err(SyscallError::EFAULT);
+        }
+        let Some(nonblocking) = try_read_user_value::<i32>(token, _argp as *const i32) else {
+            return err(SyscallError::EFAULT);
+        };
+        let files = current_files();
+        let mut files = files.lock();
+        let Some((_file, mut flags)) = files.get_file_and_flags(fd) else {
+            return EBADF;
+        };
+        if nonblocking != 0 {
+            flags |= O_NONBLOCK as u32;
+        } else {
+            flags &= !(O_NONBLOCK as u32);
+        }
+        return if files.set_flags(fd, flags) { 0 } else { EBADF };
+    }
 
     if let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() {
         match request {

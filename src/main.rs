@@ -7,7 +7,7 @@
 use core::{arch::global_asm, panic};
 extern crate alloc;
 use crate::fs::list_apps;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 mod arch;
 mod bpf;
 mod config;
@@ -45,6 +45,10 @@ static BOOT_BSS_CLEARED: AtomicBool = AtomicBool::new(false);
 // Secondary harts must not enter the scheduler before the boot hart finishes global init.
 #[unsafe(link_section = ".data")]
 static BOOT_GLOBAL_INIT_DONE: AtomicBool = AtomicBool::new(false);
+// 次级 hart 在完成本地页表、trap 与时钟初始化后置位。启动 hart 逐个等待该
+// 应答，避免把尚未完成 per-hart 初始化的 CPU 视作可调度 CPU。
+#[cfg(target_arch = "riscv64")]
+static SECONDARY_READY_MASK: AtomicUsize = AtomicUsize::new(0);
 
 fn clear_bss() {
     unsafe extern "C" {
@@ -61,15 +65,32 @@ fn clear_bss() {
 
 #[cfg(target_arch = "riscv64")]
 fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
-    // Mark the boot hart online immediately. Secondary harts become online only
-    // after they finish their own trap/timer setup and are about to enter idle.
+    // ArceOS 的 SMP 启动采用“启动一个 CPU、等待它完成本地初始化、再启动下一个”的
+    // 握手方式。这里同样不能仅发出 HSM 请求就继续：否则在线掩码和每 hart 调度状态
+    // 会随启动时序波动，导致用户任务在未准备好的 hart 上运行。
     task::manager::mark_hart_online(boot_hart_id);
+    SECONDARY_READY_MASK.store(0, Ordering::Release);
     for hart_id in 0..config::MAX_HARTS {
         if hart_id == boot_hart_id {
             continue;
         }
-        //opaque是下一个核心启动的时候给他的a1寄存器放的值
-        let _ = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
+        // opaque 是次级核心启动时放入 a1 寄存器的 DTB 地址。
+        let rc = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
+        if rc != 0 {
+            println!("[kernel] hart {} HSM start failed: rc={:#x}", hart_id, rc);
+            continue;
+        }
+
+        let ready_bit = 1usize << hart_id;
+        let start = time::get_time();
+        let timeout_ticks = config::clock_freq().saturating_mul(2);
+        while SECONDARY_READY_MASK.load(Ordering::Acquire) & ready_bit == 0 {
+            if time::get_time().wrapping_sub(start) > timeout_ticks {
+                println!("[kernel] hart {} startup timed out", hart_id);
+                break;
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -87,6 +108,7 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
     trap::init_trap();
     trap::trap::enable_timer_interrupt();
     time::set_next_trigger();
+    SECONDARY_READY_MASK.fetch_or(1usize << hart_id, Ordering::Release);
     println!(
         "[kernel] secondary hart {} online (dtb_pa={:#x}), entering scheduler...",
         hart_id, dtb_pa

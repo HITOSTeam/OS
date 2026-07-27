@@ -414,15 +414,12 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                         break err(SyscallError::EACCES);
                     };
                     if !is_ofd {
-                        set_record_lock_waiting(
-                            owner_pid,
-                            WaitingRecordLock {
-                                key,
-                                req_type: flock.l_type,
-                                start,
-                                end,
-                            },
-                        );
+                        set_record_lock_waiting(owner_pid, WaitingRecordLock {
+                            key,
+                            req_type: flock.l_type,
+                            start,
+                            end,
+                        });
                     }
                     enqueue_record_lock_waiter(key, task);
                     let still_conflict = {

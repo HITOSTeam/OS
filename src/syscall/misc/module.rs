@@ -114,14 +114,11 @@ fn register_module_image(image: &[u8], params: &str) -> isize {
     if modules.contains_key(&name) {
         return err(SyscallError::EEXIST);
     }
-    modules.insert(
-        name.clone(),
-        LoadedModule {
-            name,
-            size: image.len(),
-            deps,
-        },
-    );
+    modules.insert(name.clone(), LoadedModule {
+        name,
+        size: image.len(),
+        deps,
+    });
     0
 }
 

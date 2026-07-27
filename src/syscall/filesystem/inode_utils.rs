@@ -74,17 +74,14 @@ pub(crate) fn set_inode_times(ino: u64, times: InodeTimes) {
 
 pub(crate) fn set_inode_all_times_now(inode: &Arc<ext4_fs::Inode>) {
     let (sec, nsec) = current_timespec();
-    set_inode_times(
-        inode.inode_num() as u64,
-        InodeTimes {
-            atime_sec: sec,
-            atime_nsec: nsec,
-            mtime_sec: sec,
-            mtime_nsec: nsec,
-            ctime_sec: sec,
-            ctime_nsec: nsec,
-        },
-    );
+    set_inode_times(inode.inode_num() as u64, InodeTimes {
+        atime_sec: sec,
+        atime_nsec: nsec,
+        mtime_sec: sec,
+        mtime_nsec: nsec,
+        ctime_sec: sec,
+        ctime_nsec: nsec,
+    });
 }
 
 pub(crate) fn touch_inode_mtime_ctime_now(inode: &Arc<ext4_fs::Inode>) {
