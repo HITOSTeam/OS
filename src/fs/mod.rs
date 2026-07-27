@@ -841,10 +841,12 @@ pub(crate) use fanotify::{
 pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
     ExecInodeReservation, clear_ext4_path_cache, debug_track_iozone_inode, ext4_lock,
-    ext4_path_cache_lookup, find_path_in_roots, inode_path_hint, inode_path_in_roots,
+    ext4_path_cache_lookup, find_path_in_roots, inode_identity_path_in_roots, inode_path_hint,
+    inode_path_in_roots,
     invalidate_ext4_path_cache, invalidate_ext4_path_cache_inode,
     invalidate_ext4_path_cache_subtree, is_inode_currently_executed, note_ext4_path_cache,
-    inode_path_hint_by_identity, note_inode_path_hint, path_resolves_to_inode,
+    inode_path_hint_by_identity, note_inode_path_hint, note_process_exec_path, path_resolves_to_inode,
+    process_exec_path,
     register_deferred_unlink_cleanup,
     register_executing_inode, resolve_final_symlink_abs_path,
     resolve_final_symlink_abs_path_locked, root_inode_for_path, secondary_root_inode,

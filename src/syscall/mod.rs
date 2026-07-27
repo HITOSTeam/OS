@@ -179,6 +179,7 @@ const SYSCALL_LREMOVEXATTR: usize = 15;
 const SYSCALL_FREMOVEXATTR: usize = 16;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_FCNTL: usize = 25;
+const SYSCALL_FLOCK: usize = 32;
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_RENAMEAT: usize = 38;
@@ -585,6 +586,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
     let ret = match id {
         SYSCALL_GETCWD => filesystem::syscall_getcwd(args[0], args[1]),
         SYSCALL_FCNTL => filesystem::syscall_fcntl(args[0], args[1], args[2]),
+        SYSCALL_FLOCK => filesystem::syscall_flock(args[0], args[1]),
         SYSCALL_DUP => filesystem::syscall_dup(args[0]),
         SYSCALL_DUP3 => filesystem::syscall_dup3(args[0], args[1], args[2]),
         SYSCALL_IOCTL => misc::syscall_ioctl(args[0], args[1], args[2]),

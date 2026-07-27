@@ -37,6 +37,14 @@ pub(crate) struct RecordLock {
     pub(crate) end: Option<i64>,
 }
 
+/// `flock(2)` 安装的建议锁。
+/// Linux 规定它与 POSIX `fcntl(F_SETLK)` 记录锁互不影响，因此单独维护表。
+#[derive(Clone, Copy)]
+pub(crate) struct FlockLock {
+    pub(crate) owner: usize,
+    pub(crate) exclusive: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RecordLockOwner {
     Process(usize),
@@ -60,6 +68,8 @@ pub(crate) struct FileLease {
 
 lazy_static! {
     pub(crate) static ref RECORD_LOCKS: Mutex<BTreeMap<FileLockKey, Vec<RecordLock>>> =
+        Mutex::new(BTreeMap::new());
+    pub(crate) static ref FLOCK_LOCKS: Mutex<BTreeMap<FileLockKey, Vec<FlockLock>>> =
         Mutex::new(BTreeMap::new());
     pub(crate) static ref RECORD_LOCK_WAITERS: Mutex<BTreeMap<FileLockKey, VecDeque<Arc<TaskControlBlock>>>> =
         Mutex::new(BTreeMap::new());

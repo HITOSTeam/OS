@@ -154,8 +154,22 @@ impl MemorySet {
         }
 
         // 刷新 TLB，使新 PTE 立即生效。
+        //
+        // 这里不能只刷新当前 hart：fork 之后，父进程的多个线程可能在不同
+        // hart 上共享同一份页表。某个线程处理 COW fault 时，其他 hart 若仍
+        // 缓存旧的只读+COW PTE，会在随后写入时再次陷入，甚至观察到已经被
+        // 回收的旧映射。fork 时对父页表降权已经做了远程 shootdown；COW remap
+        // 同样必须保持这个 TLB 一致性不变量。
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         self.flush_user_page(fault_va);
+        #[cfg(target_arch = "riscv64")]
+        {
+            let remote_hart_mask = crate::task::manager::online_hart_mask()
+                & !(1usize << crate::arch::hart_id());
+            if remote_hart_mask != 0 {
+                crate::sbi::remote_sfence_vma_all(remote_hart_mask);
+            }
+        }
         true
     }
 

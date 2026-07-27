@@ -94,6 +94,10 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
     static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> =
         Mutex::new(BTreeMap::new());
+    // 另一 hart 短暂持有进程控制块锁时，`/proc/<pid>/exe` 仍必须可用。
+    // 独立保存最近一次成功 exec 的路径，供 procfs 快速读取，避免依赖 PCB 锁。
+    static ref PROCESS_EXEC_PATHS: Mutex<BTreeMap<usize, String>> =
+        Mutex::new(BTreeMap::new());
     static ref EXT4_PATH_CACHE: Mutex<BTreeMap<String, Vec<Ext4PathCacheEntry>>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_TEXT_ACCESS: Mutex<BTreeMap<(usize, u32), InodeTextAccess>> =
@@ -391,6 +395,16 @@ pub(crate) fn inode_path_hint_by_identity(device_id: usize, inode_num: u32) -> O
         .cloned()
 }
 
+/// 记录一次成功 `execve` 安装的绝对路径。
+pub(crate) fn note_process_exec_path(pid: usize, path: &str) {
+    PROCESS_EXEC_PATHS.lock().insert(pid, String::from(path));
+}
+
+/// 返回不依赖进程控制块锁的 `/proc/<pid>/exe` procfs 快速路径。
+pub(crate) fn process_exec_path(pid: usize) -> Option<String> {
+    PROCESS_EXEC_PATHS.lock().get(&pid).cloned()
+}
+
 fn normalize_inode_abs_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
     let absolute = path.starts_with('/');
@@ -482,9 +496,11 @@ fn find_inode_path_in_subtree(
     None
 }
 
-pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
-    let target_dev = target.device_id();
-    let target_ino = target.inode_num();
+/// Resolve an ext4 inode identity to its absolute path on either root disk.
+/// This is intentionally independent of the fast path-hint cache: procfs
+/// magic links must remain usable after an exec path was reached through a
+/// symlink or fallback root lookup.
+pub(crate) fn inode_identity_path_in_roots(target_dev: usize, target_ino: u32) -> Option<String> {
     let _guard = ext4_lock();
 
     let primary = root_inode_for_path("/");
@@ -500,6 +516,10 @@ pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
         return Some(String::from("/"));
     }
     find_inode_path_in_subtree(&secondary, "/", target_dev, target_ino, 64)
+}
+
+pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
+    inode_identity_path_in_roots(target.device_id(), target.inode_num())
 }
 
 pub(crate) fn path_resolves_to_inode(path: &str, target: &Arc<Inode>) -> bool {
@@ -1316,7 +1336,8 @@ pub(crate) fn find_path_in_roots(path: &str) -> Option<Arc<Inode>> {
     }
     SECONDARY_ROOT_INODE.as_ref()?.find_path(path)
 }
-// 优先选择包含完整启动程序的磁盘，不能仅因无关测试镜像中也有 /user 目录就选错磁盘。
+// 主根盘以 /home 作为 rootfs 标记。两块盘都具备该目录时，保持 QEMU 的第一块盘
+// (disk0) 为主根；这使自制完整 rootfs 不会被附加的官方测试盘反向覆盖。
 struct RootSelection {
     primary_root: Arc<Inode>,
     secondary_root: Option<Arc<Inode>>,
@@ -1334,13 +1355,13 @@ impl RootSelection {
     ) -> Self {
         // Avoid taking ext4_lock() here; this may run during lazy_static initialization
         // while a caller already holds the lock.
-        let has_init0 = root0.find_path("/user/init_proc.bin").is_some();
-        let has_init1 = root1
+        let has_home0 = root0.find_path("/home").is_some();
+        let has_home1 = root1
             .as_ref()
-            .map(|root| root.find_path("/user/init_proc.bin").is_some())
+            .map(|root| root.find_path("/home").is_some())
             .unwrap_or(false);
 
-        if root1.is_some() && !has_init0 && has_init1 {
+        if root1.is_some() && !has_home0 && has_home1 {
             RootSelection {
                 primary_root: root1.as_ref().unwrap().clone(),
                 secondary_root: Some(root0.clone()),

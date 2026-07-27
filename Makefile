@@ -19,8 +19,10 @@
 #   SUBMIT         0|1, pass `--features submit`    [0]
 #   EXT4_REBUILD   0|1, force rebuild of fs.ext4    [0]
 #   EXT4_SIZE      packer size (e.g. 1G, 4G)        [1G]
-#   EVAL_MINIMAL_ROOT 0|1, omit the legacy base rootfs when an
-#                  official full rootfs is attached as DISK_IMG [0]
+#   ROOTFS_MODE    patched|eval [patched]
+#                  patched: legacy base image plus common/arch overlays
+#                  eval: minimal bootstrap disk for the two evaluation scripts
+#   EVAL_MINIMAL_ROOT 0|1, deprecated alias for ROOTFS_MODE=eval [0]
 #   DISK_IMG       extra "test-card" image path     [sdcard-<arch>.img]
 #   QEMU_TIMEOUT   seconds, 0 disables `timeout`    [0]
 # ======================================================================
@@ -80,16 +82,24 @@ QEMU_TIMEOUT ?= 0
 SUBMIT       ?= 0
 EXT4_REBUILD ?= 0
 EXT4_SIZE    ?= 1G
+ROOTFS_MODE  ?= patched
 
-# 这个标志位先手动设置，群里老师说后续自己主动检测
+# Backward compatibility for existing invocation scripts.
 EVAL_MINIMAL_ROOT ?= 0
+ifeq ($(EVAL_MINIMAL_ROOT),1)
+    override ROOTFS_MODE := eval
+endif
+
+ifneq ($(filter $(ROOTFS_MODE),patched eval),$(ROOTFS_MODE))
+    $(error Unsupported ROOTFS_MODE=$(ROOTFS_MODE); use patched or eval)
+endif
 
 # BuildStorm/cagent images provide a mutually compatible /bin, /lib, /usr,
-# Rust toolchain and workload tree.  Seeding disk0 from the legacy base image
-# would let its older ld-linux shadow disk1 while libc comes from disk1.  In
-# evaluation mode disk0 therefore contains only /user plus the overlays and
-# the root-level test scripts.
-ifeq ($(EVAL_MINIMAL_ROOT),1)
+# Rust toolchain and workload tree.  In evaluation mode disk0 must not contain
+# any normal rootfs overlay: those overlays include target libc/loader files
+# and would mix with the official image's glibc.  The packer allow-lists only
+# /user/init_proc.bin, /user/0final_init.bin and the two test scripts.
+ifeq ($(ROOTFS_MODE),eval)
     override EXT4_BASE_IMG :=
     override EXT4_BASE_TAR :=
     override EXT4_BASE_TAR_XZ :=
@@ -104,8 +114,14 @@ endif
 # Override on the command line if cross-building from an unusual host.
 HOST_TRIPLE  ?= $(shell rustc -vV | sed -n 's/^host: //p')
 
-# Forward `--features submit` to user apps when SUBMIT=1.
-USER_FEATURES := $(if $(filter 1,$(SUBMIT)),--features submit,)
+# The evaluation bootstrap must enter 0final_init directly.  Its init_proc
+# selects that path through the user crate's `submit` feature; make the mode
+# self-contained instead of relying on callers to remember SUBMIT=1.
+ifeq ($(ROOTFS_MODE),eval)
+    USER_FEATURES := --features submit
+else
+    USER_FEATURES := $(if $(filter 1,$(SUBMIT)),--features submit,)
+endif
 
 # ----------------------------------------------------------------------
 # Derived paths
@@ -125,6 +141,14 @@ ifneq ($(strip $(EXT4_BASE_IMG)),)
 else
     EXT4_BASE_ARG :=
     EXT4_BASE_DEP :=
+endif
+
+# Normal images receive the common and architecture-specific overlays.  The
+# evaluation bootstrap disk uses the packer's strict allow-list instead, so no
+# /lib, /usr/lib, loader or helper binary can shadow the official rootfs.
+EXT4_OVERLAY_ARGS := -e extra --arch-extra extra-$(ARCH)
+ifeq ($(ROOTFS_MODE),eval)
+    EXT4_OVERLAY_ARGS := -e extra --minimal-eval-root
 endif
 
 # ----------------------------------------------------------------------
@@ -155,7 +179,7 @@ endif
 # ----------------------------------------------------------------------
 # Phony target bookkeeping
 # ----------------------------------------------------------------------
-.PHONY: all run run_ext4 debug debug_ext4 client_gdb clean help \
+.PHONY: all run run_ext4 run_patched run_eval debug debug_ext4 client_gdb clean help \
         prepare-cargo kernel user_apps ext4_img ext4_base_img \
         KERNEL USER_APPS
 
@@ -240,7 +264,7 @@ ext4_img: user_apps $(EXT4_BASE_DEP)
 	else \
 		echo "🔧 Building ext4 filesystem image..."; \
 		cd ../ext4-fs-packer && CARGO_BUILD_TARGET=$(HOST_TRIPLE) cargo run --release -- \
-			-u ../os/$(APP_DIR) -e extra --arch-extra extra-$(ARCH) $(EXT4_BASE_ARG) \
+			-u ../os/$(APP_DIR) $(EXT4_OVERLAY_ARGS) $(EXT4_BASE_ARG) \
 			-t target -S $(EXT4_SIZE); \
 		echo "✅ Ext4 image created: $(EXT4_IMG)"; \
 	fi
@@ -274,6 +298,16 @@ run run_ext4: kernel ext4_img
 	$(QEMU_RUN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) \
 	    $(QEMU_DISK0_ARGS) $(QEMU_NET_ARGS) $(QEMU_DISK1_ARGS)
 
+# Explicit rootfs-mode entry points.  `run_patched` is the historical full
+# patched disk.  `run_eval` builds the strict four-file bootstrap disk and
+# uses the official final image supplied through EVAL_DISK_IMG.
+EVAL_DISK_IMG ?= /images_host/final_img/sdcard-rv-pub.img
+run_patched:
+	@$(MAKE) run_ext4 ROOTFS_MODE=patched
+
+run_eval:
+	@$(MAKE) run_ext4 ROOTFS_MODE=eval SUBMIT=1 DISK_IMG=$(EVAL_DISK_IMG)
+
 # QEMU halts at reset and listens for a GDB client on :1234. The
 # `timeout` wrapper is intentionally not applied here so GDB sessions
 # are not killed mid-debug.
@@ -301,6 +335,8 @@ clean:
 help:
 	@echo "CongCore kernel Makefile – common targets:"
 	@echo "  make run_ext4    build + run kernel in QEMU with ext4 disk (default)"
+	@echo "  make run_patched build/run the legacy full patched filesystem disk"
+	@echo "  make run_eval    build/run the minimal BuildStorm/cagent bootstrap disk"
 	@echo "  make debug       start QEMU halted, waiting for GDB on :1234"
 	@echo "  make client_gdb  connect the bundled GDB client to a running debug"
 	@echo "  make clean       wipe kernel, user apps and cached artefacts"

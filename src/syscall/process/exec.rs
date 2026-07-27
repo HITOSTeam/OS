@@ -1,5 +1,5 @@
 use super::*;
-use crate::fs::note_inode_path_hint;
+use crate::fs::{inode_identity_path_in_roots, note_inode_path_hint, note_process_exec_path};
 use alloc::sync::Arc;
 
 struct LoadedExecImage {
@@ -954,6 +954,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
     // 将执行路径与 inode 关联，使 exec 替换 argv/进程状态后 procfs 仍能通过
     // /proc/<pid>/exe 暴露该路径。
     note_inode_path_hint(&inode, &exec_path_hint);
+    note_process_exec_path(current_process().getpid(), &exec_path_hint);
     let exec_reservation =
         match crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num()) {
             Ok(reservation) => reservation,
@@ -999,6 +1000,12 @@ pub fn syscall_execveat(
     }
     if let Some(abs) = exec_path_hint.as_deref() {
         note_inode_path_hint(&inode, abs);
+        note_process_exec_path(current_process().getpid(), abs);
+    } else if let Some(abs) = inode_identity_path_in_roots(inode.device_id(), inode.inode_num()) {
+        // 部分 Rust/Cargo 启动路径使用 `execveat(AT_EMPTY_PATH)`，它没有路径参数。
+        // 按 inode 身份反查真实路径，避免把递归的 `/proc/self/fd/...` 写成 exe 目标。
+        note_inode_path_hint(&inode, &abs);
+        note_process_exec_path(current_process().getpid(), &abs);
     }
     let exec_reservation =
         match crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num()) {

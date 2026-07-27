@@ -1245,9 +1245,65 @@ pub(crate) fn resolve_parent_and_name(
                 p.push_str(parent_path);
                 p
             };
-            let parent =
-                resolve_ext4_abs_path(&parent_abs, uid, gid, true, &mut depth, &mut seen_symlinks)?;
-            Ok((parent, alloc::string::String::from(name)))
+            // For a union of the bootstrap disk and the official rootfs, the
+            // parent directory alone is insufficient to select the writable
+            // device.  Example: disk0 supplies an empty `/tmp`, while an old
+            // `/tmp/minibuild` exists on disk1.  `unlinkat` must operate on
+            // disk1's parent, otherwise `rm -rf` reports success for disk0
+            // but the fallback lookup still exposes disk1's child.
+            //
+            // Prefer an existing child on disk0; otherwise, if disk1 has that
+            // child, return disk1's matching parent.  New names still use
+            // disk0, which is the writable overlay policy.
+            let name = alloc::string::String::from(name);
+            let primary_root = crate::fs::root_inode_for_path(abs);
+            let primary_parent = match resolve_ext4_path(
+                primary_root,
+                &parent_abs,
+                uid,
+                gid,
+                true,
+                &mut depth,
+                &mut seen_symlinks,
+            ) {
+                Ok(parent) => parent,
+                Err(e) if e == err(SyscallError::ENOENT) => {
+                    let secondary = secondary_root_inode().ok_or(e)?;
+                    let mut secondary_depth = 0usize;
+                    let mut secondary_seen = Vec::new();
+                    let parent = resolve_ext4_path(
+                        secondary,
+                        &parent_abs,
+                        uid,
+                        gid,
+                        true,
+                        &mut secondary_depth,
+                        &mut secondary_seen,
+                    )?;
+                    return Ok((parent, name));
+                }
+                Err(e) => return Err(e),
+            };
+            if primary_parent.find(&name).is_some() {
+                return Ok((primary_parent, name));
+            }
+            if let Some(secondary) = secondary_root_inode() {
+                let mut secondary_depth = 0usize;
+                let mut secondary_seen = Vec::new();
+                if let Ok(secondary_parent) = resolve_ext4_path(
+                    secondary,
+                    &parent_abs,
+                    uid,
+                    gid,
+                    true,
+                    &mut secondary_depth,
+                    &mut secondary_seen,
+                ) && secondary_parent.find(&name).is_some()
+                {
+                    return Ok((secondary_parent, name));
+                }
+            }
+            Ok((primary_parent, name))
         }
         AtPath::Ext4Rel { base, rel, .. } => {
             if rel.is_empty() {

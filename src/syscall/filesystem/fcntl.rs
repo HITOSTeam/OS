@@ -1,6 +1,6 @@
 use super::{
     Arc, FD_CLOEXEC, FcntlFlock, FcntlOwnerEx, File, O_APPEND, O_ASYNC, O_DIRECT, O_NONBLOCK,
-    O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe, PseudoShmFile, RECORD_LOCKS,
+    FLOCK_LOCKS, FlockLock, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe, PseudoShmFile, RECORD_LOCKS,
     RecordLockOwner, SyscallError, Vec, WaitingRecordLock, apply_record_lock_for_owner,
     block_current_and_run_next, clear_record_lock_waiting, collect_conflict_process_owners,
     current_files, current_files_and_nofile_limit, current_process, current_task,
@@ -16,6 +16,55 @@ fn get_fcntl_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
         .lock()
         .get_file(fd)
         .ok_or(err(SyscallError::EBADF))
+}
+
+/// 实现 Rust 增量编译所使用的 Linux `flock(2)` ABI。
+///
+/// 它与 POSIX 记录锁（`fcntl(F_SETLK)`）刻意隔离：Linux 规定两套建议锁
+/// 命名空间不互相影响；锁的所有者为 open-file description，符合 `dup`/`fork` 语义。
+pub fn syscall_flock(fd: usize, operation: usize) -> isize {
+    const LOCK_SH: usize = 1;
+    const LOCK_EX: usize = 2;
+    const LOCK_NB: usize = 4;
+    const LOCK_UN: usize = 8;
+
+    if operation & !(LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN) != 0
+        || (operation & LOCK_UN != 0 && operation & (LOCK_SH | LOCK_EX) != 0)
+        || (operation & (LOCK_SH | LOCK_EX) == (LOCK_SH | LOCK_EX))
+    {
+        return err(SyscallError::EINVAL);
+    }
+    let file = match get_fcntl_file(fd) {
+        Ok(file) => file,
+        Err(e) => return e,
+    };
+    let Some(key) = file_lock_key(&file) else {
+        return err(SyscallError::EINVAL);
+    };
+    let owner = ofd_lock_owner_id(&file);
+    let mut table = FLOCK_LOCKS.lock();
+    let locks = table.entry(key).or_insert_with(Vec::new);
+
+    if operation & LOCK_UN != 0 {
+        locks.retain(|lock| lock.owner != owner);
+        if locks.is_empty() {
+            table.remove(&key);
+        }
+        return 0;
+    }
+
+    let exclusive = operation & LOCK_EX != 0;
+    let conflict = locks.iter().any(|lock| {
+        lock.owner != owner && (exclusive || lock.exclusive)
+    });
+    if conflict {
+        // 当前工作负载使用非阻塞形式。对阻塞冲突先返回 EAGAIN，避免在尚未具备
+        // 完整等待队列时错误睡眠；后续可在本所有权模型上补充阻塞等待。
+        return err(SyscallError::EAGAIN);
+    }
+    locks.retain(|lock| lock.owner != owner);
+    locks.push(FlockLock { owner, exclusive });
+    0
 }
 
 /// Handles descriptor flags, record locks, leases, and async-owner state for `fcntl(2)`.

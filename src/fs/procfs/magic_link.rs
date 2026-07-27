@@ -7,8 +7,9 @@ use alloc::vec::Vec;
 
 use crate::fs::{
     File, NamespaceFile, NamespaceKind, NetSocketFile, OSInode, Pipe, PseudoDir, PseudoFile,
-    PseudoKindTag, PseudoShmFile, RtcFile, inode_logical_path, inode_path_hint,
-    inode_path_hint_by_identity, inode_path_in_roots, path_resolves_to_inode,
+    PseudoKindTag, PseudoShmFile, RtcFile, inode_identity_path_in_roots, inode_logical_path,
+    inode_path_hint, inode_path_hint_by_identity, inode_path_in_roots, path_resolves_to_inode,
+    process_exec_path,
 };
 use crate::task::manager::pid2process;
 use crate::task::processor::{current_process, current_task};
@@ -315,6 +316,11 @@ fn proc_pid_cwd(pid: u32) -> Option<String> {
 /// 记录 inode 到路径的提示信息。这足以实现兼容 Linux 的 `/proc/<pid>/exe`，并避免
 /// 在这里扫描大型测试根文件系统。
 fn proc_pid_exe(pid: u32) -> Option<String> {
+    // 不让 procfs 可用性依赖短暂的 PCB 锁竞争：多 hart 并发时 Cargo 启动会读取
+    // `/proc/self/exe`，此处必须避免因 try_lock 失败误判链接不存在。
+    if let Some(path) = process_exec_path(pid as usize) {
+        return Some(path);
+    }
     let proc = pid2process(pid as usize)?;
     let (device_id, inode_num) = {
         let inner = proc.try_borrow_mut()?;
@@ -325,6 +331,7 @@ fn proc_pid_exe(pid: u32) -> Option<String> {
         return None;
     }
     inode_path_hint_by_identity(device_id, inode_num)
+        .or_else(|| inode_identity_path_in_roots(device_id, inode_num))
 }
 
 /// 取目标进程 fd 表中指定 fd 的文件对象（克隆 `Arc`）。进程不存在或 fd 无效时返回 `None`。
