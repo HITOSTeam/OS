@@ -50,6 +50,12 @@ pub const SIGRETURN_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
 pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 #[cfg(target_arch = "loongarch64")]
 pub const KERNEL_STACK_TOP: usize = 0xffff_ffff_ffff_f000;
+#[cfg(target_arch = "riscv64")]
+pub const MAX_HARTS: usize = 8;
+// LoongArch secondary-core startup is a separate architecture concern and is
+// not enabled yet; retain its existing capacity until that path is implemented.
+// TODO: real support for multi-core
+#[cfg(target_arch = "loongarch64")]
 pub const MAX_HARTS: usize = 4;
 #[allow(dead_code)]
 pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;
@@ -115,8 +121,8 @@ pub fn phys_mem_end() -> usize {
 #[cfg(not(target_arch = "loongarch64"))]
 pub const MMIO: &[(usize, usize)] = &[
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
-    (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
-    (0x1000_2000, 0x00_1000), // Virtio Block (bus 1) in virt machine
+    // QEMU virt exposes eight ordered virtio-mmio transports.
+    (0x1000_1000, 0x00_8000),
 ];
 #[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
 const UART_MMIO_BASE: usize = 0x8000_0000_1fe2_0000;

@@ -29,7 +29,10 @@ mod trap;
 mod utils;
 
 #[cfg(target_arch = "riscv64")]
-global_asm!(include_str!("entry.asm"));
+global_asm!(
+    include_str!("entry.asm"),
+    max_harts = const config::MAX_HARTS,
+);
 #[cfg(target_arch = "loongarch64")]
 global_asm!(include_str!("entry_loongarch.S"));
 global_asm!(include_str!("link_app.asm"));
@@ -58,8 +61,22 @@ fn clear_bss() {
     }
 }
 
+// boot hart will run this
 #[cfg(target_arch = "riscv64")]
 fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
+    // spin loop until the hart start
+    fn wait_until_online(hart_id: usize) -> bool {
+        let started_at = arch::read_time();
+        let timeout_ticks = config::clock_freq();
+        while task::manager::online_hart_mask() & (1usize << hart_id) == 0 {
+            if arch::read_time().wrapping_sub(started_at) >= timeout_ticks {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        true
+    }
+
     // Mark the boot hart online immediately. Secondary harts become online only
     // after they finish their own trap/timer setup and are about to enter idle.
     task::manager::mark_hart_online(boot_hart_id);
@@ -67,7 +84,23 @@ fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
         if hart_id == boot_hart_id {
             continue;
         }
-        let _ = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
+        let error = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
+        if error != 0 {
+            println!(
+                "[kernel] failed to start hart {} via SBI HSM: error={}",
+                hart_id, error as isize
+            );
+            continue;
+        }
+        // Bring harts up one at a time.  This keeps early per-hart
+        // initialization deterministic and ensures userspace cannot observe a
+        // transiently incomplete online mask immediately after boot.
+        if !wait_until_online(hart_id) {
+            println!(
+                "[kernel] timed out waiting for hart {} to become online",
+                hart_id
+            );
+        }
     }
 }
 
