@@ -3,6 +3,7 @@ mod virtio_blk;
 pub use virtio_blk::VirtIOBlock;
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use ext4_fs::BlockDevice;
 use lazy_static::*;
 
@@ -10,16 +11,25 @@ use crate::println;
 
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 
-// sdcard.img on the block device and disk.img on the second part
+// VirtIO block devices in stable discovery order.
+//
+// QEMU attaches the first drive as `/dev/vda`, the second as `/dev/vdb`, and
+// so on. Keep the registry independent from filesystem roles: whether a
+// device is the system root, `/user`, or a test-data disk is decided by the
+// mount configuration rather than by the block driver.
 lazy_static! {
-    pub static ref BLOCK_DEVICE: Arc<dyn BlockDevice> = Arc::new(BlockDeviceImpl::new());
-    pub static ref USER_BLOCK_DEVICE: Option<Arc<dyn BlockDevice>> =
-        BlockDeviceImpl::try_new_second().map(|dev| Arc::new(dev) as Arc<dyn BlockDevice>);
+    pub static ref BLOCK_DEVICES: Vec<Arc<dyn BlockDevice>> = BlockDeviceImpl::probe_all()
+        .into_iter()
+        .map(|dev| Arc::new(dev) as Arc<dyn BlockDevice>)
+        .collect();
 }
 
 #[allow(unused)]
 pub fn block_device_test() {
-    let block_device = BLOCK_DEVICE.clone();
+    let block_device = BLOCK_DEVICES
+        .first()
+        .cloned()
+        .expect("VirtIO root block device not found");
     let mut write_buffer = [0u8; 512];
     let mut read_buffer = [0u8; 512];
     for i in 0..512 {

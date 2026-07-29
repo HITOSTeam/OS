@@ -21,8 +21,9 @@ mod virtio_mmio {
         println,
     };
 
-    const VIRTIO0: usize = 0x1000_1000;
-    const VIRTIO1: usize = 0x1000_2000;
+    const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+    const VIRTIO_MMIO_STRIDE: usize = 0x1000;
+    const VIRTIO_MMIO_SLOTS: usize = 8;
 
     pub struct VirtIOBlock(Mutex<VirtIOBlk<VirtioHal, MmioTransport>>);
 
@@ -71,14 +72,18 @@ mod virtio_mmio {
     impl VirtIOBlock {
         #[allow(unused)]
         pub fn new() -> Self {
-            Self::try_new_with_base(VIRTIO0).expect("VirtIO block device not found")
+            Self::try_new_with_base(VIRTIO_MMIO_BASE).expect("VirtIO block device not found")
         }
 
-        #[allow(unused)]
-        pub fn try_new_second() -> Option<Self> {
-            Self::try_new_with_base(VIRTIO1)
+        pub fn probe_all() -> Vec<Self> {
+            (0..VIRTIO_MMIO_SLOTS)
+                .filter_map(|index| {
+                    Self::try_new_with_base(VIRTIO_MMIO_BASE + index * VIRTIO_MMIO_STRIDE)
+                })
+                .collect()
         }
 
+        /// try to initalize a block device form the given address
         pub fn try_new_with_base(base: usize) -> Option<Self> {
             let header = NonNull::new(base as *mut VirtIOHeader)?;
             // SAFETY: base is the MMIO address from device tree or known constant;
@@ -563,8 +568,15 @@ mod virtio_pci {
             Self::try_new_with_index(0).expect("VirtIO block device not found")
         }
 
-        pub fn try_new_second() -> Option<Self> {
-            Self::try_new_with_index(1)
+        pub fn probe_all() -> Vec<Self> {
+            let mut devices = Vec::new();
+            for index in 0..26 {
+                let Some(device) = Self::try_new_with_index(index) else {
+                    break;
+                };
+                devices.push(device);
+            }
+            devices
         }
 
         fn try_new_with_index(index: usize) -> Option<Self> {
