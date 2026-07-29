@@ -295,7 +295,7 @@ impl TaskManager {
                 continue;
             }
             let status = candidate.borrow_mut().task_status;
-            if status == TaskStatus::Ready {
+            if status == TaskStatus::Ready && candidate.try_mark_on_cpu(hart_id) {
                 return Some(candidate);
             }
             if DEBUG_SCHED {
@@ -503,6 +503,11 @@ impl TaskManager {
             {
                 let mut inner = task.borrow_mut();
                 inner.fair_runtime_checkpoint_ns = inner.cpu_time_ns;
+            }
+            // 在仍持有本 hart 运行队列锁时声明 CPU 所有权，关闭任务出队
+            // 与调度器稍后设置 Running 状态之间的重复入队窗口。
+            if !task.try_mark_on_cpu(hart_id) {
+                continue;
             }
             return Some(task);
         }

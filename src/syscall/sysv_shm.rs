@@ -317,6 +317,11 @@ fn check_perm(
 }
 
 pub fn fork_inherit(attaches: &[ShmAttach]) {
+    // Starry/Linux 的普通编译进程通常没有 SysV SHM 映射。空快照不应获取
+    // 全局 SHM 管理器锁，否则多线程 fork 会无意义地进入跨子系统锁序。
+    if attaches.is_empty() {
+        return;
+    }
     let mut managers = SHM_MANAGERS.lock();
     for a in attaches {
         if !a.accounted {

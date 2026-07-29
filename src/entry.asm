@@ -1,11 +1,11 @@
 .section .text.entry
 .globl _start
 
-# RISC-V 评测需要 8 个 hart。每个早期启动栈为 64 KiB，且栈向下增长。
+# RISC-V 评测使用 12 个 hart。每个早期启动栈为 64 KiB，且栈向下增长。
 # `boot_stack_bottom - hart_id * BOOT_STACK_PER_HART` 必须始终落在
 # 本节预留范围内；此前仅预留一个 hart 的空间，次级 hart 会越界写入。
 .equ BOOT_STACK_PER_HART, 4096 * 16
-.equ BOOT_STACK_HARTS, 8
+.equ BOOT_STACK_HARTS, 12
 
 _start:
     # a0: hart id, a1: dtb / opaque

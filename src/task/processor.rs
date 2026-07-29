@@ -346,8 +346,7 @@ fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
             );
         }
     }
-    // Detach the kernel stack now, but free it only after switching to idle.
-    // This keeps stack reclamation independent from lingering task Arc refs.
+    // 先从任务取出内核栈，切换到 idle 栈后再释放，避免残留任务引用阻碍栈回收。
     let kstack = task.take_kstack();
     let mut processor = local_processor().lock();
     if let Some(kstack) = kstack {
@@ -545,6 +544,34 @@ fn cleanup_process_threads_for_group_exit(
         let cleanup = take_thread_exit_cleanup(member, exit_code);
         let drop_user_res = cleanup.is_linux_thread;
         let _ = finish_thread_exit_cleanup(process, cleanup, drop_user_res);
+    }
+    // 其他核心可能仍在该线程的系统调用路径中。上面清空 res 后，它会在
+    // trap_return 的统一检查点调用 exit_current_and_run_next。必须等它真正
+    // 离开 CPU，才能由调用方释放整个 mm；否则远端核心可能继续访问已经
+    // 替换的页表。这个等待对应 Linux de_thread/线程组退出的停机同步。
+    let mut kicked_mask = 0usize;
+    loop {
+        let mut running_mask = 0usize;
+        for member in &members {
+            if Arc::ptr_eq(member, current_task) {
+                continue;
+            }
+            let running_hart = member.on_cpu.load(core::sync::atomic::Ordering::Acquire);
+            if running_hart < MAX_HARTS {
+                running_mask |= 1usize << running_hart;
+            }
+        }
+        if running_mask == 0 {
+            break;
+        }
+        let new_kicks = running_mask & !kicked_mask;
+        for hart in 0..MAX_HARTS {
+            if (new_kicks & (1usize << hart)) != 0 {
+                arch::send_ipi(hart);
+            }
+        }
+        kicked_mask |= new_kicks;
+        core::hint::spin_loop();
     }
     for member in members {
         let mut member_inner = member.borrow_mut();
@@ -994,6 +1021,15 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     crate::mm::activate_kernel_space();
     let mut processor = local_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_ptr();
+    let idle_ra = unsafe { (*idle_task_cx_ptr).ra };
+    let idle_sp = unsafe { (*idle_task_cx_ptr).sp };
+    assert!(
+        idle_ra != 0 && idle_sp != 0,
+        "hart {} attempted to return to an uninitialized idle context: ra={:#x} sp={:#x}",
+        hart_id(),
+        idle_ra,
+        idle_sp
+    );
     drop(processor);
     // SAFETY: both task contexts are valid kernel stack pointers owned by their respective tasks;
     // switched_task_cx_ptr is the current task's context, idle_task_cx_ptr is the idle context.
@@ -1369,6 +1405,14 @@ pub fn idle_task() {
             start_task_runtime_slice(&task, now_ns);
             let mut task_inner = task.borrow_mut();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
+            assert!(
+                task_inner.task_cx.ra != 0 && task_inner.task_cx.sp != 0,
+                "hart {} fetched an invalid task context: ra={:#x} sp={:#x} status={:?}",
+                hart_id(),
+                task_inner.task_cx.ra,
+                task_inner.task_cx.sp,
+                task_inner.task_status
+            );
             // 首次调度日志。
             if IDLE_FIRST_SWITCH_LOG.swap(false, Ordering::SeqCst) {
                 let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
@@ -1399,7 +1443,6 @@ pub fn idle_task() {
             }
             // 同步 trap context 中的 kernel_tp（hart id），适配跨核迁移。
             task_inner.get_trap_cx().kernel_tp = hart_id();
-            task.mark_on_cpu(hart_id());
             task_inner.task_status = TaskStatus::Running;
 
             drop(task_inner);
@@ -1584,8 +1627,8 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // 标记线程状态,
     let task = take_current_task().unwrap();
     charge_task_runtime_for_scheduler(&task);
-    // This task will never be scheduled again; ensure it is considered off CPU.
-    task.clear_on_cpu();
+    // 上下文切换到本 hart 的 idle 栈之前保持 `on_cpu`。如果在这里提前清除，
+    // 并发唤醒可能在退出路径仍使用该任务内核栈时重新入队并运行它。
     let Some(process) = task.process.upgrade() else {
         if DEBUG_SCHED {
             log::warn!("[exit] task lost process; dropping task and scheduling idle");
@@ -1771,7 +1814,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     let task = take_current_task().unwrap();
     charge_task_runtime_for_scheduler(&task);
-    task.clear_on_cpu();
+    // 与普通退出路径相同，switch() 不再使用任务内核栈后，由 idle 设置 OFF_CPU。
     let Some(process) = task.process.upgrade() else {
         if DEBUG_SCHED {
             log::warn!("[exit_group] task lost process; dropping task and scheduling idle");

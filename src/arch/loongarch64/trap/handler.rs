@@ -122,12 +122,44 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             return;
         }
     }
+    let current = crate::task::processor::current_task();
+    let (pid, tid, task_ra, task_sp, on_cpu) = current
+        .as_ref()
+        .map(|task| {
+            let pid = task
+                .process
+                .upgrade()
+                .map(|process| process.getpid())
+                .unwrap_or(usize::MAX);
+            let inner = task.borrow_mut();
+            (
+                pid,
+                inner
+                    .res
+                    .as_ref()
+                    .map(|res| res.tid)
+                    .unwrap_or(usize::MAX),
+                inner.task_cx.ra,
+                inner.task_cx.sp,
+                task.on_cpu.load(Ordering::Acquire),
+            )
+        })
+        .unwrap_or((usize::MAX, usize::MAX, 0, 0, usize::MAX));
     panic!(
-        "Unhandled kernel trap: ecode={} badv={:#x} badi={:#x} era={:#x}",
+        "Unhandled kernel trap: hart={} ecode={} badv={:#x} badi={:#x} era={:#x} ra={:#x} sp={:#x} a0={:#x} pid={} tid={} task_ra={:#x} task_sp={:#x} on_cpu={}",
+        super::super::hart_id(),
         ecode,
         read_badv(),
         read_badi(),
-        trap_cx.sepc
+        trap_cx.sepc,
+        trap_cx.x[super::super::REG_RA],
+        trap_cx.x[super::super::REG_SP],
+        trap_cx.x[4],
+        pid,
+        tid,
+        task_ra,
+        task_sp,
+        on_cpu,
     );
 }
 

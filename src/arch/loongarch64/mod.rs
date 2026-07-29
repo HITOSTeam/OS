@@ -41,6 +41,16 @@ const EUEN_LSXEN: usize = 1 << 1;
 const EUEN_LASXEN: usize = 1 << 2;
 const EUEN_USER_FP_MASK: usize = EUEN_FPEN | EUEN_LSXEN | EUEN_LASXEN;
 
+// 龙芯/QEMU 次级核心启动协议：固件先暂停 AP，启动核把入口地址写入
+// 0 号邮箱并触发 IPI 动作位 0 后，AP 才开始执行。
+const IOCSR_MBUF_SEND: usize = 0x1048;
+const IOCSR_MBUF_SEND_BLOCKING: u64 = 1 << 31;
+const IOCSR_MBUF_SEND_BOX_SHIFT: usize = 2;
+const IOCSR_MBUF_SEND_CPU_SHIFT: usize = 16;
+const IOCSR_MBUF_SEND_BUF_SHIFT: usize = 32;
+const IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
+const IPI_ACTION_BOOT_CPU: u32 = 1 << 0;
+
 #[cfg(feature = "loongarch_board")]
 const UART_BASE: usize = 0x8000_0000_1fe2_0000;
 #[cfg(not(feature = "loongarch_board"))]
@@ -121,11 +131,10 @@ pub fn enable_interrupts() {
 }
 
 pub fn wait_for_interrupt() {
-    // 参考 loongArch64 架构支持库的 idle 封装：中断已在调度器中开启，
-    // 此处让空闲核休眠，避免 12 核 QEMU/TCG 持续忙等拖慢编译任务。
-    // SAFETY: 调度器只在当前 hart 已开启中断且没有可运行任务时调用本函数；
-    // `idle` 会在下一次中断到来后恢复执行。
-    unsafe { loongArch64::asm::idle() };
+    // Linux 的 LoongArch 空闲路径使用 level 0。不要调用第三方封装中的
+    // `idle 1`，该封装自身也注明尚不清楚 level 的含义。
+    // 安全性：调度器只会在本 hart 已开中断且没有可运行任务时进入这里。
+    unsafe { asm!("idle 0", options(nostack)) };
 }
 
 pub fn disable_direct_map_windows() {
@@ -171,6 +180,29 @@ fn iocsr_read32(reg: usize) -> u32 {
     value
 }
 
+#[inline(always)]
+fn iocsr_write64(reg: usize, value: u64) {
+    // 安全性：IOCSR 写入是特权操作，本函数只访问架构规定的龙芯邮箱寄存器。
+    unsafe {
+        asm!("iocsrwr.d {}, {}", in(reg) value, in(reg) reg, options(nostack));
+    }
+}
+
+fn mail_send(data: u64, hart_id: usize, mailbox: usize) {
+    // 邮箱每次传输 32 位数据；Linux/龙芯固件也使用这一协议发布 AP 入口地址。
+    let common = IOCSR_MBUF_SEND_BLOCKING | ((hart_id as u64) << IOCSR_MBUF_SEND_CPU_SHIFT);
+    let high_box = ((mailbox << 1) + 1) << IOCSR_MBUF_SEND_BOX_SHIFT;
+    let low_box = (mailbox << 1) << IOCSR_MBUF_SEND_BOX_SHIFT;
+    iocsr_write64(
+        IOCSR_MBUF_SEND,
+        common | high_box as u64 | (data & IOCSR_MBUF_SEND_H32_MASK),
+    );
+    iocsr_write64(
+        IOCSR_MBUF_SEND,
+        common | low_box as u64 | (data << IOCSR_MBUF_SEND_BUF_SHIFT),
+    );
+}
+
 pub fn send_ipi(hart_id: usize) {
     // We only need Linux's reschedule action for now: it breaks a remote hart
     // out of user/kernel execution so pending scheduler work is observed.
@@ -199,8 +231,13 @@ pub fn clear_ipi_interrupt() -> u32 {
     action
 }
 
-pub fn hart_start(_hart_id: usize, _start_addr: usize, _opaque: usize) -> usize {
-    1
+pub fn hart_start(hart_id: usize, start_addr: usize, _opaque: usize) -> usize {
+    mail_send(start_addr as u64, hart_id, 0);
+    let value = (IOCSR_IPI_SEND_BLOCKING as u32)
+        | IPI_ACTION_BOOT_CPU
+        | ((hart_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT);
+    iocsr_write32(IOCSR_IPI_SEND, value);
+    0
 }
 
 pub fn shutdown() -> ! {

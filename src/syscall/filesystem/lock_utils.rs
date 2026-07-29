@@ -99,6 +99,18 @@ pub(crate) fn ofd_lock_owner_id(file: &Arc<dyn File + Send + Sync>) -> usize {
     Arc::as_ptr(file) as *const () as usize
 }
 
+/// 当 open-file-description 最后一个引用析构时释放其 `flock(2)` 锁。
+///
+/// owner 是底层 `File` 对象的地址，因此 `dup` 和 `fork` 共享同一个 owner；
+/// 只有该对象真正析构后才清锁，不会被其中一个描述符提前释放。
+pub(crate) fn release_flock_locks_for_owner(owner: usize) {
+    let mut table = FLOCK_LOCKS.lock();
+    table.retain(|_, locks| {
+        locks.retain(|lock| lock.owner != owner);
+        !locks.is_empty()
+    });
+}
+
 /// Treats `None` as an unbounded range end for comparisons.
 pub(crate) fn range_end_i128(end: Option<i64>) -> i128 {
     end.map(|v| v as i128).unwrap_or(i128::MAX)

@@ -358,6 +358,18 @@ pub fn syscall_futex(
             let key = futex_key(pid, token, uaddr, _private);
             let in_queue = Arc::new(AtomicBool::new(true));
             let mut map = FUTEX_QUEUES.lock();
+            // 第一次读值到取得等待队列锁之间，另一个核心可能已经改值并执行
+            // FUTEX_WAKE。若不在锁内复查，wake 会先看到空队列，而本线程随后
+            // 按旧值入睡，造成永久丢失唤醒。这里与 wake 共用同一把队列锁，
+            // 建立“复查条件并入队”相对于唤醒方的原子顺序。
+            let cur_after_lock = read_user_value(token, uaddr as *const i32);
+            if cur_after_lock != val as i32 {
+                return if pending_unmasked_signal() {
+                    err(SyscallError::EINTR)
+                } else {
+                    err(SyscallError::EAGAIN)
+                };
+            }
             let queue_len_before = map.get(&key).map(VecDeque::len).unwrap_or(0);
             if crate::debug_config::DEBUG_PTHREAD {
                 let (tid, pending_sig, mask) = {

@@ -93,13 +93,20 @@ impl TaskControlBlock {
         self.cpu_id.load(Ordering::Acquire)
     }
 
-    pub fn mark_on_cpu(&self, hart_id: usize) {
+    /// 在任务离开运行队列时原子声明 CPU 所有权。
+    ///
+    /// 必须在任务仍受运行队列锁保护时完成；否则另一核可能在“已经出队、
+    /// 尚未标记运行”的窗口中再次入队同一任务，最终并发使用同一内核栈。
+    pub fn try_mark_on_cpu(&self, hart_id: usize) -> bool {
         self.cpu_id.store(hart_id, Ordering::Release);
-        self.on_cpu.store(hart_id, Ordering::Release);
-        // 一旦已经运行，就不应再保留待处理唤醒。
-        self.wakeup_pending.store(false, Ordering::Release);
-        self.wakeup_sync_hart
-            .store(Self::OFF_CPU, Ordering::Release);
+        self.on_cpu
+            .compare_exchange(
+                Self::OFF_CPU,
+                hart_id,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub fn clear_on_cpu(&self) {

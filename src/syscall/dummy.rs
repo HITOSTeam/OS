@@ -322,7 +322,16 @@ pub fn syscall_userfaultfd(flags: usize) -> isize {
 }
 
 pub fn try_handle_userfaultfd_page_fault(addr: usize, is_write: bool) -> bool {
-    let files = current_files().lock().iter_files_snapshot();
+    // 页故障可能发生在持有 fd 表锁的 syscall/uaccess 内，不能在 trap 路径再次
+    // 阻塞获取同一把锁，否则当前任务会递归等待自己，其他 hart 也会一起堵塞。
+    // userfaultfd 只是普通 fault 处理前的可选快路径；拿不到快照时先交给正常的
+    // lazy/COW fault 路径，避免把整个地址空间的进度依赖在 fd 表锁上。
+    let files_ref = current_files();
+    let Some(files_guard) = files_ref.try_lock() else {
+        return false;
+    };
+    let files = files_guard.iter_files_snapshot();
+    drop(files_guard);
     for (_fd, file) in files {
         let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() else {
             continue;

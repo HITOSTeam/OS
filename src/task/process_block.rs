@@ -1304,8 +1304,9 @@ impl ProcessControlBlock {
                 *slot = None;
             }
         }
-        for task in to_cleanup {
-            remove_inactive_task(task.clone());
+        let mut deferred_cleanup = Vec::new();
+        for task in &to_cleanup {
+            remove_inactive_task(Arc::clone(task));
             let (res, join_waiters) = {
                 let mut inner = task.borrow_mut();
                 inner.exit_code = Some(0);
@@ -1313,6 +1314,36 @@ impl ProcessControlBlock {
                 let join_waiters = inner.join_waiters.drain(..).collect::<Vec<_>>();
                 (res, join_waiters)
             };
+            deferred_cleanup.push((res, join_waiters));
+        }
+
+        // exec 对应 Linux/StarryOS 的 de_thread：只有其他线程真正离开各自
+        // CPU 后，当前线程才能替换共享 mm。清空 res 会让远端线程在
+        // trap_return 检查点退出；每个仍运行的 hart 只发送一次 IPI，避免
+        // IPI 风暴反而阻塞 OpenSBI/中断处理。
+        let mut kicked_mask = 0usize;
+        loop {
+            let mut running_mask = 0usize;
+            for task in &to_cleanup {
+                let running_hart = task.on_cpu.load(Ordering::Acquire);
+                if running_hart < MAX_HARTS {
+                    running_mask |= 1usize << running_hart;
+                }
+            }
+            if running_mask == 0 {
+                break;
+            }
+            let new_kicks = running_mask & !kicked_mask;
+            for hart in 0..MAX_HARTS {
+                if (new_kicks & (1usize << hart)) != 0 {
+                    crate::arch::send_ipi(hart);
+                }
+            }
+            kicked_mask |= new_kicks;
+            core::hint::spin_loop();
+        }
+
+        for (res, join_waiters) in deferred_cleanup {
             drop(res);
             for waiter in join_waiters {
                 wakeup_task(waiter);
@@ -1859,7 +1890,14 @@ impl ProcessControlBlock {
         let mut after_task_cycles = fork_start_cycles;
 
         let mut parent = self.borrow_mut();
-        let thread_count = parent.thread_count();
+        // 只在 PCB 锁下取得任务引用快照，不在这里嵌套 TCB 锁。远端线程的
+        // 系统调用可能正持有 TCB 并读取 PCB，反向嵌套会让多线程 fork 死锁。
+        let parent_tasks_snapshot = parent
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref().cloned())
+            .collect::<Vec<_>>();
+        let thread_count = parent_tasks_snapshot.len();
         if thread_count != 1 {
             log::warn!(
                 "[fork] pid={} thread_count={} (forking only current thread)",
@@ -1907,8 +1945,7 @@ impl ProcessControlBlock {
         let cpu_affinity_mask = parent_scheduling.cpu_affinity_mask;
         let rt_sig_handlers = parent.rt_sig_handlers.clone();
         let argv = parent.argv.clone();
-        let inherited_shm = parent.memory_set.sysv_shm_attaches_snapshot();
-        let parent_mm_token = parent.memory_set.token();
+        let parent_memory_set = parent.memory_set.clone();
         if crate::debug_config::DEBUG_PID_MAP {
             let seq = FORK_PRE_COW_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if seq <= 8 || (seq & (seq - 1)) == 0 {
@@ -1927,38 +1964,50 @@ impl ProcessControlBlock {
                 );
             }
         }
+        // Starry/Linux 的 fork 会把 task 元数据锁和 mmap 锁分层。COW 可能遍历
+        // 大量 VMA，并与其他线程的缺页路径竞争 mm 锁；若仍持有 PCB 锁，
+        // 另一线程在持有 mm 锁时读取 PCB 就会形成锁序反转。
+        drop(parent);
+        let child_excluded_trap_slots = if thread_count > 1 && !share_vm {
+            parent_tasks_snapshot
+                .iter()
+                .filter_map(|task| {
+                    let task_inner = task.borrow_mut();
+                    let res = task_inner.res.as_ref()?;
+                    (res.tid != 0).then_some(res.trap_cx_slot())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let inherited_shm = parent_memory_set.sysv_shm_attaches_snapshot();
+        let parent_mm_token = parent_memory_set.token();
+
         // Fork address space (COW by default, full copy on LoongArch).
         #[cfg(target_arch = "loongarch64")]
         let memory_set = if DEBUG_LOONGARCH_FULL_COPY_FORK {
-            MmRef::from_existed_user_deep(&parent.memory_set)
+            MmRef::from_existed_user_deep(&parent_memory_set)
         } else if share_vm {
-            parent.memory_set.clone()
+            parent_memory_set.clone()
         } else {
-            MmRef::from_existed_user_cow(&parent.memory_set)
+            MmRef::from_existed_user_cow(&parent_memory_set)
         };
         #[cfg(not(target_arch = "loongarch64"))]
         let memory_set = if share_vm {
-            parent.memory_set.clone()
+            parent_memory_set.clone()
         } else {
-            MmRef::from_existed_user_cow(&parent.memory_set)
+            MmRef::from_existed_user_cow(&parent_memory_set)
         };
         let child_mm_token = memory_set.token();
-        if thread_count > 1 && !share_vm {
+        if !child_excluded_trap_slots.is_empty() {
             let mut child_mm = memory_set.lock();
-            for task in parent.tasks.iter().filter_map(|t| t.as_ref()) {
-                let mut task_inner = task.borrow_mut();
-                let Some(res) = task_inner.res.as_ref() else {
-                    continue;
-                };
-                if res.tid == 0 {
-                    continue;
-                }
-                let trap_cx_slot = res.trap_cx_slot();
+            for trap_cx_slot in child_excluded_trap_slots {
                 let trap_cx_bottom = TRAP_CONTEXT_BASE - trap_cx_slot * PAGE_SIZE;
                 child_mm.remove_area_with_start_vpn(trap_cx_bottom.into());
                 child_mm.dealloc_trap_context_slot(trap_cx_slot);
             }
         }
+        let mut parent = self.borrow_mut();
         if diag_enabled {
             after_mem_cycles = crate::arch::read_time();
         }

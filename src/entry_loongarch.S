@@ -4,6 +4,8 @@
 .equ CSR_CPUID, 0x20
 .equ CSR_DMW0, 0x180
 .equ CSR_DMW1, 0x181
+.equ BOOT_STACK_PER_HART, 4096 * 16
+.equ BOOT_STACK_HARTS, 12
 
 # loongarch在qemu上执行这个entry之前  
 #  a0 = 1       # EFI 启动标志
@@ -14,7 +16,7 @@ _start:
     # 原先a0保存的是从EFI启动，我们不需要这个信息，直接覆盖
     csrrd $a0, CSR_CPUID
 
-    li.d $t0, 4096 * 16
+    li.d $t0, BOOT_STACK_PER_HART
     mul.d $t1, $a0, $t0
     la.global $sp, boot_stack_top
     sub.d $sp, $sp, $t1
@@ -43,6 +45,6 @@ _start:
     .section .bss.stack
     .globl boot_stack
 boot_stack:
-    .space 4096 * 16 * 4
+    .space BOOT_STACK_PER_HART * BOOT_STACK_HARTS
     .globl boot_stack_top
 boot_stack_top:

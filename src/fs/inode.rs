@@ -1677,6 +1677,11 @@ impl File for OSInode {
 
 impl Drop for OSInode {
     fn drop(&mut self) {
+        // `flock(2)` 锁属于 open-file-description；OSInode 析构意味着所有
+        // `dup`/`fork` 共享引用均已关闭，此时必须清除锁，避免 Cargo 永久重试。
+        crate::syscall::filesystem::release_flock_locks_for_owner(
+            self as *const OSInode as usize,
+        );
         let mut inner = self.inner.lock();
         let inode_key = (inner.inode.device_id(), inner.inode.inode_num());
         if !inner.write_buf.is_empty() {

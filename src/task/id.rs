@@ -181,13 +181,18 @@ impl Drop for KernelStack {
             .remove_area(kernel_stack_bottom_va.into(), kernel_stack_top_va.into());
         #[cfg(target_arch = "riscv64")]
         {
-            // RISC-V user page tables share the kernel-stack root entries with
-            // KERNEL_SPACE. After removing a stack PTE from that shared subtree,
-            // every hart must drop any stale stack translation before the frame
-            // can be reused for a future stack.
+            // RISC-V 用户页表共享内核栈所在的页表子树。删除栈 PTE 后，
+            // 必须先让所有 hart 丢弃旧翻译，才能安全复用相同虚拟槽位。
             crate::mm::flush_kernel_shared_tlb();
+            KSTACK_ALLOCATOR.lock().dealloc(self.0);
         }
-        KSTACK_ALLOCATOR.lock().dealloc(self.0);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // LoongArch 当前只有本 hart 的 invtlb，尚无带完成确认的远端
+            // shootdown。物理页已经由 remove_area 释放，但不能立即复用相同
+            // 虚拟槽位，否则另一 hart 的陈旧 TLB 会破坏新任务的内核栈。
+            // 采用单调虚拟槽位不会泄漏物理内存，64 位内核地址空间也足够大。
+        }
         KSTACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         maybe_log_kstack_inflight("drop");
     }

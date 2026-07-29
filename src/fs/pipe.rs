@@ -87,6 +87,9 @@ fn default_pipe_capacity_for_current() -> usize {
 pub struct Pipe {
     readable: bool,
     writable: bool,
+    /// 文件描述符对这个管道端点的引用数。进程退出时文件对象本身会延迟
+    /// 到 idle 栈释放，但 POSIX 的 EOF/EPIPE 语义必须在 fd 关闭时立即生效。
+    fd_refs: AtomicUsize,
     buffer: Arc<Mutex<PipeRingBuffer>>,
 }
 
@@ -99,6 +102,7 @@ impl Pipe {
         Self {
             readable: true,
             writable: false,
+            fd_refs: AtomicUsize::new(0),
             buffer,
         }
     }
@@ -108,6 +112,7 @@ impl Pipe {
         Self {
             readable: false,
             writable: true,
+            fd_refs: AtomicUsize::new(0),
             buffer,
         }
     }
@@ -1563,6 +1568,50 @@ impl File for Pipe {
     }
     fn writable(&self) -> bool {
         self.writable
+    }
+
+    fn on_fd_install(&self) {
+        let previous = self.fd_refs.fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
+            // 允许持有临时 File 引用的并发 dup 在最后一个 fd 关闭后重新安装。
+            let mut ring = self.buffer.lock();
+            if self.readable {
+                ring.read_end_shutdown = false;
+            }
+            if self.writable {
+                ring.write_end_shutdown = false;
+            }
+        }
+    }
+
+    fn on_fd_close(&self) {
+        let previous = self
+            .fd_refs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count != 0).then_some(count - 1)
+            })
+            .unwrap_or(0);
+        if previous != 1 {
+            return;
+        }
+
+        // Starry/Linux 都在 close_files 阶段先发布端点关闭，再把较重的文件
+        // 对象回收延后。否则 zombie 仍持有的 Arc 会让父进程永远等不到 EOF。
+        let wakeups = {
+            let mut ring = self.buffer.lock();
+            let mut wakeups = Vec::new();
+            if self.writable {
+                ring.write_end_shutdown = true;
+                wakeups.extend(ring.drain_readers());
+            }
+            if self.readable {
+                ring.read_end_shutdown = true;
+                wakeups.extend(ring.drain_writers());
+            }
+            wakeups.extend(ring.drain_poll_waiters());
+            wakeups
+        };
+        wake_tasks(wakeups);
     }
     /// `File::read` 的管道实现：从用户态 `UserBuffer` 接收目标地址，阻塞读取。
     ///

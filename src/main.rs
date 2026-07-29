@@ -45,9 +45,8 @@ static BOOT_BSS_CLEARED: AtomicBool = AtomicBool::new(false);
 // Secondary harts must not enter the scheduler before the boot hart finishes global init.
 #[unsafe(link_section = ".data")]
 static BOOT_GLOBAL_INIT_DONE: AtomicBool = AtomicBool::new(false);
-// 次级 hart 在完成本地页表、trap 与时钟初始化后置位。启动 hart 逐个等待该
-// 应答，避免把尚未完成 per-hart 初始化的 CPU 视作可调度 CPU。
-#[cfg(target_arch = "riscv64")]
+// 每个 hart 只有在页表、陷阱、定时器和调度状态全部就绪，且已加入
+// ONLINE_HART_MASK 后才发布自己的位。启动核等掩码完整后再创建 INITPROC。
 static SECONDARY_READY_MASK: AtomicUsize = AtomicUsize::new(0);
 
 fn clear_bss() {
@@ -63,57 +62,93 @@ fn clear_bss() {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
-fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
-    // ArceOS 的 SMP 启动采用“启动一个 CPU、等待它完成本地初始化、再启动下一个”的
-    // 握手方式。这里同样不能仅发出 HSM 请求就继续：否则在线掩码和每 hart 调度状态
-    // 会随启动时序波动，导致用户任务在未准备好的 hart 上运行。
+fn configured_hart_mask() -> usize {
+    if config::MAX_HARTS >= usize::BITS as usize {
+        usize::MAX
+    } else {
+        (1usize << config::MAX_HARTS) - 1
+    }
+}
+
+fn start_other_harts(boot_hart_id: usize, opaque: usize) {
+    // 先发出全部启动请求，让各 AP 并行初始化。相比逐核启动并等待，
+    // 这更接近 ArceOS/StarryOS，同时仍保留明确的全核上线屏障。
+    let boot_bit = 1usize << boot_hart_id;
+    let expected_mask = configured_hart_mask();
     task::manager::mark_hart_online(boot_hart_id);
-    SECONDARY_READY_MASK.store(0, Ordering::Release);
+    SECONDARY_READY_MASK.store(boot_bit, Ordering::Release);
+    let mut started_mask = boot_bit;
+
     for hart_id in 0..config::MAX_HARTS {
         if hart_id == boot_hart_id {
             continue;
         }
-        // opaque 是次级核心启动时放入 a1 寄存器的 DTB 地址。
-        let rc = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
+        let rc = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, opaque);
         if rc != 0 {
             println!("[kernel] hart {} HSM start failed: rc={:#x}", hart_id, rc);
             continue;
         }
-
-        let ready_bit = 1usize << hart_id;
-        let start = time::get_time();
-        let timeout_ticks = config::clock_freq().saturating_mul(2);
-        while SECONDARY_READY_MASK.load(Ordering::Acquire) & ready_bit == 0 {
-            if time::get_time().wrapping_sub(start) > timeout_ticks {
-                println!("[kernel] hart {} startup timed out", hart_id);
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        started_mask |= 1usize << hart_id;
     }
+
+    if started_mask != expected_mask {
+        panic!(
+            "failed to start configured harts: expected={:#x} started={:#x} missing={:#x}",
+            expected_mask,
+            started_mask,
+            expected_mask & !started_mask
+        );
+    }
+
+    let start = time::get_time();
+    let timeout_ticks = config::clock_freq().saturating_mul(10);
+    while SECONDARY_READY_MASK.load(Ordering::Acquire) & expected_mask != expected_mask {
+        if time::get_time().wrapping_sub(start) > timeout_ticks {
+            let ready = SECONDARY_READY_MASK.load(Ordering::Acquire);
+            panic!(
+                "SMP startup timed out: expected={:#x} ready={:#x} online={:#x} missing={:#x}",
+                expected_mask,
+                ready,
+                task::manager::online_hart_mask(),
+                expected_mask & !ready
+            );
+        }
+        core::hint::spin_loop();
+    }
+
+    let online = task::manager::online_hart_mask() & expected_mask;
+    assert_eq!(online, expected_mask, "ready harts must already be online");
+    println!(
+        "[kernel] all {} harts online: mask={:#x}",
+        config::MAX_HARTS,
+        online
+    );
 }
 
-#[cfg(target_arch = "riscv64")]
-fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
+fn secondary_main(hart_id: usize, opaque: usize) -> ! {
     // Wait until the boot hart clears .bss and completes global initialization.
-    while !BOOT_BSS_CLEARED.load(Ordering::SeqCst) {
+    while !BOOT_BSS_CLEARED.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
-    while !BOOT_GLOBAL_INIT_DONE.load(Ordering::SeqCst) {
+    while !BOOT_GLOBAL_INIT_DONE.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
-    // Activate the page table built by the boot hart so we can safely run in S-mode.
+
+    #[cfg(target_arch = "loongarch64")]
+    arch::bootstrap_init();
+    // 进入调度器前启用启动核建立的页表，随后 LoongArch 可关闭临时 DMW 映射。
     mm::activate_kernel_space();
+    #[cfg(target_arch = "loongarch64")]
+    arch::disable_direct_map_windows();
     trap::init_trap();
     trap::trap::enable_timer_interrupt();
     time::set_next_trigger();
+    task::manager::mark_hart_online(hart_id);
     SECONDARY_READY_MASK.fetch_or(1usize << hart_id, Ordering::Release);
     println!(
-        "[kernel] secondary hart {} online (dtb_pa={:#x}), entering scheduler...",
-        hart_id, dtb_pa
+        "[kernel] secondary hart {} online (opaque={:#x}), entering scheduler...",
+        hart_id, opaque
     );
-    task::manager::mark_hart_online(hart_id);
     task::task_start_secondary();
 }
 
@@ -134,7 +169,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
     {
         clear_bss();
         //顺便标记第一个cpu核心已经进入到初始化阶段了
-        BOOT_BSS_CLEARED.store(true, Ordering::SeqCst);
+        BOOT_BSS_CLEARED.store(true, Ordering::Release);
         let num_of_apps = unsafe { *(num_user_apps as *const i64) };
         println!(
             "Number of user apps: {}, from adress {}",
@@ -153,11 +188,11 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
             log::test();
         }
         println!("[kernel] memory management initialized.");
-        BOOT_GLOBAL_INIT_DONE.store(true, Ordering::SeqCst);
-        start_other_harts(hart_id, dtb_pa);
         trap::init_trap();
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();
+        BOOT_GLOBAL_INIT_DONE.store(true, Ordering::Release);
+        start_other_harts(hart_id, dtb_pa);
         list_apps();
         task::task_start();
     } else {
@@ -267,9 +302,7 @@ fn rust_main(hart_id: usize, efi_system_table_pa: usize) -> ! {
         .is_ok()
     {
         clear_bss();
-        BOOT_BSS_CLEARED.store(true, Ordering::SeqCst);
-        // Ensure the boot hart is marked online so tasks stay on the running hart.
-        task::manager::mark_hart_online(hart_id);
+        BOOT_BSS_CLEARED.store(true, Ordering::Release);
         println!("[kernel] loongarch64 boot hart {}", hart_id);
         arch::bootstrap_init();
         // DTB 是 EFI configuration table 中的一项，先按标准 GUID 查找它。
@@ -281,10 +314,12 @@ fn rust_main(hart_id: usize, efi_system_table_pa: usize) -> ! {
         trap::init_trap();
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();
+        BOOT_GLOBAL_INIT_DONE.store(true, Ordering::Release);
+        start_other_harts(hart_id, 0);
         list_apps();
         task::task_start();
+    } else {
+        secondary_main(hart_id, efi_system_table_pa);
     }
-    loop {
-        core::hint::spin_loop();
-    }
+    panic!("shouldn't be here");
 }
