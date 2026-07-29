@@ -21,7 +21,7 @@
 #   EXT4_SIZE      packer size (e.g. 1G, 4G)        [1G]
 #   ROOTFS_MODE    patched|eval [patched]
 #                  patched: legacy base image plus common/arch overlays
-#                  eval: minimal bootstrap disk for the two evaluation scripts
+#                  eval: local /user binaries beside the official rootfs
 #   EVAL_MINIMAL_ROOT 0|1, deprecated alias for ROOTFS_MODE=eval [0]
 #   DISK_IMG       extra "test-card" image path     [sdcard-<arch>.img]
 #   QEMU_TIMEOUT   seconds, 0 disables `timeout`    [0]
@@ -44,6 +44,8 @@ ARCH ?= riscv64
 ifeq ($(ARCH),riscv64)
     TARGET           := riscv64gc-unknown-none-elf
     QEMU_BIN         := qemu-system-riscv64
+    DEFAULT_SMP      := 8
+    DEFAULT_EVAL_IMG := /images_host/final_img/sdcard-rv-pub.img
     QEMU_BLK_DEV0    := virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
     QEMU_BLK_DEV1    := virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
     QEMU_NET_DEV     := virtio-net-device,netdev=net
@@ -57,6 +59,8 @@ ifeq ($(ARCH),riscv64)
 else ifeq ($(ARCH),loongarch64)
     TARGET           := loongarch64-unknown-none
     QEMU_BIN         := qemu-system-loongarch64
+    DEFAULT_SMP      := 12
+    DEFAULT_EVAL_IMG := /images_host/final_img/sdcard-la-pub.img
     QEMU_BLK_DEV0    := virtio-blk-pci,drive=x0
     QEMU_BLK_DEV1    := virtio-blk-pci,drive=x1
     QEMU_NET_DEV     := virtio-net-pci,netdev=net
@@ -76,9 +80,10 @@ endif
 # ----------------------------------------------------------------------
 MODE         ?= release
 CARGO_MODE_FLAG := $(if $(filter release,$(MODE)),--release,)
-SMP          ?= 4
+SMP          ?= $(DEFAULT_SMP)
 MEM          ?= 1G
 QEMU_TIMEOUT ?= 0
+QEMU_EXTRA_ARGS ?=
 SUBMIT       ?= 0
 EXT4_REBUILD ?= 0
 EXT4_SIZE    ?= 1G
@@ -95,10 +100,10 @@ ifneq ($(filter $(ROOTFS_MODE),patched eval),$(ROOTFS_MODE))
 endif
 
 # BuildStorm/cagent images provide a mutually compatible /bin, /lib, /usr,
-# Rust toolchain and workload tree.  In evaluation mode disk0 must not contain
+# Rust toolchain and workload tree. In evaluation mode disk0 must not contain
 # any normal rootfs overlay: those overlays include target libc/loader files
-# and would mix with the official image's glibc.  The packer allow-lists only
-# /user/init_proc.bin, /user/0final_init.bin and the two test scripts.
+# and would mix with the official image's glibc. The packer only includes
+# locally built /user binaries and minimal runtime directories.
 ifeq ($(ROOTFS_MODE),eval)
     override EXT4_BASE_IMG :=
     override EXT4_BASE_TAR :=
@@ -143,12 +148,12 @@ else
     EXT4_BASE_DEP :=
 endif
 
-# Normal images receive the common and architecture-specific overlays.  The
-# evaluation bootstrap disk uses the packer's strict allow-list instead, so no
-# /lib, /usr/lib, loader or helper binary can shadow the official rootfs.
+# Normal images receive the common and architecture-specific overlays. The
+# evaluation helper disk skips every overlay, so no /lib, /usr/lib, loader,
+# evaluation script or workload binary can shadow the official rootfs.
 EXT4_OVERLAY_ARGS := -e extra --arch-extra extra-$(ARCH)
 ifeq ($(ROOTFS_MODE),eval)
-    EXT4_OVERLAY_ARGS := -e extra --minimal-eval-root
+    EXT4_OVERLAY_ARGS := --minimal-eval-root
 endif
 
 # ----------------------------------------------------------------------
@@ -296,17 +301,23 @@ run run_ext4: kernel ext4_img
 	@echo "🔍 Running QEMU with VirtIO block device..."
 	@echo "   ➜ File System Image: $(EXT4_IMG)"
 	$(QEMU_RUN) $(QEMU_BASE_ARGS) $(QEMU_BIOS_ARGS) \
-	    $(QEMU_DISK0_ARGS) $(QEMU_NET_ARGS) $(QEMU_DISK1_ARGS)
+	    $(QEMU_EXTRA_ARGS) $(QEMU_DISK0_ARGS) $(QEMU_NET_ARGS) $(QEMU_DISK1_ARGS)
 
-# Explicit rootfs-mode entry points.  `run_patched` is the historical full
-# patched disk.  `run_eval` builds the strict four-file bootstrap disk and
-# uses the official final image supplied through EVAL_DISK_IMG.
-EVAL_DISK_IMG ?= /images_host/final_img/sdcard-rv-pub.img
+# Explicit rootfs-mode entry points. `run_patched` is the historical full
+# patched disk. `run_eval` builds a local /user helper disk and uses the
+# official final image supplied through EVAL_DISK_IMG as the primary rootfs.
+
+# 评分器期望 RISC-V 使用 8 核、LoongArch 使用 12 核；官方评测盘也必须
+# 随架构选择，避免 LoongArch 误挂载 RISC-V 用户态。
+EVAL_DISK_IMG ?= $(DEFAULT_EVAL_IMG)
+# 这个是初赛的部分
 run_patched:
 	@$(MAKE) run_ext4 ROOTFS_MODE=patched
 
+# 这个是决赛的部分
 run_eval:
-	@$(MAKE) run_ext4 ROOTFS_MODE=eval SUBMIT=1 DISK_IMG=$(EVAL_DISK_IMG)
+	@$(MAKE) run_ext4 ROOTFS_MODE=eval SUBMIT=1 DISK_IMG=$(EVAL_DISK_IMG) \
+	    QEMU_EXTRA_ARGS=-snapshot
 
 # QEMU halts at reset and listens for a GDB client on :1234. The
 # `timeout` wrapper is intentionally not applied here so GDB sessions
@@ -336,7 +347,7 @@ help:
 	@echo "CongCore kernel Makefile – common targets:"
 	@echo "  make run_ext4    build + run kernel in QEMU with ext4 disk (default)"
 	@echo "  make run_patched build/run the legacy full patched filesystem disk"
-	@echo "  make run_eval    build/run the minimal BuildStorm/cagent bootstrap disk"
+	@echo "  make run_eval    run official rootfs with a local /user helper disk"
 	@echo "  make debug       start QEMU halted, waiting for GDB on :1234"
 	@echo "  make client_gdb  connect the bundled GDB client to a running debug"
 	@echo "  make clean       wipe kernel, user apps and cached artefacts"

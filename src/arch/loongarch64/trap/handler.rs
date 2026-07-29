@@ -29,6 +29,8 @@ const ECODE_PAGE_PRIV: usize = 0x7;
 const ECODE_ADDR_ERROR: usize = 0x8;
 const ECODE_ADDR_ALIGN: usize = 0x9;
 const ECODE_FP_DISABLED: usize = 0xf;
+const ECODE_LSX_DISABLED: usize = 0x10;
+const ECODE_LASX_DISABLED: usize = 0x11;
 
 use super::super::csr_defs::{
     ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, ESTAT_IS_IPI, ESTAT_IS_TIMER, PRMD_USER_IE,
@@ -199,10 +201,12 @@ fn handle_user_exception(ecode: usize, badv: usize) {
         exit_group_and_run_next(errno);
     }
     let cx = get_trap_context();
+    let badi = read_badi();
     println!(
-        "[user_exn] ecode={} badv={:#x} era={:#x} ra={:#x} sp={:#x} tp={:#x}",
+        "[user_exn] ecode={} badv={:#x} badi={:#010x} era={:#x} ra={:#x} sp={:#x} tp={:#x}",
         ecode,
         badv,
+        badi,
         cx.sepc,
         cx.x[super::super::REG_RA],
         cx.x[super::super::REG_SP],
@@ -311,6 +315,14 @@ pub fn trap_handler() {
         // Lazy-FPU path: enable/restore the task's FP state and retry the
         // trapped user instruction instead of saving FP on every context switch.
         super::super::handle_user_fp_disabled();
+    } else if ecode == ECODE_LSX_DISABLED {
+        // LSX shares the FP register file. Restore the task's state, enable
+        // LSX for this quantum and retry the trapped vector instruction.
+        super::super::handle_user_lsx_disabled();
+    } else if ecode == ECODE_LASX_DISABLED {
+        // LASX is layered on LSX and the scalar FPU, so all three gates must
+        // be enabled before retrying.
+        super::super::handle_user_lasx_disabled();
     } else {
         match ecode {
             ECODE_ADDR_ERROR | ECODE_ADDR_ALIGN => handle_user_exception(ecode, badv),

@@ -1314,6 +1314,11 @@ lazy_static! {
     pub static ref USER_INODE: Arc<Inode> = {
         ROOT_INODE
             .find("user")
+            .or_else(|| {
+                SECONDARY_ROOT_INODE
+                    .as_ref()
+                    .and_then(|root| root.find("user"))
+            })
             .expect("[ext4] /user directory not found!")
     };
 }
@@ -1336,8 +1341,10 @@ pub(crate) fn find_path_in_roots(path: &str) -> Option<Arc<Inode>> {
     }
     SECONDARY_ROOT_INODE.as_ref()?.find_path(path)
 }
-// 主根盘以 /home 作为 rootfs 标记。两块盘都具备该目录时，保持 QEMU 的第一块盘
-// (disk0) 为主根；这使自制完整 rootfs 不会被附加的官方测试盘反向覆盖。
+// 主根盘以 /home 作为完整 rootfs 标记。eval 模式的本地 disk0 故意不创建
+// /home，因此带完整用户态的官方 disk1 会成为主根；本地 /user 仍可通过
+// secondary root 回退访问。两块盘都具备 /home 时保持 disk0 为主，兼容
+// patched 模式。
 struct RootSelection {
     primary_root: Arc<Inode>,
     secondary_root: Option<Arc<Inode>>,

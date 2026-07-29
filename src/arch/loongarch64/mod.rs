@@ -37,6 +37,9 @@ pub const REG_A6: usize = 10;
 pub const REG_A7: usize = 11;
 
 const EUEN_FPEN: usize = 1 << 0;
+const EUEN_LSXEN: usize = 1 << 1;
+const EUEN_LASXEN: usize = 1 << 2;
+const EUEN_USER_FP_MASK: usize = EUEN_FPEN | EUEN_LSXEN | EUEN_LASXEN;
 
 #[cfg(feature = "loongarch_board")]
 const UART_BASE: usize = 0x8000_0000_1fe2_0000;
@@ -118,7 +121,11 @@ pub fn enable_interrupts() {
 }
 
 pub fn wait_for_interrupt() {
-    core::hint::spin_loop();
+    // 参考 loongArch64 架构支持库的 idle 封装：中断已在调度器中开启，
+    // 此处让空闲核休眠，避免 12 核 QEMU/TCG 持续忙等拖慢编译任务。
+    // SAFETY: 调度器只在当前 hart 已开启中断且没有可运行任务时调用本函数；
+    // `idle` 会在下一次中断到来后恢复执行。
+    unsafe { loongArch64::asm::idle() };
 }
 
 pub fn disable_direct_map_windows() {
@@ -261,13 +268,30 @@ fn ensure_fp_enabled() {
 
 #[inline]
 fn disable_fp() {
-    // SAFETY: Clearing EUEN.FPEN is the LoongArch lazy-FPU gate. User FP instructions will trap
-    // with FPDIS until the task first owns FPU state.
+    // SAFETY: Clearing the scalar and vector EUEN bits is the LoongArch lazy-FPU
+    // gate. It prevents a newly scheduled task from observing the previous
+    // task's live FP/LSX/LASX register state.
     unsafe {
         let mut euen: usize;
         asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
-        if (euen & EUEN_FPEN) != 0 {
-            euen &= !EUEN_FPEN;
+        if (euen & EUEN_USER_FP_MASK) != 0 {
+            euen &= !EUEN_USER_FP_MASK;
+            asm!("csrwr {}, 0x2", inout(reg) euen => _, options(nostack));
+        }
+    }
+}
+
+#[inline]
+fn enable_user_vector(mask: usize) {
+    // LSX/LASX share the floating-point register file, so FPEN must be set
+    // together with the requested vector extension before retrying the user
+    // instruction that raised LSXDIS/LASXDIS.
+    unsafe {
+        let mut euen: usize;
+        asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
+        let required = EUEN_FPEN | mask;
+        if (euen & required) != required {
+            euen |= required;
             asm!("csrwr {}, 0x2", inout(reg) euen => _, options(nostack));
         }
     }
@@ -476,6 +500,16 @@ pub fn handle_user_fp_disabled() {
     inner.fp_used = true;
 }
 
+pub fn handle_user_lsx_disabled() {
+    handle_user_fp_disabled();
+    enable_user_vector(EUEN_LSXEN);
+}
+
+pub fn handle_user_lasx_disabled() {
+    handle_user_fp_disabled();
+    enable_user_vector(EUEN_LSXEN | EUEN_LASXEN);
+}
+
 pub fn prepare_user_fp_state(task: &Arc<TaskControlBlock>) {
     if task.borrow_mut().fp_used {
         ensure_fp_enabled();
@@ -516,10 +550,11 @@ pub fn bootstrap_init() {
     // target machine-defined paging state for the current hart. Programming inconsistent values
     // here would break address translation or trap refill before the kernel can recover.
     unsafe {
-        // Start with FP disabled. User FP instructions trap once and lazily acquire state.
+        // Start with scalar/vector FP disabled. User instructions trap once
+        // and lazily acquire the current task's state.
         let mut euen: usize;
         asm!("csrrd {}, 0x2", out(reg) euen);
-        euen &= !EUEN_FPEN;
+        euen &= !EUEN_USER_FP_MASK;
         asm!("csrwr {}, 0x2", inout(reg) euen => _);
 
         // Clear pending timer interrupt and disable timer while bootstrapping.
