@@ -10,7 +10,7 @@
 # :=的赋值是在makefile在被读取的时候立即做计算，也就是正常的覆盖
 # ?=是在这个变量没有被定义的时候才会赋值，也就是当环境变量有对应值的时候不会覆盖
 
-# 这些是死的路径，我们不需要外界传入，所以使用:=赋值
+# 这些是死的路径，我们不需要外界传入，所以使用:=赋值，上传的时候这个root_dir需要修改
 MAKEFILE_DIR     := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 ROOT_DIR         := $(abspath $(MAKEFILE_DIR)/..)
 USER_DIR         := $(ROOT_DIR)/user
@@ -94,6 +94,7 @@ endif
 .PHONY: all elf kernel user_apps disk ext4_img run run_ext4 \
         debug gdb client_gdb clean help prepare-cargo
 
+# all只是编译镜像还有内核elf
 all: elf disk
 
 # 为 os 与 user 安装当前架构的 Cargo 配置。

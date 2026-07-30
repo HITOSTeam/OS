@@ -34,6 +34,12 @@ impl MmRef {
         self.inner.lock()
     }
 
+    /// 尝试读取地址空间；全局统计路径不得等待任意进程的 mm 锁，否则可能
+    /// 与正在进行的缺页、brk 或 mmap 形成跨进程锁队列。
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, MemorySet>> {
+        self.inner.try_lock()
+    }
+
     /// 返回页表根地址 token（用于切换地址空间）。
     pub fn token(&self) -> usize {
         self.token
@@ -85,6 +91,15 @@ impl MmRef {
         self.lock().update_file_vm_size(dev, ino, file_size)
     }
 
+    /// 跨进程 inode 广播使用非阻塞更新，避免一个正在缺页或 mmap 的进程
+    /// 把所有并发写入者拖入同一条 mm 自旋锁队列。
+    pub fn try_update_file_vm_size(&self, dev: usize, ino: u32, file_size: usize) -> bool {
+        let Some(mut memory_set) = self.inner.try_lock() else {
+            return false;
+        };
+        memory_set.update_file_vm_size(dev, ino, file_size)
+    }
+
     /// fd write 后将数据镜像到所有共享文件映射的驻留页。
     pub fn mirror_shared_file_write_to_resident_mmaps(
         &self,
@@ -95,6 +110,22 @@ impl MmRef {
     ) {
         self.lock()
             .mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
+    }
+
+    /// 尽力同步其他进程中已经驻留的 MAP_SHARED 页；忙碌 mm 不等待，
+    /// 后续缺页仍会从全局共享文件页缓存取得最新数据。
+    pub fn try_mirror_shared_file_write_to_resident_mmaps(
+        &self,
+        dev: usize,
+        ino: u32,
+        write_off: usize,
+        data: &[u8],
+    ) -> bool {
+        let Some(mut memory_set) = self.inner.try_lock() else {
+            return false;
+        };
+        memory_set.mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
+        true
     }
 
     /// 为栈区插入 Framed 映射（exec 时建立初始栈使用）。
@@ -136,6 +167,10 @@ impl MmRef {
 
     /// 处理 lazy fault：按需分配/复用 frame 并安装 PTE。
     pub fn resolve_lazy_fault(&self, fault_va: usize, access: MapPermission) -> LazyFaultResult {
+        // lazy fault 持有 mm 锁期间可能读取 ext4 文件页。若 ext4 竞争在这里
+        // 主动 yield，同进程的其他线程会全部堵在 mm ticket lock 上；因此整个
+        // mm 临界区必须保持不可调度，只允许 ext4 做短暂自旋。
+        let _scheduling_guard = crate::task::processor::disable_current_scheduling();
         self.lock().resolve_lazy_fault(fault_va, access)
     }
 

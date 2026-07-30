@@ -1547,6 +1547,52 @@ pub fn suspend_current_and_run_next() {
     schedule(task_cx_ptr);
 }
 
+/// 当前任务的不可调度临界区守卫。
+///
+/// 守卫只记录任务级原子计数，不持有 TCB/PCB 锁，因此可以安全跨越 mm 与
+/// 文件系统调用。析构时恢复可调度状态，支持同一调用链嵌套使用。
+pub struct SchedulingDisableGuard {
+    task: Option<Arc<TaskControlBlock>>,
+}
+
+impl Drop for SchedulingDisableGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.enable_scheduling();
+        }
+    }
+}
+
+/// 标记当前任务暂时不能主动进入调度器。
+pub fn disable_current_scheduling() -> SchedulingDisableGuard {
+    let task = current_task();
+    if let Some(task) = task.as_ref() {
+        task.disable_scheduling();
+    }
+    SchedulingDisableGuard { task }
+}
+
+/// 尝试在允许调度的上下文中主动让出当前 CPU。
+///
+/// 缺页、用户内存复制等路径可能已经持有当前任务的 TCB 内锁。此时直接调用
+/// `suspend_current_and_run_next()` 会在运行时间记账或任务状态切换时再次获取
+/// 同一把锁，形成当前 hart 自锁。这里把可调度性判断收敛到调度器：只有当前
+/// TCB 内锁能够立即取得时才进入完整的让出流程，否则由调用者继续短暂自旋。
+pub fn try_suspend_current_and_run_next() -> bool {
+    let Some(task) = current_task() else {
+        return false;
+    };
+    if task.is_scheduling_disabled() {
+        return false;
+    }
+    let Some(task_inner) = task.try_borrow_mut() else {
+        return false;
+    };
+    drop(task_inner);
+    suspend_current_and_run_next();
+    true
+}
+
 pub fn block_current_and_run_next() {
     // Same rationale as in `suspend_current_and_run_next()`: a task can be stuck
     // yielding within a syscall (interrupts disabled), so handle fatal signals here.

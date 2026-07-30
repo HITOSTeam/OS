@@ -1,23 +1,37 @@
 #!/bin/sh
-set -e
-# cp testsuits-for-oskernel/sdcard/sdcard-rv.img ./sdcard-rv.img
-# cp loongarch_img_info/sdcard-la.img ./sdcard-la.img
+set -eu
 
-# ln -sfn testsuits-for-oskernel/sdcard/sdcard-rv.img "$ROOT_DIR/sdcard-rv.img"
-# ln -sfn testsuits-for-oskernel/sdcard/sdcard-la.img "$ROOT_DIR/sdcard-la.img"
-# rm if possible
-# if [ -f output.md ]; then
-#     rm output.md
-# fi
-# # read env arch
-
-cd os
-
-# EXT4_SIZE=${EXT4_SIZE:-4G}
-
-# ARCH=$ARCH SUBMIT=1 make run_ext4 LOG=warn SMP=1 MEM=1G EXT4_REBUILD=1 EXT4_SIZE=$EXT4_SIZE > ../output.md 
+# 无论从仓库根目录还是 os/ 目录调用，都以脚本所在目录为准。
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 ARCH=${ARCH:-riscv64}
 MEM=${MEM:-4G}
+SMP=${SMP:-12}
 
-make run_eval ARCH="$ARCH" MEM="$MEM"
+case "$ARCH" in
+    riscv64)
+        TEST_IMG=/images_host/final_img/sdcard-rv-pub.img
+        ;;
+    loongarch64)
+        TEST_IMG=/images_host/final_img/sdcard-la-pub.img
+        ;;
+    *)
+        echo "不支持的架构：$ARCH（仅支持 riscv64 或 loongarch64）" >&2
+        exit 2
+        ;;
+esac
+
+if [ ! -f "$TEST_IMG" ]; then
+    echo "缺少决赛测试镜像：$TEST_IMG" >&2
+    exit 1
+fi
+
+echo "启动决赛测试：架构=$ARCH 核心数=$SMP 内存=$MEM 镜像=$TEST_IMG"
+echo "测试顺序：CAgent -> BuildStorm"
+
+exec make -C "$SCRIPT_DIR" run \
+    ARCH="$ARCH" \
+    FINAL_TEST=1 \
+    TEST_IMG="$TEST_IMG" \
+    SMP="$SMP" \
+    MEM="$MEM"

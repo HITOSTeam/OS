@@ -18,9 +18,9 @@ const SATP_ASID_MASK: usize = 0xffff;
 const KERNEL_ASID: usize = 0;
 const FIRST_USER_ASID: usize = 1;
 const HW_ASID_MASK_UNPROBED: usize = usize::MAX;
-/// ASID 快路径仍需完成跨 hart TLB shootdown 验证；在此之前保留按 hart
-/// I-cache 优化，但使用 ASID 0 的保守切换路径保证正式 CAgent 回归稳定。
-const ENABLE_USER_ASID: bool = false;
+/// 用户地址空间使用不复用的硬件 ASID；页表修改路径负责向其他在线 hart
+/// 发起 TLB shootdown，普通 trap 返回无需再做全量刷新。
+const ENABLE_USER_ASID: bool = true;
 
 static NEXT_USER_ASID: AtomicUsize = AtomicUsize::new(FIRST_USER_ASID);
 static ASID_GENERATION: AtomicUsize = AtomicUsize::new(1);
@@ -36,6 +36,7 @@ static ASID_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 pub struct AsidContext {
     asid: AtomicUsize,
     generation: AtomicUsize,
+    active_hart_mask: AtomicUsize,
     icache_stale_mask: AtomicUsize,
 }
 
@@ -44,6 +45,7 @@ impl AsidContext {
         Self {
             asid: AtomicUsize::new(0),
             generation: AtomicUsize::new(0),
+            active_hart_mask: AtomicUsize::new(0),
             icache_stale_mask: AtomicUsize::new(configured_hart_mask()),
         }
     }
@@ -68,6 +70,18 @@ impl AsidContext {
     pub fn invalidate(&self) {
         self.asid.store(0, Ordering::Release);
         self.generation.store(0, Ordering::Release);
+        self.active_hart_mask.store(0, Ordering::Release);
+    }
+
+    fn mark_local_active(&self) {
+        let bit = local_hart_bit();
+        if bit != 0 {
+            self.active_hart_mask.fetch_or(bit, Ordering::AcqRel);
+        }
+    }
+
+    fn remote_active_harts(&self) -> usize {
+        self.active_hart_mask.load(Ordering::Acquire) & online_hart_mask() & !local_hart_bit()
     }
 
     pub fn mark_icache_stale(&self) {
@@ -162,6 +176,9 @@ fn token_with_asid(token: usize, asid: usize) -> usize {
 
 pub fn prepare_user_satp(ctx: &AsidContext, token: usize) -> (usize, bool, bool) {
     let need_icache_flush = ctx.take_local_icache_stale();
+    // 记录这个 mm 曾在哪些 hart 上安装过。页表改变时只需要 shootdown 这些
+    // 可能缓存旧翻译的 hart，而不是打断全部 12 个核心。
+    ctx.mark_local_active();
     if !ENABLE_USER_ASID {
         return (token_with_asid(token, KERNEL_ASID), true, need_icache_flush);
     }
@@ -210,6 +227,12 @@ pub fn flush_user_page(ctx: &AsidContext, vaddr: usize) {
     let generation = ASID_GENERATION.load(Ordering::Acquire);
     if asid_fast_path_enabled() && ctx.valid_for(generation) {
         let asid = ctx.asid.load(Ordering::Acquire);
+        // 同一个 mm 的线程可能在其他 hart 上运行，或者该 mm 最近曾在其他
+        // hart 上留下 TLB 项。先请求远端完整刷新，再清除本地指定 ASID/页。
+        // 当前 SBI 封装尚未提供按 ASID 的远端接口，页表更新远少于 trap
+        // 返回，因此这里采用正确性优先的远端全量 shootdown。
+        let remote_mask = ctx.remote_active_harts();
+        crate::sbi::remote_sfence_vma_all(remote_mask);
         // SAFETY: the address and ASID are kernel-managed; this invalidates one
         // non-global user translation while preserving unrelated ASIDs.
         unsafe {

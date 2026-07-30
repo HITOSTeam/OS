@@ -25,11 +25,9 @@ pub fn syscall_brk(addr: usize) -> isize {
         }
         return brk as isize;
     }
-    // 全局 commit 统计会依次读取所有进程的 mm。必须在持有当前 mm 锁之前
-    // 完成，否则统计走回当前进程时会再次获取同一把非重入锁，造成 brk 永久
-    // 卡住。这里保存调用开始时的快照，后续只在锁内做纯数值判断。
-    let committed_before = vm_committed_as_bytes();
-    let commit_limit = overcommit_limit_bytes();
+    // overcommit 状态必须在持有当前 mm 锁之前拍摄。严格模式可能读取全局
+    // committed 统计；若锁内执行，统计走回当前进程时会重复获取非重入锁。
+    let overcommit = OvercommitSnapshot::capture();
     let mut memory_set = mm.lock();
     let shm_attaches = memory_set.sysv_shm_attaches_snapshot();
     let update: BrkUpdate = memory_set.try_update_brk_with_holes(
@@ -37,11 +35,7 @@ pub fn syscall_brk(addr: usize) -> isize {
         USER_VA_TOP,
         BRK_RELATIVE_COMPAT_MAX,
         |page| page_overlaps_sysv_shm_regions(page, &shm_attaches),
-        |additional_bytes| {
-            commit_limit.is_some_and(|limit| {
-                committed_before.saturating_add(additional_bytes) > limit
-            })
-        },
+        |additional_bytes| overcommit.rejects(additional_bytes),
     );
     if crate::debug_config::DEBUG_SYSCALL {
         crate::println!(
@@ -143,6 +137,7 @@ impl MmapSource<'_> {
 fn build_vma_areas(
     source: MmapSource<'_>,
     is_shared: bool,
+    lock_range: bool,
     map_start: usize,
     map_end: usize,
     sigbus_start: usize,
@@ -187,7 +182,30 @@ fn build_vma_areas(
                 end: map_end,
             });
         }
-        (false, MmapSource::RegularFile { .. } | MmapSource::Shm { .. }) => {
+        (false, MmapSource::RegularFile { .. }) => {
+            if map_start < sigbus_start {
+                // 普通私有文件映射默认按页读取，避免 mmap 大文件时同步扫描整个文件。
+                // MAP_LOCKED 仍保留立即驻留语义。
+                areas.push(if lock_range {
+                    VmaInsertArea::Framed {
+                        start: map_start,
+                        end: sigbus_start,
+                    }
+                } else {
+                    VmaInsertArea::Lazy {
+                        start: map_start,
+                        end: sigbus_start,
+                    }
+                });
+            }
+            if sigbus_start < map_end {
+                areas.push(VmaInsertArea::Lazy {
+                    start: sigbus_start,
+                    end: map_end,
+                });
+            }
+        }
+        (false, MmapSource::Shm { .. }) => {
             if map_start < sigbus_start {
                 areas.push(VmaInsertArea::Framed {
                     start: map_start,
@@ -601,8 +619,15 @@ pub fn syscall_mmap(
         map_end
     };
 
-    let vma_areas = match build_vma_areas(source, is_shared, map_start, map_end, sigbus_start, off)
-    {
+    let vma_areas = match build_vma_areas(
+        source,
+        is_shared,
+        lock_range,
+        map_start,
+        map_end,
+        sigbus_start,
+        off,
+    ) {
         Ok(areas) => areas,
         Err(e) => return e,
     };
@@ -640,6 +665,7 @@ pub fn syscall_mmap(
             (true, MmapSource::RegularFile { .. })
             | (true, MmapSource::Anonymous | MmapSource::DevZero)
             | (false, MmapSource::Anonymous | MmapSource::DevZero) => MapType::Lazy,
+            (false, MmapSource::RegularFile { .. }) if !lock_range => MapType::Lazy,
             (true, MmapSource::Shm { .. })
             | (false, MmapSource::RegularFile { .. })
             | (false, MmapSource::Shm { .. }) => MapType::Framed,
@@ -660,9 +686,10 @@ pub fn syscall_mmap(
         growsdown: (flags & MAP_GROWSDOWN) != 0,
         fork_inherited_anon: false,
     };
-    // shared OSInode 页由 fault 从文件/cache 装入；private/file framed 映射仍可预填充。
-    let should_populate_file =
-        matches!(source, MmapSource::RegularFile { .. }) && !shared_inode_backed;
+    // 普通文件映射统一由 fault 按页读取；只有 MAP_LOCKED 的私有映射立即填充。
+    let should_populate_file = matches!(source, MmapSource::RegularFile { .. })
+        && !shared_inode_backed
+        && lock_range;
     let backing_file = match source {
         MmapSource::RegularFile { .. } | MmapSource::Shm { .. } => file.as_ref(),
         _ => None,

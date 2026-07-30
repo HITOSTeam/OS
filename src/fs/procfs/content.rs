@@ -474,7 +474,11 @@ pub fn vm_committed_as_bytes() -> usize {
     };
     processes.iter().fold(0usize, |acc, process| {
         let mm = process.memory_set();
-        let memory_set = mm.lock();
+        // /proc/meminfo 是统计快照，不能为了精确读取一个正在修改的 mm
+        // 阻塞所有并发 brk/mmap。忙碌地址空间留到下一次采样统计。
+        let Some(memory_set) = mm.try_lock() else {
+            return acc;
+        };
         let heap = memory_set.heap_size();
         let anon_private = memory_set.anon_private_writable_vm_bytes();
         acc.saturating_add(heap).saturating_add(anon_private)

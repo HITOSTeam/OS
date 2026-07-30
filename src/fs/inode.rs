@@ -4,8 +4,7 @@ use super::{File, POLLIN, POLLOUT};
 use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
 use crate::mm::UserBuffer;
 use crate::println;
-use crate::task::manager::PID2PCB;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -28,6 +27,9 @@ struct Ext4Lock {
 }
 
 impl Ext4Lock {
+    /// 先让锁持有者有机会结束短临界区，再尝试进入调度器。
+    const SPINS_BEFORE_YIELD: usize = 64;
+
     const fn new() -> Self {
         Self {
             held: AtomicBool::new(false),
@@ -35,6 +37,7 @@ impl Ext4Lock {
     }
 
     fn lock(&self) {
+        let mut spins = 0usize;
         loop {
             // Attempt to acquire: CAS is more efficient than swap on
             // weakly-ordered architectures (RISC-V, LoongArch) because it
@@ -46,11 +49,16 @@ impl Ext4Lock {
             {
                 return;
             }
-            // Hint the CPU we are in a spin-wait before deciding to yield.
+            // ext4 临界区通常很短，先做有限次本地自旋，减少无谓上下文切换。
             spin_loop();
-            if crate::task::processor::current_task().is_some() {
-                crate::task::processor::suspend_current_and_run_next();
+            spins += 1;
+            if spins < Self::SPINS_BEFORE_YIELD {
+                continue;
             }
+            spins = 0;
+
+            // 不可调度上下文只继续短暂自旋，避免持有当前 TCB 锁时重入调度器。
+            let _ = crate::task::processor::try_suspend_current_and_run_next();
         }
     }
 
@@ -91,6 +99,10 @@ lazy_static! {
     static ref EXT4_LOCK: Arc<Ext4Lock> = Arc::new(Ext4Lock::new());
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref DEFERRED_UNLINK_CLEANUP: Mutex<BTreeMap<(usize, u32), TmpfileCleanup>> =
+        Mutex::new(BTreeMap::new());
+    /// Linux inode/open-file-description 风格的打开引用计数。unlink 判断文件
+    /// 生命周期时查询该表，不再遍历并锁住所有进程的 fd 表。
+    static ref OPEN_INODE_DESCRIPTIONS: Mutex<BTreeMap<(usize, u32), usize>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> =
         Mutex::new(BTreeMap::new());
@@ -587,6 +599,7 @@ pub struct OSInode {
     fanotify_path: Option<String>,
     tmpfile_cleanup: Option<TmpfileCleanup>,
     write_open: Mutex<WriteOpenState>,
+    inode_key: Option<(usize, u32)>,
     inner: Arc<Mutex<OSInodeInner>>,
 }
 
@@ -793,6 +806,11 @@ impl OSInode {
     ) -> Result<Self, isize> {
         let regular_file_poll_ready = inode.is_file();
         let write_open = WriteOpenState::register_for_inode(writable, &inode)?;
+        let inode_key = regular_file_poll_ready.then(|| (inode.device_id(), inode.inode_num()));
+        if let Some(key) = inode_key {
+            let mut refs = OPEN_INODE_DESCRIPTIONS.lock();
+            *refs.entry(key).or_insert(0) += 1;
+        }
         let inner = Arc::new_cyclic(|inner_weak| {
             Mutex::new(OSInodeInner {
                 offset: 0,
@@ -819,6 +837,7 @@ impl OSInode {
             fanotify_path: None,
             tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
             write_open: Mutex::new(write_open),
+            inode_key,
             inner,
         })
     }
@@ -1213,34 +1232,16 @@ pub(crate) fn register_deferred_unlink_cleanup(
 }
 
 fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    let mut seen_tables = BTreeSet::new();
-    for process in processes {
-        let files = process.files();
-        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
-            continue;
-        }
-        if files
-            .lock()
-            .iter_files_snapshot()
-            .into_iter()
-            .any(|(_fd, file)| {
-                file.as_any()
-                    .downcast_ref::<OSInode>()
-                    .map(|o| {
-                        let inode = o.ext4_inode();
-                        inode.inode_num() == inode_num && inode.device_id() == device_id
-                    })
-                    .unwrap_or(false)
-            })
-        {
-            return true;
-        }
-    }
-    false
+    has_open_inode_description(device_id, inode_num)
+}
+
+pub(crate) fn has_open_inode_description(device_id: usize, inode_num: u32) -> bool {
+    OPEN_INODE_DESCRIPTIONS
+        .lock()
+        .get(&(device_id, inode_num))
+        .copied()
+        .unwrap_or(0)
+        != 0
 }
 
 /// Attempt to clean up any lingering deferred-unlink entries whose inodes
@@ -1685,6 +1686,15 @@ impl Drop for OSInode {
             Self::mark_write_buf_clean(&mut inner);
         }
         drop(inner);
+        if let Some(key) = self.inode_key.take() {
+            let mut refs = OPEN_INODE_DESCRIPTIONS.lock();
+            if let Some(count) = refs.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    refs.remove(&key);
+                }
+            }
+        }
         if let Some(cleanup) = self.tmpfile_cleanup.take() {
             if {
                 let _fs_guard = ext4_lock();
