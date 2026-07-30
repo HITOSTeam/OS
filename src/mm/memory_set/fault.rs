@@ -164,8 +164,8 @@ impl MemorySet {
         self.flush_user_page(fault_va);
         #[cfg(target_arch = "riscv64")]
         {
-            let remote_hart_mask = crate::task::manager::online_hart_mask()
-                & !(1usize << crate::arch::hart_id());
+            let remote_hart_mask =
+                crate::task::manager::online_hart_mask() & !(1usize << crate::arch::hart_id());
             if remote_hart_mask != 0 {
                 crate::sbi::remote_sfence_vma_all(remote_hart_mask);
             }

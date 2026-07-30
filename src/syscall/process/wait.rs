@@ -159,10 +159,7 @@ fn reap_zombie_child(child: &Arc<ProcessControlBlock>) -> u64 {
     // Linux accumulates the child's thread-group CPU time plus the child's
     // already waited descendants into the parent at reap time.
     let cpu_ns = own_cpu_ns.saturating_add(child_cpu_ns);
-    let tasks = {
-        let mut inner = child.borrow_mut();
-        core::mem::take(&mut inner.tasks)
-    };
+    let tasks = child.take_all_tasks();
     let child_pid = child.getpid();
     for task in tasks.into_iter().flatten() {
         let exit_cleaned = task.borrow_mut().res.is_none();
@@ -260,7 +257,8 @@ fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
     let mut saw_interrupt = false;
     let mut first_sig = None;
     let process = current_process();
-    let inner = process.borrow_mut();
+    let process_stopped = process.borrow_mut().stopped;
+    let inner = process.signal();
     while bits != 0 {
         let signum = bits.trailing_zeros() as usize + 1;
         let bit = 1u64 << (signum - 1);
@@ -281,7 +279,7 @@ fn wait4_pending_action(task: &Arc<TaskControlBlock>) -> Option<isize> {
         if action.handler == SIG_DFL {
             // 默认动作不中断 wait（如 SIGCHLD 默认忽略）时，同样清除并继续。
             // 若默认动作确实需要打断（如 SIGTERM），则设置 interrupt 标志后立即退出遍历。
-            if !sig_default_interrupts_wait(signum, inner.stopped) {
+            if !sig_default_interrupts_wait(signum, process_stopped) {
                 clear_bits |= bit;
                 continue;
             }
@@ -382,7 +380,7 @@ pub(super) fn wake_parent_waiters_for(process: &Arc<ProcessControlBlock>) {
 /// 以便 `PTRACE_CONT`/`PTRACE_DETACH` 通过 `stopped_by_signal` 标志精确地反向唤醒它们。
 /// 最后调用 `block_current_and_run_next` 挂起当前线程，等待 tracer 的下一次 continue。
 pub(super) fn enter_ptrace_stop(process: &Arc<ProcessControlBlock>, signum: i32) {
-    let tasks = {
+    {
         let mut inner = process.borrow_mut();
         if inner.ptrace_tracer_pid.is_none() {
             return;
@@ -391,12 +389,8 @@ pub(super) fn enter_ptrace_stop(process: &Arc<ProcessControlBlock>, signum: i32)
         inner.stop_signal = signum;
         inner.stop_pending = true;
         inner.continued = false;
-        inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<Vec<_>>()
-    };
+    }
+    let tasks = process.tasks_snapshot();
     for task in tasks {
         let mut task_inner = task.borrow_mut();
         if task_inner.task_status != TaskStatus::Blocked {
@@ -1104,7 +1098,7 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
             if !crate::task::signal::can_signal_process(&target, SIGSTOP_NUM as i32) {
                 return err(SyscallError::EPERM);
             }
-            let tasks = {
+            {
                 let mut inner = target.borrow_mut();
                 if inner.is_zombie {
                     return err(SyscallError::ESRCH);
@@ -1117,12 +1111,8 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                 inner.stop_pending = true;
                 inner.stop_signal = SIGSTOP_NUM as i32;
                 inner.continued = false;
-                inner
-                    .tasks
-                    .iter()
-                    .filter_map(|t| t.as_ref().cloned())
-                    .collect::<Vec<_>>()
-            };
+            }
+            let tasks = target.tasks_snapshot();
             note_ptrace_attach_to(tracer_pid);
             // 将目标进程的所有线程标记为因信号停止，以便 DETACH/CONT 能精确恢复它们。
             for task in tasks {
@@ -1147,20 +1137,16 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            let (old_tracer, tasks) = {
+            let old_tracer = {
                 let mut inner = target.borrow_mut();
                 let old_tracer = inner.ptrace_tracer_pid.take();
                 inner.stopped = false;
                 inner.stop_pending = false;
                 inner.stop_signal = 0;
                 inner.continued = true;
-                let tasks = inner
-                    .tasks
-                    .iter()
-                    .filter_map(|t| t.as_ref().cloned())
-                    .collect::<Vec<_>>();
-                (old_tracer, tasks)
+                old_tracer
             };
+            let tasks = target.tasks_snapshot();
             if let Some(tracer_pid) = old_tracer {
                 note_ptrace_detach_from(tracer_pid);
             }
@@ -1192,18 +1178,14 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            let tasks = {
+            {
                 let mut inner = target.borrow_mut();
                 inner.stopped = false;
                 inner.stop_pending = false;
                 inner.stop_signal = 0;
                 inner.continued = true;
-                inner
-                    .tasks
-                    .iter()
-                    .filter_map(|t| t.as_ref().cloned())
-                    .collect::<Vec<_>>()
-            };
+            }
+            let tasks = target.tasks_snapshot();
             for task in tasks {
                 let mut task_inner = task.borrow_mut();
                 if !task_inner.stopped_by_signal {
@@ -1227,18 +1209,14 @@ pub fn syscall_ptrace(request: usize, pid: usize, _addr: usize, data: usize) -> 
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            let tasks = {
+            {
                 let mut inner = target.borrow_mut();
                 inner.stopped = false;
                 inner.stop_pending = false;
                 inner.stop_signal = 0;
                 inner.continued = false;
-                inner
-                    .tasks
-                    .iter()
-                    .filter_map(|t| t.as_ref().cloned())
-                    .collect::<Vec<_>>()
-            };
+            }
+            let tasks = target.tasks_snapshot();
             // 先投递 SIGKILL，再唤醒线程，确保线程恢复运行后第一时间处理致命信号。
             queue_process_signal(pid, SIGKILL_NUM);
             for task in tasks {

@@ -134,11 +134,7 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             let inner = task.borrow_mut();
             (
                 pid,
-                inner
-                    .res
-                    .as_ref()
-                    .map(|res| res.tid)
-                    .unwrap_or(usize::MAX),
+                inner.res.as_ref().map(|res| res.tid).unwrap_or(usize::MAX),
                 inner.task_cx.ra,
                 inner.task_cx.sp,
                 task.on_cpu.load(Ordering::Acquire),
@@ -171,8 +167,8 @@ fn handle_user_exception(ecode: usize, badv: usize) {
     }
     if matches!(ecode, ECODE_PAGE_INVALID_STORE | ECODE_PAGE_MODIFY) {
         let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
-        if inner.memory_set.resolve_cow_fault(badv) {
+        let memory_set = process.memory_set();
+        if memory_set.resolve_cow_fault(badv) {
             return;
         }
     }
@@ -187,16 +183,16 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             | ECODE_PAGE_PRIV
     ) {
         let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         let access = match ecode {
             ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
             ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
             _ => MapPermission::W,
         };
-        match inner.memory_set.resolve_lazy_fault(badv, access) {
+        match memory_set.resolve_lazy_fault(badv, access) {
             LazyFaultResult::Resolved => return,
             LazyFaultResult::Oom => {
-                drop(inner);
+                drop(memory_set);
                 exit_group_and_run_next(-9);
             }
             LazyFaultResult::Invalid => {}
@@ -213,16 +209,16 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             | ECODE_PAGE_PRIV
     ) {
         let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         let access = match ecode {
             ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
             ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
             _ => MapPermission::W,
         };
-        match inner.memory_set.try_expand_growsdown(badv, access) {
+        match memory_set.try_expand_growsdown(badv, access) {
             LazyFaultResult::Resolved => return,
             LazyFaultResult::Oom => {
-                drop(inner);
+                drop(memory_set);
                 exit_group_and_run_next(-9);
             }
             LazyFaultResult::Invalid => {}
@@ -514,6 +510,5 @@ pub fn trap_return() -> ! {
 pub fn get_current_token() -> usize {
     let now_task_block = crate::task::processor::current_task().unwrap();
     let process = now_task_block.process.upgrade().unwrap();
-    let process_inner = process.borrow_mut();
-    process_inner.memory_set.token()
+    process.memory_set().token()
 }

@@ -200,12 +200,8 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if matches!(cause, Trap::Exception(STORE_PAGE_FAULT))
-        && inner.memory_set.resolve_cow_fault(stval)
-    {
+    let memory_set = process.memory_set();
+    if matches!(cause, Trap::Exception(STORE_PAGE_FAULT)) && memory_set.resolve_cow_fault(stval) {
         return true;
     }
     let access = match cause {
@@ -214,10 +210,10 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
         Trap::Exception(INSTRUCTION_PAGE_FAULT) => MapPermission::X,
         _ => return false,
     };
-    match inner.memory_set.resolve_lazy_fault(stval, access) {
+    match memory_set.resolve_lazy_fault(stval, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => {
-            drop(inner);
+            drop(memory_set);
             exit_group_and_run_next(-9);
         }
         LazyFaultResult::Invalid => false,
@@ -239,8 +235,7 @@ fn get_trap_context() -> &'static mut TrapContext {
 pub fn get_current_token() -> usize {
     let now_task_block = crate::task::processor::current_task().unwrap();
     let process = now_task_block.process.upgrade().unwrap();
-    let process_inner = process.borrow_mut();
-    process_inner.memory_set.token()
+    process.memory_set().token()
 }
 
 #[unsafe(no_mangle)]
@@ -277,10 +272,9 @@ pub fn trap_handler() {
             let (syscall_id, args) = {
                 let cx = get_trap_context();
                 cx.sepc += 4;
-                (
-                    cx.x[17],
-                    [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
-                )
+                (cx.x[17], [
+                    cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15],
+                ])
             }; // cx is dropped here, releasing the borrow
             if let Some(task) = crate::task::processor::current_task() {
                 let mut inner = task.borrow_mut();
@@ -401,11 +395,11 @@ fn exception_name(code: usize) -> &'static str {
 
 fn try_expand_mmap_growsdown(fault_va: usize, access: MapPermission) -> bool {
     let process = crate::task::processor::current_process();
-    let inner = process.borrow_mut();
-    match inner.memory_set.try_expand_growsdown(fault_va, access) {
+    let memory_set = process.memory_set();
+    match memory_set.try_expand_growsdown(fault_va, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => {
-            drop(inner);
+            drop(memory_set);
             exit_group_and_run_next(-9);
         }
         LazyFaultResult::Invalid => false,
@@ -414,13 +408,12 @@ fn try_expand_mmap_growsdown(fault_va: usize, access: MapPermission) -> bool {
 
 fn fault_hits_mmap_sigbus_tail(addr: usize) -> bool {
     let process = crate::task::processor::current_process();
-    let inner = process.borrow_mut();
-    inner.memory_set.fault_hits_mmap_sigbus_tail(addr)
+    process.memory_set().fault_hits_mmap_sigbus_tail(addr)
 }
 
 fn current_signal_handler(signum: usize) -> usize {
     let process = crate::task::processor::current_process();
-    let inner = process.borrow_mut();
+    let inner = process.signal();
     if signum <= MAX_SIG {
         let legacy = inner.signals_actions.table[signum].handler;
         if legacy != 0 {
@@ -480,8 +473,7 @@ fn handle_user_exception(code: usize, stval: usize) {
     // 2. Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
     if code == STORE_PAGE_FAULT {
         let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
-        if inner.memory_set.resolve_cow_fault(stval) {
+        if process.memory_set().resolve_cow_fault(stval) {
             return;
         }
     }
@@ -500,17 +492,17 @@ fn handle_user_exception(code: usize, stval: usize) {
     //    `Invalid` falls through to the stages below.
     if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {
         let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         let access = match code {
             LOAD_PAGE_FAULT => MapPermission::R,
             STORE_PAGE_FAULT => MapPermission::W,
             INSTRUCTION_PAGE_FAULT => MapPermission::X,
             _ => MapPermission::R,
         };
-        match inner.memory_set.resolve_lazy_fault(stval, access) {
+        match memory_set.resolve_lazy_fault(stval, access) {
             LazyFaultResult::Resolved => return,
             LazyFaultResult::Oom => {
-                drop(inner);
+                drop(memory_set);
                 exit_group_and_run_next(-9);
             }
             LazyFaultResult::Invalid => {}

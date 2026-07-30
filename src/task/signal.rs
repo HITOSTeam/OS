@@ -31,7 +31,7 @@ use crate::{
             pid2process, prime_fair_sync_wakeup_lag, wakeup_signal_tasks, wakeup_task, wakeup_tasks,
         },
         pid_namespace_member_pids,
-        process_block::{ProcessControlBlock, ProcessControlBlockInner},
+        process_block::{ProcessControlBlock, ProcessSignalState},
         process_visible_in_pid_namespace,
         processor::{current_task, hart_id, suspend_current_and_run_next},
         resolve_process_in_pid_namespace,
@@ -185,7 +185,7 @@ fn mark_pending_signal(
     }
 }
 
-fn process_signal_handler(inner: &ProcessControlBlockInner, signum: usize) -> usize {
+fn process_signal_handler(inner: &ProcessSignalState, signum: usize) -> usize {
     if signum <= MAX_SIG {
         let legacy = inner.signals_actions.table[signum].handler;
         if legacy != SIG_DFL {
@@ -209,30 +209,23 @@ fn queue_current_single_thread_signal(
     let Some(current) = current_task() else {
         return false;
     };
-    let task = {
-        let mut process_ref = process.borrow_mut();
-        if process_ref.is_zombie {
+    let live_tasks = process.tasks_snapshot();
+    if live_tasks.len() != 1 {
+        return false;
+    }
+    let task = live_tasks[0].clone();
+    if !Arc::ptr_eq(&task, &current) {
+        return false;
+    }
+    {
+        if process.borrow_mut().is_zombie {
             return true;
         }
-
-        let mut live_tasks = process_ref
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().cloned());
-        let Some(task) = live_tasks.next() else {
-            return true;
-        };
-        if live_tasks.next().is_some() {
-            return false;
-        }
-        if !Arc::ptr_eq(&task, &current) {
-            return false;
-        }
+        let mut process_ref = process.signal();
         if let Some(flag) = legacy_flag {
             process_ref.signals.insert(flag);
         }
-        task
-    };
+    }
 
     let (tid, pending, mask) = {
         let mut inner = task.borrow_mut();
@@ -310,7 +303,8 @@ pub fn has_wait_interrupting_pending(pending: u64, mask: u64) -> bool {
         return false;
     }
     let process = current_process();
-    let inner = process.borrow_mut();
+    let stopped = process.borrow_mut().stopped;
+    let inner = process.signal();
     while ready != 0 {
         let signum = ready.trailing_zeros() as usize + 1;
         ready &= ready - 1;
@@ -327,7 +321,7 @@ pub fn has_wait_interrupting_pending(pending: u64, mask: u64) -> bool {
             continue;
         }
         // SIG DFL 默认。 Linux 对于一些信号有默认处理,检查默认处理 是否是打断
-        if handler == SIG_DFL && !sig_default_interrupts_wait(signum, inner.stopped) {
+        if handler == SIG_DFL && !sig_default_interrupts_wait(signum, stopped) {
             continue;
         }
         return true;
@@ -469,7 +463,8 @@ pub fn check_task_signals_error(task: &Arc<TaskControlBlock>) -> Option<(i32, &'
         };
         let (handler, traced) = {
             let process = current_process();
-            let inner = process.borrow_mut();
+            let traced = process.borrow_mut().ptrace_tracer_pid.is_some();
+            let inner = process.signal();
             let handler = if signum <= MAX_SIG {
                 let legacy = inner.signals_actions.table[signum].handler;
                 if legacy != 0 {
@@ -488,7 +483,7 @@ pub fn check_task_signals_error(task: &Arc<TaskControlBlock>) -> Option<(i32, &'
                     .map(|a| a.handler)
                     .unwrap_or(SIG_DFL)
             };
-            (handler, inner.ptrace_tracer_pid.is_some())
+            (handler, traced)
         };
         // Traced tasks should be intercepted in ptrace-stop first (except SIGKILL),
         // so don't short-circuit to default fatal handling here.
@@ -568,7 +563,7 @@ impl Default for SignalActions {
 // set the signal mask, return the old mask
 pub fn set_signal_mask(mask: u32) -> isize {
     let cur_process = current_process();
-    let mut inner = cur_process.borrow_mut();
+    let mut inner = cur_process.signal();
     let old_mask = inner.signals;
     if let Some(flag) = SignalFlags::from_bits(mask) {
         inner.signals = flag;
@@ -592,7 +587,7 @@ pub fn set_signal(
 ) -> isize {
     let token = get_current_token();
     let process = current_process();
-    let mut inner = process.borrow_mut();
+    let mut inner = process.signal();
     if signum <= 0 || signum as usize > RT_SIG_MAX {
         return -1;
     }
@@ -710,12 +705,12 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             if current_ns_id != 0 && !process_visible_in_pid_namespace(&target, current_ns_id) {
                 return None;
             }
-            let mut process_ref = target.borrow_mut();
-            if process_ref.is_zombie {
+            if target.borrow_mut().is_zombie {
                 // Linux keeps unreaped zombies visible by PID and killable in
                 // the sense that kill(2) succeeds, but no signal is delivered.
                 return None;
             }
+            let mut process_ref = target.signal();
             if let Some(flag) = legacy_flag {
                 process_ref.signals.insert(flag);
             }
@@ -725,15 +720,8 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             } else if handler == SIG_DFL && signal_default_terminates(signum_usize) {
                 fatal_default_wakeup = true;
             }
-            Some(
-                process_ref
-                    .tasks
-                    .iter()
-                    .filter_map(|task_slot: &Option<Arc<TaskControlBlock>>| {
-                        task_slot.as_ref().cloned()
-                    })
-                    .collect::<alloc::vec::Vec<Arc<TaskControlBlock>>>(),
-            )
+            drop(process_ref);
+            Some(target.tasks_snapshot())
         })
         .flatten()
         .collect::<alloc::vec::Vec<Arc<TaskControlBlock>>>();
@@ -819,17 +807,13 @@ pub fn kill_current(signum: i32) -> isize {
         None
     };
     let (sender_pid, sender_uid, _, _) = current_sender_ids();
-    let tasks = {
-        let mut process_ref = process.borrow_mut();
+    {
+        let mut process_ref = process.signal();
         if let Some(flag) = legacy_flag {
             process_ref.signals.insert(flag);
         }
-        process_ref
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<alloc::vec::Vec<_>>()
-    };
+    }
+    let tasks = process.tasks_snapshot();
     let mut running_signal_ipi_mask = 0usize;
     for t in tasks.iter() {
         {
@@ -881,14 +865,7 @@ pub fn queue_process_signal_info(
         );
         return;
     };
-    let tasks = {
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<alloc::vec::Vec<_>>()
-    };
+    let tasks = process.tasks_snapshot();
     let Some(task) = pick_task_for_signal(&tasks, bit) else {
         crate::log_if!(
             DEBUG_UNIXBENCH,

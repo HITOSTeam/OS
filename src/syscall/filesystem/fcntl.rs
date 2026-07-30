@@ -1,14 +1,14 @@
 use super::{
-    Arc, FD_CLOEXEC, FcntlFlock, FcntlOwnerEx, File, O_APPEND, O_ASYNC, O_DIRECT, O_NONBLOCK,
-    FLOCK_LOCKS, FlockLock, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe, PseudoShmFile, RECORD_LOCKS,
-    RecordLockOwner, SyscallError, Vec, WaitingRecordLock, apply_record_lock_for_owner,
-    block_current_and_run_next, clear_record_lock_waiting, collect_conflict_process_owners,
-    current_files, current_files_and_nofile_limit, current_process, current_task,
-    detect_record_lock_deadlock, enqueue_record_lock_waiter, err, file_lock_key,
-    first_conflicting_lock, get_current_token, get_file_lease_type, has_pending_unmasked_signal,
-    lock_conflicts, lock_range_from_flock, ofd_lock_owner_id, remove_record_lock_waiter,
-    set_file_lease, set_record_lock_waiting, try_read_user_value, try_write_user_value,
-    wake_record_lock_waiters,
+    Arc, FD_CLOEXEC, FLOCK_LOCKS, FcntlFlock, FcntlOwnerEx, File, FlockLock, O_APPEND, O_ASYNC,
+    O_DIRECT, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe, PseudoShmFile,
+    RECORD_LOCKS, RecordLockOwner, SyscallError, Vec, WaitingRecordLock,
+    apply_record_lock_for_owner, block_current_and_run_next, clear_record_lock_waiting,
+    collect_conflict_process_owners, current_files, current_files_and_nofile_limit,
+    current_process, current_task, detect_record_lock_deadlock, enqueue_record_lock_waiter, err,
+    file_lock_key, first_conflicting_lock, get_current_token, get_file_lease_type,
+    has_pending_unmasked_signal, lock_conflicts, lock_range_from_flock, ofd_lock_owner_id,
+    remove_record_lock_waiter, set_file_lease, set_record_lock_waiting, try_read_user_value,
+    try_write_user_value, wake_record_lock_waiters,
 };
 
 fn get_fcntl_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
@@ -54,9 +54,9 @@ pub fn syscall_flock(fd: usize, operation: usize) -> isize {
     }
 
     let exclusive = operation & LOCK_EX != 0;
-    let conflict = locks.iter().any(|lock| {
-        lock.owner != owner && (exclusive || lock.exclusive)
-    });
+    let conflict = locks
+        .iter()
+        .any(|lock| lock.owner != owner && (exclusive || lock.exclusive));
     if conflict {
         // 当前工作负载使用非阻塞形式。对阻塞冲突先返回 EAGAIN，避免在尚未具备
         // 完整等待队列时错误睡眠；后续可在本所有权模型上补充阻塞等待。
@@ -559,8 +559,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
                     let id = shm.memfd_id();
                     let process = current_process();
-                    let inner = process.borrow_mut();
-                    inner.memory_set.has_writable_shared_memfd_mapping(id)
+                    process.memory_set().has_writable_shared_memfd_mapping(id)
                 } else {
                     false
                 };

@@ -1611,10 +1611,10 @@ impl MemorySet {
             return false;
         }
 
-        let rollback = UserRangeRollback::capture(
-            self,
-            &[(old_addr, old_end), (target_start, target_new_end)],
-        );
+        let rollback = UserRangeRollback::capture(self, &[
+            (old_addr, old_end),
+            (target_start, target_new_end),
+        ]);
         let relocated = target_start != old_addr;
         if relocated && !self.move_user_vma_range(old_addr, old_len, target_start) {
             rollback.restore(self);
@@ -2575,14 +2575,11 @@ impl MemorySet {
             }
         }
 
-        Ok((
-            load_bias + elf.header.pt2.entry_point() as usize,
-            ElfAux {
-                phdr: phdr_vaddr,
-                phent: ph_entry_size,
-                phnum: ph_count as usize,
-            },
-        ))
+        Ok((load_bias + elf.header.pt2.entry_point() as usize, ElfAux {
+            phdr: phdr_vaddr,
+            phent: ph_entry_size,
+            phnum: ph_count as usize,
+        }))
     }
 
     fn map_elf_segments_from_reader<F>(

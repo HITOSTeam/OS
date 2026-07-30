@@ -1219,14 +1219,7 @@ fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
     };
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            // Cannot inspect this process (lock held) — conservatively assume
-            // it may reference the inode.  The cleanup will be retried on the
-            // next OSInode::drop for the same inode.
-            return true;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }
@@ -1679,9 +1672,7 @@ impl Drop for OSInode {
     fn drop(&mut self) {
         // `flock(2)` 锁属于 open-file-description；OSInode 析构意味着所有
         // `dup`/`fork` 共享引用均已关闭，此时必须清除锁，避免 Cargo 永久重试。
-        crate::syscall::filesystem::release_flock_locks_for_owner(
-            self as *const OSInode as usize,
-        );
+        crate::syscall::filesystem::release_flock_locks_for_owner(self as *const OSInode as usize);
         let mut inner = self.inner.lock();
         let inode_key = (inner.inode.device_id(), inner.inode.inode_num());
         if !inner.write_buf.is_empty() {

@@ -766,13 +766,7 @@ pub fn refresh_thread_legacy_cpu_fair_group_cache(process_pid: usize, tid_index:
     let Some(process) = pid2process(process_pid) else {
         return;
     };
-    let task = {
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .get(tid_index)
-            .and_then(|slot| slot.as_ref().cloned())
-    };
+    let task = process.task_at(tid_index);
     let Some(task) = task else {
         return;
     };
@@ -783,12 +777,8 @@ pub fn refresh_thread_legacy_cpu_fair_group_cache(process_pid: usize, tid_index:
 pub fn refresh_process_legacy_cpu_fair_group_cache(process: &Arc<ProcessControlBlock>) {
     let pid = process.getpid();
     let tasks = {
-        let inner = process.borrow_mut();
         let mut tasks = Vec::new();
-        for slot in inner.tasks.iter() {
-            let Some(task) = slot.as_ref().cloned() else {
-                continue;
-            };
+        for task in process.tasks_snapshot() {
             let Some(tid) = task.borrow_mut().res.as_ref().map(|res| res.tid) else {
                 continue;
             };

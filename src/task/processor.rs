@@ -256,18 +256,28 @@ fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
             let mut condvar_waiters = 0usize;
             let mut mutex_waiters = 0usize;
             for process in processes {
+                let tasks = process.tasks_snapshot();
+                task_slots = task_slots.saturating_add(
+                    tasks
+                        .iter()
+                        .filter(|holder| Arc::ptr_eq(holder, &task))
+                        .count(),
+                );
+                for holder in &tasks {
+                    if Arc::ptr_eq(holder, &task) {
+                        continue;
+                    }
+                    if let Some(holder_inner) = holder.try_borrow_mut() {
+                        join_waiters = join_waiters.saturating_add(
+                            holder_inner
+                                .join_waiters
+                                .iter()
+                                .filter(|w| Arc::ptr_eq(w, &task))
+                                .count(),
+                        );
+                    }
+                }
                 if let Some(inner) = process.try_borrow_mut() {
-                    task_slots = task_slots.saturating_add(
-                        inner
-                            .tasks
-                            .iter()
-                            .filter(|slot| {
-                                slot.as_ref()
-                                    .map(|holder| Arc::ptr_eq(holder, &task))
-                                    .unwrap_or(false)
-                            })
-                            .count(),
-                    );
                     wait_queues = wait_queues.saturating_add(
                         inner
                             .wait_queue
@@ -282,20 +292,6 @@ fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
                             .filter(|holder| Arc::ptr_eq(holder, &task))
                             .count(),
                     );
-                    for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
-                        if Arc::ptr_eq(holder, &task) {
-                            continue;
-                        }
-                        if let Some(holder_inner) = holder.try_borrow_mut() {
-                            join_waiters = join_waiters.saturating_add(
-                                holder_inner
-                                    .join_waiters
-                                    .iter()
-                                    .filter(|w| Arc::ptr_eq(w, &task))
-                                    .count(),
-                            );
-                        }
-                    }
                     for sem in inner.semaphore_list.iter().filter_map(|s| s.as_ref()) {
                         sem_waiters = sem_waiters.saturating_add(
                             sem.inner
@@ -434,10 +430,7 @@ fn finish_thread_exit_cleanup(
     drop_user_res: bool,
 ) -> (usize, bool, Option<usize>) {
     let pid = process.getpid();
-    let token = {
-        let inner = process.borrow_mut();
-        inner.memory_set.token()
-    };
+    let token = process.memory_set().token();
 
     if cleanup.robust_list_head != 0 {
         let linux_tid = crate::syscall::misc::encode_linux_tid(pid, cleanup.tid) as u32;
@@ -525,14 +518,7 @@ fn cleanup_process_threads_for_group_exit(
     current_task: &Arc<TaskControlBlock>,
     exit_code: i32,
 ) -> Vec<TaskUserRes> {
-    let members = {
-        let process_inner = process.borrow_mut();
-        process_inner
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().cloned())
-            .collect::<Vec<_>>()
-    };
+    let members = process.tasks_snapshot();
 
     let mut recycle_res = Vec::<TaskUserRes>::new();
     for member in &members {
@@ -919,11 +905,9 @@ pub(crate) fn current_files() -> Arc<spin::Mutex<FilesStruct>> {
 
 pub(crate) fn current_files_and_nofile_limit() -> (Arc<spin::Mutex<FilesStruct>>, usize) {
     let process = current_process();
-    let inner = process.borrow_mut();
-    (
-        Arc::clone(&inner.files),
-        inner.rlimits.rlimit_nofile_cur as usize,
-    )
+    let files = process.files();
+    let limit = process.borrow_mut().rlimits.rlimit_nofile_cur as usize;
+    (files, limit)
 }
 
 // todo
@@ -1330,17 +1314,9 @@ pub fn idle_task() {
             if let Some(process) = task.process.upgrade() {
                 if let Some(mut inner) = process.try_borrow_mut() {
                     let keep_for_reap = inner.is_zombie && Arc::strong_count(&task) > 2;
+                    drop(inner);
                     if !keep_for_reap {
-                        for slot in inner.tasks.iter_mut() {
-                            if slot
-                                .as_ref()
-                                .map(|t| Arc::ptr_eq(t, &task))
-                                .unwrap_or(false)
-                            {
-                                *slot = None;
-                                break;
-                            }
-                        }
+                        process.remove_task_ref(&task);
                     }
                 }
             }
@@ -1662,16 +1638,9 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             // For Linux threads, remove from the process task table immediately.
             // Joiners use futexes instead of waittid, so we don't need the slot.
             let thread_cpu_ns = crate::task::runtime::task_cpu_time_ns(&task);
-            let mut process_inner = process.borrow_mut();
-            let remove_slot = process_inner
-                .tasks
-                .get(tid)
-                .and_then(|slot| slot.as_ref())
-                .map(|t| Arc::ptr_eq(t, &task))
-                .unwrap_or(false);
-            if remove_slot {
+            if process.remove_task_if(tid, &task) {
+                let mut process_inner = process.borrow_mut();
                 process_inner.cpu_time_ns = process_inner.cpu_time_ns.saturating_add(thread_cpu_ns);
-                process_inner.tasks[tid] = None;
             }
         }
     }
@@ -1715,17 +1684,14 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // Detach and semantically close this process' fd table before the
         // zombie becomes visible to waiters.  Heavy file object drops remain
         // deferred below.
-        let (parent, exit_signal, old_files) = {
+        let old_files = process.replace_files(Arc::new(spin::Mutex::new(FilesStruct::new())));
+        close_files_struct_fd_refs_if_unshared(&old_files);
+        let (parent, exit_signal) = {
             let mut process_inner = process.borrow_mut();
             crate::syscall::process::unregister_executing_inode(
                 process_inner.exec_inode_dev,
                 process_inner.exec_inode_num,
             );
-            let old_files = core::mem::replace(
-                &mut process_inner.files,
-                Arc::new(spin::Mutex::new(FilesStruct::new())),
-            );
-            close_files_struct_fd_refs_if_unshared(&old_files);
             process_inner.is_zombie = true;
             process_inner.dumped_core = dumped_core;
             process_inner.exit_code = exit_code;
@@ -1733,7 +1699,6 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             (
                 process_inner.parent.as_ref().and_then(|p| p.upgrade()),
                 process_inner.exit_signal,
-                old_files,
             )
         }; // drop child PCB lock before touching parent to avoid lock inversion
         crate::syscall::process::release_ptrace_tracer(&process);
@@ -1760,25 +1725,18 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // same exit-side futex/join cleanup as the current thread.
         let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
         recycle_res.clear();
-        let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
+        // Linux 在退出时先把 mm 从进程上摘下，zombie 只保留元数据。
+        let mut old_mm = process.replace_memory_set(MmRef::new(MemorySet::new_bare()));
+        let old_mm_token = old_mm.token();
+        let old_shm_cleanup = old_mm.take_sysv_shm_attaches_for_cleanup();
+        let old_net_ns_id = {
             let mut process_inner = process.borrow_mut();
             process_inner.clear_children();
             process_inner.exited_children.clear();
-            let old_mm_token = process_inner.memory_set.token();
             let old_net_ns_id = process_inner.net_ns_id;
-            let old_shm_cleanup = process_inner
-                .memory_set
-                .take_sysv_shm_attaches_for_cleanup();
-            // Linux releases `mm_struct` at exit and keeps only zombie metadata.
-            // Drop the full user address space here so unreaped zombies do not pin
-            // page-table pages (and COW refs) during fork-heavy workloads.
-            let old_mm = core::mem::replace(
-                &mut process_inner.memory_set,
-                MmRef::new(MemorySet::new_bare()),
-            );
             crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
             crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-            (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
+            old_net_ns_id
         };
         if !release_process_mm_owner(old_mm_token) {
             crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
@@ -1854,17 +1812,14 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         }
     }
 
-    let (parent, exit_signal, old_files) = {
+    let old_files = process.replace_files(Arc::new(spin::Mutex::new(FilesStruct::new())));
+    close_files_struct_fd_refs_if_unshared(&old_files);
+    let (parent, exit_signal) = {
         let mut process_inner = process.borrow_mut();
         crate::syscall::process::unregister_executing_inode(
             process_inner.exec_inode_dev,
             process_inner.exec_inode_num,
         );
-        let old_files = core::mem::replace(
-            &mut process_inner.files,
-            Arc::new(spin::Mutex::new(FilesStruct::new())),
-        );
-        close_files_struct_fd_refs_if_unshared(&old_files);
         process_inner.is_zombie = true;
         process_inner.dumped_core = dumped_core;
         process_inner.exit_code = exit_code;
@@ -1872,7 +1827,6 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         (
             process_inner.parent.as_ref().and_then(|p| p.upgrade()),
             process_inner.exit_signal,
-            old_files,
         )
     };
     crate::syscall::process::release_ptrace_tracer(&process);
@@ -1896,24 +1850,17 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
 
     let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();
-    let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
+    let mut old_mm = process.replace_memory_set(MmRef::new(MemorySet::new_bare()));
+    let old_mm_token = old_mm.token();
+    let old_shm_cleanup = old_mm.take_sysv_shm_attaches_for_cleanup();
+    let old_net_ns_id = {
         let mut process_inner = process.borrow_mut();
         process_inner.clear_children();
         process_inner.exited_children.clear();
-        let old_mm_token = process_inner.memory_set.token();
         let old_net_ns_id = process_inner.net_ns_id;
-        let old_shm_cleanup = process_inner
-            .memory_set
-            .take_sysv_shm_attaches_for_cleanup();
-        // Same as exit_current_and_run_next(): release the whole user address
-        // space eagerly and keep only zombie bookkeeping in the PCB.
-        let old_mm = core::mem::replace(
-            &mut process_inner.memory_set,
-            MmRef::new(MemorySet::new_bare()),
-        );
         crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
         crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-        (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
+        old_net_ns_id
     };
     if !release_process_mm_owner(old_mm_token) {
         crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);

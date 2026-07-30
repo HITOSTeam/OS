@@ -689,9 +689,9 @@ pub(crate) fn proc_pid_fd_entries(pid: u32) -> Vec<PseudoDirent> {
     let Some(inner) = proc.try_borrow_mut() else {
         return entries;
     };
-    let files = alloc::sync::Arc::clone(&inner.files);
     let limit = inner.rlimits.rlimit_nofile_cur as usize;
     drop(inner);
+    let files = proc.files();
     let files_guard = files.lock();
     let mut has_predicted = false;
     let predicted_fd = if pid as usize == current_process().getpid() {
@@ -734,11 +734,7 @@ pub(crate) fn proc_pid_fd_exists(pid: u32, fd: usize) -> bool {
     let Some(proc) = pid2process(pid as usize) else {
         return false;
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        return false;
-    };
-    let files = alloc::sync::Arc::clone(&inner.files);
-    drop(inner);
+    let files = proc.files();
     files.lock().is_fd_open(fd)
 }
 
@@ -757,11 +753,7 @@ pub(crate) fn proc_pid_fdinfo_entries(pid: u32) -> Vec<PseudoDirent> {
     let Some(proc) = pid2process(pid as usize) else {
         return entries;
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        return entries;
-    };
-    let files = alloc::sync::Arc::clone(&inner.files);
-    drop(inner);
+    let files = proc.files();
     let files_guard = files.lock();
     for (fd, _file) in files_guard.iter_files_snapshot() {
         entries.push(PseudoDirent {
@@ -807,13 +799,7 @@ pub(crate) fn proc_pid_task_entries(pid: u32) -> Vec<PseudoDirent> {
     let Some(proc) = pid2process(pid as usize) else {
         return entries;
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        return entries;
-    };
-    for (tid_index, task) in inner.tasks.iter().enumerate() {
-        let Some(task) = task.as_ref() else {
-            continue;
-        };
+    for (tid_index, task) in proc.indexed_tasks_snapshot() {
         let alive = task
             .try_borrow_mut()
             .map(|ti| ti.res.is_some() && ti.exit_code.is_none())
@@ -838,13 +824,7 @@ pub(crate) fn proc_pid_task_alive(pid: u32, tid: u32) -> bool {
     let Some(proc) = pid2process(pid as usize) else {
         return false;
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        return false;
-    };
-    inner
-        .tasks
-        .get(tid_index)
-        .and_then(|t| t.as_ref())
+    proc.task_at(tid_index)
         .and_then(|t| {
             t.try_borrow_mut()
                 .map(|ti| ti.res.is_some() && ti.exit_code.is_none())

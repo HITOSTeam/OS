@@ -258,10 +258,11 @@ pub fn normalize_proc_magic_path(path: &str) -> Cow<'_, str> {
 /// 无法识别的类型返回 `None`。
 fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     let proc = pid2process(pid as usize)?;
-    let (files, cwd) = {
+    let cwd = {
         let inner = proc.try_borrow_mut()?;
-        (Arc::clone(&inner.files), inner.cwd.clone())
+        inner.cwd.clone()
     };
+    let files = proc.files();
     let file = files.lock().get_file(fd)?;
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
@@ -337,10 +338,7 @@ fn proc_pid_exe(pid: u32) -> Option<String> {
 /// 取目标进程 fd 表中指定 fd 的文件对象（克隆 `Arc`）。进程不存在或 fd 无效时返回 `None`。
 fn proc_pid_fd_file(pid: u32, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
     let proc = pid2process(pid as usize)?;
-    let files = {
-        let inner = proc.try_borrow_mut()?;
-        Arc::clone(&inner.files)
-    };
+    let files = proc.files();
     files.lock().get_file(fd)
 }
 

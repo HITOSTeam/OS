@@ -4,19 +4,13 @@ pub(crate) fn live_thread_ids_for_process(tgid: usize) -> Vec<CgroupThreadId> {
     let Some(process) = pid2process(tgid) else {
         return Vec::new();
     };
-    let inner = process.borrow_mut();
-    inner
-        .tasks
-        .iter()
-        .enumerate()
+    process
+        .indexed_tasks_snapshot()
+        .into_iter()
         .filter_map(|(tid_index, task)| {
-            task.as_ref().and_then(|task| {
-                task.try_borrow_mut()
-                    .and_then(|inner| {
-                        (inner.res.is_some() && inner.exit_code.is_none()).then_some(())
-                    })
-                    .map(|_| CgroupThreadId::new(tgid, tid_index))
-            })
+            task.try_borrow_mut()
+                .and_then(|inner| (inner.res.is_some() && inner.exit_code.is_none()).then_some(()))
+                .map(|_| CgroupThreadId::new(tgid, tid_index))
         })
         .collect()
 }
@@ -51,34 +45,22 @@ pub(crate) fn visible_tid_to_thread_id(pid_ns_id: usize, tid: usize) -> Option<C
         let tgid = tid >> LINUX_TID_PID_SHIFT;
         let tid_index = decode_linux_tid_strict(tgid, tid)?;
         let process = pid2process(tgid)?;
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .get(tid_index)
-            .and_then(|task| task.as_ref())
-            .and_then(|task| {
-                task.try_borrow_mut().and_then(|task_inner| {
-                    (task_inner.res.is_some() && task_inner.exit_code.is_none()).then_some(())
-                })
-            })?;
+        let task = process.task_at(tid_index)?;
+        task.try_borrow_mut().and_then(|task_inner| {
+            (task_inner.res.is_some() && task_inner.exit_code.is_none()).then_some(())
+        })?;
         return Some(CgroupThreadId::new(tgid, tid_index));
     }
 
     if let Some(process) = resolve_process_in_pid_namespace(pid_ns_id, tid) {
         let tgid = process.getpid();
-        let main_alive = {
-            let inner = process.borrow_mut();
-            inner
-                .tasks
-                .first()
-                .and_then(|task| task.as_ref())
-                .and_then(|task| {
-                    task.try_borrow_mut().and_then(|task_inner| {
-                        (task_inner.res.is_some() && task_inner.exit_code.is_none()).then_some(())
-                    })
+        let main_alive = process.task_at(0).is_some_and(|task| {
+            task.try_borrow_mut()
+                .and_then(|task_inner| {
+                    (task_inner.res.is_some() && task_inner.exit_code.is_none()).then_some(())
                 })
                 .is_some()
-        };
+        });
         if main_alive {
             return Some(CgroupThreadId::new(tgid, 0));
         }
@@ -88,16 +70,10 @@ pub(crate) fn visible_tid_to_thread_id(pid_ns_id: usize, tid: usize) -> Option<C
     let process = resolve_process_in_pid_namespace(pid_ns_id, visible_tgid)?;
     let tgid = process.getpid();
     let tid_index = decode_linux_tid_strict(visible_tgid, tid)?;
-    let inner = process.borrow_mut();
-    inner
-        .tasks
-        .get(tid_index)
-        .and_then(|task| task.as_ref())
-        .and_then(|task| {
-            task.try_borrow_mut().and_then(|task_inner| {
-                (task_inner.res.is_some() && task_inner.exit_code.is_none()).then_some(())
-            })
-        })?;
+    let task = process.task_at(tid_index)?;
+    task.try_borrow_mut().and_then(|task_inner| {
+        (task_inner.res.is_some() && task_inner.exit_code.is_none()).then_some(())
+    })?;
     Some(CgroupThreadId::new(tgid, tid_index))
 }
 

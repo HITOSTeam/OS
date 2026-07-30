@@ -488,11 +488,7 @@ pub(crate) fn count_open_fds_for_key(key: FileLockKey) -> usize {
     let mut count = 0usize;
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let table = alloc::sync::Arc::clone(&inner.files);
-        drop(inner);
+        let table = process.files();
         if !seen_tables.insert(alloc::sync::Arc::as_ptr(&table) as usize) {
             continue;
         }

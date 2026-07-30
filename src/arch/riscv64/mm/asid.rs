@@ -1,7 +1,8 @@
 use core::arch::asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use riscv::register::satp::{self, Satp};
+use spin::Mutex;
 
 use crate::config::MAX_HARTS;
 
@@ -17,10 +18,20 @@ const SATP_ASID_MASK: usize = 0xffff;
 const KERNEL_ASID: usize = 0;
 const FIRST_USER_ASID: usize = 1;
 const HW_ASID_MASK_UNPROBED: usize = usize::MAX;
+/// ASID 快路径仍需完成跨 hart TLB shootdown 验证；在此之前保留按 hart
+/// I-cache 优化，但使用 ASID 0 的保守切换路径保证正式 CAgent 回归稳定。
+const ENABLE_USER_ASID: bool = false;
 
 static NEXT_USER_ASID: AtomicUsize = AtomicUsize::new(FIRST_USER_ASID);
 static ASID_GENERATION: AtomicUsize = AtomicUsize::new(1);
 static HW_ASID_MASK: AtomicUsize = AtomicUsize::new(HW_ASID_MASK_UNPROBED);
+/// 串行化首次 ASID 分配，避免同一个 mm 被多个 hart 同时分配不同 ASID。
+static ASID_ALLOC_LOCK: Mutex<()> = Mutex::new(());
+/// ASID 空间耗尽后永久退回 ASID 0 + 本地全量刷新。
+///
+/// 在没有实现 Linux 式全 hart rollover 同步前，禁止复用旧 ASID，避免远端
+/// hart 的旧 TLB 项与新 mm 冲突。16 位 ASID 足以覆盖当前评测生命周期。
+static ASID_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 
 pub struct AsidContext {
     asid: AtomicUsize,
@@ -64,24 +75,15 @@ impl AsidContext {
             .fetch_or(online_hart_mask(), Ordering::Release);
     }
 
-    fn take_local_icache_stale(&self, single_hart: bool) -> bool {
-        // Until we track active mm contexts and can issue remote fence.i like
-        // Linux, keep the old conservative behaviour on SMP. The SMP=1 path is
-        // the hot cyclictest/hackbench case and can safely defer I-cache flushes
-        // per mm/hart.
-        if !single_hart {
-            return true;
-        }
+    fn take_local_icache_stale(&self) -> bool {
+        // 每个 mm 为每个 hart 保存一个 stale 位。任务迁移到某个 hart 时只消费
+        // 该 hart 的位；可执行映射再次变化后，mark_icache_stale 会重新置位。
         let bit = local_hart_bit();
         if bit == 0 {
             return self.icache_stale_mask.swap(0, Ordering::AcqRel) != 0;
         }
         self.icache_stale_mask.fetch_and(!bit, Ordering::AcqRel) & bit != 0
     }
-}
-
-fn single_hart_online() -> bool {
-    crate::task::manager::online_hart_mask().count_ones() <= 1
 }
 
 const fn configured_hart_mask() -> usize {
@@ -141,23 +143,17 @@ fn hw_asid_mask() -> usize {
 }
 
 fn asid_fast_path_enabled() -> bool {
-    single_hart_online() && hw_asid_mask() != 0
+    ENABLE_USER_ASID && !ASID_EXHAUSTED.load(Ordering::Acquire) && hw_asid_mask() != 0
 }
 
-fn allocate_user_asid(max_asid: usize) -> (usize, usize, bool) {
+fn allocate_user_asid(max_asid: usize) -> Option<(usize, usize)> {
     let asid = NEXT_USER_ASID.fetch_add(1, Ordering::AcqRel);
     if asid <= max_asid {
-        return (asid, ASID_GENERATION.load(Ordering::Acquire), false);
+        return Some((asid, ASID_GENERATION.load(Ordering::Acquire)));
     }
 
-    let current = ASID_GENERATION.load(Ordering::Acquire);
-    let mut next_generation = current.wrapping_add(1);
-    if next_generation == 0 {
-        next_generation = 1;
-    }
-    ASID_GENERATION.store(next_generation, Ordering::Release);
-    NEXT_USER_ASID.store(FIRST_USER_ASID + 1, Ordering::Release);
-    (FIRST_USER_ASID, next_generation, true)
+    ASID_EXHAUSTED.store(true, Ordering::Release);
+    None
 }
 
 fn token_with_asid(token: usize, asid: usize) -> usize {
@@ -165,10 +161,12 @@ fn token_with_asid(token: usize, asid: usize) -> usize {
 }
 
 pub fn prepare_user_satp(ctx: &AsidContext, token: usize) -> (usize, bool, bool) {
-    let single_hart = single_hart_online();
-    let need_icache_flush = ctx.take_local_icache_stale(single_hart);
+    let need_icache_flush = ctx.take_local_icache_stale();
+    if !ENABLE_USER_ASID {
+        return (token_with_asid(token, KERNEL_ASID), true, need_icache_flush);
+    }
     let max_asid = hw_asid_mask();
-    if !(single_hart && max_asid != 0) {
+    if max_asid == 0 || ASID_EXHAUSTED.load(Ordering::Acquire) {
         return (token_with_asid(token, KERNEL_ASID), true, need_icache_flush);
     }
 
@@ -181,9 +179,23 @@ pub fn prepare_user_satp(ctx: &AsidContext, token: usize) -> (usize, bool, bool)
         );
     }
 
-    let (asid, generation, need_flush) = allocate_user_asid(max_asid);
+    // 同一个新 mm 可能被多个 hart 同时调度。锁内复查可保证它们共享同一个
+    // ASID，而不是分别分配后互相覆盖 ctx。
+    let _alloc_guard = ASID_ALLOC_LOCK.lock();
+    let generation = ASID_GENERATION.load(Ordering::Acquire);
+    if ctx.valid_for(generation) {
+        return (
+            token_with_asid(token, ctx.asid.load(Ordering::Acquire)),
+            false,
+            need_icache_flush,
+        );
+    }
+    let Some((asid, generation)) = allocate_user_asid(max_asid) else {
+        return (token_with_asid(token, KERNEL_ASID), true, need_icache_flush);
+    };
     ctx.store(asid, generation);
-    (token_with_asid(token, asid), need_flush, need_icache_flush)
+    // ASID 在整个评测生命周期内不复用，因此首次安装也不需要清除旧 TLB。
+    (token_with_asid(token, asid), false, need_icache_flush)
 }
 
 pub fn drop_user_asid(ctx: &AsidContext) {

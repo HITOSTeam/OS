@@ -126,8 +126,7 @@ fn task_from_process(
     process: &Arc<ProcessControlBlock>,
     tid: usize,
 ) -> Option<Arc<TaskControlBlock>> {
-    let inner = process.borrow_mut();
-    inner.tasks.get(tid).and_then(|task| task.as_ref()).cloned()
+    process.task_at(tid)
 }
 
 fn resolve_task(pid: usize) -> Option<(Arc<ProcessControlBlock>, Arc<TaskControlBlock>)> {
@@ -139,14 +138,8 @@ fn resolve_task(pid: usize) -> Option<(Arc<ProcessControlBlock>, Arc<TaskControl
     if let Some(tid) = decode_linux_tid(cur_pid, pid) {
         return task_from_process(&cur, tid).map(|task| (cur, task));
     }
-    {
-        let inner = cur.borrow_mut();
-        if pid < inner.tasks.len() {
-            if let Some(task) = inner.tasks[pid].as_ref().cloned() {
-                drop(inner);
-                return Some((cur, task));
-            }
-        }
+    if let Some(task) = cur.task_at(pid) {
+        return Some((cur, task));
     }
     let process = pid2process(pid)?;
     let task = task_from_process(&process, 0)?;

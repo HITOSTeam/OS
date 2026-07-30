@@ -87,18 +87,25 @@ pub(super) fn debug_task_ref_breakdown(
     let mut condvar_waiter_refs = 0usize;
     let mut mutex_waiter_refs = 0usize;
     for process in processes {
-        let inner = process.borrow_mut();
+        let tasks = process.tasks_snapshot();
         task_slot_refs = task_slot_refs.saturating_add(
-            inner
-                .tasks
+            tasks
                 .iter()
-                .filter(|slot| {
-                    slot.as_ref()
-                        .map(|holder| alloc::sync::Arc::ptr_eq(holder, task))
-                        .unwrap_or(false)
-                })
+                .filter(|holder| alloc::sync::Arc::ptr_eq(holder, task))
                 .count(),
         );
+        for holder in &tasks {
+            if let Some(holder_inner) = holder.try_borrow_mut() {
+                join_waiter_refs = join_waiter_refs.saturating_add(
+                    holder_inner
+                        .join_waiters
+                        .iter()
+                        .filter(|w| alloc::sync::Arc::ptr_eq(w, task))
+                        .count(),
+                );
+            }
+        }
+        let inner = process.borrow_mut();
         wait_queue_refs = wait_queue_refs.saturating_add(
             inner
                 .wait_queue
@@ -115,17 +122,6 @@ pub(super) fn debug_task_ref_breakdown(
                 .filter(|holder| alloc::sync::Arc::ptr_eq(holder, task))
                 .count(),
         );
-        for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
-            if let Some(holder_inner) = holder.try_borrow_mut() {
-                join_waiter_refs = join_waiter_refs.saturating_add(
-                    holder_inner
-                        .join_waiters
-                        .iter()
-                        .filter(|w| alloc::sync::Arc::ptr_eq(w, task))
-                        .count(),
-                );
-            }
-        }
         for sem in inner.semaphore_list.iter().filter_map(|s| s.as_ref()) {
             sem_waiter_refs = sem_waiter_refs.saturating_add(
                 sem.inner

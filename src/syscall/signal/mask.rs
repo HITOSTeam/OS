@@ -81,7 +81,7 @@ pub fn syscall_rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize
 
     let old_action = {
         let process = current_process();
-        let mut inner = process.borrow_mut();
+        let mut inner = process.signal();
         let old_action = if oldact != 0 {
             Some(
                 inner

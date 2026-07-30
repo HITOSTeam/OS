@@ -1486,12 +1486,7 @@ pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
     let mut seen_tables = BTreeSet::new();
     let mut refs = 0usize;
     for process in processes {
-        let files = {
-            let Some(inner) = process.try_borrow_mut() else {
-                continue;
-            };
-            Arc::clone(&inner.files)
-        };
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }

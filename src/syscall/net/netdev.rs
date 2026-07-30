@@ -2947,11 +2947,7 @@ fn collect_proc_sockets() -> ProcSocketSnapshot {
     let mut seen_tables = BTreeSet::new();
     let mut seen_files = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }

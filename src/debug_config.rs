@@ -63,7 +63,7 @@ pub const DEBUG_SIGNAL: bool = false;
 pub const DEBUG_PROCFS: bool = false;
 
 /// Print a periodic diagnostic dump when the system has no runnable tasks.
-pub const DEBUG_WATCHDOG: bool = true;
+pub const DEBUG_WATCHDOG: bool = false;
 
 /// Run `log::test()` at boot (very noisy).
 pub const DEBUG_LOG_TEST: bool = false;

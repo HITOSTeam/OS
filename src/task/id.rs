@@ -241,16 +241,13 @@ impl TaskUserRes {
         ustack_base: usize,
         alloc_user_res: bool,
     ) -> Option<Self> {
-        let (tid, trap_cx_slot) = {
-            let mut process_inner = process.borrow_mut();
-            let tid = process_inner.alloc_tid();
-            let trap_cx_slot = if alloc_user_res {
-                process_inner.memory_set.alloc_trap_context_slot()
-            } else {
-                process_inner.memory_set.reserve_trap_context_slot(tid);
-                tid
-            };
-            (tid, trap_cx_slot)
+        let tid = process.alloc_tid();
+        let memory_set = process.memory_set();
+        let trap_cx_slot = if alloc_user_res {
+            memory_set.alloc_trap_context_slot()
+        } else {
+            memory_set.reserve_trap_context_slot(tid);
+            tid
         };
         let task_user_res = Self {
             tid,
@@ -266,13 +263,8 @@ impl TaskUserRes {
     }
 
     pub fn try_new_trap_cx_only(process: Arc<ProcessControlBlock>) -> Option<Self> {
-        let (tid, trap_cx_slot) = {
-            let mut process_inner = process.borrow_mut();
-            (
-                process_inner.alloc_tid(),
-                process_inner.memory_set.alloc_trap_context_slot(),
-            )
-        };
+        let tid = process.alloc_tid();
+        let trap_cx_slot = process.memory_set().alloc_trap_context_slot();
         let task_user_res = Self {
             tid,
             trap_cx_slot,
@@ -288,10 +280,10 @@ impl TaskUserRes {
 
     fn try_alloc_trap_cx_only(&self) -> bool {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         let trap_cx_bottom = trap_cx_bottom_from_slot(self.trap_cx_slot);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.try_insert_framed_area(
+        memory_set.try_insert_framed_area(
             trap_cx_bottom.into(),
             trap_cx_top.into(),
             MapPermission::R | MapPermission::W,
@@ -308,13 +300,13 @@ impl TaskUserRes {
 
     fn try_alloc_user_res(&self) -> bool {
         let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         if self.owns_ustack {
             // alloc user stack
             let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
             let ustack_top = ustack_bottom + USER_STACK_SIZE;
             // insert the user resource into the program memory space
-            if !process_inner.memory_set.try_insert_stack_framed_range(
+            if !memory_set.try_insert_stack_framed_range(
                 ustack_bottom,
                 ustack_top,
                 MapPermission::R | MapPermission::W | MapPermission::U,
@@ -326,7 +318,7 @@ impl TaskUserRes {
         // if trap alloc failed,we will remove the user_stack too
         let trap_cx_bottom = trap_cx_bottom_from_slot(self.trap_cx_slot);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        if !process_inner.memory_set.try_insert_framed_area(
+        if !memory_set.try_insert_framed_area(
             trap_cx_bottom.into(),
             trap_cx_top.into(),
             MapPermission::R | MapPermission::W,
@@ -334,9 +326,7 @@ impl TaskUserRes {
             if self.owns_ustack {
                 let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
                 let ustack_top = ustack_bottom + USER_STACK_SIZE;
-                process_inner
-                    .memory_set
-                    .unmap_user_vma_range(ustack_bottom.into(), ustack_top.into());
+                memory_set.unmap_user_vma_range(ustack_bottom.into(), ustack_top.into());
             }
             return false;
         }
@@ -348,31 +338,24 @@ impl TaskUserRes {
         let Some(process) = self.process.upgrade() else {
             return;
         };
-        let mut process_inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         if self.owns_ustack {
             // dealloc ustack manually
             let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
             let ustack_top = ustack_bottom + USER_STACK_SIZE;
-            process_inner
-                .memory_set
-                .unmap_user_vma_range(ustack_bottom.into(), ustack_top.into());
+            memory_set.unmap_user_vma_range(ustack_bottom.into(), ustack_top.into());
         }
         // dealloc trap_cx manually
         let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_slot(self.trap_cx_slot).into();
-        process_inner
-            .memory_set
-            .remove_area_with_start_vpn(trap_cx_bottom_va.into());
-        process_inner
-            .memory_set
-            .dealloc_trap_context_slot(self.trap_cx_slot);
+        memory_set.remove_area_with_start_vpn(trap_cx_bottom_va.into());
+        memory_set.dealloc_trap_context_slot(self.trap_cx_slot);
     }
 
     pub fn dealloc_tid(&self) {
         let Some(process) = self.process.upgrade() else {
             return;
         };
-        let mut process_inner = process.borrow_mut();
-        process_inner.dealloc_tid(self.tid);
+        process.dealloc_tid(self.tid);
     }
 
     pub fn trap_cx_user_va(&self) -> usize {
@@ -381,10 +364,9 @@ impl TaskUserRes {
 
     pub fn trap_cx_ppn(&self) -> PhysPageNum {
         let process = self.process.upgrade().expect("process already dropped");
-        let process_inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_slot(self.trap_cx_slot).into();
-        process_inner
-            .memory_set
+        memory_set
             .translate(trap_cx_bottom_va.into())
             .unwrap()
             .ppn()

@@ -138,10 +138,7 @@ fn wake_parent_waiters() {
 
 fn find_task_by_linux_tid(tid: usize) -> Option<(Arc<ProcessControlBlock>, Arc<TaskControlBlock>)> {
     if let Some(proc) = pid2process(tid) {
-        let main_task = {
-            let inner = proc.borrow_mut();
-            inner.tasks.first().and_then(|t| t.as_ref()).cloned()
-        };
+        let main_task = proc.task_at(0);
         if let Some(task) = main_task {
             return Some((proc, task));
         }
@@ -153,15 +150,7 @@ fn find_task_by_linux_tid(tid: usize) -> Option<(Arc<ProcessControlBlock>, Arc<T
     };
     for proc in procs {
         let pid = proc.getpid();
-        let tasks = {
-            let inner = proc.borrow_mut();
-            inner
-                .tasks
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, t)| t.as_ref().cloned().map(|task| (idx, task)))
-                .collect::<Vec<_>>()
-        };
+        let tasks = proc.indexed_tasks_snapshot();
         for (idx, task) in tasks {
             if encode_linux_tid(pid, idx) == tid {
                 return Some((proc.clone(), task));
@@ -230,14 +219,7 @@ pub(crate) fn queue_signal_with_info(
     }
 
     let bit = signal_bit(signum).unwrap();
-    let tasks = {
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<Vec<_>>()
-    };
+    let tasks = process.tasks_snapshot();
     let Some(task) = crate::task::signal::pick_task_for_signal(&tasks, bit) else {
         return err(SyscallError::ESRCH);
     };
@@ -249,15 +231,11 @@ fn rt_sigpending_limit_reached(proc: &Arc<ProcessControlBlock>, signum: usize) -
     if signum <= crate::task::signal::MAX_SIG {
         return false;
     }
-    let (limit, tasks) = {
+    let limit = {
         let inner = proc.borrow_mut();
-        let tasks = inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<Vec<_>>();
-        (inner.rlimits.rlimit_sigpending_cur, tasks)
+        inner.rlimits.rlimit_sigpending_cur
     };
+    let tasks = proc.tasks_snapshot();
     if limit == u64::MAX {
         return false;
     }

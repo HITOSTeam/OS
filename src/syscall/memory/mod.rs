@@ -124,11 +124,7 @@ pub(super) fn find_open_inode_file(
     };
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }
@@ -168,11 +164,7 @@ pub(super) fn find_open_shm_file(memfd_id: u64) -> Option<Arc<dyn File + Send + 
     };
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }

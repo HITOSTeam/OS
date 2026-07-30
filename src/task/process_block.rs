@@ -241,20 +241,20 @@ pub(crate) fn remove_task_from_wait_queues(task: &Arc<TaskControlBlock>) {
     };
 
     for process in processes {
-        let Some(mut inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        inner.wait_queue.retain(|t| !Arc::ptr_eq(t, task));
-        inner.vfork_wait_queue.retain(|t| !Arc::ptr_eq(t, task));
-
-        for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
-            if Arc::ptr_eq(holder, task) {
+        let tasks = process.tasks_snapshot();
+        for holder in tasks {
+            if Arc::ptr_eq(&holder, task) {
                 continue;
             }
             if let Some(mut holder_inner) = holder.try_borrow_mut() {
                 holder_inner.join_waiters.retain(|w| !Arc::ptr_eq(w, task));
             }
         }
+        let Some(mut inner) = process.try_borrow_mut() else {
+            continue;
+        };
+        inner.wait_queue.retain(|t| !Arc::ptr_eq(t, task));
+        inner.vfork_wait_queue.retain(|t| !Arc::ptr_eq(t, task));
 
         for mutex in inner.mutex_list.iter().filter_map(|m| m.as_ref()) {
             let _ = mutex.remove_waiter(task);
@@ -322,8 +322,8 @@ lazy_static! {
         RwLock::new(BTreeMap::new());
 }
 
-fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
-    for (signum, action) in inner.rt_sig_handlers.iter_mut().enumerate() {
+fn reset_signal_handlers_on_exec(signal: &mut ProcessSignalState) {
+    for (signum, action) in signal.rt_sig_handlers.iter_mut().enumerate() {
         if signum == 0 {
             continue;
         }
@@ -331,7 +331,7 @@ fn reset_signal_handlers_on_exec(inner: &mut ProcessControlBlockInner) {
             *action = RtSigAction::default();
         }
     }
-    for (signum, action) in inner.signals_actions.table.iter_mut().enumerate() {
+    for (signum, action) in signal.signals_actions.table.iter_mut().enumerate() {
         if signum == 0 {
             continue;
         }
@@ -989,10 +989,25 @@ pub struct ProcessScheduling {
 // later refactoring pass once the access patterns are stabilised.
 
 pub struct ProcessControlBlock {
-    // immutable
+    // 不可变的进程标识。
     pub pid: PidHandle,
     parent_visible_pid: AtomicUsize,
-    // mutable
+    /// 文件描述符表属于独立共享域。
+    ///
+    /// Linux 的 `task_struct::files` 和 StarryOS 的资源域都不会依赖进程
+    /// 元数据总锁。这里的外层锁只保护 CLONE_FILES/unshare 时替换 Arc，
+    /// 真正的 fd 操作仍由 FilesStruct 自己的锁保护。
+    files: SpinMutex<Arc<SpinMutex<FilesStruct>>>,
+    /// 线程组只保护 TID 分配与线程表，不再与进程身份、文件表或地址空间共锁。
+    threads: SpinMutex<ThreadGroup>,
+    /// 地址空间句柄独立于进程元数据。
+    ///
+    /// 外层锁只保护 exec/exit 时替换 `MmRef`；页表、VMA 与 COW 操作由
+    /// `MmRef` 自身同步，普通缺页和用户态访问不再争用 PCB 总锁。
+    memory_set: SpinMutex<MmRef>,
+    /// 进程级信号动作与共享 pending 状态，对应 Linux `signal_struct/sighand`。
+    signal: SpinMutex<ProcessSignalState>,
+    /// 低频进程元数据。地址空间、线程组、信号等热点域会逐步从这里拆出。
     inner: SpinMutex<ProcessControlBlockInner>,
 }
 
@@ -1022,7 +1037,6 @@ pub struct ProcessControlBlockInner {
     /// `wait4()` 同样的“没有 tracee 就快速跳过”判断，同时仍让每个 tracee
     /// 通过自己的 `ptrace_tracer_pid` 记录所属 tracer。
     pub ptrace_tracee_count: usize,
-    pub memory_set: MmRef,
     pub parent: Option<Weak<ProcessControlBlock>>,
     /// 当前进程在父进程 `children` 向量中的下标；`None` 表示当前未挂在父进程子列表中。
     ///
@@ -1089,9 +1103,6 @@ pub struct ProcessControlBlockInner {
     pub ioprio: u16,
     /// 进程级文件创建模式掩码（umask）。
     pub umask: usize,
-    /// 文件描述符表。普通 fork 会快照这个对象；CLONE_FILES 共享同一个 Arc，
-    /// 让生命周期跟随引用，而不是依赖进程所有者转发模型。
-    pub(crate) files: Arc<SpinMutex<FilesStruct>>,
     /// 所有 POSIX 资源限制。
     pub rlimits: ProcessResourceLimits,
     /// 进程根目录（宿主绝对路径），用于 `chroot`。
@@ -1120,18 +1131,8 @@ pub struct ProcessControlBlockInner {
     pub pid_ns_vpid: usize,
     /// 当前进程是否是其 PID namespace 内的 PID 1。
     pub pid_ns_init: bool,
-    pub signals: SignalFlags,
-    pub signals_actions: SignalActions,
-    pub signals_masks: SignalFlags,
-    pub handling_signal: i32,
-    /// 按信号编号索引的 Linux rt_sigaction 处理器。
-    pub rt_sig_handlers: Vec<RtSigAction>,
     /// rt-tests（cyclictest/hackbench）使用的 Linux 风格调度状态。
     pub scheduling: ProcessScheduling,
-    // TaskControlBlock实际上现在是线程
-    pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
-    // 进程控制块 有一个分配 线程ID的分配器
-    pub task_res_allocator: RecycleAllocator,
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
@@ -1141,6 +1142,27 @@ pub struct ProcessControlBlockInner {
     pub vfork_wait_queue: VecDeque<Arc<TaskControlBlock>>,
     /// 等待当前进程变为可 wait 状态、从而让 pidfd 就绪的 task。
     pub pidfd_poll_waiters: PollWaitQueue,
+}
+
+pub struct ProcessSignalState {
+    pub signals: SignalFlags,
+    pub signals_actions: SignalActions,
+    pub signals_masks: SignalFlags,
+    pub handling_signal: i32,
+    /// 按信号编号索引的 Linux rt_sigaction 处理器。
+    pub rt_sig_handlers: Vec<RtSigAction>,
+}
+
+impl ProcessSignalState {
+    fn new() -> Self {
+        Self {
+            signals: SignalFlags::empty(),
+            signals_actions: SignalActions::default(),
+            signals_masks: SignalFlags::empty(),
+            handling_signal: -1,
+            rt_sig_handlers: vec![RtSigAction::default(); RT_SIG_MAX + 1],
+        }
+    }
 }
 
 impl ProcessControlBlockInner {
@@ -1193,31 +1215,34 @@ impl ProcessControlBlockInner {
     pub fn clear_children(&mut self) {
         self.children.clear();
     }
+}
 
-    #[allow(unused)]
-    pub fn get_user_token(&self) -> usize {
-        self.memory_set.token()
+/// 一个线程组中仅与线程成员关系有关的状态。
+///
+/// Linux 使用独立的 task list/signal_struct 管理线程组；StarryOS 也把
+/// `Thread` 从 `ProcessData` 中分离。这里先把最常竞争的线程表从 PCB 总锁
+/// 中拆出，后续 fork/exit 只需要短暂持有这把锁取得 Arc 快照。
+pub struct ThreadGroup {
+    pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
+    tid_allocator: RecycleAllocator,
+}
+
+impl ThreadGroup {
+    fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            tid_allocator: RecycleAllocator::new(),
+        }
     }
 
     pub fn alloc_tid(&mut self) -> usize {
-        self.task_res_allocator.alloc()
+        self.tid_allocator.alloc()
     }
 
     pub fn dealloc_tid(&mut self, _tid: usize) {
         // Keep thread IDs monotonic within a process to avoid immediate reuse.
         // Linux TIDs are globally unique for a long period; reusing tiny per-process
         // indexes too early breaks gettid-based uniqueness checks in pthread tests.
-    }
-
-    pub fn thread_count(&self) -> usize {
-        self.tasks
-            .iter()
-            .filter(|t| {
-                t.as_ref()
-                    .map(|t| t.borrow_mut().res.is_some())
-                    .unwrap_or(false)
-            })
-            .count()
     }
 
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
@@ -1289,8 +1314,8 @@ impl ProcessControlBlock {
         let current_ptr = current.as_ref().map(Arc::as_ptr);
         let mut to_cleanup = Vec::new();
         {
-            let mut inner = self.borrow_mut();
-            for slot in inner.tasks.iter_mut() {
+            let mut threads = self.threads();
+            for slot in threads.tasks.iter_mut() {
                 let Some(task) = slot.as_ref() else {
                     continue;
                 };
@@ -1360,8 +1385,129 @@ impl ProcessControlBlock {
     }
 
     pub(crate) fn files(&self) -> Arc<SpinMutex<FilesStruct>> {
-        let inner = self.borrow_mut();
-        Arc::clone(&inner.files)
+        Arc::clone(&self.files.lock())
+    }
+
+    pub(crate) fn threads(&self) -> MutexGuard<'_, ThreadGroup> {
+        self.threads.lock()
+    }
+
+    pub fn memory_set(&self) -> MmRef {
+        self.memory_set.lock().clone()
+    }
+
+    pub fn signal(&self) -> MutexGuard<'_, ProcessSignalState> {
+        self.signal.lock()
+    }
+
+    pub fn replace_memory_set(&self, memory_set: MmRef) -> MmRef {
+        core::mem::replace(&mut *self.memory_set.lock(), memory_set)
+    }
+
+    #[allow(unused)]
+    pub fn get_user_token(&self) -> usize {
+        self.memory_set().token()
+    }
+
+    pub fn alloc_tid(&self) -> usize {
+        self.threads.lock().alloc_tid()
+    }
+
+    pub fn dealloc_tid(&self, tid: usize) {
+        self.threads.lock().dealloc_tid(tid);
+    }
+
+    pub fn thread_count(&self) -> usize {
+        self.tasks_snapshot()
+            .iter()
+            .filter(|task| task.borrow_mut().res.is_some())
+            .count()
+    }
+
+    pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
+        self.threads.lock().get_task(tid)
+    }
+
+    /// 在线程组锁内只克隆任务引用，TCB 检查必须在锁外完成。
+    pub fn task_at(&self, tid: usize) -> Option<Arc<TaskControlBlock>> {
+        self.threads
+            .lock()
+            .tasks
+            .get(tid)
+            .and_then(|slot| slot.as_ref().cloned())
+    }
+
+    pub fn tasks_snapshot(&self) -> Vec<Arc<TaskControlBlock>> {
+        self.threads
+            .lock()
+            .tasks
+            .iter()
+            .filter_map(|slot| slot.as_ref().cloned())
+            .collect()
+    }
+
+    pub fn indexed_tasks_snapshot(&self) -> Vec<(usize, Arc<TaskControlBlock>)> {
+        self.threads
+            .lock()
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(tid, slot)| slot.as_ref().cloned().map(|task| (tid, task)))
+            .collect()
+    }
+
+    pub fn remove_task(&self, tid: usize) -> Option<Arc<TaskControlBlock>> {
+        self.threads
+            .lock()
+            .tasks
+            .get_mut(tid)
+            .and_then(Option::take)
+    }
+
+    pub fn install_task(&self, tid: usize, task: Arc<TaskControlBlock>) {
+        let mut threads = self.threads.lock();
+        threads.tasks.resize_with(tid + 1, || None);
+        threads.tasks[tid] = Some(task);
+    }
+
+    pub fn remove_task_if(&self, tid: usize, expected: &Arc<TaskControlBlock>) -> bool {
+        let mut threads = self.threads.lock();
+        let Some(slot) = threads.tasks.get_mut(tid) else {
+            return false;
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|task| Arc::ptr_eq(task, expected))
+        {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_task_ref(&self, expected: &Arc<TaskControlBlock>) -> bool {
+        let mut threads = self.threads.lock();
+        let Some(slot) = threads.tasks.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|task| Arc::ptr_eq(task, expected))
+        }) else {
+            return false;
+        };
+        *slot = None;
+        true
+    }
+
+    pub fn take_all_tasks(&self) -> Vec<Option<Arc<TaskControlBlock>>> {
+        core::mem::take(&mut self.threads.lock().tasks)
+    }
+
+    /// 原子替换进程持有的 fd 表引用，供 exec/exit/unshare 使用。
+    pub(crate) fn replace_files(
+        &self,
+        files: Arc<SpinMutex<FilesStruct>>,
+    ) -> Arc<SpinMutex<FilesStruct>> {
+        core::mem::replace(&mut *self.files.lock(), files)
     }
 
     pub(crate) fn nofile_limit(&self) -> usize {
@@ -1377,19 +1523,19 @@ impl ProcessControlBlock {
     /// the count larger, causing an unnecessary but harmless copy.
     pub fn unshare_files(self: &Arc<Self>) {
         let old_files = {
-            let inner = self.borrow_mut();
-            if Arc::strong_count(&inner.files) == 1 {
+            let files = self.files.lock();
+            if Arc::strong_count(&files) == 1 {
                 return;
             }
-            Arc::clone(&inner.files)
+            Arc::clone(&files)
         };
         let new_files = {
             let files = old_files.lock();
             Arc::new(SpinMutex::new(files.clone_private()))
         };
-        let mut inner = self.borrow_mut();
-        if Arc::ptr_eq(&inner.files, &old_files) && Arc::strong_count(&inner.files) > 1 {
-            inner.files = new_files;
+        let mut files = self.files.lock();
+        if Arc::ptr_eq(&files, &old_files) && Arc::strong_count(&files) > 1 {
+            *files = new_files;
         }
     }
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
@@ -1414,6 +1560,10 @@ impl ProcessControlBlock {
         let process = Arc::new(Self {
             pid: pid_handle,
             parent_visible_pid: AtomicUsize::new(0),
+            files: SpinMutex::new(Arc::new(SpinMutex::new(FilesStruct::with_stdio()))),
+            threads: SpinMutex::new(ThreadGroup::new()),
+            memory_set: SpinMutex::new(MmRef::new(memory_set)),
+            signal: SpinMutex::new(ProcessSignalState::new()),
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
                 dumped_core: false,
@@ -1427,7 +1577,6 @@ impl ProcessControlBlock {
                 continued: false,
                 ptrace_tracer_pid: None,
                 ptrace_tracee_count: 0,
-                memory_set: MmRef::new(memory_set),
                 parent: None,
                 child_parent_index: None,
                 children: Vec::new(),
@@ -1462,7 +1611,6 @@ impl ProcessControlBlock {
                 personality: 0,
                 ioprio: 0,
                 umask: 0,
-                files: Arc::new(SpinMutex::new(FilesStruct::with_stdio())),
                 rlimits: ProcessResourceLimits {
                     rlimit_nofile_cur: 1024,
                     rlimit_nofile_max: 1024,
@@ -1513,11 +1661,6 @@ impl ProcessControlBlock {
                 pid_ns_id: 0,
                 pid_ns_vpid: pid,
                 pid_ns_init: true,
-                signals: SignalFlags::empty(),
-                signals_actions: SignalActions::default(),
-                signals_masks: SignalFlags::empty(),
-                handling_signal: -1,
-                rt_sig_handlers: vec![RtSigAction::default(); RT_SIG_MAX + 1],
                 scheduling: ProcessScheduling {
                     sched_policy: 0,
                     cpu_affinity_mask: if MAX_HARTS >= usize::BITS as usize {
@@ -1532,8 +1675,6 @@ impl ProcessControlBlock {
                     nice: 0,
                     reset_on_fork: false,
                 },
-                tasks: Vec::new(),
-                task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),
                 semaphore_list: Vec::new(),
                 condvar_list: Vec::new(),
@@ -1572,9 +1713,7 @@ impl ProcessControlBlock {
         //     entry_point, ustack_top, kstack_top
         // );
         // add main thread to the process
-        let mut process_inner = process.borrow_mut();
-        process_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(process_inner);
+        process.threads().tasks.push(Some(Arc::clone(&task)));
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         register_pid_namespace_reaper(0, process.getpid());
         // add main thread to scheduler
@@ -1658,7 +1797,7 @@ impl ProcessControlBlock {
     ) {
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
-        let thread_count = { self.borrow_mut().thread_count() };
+        let thread_count = self.thread_count();
         if thread_count != 1 {
             log::warn!(
                 "[exec] pid={} thread_count={} (terminating other threads)",
@@ -1670,28 +1809,27 @@ impl ProcessControlBlock {
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
         let new_memory_set = MmRef::new(memory_set);
-        let task = self.borrow_mut().get_task(0);
+        let task = self.get_task(0);
         let old_trap_cx_slot = {
             let task_inner = task.borrow_mut();
             task_inner.res.as_ref().map(|res| res.trap_cx_slot())
         };
-        let (old_shm_cleanup, old_mm_token) = {
+        let mut old_memory_set = self.memory_set();
+        let old_mm_token = old_memory_set.token();
+        if let Some(slot) = old_trap_cx_slot {
+            let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
+            old_memory_set.remove_area_with_start_vpn(trap_cx_bottom.into());
+            old_memory_set.dealloc_trap_context_slot(slot);
+        }
+        let old_shm_cleanup = old_memory_set.take_sysv_shm_attaches_for_cleanup();
+        #[cfg(target_arch = "riscv64")]
+        // Trap entry may still be running on the old user SATP; switch away
+        // before replacing and potentially dropping that address space.
+        crate::mm::activate_kernel_space();
+        drop(self.replace_memory_set(new_memory_set.clone()));
+        reset_signal_handlers_on_exec(&mut self.signal());
+        {
             let mut inner = self.borrow_mut();
-            let old_mm_token = inner.memory_set.token();
-            if let Some(slot) = old_trap_cx_slot {
-                let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
-                inner
-                    .memory_set
-                    .remove_area_with_start_vpn(trap_cx_bottom.into());
-                inner.memory_set.dealloc_trap_context_slot(slot);
-            }
-            let old_shm_cleanup = inner.memory_set.take_sysv_shm_attaches_for_cleanup();
-            reset_signal_handlers_on_exec(&mut inner);
-            #[cfg(target_arch = "riscv64")]
-            // Trap entry may still be running on the old user SATP; switch away
-            // before replacing and potentially dropping that address space.
-            crate::mm::activate_kernel_space();
-            inner.memory_set = new_memory_set.clone();
             inner.scheduling.reset_on_fork = false;
             inner.keep_caps = false;
             inner.argv = args.clone();
@@ -1707,8 +1845,7 @@ impl ProcessControlBlock {
             inner.exec_inode_num = exec_inode.1;
             crate::syscall::process::register_executing_inode(exec_inode.0, exec_inode.1);
             inner.did_exec = true;
-            (old_shm_cleanup, old_mm_token)
-        };
+        }
         task.set_memory_set(new_memory_set);
         let old_mm_still_owned = release_process_mm_owner(old_mm_token);
         self.wake_vfork_parent_waiters_after_exec();
@@ -1765,7 +1902,7 @@ impl ProcessControlBlock {
     ) {
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
-        let thread_count = { self.borrow_mut().thread_count() };
+        let thread_count = self.thread_count();
         if thread_count != 1 {
             log::warn!(
                 "[exec_dyn] pid={} thread_count={} (terminating other threads)",
@@ -1777,28 +1914,27 @@ impl ProcessControlBlock {
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
         let new_memory_set = MmRef::new(memory_set);
-        let task = self.borrow_mut().get_task(0);
+        let task = self.get_task(0);
         let old_trap_cx_slot = {
             let task_inner = task.borrow_mut();
             task_inner.res.as_ref().map(|res| res.trap_cx_slot())
         };
-        let (old_shm_cleanup, old_mm_token) = {
+        let mut old_memory_set = self.memory_set();
+        let old_mm_token = old_memory_set.token();
+        if let Some(slot) = old_trap_cx_slot {
+            let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
+            old_memory_set.remove_area_with_start_vpn(trap_cx_bottom.into());
+            old_memory_set.dealloc_trap_context_slot(slot);
+        }
+        let old_shm_cleanup = old_memory_set.take_sysv_shm_attaches_for_cleanup();
+        #[cfg(target_arch = "riscv64")]
+        // Trap entry may still be running on the old user SATP; switch away
+        // before replacing and potentially dropping that address space.
+        crate::mm::activate_kernel_space();
+        drop(self.replace_memory_set(new_memory_set.clone()));
+        reset_signal_handlers_on_exec(&mut self.signal());
+        {
             let mut inner = self.borrow_mut();
-            let old_mm_token = inner.memory_set.token();
-            if let Some(slot) = old_trap_cx_slot {
-                let trap_cx_bottom = TRAP_CONTEXT_BASE - slot * PAGE_SIZE;
-                inner
-                    .memory_set
-                    .remove_area_with_start_vpn(trap_cx_bottom.into());
-                inner.memory_set.dealloc_trap_context_slot(slot);
-            }
-            let old_shm_cleanup = inner.memory_set.take_sysv_shm_attaches_for_cleanup();
-            reset_signal_handlers_on_exec(&mut inner);
-            #[cfg(target_arch = "riscv64")]
-            // Trap entry may still be running on the old user SATP; switch away
-            // before replacing and potentially dropping that address space.
-            crate::mm::activate_kernel_space();
-            inner.memory_set = new_memory_set.clone();
             inner.scheduling.reset_on_fork = false;
             inner.keep_caps = false;
             inner.argv = args.clone();
@@ -1814,8 +1950,7 @@ impl ProcessControlBlock {
             inner.exec_inode_num = exec_inode.1;
             crate::syscall::process::register_executing_inode(exec_inode.0, exec_inode.1);
             inner.did_exec = true;
-            (old_shm_cleanup, old_mm_token)
-        };
+        }
         task.set_memory_set(new_memory_set);
         let old_mm_still_owned = release_process_mm_owner(old_mm_token);
         self.wake_vfork_parent_waiters_after_exec();
@@ -1889,15 +2024,12 @@ impl ProcessControlBlock {
         let mut after_pcb_cycles = fork_start_cycles;
         let mut after_task_cycles = fork_start_cycles;
 
-        let mut parent = self.borrow_mut();
-        // 只在 PCB 锁下取得任务引用快照，不在这里嵌套 TCB 锁。远端线程的
-        // 系统调用可能正持有 TCB 并读取 PCB，反向嵌套会让多线程 fork 死锁。
-        let parent_tasks_snapshot = parent
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().cloned())
-            .collect::<Vec<_>>();
+        // 线程表和地址空间各自取引用快照，随后才读取低频 PCB 元数据。
+        // COW 和 TCB 访问都不会嵌套在这些锁内。
+        let parent_tasks_snapshot = self.tasks_snapshot();
+        let parent_memory_set = self.memory_set();
         let thread_count = parent_tasks_snapshot.len();
+        let mut parent = self.borrow_mut();
         if thread_count != 1 {
             log::warn!(
                 "[fork] pid={} thread_count={} (forking only current thread)",
@@ -1943,14 +2075,13 @@ impl ProcessControlBlock {
             )
         };
         let cpu_affinity_mask = parent_scheduling.cpu_affinity_mask;
-        let rt_sig_handlers = parent.rt_sig_handlers.clone();
+        let rt_sig_handlers = self.signal().rt_sig_handlers.clone();
         let argv = parent.argv.clone();
-        let parent_memory_set = parent.memory_set.clone();
         if crate::debug_config::DEBUG_PID_MAP {
             let seq = FORK_PRE_COW_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if seq <= 8 || (seq & (seq - 1)) == 0 {
                 let (areas, data_frames, ident_vpns, lazy_areas, framed_areas, ident_areas) =
-                    parent.memory_set.cow_diag_stats();
+                    parent_memory_set.cow_diag_stats();
                 crate::println!(
                     "[fork-cow-pre] seq={} pid={} areas={} data_frames={} ident_vpns={} lazy={} framed={} ident={}",
                     seq,
@@ -2015,7 +2146,6 @@ impl ProcessControlBlock {
         let pid = pid_alloc()?;
         let pid_value = pid.0;
         let parent_visible_pid = parent.pid_ns_vpid;
-        let parent_files = Arc::clone(&parent.files);
         let pgid = parent.pgid;
         let sid = parent.sid;
         let comm = parent.comm.clone();
@@ -2054,8 +2184,7 @@ impl ProcessControlBlock {
         let exec_inode_num = parent.exec_inode_num;
         // Remember parent's user-stack base for the calling thread.
         let parent_ustack_base = caller_task_res.map(|(_, base)| base).unwrap_or_else(|| {
-            parent
-                .get_task(0)
+            self.get_task(0)
                 .borrow_mut()
                 .res
                 .as_ref()
@@ -2067,6 +2196,7 @@ impl ProcessControlBlock {
         // here that choice also keeps the PCB lock from nesting with the files
         // lock.
         drop(parent);
+        let parent_files = self.files();
         let child_files = if share_files {
             Arc::clone(&parent_files)
         } else {
@@ -2077,6 +2207,13 @@ impl ProcessControlBlock {
         let child = Arc::new(Self {
             pid,
             parent_visible_pid: AtomicUsize::new(parent_visible_pid),
+            files: SpinMutex::new(child_files),
+            threads: SpinMutex::new(ThreadGroup::new()),
+            memory_set: SpinMutex::new(memory_set),
+            signal: SpinMutex::new(ProcessSignalState {
+                rt_sig_handlers,
+                ..ProcessSignalState::new()
+            }),
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
                 dumped_core: false,
@@ -2089,7 +2226,6 @@ impl ProcessControlBlock {
                 continued: false,
                 ptrace_tracer_pid: None,
                 ptrace_tracee_count: 0,
-                memory_set,
                 parent: Some(Arc::downgrade(self)),
                 child_parent_index: None,
                 children: Vec::new(),
@@ -2122,7 +2258,6 @@ impl ProcessControlBlock {
                 personality,
                 ioprio,
                 umask,
-                files: child_files,
                 rlimits,
                 root,
                 cwd,
@@ -2140,12 +2275,6 @@ impl ProcessControlBlock {
                 pid_ns_init: false,
                 exec_inode_dev,
                 exec_inode_num,
-                // Pending signals are not inherited across fork.
-                signals: SignalFlags::empty(),
-                signals_actions: SignalActions::default(),
-                signals_masks: SignalFlags::empty(),
-                handling_signal: -1,
-                rt_sig_handlers,
                 scheduling: ProcessScheduling {
                     sched_policy: child_sched_policy,
                     cpu_affinity_mask,
@@ -2156,8 +2285,6 @@ impl ProcessControlBlock {
                     nice: child_nice,
                     reset_on_fork: false,
                 },
-                tasks: Vec::new(),
-                task_res_allocator: RecycleAllocator::new(),
                 mutex_list: Vec::new(),
                 semaphore_list: Vec::new(),
                 condvar_list: Vec::new(),
@@ -2194,9 +2321,7 @@ impl ProcessControlBlock {
         // Distribute child processes across harts.
         task.set_cpu_id(select_hart_for_new_task());
         // attach task to child process
-        let mut child_inner = child.borrow_mut();
-        child_inner.tasks.push(Some(Arc::clone(&task)));
-        drop(child_inner);
+        child.threads().tasks.push(Some(Arc::clone(&task)));
         // Publish the child before cgroup inheritance so per-thread membership
         // can resolve the freshly created main task.
         insert_into_pid2process(child.getpid(), Arc::clone(&child));

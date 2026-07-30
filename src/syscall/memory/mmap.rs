@@ -10,9 +10,9 @@ pub fn syscall_brk(addr: usize) -> isize {
     const BRK_RELATIVE_COMPAT_MAX: usize = 64 * 1024;
     let process = current_process();
     let pid = process.getpid();
-    let inner = process.borrow_mut();
+    let mm = process.memory_set();
     if addr == 0 {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         let brk = memory_set.brk();
         let heap_start = memory_set.heap_start();
         if crate::debug_config::DEBUG_SYSCALL {
@@ -25,14 +25,23 @@ pub fn syscall_brk(addr: usize) -> isize {
         }
         return brk as isize;
     }
-    let mut memory_set = inner.memory_set.lock();
+    // 全局 commit 统计会依次读取所有进程的 mm。必须在持有当前 mm 锁之前
+    // 完成，否则统计走回当前进程时会再次获取同一把非重入锁，造成 brk 永久
+    // 卡住。这里保存调用开始时的快照，后续只在锁内做纯数值判断。
+    let committed_before = vm_committed_as_bytes();
+    let commit_limit = overcommit_limit_bytes();
+    let mut memory_set = mm.lock();
     let shm_attaches = memory_set.sysv_shm_attaches_snapshot();
     let update: BrkUpdate = memory_set.try_update_brk_with_holes(
         addr,
         USER_VA_TOP,
         BRK_RELATIVE_COMPAT_MAX,
         |page| page_overlaps_sysv_shm_regions(page, &shm_attaches),
-        exceeds_overcommit_limit,
+        |additional_bytes| {
+            commit_limit.is_some_and(|limit| {
+                committed_before.saturating_add(additional_bytes) > limit
+            })
+        },
     );
     if crate::debug_config::DEBUG_SYSCALL {
         crate::println!(
@@ -262,7 +271,7 @@ fn mmap_packet_socket_ring(
     }
 
     let process = current_process();
-    let inner = process.borrow_mut();
+    let mm = process.memory_set();
     let is_fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     let start = if is_fixed {
         if addr == 0 || addr % PAGE_SIZE != 0 {
@@ -270,7 +279,7 @@ fn mmap_packet_socket_ring(
         }
         addr
     } else {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let Some(start) =
             memory_set.find_free_mmap_range((addr != 0).then_some(addr), map_len, USER_VA_TOP)
         else {
@@ -290,7 +299,7 @@ fn mmap_packet_socket_ring(
     }
 
     let lock_range = {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         if !is_fixed && !memory_set.user_range_is_free(start, end, USER_VA_TOP) {
             return err(SyscallError::ENOMEM);
         }
@@ -338,7 +347,7 @@ fn mmap_packet_socket_ring(
     };
     let areas = vec![VmaInsertArea::Framed { start, end }];
     let replace_existing = (flags & MAP_FIXED) != 0;
-    let mut memory_set = inner.memory_set.lock();
+    let mut memory_set = mm.lock();
     let inserted = commit_mmap_vma(
         &mut memory_set,
         replace_existing,
@@ -359,7 +368,7 @@ fn mmap_packet_socket_ring(
     }
     let token = memory_set.token();
     drop(memory_set);
-    drop(inner);
+    drop(mm);
 
     if replace_existing {
         crate::syscall::net::clear_packet_ring_mmaps_for_range(token, start, end);
@@ -367,10 +376,8 @@ fn mmap_packet_socket_ring(
     let ret = packet_sock.set_rx_ring_mmap(start, map_len, token);
     if ret < 0 {
         let process = current_process();
-        let inner = process.borrow_mut();
-        inner
-            .memory_set
-            .lock()
+        process
+            .memory_set()
             .unmap_user_vma_range(start.into(), end.into());
         return ret;
     }
@@ -507,7 +514,7 @@ pub fn syscall_mmap(
     }
 
     let process = current_process();
-    let inner = process.borrow_mut();
+    let mm = process.memory_set();
 
     // 非 MAP_FIXED 时 addr 仅作为地址建议；MemorySet 会从高地址向下找空闲区间，
     // 找不到时回退到 brk 附近的低地址（与 Linux 行为一致）。
@@ -518,7 +525,7 @@ pub fn syscall_mmap(
         }
         addr
     } else {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let Some(start) =
             memory_set.find_free_mmap_range((addr != 0).then_some(addr), map_len, USER_VA_TOP)
         else {
@@ -541,7 +548,7 @@ pub fn syscall_mmap(
     let perm = VmRegion::permission_from_prot(prot);
     // 是否锁定 对应区间,目前还没有swap 实现(TODO)
     let lock_range = {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         // 非 MAP_FIXED 时目标区间必须在两套数据结构中均空闲，vma 以及 真实数据映射
         if !is_fixed && !memory_set.user_range_is_free(map_start, map_end, USER_VA_TOP) {
             return err(SyscallError::ENOMEM);
@@ -663,7 +670,7 @@ pub fn syscall_mmap(
     let populate_file = should_populate_file.then_some(backing_file).flatten();
     let replace_existing = (flags & MAP_FIXED) != 0;
     let (detached_shmids, fixed_packet_ring_token) = {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let fixed_attach_update = if replace_existing {
             let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
             let Some(release_shmids) =
@@ -705,7 +712,7 @@ pub fn syscall_mmap(
         (detached_shmids, clear_token)
     };
     let pid = process.getpid() as u32;
-    drop(inner);
+    drop(mm);
     if let Some(token) = fixed_packet_ring_token {
         crate::syscall::net::clear_packet_ring_mmaps_for_range(token, map_start, map_end);
     }
@@ -743,9 +750,10 @@ pub fn syscall_mremap(
 
     let files_snapshot = current_files().lock().iter_files_snapshot();
     let process = current_process();
-    let inner = process.borrow_mut();
+    let ipc_ns_id = process.borrow_mut().ipc_ns_id;
+    let mm = process.memory_set();
     let (src_region, sysv_attach, mm_token) = {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         let Some(src_region) = memory_set.vm_region_containing(old_addr, old_end) else {
             return err(SyscallError::EFAULT);
         };
@@ -789,7 +797,7 @@ pub fn syscall_mremap(
             return err(SyscallError::EINVAL);
         }
         let detached_shmids = {
-            let mut memory_set = inner.memory_set.lock();
+            let mut memory_set = mm.lock();
             let mut cur = new_addr;
             while cur < new_end {
                 let vpn = crate::mm::VirtAddr::from(cur).floor();
@@ -834,7 +842,7 @@ pub fn syscall_mremap(
             detached_shmids
         };
         let pid = process.getpid() as u32;
-        drop(inner);
+        drop(mm);
         crate::syscall::net::clear_packet_ring_mmaps_for_range(mm_token, new_addr, new_end);
         release_detached_attach_refs(pid, detached_shmids.as_slice());
         return new_addr as isize;
@@ -842,7 +850,7 @@ pub fn syscall_mremap(
 
     if new_len <= old_len {
         {
-            let mut memory_set = inner.memory_set.lock();
+            let mut memory_set = mm.lock();
             let updated_attaches = if sysv_attach.is_some() {
                 let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
                 let Some(idx) = find_attach_containing(
@@ -887,7 +895,7 @@ pub fn syscall_mremap(
     // still get a chance to relocate instead of failing on the invalid in-place
     // end address.
     let in_place_grow_ok = {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         target_new_end != 0
             && user_range_valid(target_start, target_new_end)
             && memory_set.user_range_is_free(old_end, target_new_end, USER_VA_TOP)
@@ -896,7 +904,7 @@ pub fn syscall_mremap(
         if (flags & MREMAP_MAYMOVE) == 0 {
             return err(SyscallError::ENOMEM);
         }
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let Some(free_start) = memory_set.find_free_mmap_range(None, new_len, USER_VA_TOP) else {
             return err(SyscallError::ENOMEM);
         };
@@ -921,7 +929,7 @@ pub fn syscall_mremap(
     };
 
     let updated_attaches = if sysv_attach.is_some() {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
         let Some(idx) =
             find_attach_containing(&updated_attaches, src_region.sysv_shmid, old_addr, old_len)
@@ -946,7 +954,7 @@ pub fn syscall_mremap(
     let grow_ok = if src_region.sysv_shmid != 0 {
         let sysv_ipc_ns_id = sysv_attach
             .map(|attach| attach.ipc_ns_id)
-            .unwrap_or(inner.ipc_ns_id);
+            .unwrap_or(ipc_ns_id);
         let Some(seg_size) = segment_size(sysv_ipc_ns_id, src_region.sysv_shmid) else {
             return err(SyscallError::ENOMEM);
         };
@@ -989,7 +997,7 @@ pub fn syscall_mremap(
             });
         }
         {
-            let mut memory_set = inner.memory_set.lock();
+            let mut memory_set = mm.lock();
             memory_set.try_grow_user_vma_range_with_file_len(
                 old_addr,
                 old_len,
@@ -1002,7 +1010,7 @@ pub fn syscall_mremap(
         }
     } else if src_region.shared && src_region.memfd_id != 0 {
         let backing_file = {
-            let memory_set = inner.memory_set.lock();
+            let memory_set = mm.lock();
             memory_set.mmap_backing_file(src_region.backing_id)
         };
         let Some(file) = backing_file
@@ -1049,7 +1057,7 @@ pub fn syscall_mremap(
             });
         }
         {
-            let mut memory_set = inner.memory_set.lock();
+            let mut memory_set = mm.lock();
             memory_set.try_grow_user_vma_range_with_file_len(
                 old_addr,
                 old_len,
@@ -1062,7 +1070,7 @@ pub fn syscall_mremap(
         }
     } else if src_region.file_backed {
         let backing_file = {
-            let memory_set = inner.memory_set.lock();
+            let memory_set = mm.lock();
             memory_set.mmap_backing_file(src_region.backing_id)
         };
         let Some(file) = backing_file.or_else(|| {
@@ -1126,7 +1134,7 @@ pub fn syscall_mremap(
         }
 
         {
-            let mut memory_set = inner.memory_set.lock();
+            let mut memory_set = mm.lock();
             memory_set.try_grow_user_vma_range_with_file_len(
                 old_addr,
                 old_len,
@@ -1169,7 +1177,7 @@ pub fn syscall_mremap(
             end: target_new_end,
         };
         {
-            let mut memory_set = inner.memory_set.lock();
+            let mut memory_set = mm.lock();
             memory_set.try_grow_user_vma_range(
                 old_addr,
                 old_len,
@@ -1185,13 +1193,13 @@ pub fn syscall_mremap(
     }
 
     {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         if let Some(updated_attaches) = updated_attaches {
             memory_set.replace_sysv_shm_attaches(updated_attaches);
         }
         memory_set.note_mmap_end(target_new_end);
     }
-    drop(inner);
+    drop(mm);
     let clear_start = if target_start == old_addr {
         old_end
     } else {

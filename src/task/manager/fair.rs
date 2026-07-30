@@ -98,15 +98,12 @@ impl FairGroupQueue {
         deadline: u128,
         weight: u128,
     ) {
-        if let Some(old) = self.tasks.insert(
-            task_id,
-            FairTaskEntity {
-                vruntime,
-                deadline,
-                weight,
-                task,
-            },
-        ) {
+        if let Some(old) = self.tasks.insert(task_id, FairTaskEntity {
+            vruntime,
+            deadline,
+            weight,
+            task,
+        }) {
             self.task_order
                 .remove(&(old.deadline, old.vruntime, task_id));
             self.vruntime_weighted_sum = self

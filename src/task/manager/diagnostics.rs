@@ -16,6 +16,7 @@ pub fn dump_system_state() {
     );
     let map = PID2PCB.lock();
     for (pid, pcb) in map.iter() {
+        let tasks = pcb.indexed_tasks_snapshot();
         let Some(process_inner) = pcb.try_borrow_mut() else {
             log::warn!("[watchdog] pid={} pcb_lock=BUSY", pid);
             continue;
@@ -24,13 +25,25 @@ pub fn dump_system_state() {
             "[watchdog] pid={} zombie={} tasks_len={} children_len={} sems_len={}",
             pid,
             process_inner.is_zombie,
-            process_inner.tasks.len(),
+            tasks.len(),
             process_inner.children.len(),
             process_inner.semaphore_list.len()
         );
+        let semaphores = process_inner
+            .semaphore_list
+            .iter()
+            .enumerate()
+            .filter_map(|(sid, sem)| sem.as_ref().cloned().map(|sem| (sid, sem)))
+            .collect::<alloc::vec::Vec<_>>();
+        let mutex_ids = process_inner
+            .mutex_list
+            .iter()
+            .enumerate()
+            .filter_map(|(mid, mutex)| mutex.is_some().then_some(mid))
+            .collect::<alloc::vec::Vec<_>>();
+        drop(process_inner);
         // 任务
-        for (tid, t) in process_inner.tasks.iter().enumerate() {
-            let Some(tcb) = t else { continue };
+        for (tid, tcb) in tasks {
             let on_cpu = tcb.on_cpu.load(core::sync::atomic::Ordering::Acquire);
             let in_rq = tcb
                 .in_ready_queue
@@ -54,8 +67,7 @@ pub fn dump_system_state() {
             );
         }
         // 信号量
-        for (sid, sem) in process_inner.semaphore_list.iter().enumerate() {
-            let Some(sem) = sem else { continue };
+        for (sid, sem) in semaphores {
             let Some(guard) = sem.inner.try_lock() else {
                 log::warn!("[watchdog]  sem[{}] lock=BUSY", sid);
                 continue;
@@ -68,12 +80,9 @@ pub fn dump_system_state() {
             );
         }
         // 互斥锁
-        for (mid, m) in process_inner.mutex_list.iter().enumerate() {
-            if m.is_some() {
-                log::warn!("[watchdog]  mutex[{}]=Some(..)", mid);
-            }
+        for mid in mutex_ids {
+            log::warn!("[watchdog]  mutex[{}]=Some(..)", mid);
         }
-        drop(process_inner);
     }
     drop(map);
     log::warn!("==== [watchdog] end ====");

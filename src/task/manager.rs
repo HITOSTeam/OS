@@ -318,14 +318,7 @@ fn wakeup_task_with_batch_inner(
 
 /// 在进程调度策略/优先级/nice 值变更后，重新将其所有可运行线程入队到正确的位置
 pub fn refresh_process_runqueues(process: &Arc<ProcessControlBlock>) {
-    let tasks = {
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<alloc::vec::Vec<_>>()
-    };
+    let tasks = process.tasks_snapshot();
     if tasks.is_empty() {
         return;
     }

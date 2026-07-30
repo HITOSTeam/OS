@@ -60,13 +60,10 @@ impl PacketTapLoopback {
     /// 从外部（非 smoltcp 发送路径）直接向回环队列注入一个 IP 报文，
     /// 下次 `receive` 时即可被协议栈取走。供 `inject_loopback_ip_packet_in` 使用。
     pub(super) fn inject_ip_packet(&mut self, packet: &[u8], observe_rx: bool) {
-        push_back_bounded(
-            &mut self.queue,
-            QueuedLoopbackPacket {
-                data: packet.to_vec(),
-                observe_rx,
-            },
-        );
+        push_back_bounded(&mut self.queue, QueuedLoopbackPacket {
+            data: packet.to_vec(),
+            observe_rx,
+        });
     }
 }
 
@@ -162,13 +159,10 @@ impl<'a> SmolTxToken for PacketTapTxToken<'a> {
             *self.suppress_multicast_loopback -= 1;
         } else {
             // loopback 的发送结果就是稍后被同一个 namespace 的 RX 路径取走。
-            push_back_bounded(
-                self.queue,
-                QueuedLoopbackPacket {
-                    data: buffer,
-                    observe_rx: true,
-                },
-            );
+            push_back_bounded(self.queue, QueuedLoopbackPacket {
+                data: buffer,
+                observe_rx: true,
+            });
         }
         result
     }
@@ -191,13 +185,10 @@ impl Device for PacketTapLoopback {
                 crate::syscall::net::wireguard::handle_inbound_ipv4_packet(self.ns_id, &packet.data)
             {
                 for inner in inner_packets.into_iter().rev() {
-                    push_front_bounded(
-                        &mut self.queue,
-                        QueuedLoopbackPacket {
-                            data: inner,
-                            observe_rx: true,
-                        },
-                    );
+                    push_front_bounded(&mut self.queue, QueuedLoopbackPacket {
+                        data: inner,
+                        observe_rx: true,
+                    });
                 }
                 continue;
             }

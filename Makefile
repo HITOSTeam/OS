@@ -16,10 +16,12 @@ ROOT_DIR         := $(abspath $(MAKEFILE_DIR)/..)
 USER_DIR         := $(ROOT_DIR)/user
 CARGO_TARGET_DIR := $(ROOT_DIR)/target
 
+# 这个可以被外界赋值的变量，所以使用?修饰等于号
 ARCH          ?= riscv64
 MODE          ?= release
 FINAL_TEST    ?= 0
 SMP           ?= 12
+# 国赛测试使用4G 然后初赛的测试使用1G 当然也可以自己指定
 MEM           ?= $(if $(filter 1,$(FINAL_TEST)),4G,1G)
 DISK_SIZE     ?= 1G
 QEMU_TIMEOUT  ?= 0

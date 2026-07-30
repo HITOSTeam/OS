@@ -100,12 +100,7 @@ impl TaskControlBlock {
     pub fn try_mark_on_cpu(&self, hart_id: usize) -> bool {
         self.cpu_id.store(hart_id, Ordering::Release);
         self.on_cpu
-            .compare_exchange(
-                Self::OFF_CPU,
-                hart_id,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(Self::OFF_CPU, hart_id, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
@@ -403,10 +398,11 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
-        let (process_scheduling, memory_set) = {
+        let process_scheduling = {
             let inner = process.borrow_mut();
-            (inner.scheduling.clone(), inner.memory_set.clone())
+            inner.scheduling.clone()
         };
+        let memory_set = process.memory_set();
         let tcb = Self {
             process: Arc::downgrade(&process),
             memory_set: Mutex::new(memory_set),
@@ -503,10 +499,11 @@ impl TaskControlBlock {
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
         // 继承进程当前的 nice 值，避免新线程上调度器后 nice 不一致
-        let (process_scheduling, memory_set) = {
+        let process_scheduling = {
             let inner = process.borrow_mut();
-            (inner.scheduling.clone(), inner.memory_set.clone())
+            inner.scheduling.clone()
         };
+        let memory_set = process.memory_set();
         let tcb = Self {
             // 用 Weak 反指回所属进程，避免线程 TCB 与进程 PCB 之间形成 Arc 循环引用
             process: Arc::downgrade(&process),
