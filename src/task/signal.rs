@@ -455,6 +455,7 @@ pub fn check_task_signals_error(task: &Arc<TaskControlBlock>) -> Option<(i32, &'
     if ready == 0 {
         return None;
     }
+    let process = task.process.upgrade()?;
     while ready != 0 {
         let signum = ready.trailing_zeros() as usize + 1;
         ready &= ready - 1;
@@ -462,7 +463,6 @@ pub fn check_task_signals_error(task: &Arc<TaskControlBlock>) -> Option<(i32, &'
             continue;
         };
         let (handler, traced) = {
-            let process = current_process();
             let traced = process.borrow_mut().ptrace_tracer_pid.is_some();
             let inner = process.signal();
             let handler = if signum <= MAX_SIG {
@@ -738,7 +738,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
     if sig_bit != 0 {
         for t in tasks.iter() {
             let (tid, pending, mask) = {
-                let mut inner: spin::MutexGuard<'_, TaskControlBlockInner> = t.borrow_mut();
+                let mut inner = t.borrow_mut();
                 mark_pending_signal(&mut inner, signum as usize, sender_pid, sender_uid, 0, 0);
                 let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
                 (tid, inner.pending_signals, inner.signal_mask)

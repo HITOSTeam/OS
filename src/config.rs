@@ -236,6 +236,7 @@ pub fn phys_mem_total() -> usize {
 }
 
 /// 检查整个物理地址区间是否落在同一段 RAM 内。
+#[cfg(target_arch = "loongarch64")]
 pub fn phys_range_in_ram(start: usize, len: usize) -> bool {
     let Some(end) = start.checked_add(len) else {
         return false;

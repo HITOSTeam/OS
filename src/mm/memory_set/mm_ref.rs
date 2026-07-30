@@ -100,18 +100,6 @@ impl MmRef {
         memory_set.update_file_vm_size(dev, ino, file_size)
     }
 
-    /// fd write 后将数据镜像到所有共享文件映射的驻留页。
-    pub fn mirror_shared_file_write_to_resident_mmaps(
-        &self,
-        dev: usize,
-        ino: u32,
-        write_off: usize,
-        data: &[u8],
-    ) {
-        self.lock()
-            .mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
-    }
-
     /// 尽力同步其他进程中已经驻留的 MAP_SHARED 页；忙碌 mm 不等待，
     /// 后续缺页仍会从全局共享文件页缓存取得最新数据。
     pub fn try_mirror_shared_file_write_to_resident_mmaps(

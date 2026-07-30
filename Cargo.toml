@@ -64,12 +64,3 @@ loongArch64 = "0.2.4"
 
 [features]
 loongarch_board = []
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-debug = true
-opt-level = 3           # LTP fork-heavy cases need optimized kernel hot paths.
-overflow-checks = false # 关闭整数溢出检查

@@ -6,10 +6,8 @@ use alloc::sync::Arc;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use riscv::register::sstatus::{self, FS};
-use spin::MutexGuard;
-
 use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
+use riscv::register::sstatus::{self, FS};
 
 /// 有SSTC寄存器的话就不需要使用 SBI 来设置时钟中断了。
 static RISCV_HAS_SSTC: AtomicBool = AtomicBool::new(false);
@@ -207,7 +205,7 @@ fn disable_fp() {
 }
 
 #[inline]
-fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
+fn save_fp_registers(inner: &mut TaskControlBlockInner) {
     ensure_fs_enabled();
     let ptr = inner.fp_regs.as_mut_ptr();
     // SAFETY: ptr points to a valid fp_regs array in the task control block;
@@ -257,7 +255,7 @@ fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
 }
 
 #[inline]
-fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
+fn restore_fp_registers(inner: &TaskControlBlockInner) {
     if !inner.fp_valid {
         return;
     }

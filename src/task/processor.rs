@@ -26,7 +26,8 @@ use crate::{
     trap::init_trap,
 };
 use alloc::{collections::VecDeque, sync::Arc, task, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use log;
 use spin::Mutex;
@@ -719,9 +720,12 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     task
 }
 
-/// 唤醒路径专用：用 `try_lock` 获取当前任务，拿不到锁就放弃抢占判断，
-/// 避免在持有就绪队列锁时再去抢 processor 锁而死锁。
-fn current_task_for_wakeup_preempt() -> Option<Arc<TaskControlBlock>> {
+/// 非阻塞获取本 hart 当前任务。
+///
+/// 调度探测和唤醒抢占路径可能已经位于其他锁的临界区，拿不到 processor 锁时
+/// 应直接放弃本次优化机会，不能为了读取当前任务再形成一条自旋锁等待链。
+#[inline]
+fn try_current_task() -> Option<Arc<TaskControlBlock>> {
     let processor = local_processor().try_lock()?;
     processor.current()
 }
@@ -795,7 +799,7 @@ fn wakeup_should_preempt_task(
 /// 判断被唤醒的任务是否应抢占本 hart（调用方所在 hart）当前运行的任务。
 /// 取不到当前任务则视为应抢占（idle 状态，谁来都行）。
 fn wakeup_should_preempt_current(woken: &Arc<TaskControlBlock>) -> bool {
-    let Some(current) = current_task_for_wakeup_preempt() else {
+    let Some(current) = try_current_task() else {
         return true;
     };
     wakeup_should_preempt_task(&current, woken, hart_id() % MAX_HARTS)
@@ -998,6 +1002,7 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
 /// 调度核心函数,直接完成任务的切换，传入参数为我们需要切换的任务的上下文
 /// 完毕之后，该hart 进入idle_task,idle-Task会进入调度循环idle_task()
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+    assert_current_scheduling_enabled("schedule");
     #[cfg(target_arch = "riscv64")]
     // The RISC-V trap path runs part of the kernel on the current user SATP
     // with shared kernel roots. Switch to the full kernel SATP before the idle
@@ -1508,23 +1513,46 @@ lazy_static! {
 /// `reschedule_before_user_return_if_needed` 消费。
 static NEED_RESCHED: [AtomicBool; MAX_HARTS] = [const { AtomicBool::new(false) }; MAX_HARTS];
 
+/// 每 hart 的不可调度嵌套深度，对应 Linux `preempt_count`。
+///
+/// 计数属于执行上下文而不是某个 TCB，持有任意 TCB 内锁或跨子系统临界区时
+/// 都能用一次本地原子读取阻止主动调度，不需要争用 processor/TCB 锁。
+#[repr(align(64))]
+struct HartSchedulingState {
+    disabled: AtomicUsize,
+}
+
+impl HartSchedulingState {
+    const fn new() -> Self {
+        Self {
+            disabled: AtomicUsize::new(0),
+        }
+    }
+}
+
+static SCHEDULING_STATE: [HartSchedulingState; MAX_HARTS] =
+    [const { HartSchedulingState::new() }; MAX_HARTS];
+
 pub fn go_to_first_task() -> ! {
     idle_task();
     panic!("Unreachable in go_to_first_task!");
 }
-pub fn suspend_current_and_run_next() {
-    // If the current process has a fatal pending signal, terminate it even if we are
-    // inside a long-running/blocking syscall loop (where we may never return to the
-    // trap handler's "check signal then return to user" path).
-    //
-    // Use `try_borrow_mut` to avoid deadlocking if the caller already holds the PCB lock.
-    if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
+fn suspend_current_and_run_next_unchecked(task_snapshot: Arc<TaskControlBlock>) {
+    // 长时间运行或循环阻塞的系统调用可能一直到不了返回用户态前的信号检查点，
+    // 因此主动让出时也处理致命信号。进入这里前已经非阻塞探测过 TCB/PCB 锁。
+    if let Some((errno, msg)) = crate::task::signal::check_task_signals_error(&task_snapshot) {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
     let Some(task) = take_current_task() else {
         return;
     };
+    debug_assert!(
+        Arc::ptr_eq(&task, &task_snapshot),
+        "hart {} 调度探测期间当前任务发生变化",
+        hart_id()
+    );
+    drop(task_snapshot);
     charge_task_runtime_for_scheduler(&task);
 
     // ---- access current TCB exclusively
@@ -1547,29 +1575,61 @@ pub fn suspend_current_and_run_next() {
     schedule(task_cx_ptr);
 }
 
-/// 当前任务的不可调度临界区守卫。
+/// 当前 hart 的不可调度临界区守卫。
 ///
-/// 守卫只记录任务级原子计数，不持有 TCB/PCB 锁，因此可以安全跨越 mm 与
-/// 文件系统调用。析构时恢复可调度状态，支持同一调用链嵌套使用。
+/// 守卫不持有 TCB/PCB 锁，可以安全嵌套并跨越 mm 与文件系统调用。
 pub struct SchedulingDisableGuard {
-    task: Option<Arc<TaskControlBlock>>,
+    hart: usize,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Drop for SchedulingDisableGuard {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.enable_scheduling();
-        }
+        let previous = SCHEDULING_STATE[self.hart]
+            .disabled
+            .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "hart 不可调度计数下溢");
     }
 }
 
-/// 标记当前任务暂时不能主动进入调度器。
+/// 标记当前 hart 暂时不能主动进入调度器。
+#[inline]
 pub fn disable_current_scheduling() -> SchedulingDisableGuard {
-    let task = current_task();
-    if let Some(task) = task.as_ref() {
-        task.disable_scheduling();
+    let hart = hart_id();
+    debug_assert!(hart < MAX_HARTS, "hart id 超出不可调度计数范围");
+    SCHEDULING_STATE[hart]
+        .disabled
+        .fetch_add(1, Ordering::Relaxed);
+    SchedulingDisableGuard {
+        hart,
+        _not_send: PhantomData,
     }
-    SchedulingDisableGuard { task }
+}
+
+#[inline]
+fn current_scheduling_disable_depth() -> usize {
+    let hart = hart_id();
+    if hart >= MAX_HARTS {
+        return usize::MAX;
+    }
+    SCHEDULING_STATE[hart].disabled.load(Ordering::Relaxed)
+}
+
+/// 当前执行上下文是否允许主动调度。
+#[inline]
+fn current_scheduling_enabled() -> bool {
+    current_scheduling_disable_depth() == 0
+}
+
+#[inline]
+fn assert_current_scheduling_enabled(operation: &str) {
+    assert_eq!(
+        current_scheduling_disable_depth(),
+        0,
+        "hart {} 在不可调度临界区内进入 {}",
+        hart_id(),
+        operation
+    );
 }
 
 /// 尝试在允许调度的上下文中主动让出当前 CPU。
@@ -1577,23 +1637,37 @@ pub fn disable_current_scheduling() -> SchedulingDisableGuard {
 /// 缺页、用户内存复制等路径可能已经持有当前任务的 TCB 内锁。此时直接调用
 /// `suspend_current_and_run_next()` 会在运行时间记账或任务状态切换时再次获取
 /// 同一把锁，形成当前 hart 自锁。这里把可调度性判断收敛到调度器：只有当前
-/// TCB 内锁能够立即取得时才进入完整的让出流程，否则由调用者继续短暂自旋。
+/// processor、当前 TCB 和 PCB 内锁都能够立即取得时才进入完整的让出流程，
+/// 否则由调用者继续短暂自旋。
 pub fn try_suspend_current_and_run_next() -> bool {
-    let Some(task) = current_task() else {
-        return false;
-    };
-    if task.is_scheduling_disabled() {
+    // 热路径先读每 hart 计数。持有 TCB/mm 锁时无需再争用 processor 锁。
+    if !current_scheduling_enabled() {
         return false;
     }
-    let Some(task_inner) = task.try_borrow_mut() else {
+    let Some(task) = try_current_task() else {
         return false;
     };
-    drop(task_inner);
-    suspend_current_and_run_next();
+    if !task.inner_lock_available_for_scheduling() {
+        return false;
+    }
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
+    if !process.inner_lock_available_for_scheduling() {
+        return false;
+    }
+    drop(process);
+    suspend_current_and_run_next_unchecked(task);
     true
 }
 
+/// 主动让出当前 CPU；不可调度上下文中保持运行并由调用者继续重试。
+pub fn suspend_current_and_run_next() {
+    let _ = try_suspend_current_and_run_next();
+}
+
 pub fn block_current_and_run_next() {
+    assert_current_scheduling_enabled("block_current_and_run_next");
     // Same rationale as in `suspend_current_and_run_next()`: a task can be stuck
     // yielding within a syscall (interrupts disabled), so handle fatal signals here.
     if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
@@ -1646,6 +1720,7 @@ pub const IDLE_PID: usize = 0;
 
 // 线程(task)  单位的推出
 pub fn exit_current_and_run_next(exit_code: i32) -> ! {
+    assert_current_scheduling_enabled("exit_current_and_run_next");
     // 标记线程状态,
     let task = take_current_task().unwrap();
     charge_task_runtime_for_scheduler(&task);
@@ -1816,6 +1891,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
 /// Terminate the entire process, even when called from a non-main thread.
 pub fn exit_group_and_run_next(exit_code: i32) -> ! {
+    assert_current_scheduling_enabled("exit_group_and_run_next");
     let task = take_current_task().unwrap();
     charge_task_runtime_for_scheduler(&task);
     // 与普通退出路径相同，switch() 不再使用任务内核栈后，由 idle 设置 OFF_CPU。

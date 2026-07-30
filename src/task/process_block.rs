@@ -1384,6 +1384,13 @@ impl ProcessControlBlock {
         self.inner.try_lock()
     }
 
+    /// 主动调度前只探测一次 PCB 元数据锁，避免持锁调用者切走后在同一 hart
+    /// 上运行的任务反向等待这把锁。锁忙时由调用者保留 CPU 并短暂重试。
+    #[inline]
+    pub(crate) fn inner_lock_available_for_scheduling(&self) -> bool {
+        self.inner.try_lock().is_some()
+    }
+
     pub(crate) fn files(&self) -> Arc<SpinMutex<FilesStruct>> {
         Arc::clone(&self.files.lock())
     }

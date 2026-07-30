@@ -202,7 +202,6 @@ mod virtio_pci {
             FrameTracker, KERNEL_SPACE, MapPermission, PTEFlags, PhysAddr, VirtAddr,
             frame_alloc_contiguous,
         },
-        println,
     };
     use alloc::vec;
     use alloc::{
@@ -212,7 +211,7 @@ mod virtio_pci {
     };
     use core::{
         ptr::NonNull,
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, Ordering},
     };
     use ext4_fs::BlockDevice;
     use fdt::{Fdt, node::FdtNode};
@@ -232,8 +231,6 @@ mod virtio_pci {
     };
 
     static PCI_ECAM_MAPPED: AtomicBool = AtomicBool::new(false);
-    static READ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static WRITE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
     const FORCE_DMA_CACHEABLE: bool = true;
 
     pub struct VirtIOBlock(Mutex<VirtIOBlk<HalImpl, PciTransport>>);
@@ -322,15 +319,20 @@ mod virtio_pci {
             if direct_dma_ok(vaddr, buffer.len()) {
                 return;
             }
-            if let BufferDirection::DeviceToDriver | BufferDirection::Both = direction {
-                let src = core::slice::from_raw_parts(paddr as *const u8, buffer.len());
-                let dst = core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
-                dst.copy_from_slice(src);
+            // SAFETY: paddr 来自 share 中同长度的 Box<[u8]>；buffer 在调用期间
+            // 保持有效且与该临时缓冲区不重叠，最后用原始切片指针恢复所有权。
+            unsafe {
+                if let BufferDirection::DeviceToDriver | BufferDirection::Both = direction {
+                    let src = core::slice::from_raw_parts(paddr as *const u8, buffer.len());
+                    let dst =
+                        core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
+                    dst.copy_from_slice(src);
+                }
+                drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                    paddr as *mut u8,
+                    buffer.len(),
+                )));
             }
-            let _shared = Box::from_raw(core::ptr::slice_from_raw_parts_mut(
-                paddr as *mut u8,
-                buffer.len(),
-            ));
         }
     }
 
@@ -349,59 +351,23 @@ mod virtio_pci {
             assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
-            let idx = READ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            // if idx < 8 {
-            //     println!(
-            //         "[virtio_pci] read block_id={} sector={} sectors={} bytes={}",
-            //         block_id,
-            //         base_sector,
-            //         buf.len() / 512,
-            //         buf.len()
-            //     );
-            // }
             let start = crate::perf::block_read_begin();
             self.0
                 .lock()
                 .read_blocks(base_sector, buf)
                 .expect("Error when reading VirtIOBlk");
             crate::perf::block_read_end(start, buf.len());
-            // if idx < 8 {
-            //     println!(
-            //         "[virtio_pci] read done block_id={} sector={} bytes={}",
-            //         block_id,
-            //         base_sector,
-            //         buf.len()
-            //     );
-            // }
         }
         fn write_blocks(&self, block_id: usize, buf: &[u8]) {
             assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
-            let idx = WRITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            // if idx < 8 {
-            //     println!(
-            //         "[virtio_pci] write block_id={} sector={} sectors={} bytes={}",
-            //         block_id,
-            //         base_sector,
-            //         buf.len() / 512,
-            //         buf.len()
-            //     );
-            // }
             let start = crate::perf::block_write_begin();
             self.0
                 .lock()
                 .write_blocks(base_sector, buf)
                 .expect("Error when writing VirtIOBlk");
             crate::perf::block_write_end(start, buf.len());
-            // if idx < 8 {
-            //     println!(
-            //         "[virtio_pci] write done block_id={} sector={} bytes={}",
-            //         block_id,
-            //         base_sector,
-            //         buf.len()
-            //     );
-            // }
         }
     }
 
@@ -532,22 +498,6 @@ mod virtio_pci {
         );
     }
 
-    fn log_pci_range(label: &str, start: usize, size: usize) {
-        let end = start.saturating_add(size);
-        let mem_start = crate::config::phys_mem_start();
-        let mem_end = crate::config::phys_mem_end();
-        // println!(
-        //     "[virtio_pci] {} [{:#x}, {:#x}) size={:#x}",
-        //     label, start, end, size
-        // );
-        // if start < mem_end && end > mem_start {
-        //     println!(
-        //         "[virtio_pci][warn] {} overlaps RAM [{:#x}, {:#x})",
-        //         label, mem_start, mem_end
-        //     );
-        // }
-    }
-
     fn map_device_bars(root: &mut PciRoot, device_function: DeviceFunction) {
         let mut bar_index = 0u8;
         while bar_index < 6 {
@@ -559,7 +509,6 @@ mod virtio_pci {
                 }
             };
             if let Some((addr, size)) = info.memory_address_size() {
-                log_pci_range("PCI BAR", addr as usize, size as usize);
                 map_identical_range(addr as usize, size as usize);
             }
             bar_index += if info.takes_two_entries() { 2 } else { 1 };
@@ -581,7 +530,6 @@ mod virtio_pci {
         if let Some(reg) = pci_node.reg() {
             for region in reg {
                 if let Some(size) = region.size {
-                    log_pci_range("PCI ECAM", region.starting_address as usize, size);
                     map_identical_range(region.starting_address as usize, size);
                     mapped = true;
                 }

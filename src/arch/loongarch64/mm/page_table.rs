@@ -550,11 +550,10 @@ fn resolve_user_pte(token: usize, va: usize, access: MapPermission) -> Result<Pa
             }
         }
     };
-    let mut flags = pte.flags();
+    let flags = pte.flags();
     if access.contains(MapPermission::W) && !pte.writable() {
         if flags.contains(PTEFlags::COW) && try_resolve_user_page(token, va, access) {
             pte = page_table.translate(vpn).ok_or(())?;
-            flags = pte.flags();
         }
     }
     if !pte.is_user() {

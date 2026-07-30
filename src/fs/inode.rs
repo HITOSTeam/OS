@@ -49,16 +49,21 @@ impl Ext4Lock {
             {
                 return;
             }
-            // ext4 临界区通常很短，先做有限次本地自旋，减少无谓上下文切换。
-            spin_loop();
-            spins += 1;
-            if spins < Self::SPINS_BEFORE_YIELD {
-                continue;
-            }
-            spins = 0;
 
-            // 不可调度上下文只继续短暂自旋，避免持有当前 TCB 锁时重入调度器。
-            let _ = crate::task::processor::try_suspend_current_and_run_next();
+            // 已知锁被持有后只做共享读取，避免每个 hart 持续用 CAS 抢占
+            // 同一缓存行。锁释放后再回到外层尝试一次原子获取。
+            while self.held.load(Ordering::Relaxed) {
+                spin_loop();
+                spins += 1;
+                if spins < Self::SPINS_BEFORE_YIELD {
+                    continue;
+                }
+                spins = 0;
+
+                // 不可调度上下文只继续短暂自旋，避免持有 TCB/mm 锁时
+                // 重入调度器；可调度时让锁持有者获得实际运行时间。
+                let _ = crate::task::processor::try_suspend_current_and_run_next();
+            }
         }
     }
 
@@ -897,15 +902,6 @@ impl OSInode {
 
     pub fn ext4_inode(&self) -> Arc<Inode> {
         self.inner.lock().inode.clone()
-    }
-
-    /// Return the end offset of buffered (not-yet-flushed) writes.
-    ///
-    /// This is used to report a correct file size to userspace (`fstat`, `lseek(SEEK_END)`)
-    /// even when we are buffering writes in memory.
-    pub fn pending_write_end(&self) -> usize {
-        let inner = self.inner.lock();
-        inner.write_buf_off.saturating_add(inner.write_buf.len())
     }
 
     fn write_at_zeroing_gap(

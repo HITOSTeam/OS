@@ -17,10 +17,10 @@ use crate::arch::loongarch64::mm::AsidContext;
 #[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::mm::AsidContext;
 #[cfg(target_arch = "riscv64")]
-use crate::config::{KERNEL_STACK_TOP, phys_mem_start};
+use crate::config::{KERNEL_STACK_TOP, phys_mem_end, phys_mem_start};
 use crate::config::{
     MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
-    USER_STACK_SIZE, for_each_dtb_mmio_range, for_each_phys_mem_range, phys_mem_end,
+    USER_STACK_SIZE, for_each_dtb_mmio_range, for_each_phys_mem_range,
 };
 use crate::fs::File;
 use crate::println;
@@ -44,7 +44,6 @@ unsafe extern "C" {
     safe fn edata();
     safe fn sbss_with_stack();
     safe fn ebss();
-    safe fn ekernel();
     safe fn strampoline();
 }
 
@@ -2079,26 +2078,33 @@ impl MemorySet {
         overlap_end
     }
 
+    #[cfg(target_arch = "riscv64")]
     fn page_align_up(value: usize) -> usize {
         value.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
     }
 
     fn place_initial_user_stack_bottom(&self, requested_bottom: usize) -> usize {
-        let mut bottom = requested_bottom;
         #[cfg(target_arch = "riscv64")]
-        if self.has_user_kernel_mappings {
-            // ELF stacks are normally placed after the last PT_LOAD segment.
-            // With shared kernel roots, skip over any shared high-root window so
-            // user VMAs never overlap kernel-only page-table subtrees.
-            loop {
-                let end = bottom.saturating_add(USER_STACK_SIZE);
-                let Some(conflict_end) = self.riscv_shared_kernel_overlap_end(bottom, end) else {
-                    break;
-                };
-                bottom = Self::page_align_up(conflict_end.saturating_add(PAGE_SIZE));
+        {
+            let mut bottom = requested_bottom;
+            if self.has_user_kernel_mappings {
+                // ELF 栈通常位于最后一个 PT_LOAD 段之后。共享内核根页表时，
+                // 跳过高地址共享窗口，避免用户 VMA 覆盖内核页表子树。
+                loop {
+                    let end = bottom.saturating_add(USER_STACK_SIZE);
+                    let Some(conflict_end) = self.riscv_shared_kernel_overlap_end(bottom, end)
+                    else {
+                        break;
+                    };
+                    bottom = Self::page_align_up(conflict_end.saturating_add(PAGE_SIZE));
+                }
             }
+            bottom
         }
-        bottom
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            requested_bottom
+        }
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -2171,11 +2177,9 @@ impl MemorySet {
 
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
-        let mut flags = PTEFlags::from(MapPermission::R | MapPermission::X);
+        let flags = PTEFlags::from(MapPermission::R | MapPermission::X);
         #[cfg(target_arch = "riscv64")]
-        {
-            flags |= PTEFlags::G;
-        }
+        let flags = flags | PTEFlags::G;
         self.page_table.map(
             VirtAddr::from(TRAMPOLINE).into(),
             PhysAddr::from(strampoline as usize).into(),

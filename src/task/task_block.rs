@@ -1,5 +1,6 @@
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 
@@ -47,11 +48,6 @@ pub struct TaskControlBlock {
     pub in_ready_queue: AtomicBool,
     /// 当前持有该任务的 hart 运行队列；未入队时为 `OFF_CPU`。
     pub ready_queue_hart: AtomicUsize,
-    /// 当前任务进入不可调度临界区的嵌套深度。
-    ///
-    /// 这对应 Linux 的 preempt_count/StarryOS 任务层抢占约束。持有 mm 等
-    /// 跨子系统自旋锁时，ext4 锁竞争只能短暂自旋，不能重入调度器。
-    scheduling_disabled: AtomicUsize,
     /// futex wait 入队后的反向句柄。
     ///
     /// 退出清理可凭它直接进入对应 futex bucket 删除 waiter，避免扫描所有
@@ -64,6 +60,30 @@ pub struct TaskControlBlock {
 pub struct FutexWaitHandle {
     pub key: (usize, usize),
     pub in_queue: Arc<AtomicBool>,
+}
+
+/// 持有 TCB 内锁期间同时禁止当前 hart 主动调度。
+///
+/// TCB 使用自旋锁保护；若锁持有者在临界区内主动让出 CPU，新任务可能再次
+/// 获取同一把锁而自锁。该守卫把 StarryOS `SpinNoPreempt` 和 Linux
+/// `spin_lock()` 的约束固化到类型中，先释放内锁，再恢复可调度状态。
+pub struct TaskControlBlockGuard<'a> {
+    inner: MutexGuard<'a, TaskControlBlockInner>,
+    _scheduling_guard: crate::task::processor::SchedulingDisableGuard,
+}
+
+impl Deref for TaskControlBlockGuard<'_> {
+    type Target = TaskControlBlockInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for TaskControlBlockGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 
 static TASK_TCB_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -125,21 +145,13 @@ impl TaskControlBlock {
         self.signal_pending.load(Ordering::Acquire)
     }
 
-    pub(crate) fn disable_scheduling(&self) {
-        self.scheduling_disabled.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn enable_scheduling(&self) {
-        let previous = self.scheduling_disabled.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "任务可调度性计数下溢");
-    }
-
-    pub(crate) fn is_scheduling_disabled(&self) -> bool {
-        self.scheduling_disabled.load(Ordering::Acquire) != 0
-    }
-
-    pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
-        self.inner.lock()
+    pub fn borrow_mut(&self) -> TaskControlBlockGuard<'_> {
+        let scheduling_guard = crate::task::processor::disable_current_scheduling();
+        let inner = self.inner.lock();
+        TaskControlBlockGuard {
+            inner,
+            _scheduling_guard: scheduling_guard,
+        }
     }
 
     pub fn kstack_top(&self) -> usize {
@@ -154,8 +166,19 @@ impl TaskControlBlock {
         self.kstack.lock().take()
     }
 
-    pub fn try_borrow_mut(&self) -> Option<MutexGuard<'_, TaskControlBlockInner>> {
-        self.inner.try_lock()
+    pub fn try_borrow_mut(&self) -> Option<TaskControlBlockGuard<'_>> {
+        let scheduling_guard = crate::task::processor::disable_current_scheduling();
+        let inner = self.inner.try_lock()?;
+        Some(TaskControlBlockGuard {
+            inner,
+            _scheduling_guard: scheduling_guard,
+        })
+    }
+
+    /// 调度器让出 CPU 前只探测一次 TCB 内锁，不把原始 guard 暴露给调用者。
+    #[inline]
+    pub(crate) fn inner_lock_available_for_scheduling(&self) -> bool {
+        self.inner.try_lock().is_some()
     }
 
     pub fn get_user_token(&self) -> usize {
@@ -432,7 +455,6 @@ impl TaskControlBlock {
             signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
-            scheduling_disabled: AtomicUsize::new(0),
             futex_wait: Mutex::new(None),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),
@@ -539,7 +561,6 @@ impl TaskControlBlock {
             signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
-            scheduling_disabled: AtomicUsize::new(0),
             futex_wait: Mutex::new(None),
             inner: Mutex::new(TaskControlBlockInner {
                 res: Some(res),

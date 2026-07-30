@@ -8,8 +8,6 @@ use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::MutexGuard;
-
 use csr_defs::{
     CRMD_DA, CRMD_IE, CRMD_PG, ECFG_LIE_IPI, ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT,
     IOCSR_IPI_CLEAR, IOCSR_IPI_EN, IOCSR_IPI_SEND, IOCSR_IPI_SEND_BLOCKING,
@@ -335,7 +333,7 @@ fn enable_user_vector(mask: usize) {
 }
 
 #[inline]
-fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
+fn save_fp_registers(inner: &mut TaskControlBlockInner) {
     ensure_fp_enabled();
     let ptr = inner.fp_regs.as_mut_ptr();
     // SAFETY: ptr points to a valid fp_regs array in the task control block;
@@ -422,7 +420,7 @@ fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
 }
 
 #[inline]
-fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
+fn restore_fp_registers(inner: &TaskControlBlockInner) {
     if !inner.fp_valid {
         return;
     }
