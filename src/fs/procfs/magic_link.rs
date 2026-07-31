@@ -309,6 +309,19 @@ fn proc_pid_cwd(pid: u32) -> Option<String> {
     Some(inner.cwd.clone())
 }
 
+/// 读取目标进程当前可执行文件的逻辑绝对路径。
+///
+/// Zombie 已经不再拥有可运行的地址空间，和 Linux 一样不再暴露 `exe` 目标。
+fn proc_pid_exe(pid: u32) -> Option<String> {
+    let proc = pid2process(pid as usize)?;
+    let inner = proc.try_borrow_mut()?;
+    if inner.is_zombie || inner.exe_path.is_empty() {
+        None
+    } else {
+        Some(inner.exe_path.clone())
+    }
+}
+
 /// 取目标进程 fd 表中指定 fd 的文件对象（克隆 `Arc`）。进程不存在或 fd 无效时返回 `None`。
 fn proc_pid_fd_file(pid: u32, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
     let proc = pid2process(pid as usize)?;
@@ -377,8 +390,9 @@ enum ProcMagicLinkFollowTarget {
 
 /// 判断某个 procfs 路径是否本身是一个 magic link，并解析出它的跟随目标。
 ///
-/// 覆盖 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下的 `cwd`、`ns/ipc`、
-/// `ns/mnt`、`fd/<n>` 和对应的 `task/<tid>/…` 变体。非 magic link 返回 `None`。
+/// 覆盖 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下的 `cwd`、`exe`、
+/// `ns/ipc`、`ns/mnt`、`fd/<n>` 和对应的 `task/<tid>/…` 变体。
+/// 非 magic link 返回 `None`。
 fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget> {
     let trimmed = trim_proc_path(path);
 
@@ -399,6 +413,9 @@ fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget
     }
     if rest == "cwd" {
         return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
+    }
+    if rest == "exe" {
+        return proc_pid_exe(pid).map(ProcMagicLinkFollowTarget::Path);
     }
     if rest == "ns/ipc" {
         return proc_pid_namespace_file(pid, NamespaceKind::Ipc)
@@ -423,6 +440,9 @@ fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget
     }
     if tail == "cwd" {
         return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
+    }
+    if tail == "exe" {
+        return proc_pid_exe(pid).map(ProcMagicLinkFollowTarget::Path);
     }
     if tail == "ns/ipc" {
         return proc_pid_namespace_file(pid, NamespaceKind::Ipc)
@@ -462,7 +482,13 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if !proc_pid_exists(pid) {
         return false;
     }
-    if rest == "cwd" || rest == "ns/ipc" || rest == "ns/mnt" || rest == "ns/net" {
+    if rest == "cwd" {
+        return true;
+    }
+    if rest == "exe" {
+        return proc_pid_exe(pid).is_some();
+    }
+    if rest == "ns/ipc" || rest == "ns/mnt" || rest == "ns/net" {
         return true;
     }
     if let Some(fd_name) = rest.strip_prefix("fd/") {
@@ -477,7 +503,13 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if !proc_pid_task_alive(pid, tid) {
         return false;
     }
-    if tail == "cwd" || tail == "ns/ipc" || tail == "ns/mnt" || tail == "ns/net" {
+    if tail == "cwd" {
+        return true;
+    }
+    if tail == "exe" {
+        return proc_pid_exe(pid).is_some();
+    }
+    if tail == "ns/ipc" || tail == "ns/mnt" || tail == "ns/net" {
         return true;
     }
     tail.strip_prefix("fd/")
@@ -512,8 +544,9 @@ pub fn proc_fd_link_file(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
 
 /// 实现对 procfs magic link 的 `readlink`：返回链接指向的目标字符串。
 ///
-/// 处理 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下 `cwd`、`ns/ipc`、`ns/mnt`、
-/// `fd/<n>`（及 `task/<tid>/…` 变体）。非链接路径返回 `None`。
+/// 处理 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下 `cwd`、`exe`、
+/// `ns/ipc`、`ns/mnt`、`fd/<n>`（及 `task/<tid>/…` 变体）。
+/// 非链接路径返回 `None`。
 pub fn proc_readlink(path: &str) -> Option<String> {
     let trimmed = trim_proc_path(path);
 
@@ -538,6 +571,9 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     if rest == "cwd" {
         return proc_pid_cwd(pid);
     }
+    if rest == "exe" {
+        return proc_pid_exe(pid);
+    }
     if rest == "ns/ipc" {
         return proc_pid_namespace_target(pid, NamespaceKind::Ipc);
     }
@@ -559,6 +595,9 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     }
     if tail == "cwd" {
         return proc_pid_cwd(pid);
+    }
+    if tail == "exe" {
+        return proc_pid_exe(pid);
     }
     if tail == "ns/ipc" {
         return proc_pid_namespace_target(pid, NamespaceKind::Ipc);

@@ -4,12 +4,28 @@ use alloc::sync::Arc;
 struct LoadedExecImage {
     data: Vec<u8>,
     exec_inode: (usize, u32),
+    exe_path: String,
     _reservation: crate::fs::ExecInodeReservation,
 }
 
-fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>) -> Result<LoadedExecImage, isize> {
+/// Return a stable logical path for `/proc/<pid>/exe`.
+///
+/// Normal exec paths are made absolute before the old address space is
+/// replaced.  `AT_EMPTY_PATH` has no pathname, so it falls back to the inode
+/// path hint/search used elsewhere by procfs.
+fn logical_exec_path(dirfd: isize, path: &str, inode: &Arc<ext4_fs::Inode>) -> String {
+    resolve_abs_path(dirfd, path)
+        .ok()
+        .flatten()
+        .or_else(|| crate::fs::inode_path_hint(inode))
+        .or_else(|| crate::fs::inode_path_in_roots(inode))
+        .unwrap_or_else(|| String::from(path))
+}
+
+fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>, path: &str) -> Result<LoadedExecImage, isize> {
     let reservation = crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num())?;
     let exec_inode = reservation.key();
+    let exe_path = logical_exec_path(AT_FDCWD, path, &inode);
     let data = {
         let _ext4_guard = ext4_lock();
         inode.read_all()
@@ -17,6 +33,7 @@ fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>) -> Result<LoadedExecImage, 
     Ok(LoadedExecImage {
         data,
         exec_inode,
+        exe_path,
         _reservation: reservation,
     })
 }
@@ -24,7 +41,7 @@ fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>) -> Result<LoadedExecImage, 
 /// This function tries to load a file from the given path.
 fn load_file_from_path(path: &str) -> Result<LoadedExecImage, isize> {
     match resolve_exec_inode(path) {
-        Ok(inode) => return load_exec_inode_image(inode),
+        Ok(inode) => return load_exec_inode_image(inode, path),
         Err(e) if e != err(SyscallError::ENOENT) => return Err(e),
         Err(_) => {}
     }
@@ -37,7 +54,7 @@ fn load_file_from_path(path: &str) -> Result<LoadedExecImage, isize> {
         ];
         for cand in fallbacks {
             match resolve_exec_inode(cand) {
-                Ok(inode) => return load_exec_inode_image(inode),
+                Ok(inode) => return load_exec_inode_image(inode, cand),
                 Err(e) if e == err(SyscallError::ENOENT) => {}
                 Err(e) => return Err(e),
             }
@@ -47,7 +64,7 @@ fn load_file_from_path(path: &str) -> Result<LoadedExecImage, isize> {
         let mut with_bin = String::from(path);
         with_bin.push_str(".bin");
         return match resolve_exec_inode(&with_bin) {
-            Ok(inode) => load_exec_inode_image(inode),
+            Ok(inode) => load_exec_inode_image(inode, &with_bin),
             Err(e) => Err(e),
         };
     }
@@ -58,15 +75,18 @@ fn load_file_from_path(path: &str) -> Result<LoadedExecImage, isize> {
 /// 用于加载动态链接器（`ld.so`）等不需要执行权限的场景。
 fn load_file_readonly(path: &str) -> Result<LoadedExecImage, isize> {
     match resolve_read_inode(path) {
-        Ok(inode) => load_exec_inode_image(inode),
+        Ok(inode) => load_exec_inode_image(inode, path),
         Err(e) => Err(e),
     }
 }
 
 /// 解析可执行文件的 inode，若路径不存在则尝试 busybox / `.bin` 后缀等回退路径。
-fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, isize> {
+fn resolve_exec_inode_with_fallback(path: &str) -> Result<(Arc<ext4_fs::Inode>, String), isize> {
     match resolve_exec_inode(path) {
-        Ok(inode) => return Ok(inode),
+        Ok(inode) => {
+            let exe_path = logical_exec_path(AT_FDCWD, path, &inode);
+            return Ok((inode, exe_path));
+        }
         Err(e) if e != err(SyscallError::ENOENT) => return Err(e),
         Err(_) => {}
     }
@@ -79,7 +99,10 @@ fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, i
         ];
         for cand in fallbacks {
             match resolve_exec_inode(cand) {
-                Ok(inode) => return Ok(inode),
+                Ok(inode) => {
+                    let exe_path = logical_exec_path(AT_FDCWD, cand, &inode);
+                    return Ok((inode, exe_path));
+                }
                 Err(e) if e == err(SyscallError::ENOENT) => {}
                 Err(e) => return Err(e),
             }
@@ -88,7 +111,10 @@ fn resolve_exec_inode_with_fallback(path: &str) -> Result<Arc<ext4_fs::Inode>, i
     if !path.ends_with(".bin") {
         let mut with_bin = String::from(path);
         with_bin.push_str(".bin");
-        return resolve_exec_inode(&with_bin);
+        return resolve_exec_inode(&with_bin).map(|inode| {
+            let exe_path = logical_exec_path(AT_FDCWD, &with_bin, &inode);
+            (inode, exe_path)
+        });
     }
     Err(err(SyscallError::ENOENT))
 }
@@ -191,6 +217,7 @@ fn exec_interpreter(
         return e;
     }
     let process = current_process();
+    let exe_path = interp.exe_path.clone();
     let interp_abi = crate::mm::elf_arch_abi_from_bytes(&interp.data).ok();
     if let Some(interp_interp) = elf_interp_path(&interp.data) {
         let interp_interp_data = match load_interp_data(&interp_interp, interp_abi) {
@@ -203,12 +230,20 @@ fn exec_interpreter(
             args,
             envs,
             interp.exec_inode,
+            exe_path,
             comm_override,
         ) {
             return e;
         }
     } else {
-        if let Err(e) = process.exec(&interp.data, args, envs, interp.exec_inode, comm_override) {
+        if let Err(e) = process.exec(
+            &interp.data,
+            args,
+            envs,
+            interp.exec_inode,
+            exe_path,
+            comm_override,
+        ) {
             return e;
         }
     }
@@ -617,6 +652,7 @@ fn read_exec_args_envs(
 /// 5. 其他情况返回 `ENOEXEC`。
 fn execve_with_inode(
     path: String,
+    exe_path: String,
     args_vec: Vec<String>,
     envs_vec: Vec<String>,
     inode: Arc<ext4_fs::Inode>,
@@ -675,6 +711,7 @@ fn execve_with_inode(
                 args_vec,
                 envs_vec,
                 exec_inode,
+                exe_path.clone(),
                 None,
             );
             maybe_stop_after_ptrace_exec();
@@ -700,6 +737,7 @@ fn execve_with_inode(
             envs_vec,
             elf_aux,
             exec_inode,
+            exe_path,
             None,
         );
         maybe_stop_after_ptrace_exec();
@@ -904,8 +942,8 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         }
     }
 
-    let inode = match resolve_exec_inode_with_fallback(&path) {
-        Ok(inode) => inode,
+    let (inode, exe_path) = match resolve_exec_inode_with_fallback(&path) {
+        Ok(resolved) => resolved,
         Err(e) => {
             if e == err(SyscallError::ENOENT) {
                 if let Some(ret) = try_exec_busybox_applet(&path, &args_vec, &envs_vec) {
@@ -919,17 +957,16 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
                 } else {
                     normalize_path(&cwd, &path)
                 };
-                let (primary_hit, secondary_hit) = {
+                let backing_hit = {
                     let _ext4_guard = ext4_lock();
-                    let primary_hit = root_inode_for_path(&abs).find_path(&abs).is_some();
-                    let secondary_hit = secondary_root_inode()
-                        .and_then(|root| root.find_path(&abs))
-                        .is_some();
-                    (primary_hit, secondary_hit)
+                    crate::fs::find_path_in_roots(&crate::syscall::filesystem::translate_mount_abs(
+                        &abs,
+                    ))
+                    .is_some()
                 };
                 println!(
-                    "[exec] path='{}' abs='{}' cwd='{}' err={} primary_hit={} secondary_hit={}",
-                    path, abs, cwd, e, primary_hit, secondary_hit
+                    "[exec] path='{}' abs='{}' cwd='{}' err={} backing_hit={}",
+                    path, abs, cwd, e, backing_hit
                 );
             }
             return e;
@@ -946,7 +983,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         };
     fanotify_notify_open_exec(&inode, false, fanotify_path.as_deref());
 
-    execve_with_inode(path, args_vec, envs_vec, inode, exec_reservation)
+    execve_with_inode(path, exe_path, args_vec, envs_vec, inode, exec_reservation)
 }
 
 pub fn syscall_execveat(
@@ -974,6 +1011,9 @@ pub fn syscall_execveat(
         Err(e) => return e,
     };
     let fanotify_path = resolve_abs_path(dirfd, &path).ok().flatten();
+    let exe_path = fanotify_path
+        .clone()
+        .unwrap_or_else(|| logical_exec_path(dirfd, &path, &inode));
     if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
         return e;
     }
@@ -983,5 +1023,5 @@ pub fn syscall_execveat(
             Err(e) => return e,
         };
     fanotify_notify_open_exec(&inode, false, fanotify_path.as_deref());
-    execve_with_inode(path, args_vec, envs_vec, inode, exec_reservation)
+    execve_with_inode(path, exe_path, args_vec, envs_vec, inode, exec_reservation)
 }

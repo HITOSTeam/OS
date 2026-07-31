@@ -950,6 +950,15 @@ pub struct PipeRingBuffer {
     read_end_ref_bias: usize,
     /// 写端引用计数基线，语义同 `read_end_ref_bias`。
     write_end_ref_bias: usize,
+    /// Descriptor references are tracked separately from `Arc` references.
+    ///
+    /// Exiting processes detach their descriptor table before the kernel
+    /// eventually drops the backing `Arc`s.  Pipe EOF/EPIPE must follow the
+    /// descriptor lifetime immediately, not that deferred object destruction.
+    read_fd_refs: usize,
+    write_fd_refs: usize,
+    read_fd_tracking: bool,
+    write_fd_tracking: bool,
     read_waiters: VecDeque<Weak<crate::task::task_block::TaskControlBlock>>,
     write_waiters: VecDeque<Weak<crate::task::task_block::TaskControlBlock>>,
     poll_waiters: PollWaitQueue,
@@ -978,6 +987,10 @@ impl PipeRingBuffer {
             write_end_shutdown: false,
             read_end_ref_bias: 0,
             write_end_ref_bias: 0,
+            read_fd_refs: 0,
+            write_fd_refs: 0,
+            read_fd_tracking: false,
+            write_fd_tracking: false,
             read_waiters: VecDeque::new(),
             write_waiters: VecDeque::new(),
             poll_waiters: PollWaitQueue::default(),
@@ -1000,6 +1013,31 @@ impl PipeRingBuffer {
     pub fn set_end_ref_bias(&mut self, read_bias: usize, write_bias: usize) {
         self.read_end_ref_bias = read_bias;
         self.write_end_ref_bias = write_bias;
+    }
+
+    fn install_fd_ref(&mut self, readable: bool, writable: bool) {
+        if readable {
+            self.read_fd_tracking = true;
+            self.read_fd_refs = self.read_fd_refs.saturating_add(1);
+        }
+        if writable {
+            self.write_fd_tracking = true;
+            self.write_fd_refs = self.write_fd_refs.saturating_add(1);
+        }
+    }
+
+    fn close_fd_ref(&mut self, readable: bool, writable: bool) -> (bool, bool) {
+        let mut last_reader = false;
+        let mut last_writer = false;
+        if readable && self.read_fd_tracking && self.read_fd_refs > 0 {
+            self.read_fd_refs -= 1;
+            last_reader = self.read_fd_refs == 0;
+        }
+        if writable && self.write_fd_tracking && self.write_fd_refs > 0 {
+            self.write_fd_refs -= 1;
+            last_writer = self.write_fd_refs == 0;
+        }
+        (last_reader, last_writer)
     }
 
     /// 访问之前必须确保数据已经被分配
@@ -1211,6 +1249,9 @@ impl PipeRingBuffer {
         if self.write_end_shutdown {
             return true;
         }
+        if self.write_fd_tracking {
+            return self.write_fd_refs == 0;
+        }
         match self.write_end.as_ref() {
             Some(end) => end.strong_count() <= self.write_end_ref_bias,
             None => true,
@@ -1222,6 +1263,9 @@ impl PipeRingBuffer {
         if self.read_end_shutdown {
             return true;
         }
+        if self.read_fd_tracking {
+            return self.read_fd_refs == 0;
+        }
         match self.read_end.as_ref() {
             Some(end) => end.strong_count() <= self.read_end_ref_bias,
             None => true,
@@ -1229,6 +1273,9 @@ impl PipeRingBuffer {
     }
 
     fn read_end_count(&self) -> usize {
+        if self.read_fd_tracking {
+            return self.read_fd_refs;
+        }
         self.read_end
             .as_ref()
             .map(|w| w.strong_count().saturating_sub(self.read_end_ref_bias))
@@ -1236,6 +1283,9 @@ impl PipeRingBuffer {
     }
 
     fn write_end_count(&self) -> usize {
+        if self.write_fd_tracking {
+            return self.write_fd_refs;
+        }
         self.write_end
             .as_ref()
             .map(|w| w.strong_count().saturating_sub(self.write_end_ref_bias))
@@ -1563,6 +1613,29 @@ impl File for Pipe {
     }
     fn writable(&self) -> bool {
         self.writable
+    }
+    fn on_fd_install(&self) {
+        self.buffer
+            .lock()
+            .install_fd_ref(self.readable, self.writable);
+    }
+    fn on_fd_close(&self) {
+        let wakeups = {
+            let mut ring = self.buffer.lock();
+            let (last_reader, last_writer) = ring.close_fd_ref(self.readable, self.writable);
+            let mut wakeups = Vec::new();
+            if last_writer {
+                wakeups.extend(ring.drain_readers());
+            }
+            if last_reader {
+                wakeups.extend(ring.drain_writers());
+            }
+            if last_reader || last_writer {
+                wakeups.extend(ring.drain_poll_waiters());
+            }
+            wakeups
+        };
+        wake_tasks(wakeups);
     }
     /// `File::read` 的管道实现：从用户态 `UserBuffer` 接收目标地址，阻塞读取。
     ///

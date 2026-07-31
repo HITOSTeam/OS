@@ -1,3 +1,11 @@
+//! procfs filesystem view.
+//!
+//! procfs is a concrete VFS backend and therefore remains a sibling of
+//! `fs::vfs`, rather than becoming part of its generic object model.  This
+//! module still exposes the transitional path-based provider; node conversion
+//! will replace it with component lookup and proc magic links returning
+//! `VfsPath`.  Process and PID-namespace state stays owned by the task layer.
+
 extern crate alloc;
 
 use alloc::string::String;
@@ -21,6 +29,7 @@ pub use magic_link::{
     normalize_proc_magic_path, proc_fd_link_file, proc_magic_link_exists, proc_readlink,
 };
 pub use open::open_proc_pseudo;
+pub(crate) use open::{open_proc_pseudo_in, proc_provider_path_for_namespace};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ProcFileKind {

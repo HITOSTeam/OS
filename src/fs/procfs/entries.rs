@@ -16,16 +16,11 @@ const PROC_LINUX_TID_PID_SHIFT: usize = 15;
 static PROC_SIMPLE_TEXT_FILES: Mutex<BTreeMap<&'static str, Vec<u8>>> = Mutex::new(BTreeMap::new());
 const VM_MAX_MAP_COUNT_DEFAULT: usize = 65530;
 
-pub(crate) fn collect_pids() -> Vec<usize> {
-    let mut pids: Vec<usize> = {
-        let map = PID2PCB.lock();
-        map.keys().copied().filter(|pid| *pid != 0).collect()
-    };
-    pids.sort_unstable();
-    pids
+pub(crate) fn proc_root_entries() -> Vec<PseudoDirent> {
+    proc_root_entries_for_pid_namespace(0)
 }
 
-pub(crate) fn proc_root_entries() -> Vec<PseudoDirent> {
+pub(crate) fn proc_root_entries_for_pid_namespace(namespace_id: usize) -> Vec<PseudoDirent> {
     let mut entries = Vec::new();
     entries.push(PseudoDirent {
         name: String::from("."),
@@ -90,7 +85,18 @@ pub(crate) fn proc_root_entries() -> Vec<PseudoDirent> {
             dtype: 8,
         });
     }
-    for pid in collect_pids() {
+    let processes = {
+        let map = PID2PCB.lock();
+        map.values().cloned().collect::<Vec<_>>()
+    };
+    let mut visible_pids = processes
+        .iter()
+        .filter_map(|process| crate::task::process_pid_in_pid_namespace(process, namespace_id))
+        .filter(|pid| *pid != 0)
+        .collect::<Vec<_>>();
+    visible_pids.sort_unstable();
+    visible_pids.dedup();
+    for pid in visible_pids {
         entries.push(PseudoDirent {
             name: alloc::format!("{}", pid),
             ino: pid as u64,
@@ -614,6 +620,11 @@ pub(crate) fn proc_pid_entries(pid: u32) -> Vec<PseudoDirent> {
         dtype: 10,
     });
     entries.push(PseudoDirent {
+        name: String::from("exe"),
+        ino: pid as u64,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
         name: String::from("fd"),
         ino: pid as u64,
         dtype: 4,
@@ -874,6 +885,11 @@ pub(crate) fn proc_pid_task_tid_entries(pid: u32, tid: u32) -> Vec<PseudoDirent>
     });
     entries.push(PseudoDirent {
         name: String::from("cwd"),
+        ino: tid as u64,
+        dtype: 10,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("exe"),
         ino: tid as u64,
         dtype: 10,
     });

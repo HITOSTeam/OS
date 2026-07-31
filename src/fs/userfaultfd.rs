@@ -3,7 +3,11 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, mem::size_of};
+use core::{
+    any::Any,
+    mem::size_of,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use spin::Mutex;
 
 use crate::{
@@ -23,6 +27,19 @@ const UFFD_PAGEFAULT_FLAG_WRITE: u64 = 1 << 0;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
 const UFFD_API_IOCTLS: u64 = (1u64 << 0) | (1u64 << 3) | (1u64 << 0x3f);
 const UFFD_REGISTER_IOCTLS: u64 = 1u64 << 3;
+
+/// Installed userfaultfd descriptor references across the system.
+///
+/// The normal page-fault path uses this as a lock-free negative lookup. Linux
+/// keeps equivalent userfaultfd context state on `mm_struct`; our current
+/// implementation still discovers registrations through the fd table, but it
+/// must not lock and scan that table for every ordinary lazy page fault when no
+/// userfaultfd exists anywhere.
+static ACTIVE_USERFAULTFD_REFS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn userfaultfd_active() -> bool {
+    ACTIVE_USERFAULTFD_REFS.load(Ordering::Acquire) != 0
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -213,6 +230,18 @@ impl File for UserfaultfdFile {
 
     fn writable(&self) -> bool {
         false
+    }
+
+    fn on_fd_install(&self) {
+        ACTIVE_USERFAULTFD_REFS.fetch_add(1, Ordering::Release);
+    }
+
+    fn on_fd_close(&self) {
+        let result =
+            ACTIVE_USERFAULTFD_REFS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |refs| {
+                refs.checked_sub(1)
+            });
+        debug_assert!(result.is_ok(), "userfaultfd descriptor reference underflow");
     }
 
     fn read(&self, buf: UserBuffer) -> usize {

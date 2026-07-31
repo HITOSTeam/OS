@@ -1,13 +1,18 @@
 //! File system in os
 //!
 //! 本模块是内核文件系统层的聚合入口：对外统一暴露 `File` trait 与各类文件实现，
-//! 负责伪文件系统（/proc、/sys、/dev、cgroup 等）的按路径分发，以及 poll/epoll
-//! 就绪等待队列等通用机制。真实数据落盘走 ext4（见 `inode` 子模块），其余多为内存态伪文件。
+//! 连接过渡期 pathname 分发，并提供 poll/epoll 就绪等待队列等通用机制。通用
+//! 对象模型位于 `vfs`，ext4、tmpfs、procfs、sysfs、devtmpfs 与 cgroupfs 均为
+//! 同级具体后端。
 
 // ---- 各类文件实现与文件系统子模块 ----
-mod cgroupfs; // cgroup v2 伪文件系统
+mod cgroupfs; // cgroup 文件系统视图；领域状态将在节点化时继续拆分
+mod devtmpfs; // /dev 设备文件系统视图
 mod dummy; // 占位/哑文件
 mod eventfd; // eventfd
+#[cfg(target_os = "none")]
+#[allow(dead_code)]
+pub(crate) mod ext4; // ext4 对对象 VFS 的具体适配器
 mod fanotify; // fanotify notification groups
 mod inode; // ext4 真实文件 inode 与打开逻辑
 mod mountns; // 挂载命名空间
@@ -19,9 +24,14 @@ mod procfs; // /proc 伪文件系统
 mod pseudo; // 通用伪文件/伪目录（/sys、/dev 等）
 mod socketpair; // socketpair 两端
 mod stdio; // 标准输入输出
+mod sysfs; // /sys 内核对象文件系统视图
 mod timerfd; // timerfd
+#[allow(dead_code)]
+pub(crate) mod tmpfs; // 独立实例的内存文件系统实现
 mod tty; // tty / pty
 mod userfaultfd; // userfaultfd
+#[allow(dead_code)]
+pub(crate) mod vfs; // 仅包含对象模型、dcache、mount graph 与 REF-walk
 use crate::mm::UserBuffer;
 use crate::task::{
     manager::wakeup_tasks,
@@ -34,7 +44,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, fmt::Write};
+use core::any::Any;
 
 // ---- poll/select/epoll 就绪事件位（对应 Linux <poll.h> 的 POLL* 常量）----
 /// 有数据可读。
@@ -51,35 +61,6 @@ pub(crate) const POLLHUP: i16 = 0x0010;
 pub(crate) const POLLNVAL: i16 = 0x0020;
 /// 对端关闭了写方向（半关闭）。
 pub(crate) const POLLRDHUP: i16 = 0x2000;
-
-fn cpu_list_from_mask(mask: usize) -> String {
-    let mut out = String::new();
-    let mask = if mask == 0 { 1 } else { mask };
-    let mut first = true;
-    let mut cpu = 0;
-    while cpu < usize::BITS as usize {
-        if (mask & (1usize << cpu)) == 0 {
-            cpu += 1;
-            continue;
-        }
-        let start = cpu;
-        while cpu + 1 < usize::BITS as usize && (mask & (1usize << (cpu + 1))) != 0 {
-            cpu += 1;
-        }
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        if start == cpu {
-            let _ = write!(out, "{}", start);
-        } else {
-            let _ = write!(out, "{}-{}", start, cpu);
-        }
-        cpu += 1;
-    }
-    out.push('\n');
-    out
-}
 
 /// File trait
 pub trait File: Send + Sync {
@@ -212,17 +193,6 @@ pub(crate) fn shm_object_name(abs: &str) -> Option<&str> {
     Some(name)
 }
 
-/// 判断某绝对路径是否落在内核内置的伪文件系统命名空间下（/sys、/dev、/proc/sys）。
-/// 这些路径由 `open_pseudo` 提供，不走真实 ext4。
-pub(crate) fn is_builtin_pseudo_path(abs: &str) -> bool {
-    abs == "/sys"
-        || abs.starts_with("/sys/")
-        || abs == "/dev"
-        || abs.starts_with("/dev/")
-        || abs == "/proc/sys"
-        || abs.starts_with("/proc/sys/")
-}
-
 /// 把内核内部的绝对路径翻译成当前进程挂载命名空间下用户可见的显示路径。
 pub(crate) fn current_mount_display_abs(abs: &str) -> String {
     let ns = current_process().mount_namespace();
@@ -234,6 +204,66 @@ pub(crate) fn mounted_file_for_abs(abs: &str) -> Option<Arc<dyn File + Send + Sy
     let ns = current_process().mount_namespace();
     let state = ns.lock();
     state.bound_file_for_path(abs)
+}
+
+/// Resolve a logical path through the currently selected virtual mount.
+pub(crate) fn current_pseudo_canonical_abs(abs: &str) -> Option<(mountns::MountRecord, String)> {
+    let ns = current_process().mount_namespace();
+    let state = ns.lock();
+    state.canonical_pseudo_abs(abs)
+}
+
+fn current_proc_provider_abs(abs: &str) -> Option<(mountns::MountRecord, String, String)> {
+    let (mount, canonical) = current_pseudo_canonical_abs(abs)?;
+    let pid_namespace_id = match &mount.backend {
+        mountns::MountBackend::Proc { pid_namespace_id } => *pid_namespace_id,
+        _ => return None,
+    };
+    let provider = procfs::proc_provider_path_for_namespace(&canonical, pid_namespace_id)?;
+    Some((mount, canonical, provider))
+}
+
+pub(crate) fn mounted_proc_provider_path(abs: &str) -> Option<String> {
+    current_proc_provider_abs(abs).map(|(_, _, provider)| provider)
+}
+
+pub(crate) fn mounted_proc_magic_link_exists(abs: &str) -> bool {
+    let Some((_mount, canonical, provider)) = current_proc_provider_abs(abs) else {
+        return false;
+    };
+    canonical == "/proc/self"
+        || canonical == "/proc/thread-self"
+        || procfs::proc_magic_link_exists(&provider)
+}
+
+pub(crate) fn mounted_proc_fd_link_file(abs: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    let (_, _, provider) = current_proc_provider_abs(abs)?;
+    procfs::proc_fd_link_file(&provider)
+}
+
+pub(crate) fn mounted_proc_readlink(abs: &str) -> Option<String> {
+    let (mount, canonical, provider) = current_proc_provider_abs(abs)?;
+    let pid_namespace_id = match &mount.backend {
+        mountns::MountBackend::Proc { pid_namespace_id } => *pid_namespace_id,
+        _ => return None,
+    };
+    if canonical == "/proc/self" {
+        let process = current_process();
+        let pid = crate::task::process_pid_in_pid_namespace(&process, pid_namespace_id)?;
+        return Some(alloc::format!("{pid}"));
+    }
+    if canonical == "/proc/thread-self" {
+        let process = current_process();
+        let global_pid = process.getpid();
+        let visible_pid = crate::task::process_pid_in_pid_namespace(&process, pid_namespace_id)?;
+        let target = procfs::proc_readlink("/proc/thread-self")?;
+        return Some(target.replacen(
+            &alloc::format!("{global_pid}/"),
+            &alloc::format!("{visible_pid}/"),
+            1,
+        ));
+    }
+    procfs::proc_readlink(&provider)
 }
 
 /// 根据 inode 的路径提示反查其逻辑路径，并转换为当前挂载命名空间下的可见路径。
@@ -256,563 +286,38 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     if let Some(node) = mounted_file_for_abs(path) {
         return Some(node);
     }
-    if let Some(node) = cgroupfs::open_cgroup_pseudo(path) {
-        return Some(node);
-    }
-    if let Some(node) = procfs::open_proc_pseudo(path) {
-        return Some(node);
-    }
-    if path == "/sys" || path == "/sys/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("devices"),
-                ino: 2,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("block"),
-                ino: 3,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("dev"),
-                ino: 4,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("class"),
-                ino: 5,
-                dtype: 4,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys", entries)));
-    }
-    if path == "/dev" || path == "/dev/" {
-        let mut entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("root"),
-                ino: 6,
-                dtype: 6,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("ptmx"),
-                ino: 9,
-                dtype: 2,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("tty"),
-                ino: 10,
-                dtype: 2,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("pts"),
-                ino: 11,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("shm"),
-                ino: 8,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("cgroup"),
-                ino: 12,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("null"),
-                ino: 2,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("zero"),
-                ino: 3,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("urandom"),
-                ino: 4,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("random"),
-                ino: 5,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("misc"),
-                ino: 7,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("net"),
-                ino: 13,
-                dtype: 4,
-            },
-        ];
-        entries.extend(pseudo::pseudo_dev_dir_entries());
-        return Some(Arc::new(pseudo::PseudoDir::new("/dev", entries)));
-    }
-    if path == "/dev/net" || path == "/dev/net/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 13,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("tun"),
-                ino: 14,
-                dtype: 2,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/dev/net", entries)));
-    }
-    if path == "/dev/cgroup" || path == "/dev/cgroup/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 12,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/dev/cgroup", entries)));
-    }
-    if path == "/dev/pts" || path == "/dev/pts/" {
-        let mut entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-        ];
-        for idx in tty::list_dev_pts() {
-            entries.push(pseudo::PseudoDirent {
-                name: alloc::format!("{}", idx),
-                ino: 2000 + idx as u64,
-                dtype: 2,
-            });
+    let ns = current_process().mount_namespace();
+    let (mount, canonical) = {
+        let state = ns.lock();
+        let mount = state.mount_record_for_path(path)?;
+        if matches!(mount.backend, mountns::MountBackend::Cgroup) {
+            drop(state);
+            return cgroupfs::open_cgroup_pseudo(path);
         }
-        return Some(Arc::new(pseudo::PseudoDir::new("/dev/pts", entries)));
-    }
-    if let Some(rest) = path.strip_prefix("/dev/pts/") {
-        if !rest.is_empty() && !rest.contains('/') && rest.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(idx) = rest.parse::<u32>() {
-                if let Some(node) = tty::open_dev_pts(idx) {
-                    return Some(node);
-                }
-            }
-        }
-    }
-    if path == "/dev/shm" || path == "/dev/shm/" {
-        let mut entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-        ];
-        for (idx, name) in pseudo::shm_list().into_iter().enumerate() {
-            entries.push(pseudo::PseudoDirent {
-                name,
-                ino: (1000 + idx) as u64,
-                dtype: 8,
-            });
-        }
-        return Some(Arc::new(pseudo::PseudoDir::new("/dev/shm", entries)));
-    }
-    if path == "/dev/misc" || path == "/dev/misc/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("rtc"),
-                ino: 2,
-                dtype: 8,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/dev/misc", entries)));
-    }
-    if path == "/sys/class" || path == "/sys/class/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("net"),
-                ino: 2,
-                dtype: 4,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys/class", entries)));
-    }
-    if path == "/sys/class/net" || path == "/sys/class/net/" {
-        let mut entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-        ];
-        for (idx, (name, dtype)) in crate::syscall::net::netdev::sys_class_net_entries()
-            .into_iter()
-            .enumerate()
-        {
-            entries.push(pseudo::PseudoDirent {
-                name,
-                ino: (10 + idx) as u64,
-                dtype,
-            });
-        }
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys/class/net", entries)));
-    }
-    if let Some(rest) = path.strip_prefix("/sys/class/net/") {
-        let trimmed = rest.trim_end_matches('/');
-        if !trimmed.is_empty() && !trimmed.contains('/') {
-            if crate::syscall::net::netdev::device_snapshot_by_name(trimmed).is_some() {
-                let mut entries = alloc::vec![
-                    pseudo::PseudoDirent {
-                        name: String::from("."),
-                        ino: 1,
-                        dtype: 4,
-                    },
-                    pseudo::PseudoDirent {
-                        name: String::from(".."),
-                        ino: 1,
-                        dtype: 4,
-                    },
-                ];
-                for (idx, (name, dtype)) in
-                    crate::syscall::net::netdev::sys_class_net_device_entries(trimmed)
-                        .into_iter()
-                        .enumerate()
-                {
-                    entries.push(pseudo::PseudoDirent {
-                        name: String::from(name),
-                        ino: (20 + idx) as u64,
-                        dtype,
-                    });
-                }
-                return Some(Arc::new(pseudo::PseudoDir::new(path, entries)));
-            }
-        }
-        if let Some(content) = crate::syscall::net::netdev::sys_class_net_file_content(path) {
-            return Some(Arc::new(pseudo::PseudoFile::new_static(&content)));
-        }
-    }
-    if path == "/sys/block" || path == "/sys/block/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("root"),
-                ino: 2,
-                dtype: 4,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys/block", entries)));
-    }
-    if path == "/sys/block/root" || path == "/sys/block/root/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("queue"),
-                ino: 2,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("size"),
-                ino: 3,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("stat"),
-                ino: 4,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("dev"),
-                ino: 5,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("removable"),
-                ino: 6,
-                dtype: 8,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys/block/root", entries)));
-    }
-    if path == "/sys/block/root/queue" || path == "/sys/block/root/queue/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("logical_block_size"),
-                ino: 2,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("physical_block_size"),
-                ino: 3,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("minimum_io_size"),
-                ino: 4,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("optimal_io_size"),
-                ino: 5,
-                dtype: 8,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("dma_alignment"),
-                ino: 6,
-                dtype: 8,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new(
-            "/sys/block/root/queue",
-            entries,
-        )));
-    }
-    if path == "/sys/block/root/size" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("2097152\n")));
-    }
-    if path == "/sys/block/root/stat" {
-        let stat = pseudo::pseudo_block_stat_snapshot();
-        return Some(Arc::new(pseudo::PseudoFile::new_static(&stat)));
-    }
-    if path == "/sys/block/root/dev" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("1:0\n")));
-    }
-    if path == "/sys/block/root/removable" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("0\n")));
-    }
-    if path == "/sys/block/root/queue/logical_block_size" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("512\n")));
-    }
-    if path == "/sys/block/root/queue/physical_block_size" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("4096\n")));
-    }
-    if path == "/sys/block/root/queue/minimum_io_size" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("512\n")));
-    }
-    if path == "/sys/block/root/queue/optimal_io_size" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("0\n")));
-    }
-    if path == "/sys/block/root/queue/dma_alignment" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("0\n")));
-    }
-    if path == "/sys/dev" || path == "/sys/dev/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("block"),
-                ino: 2,
-                dtype: 4,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys/dev", entries)));
-    }
-    if path == "/sys/dev/block" || path == "/sys/dev/block/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("1:0"),
-                ino: 2,
-                dtype: 4,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new("/sys/dev/block", entries)));
-    }
-    if path == "/sys/dev/block/1:0" || path == "/sys/dev/block/1:0/" {
-        let entries = alloc::vec![
-            pseudo::PseudoDirent {
-                name: String::from("."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from(".."),
-                ino: 1,
-                dtype: 4,
-            },
-            pseudo::PseudoDirent {
-                name: String::from("uevent"),
-                ino: 2,
-                dtype: 8,
-            },
-        ];
-        return Some(Arc::new(pseudo::PseudoDir::new(
-            "/sys/dev/block/1:0",
-            entries,
-        )));
-    }
-    if path == "/sys/dev/block/1:0/uevent" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static(
-            "MAJOR=1\nMINOR=0\nDEVNAME=root\nDEVTYPE=disk\n",
-        )));
-    }
+        state.canonical_pseudo_abs(path)?
+    };
 
-    if path == "/sys/devices/system/cpu/possible"
-        || path == "/sys/devices/system/cpu/present"
-        || path == "/sys/devices/system/cpu/online"
-    {
-        let s = cpu_list_from_mask(crate::task::manager::online_hart_mask());
-        return Some(Arc::new(pseudo::PseudoFile::new_static(&s)));
-    }
-    if path == "/sys/devices/system/cpu/kernel_max" {
-        let n = crate::config::MAX_HARTS;
-        let s = if n == 0 {
-            String::from("0\n")
-        } else {
-            alloc::format!("{}\n", n - 1)
-        };
-        return Some(Arc::new(pseudo::PseudoFile::new_static(&s)));
-    }
-    if path == "/sys/devices/system/node/online" || path == "/sys/devices/system/node/possible" {
-        return Some(Arc::new(pseudo::PseudoFile::new_static("0\n")));
-    }
-    if path == "/dev/ptmx" {
-        return Some(tty::open_dev_ptmx());
-    }
-    if path == "/dev/tty" {
-        return Some(tty::open_dev_tty());
-    }
-    if path == "/dev/root" {
-        return Some(Arc::new(pseudo::PseudoBlock::new()));
-    }
-    if let Some(name) = shm_object_name(path) {
-        let data = pseudo::shm_get(name)?;
-        return Some(Arc::new(pseudo::PseudoShmFile::new(data)));
-    }
-    if path == "/dev/null" {
-        return Some(Arc::new(pseudo::PseudoFile::new_null()));
-    }
-    if path == "/dev/zero" {
-        return Some(Arc::new(pseudo::PseudoFile::new_zero()));
-    }
-    if path == "/dev/urandom" || path == "/dev/random" {
-        let seed =
-            (crate::time::get_time() as u64) ^ ((crate::task::processor::hart_id() as u64) << 32);
-        return Some(Arc::new(pseudo::PseudoFile::new_urandom(seed)));
-    }
-    if path == "/dev/misc/rtc" {
-        return Some(Arc::new(pseudo::RtcFile::new()));
-    }
-    if path == "/dev/net/tun" {
-        return Some(Arc::new(pseudo::TunTapFile::new()));
-    }
-    if let Some(node) = pseudo::open_pseudo_dev_dir(path) {
+    let node = match mount.backend {
+        mountns::MountBackend::Proc { pid_namespace_id } => {
+            procfs::open_proc_pseudo_in(&canonical, pid_namespace_id)?
+        }
+        _ => open_canonical_pseudo(&canonical)?,
+    };
+    if canonical == path {
         return Some(node);
     }
-    None
+    if let Some(dir) = node.as_any().downcast_ref::<pseudo::PseudoDir>() {
+        return Some(Arc::new(dir.remapped(path)));
+    }
+    Some(node)
+}
+
+/// Dispatch a path in the canonical namespace used internally by the existing
+/// virtual filesystem providers. Callers must first select a mounted backend.
+fn open_canonical_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
+    procfs::open_proc_pseudo(path)
+        .or_else(|| sysfs::open_legacy(path))
+        .or_else(|| devtmpfs::open_legacy(path))
 }
 
 // ---- 子模块的对外重导出（汇总各文件系统/文件类型供 crate 其余部分使用）----
@@ -840,13 +345,14 @@ pub(crate) use fanotify::{
 #[allow(unused_imports)]
 pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
-    ExecInodeReservation, clear_ext4_path_cache, debug_track_iozone_inode, ext4_lock,
-    ext4_path_cache_lookup, find_path_in_roots, inode_path_hint, inode_path_in_roots,
-    invalidate_ext4_path_cache, invalidate_ext4_path_cache_inode,
-    invalidate_ext4_path_cache_subtree, is_inode_currently_executed, note_ext4_path_cache,
-    note_inode_path_hint, path_resolves_to_inode, register_deferred_unlink_cleanup,
+    ExecInodeReservation, block_device_source_path, clear_ext4_path_cache,
+    debug_track_iozone_inode, ensure_root_mount_directory, ext4_lock, ext4_path_cache_lookup,
+    find_path_in_roots, inode_path_hint, inode_path_in_roots, invalidate_ext4_path_cache,
+    invalidate_ext4_path_cache_inode, invalidate_ext4_path_cache_subtree,
+    is_inode_currently_executed, note_ext4_path_cache, note_inode_path_hint,
+    path_resolves_to_inode, path_within_filesystem, register_deferred_unlink_cleanup,
     register_executing_inode, resolve_final_symlink_abs_path,
-    resolve_final_symlink_abs_path_locked, root_inode_for_path, secondary_root_inode,
+    resolve_final_symlink_abs_path_locked, root_inode_for_device, root_inode_for_path,
     unregister_executing_inode,
 };
 pub(crate) use inode::{
@@ -854,8 +360,9 @@ pub(crate) use inode::{
     pending_inode_write_end,
 };
 pub(crate) use mountns::{
-    ClassifiedAbsPath, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
-    clone_mount_namespace, initial_mount_namespace, mount_namespace_id,
+    ClassifiedAbsPath, FdMountRef, MountBackend, MountNamespace, MountNamespaceState,
+    MountPropagation, MountRecord, clone_mount_namespace, initial_mount_namespace,
+    mount_namespace_id,
 };
 pub(crate) use namespace_file::net_namespace_file_refs;
 pub use namespace_file::{NamespaceFile, NamespaceKind};
@@ -871,7 +378,6 @@ pub use pipe::{
     Pipe, debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe,
     pipe_max_size_limit_for_procfs, write_pipe_sysctl,
 };
-pub(crate) use procfs::parse_proc_sys_usize;
 pub(crate) use procfs::resolve_proc_magic_intermediate_abs_path;
 pub(crate) use procfs::vm_max_map_count;
 pub use procfs::{
@@ -879,6 +385,7 @@ pub use procfs::{
     proc_fd_link_file, proc_magic_link_exists, proc_readlink, vm_commit_limit_bytes,
     vm_committed_as_bytes, vm_overcommit_memory,
 };
+pub(crate) use procfs::{parse_proc_sys_usize, proc_provider_path_for_namespace};
 pub use pseudo::PseudoBlock;
 pub use pseudo::TunTapFile;
 pub use pseudo::{PseudoDir, PseudoDirent, PseudoFile, PseudoKindTag, PseudoShmFile, RtcFile};
@@ -900,4 +407,4 @@ pub use tty::{
     LinuxTermio, LinuxTermios, LinuxWinSize, PtyMasterFile, PtySlaveFile, TtyFile, dev_pts_exists,
     dev_pts_index_from_path,
 };
-pub use userfaultfd::UserfaultfdFile;
+pub use userfaultfd::{UserfaultfdFile, userfaultfd_active};

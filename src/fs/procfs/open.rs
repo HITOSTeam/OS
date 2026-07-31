@@ -9,11 +9,12 @@ use super::entries::{
     managed_proc_sys_file_kind, proc_dir_entries, proc_irq_entries, proc_irq_number_entries,
     proc_pid_entries, proc_pid_exists, proc_pid_fd_entries, proc_pid_fd_exists,
     proc_pid_fdinfo_entries, proc_pid_ns_entries, proc_pid_task_alive, proc_pid_task_entries,
-    proc_pid_task_tid_entries, proc_root_entries, proc_sys_fs_entries, proc_sys_kernel_entries,
-    proc_sys_kernel_keys_entries, proc_sys_net_core_entries, proc_sys_net_entries,
-    proc_sys_net_ipv4_conf_entries, proc_sys_net_ipv4_conf_if_entries, proc_sys_net_ipv4_entries,
-    proc_sys_net_ipv6_conf_entries, proc_sys_net_ipv6_conf_if_entries, proc_sys_net_ipv6_entries,
-    proc_sys_user_entries, proc_sys_vm_entries,
+    proc_pid_task_tid_entries, proc_root_entries, proc_root_entries_for_pid_namespace,
+    proc_sys_fs_entries, proc_sys_kernel_entries, proc_sys_kernel_keys_entries,
+    proc_sys_net_core_entries, proc_sys_net_entries, proc_sys_net_ipv4_conf_entries,
+    proc_sys_net_ipv4_conf_if_entries, proc_sys_net_ipv4_entries, proc_sys_net_ipv6_conf_entries,
+    proc_sys_net_ipv6_conf_if_entries, proc_sys_net_ipv6_entries, proc_sys_user_entries,
+    proc_sys_vm_entries,
 };
 use super::magic_link::{
     normalize_proc_magic_path, proc_pid_from_path_with_rest, proc_pid_namespace_file,
@@ -458,4 +459,57 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "cgroup" => Some(ProcPseudoFile::new(ProcFileKind::PidCgroup(pid))),
         _ => None,
     }
+}
+
+/// Convert a PID as named by a mounted procfs instance to the global PID used
+/// by the existing per-process providers.
+pub(crate) fn proc_provider_path_for_namespace(
+    path: &str,
+    pid_namespace_id: usize,
+) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed == "/proc" {
+        return Some(String::from("/proc"));
+    }
+    let rest = trimmed.strip_prefix("/proc/")?;
+    let (head, suffix) = rest.split_once('/').unwrap_or((rest, ""));
+    let process = if head == "self" || head == "thread-self" {
+        let process = crate::task::processor::current_process();
+        crate::task::process_pid_in_pid_namespace(&process, pid_namespace_id)?;
+        process
+    } else if head.bytes().all(|byte| byte.is_ascii_digit()) {
+        let visible_pid = head.parse::<usize>().ok()?;
+        crate::task::resolve_process_in_pid_namespace(pid_namespace_id, visible_pid)?
+    } else {
+        return Some(String::from(trimmed));
+    };
+    let global_pid = process.getpid();
+    if head == "thread-self" {
+        // Keep the alias for the existing task/TID normalizer, which already
+        // uses the global process identity expected by the provider.
+        return Some(String::from(trimmed));
+    }
+    if suffix.is_empty() {
+        Some(alloc::format!("/proc/{global_pid}"))
+    } else {
+        Some(alloc::format!("/proc/{global_pid}/{suffix}"))
+    }
+}
+
+pub(crate) fn open_proc_pseudo_in(
+    path: &str,
+    pid_namespace_id: usize,
+) -> Option<Arc<dyn File + Send + Sync>> {
+    if path.trim_end_matches('/') == "/proc" {
+        return Some(Arc::new(PseudoDir::new(
+            "/proc",
+            proc_root_entries_for_pid_namespace(pid_namespace_id),
+        )));
+    }
+    let provider_path = proc_provider_path_for_namespace(path, pid_namespace_id)?;
+    let node = open_proc_pseudo(&provider_path)?;
+    if let Some(dir) = node.as_any().downcast_ref::<PseudoDir>() {
+        return Some(Arc::new(dir.remapped(path)));
+    }
+    Some(node)
 }

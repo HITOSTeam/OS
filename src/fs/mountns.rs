@@ -18,6 +18,48 @@ pub(crate) enum MountPropagation {
     Unbindable,
 }
 
+/// Filesystem instance attached by a mount record.
+///
+/// Virtual filesystems are selected from this value, never from the spelling
+/// of the userspace path.  In particular, an empty `/proc` directory in an
+/// ext4 image remains an ext4 directory until a `Proc` backend is mounted on
+/// it, and the same backend can be mounted at an arbitrary directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MountBackend {
+    Storage,
+    // procfs system in certain pid namespace
+    Proc { pid_namespace_id: usize },
+    SysFs,
+    DevTmpFs,
+    Cgroup,
+}
+
+impl MountBackend {
+    pub(crate) fn is_pseudo(&self) -> bool {
+        !matches!(self, Self::Storage)
+    }
+
+    pub(crate) fn canonical_root(&self) -> Option<&'static str> {
+        match self {
+            Self::Storage => None,
+            Self::Proc { .. } => Some("/proc"),
+            Self::SysFs => Some("/sys"),
+            Self::DevTmpFs => Some("/dev"),
+            Self::Cgroup => None,
+        }
+    }
+
+    pub(crate) fn statfs_magic(&self) -> i64 {
+        match self {
+            Self::Storage => 0xef53,
+            Self::Proc { .. } => 0x9fa0,
+            Self::SysFs => 0x6265_6572,
+            Self::DevTmpFs => 0x0102_1994,
+            Self::Cgroup => 0x6367_7270,
+        }
+    }
+}
+
 /// One mount entry visible inside a mount namespace.
 #[derive(Clone, Debug)]
 pub(crate) struct MountRecord {
@@ -29,6 +71,8 @@ pub(crate) struct MountRecord {
     pub(crate) source_display: String,
     /// Filesystem type name, e.g. `ext4`, `proc`, `tmpfs`, or `cgroup2`.
     pub(crate) fs_type: String,
+    /// Mounted filesystem instance used for path dispatch.
+    pub(crate) backend: MountBackend,
     /// Linux mount flags such as `MS_RDONLY`, `MS_NOSUID`, or propagation flags.
     pub(crate) flags: usize,
     /// Monotonic order for mounts stacked on the same target; larger wins lookups.
@@ -45,6 +89,27 @@ pub(crate) struct MountRecord {
     pub(crate) access_seq: usize,
     /// Last access counter value observed when this mount was marked for expiry.
     pub(crate) expire_mark_seq: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FdMountRef {
+    pub(crate) target: String,
+    pub(crate) event_id: usize,
+    pub(crate) stack_seq: usize,
+    pub(crate) flags: usize,
+    pub(crate) backend: MountBackend,
+}
+
+impl From<&MountRecord> for FdMountRef {
+    fn from(record: &MountRecord) -> Self {
+        Self {
+            target: record.target.clone(),
+            event_id: record.event_id,
+            stack_seq: record.stack_seq,
+            flags: record.flags,
+            backend: record.backend.clone(),
+        }
+    }
 }
 
 pub(crate) type MountNamespace = Arc<Mutex<MountNamespaceState>>;
@@ -71,6 +136,7 @@ impl MountNamespaceState {
             source: String::from("/"),
             source_display: String::from("/dev/root"),
             fs_type: String::from("ext4"),
+            backend: MountBackend::Storage,
             flags: 0,
             stack_seq: 1,
             event_id: 1,
@@ -80,6 +146,60 @@ impl MountNamespaceState {
             access_seq: 0,
             expire_mark_seq: None,
         });
+        if let Some(source) = super::block_device_source_path("/dev/vdb") {
+            super::ensure_root_mount_directory("user");
+            mounts.push(MountRecord {
+                target: String::from("/user"),
+                source,
+                source_display: String::from("/dev/vdb"),
+                fs_type: String::from("ext4"),
+                backend: MountBackend::Storage,
+                flags: 0,
+                stack_seq: 2,
+                event_id: 2,
+                propagation: MountPropagation::Private,
+                peer_group_id: None,
+                master_group_id: None,
+                access_seq: 0,
+                expire_mark_seq: None,
+            });
+        }
+        if let Some(source) = super::block_device_source_path("/dev/vdc") {
+            mounts.push(MountRecord {
+                target: String::from("/mnt/oscomp"),
+                source: source.clone(),
+                source_display: String::from("/dev/vdc"),
+                fs_type: String::from("ext4"),
+                backend: MountBackend::Storage,
+                flags: 0,
+                stack_seq: 3,
+                event_id: 3,
+                propagation: MountPropagation::Private,
+                peer_group_id: None,
+                master_group_id: None,
+                access_seq: 0,
+                expire_mark_seq: None,
+            });
+            for (stack_seq, event_id, target, child) in
+                [(4, 4, "/glibc", "glibc"), (5, 5, "/musl", "musl")]
+            {
+                mounts.push(MountRecord {
+                    target: String::from(target),
+                    source: alloc::format!("{}/{}", source, child),
+                    source_display: alloc::format!("/mnt/oscomp/{}", child),
+                    fs_type: String::from("none"),
+                    backend: MountBackend::Storage,
+                    flags: 0,
+                    stack_seq,
+                    event_id,
+                    propagation: MountPropagation::Private,
+                    peer_group_id: None,
+                    master_group_id: None,
+                    access_seq: 0,
+                    expire_mark_seq: None,
+                });
+            }
+        }
         Self {
             id,
             mounts,
@@ -177,19 +297,31 @@ impl MountNamespaceState {
         if self.bound_file_for_path(abs).is_some() {
             return ClassifiedAbsPath::Pseudo(String::from(abs));
         }
-        if super::procfs::is_proc_pseudo_path(abs)
-            || super::cgroupfs::is_cgroup_pseudo_path(abs)
-            || super::is_builtin_pseudo_path(abs)
-        {
-            return ClassifiedAbsPath::Pseudo(String::from(abs));
-        }
         if self
             .mount_record_for_path(abs)
-            .is_some_and(|mount| mount.fs_type == "cgroup" || mount.fs_type == "cgroup2")
+            .is_some_and(|mount| mount.backend.is_pseudo())
         {
             return ClassifiedAbsPath::Pseudo(String::from(abs));
         }
         ClassifiedAbsPath::Ext4(self.translate_mount_abs(abs))
+    }
+
+    /// Translate a logical path inside a virtual mount to the canonical path
+    /// understood by the existing proc/sys/dev providers.
+    pub(crate) fn canonical_pseudo_abs(&self, abs: &str) -> Option<(MountRecord, String)> {
+        let mount = self.mount_record_for_path(abs)?;
+        let canonical_root = mount.backend.canonical_root()?;
+        let root = if path_under_mount(&mount.source, canonical_root) {
+            mount.source.clone()
+        } else {
+            String::from(canonical_root)
+        };
+        let suffix = if abs == mount.target {
+            ""
+        } else {
+            &abs[mount.target.len()..]
+        };
+        Some((mount, mount_path_join(&root, suffix)))
     }
 
     pub(crate) fn translate_mount_abs(&self, abs: &str) -> String {

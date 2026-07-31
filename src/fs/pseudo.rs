@@ -269,6 +269,14 @@ impl PseudoDir {
         &self.entries
     }
 
+    /// Build a fresh directory handle for the same virtual directory at a
+    /// different userspace-visible mount path.
+    pub(crate) fn remapped(&self, path: &str) -> Self {
+        let mut dir = Self::new(path, self.entries.clone());
+        dir.pidfd_target = self.pidfd_target.clone();
+        dir
+    }
+
     pub fn index(&self) -> usize {
         self.inner.lock().index
     }

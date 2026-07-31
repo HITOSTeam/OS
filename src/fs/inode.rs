@@ -1,7 +1,7 @@
 //! Inode abstraction for ext4 filesystem
 
 use super::{File, POLLIN, POLLOUT};
-use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
+use crate::drivers::BLOCK_DEVICES;
 use crate::mm::UserBuffer;
 use crate::println;
 use crate::task::manager::PID2PCB;
@@ -474,19 +474,23 @@ pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
     let target_ino = target.inode_num();
     let _guard = ext4_lock();
 
-    let primary = root_inode_for_path("/");
-    if primary.device_id() == target_dev && primary.inode_num() == target_ino {
-        return Some(String::from("/"));
+    for (index, root) in BLOCK_ROOTS.iter().enumerate() {
+        let Some(root) = root.as_ref() else {
+            continue;
+        };
+        let base = if index == 0 {
+            String::from("/")
+        } else {
+            alloc::format!("/.block_devices/vd{}", (b'a' + index as u8) as char)
+        };
+        if root.device_id() == target_dev && root.inode_num() == target_ino {
+            return Some(base);
+        }
+        if let Some(found) = find_inode_path_in_subtree(root, &base, target_dev, target_ino, 64) {
+            return Some(found);
+        }
     }
-    if let Some(found) = find_inode_path_in_subtree(&primary, "/", target_dev, target_ino, 64) {
-        return Some(found);
-    }
-
-    let secondary = secondary_root_inode()?;
-    if secondary.device_id() == target_dev && secondary.inode_num() == target_ino {
-        return Some(String::from("/"));
-    }
-    find_inode_path_in_subtree(&secondary, "/", target_dev, target_ino, 64)
+    None
 }
 
 pub(crate) fn path_resolves_to_inode(path: &str, target: &Arc<Inode>) -> bool {
@@ -544,6 +548,10 @@ fn debug_iozone_tracked(inode_num: u32) -> bool {
 
 /// A wrapper around a filesystem inode to implement File trait
 pub struct OSInode {
+    flock_owner_id: usize,
+    open_fd_refs: AtomicUsize,
+    inode_device_id: usize,
+    inode_num: u32,
     readable: bool,
     writable: bool,
     regular_file_poll_ready: bool,
@@ -583,6 +591,7 @@ const WRITEBUF_MAX: usize = 128 * 1024;
 const ETXTBSY_ERR: isize = -26;
 static PENDING_WRITE_BUFFERS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_WRITE_BUF_REGISTRY_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_FLOCK_OWNER_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub(crate) fn pending_inode_write_end(device_id: usize, inode_num: u32) -> Option<usize> {
     if PENDING_WRITE_BUFFERS.load(Ordering::Acquire) == 0 {
@@ -759,6 +768,8 @@ impl OSInode {
         tmpfile_cleanup: Option<(Arc<Inode>, String)>,
     ) -> Result<Self, isize> {
         let regular_file_poll_ready = inode.is_file();
+        let inode_device_id = inode.device_id();
+        let inode_num = inode.inode_num();
         let write_open = WriteOpenState::register_for_inode(writable, &inode)?;
         let inner = Arc::new_cyclic(|inner_weak| {
             Mutex::new(OSInodeInner {
@@ -776,6 +787,10 @@ impl OSInode {
             })
         });
         Ok(Self {
+            flock_owner_id: NEXT_FLOCK_OWNER_ID.fetch_add(1, Ordering::Relaxed),
+            open_fd_refs: AtomicUsize::new(0),
+            inode_device_id,
+            inode_num,
             readable,
             writable,
             regular_file_poll_ready,
@@ -797,6 +812,28 @@ impl OSInode {
 
     pub fn append(&self) -> bool {
         self.append
+    }
+
+    pub(crate) fn flock_owner_id(&self) -> usize {
+        self.flock_owner_id
+    }
+
+    fn close_fd_ref(&self) -> bool {
+        let mut refs = self.open_fd_refs.load(Ordering::Acquire);
+        loop {
+            if refs == 0 {
+                return false;
+            }
+            match self.open_fd_refs.compare_exchange_weak(
+                refs,
+                refs - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return refs == 1,
+                Err(actual) => refs = actual,
+            }
+        }
     }
 
     pub fn readonly_fs(&self) -> bool {
@@ -1236,114 +1273,131 @@ fn sweep_deferred_unlinks() {
 }
 
 lazy_static! {
-    static ref DISK0_FS: Arc<spin::Mutex<Ext4FileSystem>> = {
-        Ext4FileSystem::open(BLOCK_DEVICE.clone())
-    };
+    /// One optional ext4 instance per registered block device.  Keeping the
+    /// vector aligned with `/dev/vdX` preserves stable device identities even
+    /// when a future non-ext4 disk is present.
+    static ref BLOCK_FILESYSTEMS: Vec<Option<Arc<spin::Mutex<Ext4FileSystem>>>> = BLOCK_DEVICES
+        .iter()
+        .map(|device| Ext4FileSystem::try_open(device.clone()).ok())
+        .collect();
 
-    static ref DISK1_FS: Option<Arc<spin::Mutex<Ext4FileSystem>>> = {
-        USER_BLOCK_DEVICE
-            .as_ref()
-            .and_then(|dev| Ext4FileSystem::try_open(dev.clone()).ok())
-    };
-
-    static ref DISK0_ROOT: Arc<Inode> = {
-        Arc::new(Ext4FileSystem::root_inode(&DISK0_FS))
-    };
-
-    static ref DISK1_ROOT: Option<Arc<Inode>> = {
-        DISK1_FS
-            .as_ref()
-            .map(|fs| Arc::new(Ext4FileSystem::root_inode(fs)))
-    };
-
-    static ref ROOT_SELECTION: RootSelection = RootSelection::new(
-        &DISK0_ROOT,
-        &DISK1_ROOT,
-        &DISK0_FS,
-        &DISK1_FS,
-    );
+    static ref BLOCK_ROOTS: Vec<Option<Arc<Inode>>> = BLOCK_FILESYSTEMS
+        .iter()
+        .map(|fs| {
+            fs.as_ref()
+                .map(|fs| Arc::new(Ext4FileSystem::root_inode(fs)))
+        })
+        .collect();
 
     /// ext4 filesystem handle (primary root device).
-    pub static ref EXT4_FS: Arc<spin::Mutex<Ext4FileSystem>> = ROOT_SELECTION.primary_fs.clone();
+    pub static ref EXT4_FS: Arc<spin::Mutex<Ext4FileSystem>> = BLOCK_FILESYSTEMS
+        .first()
+        .and_then(|fs| fs.as_ref())
+        .cloned()
+        .expect("[ext4] /dev/vda is not a valid ext4 filesystem");
 
     /// Root inode of the primary filesystem.
-    pub static ref ROOT_INODE: Arc<Inode> = ROOT_SELECTION.primary_root.clone();
+    pub static ref ROOT_INODE: Arc<Inode> = BLOCK_ROOTS
+        .first()
+        .and_then(|root| root.as_ref())
+        .cloned()
+        .expect("[ext4] /dev/vda has no ext4 root inode");
 
-    /// Optional secondary filesystem (if present).
-    pub static ref SECONDARY_EXT4_FS: Option<Arc<spin::Mutex<Ext4FileSystem>>> =
-        ROOT_SELECTION.secondary_fs.clone();
-
-    /// Root inode of the secondary filesystem (if present).
-    pub static ref SECONDARY_ROOT_INODE: Option<Arc<Inode>> =
-        ROOT_SELECTION.secondary_root.clone();
-
-    /// User directory inode (for ext4, apps are in /user).
-    pub static ref USER_INODE: Arc<Inode> = {
-        ROOT_INODE
-            .find("user")
-            .expect("[ext4] /user directory not found!")
-    };
+    /// User-app filesystem root.  The split layout stores app binaries at the
+    /// root of `/dev/vdb` and mounts that filesystem at `/user`.
+    pub static ref USER_INODE: Arc<Inode> = BLOCK_ROOTS
+        .get(1)
+        .and_then(|root| root.as_ref())
+        .cloned()
+        .expect("[ext4] /dev/vdb has no user ext4 root inode");
 }
 
 pub(crate) fn root_inode_for_path(path: &str) -> Arc<Inode> {
-    let _ = path;
-    ROOT_INODE.clone()
+    device_path_parts(path)
+        .and_then(|(index, _)| block_root(index))
+        .unwrap_or_else(|| ROOT_INODE.clone())
 }
 
-pub(crate) fn secondary_root_inode() -> Option<Arc<Inode>> {
-    SECONDARY_ROOT_INODE.as_ref().map(Arc::clone)
+pub(crate) fn path_within_filesystem(path: &str) -> &str {
+    match device_path_parts(path) {
+        Some((_, "")) => "/",
+        Some((_, suffix)) => suffix,
+        None => path,
+    }
 }
 
-/// Find a path in the primary root, falling back to the secondary root when missing.
+pub(crate) fn root_inode_for_device(device_id: usize) -> Option<Arc<Inode>> {
+    BLOCK_ROOTS
+        .iter()
+        .filter_map(|root| root.as_ref())
+        .find(|root| root.device_id() == device_id)
+        .cloned()
+}
+
+pub(crate) fn ensure_root_mount_directory(name: &str) {
+    let _guard = ext4_lock();
+    if ROOT_INODE.find(name).is_some() {
+        return;
+    }
+    if let Ok(inode) = ROOT_INODE.create_dir(name) {
+        inode.set_uid_gid(0, 0);
+        inode.set_mode(0o755);
+        clear_ext4_path_cache();
+    }
+}
+
+pub(crate) fn block_device_source_path(name: &str) -> Option<String> {
+    let index = block_device_index(name)?;
+    BLOCK_ROOTS.get(index)?.as_ref()?;
+    Some(alloc::format!(
+        "/.block_devices/vd{}",
+        (b'a' + index as u8) as char
+    ))
+}
+
+fn block_device_index(name: &str) -> Option<usize> {
+    let suffix = name
+        .strip_prefix("/dev/vd")
+        .or_else(|| name.strip_prefix("vd"))?;
+    if suffix.len() != 1 {
+        return None;
+    }
+    suffix
+        .as_bytes()
+        .first()
+        .and_then(|letter| letter.checked_sub(b'a'))
+        .map(usize::from)
+}
+
+fn device_path_parts(path: &str) -> Option<(usize, &str)> {
+    let path = path.strip_prefix("/.block_devices/")?;
+    let (device, suffix) = path.split_once('/').unwrap_or((path, ""));
+    Some((block_device_index(device)?, suffix))
+}
+
+fn block_root(index: usize) -> Option<Arc<Inode>> {
+    BLOCK_ROOTS
+        .get(index)
+        .and_then(|root| root.as_ref())
+        .cloned()
+}
+
+/// Find a path in exactly one filesystem.
+///
+/// Logical mount translation encodes non-root filesystems under the internal
+/// `/.block_devices/vdX` prefix.  Missing files never fall through to another
+/// disk, matching Linux mount semantics.
 ///
 /// Caller should hold `ext4_lock()` if concurrent ext4 access is possible.
 pub(crate) fn find_path_in_roots(path: &str) -> Option<Arc<Inode>> {
-    if let Some(inode) = ROOT_INODE.find_path(path) {
-        return Some(inode);
-    }
-    SECONDARY_ROOT_INODE.as_ref()?.find_path(path)
-}
-//if a disk has a /user directory while the other does not, prefer the one with /user
-//todo: better solution.
-struct RootSelection {
-    primary_root: Arc<Inode>,
-    secondary_root: Option<Arc<Inode>>,
-    primary_fs: Arc<spin::Mutex<Ext4FileSystem>>,
-    #[allow(dead_code)]
-    secondary_fs: Option<Arc<spin::Mutex<Ext4FileSystem>>>,
-}
-
-impl RootSelection {
-    fn new(
-        root0: &Arc<Inode>,
-        root1: &Option<Arc<Inode>>,
-        fs0: &Arc<spin::Mutex<Ext4FileSystem>>,
-        fs1: &Option<Arc<spin::Mutex<Ext4FileSystem>>>,
-    ) -> Self {
-        // Avoid taking ext4_lock() here; this may run during lazy_static initialization
-        // while a caller already holds the lock.
-        let has_user0 = root0.find("user").is_some();
-        let has_user1 = root1
-            .as_ref()
-            .map(|root| root.find("user").is_some())
-            .unwrap_or(false);
-
-        if root1.is_some() && !has_user0 && has_user1 {
-            RootSelection {
-                primary_root: root1.as_ref().unwrap().clone(),
-                secondary_root: Some(root0.clone()),
-                primary_fs: fs1.as_ref().unwrap().clone(),
-                secondary_fs: Some(fs0.clone()),
-            }
-        } else {
-            RootSelection {
-                primary_root: root0.clone(),
-                secondary_root: root1.clone(),
-                primary_fs: fs0.clone(),
-                secondary_fs: fs1.clone(),
-            }
+    if let Some((index, suffix)) = device_path_parts(path) {
+        let root = block_root(index)?;
+        if suffix.is_empty() {
+            return Some(root);
         }
+        return root.find_path(suffix);
     }
+    ROOT_INODE.find_path(path)
 }
 
 /// List all files in the filesystem
@@ -1459,6 +1513,7 @@ impl File for OSInode {
     }
 
     fn on_fd_install(&self) {
+        self.open_fd_refs.fetch_add(1, Ordering::AcqRel);
         let mut write_open = self.write_open.lock();
         if write_open.key.is_some() {
             write_open.fd_refs = write_open.fd_refs.saturating_add(1);
@@ -1466,12 +1521,12 @@ impl File for OSInode {
     }
 
     fn on_fd_close(&self) {
+        let last_fd = self.close_fd_ref();
         let key = {
             let mut write_open = self.write_open.lock();
-            if write_open.fd_refs == 0 {
-                return;
+            if write_open.fd_refs > 0 {
+                write_open.fd_refs -= 1;
             }
-            write_open.fd_refs -= 1;
             if write_open.fd_refs == 0 {
                 write_open.key.take()
             } else {
@@ -1480,6 +1535,13 @@ impl File for OSInode {
         };
         if let Some((dev, ino)) = key {
             unregister_write_open_inode(dev, ino);
+        }
+        if last_fd {
+            crate::syscall::filesystem::release_flock_owner_for_inode(
+                self.inode_device_id,
+                self.inode_num,
+                self.flock_owner_id,
+            );
         }
     }
 
@@ -1649,6 +1711,11 @@ impl Drop for OSInode {
             Self::mark_write_buf_clean(&mut inner);
         }
         drop(inner);
+        crate::syscall::filesystem::release_flock_owner_for_inode(
+            inode_key.0,
+            inode_key.1,
+            self.flock_owner_id,
+        );
         if let Some(cleanup) = self.tmpfile_cleanup.take() {
             if {
                 let _fs_guard = ext4_lock();

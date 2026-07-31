@@ -2,7 +2,8 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::fs::{File, Stdin, Stdout};
+use crate::fs::{FdMountRef, File, Stdin, Stdout};
+use spin::mutex::SpinMutex;
 
 const FD_CLOEXEC: u32 = 1;
 
@@ -10,15 +11,31 @@ const FD_CLOEXEC: u32 = 1;
 ///
 /// `FilesStruct` is intentionally independent of `ProcessControlBlockInner`:
 /// regular fork snapshots it into a private table, while `clone(CLONE_FILES)`
-/// shares the same `Arc<SpinMutex<FilesStruct>>`.  Resource limits stay in the
-/// PCB because they are process attributes rather than file-table state.
+/// shares the same `Arc<FilesLock>`. Resource limits stay in the PCB because
+/// they are process attributes rather than file-table state.
 pub struct FilesStruct {
     fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     fd_flags: Vec<u32>,
+    fd_mounts: Vec<Option<FdMountRef>>,
     next_fd_hint: usize,
     close_cursor: Option<usize>,
     fd_refs_closed: bool,
+    /// Number of process objects that own this descriptor table.
+    ///
+    /// This is deliberately independent of `Arc::strong_count`: syscall stack
+    /// frames and procfs snapshots also hold temporary Arcs, and a thread that
+    /// exits without unwinding its kernel stack can retain one indefinitely.
+    /// Descriptor close semantics follow process ownership, not those
+    /// implementation references.
+    process_owners: usize,
 }
+
+/// The descriptor table has short, non-sleeping critical sections.
+///
+/// Use the simple test-and-set mutex rather than the crate-wide ticket mutex:
+/// a ticket waiter that is not currently scheduled otherwise creates
+/// head-of-line blocking for every other thread sharing `CLONE_FILES`.
+pub type FilesLock = SpinMutex<FilesStruct>;
 
 impl FilesStruct {
     /// Create an empty file table.  Used when an exiting process drops its table
@@ -36,9 +53,11 @@ impl FilesStruct {
                 Some(Arc::new(Stdout)),
             ],
             fd_flags: vec![0; 3],
+            fd_mounts: vec![None; 3],
             next_fd_hint: 3,
             close_cursor: None,
             fd_refs_closed: false,
+            process_owners: 1,
         }
     }
 
@@ -47,7 +66,7 @@ impl FilesStruct {
     /// 子进程关闭/重定向 fd 不会影响父进程。
     /// 也就是 表独立，而不是底层资源独立
     pub fn clone_private(&self) -> Self {
-        let (fd_table, fd_flags) = self.snapshot_fd_state();
+        let (fd_table, fd_flags, fd_mounts) = self.snapshot_fd_state();
         for file in fd_table.iter().flatten() {
             file.on_fd_install();
         }
@@ -55,9 +74,36 @@ impl FilesStruct {
         Self {
             fd_table,
             fd_flags,
+            fd_mounts,
             next_fd_hint,
             close_cursor: None,
             fd_refs_closed: false,
+            process_owners: 1,
+        }
+    }
+
+    pub fn process_owner_count(&self) -> usize {
+        self.process_owners
+    }
+
+    pub fn acquire_process_owner(&mut self) {
+        self.process_owners = self.process_owners.saturating_add(1);
+    }
+
+    /// Drop one process-level ownership reference.
+    ///
+    /// The last owner semantically closes every descriptor immediately, even
+    /// when temporary or abandoned Arc references keep this Rust object alive.
+    pub fn release_process_owner(&mut self) -> bool {
+        if self.process_owners == 0 {
+            return false;
+        }
+        self.process_owners -= 1;
+        if self.process_owners == 0 {
+            self.close_all_fd_refs();
+            true
+        } else {
+            false
         }
     }
 
@@ -69,7 +115,8 @@ impl FilesStruct {
             let idx = len - 1;
             let has_file = self.fd_table[idx].is_some();
             let has_flag = self.fd_flags.get(idx).copied().unwrap_or(0) != 0;
-            if has_file || has_flag {
+            let has_mount = self.fd_mounts.get(idx).is_some_and(Option::is_some);
+            if has_file || has_flag || has_mount {
                 break;
             }
             len -= 1;
@@ -82,6 +129,7 @@ impl FilesStruct {
         let len = self.effective_len();
         self.fd_table.truncate(len);
         self.fd_flags.truncate(len);
+        self.fd_mounts.truncate(len);
         if self.next_fd_hint > len {
             self.next_fd_hint = len;
         }
@@ -93,12 +141,21 @@ impl FilesStruct {
         if self.fd_flags.len() < self.fd_table.len() {
             self.fd_flags.resize(self.fd_table.len(), 0);
         }
+        if self.fd_mounts.len() < self.fd_table.len() {
+            self.fd_mounts.resize(self.fd_table.len(), None);
+        }
     }
 
     /// 快照当前 fd 表状态，返回 (fd_table 副本, fd_flags 副本)。
     /// 用于 fork（clone_private）以及需要在持锁外遍历 fd 的场景。
     /// Arc::clone 只增加引用计数，不复制底层 File 数据。
-    pub fn snapshot_fd_state(&self) -> (Vec<Option<Arc<dyn File + Send + Sync>>>, Vec<u32>) {
+    pub fn snapshot_fd_state(
+        &self,
+    ) -> (
+        Vec<Option<Arc<dyn File + Send + Sync>>>,
+        Vec<u32>,
+        Vec<Option<FdMountRef>>,
+    ) {
         let len = self.effective_len();
         let fd_table = self
             .fd_table
@@ -110,7 +167,11 @@ impl FilesStruct {
         if fd_flags.len() < fd_table.len() {
             fd_flags.resize(fd_table.len(), 0);
         }
-        (fd_table, fd_flags)
+        let mut fd_mounts = self.fd_mounts.iter().take(len).cloned().collect::<Vec<_>>();
+        if fd_mounts.len() < fd_table.len() {
+            fd_mounts.resize(fd_table.len(), None);
+        }
+        (fd_table, fd_flags, fd_mounts)
     }
 
     /// 返回所有已打开 fd 的 (fd编号, File引用) 列表（快照，不持锁）。
@@ -146,12 +207,16 @@ impl FilesStruct {
             if let Some(flag) = self.fd_flags.get_mut(cursor) {
                 *flag = 0;
             }
+            if let Some(mount) = self.fd_mounts.get_mut(cursor) {
+                *mount = None;
+            }
             cursor += 1;
         }
 
         if cursor >= self.fd_table.len() {
             self.fd_table.clear();
             self.fd_flags.clear();
+            self.fd_mounts.clear();
             self.next_fd_hint = 0;
             self.close_cursor = None;
         } else {
@@ -187,6 +252,18 @@ impl FilesStruct {
     pub fn get_file_and_flags(&self, fd: usize) -> Option<(Arc<dyn File + Send + Sync>, u32)> {
         let file = self.get_file(fd)?;
         Some((file, self.get_flags(fd)))
+    }
+
+    pub fn get_mount_ref(&self, fd: usize) -> Option<FdMountRef> {
+        self.fd_mounts.get(fd).and_then(Clone::clone)
+    }
+
+    pub fn iter_mount_refs_snapshot(&self) -> Vec<(usize, FdMountRef)> {
+        self.fd_mounts
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, mount)| mount.clone().map(|mount| (fd, mount)))
+            .collect()
     }
 
     /// Return the descriptor state needed by select/poll style syscalls.
@@ -234,6 +311,7 @@ impl FilesStruct {
             }
             self.ensure_flags_len();
             self.fd_flags[fd] = 0;
+            self.fd_mounts[fd] = None;
             self.next_fd_hint = fd + 1;
             Some(fd)
         } else {
@@ -242,6 +320,7 @@ impl FilesStruct {
             }
             self.fd_table.push(None);
             self.fd_flags.push(0);
+            self.fd_mounts.push(None);
             let fd = self.fd_table.len() - 1;
             self.next_fd_hint = fd + 1;
             Some(fd)
@@ -256,11 +335,22 @@ impl FilesStruct {
         flags: u32,
         limit: usize,
     ) -> Option<usize> {
+        self.install_fd_with_mount(file, flags, None, limit)
+    }
+
+    pub fn install_fd_with_mount(
+        &mut self,
+        file: Arc<dyn File + Send + Sync>,
+        flags: u32,
+        mount: Option<FdMountRef>,
+        limit: usize,
+    ) -> Option<usize> {
         self.close_cursor = None;
         let fd = self.alloc_fd(limit)?;
         file.on_fd_install();
         self.fd_table[fd] = Some(file);
         self.fd_flags[fd] = flags;
+        self.fd_mounts[fd] = mount;
         Some(fd)
     }
 
@@ -288,6 +378,17 @@ impl FilesStruct {
         flags: u32,
         limit: usize,
     ) -> Option<Option<Arc<dyn File + Send + Sync>>> {
+        self.replace_fd_at_with_mount(fd, file, flags, None, limit)
+    }
+
+    pub fn replace_fd_at_with_mount(
+        &mut self,
+        fd: usize,
+        file: Arc<dyn File + Send + Sync>,
+        flags: u32,
+        mount: Option<FdMountRef>,
+        limit: usize,
+    ) -> Option<Option<Arc<dyn File + Send + Sync>>> {
         if fd >= limit {
             return None;
         }
@@ -295,6 +396,7 @@ impl FilesStruct {
         if self.fd_table.len() <= fd {
             self.fd_table.resize(fd + 1, None);
             self.fd_flags.resize(fd + 1, 0);
+            self.fd_mounts.resize(fd + 1, None);
         } else {
             self.ensure_flags_len();
         }
@@ -307,6 +409,7 @@ impl FilesStruct {
         file.on_fd_install();
         self.fd_table[fd] = Some(file);
         self.fd_flags[fd] = flags;
+        self.fd_mounts[fd] = mount;
         if fd == self.next_fd_hint {
             while self
                 .fd_table
@@ -333,6 +436,7 @@ impl FilesStruct {
         }
         self.ensure_flags_len();
         self.fd_flags[fd] = 0;
+        self.fd_mounts[fd] = None;
         self.close_cursor = None;
         if file.is_some() {
             self.next_fd_hint = self.next_fd_hint.min(fd);
@@ -370,6 +474,7 @@ impl FilesStruct {
                     }
                 }
                 *flags = 0;
+                self.fd_mounts[idx] = None;
                 self.next_fd_hint = self.next_fd_hint.min(idx);
             }
         }
@@ -382,9 +487,11 @@ impl Default for FilesStruct {
         Self {
             fd_table: Vec::new(),
             fd_flags: Vec::new(),
+            fd_mounts: Vec::new(),
             next_fd_hint: 0,
             close_cursor: None,
             fd_refs_closed: false,
+            process_owners: 1,
         }
     }
 }
