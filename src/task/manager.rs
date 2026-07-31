@@ -6,7 +6,7 @@ use lazy_static::*;
 use spin::Mutex;
 
 use crate::arch;
-use crate::config::MAX_HARTS;
+use crate::config::{MAX_HARTS, active_hart_mask};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 
@@ -48,16 +48,24 @@ pub(super) fn current_time_ns_usize() -> usize {
 
 /// 让 hart 上线
 pub fn mark_hart_online(hart_id: usize) {
-    if hart_id < usize::BITS as usize {
+    if hart_id < MAX_HARTS && (active_hart_mask() & (1usize << hart_id)) != 0 {
         ONLINE_HART_MASK.fetch_or(1usize << hart_id, Ordering::SeqCst);
     }
 }
 
 /// hart_mask 的全局包装
 pub fn online_hart_mask() -> usize {
-    let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
-    // 兜底：至少 hart0 存在。
-    if mask == 0 { 1 } else { mask }
+    let active = active_hart_mask();
+    let mask = ONLINE_HART_MASK.load(Ordering::Acquire) & active;
+    if mask != 0 {
+        return mask;
+    }
+    // 早期启动阶段还没有发布 online bit；兜底到 DTB 中的第一个 hart。
+    if active == 0 {
+        1
+    } else {
+        1usize << active.trailing_zeros()
+    }
 }
 
 /// 从 start hart 开始轮询，返回第一个在线（已上线）的 hart ID

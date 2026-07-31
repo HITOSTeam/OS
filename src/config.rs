@@ -51,12 +51,49 @@ pub const SIGRETURN_TRAMPOLINE: usize = TRAMPOLINE - PAGE_SIZE;
 pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 #[cfg(target_arch = "loongarch64")]
 pub const KERNEL_STACK_TOP: usize = 0xffff_ffff_ffff_f000;
-// BuildStorm 编译需要完整的 12 核拓扑。两种架构的入口汇编都必须预留
-// 相同数量的早期启动栈，并与这里的上限保持一致。
+// 两种架构的入口汇编都为最多 12 个 hart 预留早期启动栈，并与这里的
+// 静态容量保持一致。运行时实际启动的 hart 集合由 DTB 决定，可能小于该值。
 #[cfg(target_arch = "riscv64")]
 pub const MAX_HARTS: usize = 12;
 #[cfg(target_arch = "loongarch64")]
 pub const MAX_HARTS: usize = 12;
+
+/// 编译期支持的 hart ID 位图。所有 per-hart 静态数组均以该上限分配。
+pub const fn supported_hart_mask() -> usize {
+    if MAX_HARTS >= usize::BITS as usize {
+        usize::MAX
+    } else {
+        (1usize << MAX_HARTS) - 1
+    }
+}
+
+/// 启动核从 DTB 发布的实际 hart 集合。0 表示拓扑尚未初始化。
+static ACTIVE_HART_MASK: AtomicUsize = AtomicUsize::new(0);
+
+/// 发布本次启动可用的 hart 集合，并永远限制在静态容量内。
+///
+/// 平台没有可用 DTB 时调用方会至少保留启动 hart，因而不会回退为一个
+/// 虚假的全 12 hart 拓扑。
+pub fn set_active_hart_mask(mask: usize) {
+    let mask = mask & supported_hart_mask();
+    if mask != 0 {
+        ACTIVE_HART_MASK.store(mask, Ordering::Release);
+    }
+}
+
+/// 返回 DTB 描述的运行时 hart 集合；早期启动阶段尚未发布时保留旧的容量语义。
+pub fn active_hart_mask() -> usize {
+    let mask = ACTIVE_HART_MASK.load(Ordering::Acquire);
+    if mask == 0 {
+        supported_hart_mask()
+    } else {
+        mask
+    }
+}
+
+pub fn active_hart_count() -> usize {
+    active_hart_mask().count_ones() as usize
+}
 #[cfg(target_arch = "riscv64")]
 #[allow(dead_code)]
 pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;

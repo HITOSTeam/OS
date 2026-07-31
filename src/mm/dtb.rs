@@ -1,8 +1,8 @@
 use fdt::Fdt;
 
 use crate::config::{
-    DEFAULT_MEMORY_END, DEFAULT_MEMORY_START, MAX_DTB_MMIO_REGIONS, MAX_PHYS_MEMORY_REGIONS,
-    MAX_VIRTIO_MMIO_DEVICES, init_platform_info,
+    DEFAULT_MEMORY_END, DEFAULT_MEMORY_START, MAX_DTB_MMIO_REGIONS, MAX_HARTS,
+    MAX_PHYS_MEMORY_REGIONS, MAX_VIRTIO_MMIO_DEVICES, init_platform_info, set_active_hart_mask,
 };
 
 const VIRTIO_MMIO_COMPATIBLE: &[u8] = b"virtio,mmio";
@@ -34,6 +34,81 @@ fn node_should_map_mmio(node: fdt::node::FdtNode<'_, '_>) -> bool {
         || compatible_contains(node, b"ns16550a")
         || compatible_contains(node, b"qemu,fw-cfg-mmio")
         || compatible_contains(node, b"syscon")
+}
+
+/// DTB 中缺省、`okay` 和 `ok` 的节点可用；其他 status（如 `disabled`、
+/// `fail`）都不能进入 SMP 启动屏障。
+fn node_is_available(node: fdt::node::FdtNode<'_, '_>) -> bool {
+    node.property("status")
+        .and_then(|property| property.as_str())
+        .is_none_or(|status| status == "okay" || status == "ok")
+}
+
+/// 从 `/cpus/cpu@*/reg` 读取本次启动实际存在的 hart ID 集合。
+///
+/// `MAX_HARTS` 仍是 per-hart 静态存储的容量，不是 QEMU 的运行时核数。
+/// 没有 DTB 或 DTB 不含可用 CPU 节点时，保守地只保留启动 hart，避免尝试
+/// 启动不存在的 CPU 后永久卡在 SMP 启动屏障。
+pub fn init_hart_topology_from_dtb(dtb_pa: usize, boot_hart_id: usize) -> usize {
+    assert!(
+        boot_hart_id < MAX_HARTS,
+        "boot hart {} exceeds MAX_HARTS={}",
+        boot_hart_id,
+        MAX_HARTS
+    );
+
+    let boot_mask = 1usize << boot_hart_id;
+    let mut active_mask = boot_mask;
+    let mut discovered = 0usize;
+    let mut ignored = 0usize;
+
+    if dtb_pa == 0 {
+        crate::println!(
+            "[kernel] no DTB CPU topology; using boot hart {} only",
+            boot_hart_id
+        );
+    } else if let Ok(fdt) = unsafe { Fdt::from_ptr(dtb_pa as *const u8) } {
+        if let Some(cpus) = fdt.find_node("/cpus") {
+            for cpu in cpus.children() {
+                if cpu.name.split('@').next() != Some("cpu") {
+                    continue;
+                }
+                if !node_is_available(cpu) {
+                    continue;
+                }
+                let Some(mut regions) = cpu.reg() else {
+                    continue;
+                };
+                let Some(region) = regions.next() else {
+                    continue;
+                };
+                let hart_id = region.starting_address as usize;
+                discovered += 1;
+                if hart_id >= MAX_HARTS {
+                    ignored += 1;
+                    continue;
+                }
+                active_mask |= 1usize << hart_id;
+            }
+        } else {
+            crate::println!("[kernel] DTB has no /cpus node; using boot hart only");
+        }
+    } else {
+        crate::println!(
+            "[kernel] failed to parse DTB CPU topology @ {:#x}; using boot hart only",
+            dtb_pa
+        );
+    }
+
+    set_active_hart_mask(active_mask);
+    crate::println!(
+        "[kernel] hart topology: active={} mask={:#x} discovered={} ignored_over_capacity={}",
+        active_mask.count_ones(),
+        active_mask,
+        discovered,
+        ignored
+    );
+    active_mask
 }
 
 #[allow(dead_code)]

@@ -502,9 +502,23 @@ fn proc_meminfo() -> String {
 }
 
 fn proc_cpuinfo() -> String {
-    String::from(
-        "processor\t: 0\nvendor_id\t: QEMU\nmodel name\t: QEMU Virtual CPU\ncpu MHz\t\t: 1000.000\n",
-    )
+    let mut out = String::new();
+    let online = crate::task::manager::online_hart_mask();
+    for hart_id in 0..config::MAX_HARTS {
+        if online & (1usize << hart_id) == 0 {
+            continue;
+        }
+        let _ = write!(
+            out,
+            "processor\t: {hart_id}\nvendor_id\t: QEMU\nmodel name\t: QEMU Virtual CPU\ncpu MHz\t\t: 1000.000\n\n"
+        );
+    }
+    if out.is_empty() {
+        out.push_str(
+            "processor\t: 0\nvendor_id\t: QEMU\nmodel name\t: QEMU Virtual CPU\ncpu MHz\t\t: 1000.000\n",
+        );
+    }
+    out
 }
 
 fn proc_cmdline() -> String {
@@ -519,9 +533,15 @@ fn proc_uptime() -> String {
 }
 
 fn proc_stat() -> String {
-    String::from(
-        "cpu  0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n",
-    )
+    let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
+    let online = crate::task::manager::online_hart_mask();
+    for hart_id in 0..config::MAX_HARTS {
+        if online & (1usize << hart_id) != 0 {
+            let _ = writeln!(out, "cpu{hart_id} 0 0 0 0 0 0 0 0 0 0");
+        }
+    }
+    out.push_str("intr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n");
+    out
 }
 
 fn proc_perf() -> String {

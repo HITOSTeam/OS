@@ -62,25 +62,29 @@ fn clear_bss() {
     }
 }
 
-fn configured_hart_mask() -> usize {
-    if config::MAX_HARTS >= usize::BITS as usize {
-        usize::MAX
-    } else {
-        (1usize << config::MAX_HARTS) - 1
-    }
-}
-
-fn start_other_harts(boot_hart_id: usize, opaque: usize) {
+fn start_other_harts(boot_hart_id: usize, opaque: usize, active_hart_mask: usize) {
     // 先发出全部启动请求，让各 AP 并行初始化。相比逐核启动并等待，
     // 这更接近 ArceOS/StarryOS，同时仍保留明确的全核上线屏障。
+    assert!(
+        boot_hart_id < config::MAX_HARTS,
+        "boot hart {} exceeds MAX_HARTS={}",
+        boot_hart_id,
+        config::MAX_HARTS
+    );
     let boot_bit = 1usize << boot_hart_id;
-    let expected_mask = configured_hart_mask();
+    let expected_mask = active_hart_mask & config::supported_hart_mask();
+    assert!(
+        expected_mask & boot_bit != 0,
+        "runtime hart topology {:#x} excludes boot hart {}",
+        expected_mask,
+        boot_hart_id
+    );
     task::manager::mark_hart_online(boot_hart_id);
     SECONDARY_READY_MASK.store(boot_bit, Ordering::Release);
     let mut started_mask = boot_bit;
 
     for hart_id in 0..config::MAX_HARTS {
-        if hart_id == boot_hart_id {
+        if hart_id == boot_hart_id || expected_mask & (1usize << hart_id) == 0 {
             continue;
         }
         let rc = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, opaque);
@@ -120,7 +124,7 @@ fn start_other_harts(boot_hart_id: usize, opaque: usize) {
     assert_eq!(online, expected_mask, "ready harts must already be online");
     println!(
         "[kernel] all {} harts online: mask={:#x}",
-        config::MAX_HARTS,
+        expected_mask.count_ones(),
         online
     );
 }
@@ -181,6 +185,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         );
         arch::bootstrap_init(dtb_pa);
         mm::init_phys_mem_from_dtb(dtb_pa);
+        let active_hart_mask = mm::init_hart_topology_from_dtb(dtb_pa, hart_id);
         mm::init();
         mm::remap_test();
         log::init();
@@ -192,7 +197,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();
         BOOT_GLOBAL_INIT_DONE.store(true, Ordering::Release);
-        start_other_harts(hart_id, dtb_pa);
+        start_other_harts(hart_id, dtb_pa, active_hart_mask);
         list_apps();
         task::task_start();
     } else {
@@ -308,6 +313,7 @@ fn rust_main(hart_id: usize, efi_system_table_pa: usize) -> ! {
         // DTB 是 EFI configuration table 中的一项，先按标准 GUID 查找它。
         let dtb_pa = loongarch_dtb_from_efi(efi_system_table_pa).unwrap_or(0);
         mm::init_phys_mem_from_dtb(dtb_pa);
+        let active_hart_mask = mm::init_hart_topology_from_dtb(dtb_pa, hart_id);
         mm::init();
         arch::disable_direct_map_windows();
         log::init();
@@ -315,7 +321,7 @@ fn rust_main(hart_id: usize, efi_system_table_pa: usize) -> ! {
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();
         BOOT_GLOBAL_INIT_DONE.store(true, Ordering::Release);
-        start_other_harts(hart_id, 0);
+        start_other_harts(hart_id, 0, active_hart_mask);
         list_apps();
         task::task_start();
     } else {

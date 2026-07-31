@@ -760,10 +760,11 @@ pub(crate) fn open_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         )));
     }
 
-    if path == "/sys/devices/system/cpu/possible"
-        || path == "/sys/devices/system/cpu/present"
-        || path == "/sys/devices/system/cpu/online"
-    {
+    if path == "/sys/devices/system/cpu/possible" || path == "/sys/devices/system/cpu/present" {
+        let s = cpu_list_from_mask(crate::config::active_hart_mask());
+        return Some(Arc::new(pseudo::PseudoFile::new_static(&s)));
+    }
+    if path == "/sys/devices/system/cpu/online" {
         let s = cpu_list_from_mask(crate::task::manager::online_hart_mask());
         return Some(Arc::new(pseudo::PseudoFile::new_static(&s)));
     }

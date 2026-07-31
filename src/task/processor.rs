@@ -924,7 +924,9 @@ pub fn wakeup_should_preempt_target_hart(
 /// `NEED_RESCHED`，远端 hart 通过 IPI 尽快走到返回用户态前的调度点。
 pub fn request_reschedule_for_wakeup(woken: &Arc<TaskControlBlock>, target_hart: usize) {
     let local_hart = hart_id() % MAX_HARTS;
-    if target_hart >= MAX_HARTS {
+    if target_hart >= MAX_HARTS
+        || crate::task::manager::online_hart_mask() & (1usize << target_hart) == 0
+    {
         return;
     }
     if !wakeup_should_preempt_target_hart(woken, target_hart) {
@@ -943,6 +945,7 @@ pub fn request_reschedule_for_wakeup(woken: &Arc<TaskControlBlock>, target_hart:
 /// 逐个发 IPI 的开销。
 pub fn request_reschedule_harts(target_mask: usize) {
     let local_hart = hart_id() % MAX_HARTS;
+    let target_mask = target_mask & crate::task::manager::online_hart_mask();
     for target_hart in 0..MAX_HARTS {
         if (target_mask & (1usize << target_hart)) != 0 {
             NEED_RESCHED[target_hart].store(true, Ordering::Release);
