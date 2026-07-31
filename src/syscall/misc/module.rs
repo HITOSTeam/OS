@@ -5,7 +5,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::{
-    fs::{OSInode, ext4_lock},
+    fs::{OSInode, ext4_inode_lock},
     mm::try_copy_from_user,
     syscall::{
         error::{SyscallError, err},
@@ -167,7 +167,8 @@ fn read_fd_module_image(fd: isize) -> Result<Vec<u8>, isize> {
     };
     let inode = inode_file.ext4_inode();
     let (is_file, file_size) = {
-        let _guard = ext4_lock();
+        let inode_lock = ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         (inode.is_file(), inode.size() as usize)
     };
     if !is_file {
@@ -184,7 +185,8 @@ fn read_fd_module_image(fd: isize) -> Result<Vec<u8>, isize> {
     image.resize(file_size, 0);
     let mut read = 0usize;
     {
-        let _guard = ext4_lock();
+        let inode_lock = ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         while read < file_size {
             let got = inode.read_at(read, &mut image[read..]);
             if got == 0 {

@@ -4,79 +4,19 @@ use super::{File, POLLIN, POLLOUT};
 use crate::drivers::BLOCK_DEVICES;
 use crate::mm::UserBuffer;
 use crate::println;
+use crate::sync::{KernelMutex, KernelMutexGuard, KernelRwSemaphore};
 use crate::task::manager::PID2PCB;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use bitflags::*;
-use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use ext4_fs::{Ext4FileSystem, Inode};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use ext4_fs::{Ext4FileSystem, Ext4FileSystemHandle, Inode};
 use lazy_static::*;
 use spin::Mutex;
 
-/// Yield-aware spinlock for serializing ext4 filesystem operations.
-///
-/// Unlike a pure spinlock, this lock cooperatively yields the current task
-/// (via `suspend_current_and_run_next`) when contended and a task context
-/// is available. During early boot (before the task system is initialized),
-/// it falls back to a spin-loop hint. This avoids wasting CPU on busy-wait
-/// while still working correctly outside of a multitasking context.
-struct Ext4Lock {
-    held: AtomicBool,
-}
-
-impl Ext4Lock {
-    const fn new() -> Self {
-        Self {
-            held: AtomicBool::new(false),
-        }
-    }
-
-    fn lock(&self) {
-        loop {
-            // Attempt to acquire: CAS is more efficient than swap on
-            // weakly-ordered architectures (RISC-V, LoongArch) because it
-            // avoids writing when the lock is already held.
-            if self
-                .held
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
-            }
-            // Hint the CPU we are in a spin-wait before deciding to yield.
-            spin_loop();
-            if crate::task::processor::current_task().is_some() {
-                crate::task::processor::suspend_current_and_run_next();
-            }
-        }
-    }
-
-    fn unlock(&self) {
-        self.held.store(false, Ordering::Release);
-    }
-}
-
-pub(crate) struct Ext4Guard {
-    lock: Arc<Ext4Lock>,
-}
-
-impl Drop for Ext4Guard {
-    fn drop(&mut self) {
-        self.lock.unlock();
-    }
-}
-
-const EXT4_PATH_CACHE_MAX: usize = 512;
-
-struct Ext4PathCacheEntry {
-    uid: u32,
-    gid: u32,
-    follow_final: bool,
-    inode: Arc<Inode>,
-}
+const EXT4_INODE_LOCK_CACHE_MAX: usize = 4096;
 
 struct PendingWriteRegistration {
     device_id: usize,
@@ -87,13 +27,19 @@ struct PendingWriteRegistration {
 
 // Serialize ext4 operations across harts.
 lazy_static! {
-    static ref EXT4_LOCK: Arc<Ext4Lock> = Arc::new(Ext4Lock::new());
+    /// Linux `s_vfs_rename_mutex` analogue.  It is only taken for operations
+    /// that move names between two directories, before either parent lock.
+    static ref EXT4_TOPOLOGY_LOCK: KernelMutex<()> = KernelMutex::new(());
+    /// Stable Linux `i_rwsem` equivalents.  ext4-fs may construct more than
+    /// one Rust `Inode` object for the same on-disk inode (in particular for
+    /// hard links), so object addresses cannot identify the lock.
+    static ref EXT4_INODE_LOCKS:
+        Mutex<BTreeMap<(usize, u32), Weak<KernelRwSemaphore<()>>>> =
+        Mutex::new(BTreeMap::new());
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref DEFERRED_UNLINK_CLEANUP: Mutex<BTreeMap<(usize, u32), TmpfileCleanup>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> =
-        Mutex::new(BTreeMap::new());
-    static ref EXT4_PATH_CACHE: Mutex<BTreeMap<String, Vec<Ext4PathCacheEntry>>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_TEXT_ACCESS: Mutex<BTreeMap<(usize, u32), InodeTextAccess>> =
         Mutex::new(BTreeMap::new());
@@ -101,55 +47,79 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
 }
 
-pub(crate) fn ext4_lock() -> Ext4Guard {
-    let lock = Arc::clone(&EXT4_LOCK);
-    lock.lock();
-    Ext4Guard { lock }
+pub(crate) fn ext4_topology_lock() -> KernelMutexGuard<'static, ()> {
+    EXT4_TOPOLOGY_LOCK.lock()
 }
 
-pub(crate) fn clear_ext4_path_cache() {
-    let mut cache = EXT4_PATH_CACHE.lock();
-    if !cache.is_empty() {
-        cache.clear();
+pub(crate) type Ext4InodeLock = KernelRwSemaphore<()>;
+
+pub(crate) fn ext4_inode_key(inode: &Inode) -> (usize, u32) {
+    (inode.device_id(), inode.inode_num())
+}
+
+fn ext4_inode_lock_by_key(key: (usize, u32)) -> Arc<Ext4InodeLock> {
+    let mut locks = EXT4_INODE_LOCKS.lock();
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
     }
-}
-
-pub(crate) fn invalidate_ext4_path_cache(path: &str) {
-    let path = if path.len() > 1 {
-        path.trim_end_matches('/')
-    } else {
-        path
-    };
-    EXT4_PATH_CACHE.lock().remove(path);
-}
-
-pub(crate) fn invalidate_ext4_path_cache_subtree(path: &str) {
-    let path = if path.len() > 1 {
-        path.trim_end_matches('/')
-    } else {
-        path
-    };
-    let mut cache = EXT4_PATH_CACHE.lock();
-    if path == "/" {
-        cache.clear();
-        return;
+    if locks.len() >= EXT4_INODE_LOCK_CACHE_MAX {
+        locks.retain(|_, lock| lock.strong_count() != 0);
     }
-    cache.retain(|candidate, _| {
-        candidate != path
-            && !candidate
-                .strip_prefix(path)
-                .is_some_and(|rest| rest.starts_with('/'))
-    });
+    let lock = Arc::new(KernelRwSemaphore::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
-pub(crate) fn invalidate_ext4_path_cache_inode(inode: &Inode) {
-    let key = (inode.device_id(), inode.inode_num());
-    let mut cache = EXT4_PATH_CACHE.lock();
-    cache.retain(|_, entries| {
-        entries.retain(|entry| (entry.inode.device_id(), entry.inode.inode_num()) != key);
-        !entries.is_empty()
-    });
+/// Return the stable per-inode sleeping read/write semaphore.
+///
+/// Weak table entries allow closed and unlinked inodes to be reclaimed.  An
+/// active caller always owns a strong reference before acquiring the lock.
+pub(crate) fn ext4_inode_lock(inode: &Inode) -> Arc<Ext4InodeLock> {
+    ext4_inode_lock_by_key(ext4_inode_key(inode))
 }
+
+pub(crate) fn with_ext4_inode_read<R>(inode: &Inode, operation: impl FnOnce() -> R) -> R {
+    let lock = ext4_inode_lock(inode);
+    let _guard = lock.read();
+    operation()
+}
+
+pub(crate) fn with_ext4_inode_write<R>(inode: &Inode, operation: impl FnOnce() -> R) -> R {
+    let lock = ext4_inode_lock(inode);
+    let _guard = lock.write();
+    operation()
+}
+
+/// Acquire several inode write semaphores in stable filesystem/inode order.
+///
+/// This is the project's address-independent equivalent of Linux ordering
+/// non-directory `i_rwsem` locks by inode address.  Stable keys are required
+/// because ext4-fs can materialize multiple Rust objects for one inode.
+pub(crate) fn with_ext4_inode_write_set<R>(inodes: &[&Inode], operation: impl FnOnce() -> R) -> R {
+    let mut locks = inodes
+        .iter()
+        .map(|inode| (ext4_inode_key(inode), ext4_inode_lock(inode)))
+        .collect::<Vec<_>>();
+    locks.sort_unstable_by_key(|(key, _)| *key);
+    locks.dedup_by_key(|(key, _)| *key);
+    let _guards = locks
+        .iter()
+        .map(|(_, lock)| lock.write())
+        .collect::<Vec<_>>();
+    operation()
+}
+
+// Compatibility hooks kept until all legacy syscall callers use the VFS
+// dentry cache.  The old absolute-path cache is intentionally gone: returning
+// an inode without revalidating its parent dentry races rename/unlink, and
+// populating an unused global BTreeMap only reintroduces path-walk contention.
+pub(crate) fn clear_ext4_path_cache() {}
+
+pub(crate) fn invalidate_ext4_path_cache(_path: &str) {}
+
+pub(crate) fn invalidate_ext4_path_cache_subtree(_path: &str) {}
+
+pub(crate) fn invalidate_ext4_path_cache_inode(_inode: &Inode) {}
 
 #[derive(Clone, Copy, Default)]
 struct InodeTextAccess {
@@ -307,47 +277,13 @@ impl WriteOpenState {
     }
 }
 
-pub(crate) fn ext4_path_cache_lookup(
-    path: &str,
-    uid: u32,
-    gid: u32,
-    follow_final: bool,
-) -> Option<Arc<Inode>> {
-    EXT4_PATH_CACHE.lock().get(path).and_then(|entries| {
-        entries
-            .iter()
-            .find(|entry| {
-                entry.uid == uid && entry.gid == gid && entry.follow_final == follow_final
-            })
-            .map(|entry| Arc::clone(&entry.inode))
-    })
-}
-
 pub(crate) fn note_ext4_path_cache(
-    path: &str,
-    uid: u32,
-    gid: u32,
-    follow_final: bool,
-    inode: &Arc<Inode>,
+    _path: &str,
+    _uid: u32,
+    _gid: u32,
+    _follow_final: bool,
+    _inode: &Arc<Inode>,
 ) {
-    let mut cache = EXT4_PATH_CACHE.lock();
-    if !cache.contains_key(path) && cache.len() >= EXT4_PATH_CACHE_MAX {
-        cache.clear();
-    }
-    let entries = cache.entry(String::from(path)).or_default();
-    if let Some(entry) = entries
-        .iter_mut()
-        .find(|entry| entry.uid == uid && entry.gid == gid && entry.follow_final == follow_final)
-    {
-        entry.inode = Arc::clone(inode);
-        return;
-    }
-    entries.push(Ext4PathCacheEntry {
-        uid,
-        gid,
-        follow_final,
-        inode: Arc::clone(inode),
-    });
 }
 
 pub(crate) fn debug_track_iozone_inode(path: &str, inode_num: u32) {
@@ -443,6 +379,8 @@ fn find_inode_path_in_subtree(
     if depth == 0 {
         return None;
     }
+    let dir_lock = ext4_inode_lock(dir);
+    let _dir_guard = dir_lock.read();
     for (name, _ino, _ftype) in dir.dir_entries() {
         if name == "." || name == ".." {
             continue;
@@ -472,7 +410,6 @@ fn find_inode_path_in_subtree(
 pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
     let target_dev = target.device_id();
     let target_ino = target.inode_num();
-    let _guard = ext4_lock();
 
     for (index, root) in BLOCK_ROOTS.iter().enumerate() {
         let Some(root) = root.as_ref() else {
@@ -494,14 +431,12 @@ pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
 }
 
 pub(crate) fn path_resolves_to_inode(path: &str, target: &Arc<Inode>) -> bool {
-    let _guard = ext4_lock();
     let Some(found) = find_path_in_roots(path) else {
         return false;
     };
     found.device_id() == target.device_id() && found.inode_num() == target.inode_num()
 }
 
-/// Caller must already hold `ext4_lock()`.
 pub(crate) fn resolve_final_symlink_abs_path_locked(abs: &str) -> String {
     let mut current = String::from(abs);
     for _ in 0..40 {
@@ -515,9 +450,16 @@ pub(crate) fn resolve_final_symlink_abs_path_locked(abs: &str) -> String {
         let Some(parent_inode) = find_path_in_roots(parent_abs) else {
             break;
         };
-        let Some(child) = parent_inode.find(name) else {
-            break;
+        let child = {
+            let parent_lock = ext4_inode_lock(&parent_inode);
+            let _parent_guard = parent_lock.read();
+            let Some(child) = parent_inode.find(name) else {
+                break;
+            };
+            child
         };
+        let child_lock = ext4_inode_lock(&child);
+        let _child_guard = child_lock.read();
         if !child.is_symlink() {
             break;
         }
@@ -535,7 +477,6 @@ pub(crate) fn resolve_final_symlink_abs_path_locked(abs: &str) -> String {
 }
 
 pub(crate) fn resolve_final_symlink_abs_path(abs: &str) -> String {
-    let _guard = ext4_lock();
     resolve_final_symlink_abs_path_locked(abs)
 }
 
@@ -552,6 +493,7 @@ pub struct OSInode {
     open_fd_refs: AtomicUsize,
     inode_device_id: usize,
     inode_num: u32,
+    inode_lock: Arc<Ext4InodeLock>,
     readable: bool,
     writable: bool,
     regular_file_poll_ready: bool,
@@ -638,6 +580,8 @@ pub(crate) fn flush_inode_pending_writes_before_truncate(
             remove_stale_pending_write_entry(id);
             continue;
         };
+        let inode_lock = ext4_inode_lock_by_key((device_id, inode_num));
+        let _inode_guard = inode_lock.write();
         let mut inner = inner_arc.lock();
         if inner.write_buf_registry_id != id
             || inner.inode.device_id() != device_id
@@ -657,7 +601,7 @@ pub(crate) fn flush_inode_pending_writes_before_truncate(
         }
         inner.read_buf_valid = 0;
         if end <= new_len {
-            OSInode::flush_inner(&mut inner)?;
+            OSInode::flush_inner_locked(&mut inner)?;
             continue;
         }
 
@@ -666,10 +610,7 @@ pub(crate) fn flush_inode_pending_writes_before_truncate(
             continue;
         }
         let data = inner.write_buf[..keep_len].to_vec();
-        let result = {
-            let _fs_guard = ext4_lock();
-            inner.inode.write_at(start, &data)
-        };
+        let result = inner.inode.write_at(start, &data);
         match result {
             Ok(n) if n == data.len() => {}
             Ok(_) => return Err(ext4_fs::Ext4Error::NoSpace),
@@ -689,6 +630,8 @@ pub(crate) fn discard_inode_pending_writes_after_truncate(
             remove_stale_pending_write_entry(id);
             continue;
         };
+        let inode_lock = ext4_inode_lock_by_key((device_id, inode_num));
+        let _inode_guard = inode_lock.write();
         let mut inner = inner_arc.lock();
         if inner.write_buf_registry_id != id
             || inner.inode.device_id() != device_id
@@ -770,6 +713,7 @@ impl OSInode {
         let regular_file_poll_ready = inode.is_file();
         let inode_device_id = inode.device_id();
         let inode_num = inode.inode_num();
+        let inode_lock = ext4_inode_lock(&inode);
         let write_open = WriteOpenState::register_for_inode(writable, &inode)?;
         let inner = Arc::new_cyclic(|inner_weak| {
             Mutex::new(OSInodeInner {
@@ -791,6 +735,7 @@ impl OSInode {
             open_fd_refs: AtomicUsize::new(0),
             inode_device_id,
             inode_num,
+            inode_lock,
             readable,
             writable,
             regular_file_poll_ready,
@@ -850,9 +795,18 @@ impl OSInode {
 
     /// Read all data inside an inode into vector
     pub fn read_all(&self) -> Vec<u8> {
+        if self.writable {
+            let _inode_guard = self.inode_lock.write();
+            return self.read_all_locked();
+        }
+        let _inode_guard = self.inode_lock.read();
+        self.read_all_locked()
+    }
+
+    fn read_all_locked(&self) -> Vec<u8> {
         let mut inner = self.inner.lock();
         if self.writable {
-            let _ = Self::flush_inner(&mut inner);
+            let _ = Self::flush_inner_locked(&mut inner);
         }
         let file_size = inner.inode.size() as usize;
 
@@ -861,10 +815,7 @@ impl OSInode {
         let mut total_read = 0usize;
 
         loop {
-            let len = {
-                let _fs_guard = ext4_lock();
-                inner.inode.read_at(inner.offset, &mut buffer)
-            };
+            let len = inner.inode.read_at(inner.offset, &mut buffer);
             if len == 0 {
                 break;
             }
@@ -921,9 +872,18 @@ impl OSInode {
 
     /// Read from this inode at the given offset without updating the file offset.
     pub fn pread_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        if self.writable {
+            let _inode_guard = self.inode_lock.write();
+            return self.pread_at_locked(offset, buf);
+        }
+        let _inode_guard = self.inode_lock.read();
+        self.pread_at_locked(offset, buf)
+    }
+
+    fn pread_at_locked(&self, offset: usize, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
         if self.writable {
-            let _ = Self::flush_inner(&mut inner);
+            let _ = Self::flush_inner_locked(&mut inner);
         }
         let inode_num = inner.inode.inode_num();
 
@@ -945,10 +905,7 @@ impl OSInode {
                 inner.read_buf_off = pos;
                 let inode = inner.inode.clone();
                 let off = pos;
-                let n = {
-                    let _fs_guard = ext4_lock();
-                    inode.read_at(off, &mut inner.read_buf[..refill_len])
-                };
+                let n = inode.read_at(off, &mut inner.read_buf[..refill_len]);
                 inner.read_buf_valid = n;
                 if debug_iozone_tracked(inode_num) {
                     let size = inode.size() as usize;
@@ -977,9 +934,19 @@ impl OSInode {
 
     /// Write to this inode at the given offset without updating the file offset.
     pub fn pwrite_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ()> {
+        let _inode_guard = self.inode_lock.write();
         let mut inner = self.inner.lock();
+        let offset = if self.append {
+            let disk_end = inner.inode.size() as usize;
+            let pending_end =
+                pending_inode_write_end(inner.inode.device_id(), inner.inode.inode_num())
+                    .unwrap_or(0);
+            core::cmp::max(disk_end, pending_end)
+        } else {
+            offset
+        };
         if self.replace_on_write && offset == 0 && inner.write_buf.is_empty() {
-            self.clear_inode_for_replace_write(&mut inner, offset)?;
+            self.clear_inode_for_replace_write_locked(&mut inner, offset)?;
         }
         // Writes via pwrite/pwritev must invalidate the buffered read cache.
         inner.read_buf_valid = 0;
@@ -988,15 +955,12 @@ impl OSInode {
 
         if buf.len() >= WRITEBUF_MAX {
             if !inner.write_buf.is_empty() {
-                if Self::flush_inner(&mut inner).is_err() {
+                if Self::flush_inner_locked(&mut inner).is_err() {
                     return Err(());
                 }
                 inner.read_buf_valid = 0;
             }
-            let result = {
-                let _fs_guard = ext4_lock();
-                Self::write_at_zeroing_gap(&inner.inode, offset, buf)
-            };
+            let result = Self::write_at_zeroing_gap(&inner.inode, offset, buf);
             if debug_iozone_tracked(inode_num) {
                 let size_after = inner.inode.size() as usize;
                 match result {
@@ -1029,7 +993,7 @@ impl OSInode {
         if !inner.write_buf.is_empty()
             && offset != inner.write_buf_off.saturating_add(inner.write_buf.len())
         {
-            if Self::flush_inner(&mut inner).is_err() {
+            if Self::flush_inner_locked(&mut inner).is_err() {
                 return Err(());
             }
             inner.read_buf_valid = 0;
@@ -1044,7 +1008,7 @@ impl OSInode {
             Self::mark_write_buf_dirty(&mut inner);
         }
         if inner.write_buf.len() >= WRITEBUF_MAX {
-            if Self::flush_inner(&mut inner).is_err() {
+            if Self::flush_inner_locked(&mut inner).is_err() {
                 return Err(());
             }
             return Ok(buf.len());
@@ -1053,8 +1017,8 @@ impl OSInode {
         Ok(buf.len())
     }
 
-    /// Flush buffered writes to disk. Caller must already hold `self.inner`.
-    fn flush_inner(inner: &mut OSInodeInner) -> Result<(), ext4_fs::Ext4Error> {
+    /// Flush with the inode's write semaphore already held.
+    fn flush_inner_locked(inner: &mut OSInodeInner) -> Result<(), ext4_fs::Ext4Error> {
         if inner.write_buf.is_empty() {
             return Ok(());
         }
@@ -1062,10 +1026,7 @@ impl OSInode {
         let data = core::mem::take(&mut inner.write_buf);
         let inode_num = inner.inode.inode_num();
         let size_before = inner.inode.size() as usize;
-        let result = {
-            let _fs_guard = ext4_lock();
-            Self::write_at_zeroing_gap(&inner.inode, off, &data)
-        };
+        let result = Self::write_at_zeroing_gap(&inner.inode, off, &data);
         if debug_iozone_tracked(inode_num) {
             let size_after = inner.inode.size() as usize;
             match result {
@@ -1143,8 +1104,9 @@ impl OSInode {
     }
 
     pub fn flush_with_error(&self) -> Result<(), ext4_fs::Ext4Error> {
+        let _inode_guard = self.inode_lock.write();
         let mut inner = self.inner.lock();
-        Self::flush_inner(&mut inner)
+        Self::flush_inner_locked(&mut inner)
     }
 
     pub fn flush(&self) -> Result<(), ()> {
@@ -1157,25 +1119,28 @@ impl OSInode {
 
     pub fn visible_end(&self) -> usize {
         let inode = self.ext4_inode();
-        let disk_end = {
-            let _fs_guard = ext4_lock();
-            inode.size() as usize
-        };
+        let _inode_guard = self.inode_lock.read();
+        let disk_end = inode.size() as usize;
         pending_inode_write_end(inode.device_id(), inode.inode_num())
             .map(|pending_end| core::cmp::max(disk_end, pending_end))
             .unwrap_or(disk_end)
     }
 
     pub fn set_offset(&self, offset: usize) {
-        let mut inner = self.inner.lock();
-        if self.writable {
-            let _ = Self::flush_inner(&mut inner);
+        if !self.writable {
+            let mut inner = self.inner.lock();
+            inner.offset = offset;
+            inner.read_buf_valid = 0;
+            return;
         }
+        let _inode_guard = self.inode_lock.write();
+        let mut inner = self.inner.lock();
+        let _ = Self::flush_inner_locked(&mut inner);
         inner.offset = offset;
         inner.read_buf_valid = 0;
     }
 
-    fn clear_inode_for_replace_write(
+    fn clear_inode_for_replace_write_locked(
         &self,
         inner: &mut OSInodeInner,
         write_offset: usize,
@@ -1183,10 +1148,7 @@ impl OSInode {
         if !self.replace_on_write || !inner.write_buf.is_empty() || write_offset != 0 {
             return Ok(());
         }
-        let result = {
-            let _fs_guard = ext4_lock();
-            inner.inode.clear()
-        };
+        let result = inner.inode.clear();
         match result {
             Ok(_) => {
                 inner.read_buf_valid = 0;
@@ -1263,7 +1225,11 @@ fn sweep_deferred_unlinks() {
         // Only proceed if we can definitively confirm no refs remain.
         if !has_open_inode_fd_refs(key.0, key.1) {
             if let Some(cleanup) = DEFERRED_UNLINK_CLEANUP.lock().remove(&key) {
-                let _fs_guard = ext4_lock();
+                let parent_lock = ext4_inode_lock(&cleanup.parent);
+                let _parent_guard = parent_lock.write();
+                let child = cleanup.parent.find(&cleanup.name);
+                let child_lock = child.as_ref().map(|child| ext4_inode_lock(child));
+                let _child_guard = child_lock.as_ref().map(|lock| lock.write());
                 if cleanup.parent.unlink(&cleanup.name).is_ok() {
                     clear_ext4_path_cache();
                 }
@@ -1276,7 +1242,7 @@ lazy_static! {
     /// One optional ext4 instance per registered block device.  Keeping the
     /// vector aligned with `/dev/vdX` preserves stable device identities even
     /// when a future non-ext4 disk is present.
-    static ref BLOCK_FILESYSTEMS: Vec<Option<Arc<spin::Mutex<Ext4FileSystem>>>> = BLOCK_DEVICES
+    static ref BLOCK_FILESYSTEMS: Vec<Option<Arc<Ext4FileSystemHandle>>> = BLOCK_DEVICES
         .iter()
         .map(|device| Ext4FileSystem::try_open(device.clone()).ok())
         .collect();
@@ -1290,7 +1256,7 @@ lazy_static! {
         .collect();
 
     /// ext4 filesystem handle (primary root device).
-    pub static ref EXT4_FS: Arc<spin::Mutex<Ext4FileSystem>> = BLOCK_FILESYSTEMS
+    pub static ref EXT4_FS: Arc<Ext4FileSystemHandle> = BLOCK_FILESYSTEMS
         .first()
         .and_then(|fs| fs.as_ref())
         .cloned()
@@ -1335,7 +1301,8 @@ pub(crate) fn root_inode_for_device(device_id: usize) -> Option<Arc<Inode>> {
 }
 
 pub(crate) fn ensure_root_mount_directory(name: &str) {
-    let _guard = ext4_lock();
+    let root_lock = ext4_inode_lock(&ROOT_INODE);
+    let _root_guard = root_lock.write();
     if ROOT_INODE.find(name).is_some() {
         return;
     }
@@ -1388,22 +1355,39 @@ fn block_root(index: usize) -> Option<Arc<Inode>> {
 /// `/.block_devices/vdX` prefix.  Missing files never fall through to another
 /// disk, matching Linux mount semantics.
 ///
-/// Caller should hold `ext4_lock()` if concurrent ext4 access is possible.
+fn find_path_from_inode(start: Arc<Inode>, path: &str) -> Option<Arc<Inode>> {
+    let mut current = start;
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        if component == "." {
+            continue;
+        }
+        let next = {
+            let current_lock = ext4_inode_lock(&current);
+            let _current_guard = current_lock.read();
+            current.find(component)?
+        };
+        current = next;
+    }
+    Some(current)
+}
+
+/// Each component lookup takes the directory's shared `i_rwsem` equivalent.
 pub(crate) fn find_path_in_roots(path: &str) -> Option<Arc<Inode>> {
     if let Some((index, suffix)) = device_path_parts(path) {
         let root = block_root(index)?;
         if suffix.is_empty() {
             return Some(root);
         }
-        return root.find_path(suffix);
+        return find_path_from_inode(root, suffix);
     }
-    ROOT_INODE.find_path(path)
+    find_path_from_inode(Arc::clone(&ROOT_INODE), path)
 }
 
 /// List all files in the filesystem
 #[allow(dead_code)]
 pub fn list_apps() {
-    let _fs_guard = ext4_lock();
+    let user_lock = ext4_inode_lock(&USER_INODE);
+    let _user_guard = user_lock.read();
     println!("/**** APPS ****");
     println!("[ext4] list_apps start");
     let mut count = 0usize;
@@ -1449,7 +1433,6 @@ impl OpenFlags {
 /// Files are located in /user directory
 pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let (readable, writable) = flags.read_write();
-    let _fs_guard = ext4_lock();
 
     let raw = name.trim_matches('\0');
     if raw.is_empty() {
@@ -1467,13 +1450,13 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     let mut inode = if is_abs {
         find_path_in_roots(raw)
     } else {
-        base_dir.find_path(raw)
+        find_path_from_inode(Arc::clone(&base_dir), raw)
     };
 
     // Keep compatibility: exec("foo") can omit ".bin".
     if inode.is_none() && !raw.contains('/') && !raw.ends_with(".bin") {
         let name_with_bin = alloc::format!("{}.bin", raw);
-        inode = base_dir.find_path(&name_with_bin);
+        inode = find_path_from_inode(Arc::clone(&base_dir), &name_with_bin);
     }
 
     // CREATE: create the file if it does not exist.
@@ -1485,8 +1468,10 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             let parent_abs = alloc::format!("/{}", parent_path);
             find_path_in_roots(&parent_abs)?
         } else {
-            base_dir.find_path(parent_path)?
+            find_path_from_inode(Arc::clone(&base_dir), parent_path)?
         };
+        let parent_lock = ext4_inode_lock(&parent);
+        let _parent_guard = parent_lock.write();
         inode = parent.create_file(file_name).ok();
         if inode.is_some() {
             clear_ext4_path_cache();
@@ -1497,6 +1482,8 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
 
     // TRUNC: clear file contents.
     if flags.contains(OpenFlags::TRUNC) {
+        let inode_lock = ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.write();
         let _ = inode.clear();
     }
 
@@ -1564,84 +1551,90 @@ impl File for OSInode {
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
-        let mut inner = self.inner.lock();
-        if self.writable {
-            let _ = Self::flush_inner(&mut inner);
-        }
-        let mut total_read_size = 0usize;
-
-        if inner.read_buf.len() < READBUF_MAX {
-            inner.read_buf.resize(READBUF_MAX, 0);
-            inner.read_buf_off = 0;
-            inner.read_buf_valid = 0;
-        }
-
-        for slice in buf.buffers.iter_mut() {
-            let mut out: &mut [u8] = *slice;
-            while !out.is_empty() {
-                let need_refill = inner.read_buf_valid == 0
-                    || inner.offset < inner.read_buf_off
-                    || inner.offset >= inner.read_buf_off + inner.read_buf_valid;
-
-                if need_refill {
-                    let sequential = inner.read_buf_valid > 0
-                        && inner.offset == inner.read_buf_off.saturating_add(inner.read_buf_valid);
-                    let refill_len = if sequential {
-                        READBUF_MAX
-                    } else {
-                        core::cmp::min(READBUF_MAX, core::cmp::max(out.len(), READBUF_MIN))
-                    };
-                    inner.read_buf_off = inner.offset;
-                    let inode = inner.inode.clone();
-                    let off = inner.read_buf_off;
-                    let n = {
-                        let _fs_guard = ext4_lock();
-                        inode.read_at(off, &mut inner.read_buf[..refill_len])
-                    };
-                    inner.read_buf_valid = n;
-                    let inode_num = inode.inode_num();
-                    if debug_iozone_tracked(inode_num) {
-                        let size = inode.size() as usize;
-                        println!(
-                            "[iozone-debug] read inode={} off={} len={} size={}",
-                            inode_num, off, n, size
-                        );
-                    }
-                    if n == 0 {
-                        return total_read_size;
-                    }
-                }
-
-                let buf_off = inner.offset - inner.read_buf_off;
-                let avail = inner.read_buf_valid.saturating_sub(buf_off);
-                if avail == 0 {
-                    continue;
-                }
-
-                let n = core::cmp::min(avail, out.len());
-                out[..n].copy_from_slice(&inner.read_buf[buf_off..buf_off + n]);
-                inner.offset += n;
-                total_read_size += n;
-                out = &mut out[n..];
+        let mut read_locked = || {
+            let mut inner = self.inner.lock();
+            if self.writable {
+                let _ = Self::flush_inner_locked(&mut inner);
             }
+            let mut total_read_size = 0usize;
+
+            if inner.read_buf.len() < READBUF_MAX {
+                inner.read_buf.resize(READBUF_MAX, 0);
+                inner.read_buf_off = 0;
+                inner.read_buf_valid = 0;
+            }
+
+            for slice in buf.buffers.iter_mut() {
+                let mut out: &mut [u8] = *slice;
+                while !out.is_empty() {
+                    let need_refill = inner.read_buf_valid == 0
+                        || inner.offset < inner.read_buf_off
+                        || inner.offset >= inner.read_buf_off + inner.read_buf_valid;
+
+                    if need_refill {
+                        let sequential = inner.read_buf_valid > 0
+                            && inner.offset
+                                == inner.read_buf_off.saturating_add(inner.read_buf_valid);
+                        let refill_len = if sequential {
+                            READBUF_MAX
+                        } else {
+                            core::cmp::min(READBUF_MAX, core::cmp::max(out.len(), READBUF_MIN))
+                        };
+                        inner.read_buf_off = inner.offset;
+                        let inode = inner.inode.clone();
+                        let off = inner.read_buf_off;
+                        let n = inode.read_at(off, &mut inner.read_buf[..refill_len]);
+                        inner.read_buf_valid = n;
+                        let inode_num = inode.inode_num();
+                        if debug_iozone_tracked(inode_num) {
+                            let size = inode.size() as usize;
+                            println!(
+                                "[iozone-debug] read inode={} off={} len={} size={}",
+                                inode_num, off, n, size
+                            );
+                        }
+                        if n == 0 {
+                            return total_read_size;
+                        }
+                    }
+
+                    let buf_off = inner.offset - inner.read_buf_off;
+                    let avail = inner.read_buf_valid.saturating_sub(buf_off);
+                    if avail == 0 {
+                        continue;
+                    }
+
+                    let n = core::cmp::min(avail, out.len());
+                    out[..n].copy_from_slice(&inner.read_buf[buf_off..buf_off + n]);
+                    inner.offset += n;
+                    total_read_size += n;
+                    out = &mut out[n..];
+                }
+            }
+            total_read_size
+        };
+
+        if self.writable {
+            let _inode_guard = self.inode_lock.write();
+            read_locked()
+        } else {
+            let _inode_guard = self.inode_lock.read();
+            read_locked()
         }
-        total_read_size
     }
 
     fn write(&self, _buf: UserBuffer) -> usize {
+        let _inode_guard = self.inode_lock.write();
         let mut inner = self.inner.lock();
         if self.append {
             if !inner.write_buf.is_empty() {
-                if Self::flush_inner(&mut inner).is_err() {
+                if Self::flush_inner_locked(&mut inner).is_err() {
                     println!("[ext4] Warning: write failed");
                     return 0;
                 }
                 inner.read_buf_valid = 0;
             }
-            let disk_end = {
-                let _fs_guard = ext4_lock();
-                inner.inode.size() as usize
-            };
+            let disk_end = inner.inode.size() as usize;
             let pending_end =
                 pending_inode_write_end(inner.inode.device_id(), inner.inode.inode_num())
                     .unwrap_or(0);
@@ -1651,7 +1644,7 @@ impl File for OSInode {
 
         let current_offset = inner.offset;
         if self
-            .clear_inode_for_replace_write(&mut inner, current_offset)
+            .clear_inode_for_replace_write_locked(&mut inner, current_offset)
             .is_err()
         {
             return 0;
@@ -1662,7 +1655,7 @@ impl File for OSInode {
             if !inner.write_buf.is_empty()
                 && inner.offset != inner.write_buf_off.saturating_add(inner.write_buf.len())
             {
-                if Self::flush_inner(&mut inner).is_err() {
+                if Self::flush_inner_locked(&mut inner).is_err() {
                     println!("[ext4] Warning: write failed");
                     break;
                 }
@@ -1682,7 +1675,7 @@ impl File for OSInode {
             inner.read_buf_valid = 0;
 
             if inner.write_buf.len() >= WRITEBUF_MAX {
-                if Self::flush_inner(&mut inner).is_err() {
+                if Self::flush_inner_locked(&mut inner).is_err() {
                     println!("[ext4] Warning: write failed");
                     break;
                 }
@@ -1699,18 +1692,18 @@ impl File for OSInode {
 
 impl Drop for OSInode {
     fn drop(&mut self) {
-        let mut inner = self.inner.lock();
-        let inode_key = (inner.inode.device_id(), inner.inode.inode_num());
-        if !inner.write_buf.is_empty() {
-            let off = inner.write_buf_off;
-            let data = core::mem::take(&mut inner.write_buf);
-            let _ = {
-                let _fs_guard = ext4_lock();
-                Self::write_at_zeroing_gap(&inner.inode, off, &data)
-            };
-            Self::mark_write_buf_clean(&mut inner);
-        }
-        drop(inner);
+        let inode_key = {
+            let _inode_guard = self.inode_lock.write();
+            let mut inner = self.inner.lock();
+            let inode_key = (inner.inode.device_id(), inner.inode.inode_num());
+            if !inner.write_buf.is_empty() {
+                let off = inner.write_buf_off;
+                let data = core::mem::take(&mut inner.write_buf);
+                let _ = Self::write_at_zeroing_gap(&inner.inode, off, &data);
+                Self::mark_write_buf_clean(&mut inner);
+            }
+            inode_key
+        };
         crate::syscall::filesystem::release_flock_owner_for_inode(
             inode_key.0,
             inode_key.1,
@@ -1718,7 +1711,11 @@ impl Drop for OSInode {
         );
         if let Some(cleanup) = self.tmpfile_cleanup.take() {
             if {
-                let _fs_guard = ext4_lock();
+                let parent_lock = ext4_inode_lock(&cleanup.parent);
+                let _parent_guard = parent_lock.write();
+                let child = cleanup.parent.find(&cleanup.name);
+                let child_lock = child.as_ref().map(|child| ext4_inode_lock(child));
+                let _child_guard = child_lock.as_ref().map(|lock| lock.write());
                 cleanup.parent.unlink(&cleanup.name)
             }
             .is_ok()
@@ -1732,7 +1729,11 @@ impl Drop for OSInode {
                 DEFERRED_UNLINK_CLEANUP.lock().insert(inode_key, cleanup);
             } else {
                 if {
-                    let _fs_guard = ext4_lock();
+                    let parent_lock = ext4_inode_lock(&cleanup.parent);
+                    let _parent_guard = parent_lock.write();
+                    let child = cleanup.parent.find(&cleanup.name);
+                    let child_lock = child.as_ref().map(|child| ext4_inode_lock(child));
+                    let _child_guard = child_lock.as_ref().map(|lock| lock.write());
                     cleanup.parent.unlink(&cleanup.name)
                 }
                 .is_ok()

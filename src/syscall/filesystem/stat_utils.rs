@@ -2,10 +2,10 @@ use super::{
     AT_FDCWD, AtPath, CgroupFile, FS_APPEND_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, File, NamespaceFile,
     OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile,
     PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile, SyscallError, TtyFile, current_fsuid_gid,
-    err, ext4_lock, get_current_token, get_fd_file, get_inode_times, inode_fs_flags,
+    err, get_current_token, get_fd_file, get_inode_times, inode_fs_flags,
     inode_visible_size_with_disk_size, linux_dev_major, linux_dev_minor, open_pseudo,
     resolve_at_inode, resolve_at_path, translated_mutref, try_read_user_value,
-    try_write_user_value,
+    try_write_user_value, with_ext4_inode_read,
 };
 use crate::fs::{TunTapFile, dev_pts_exists, dev_pts_index_from_path};
 
@@ -519,10 +519,7 @@ pub(crate) fn kstat_from_file(
     };
     let inode = os_inode.ext4_inode();
 
-    let meta = {
-        let _ext4_guard = ext4_lock();
-        inode.stat_snapshot()
-    };
+    let meta = with_ext4_inode_read(&inode, || inode.stat_snapshot());
     let disk_size = meta.size as usize;
     let visible_size = inode_visible_size_with_disk_size(&inode, disk_size);
     Ok(kstat_from_ext4_snapshot(meta, visible_size))
@@ -575,12 +572,8 @@ pub(crate) fn kstat_from_abs_path(abs: &str) -> Result<KStat, isize> {
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let (inode, meta) = {
-        let _ext4_guard = ext4_lock();
-        let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
-        let meta = inode.stat_snapshot();
-        (inode, meta)
-    };
+    let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+    let meta = with_ext4_inode_read(&inode, || inode.stat_snapshot());
     let disk_size = meta.size as usize;
     let visible_size = inode_visible_size_with_disk_size(&inode, disk_size);
     Ok(kstat_from_ext4_snapshot(meta, visible_size))

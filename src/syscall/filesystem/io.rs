@@ -3,7 +3,7 @@ use super::{
     OSInode, PIPE_BUF, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
     SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK, SocketPairEnd,
     SyscallError, TimerFdFile, UserBuffer, Vec, cgroup_charge_file_write, current_process, err,
-    ext4_err_to_errno, ext4_lock, fanotify_notify_access, fanotify_notify_modify,
+    ext4_err_to_errno, fanotify_notify_access, fanotify_notify_modify,
     fanotify_permission_access, fanotify_read_result, fanotify_write_result, fd_has_append,
     fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe, file_is_seekable_for_preadwrite,
     get_current_token, get_fd_file_and_flags, inode_visible_size_with_disk_size,
@@ -12,7 +12,8 @@ use super::{
     queue_process_signal, read_optional_offset, read_vm_iovec, require_fd_file,
     socketpair_write_from_kernel, touch_inode_mtime_ctime_now, try_copy_from_user,
     try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_proc_pseudo_file,
-    try_write_user_value, validate_direct_io_request, write_optional_offset,
+    try_write_user_value, validate_direct_io_request, with_ext4_inode_read,
+    write_optional_offset,
 };
 use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, TunTapFile};
 use alloc::vec;
@@ -107,10 +108,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         .filter(|os_inode| !os_inode.fanotify_silent())
     {
         let inode = os_inode.ext4_inode();
-        let is_dir = {
-            let _ext4_guard = ext4_lock();
-            inode.is_dir()
-        };
+        let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
         if is_dir {
             return err(SyscallError::EISDIR);
         }
@@ -185,10 +183,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     {
         let inode = os_inode.ext4_inode();
         let fanotify_path = os_inode.fanotify_path();
-        let is_dir = {
-            let _ext4_guard = ext4_lock();
-            inode.is_dir()
-        };
+        let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
         if let Err(e) = fanotify_permission_access(&inode, is_dir, fanotify_path.as_deref()) {
             return e;
         }
@@ -213,10 +208,7 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             maybe_update_inode_atime(&inode, false);
             if read_len > 0 {
                 let fanotify_path = os_inode.fanotify_path();
-                let is_dir = {
-                    let _ext4_guard = ext4_lock();
-                    inode.is_dir()
-                };
+                let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
                 fanotify_notify_access(&inode, is_dir, fanotify_path.as_deref());
             }
         }
@@ -536,10 +528,7 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             }
             let inode = os_inode.ext4_inode();
             let fanotify_path = os_inode.fanotify_path();
-            let is_dir = {
-                let _ext4_guard = ext4_lock();
-                inode.is_dir()
-            };
+            let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
             fanotify_notify_modify(&inode, is_dir, fanotify_path.as_deref());
         }
     }
@@ -575,10 +564,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     // ext4 regular files
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
-        let is_dir = {
-            let _ext4_guard = ext4_lock();
-            inode.is_dir()
-        };
+        let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
         if is_dir {
             return err(SyscallError::EISDIR);
         }
@@ -702,19 +688,13 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     // ext4 regular files
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
-        let is_dir = {
-            let _ext4_guard = ext4_lock();
-            inode.is_dir()
-        };
+        let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
         if is_dir {
             return err(SyscallError::EISDIR);
         }
 
         let effective_pos = if os_inode.append() {
-            let disk_end = {
-                let _ext4_guard = ext4_lock();
-                inode.size() as usize
-            };
+            let disk_end = with_ext4_inode_read(&inode, || inode.size() as usize);
             inode_visible_size_with_disk_size(&inode, disk_end)
         } else {
             pos as usize
@@ -1128,8 +1108,7 @@ pub fn syscall_splice(
             };
             let is_file = {
                 let inode = in_inode.ext4_inode();
-                let _ext4_guard = ext4_lock();
-                inode.is_file()
+                with_ext4_inode_read(&inode, || inode.is_file())
             };
             if !is_file {
                 return if moved > 0 {
@@ -1156,8 +1135,7 @@ pub fn syscall_splice(
         } else if let Some(out_inode) = out_file.as_any().downcast_ref::<OSInode>() {
             let is_file = {
                 let inode = out_inode.ext4_inode();
-                let _ext4_guard = ext4_lock();
-                inode.is_file()
+                with_ext4_inode_read(&inode, || inode.is_file())
             };
             if !is_file {
                 return if moved > 0 {
@@ -1576,10 +1554,9 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
 
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
-        let (is_dir, is_fifo, disk_end) = {
-            let _ext4_guard = ext4_lock();
+        let (is_dir, is_fifo, disk_end) = with_ext4_inode_read(&inode, || {
             (inode.is_dir(), inode.is_fifo(), inode.size() as usize)
-        };
+        });
         let end = inode_visible_size_with_disk_size(&inode, disk_end) as isize;
         if is_fifo {
             return err(SyscallError::ESPIPE);

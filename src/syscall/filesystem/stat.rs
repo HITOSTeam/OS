@@ -4,7 +4,7 @@ use super::{
     FS_APPEND_FL, FS_IMMUTABLE_FL, FifoDuplexFile, File, KStat, NetSocketFile, OSInode, PID2PCB,
     Pipe, ProcPseudoFile, ProcessControlBlock, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
     RtcFile, Statx, String, SyscallError, TimeSpec, Vec, current_effective_uid_gid,
-    current_fsuid_gid, current_process, current_timespec, err, ext4_lock, fd_has_o_path,
+    current_fsuid_gid, current_process, current_timespec, err, fd_has_o_path,
     file_lock_key_from_inode, fill_statfs, fill_statfs_for_backend, find_path_in_roots,
     flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file, get_fd_mount_ref,
     get_inode_times, inode_fs_flags, inode_mode_allows_uid_gid, inode_visible_size_with_disk_size,
@@ -15,7 +15,8 @@ use super::{
     resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, statfs_mount_backend_for_abs,
     statfs_mount_flags_for_abs, statx_from_kstat, sync_all, touch_inode_mtime_ctime_now,
     truncate_regular_inode, try_copy_to_user, try_read_user_value, try_write_user_value,
-    update_current_inode_mmaps_size, update_current_os_inode_mmaps_size, write_zeros_range,
+    update_current_inode_mmaps_size, update_current_os_inode_mmaps_size, with_ext4_inode_read,
+    with_ext4_inode_write, write_zeros_range,
 };
 use crate::fs::TunTapFile;
 
@@ -93,14 +94,17 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
         return err(SyscallError::EROFS);
     }
     let inode = os_inode.ext4_inode();
-    {
-        let _ext4_guard = ext4_lock();
+    let inode_type_error = with_ext4_inode_read(&inode, || {
         if inode.is_dir() {
-            return err(SyscallError::EISDIR);
+            return Some(err(SyscallError::EISDIR));
         }
         if !inode.is_file() {
-            return err(SyscallError::EINVAL);
+            return Some(err(SyscallError::EINVAL));
         }
+        None
+    });
+    if let Some(error) = inode_type_error {
+        return error;
     }
     maybe_signal_lease_break(
         file_lock_key_from_inode(&inode),
@@ -114,10 +118,7 @@ pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> i
     let ret = if (mode & FALLOC_FL_PUNCH_HOLE) != 0 {
         punch_hole_keep_size(&inode, offset, len)
     } else {
-        let old_size = {
-            let _ext4_guard = ext4_lock();
-            inode.size() as usize
-        };
+        let old_size = with_ext4_inode_read(&inode, || inode.size() as usize);
         let alloc_end = if (mode & FALLOC_FL_KEEP_SIZE) != 0 {
             core::cmp::min(end, old_size)
         } else {
@@ -216,30 +217,29 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if trailing_slash && !inode.is_dir() {
-        return err(SyscallError::ENOTDIR);
-    }
-    if !inode.is_file() {
-        if inode.is_dir() {
-            return err(SyscallError::EISDIR);
+    let inode_lock_key = match with_ext4_inode_read(&inode, || {
+        if trailing_slash && !inode.is_dir() {
+            return Err(err(SyscallError::ENOTDIR));
         }
-        return err(SyscallError::EINVAL);
-    }
-    if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
-        return err(SyscallError::EACCES);
-    }
-    maybe_signal_lease_break(
-        file_lock_key_from_inode(&inode),
-        true,
-        true,
-        current_process().getpid(),
-    );
-    drop(_ext4_guard);
+        if !inode.is_file() {
+            if inode.is_dir() {
+                return Err(err(SyscallError::EISDIR));
+            }
+            return Err(err(SyscallError::EINVAL));
+        }
+        if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+            return Err(err(SyscallError::EACCES));
+        }
+        Ok(file_lock_key_from_inode(&inode))
+    }) {
+        Ok(key) => key,
+        Err(error) => return error,
+    };
+    maybe_signal_lease_break(inode_lock_key, true, true, current_process().getpid());
     flush_open_inode_views(&inode);
     let ret = truncate_regular_inode(&inode, length);
     if ret == 0 {
@@ -261,7 +261,6 @@ pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
             super::mount_flags_to_statfs(mount.flags),
         );
     }
-    let _ext4_guard = ext4_lock();
     fill_statfs(st_ptr, 0)
 }
 
@@ -293,7 +292,6 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
         }
         AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
             let (fsuid, fsgid) = current_fsuid_gid();
-            let _ext4_guard = ext4_lock();
             if let Err(e) = resolve_at_inode(&at, fsuid, fsgid, true) {
                 return e;
             }
@@ -432,10 +430,12 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
             }
             let (fsuid, fsgid) = current_fsuid_gid();
             let (euid, _egid) = current_effective_uid_gid();
-            if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
-                return e;
-            }
-            return apply_utimens_to_inode(&inode, spec);
+            return with_ext4_inode_write(&inode, || {
+                if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
+                    return e;
+                }
+                apply_utimens_to_inode(&inode, spec)
+            });
         }
         return 0;
     }
@@ -472,10 +472,12 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
             }
             let (fsuid, fsgid) = current_fsuid_gid();
             let (euid, _egid) = current_effective_uid_gid();
-            if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
-                return e;
-            }
-            return apply_utimens_to_inode(&inode, spec);
+            return with_ext4_inode_write(&inode, || {
+                if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
+                    return e;
+                }
+                apply_utimens_to_inode(&inode, spec)
+            });
         }
         return 0;
     }
@@ -511,7 +513,6 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
     let (fsuid, fsgid) = current_fsuid_gid();
     let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
         Ok(v) => v,
         Err(e) => return e,
@@ -524,25 +525,27 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
     if rofs_for_path(dirfd, &path) {
         return err(SyscallError::EROFS);
     }
-    if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
-        return e;
-    }
-    let ino = inode.inode_num() as u64;
-    let mut cur = get_inode_times(ino);
-    if let Some((sec, nsec)) = atime {
-        cur.atime_sec = sec;
-        cur.atime_nsec = nsec;
-    }
-    if let Some((sec, nsec)) = mtime {
-        cur.mtime_sec = sec;
-        cur.mtime_nsec = nsec;
-    }
-    if atime.is_some() || mtime.is_some() {
-        cur.ctime_sec = now.0;
-        cur.ctime_nsec = now.1;
-    }
-    set_inode_times(ino, cur);
-    0
+    with_ext4_inode_write(&inode, || {
+        if let Err(e) = check_utimens_permission(&inode, fsuid, fsgid, euid, touch) {
+            return e;
+        }
+        let ino = inode.inode_num() as u64;
+        let mut cur = get_inode_times(ino);
+        if let Some((sec, nsec)) = atime {
+            cur.atime_sec = sec;
+            cur.atime_nsec = nsec;
+        }
+        if let Some((sec, nsec)) = mtime {
+            cur.mtime_sec = sec;
+            cur.mtime_nsec = nsec;
+        }
+        if atime.is_some() || mtime.is_some() {
+            cur.ctime_sec = now.0;
+            cur.ctime_nsec = now.1;
+        }
+        set_inode_times(ino, cur);
+        0
+    })
 }
 
 /// Copies the caller's current working directory into a userspace buffer.
@@ -612,11 +615,8 @@ pub fn syscall_fsync(fd: usize) -> isize {
     let file = require_fd_file!(fd);
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
-        {
-            let _ext4_guard = ext4_lock();
-            if !(inode.is_file() || inode.is_dir()) {
-                return err(SyscallError::EINVAL);
-            }
+        if !with_ext4_inode_read(&inode, || inode.is_file() || inode.is_dir()) {
+            return err(SyscallError::EINVAL);
         }
         if os_inode.readonly_fs() {
             return 0;
@@ -714,11 +714,8 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
         return err(SyscallError::EINVAL);
     };
     let inode = os_inode.ext4_inode();
-    {
-        let _ext4_guard = ext4_lock();
-        if !inode.is_file() {
-            return err(SyscallError::EINVAL);
-        }
+    if !with_ext4_inode_read(&inode, || inode.is_file()) {
+        return err(SyscallError::EINVAL);
     }
     if os_inode.readonly_fs() {
         return 0;
@@ -766,20 +763,14 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
         return err(SyscallError::EINVAL);
     };
     let inode = os_inode.ext4_inode();
-    {
-        let _ext4_guard = ext4_lock();
-        if !inode.is_file() {
-            return err(SyscallError::ESPIPE);
-        }
+    if !with_ext4_inode_read(&inode, || inode.is_file()) {
+        return err(SyscallError::ESPIPE);
     }
     0
 }
 
 fn kstat_from_ext4_inode(inode: &alloc::sync::Arc<ext4_fs::Inode>) -> KStat {
-    let meta = {
-        let _ext4_guard = ext4_lock();
-        inode.stat_snapshot()
-    };
+    let meta = with_ext4_inode_read(inode, || inode.stat_snapshot());
     let visible_size = inode_visible_size_with_disk_size(inode, meta.size as usize);
     kstat_from_ext4_snapshot(meta, visible_size)
 }
@@ -793,19 +784,12 @@ fn resolve_ext4_stat_kstat(
     follow_final: bool,
 ) -> Result<KStat, isize> {
     if !follow_final {
-        let inode = {
-            let _ext4_guard = ext4_lock();
-            resolve_at_inode(at, fsuid, fsgid, false)?
-        };
+        let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
         return Ok(kstat_from_ext4_inode(&inode));
     }
 
-    let (inode, is_symlink) = {
-        let _ext4_guard = ext4_lock();
-        let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
-        let is_symlink = inode.is_symlink();
-        (inode, is_symlink)
-    };
+    let inode = resolve_at_inode(at, fsuid, fsgid, false)?;
+    let is_symlink = with_ext4_inode_read(&inode, || inode.is_symlink());
     if !is_symlink {
         return Ok(kstat_from_ext4_inode(&inode));
     }
@@ -816,10 +800,7 @@ fn resolve_ext4_stat_kstat(
         }
     }
 
-    let inode = {
-        let _ext4_guard = ext4_lock();
-        resolve_at_inode(at, fsuid, fsgid, true)?
-    };
+    let inode = resolve_at_inode(at, fsuid, fsgid, true)?;
     Ok(kstat_from_ext4_inode(&inode))
 }
 
@@ -831,10 +812,7 @@ fn busybox_fallback_kstat() -> Option<KStat> {
         "/busybox",
     ];
     for cand in candidates {
-        let inode = {
-            let _ext4_guard = ext4_lock();
-            find_path_in_roots(cand)
-        };
+        let inode = find_path_in_roots(cand);
         if let Some(inode) = inode {
             return Some(kstat_from_ext4_inode(&inode));
         }

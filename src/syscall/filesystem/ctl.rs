@@ -5,14 +5,14 @@ use super::{
     TaskControlBlock, Vec, apply_chown_to_inode, apply_process_root, busybox_exists,
     classify_current_abs_path, clear_ext4_path_cache, clear_record_lock_waiting, current_cwd_path,
     current_effective_uid_gid, current_fsuid_gid, current_in_group, current_process,
-    current_real_uid_gid, do_fchmodat, empty_path_fd_for_at_op, err, ext4_lock, fd_has_o_path,
+    current_real_uid_gid, do_fchmodat, empty_path_fd_for_at_op, err, fd_has_o_path,
     find_path_in_roots, get_current_token, get_fd_file, get_time_ms, inode_mode_allows,
     inode_mode_allows_uid_gid, is_privileged_or_owner, logical_path_for_open_fd,
     maybe_dispatch_proc_fd_at, mount_note_path_access, normalize_path, open_pseudo,
     pseudo_path_exists_result, read_user_cstring, resolve_abs_path, resolve_at_inode,
     resolve_at_path, resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked,
     resolve_proc_magic_intermediate_abs_path, rofs_for_path, should_try_busybox_applet_path,
-    wake_record_lock_waiters,
+    wake_record_lock_waiters, with_ext4_inode_read, with_ext4_inode_write,
 };
 
 /// Enables or disables BSD-style process accounting on an ext4 regular file.
@@ -49,22 +49,27 @@ pub fn syscall_acct(pathname: usize) -> isize {
         return err(SyscallError::EACCES);
     }
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
         Ok(inode) => inode,
         Err(e) => return e,
     };
-    if inode.is_dir() {
-        return err(SyscallError::EISDIR);
-    }
-    if trailing_slash {
-        return err(SyscallError::ENOTDIR);
-    }
-    if !inode.is_file() {
-        return err(SyscallError::EACCES);
-    }
-    if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
-        return err(SyscallError::EACCES);
+    let validation_error = with_ext4_inode_read(&inode, || {
+        if inode.is_dir() {
+            return Some(err(SyscallError::EISDIR));
+        }
+        if trailing_slash {
+            return Some(err(SyscallError::ENOTDIR));
+        }
+        if !inode.is_file() {
+            return Some(err(SyscallError::EACCES));
+        }
+        if !inode_mode_allows_uid_gid(&inode, 2, fsuid, fsgid) {
+            return Some(err(SyscallError::EACCES));
+        }
+        None
+    });
+    if let Some(error) = validation_error {
+        return error;
     }
     *ACCT_STATE.lock() = Some(AcctState {
         inode: Arc::clone(&inode),
@@ -147,9 +152,10 @@ pub fn acct_process_exit(process: &Arc<ProcessControlBlock>, exit_code: i32) {
         )
     };
 
-    let _ext4_guard = ext4_lock();
-    let offset = inode.size() as usize;
-    let _ = inode.write_at(offset, bytes);
+    with_ext4_inode_write(&inode, || {
+        let offset = inode.size() as usize;
+        let _ = inode.write_at(offset, bytes);
+    });
 }
 
 /// Counts how many record-lock wait queues currently reference the given task.
@@ -231,8 +237,9 @@ fn do_faccessat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isi
         } else {
             current_real_uid_gid()
         };
-        let _ext4_guard = ext4_lock();
-        return if inode_mode_allows_uid_gid(&os_inode.ext4_inode(), mode, uid, gid) {
+        let inode = os_inode.ext4_inode();
+        return if with_ext4_inode_read(&inode, || inode_mode_allows_uid_gid(&inode, mode, uid, gid))
+        {
             0
         } else {
             err(SyscallError::EACCES)
@@ -267,7 +274,6 @@ fn do_faccessat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isi
     };
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     {
-        let _ext4_guard = ext4_lock();
         let inode = match resolve_at_inode(&at, uid, gid, follow_final) {
             Ok(v) => v,
             Err(e)
@@ -298,7 +304,7 @@ fn do_faccessat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isi
         if write_on_readonly_mount {
             return err(SyscallError::EROFS);
         }
-        if !inode_mode_allows_uid_gid(&inode, mode, uid, gid) {
+        if !with_ext4_inode_read(&inode, || inode_mode_allows_uid_gid(&inode, mode, uid, gid)) {
             return err(SyscallError::EACCES);
         }
     }
@@ -333,18 +339,23 @@ fn chmod_fd(fd: usize, mode: usize, allow_o_path: bool) -> isize {
             return err(SyscallError::EROFS);
         }
         let inode = os_inode.ext4_inode();
-        let _ext4_guard = ext4_lock();
-        let (uid, _gid) = current_effective_uid_gid();
-        if !is_privileged_or_owner(uid, &inode) {
-            return err(SyscallError::EPERM);
+        let result = with_ext4_inode_write(&inode, || {
+            let (uid, _gid) = current_effective_uid_gid();
+            if !is_privileged_or_owner(uid, &inode) {
+                return err(SyscallError::EPERM);
+            }
+            let mut new_mode = (mode as u16) & 0o7777;
+            // Linux clears S_ISGID when an unprivileged caller is outside file group.
+            if uid != 0 && (new_mode & 0o2000) != 0 && !current_in_group(inode.gid()) {
+                new_mode &= !0o2000;
+            }
+            inode.set_mode(new_mode);
+            clear_ext4_path_cache();
+            0
+        });
+        if result != 0 {
+            return result;
         }
-        let mut new_mode = (mode as u16) & 0o7777;
-        // Linux clears S_ISGID when an unprivileged caller is outside file group.
-        if uid != 0 && (new_mode & 0o2000) != 0 && !current_in_group(inode.gid()) {
-            new_mode &= !0o2000;
-        }
-        inode.set_mode(new_mode);
-        clear_ext4_path_cache();
     }
     0
 }
@@ -380,7 +391,6 @@ fn chown_fd(fd: usize, uid: usize, gid: usize, allow_o_path: bool) -> isize {
             return err(SyscallError::EROFS);
         }
         let inode = os_inode.ext4_inode();
-        let _ext4_guard = ext4_lock();
         let ret = apply_chown_to_inode(&inode, uid, gid);
         if ret != 0 {
             return ret;
@@ -443,17 +453,13 @@ pub fn syscall_fchownat(
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let inode = {
-        let _ext4_guard = ext4_lock();
-        match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
-            Ok(v) => v,
-            Err(e) => return e,
-        }
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
     if rofs_for_path(dirfd, &path) {
         return err(SyscallError::EROFS);
     }
-    let _ext4_guard = ext4_lock();
     let ret = apply_chown_to_inode(&inode, uid, gid);
     if ret != 0 {
         return ret;
@@ -490,11 +496,12 @@ pub fn syscall_chroot(pathname: usize) -> isize {
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let final_root = {
-        let _ext4_guard = ext4_lock();
         let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let inode_lock = crate::fs::ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         if !inode.is_dir() {
             return err(SyscallError::ENOTDIR);
         }
@@ -565,7 +572,6 @@ pub fn syscall_chdir(pathname: usize) -> isize {
 
     let final_cwd = if matches!(at, AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. }) {
         let (fsuid, fsgid) = current_fsuid_gid();
-        let _ext4_guard = ext4_lock();
         let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
             Ok(v) => v,
             Err(e) => {
@@ -581,6 +587,8 @@ pub fn syscall_chdir(pathname: usize) -> isize {
                 return e;
             }
         };
+        let inode_lock = crate::fs::ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         if crate::debug_config::DEBUG_SYSCALL {
             let pid = process.getpid();
             crate::println!(
@@ -628,14 +636,17 @@ pub fn syscall_fchdir(fd: usize) -> isize {
         return err(SyscallError::ENOTDIR);
     };
     let inode = os_inode.ext4_inode();
-    {
-        let _ext4_guard = ext4_lock();
+    let access_error = with_ext4_inode_read(&inode, || {
         if !inode.is_dir() {
-            return err(SyscallError::ENOTDIR);
+            return Some(err(SyscallError::ENOTDIR));
         }
         if !inode_mode_allows(&inode, 1) {
-            return err(SyscallError::EACCES);
+            return Some(err(SyscallError::EACCES));
         }
+        None
+    });
+    if let Some(error) = access_error {
+        return error;
     }
 
     let fallback_cwd = current_cwd_path();

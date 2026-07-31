@@ -8,10 +8,10 @@ use super::{
     ST_NOSYMFOLLOW, String, SyscallError, TMPFILE_SEQ, UMOUNT_NOFOLLOW, Vec,
     block_device_source_path, cgroup_logical_path_for_file, cgroup_mount, cgroup_umount,
     clear_ext4_path_cache, current_fsuid_gid, current_process, current_timespec, err,
-    ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token, get_inode_times,
+    ext4_err_to_errno, ext4_inode_lock, find_path_in_roots, get_current_token, get_inode_times,
     inode_logical_path, inode_raw_logical_path, mount_namespace_id, normalize_path, open_pseudo,
     pseudo_block_is_read_only, read_user_cstring, resolve_at_inode, resolve_at_path,
-    set_inode_times,
+    set_inode_times, with_ext4_inode_read,
 };
 use alloc::vec;
 use lazy_static::lazy_static;
@@ -556,8 +556,9 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
 }
 
 pub(crate) fn ensure_mount_source_root() -> Result<Arc<ext4_fs::Inode>, isize> {
-    let _ext4_guard = ext4_lock();
     let root = crate::fs::root_inode_for_path("/");
+    let root_lock = ext4_inode_lock(&root);
+    let _root_guard = root_lock.write();
     if let Some(dir) = root.find(".ltp_mounts") {
         if dir.is_dir() {
             return Ok(dir);
@@ -588,7 +589,8 @@ pub(crate) fn source_for_device_mount(key: &str) -> Result<String, isize> {
     loop {
         let id = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
         let name = alloc::format!("mnt.{}", id);
-        let _ext4_guard = ext4_lock();
+        let root_lock = ext4_inode_lock(&root);
+        let _root_guard = root_lock.write();
         if root.find(&name).is_some() {
             continue;
         }
@@ -624,9 +626,8 @@ pub(crate) fn target_dir_exists(abs: &str) -> Result<(), isize> {
         return Err(err(SyscallError::ENOTDIR));
     }
     let translated = translate_mount_abs(abs);
-    let _ext4_guard = ext4_lock();
     let inode = find_path_in_roots(&translated).ok_or_else(|| err(SyscallError::ENOENT))?;
-    if !inode.is_dir() {
+    if !with_ext4_inode_read(&inode, || inode.is_dir()) {
         return Err(err(SyscallError::ENOTDIR));
     }
     Ok(())
@@ -642,9 +643,8 @@ fn bind_target_matches_source_kind(abs: &str, source_is_dir: bool) -> Result<(),
         };
     }
     let translated = translate_mount_abs(abs);
-    let _ext4_guard = ext4_lock();
     let inode = find_path_in_roots(&translated).ok_or_else(|| err(SyscallError::ENOENT))?;
-    if inode.is_dir() != source_is_dir {
+    if with_ext4_inode_read(&inode, || inode.is_dir()) != source_is_dir {
         return Err(err(SyscallError::ENOTDIR));
     }
     Ok(())
@@ -1754,11 +1754,10 @@ pub(crate) fn syscall_mount_impl(
 
         let source = translate_mount_abs(&source_abs);
         let source_is_dir = {
-            let _ext4_guard = ext4_lock();
             let Some(source_inode) = find_path_in_roots(&source) else {
                 return err(SyscallError::ENOENT);
             };
-            source_inode.is_dir()
+            with_ext4_inode_read(&source_inode, || source_inode.is_dir())
         };
         if let Err(e) = bind_target_matches_source_kind(&target, source_is_dir) {
             return e;
@@ -1926,9 +1925,8 @@ pub(crate) fn syscall_mount_impl(
     }
     let special_abs = normalize_path(&cwd, source_display);
     {
-        let _ext4_guard = ext4_lock();
         if let Some(inode) = find_path_in_roots(&special_abs) {
-            if inode.is_chrdev() {
+            if with_ext4_inode_read(&inode, || inode.is_chrdev()) {
                 return err(SyscallError::ENOTBLK);
             }
         }
@@ -1984,16 +1982,14 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
             Err(e) => return e,
         };
         let (fsuid, fsgid) = current_fsuid_gid();
-        let _ext4_guard = ext4_lock();
         if let Ok(inode) = resolve_at_inode(&at, fsuid, fsgid, false) {
-            if inode.is_symlink() {
+            if with_ext4_inode_read(&inode, || inode.is_symlink()) {
                 return err(SyscallError::EINVAL);
             }
         }
     }
 
     let Some(record) = mount_record_for_target(&abs) else {
-        let _ext4_guard = ext4_lock();
         return if find_path_in_roots(&abs).is_some() {
             err(SyscallError::EINVAL)
         } else {

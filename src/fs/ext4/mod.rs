@@ -1,6 +1,6 @@
 //! ext4 adapter for the object-based VFS.
 
-use crate::fs::inode::{OSInode, ext4_lock};
+use crate::fs::inode::{Ext4InodeLock, OSInode, ext4_inode_lock};
 use crate::fs::vfs::{
     DentryCachePolicy, VfsDirEntry, VfsError, VfsFileSystem, VfsLink, VfsMetadata, VfsNode,
     VfsNodeKind, VfsOpenOptions, VfsResult, VfsStatFs, VfsTimes,
@@ -59,13 +59,16 @@ impl VfsFileSystem for Ext4Vfs {
 pub struct Ext4VfsNode {
     filesystem_id: u64,
     inode: Arc<Inode>,
+    inode_lock: Arc<Ext4InodeLock>,
 }
 
 impl Ext4VfsNode {
     fn new(filesystem_id: u64, inode: Arc<Inode>) -> Self {
+        let inode_lock = ext4_inode_lock(&inode);
         Self {
             filesystem_id,
             inode,
+            inode_lock,
         }
     }
 
@@ -93,7 +96,7 @@ impl VfsNode for Ext4VfsNode {
 
     fn metadata(&self) -> VfsResult<VfsMetadata> {
         let snapshot = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.read();
             self.inode.stat_snapshot()
         };
         Ok(VfsMetadata {
@@ -121,7 +124,7 @@ impl VfsNode for Ext4VfsNode {
             return Err(VfsError::Invalid);
         }
         let inode = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.read();
             if !self.inode.is_dir() {
                 return Err(VfsError::NotDirectory);
             }
@@ -132,7 +135,7 @@ impl VfsNode for Ext4VfsNode {
 
     fn readdir(&self) -> VfsResult<Vec<VfsDirEntry>> {
         let entries = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.read();
             if !self.inode.is_dir() {
                 return Err(VfsError::NotDirectory);
             }
@@ -141,7 +144,7 @@ impl VfsNode for Ext4VfsNode {
         let mut output = Vec::with_capacity(entries.len());
         for (name, inode_num, _) in entries {
             let kind = {
-                let _guard = ext4_lock();
+                let _inode_guard = self.inode_lock.read();
                 self.inode
                     .find(&name)
                     .map(|inode| inode_kind(&inode))
@@ -158,7 +161,7 @@ impl VfsNode for Ext4VfsNode {
 
     fn readlink(&self) -> VfsResult<VfsLink> {
         let size = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.read();
             if !self.inode.is_symlink() {
                 return Err(VfsError::Invalid);
             }
@@ -166,7 +169,7 @@ impl VfsNode for Ext4VfsNode {
         };
         let mut bytes = vec![0; size];
         let read = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.read();
             self.inode.read_at(0, &mut bytes)
         };
         bytes.truncate(read);
@@ -190,7 +193,7 @@ impl VfsNode for Ext4VfsNode {
 
     fn create(&self, name: &str, mode: u16) -> VfsResult<Arc<dyn VfsNode>> {
         let inode = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.write();
             let inode = self.inode.create_file(name).map_err(map_ext4_error)?;
             inode.set_mode(mode);
             inode
@@ -200,7 +203,7 @@ impl VfsNode for Ext4VfsNode {
 
     fn mkdir(&self, name: &str, mode: u16) -> VfsResult<Arc<dyn VfsNode>> {
         let inode = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.write();
             let inode = self.inode.create_dir(name).map_err(map_ext4_error)?;
             inode.set_mode(mode);
             inode
@@ -210,7 +213,7 @@ impl VfsNode for Ext4VfsNode {
 
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn VfsNode>> {
         let inode = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.write();
             self.inode
                 .create_symlink(name, target)
                 .map_err(map_ext4_error)?
@@ -226,15 +229,28 @@ impl VfsNode for Ext4VfsNode {
         if target.filesystem_id != self.filesystem_id {
             return Err(VfsError::CrossDevice);
         }
-        let _guard = ext4_lock();
+        // Linux forbids hard-linking directories before taking the target
+        // inode's exclusive lock.  Besides matching EPERM semantics, this
+        // avoids recursively taking the same i_rwsem when `target` is this
+        // parent directory.
+        if target.inode.is_dir() {
+            return Err(VfsError::Access);
+        }
+        let _parent_guard = self.inode_lock.write();
+        let _target_guard = target.inode_lock.write();
         self.inode
             .link_inode(name, &target.inode)
             .map_err(map_ext4_error)
     }
 
     fn unlink(&self, name: &str, remove_dir: bool) -> VfsResult<()> {
-        let _guard = ext4_lock();
+        if matches!(name, "." | "..") {
+            return Err(VfsError::Invalid);
+        }
+        let _parent_guard = self.inode_lock.write();
         let child = self.inode.find(name).ok_or(VfsError::NoEntry)?;
+        let child_lock = ext4_inode_lock(&child);
+        let _child_guard = child_lock.write();
         if child.is_dir() != remove_dir {
             return Err(if child.is_dir() {
                 VfsError::IsDirectory
@@ -258,11 +274,17 @@ impl VfsNode for Ext4VfsNode {
         if new_parent.filesystem_id != self.filesystem_id {
             return Err(VfsError::CrossDevice);
         }
+        if matches!(old_name, "." | "..") || matches!(new_name, "." | "..") {
+            return Err(VfsError::Invalid);
+        }
         if new_parent.node_id() != self.node_id() {
             // ext4-fs currently exposes atomic same-directory rename only.
             return Err(VfsError::NotSupported);
         }
-        let _guard = ext4_lock();
+        let _parent_guard = self.inode_lock.write();
+        let source = self.inode.find(old_name).ok_or(VfsError::NoEntry)?;
+        let source_lock = ext4_inode_lock(&source);
+        let _source_guard = source_lock.write();
         self.inode
             .rename(old_name, new_name)
             .map_err(map_ext4_error)
@@ -272,7 +294,7 @@ impl VfsNode for Ext4VfsNode {
         if size != 0 {
             return Err(VfsError::NotSupported);
         }
-        let _guard = ext4_lock();
+        let _inode_guard = self.inode_lock.write();
         self.inode.clear().map_err(map_ext4_error)
     }
 
@@ -291,7 +313,7 @@ impl VfsNode for Ext4VfsNode {
             _ => return Err(VfsError::Invalid),
         };
         let inode = {
-            let _guard = ext4_lock();
+            let _inode_guard = self.inode_lock.write();
             self.inode
                 .create_special(name, type_mode | (mode & 0o7777), rdev)
                 .map_err(map_ext4_error)?
@@ -300,13 +322,13 @@ impl VfsNode for Ext4VfsNode {
     }
 
     fn set_mode(&self, mode: u16) -> VfsResult<()> {
-        let _guard = ext4_lock();
+        let _inode_guard = self.inode_lock.write();
         self.inode.set_mode(mode);
         Ok(())
     }
 
     fn set_owner(&self, uid: u32, gid: u32) -> VfsResult<()> {
-        let _guard = ext4_lock();
+        let _inode_guard = self.inode_lock.write();
         self.inode.set_uid_gid(uid, gid);
         Ok(())
     }

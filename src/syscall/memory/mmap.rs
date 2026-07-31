@@ -1,5 +1,5 @@
 use super::*;
-use crate::fs::{PseudoFile, PseudoKindTag};
+use crate::fs::{PseudoFile, PseudoKindTag, with_ext4_inode_read};
 use crate::syscall::sysv_shm::{
     detach_attaches_overlapping, find_attach_containing, release_detached_attach_refs,
     segment_shared_frames_existing, segment_size, split_mremap_attach,
@@ -110,10 +110,7 @@ impl MmapSource<'_> {
             Self::Anonymous | Self::DevZero => map_len,
             Self::RegularFile { inode_file, .. } => {
                 let inode = inode_file.ext4_inode();
-                let file_size = {
-                    let _ext4_guard = ext4_lock();
-                    inode.size() as usize
-                };
+                let file_size = with_ext4_inode_read(&inode, || inode.size() as usize);
                 let file_size = crate::syscall::filesystem::inode_visible_size_with_disk_size(
                     &inode, file_size,
                 );
@@ -449,10 +446,7 @@ pub fn syscall_mmap(
         let file = file.as_ref().expect("non-anonymous mmap has file");
         if let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() {
             let inode = inode_file.ext4_inode();
-            let (dev, ino) = {
-                let _ext4_guard = ext4_lock();
-                (inode.device_id(), inode.inode_num())
-            };
+            let (dev, ino) = (inode.device_id(), inode.inode_num());
             MmapSource::RegularFile {
                 inode_file,
                 dev,
@@ -1075,10 +1069,7 @@ pub fn syscall_mremap(
             return err(SyscallError::ENOMEM);
         };
         let inode = os_inode.ext4_inode();
-        let file_size = {
-            let _ext4_guard = ext4_lock();
-            inode.size() as usize
-        };
+        let file_size = with_ext4_inode_read(&inode, || inode.size() as usize);
         let file_size =
             crate::syscall::filesystem::inode_visible_size_with_disk_size(&inode, file_size);
         let old_slice_file_valid_len = src_region

@@ -3,8 +3,8 @@ use super::{
     MOUNT_ATTR_NOSUID, MOUNT_ATTR_NOSYMFOLLOW, MOUNT_ATTR_RDONLY, MOUNT_ATTR_STRICTATIME,
     MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_RDONLY,
     MS_STRICTATIME, Mutex, String, SyscallError, UserBuffer, current_files_and_nofile_limit, err,
-    ext4_lock, find_path_in_roots, get_current_token, mount_lookup_for_abs, read_user_cstring,
-    register_rofs_mount, resolve_abs_path, unregister_rofs_mount,
+    find_path_in_roots, get_current_token, mount_lookup_for_abs, read_user_cstring,
+    register_rofs_mount, resolve_abs_path, unregister_rofs_mount, with_ext4_inode_read,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -198,11 +198,10 @@ pub(crate) fn read_user_path_abs(dirfd: isize, ptr: usize) -> Result<String, isi
 
 /// Ensures that a mount target exists and names a directory.
 pub(crate) fn ensure_mount_target_dir(abs: &str) -> Result<(), isize> {
-    let _ext4_guard = ext4_lock();
     let Some(inode) = find_path_in_roots(abs) else {
         return Err(err(SyscallError::ENOENT));
     };
-    if !inode.is_dir() {
+    if !with_ext4_inode_read(&inode, || inode.is_dir()) {
         return Err(err(SyscallError::ENOTDIR));
     }
     Ok(())

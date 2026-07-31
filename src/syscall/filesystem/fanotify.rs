@@ -1,8 +1,8 @@
 use super::{
     AT_FDCWD, FanotifyFile, File, MapPermission, SyscallError, current_files,
-    current_files_and_nofile_limit, current_fsuid_gid, err, ext4_lock, get_current_token,
+    current_files_and_nofile_limit, current_fsuid_gid, err, get_current_token,
     read_user_cstring, resolve_abs_path, resolve_at_inode, resolve_at_path, translate_mount_abs,
-    try_translated_byte_buffer,
+    try_translated_byte_buffer, with_ext4_inode_read,
 };
 use alloc::sync::Arc;
 
@@ -56,17 +56,11 @@ pub fn syscall_fanotify_mark(
     };
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow = (flags & FAN_MARK_DONT_FOLLOW) == 0;
-    let inode = {
-        let _guard = ext4_lock();
-        match resolve_at_inode(&at, fsuid, fsgid, follow) {
-            Ok(inode) => inode,
-            Err(e) => return e,
-        }
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow) {
+        Ok(inode) => inode,
+        Err(e) => return e,
     };
-    let is_dir = {
-        let _guard = ext4_lock();
-        inode.is_dir()
-    };
+    let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
     let (mark_path, mark_source_path) = match resolve_abs_path(dirfd, &path) {
         Ok(Some(path)) => {
             let source_path = translate_mount_abs(&path);

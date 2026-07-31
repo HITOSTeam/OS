@@ -10,7 +10,7 @@ pub(super) use crate::syscall::error::{SyscallError, err};
 pub(super) use crate::{
     config::PAGE_SIZE,
     fs::{
-        File, OSInode, PseudoShmFile, ext4_lock, vm_commit_limit_bytes, vm_committed_as_bytes,
+        File, OSInode, PseudoShmFile, vm_commit_limit_bytes, vm_committed_as_bytes,
         vm_overcommit_memory,
     },
     mm::{

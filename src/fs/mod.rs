@@ -346,14 +346,15 @@ pub(crate) use fanotify::{
 pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
     ExecInodeReservation, block_device_source_path, clear_ext4_path_cache,
-    debug_track_iozone_inode, ensure_root_mount_directory, ext4_lock, ext4_path_cache_lookup,
+    debug_track_iozone_inode, ensure_root_mount_directory, ext4_inode_lock, ext4_topology_lock,
     find_path_in_roots, inode_path_hint, inode_path_in_roots, invalidate_ext4_path_cache,
     invalidate_ext4_path_cache_inode, invalidate_ext4_path_cache_subtree,
     is_inode_currently_executed, note_ext4_path_cache, note_inode_path_hint,
     path_resolves_to_inode, path_within_filesystem, register_deferred_unlink_cleanup,
     register_executing_inode, resolve_final_symlink_abs_path,
     resolve_final_symlink_abs_path_locked, root_inode_for_device, root_inode_for_path,
-    unregister_executing_inode,
+    unregister_executing_inode, with_ext4_inode_read, with_ext4_inode_write,
+    with_ext4_inode_write_set,
 };
 pub(crate) use inode::{
     discard_inode_pending_writes_after_truncate, flush_inode_pending_writes_before_truncate,

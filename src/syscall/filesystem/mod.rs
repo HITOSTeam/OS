@@ -16,7 +16,7 @@ use crate::{
         PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
         SocketPairEnd, TimerFdFile, TtyFile, block_device_source_path, cgroup_charge_file_write,
         cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
-        cgroup_umount, clear_ext4_path_cache, ext4_lock, ext4_path_cache_lookup,
+        cgroup_umount, clear_ext4_path_cache, ext4_inode_lock, ext4_topology_lock,
         fanotify_notify_access, fanotify_notify_close, fanotify_notify_modify,
         fanotify_notify_open, fanotify_permission_access, fanotify_permission_open,
         find_path_in_roots, inode_logical_path, inode_raw_logical_path, invalidate_ext4_path_cache,
@@ -25,7 +25,8 @@ use crate::{
         pseudo_block_is_read_only, pseudo_block_note_sync, register_deferred_unlink_cleanup,
         resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked,
         resolve_proc_magic_intermediate_abs_path, root_inode_for_device, shm_create, shm_get,
-        shm_object_name, shm_remove,
+        shm_object_name, shm_remove, with_ext4_inode_read, with_ext4_inode_write,
+        with_ext4_inode_write_set,
     },
     mm::{
         MapPermission, UserBuffer, translated_byte_buffer, translated_mutref, try_copy_from_user,

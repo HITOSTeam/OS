@@ -27,7 +27,8 @@ fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>, path: &str) -> Result<Loade
     let exec_inode = reservation.key();
     let exe_path = logical_exec_path(AT_FDCWD, path, &inode);
     let data = {
-        let _ext4_guard = ext4_lock();
+        let inode_lock = ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         inode.read_all()
     };
     Ok(LoadedExecImage {
@@ -665,8 +666,9 @@ fn execve_with_inode(
     // Try lazy ELF loading to avoid reading large binaries into kernel heap.
     let elf_info = {
         let inode = Arc::clone(&inode);
+        let inode_lock = ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         let mut read_at = |offset: usize, buf: &mut [u8]| {
-            let _ext4_guard = ext4_lock();
             inode.read_at(offset, buf)
         };
         match crate::mm::elf_load_info_from_reader(&mut read_at) {
@@ -675,10 +677,7 @@ fn execve_with_inode(
             Err(e) => return e,
         }
     };
-    let exec_inode = {
-        let _ext4_guard = ext4_lock();
-        (inode.device_id(), inode.inode_num())
-    };
+    let exec_inode = (inode.device_id(), inode.inode_num());
     if let Some(info) = elf_info {
         if let Some(interp) = info.interp.as_deref() {
             let interp_data = match load_interp_data(interp, Some(info.arch_abi)) {
@@ -689,8 +688,9 @@ fn execve_with_inode(
                 return ENOEXEC;
             }
             let inode = Arc::clone(&inode);
+            let inode_lock = ext4_inode_lock(&inode);
+            let _inode_guard = inode_lock.read();
             let loader = |offset: usize, buf: &mut [u8]| {
-                let _ext4_guard = ext4_lock();
                 inode.read_at(offset, buf)
             };
             let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
@@ -719,8 +719,9 @@ fn execve_with_inode(
         }
 
         let inode = Arc::clone(&inode);
+        let inode_lock = ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         let loader = |offset: usize, buf: &mut [u8]| {
-            let _ext4_guard = ext4_lock();
             inode.read_at(offset, buf)
         };
         let (memory_set, ustack_base, entry_point, elf_aux) =
@@ -747,7 +748,8 @@ fn execve_with_inode(
     // Not an ELF: check for shebang using a small prefix to avoid big allocations.
     let mut head = [0u8; 256];
     let head_len = {
-        let _ext4_guard = ext4_lock();
+        let inode_lock = ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         inode.read_at(0, &mut head)
     };
     let head = &head[..head_len];
@@ -957,13 +959,10 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
                 } else {
                     normalize_path(&cwd, &path)
                 };
-                let backing_hit = {
-                    let _ext4_guard = ext4_lock();
-                    crate::fs::find_path_in_roots(&crate::syscall::filesystem::translate_mount_abs(
-                        &abs,
-                    ))
-                    .is_some()
-                };
+                let backing_hit = crate::fs::find_path_in_roots(
+                    &crate::syscall::filesystem::translate_mount_abs(&abs),
+                )
+                .is_some();
                 println!(
                     "[exec] path='{}' abs='{}' cwd='{}' err={} backing_hit={}",
                     path, abs, cwd, e, backing_hit

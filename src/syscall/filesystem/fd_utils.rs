@@ -2,8 +2,8 @@ use super::{
     Arc, BTreeMap, DIRECT_IO_ALIGN, FD_CLOEXEC, File, Mutex, O_APPEND, O_ASYNC, O_CLOEXEC,
     O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe,
     ProcPseudoFile, PseudoFile, PseudoShmFile, SocketPairEnd, SyscallError, TaskControlBlock,
-    UserBuffer, current_files, current_files_and_nofile_limit, err, ext4_lock, get_current_token,
-    make_pipe, mount_lookup_for_abs, try_read_user_value, try_write_user_value,
+    UserBuffer, current_files, current_files_and_nofile_limit, err, get_current_token, make_pipe,
+    mount_lookup_for_abs, try_read_user_value, try_write_user_value, with_ext4_inode_read,
 };
 use lazy_static::lazy_static;
 
@@ -258,10 +258,7 @@ pub(crate) fn validate_direct_io_request(
         return Ok(());
     };
     let inode = os_inode.ext4_inode();
-    let is_regular = {
-        let _ext4_guard = ext4_lock();
-        inode.is_file()
-    };
+    let is_regular = with_ext4_inode_read(&inode, || inode.is_file());
     if !is_regular {
         return Ok(());
     }

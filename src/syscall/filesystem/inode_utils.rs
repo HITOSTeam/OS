@@ -4,14 +4,15 @@ use super::{
     O_TMPFILE, O_TRUNC, O_WRONLY, OSInode, Ordering, PID2PCB, S_IFBLK, S_IFCHR, S_IFMT,
     SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec, cgroup_rename, clear_ext4_path_cache,
     current_effective_uid_gid, current_files, current_fsuid_gid, current_in_group, current_process,
-    current_timespec, empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_lock,
-    fchmod_fd_for_at_empty_path, fifo_pipe_state_for_inode, file_lock_key_from_inode,
-    get_current_token, inode_mode_allows, inode_mode_allows_uid_gid,
+    current_timespec, empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_inode_lock,
+    ext4_topology_lock, fchmod_fd_for_at_empty_path, fifo_pipe_state_for_inode,
+    file_lock_key_from_inode, get_current_token, inode_mode_allows, inode_mode_allows_uid_gid,
     inode_visible_size_with_disk_size, install_open_file_fd, maybe_dispatch_proc_fd_at,
     maybe_signal_lease_break, note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs,
     pseudo_path_exists_result, queue_process_signal, read_user_cstring,
     register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
     rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
+    with_ext4_inode_write, with_ext4_inode_write_set,
 };
 use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
 use alloc::vec;
@@ -125,7 +126,8 @@ pub(crate) fn open_existing_ext4_inode(
     o_path: bool,
 ) -> Result<usize, isize> {
     let readonly_fs = raw_abs.map(path_is_rofs).unwrap_or(false);
-    let ext4_guard = ext4_lock();
+    let inode_lock = ext4_inode_lock(&inode);
+    let inode_guard = inode_lock.read();
 
     if let Some(abs) = raw_abs {
         note_inode_path_hint(&inode, abs);
@@ -165,14 +167,14 @@ pub(crate) fn open_existing_ext4_inode(
         let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
         let accmode = flags & O_ACCMODE;
         if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
-            drop(ext4_guard);
+            drop(inode_guard);
             return Err(err(SyscallError::ENXIO));
         }
         let Some(file) = state.open_file(accmode) else {
-            drop(ext4_guard);
+            drop(inode_guard);
             return Err(err(SyscallError::EINVAL));
         };
-        drop(ext4_guard);
+        drop(inode_guard);
         return install_open_file_fd(file, flags, o_path);
     }
 
@@ -202,7 +204,7 @@ pub(crate) fn open_existing_ext4_inode(
     }
 
     let needs_trunc = !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file();
-    drop(ext4_guard);
+    drop(inode_guard);
     if needs_trunc {
         let ret = truncate_regular_inode(&inode, 0);
         if ret != 0 {
@@ -238,9 +240,7 @@ pub(crate) fn open_existing_target_path(
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
-    drop(_ext4_guard);
     open_existing_ext4_inode(
         abs,
         Some(abs),
@@ -305,27 +305,25 @@ pub(crate) fn do_fchmodat(
     let (fsuid, fsgid) = current_fsuid_gid();
     let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let inode = {
-        let _ext4_guard = ext4_lock();
-        match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
-            Ok(v) => v,
-            Err(e) => return e,
-        }
+    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
     if rofs_for_path(dirfd, &path) {
         return err(SyscallError::EROFS);
     }
-    let _ext4_guard = ext4_lock();
-    if euid != 0 && inode.uid() != euid {
-        return err(SyscallError::EPERM);
-    }
-    let mut new_mode = (mode as u16) & 0o7777;
-    if euid != 0 && (new_mode & 0o2000) != 0 && !current_in_group(inode.gid()) {
-        new_mode &= !0o2000;
-    }
-    inode.set_mode(new_mode);
-    clear_ext4_path_cache();
-    0
+    with_ext4_inode_write(&inode, || {
+        if euid != 0 && inode.uid() != euid {
+            return err(SyscallError::EPERM);
+        }
+        let mut new_mode = (mode as u16) & 0o7777;
+        if euid != 0 && (new_mode & 0o2000) != 0 && !current_in_group(inode.gid()) {
+            new_mode &= !0o2000;
+        }
+        inode.set_mode(new_mode);
+        clear_ext4_path_cache();
+        0
+    })
 }
 
 /// Legacy Linux `fchmodat(2)` syscall entry.
@@ -448,7 +446,6 @@ pub(crate) fn do_renameat(
         return err(SyscallError::EROFS);
     }
 
-    let _ext4_guard = ext4_lock();
     let (fsuid, fsgid) = current_fsuid_gid();
     let (old_parent, old_name) = match resolve_parent_and_name(&old_at, fsuid, fsgid) {
         Ok(v) => v,
@@ -458,94 +455,106 @@ pub(crate) fn do_renameat(
         Ok(v) => v,
         Err(e) => return e,
     };
+    let _topology_guard = (!inode_eq(&old_parent, &new_parent)).then(ext4_topology_lock);
 
-    if old_name.is_empty() || new_name.is_empty() {
-        return err(SyscallError::ENOENT);
-    }
-    if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
-        return err(SyscallError::EINVAL);
-    }
-    if old_name == new_name && inode_eq(&old_parent, &new_parent) {
-        return 0;
-    }
-    if !old_parent.is_dir() || !new_parent.is_dir() {
-        return err(SyscallError::ENOTDIR);
-    }
-    if !inode_mode_allows_uid_gid(&old_parent, 3, fsuid, fsgid)
-        || !inode_mode_allows_uid_gid(&new_parent, 3, fsuid, fsgid)
-    {
-        return err(SyscallError::EACCES);
-    }
-
-    let Some(source) = old_parent.find(&old_name) else {
-        return err(SyscallError::ENOENT);
-    };
-    if !sticky_rename_allowed(&old_parent, &source, fsuid) {
-        return err(SyscallError::EPERM);
-    }
-
-    let target = new_parent.find(&new_name);
-    if let Some(target_inode) = target.as_ref() {
-        if !sticky_rename_allowed(&new_parent, target_inode, fsuid) {
-            return err(SyscallError::EPERM);
+    with_ext4_inode_write_set(&[old_parent.as_ref(), new_parent.as_ref()], || {
+        if old_name.is_empty() || new_name.is_empty() {
+            return err(SyscallError::ENOENT);
         }
-        if inode_eq(&source, target_inode) {
+        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+            return err(SyscallError::EINVAL);
+        }
+        if old_name == new_name && inode_eq(&old_parent, &new_parent) {
             return 0;
         }
-        if source.is_dir() && !target_inode.is_dir() {
+        if !old_parent.is_dir() || !new_parent.is_dir() {
             return err(SyscallError::ENOTDIR);
         }
-        if !source.is_dir() && target_inode.is_dir() {
-            return err(SyscallError::EISDIR);
+        if !inode_mode_allows_uid_gid(&old_parent, 3, fsuid, fsgid)
+            || !inode_mode_allows_uid_gid(&new_parent, 3, fsuid, fsgid)
+        {
+            return err(SyscallError::EACCES);
         }
-        if source.is_dir() && target_inode.is_dir() && !target_inode.ls().is_empty() {
-            return err(SyscallError::ENOTEMPTY);
-        }
-        if no_replace {
-            return err(SyscallError::EEXIST);
-        }
-    }
 
-    if source.is_dir() && path_is_descendant_of(new_parent.clone(), &source) {
-        return err(SyscallError::EINVAL);
-    }
+        let Some(source) = old_parent.find(&old_name) else {
+            return err(SyscallError::ENOENT);
+        };
+        let target = new_parent.find(&new_name);
 
-    let same_parent = inode_eq(&old_parent, &new_parent);
-    clear_ext4_path_cache();
-    if !same_parent {
-        if source.is_dir() {
-            if new_parent.link_count() >= u16::MAX as u32 {
-                return err(SyscallError::EMLINK);
+        // Do this before taking child locks: `new_parent` can itself be the
+        // source directory for `rename("a", "a/b")`, in which case nesting
+        // the source i_rwsem below would recursively lock a parent semaphore.
+        if source.is_dir() && path_is_descendant_of(new_parent.clone(), &source) {
+            return err(SyscallError::EINVAL);
+        }
+
+        let mut changed_inodes = vec![source.as_ref()];
+        if let Some(target_inode) = target.as_ref() {
+            changed_inodes.push(target_inode.as_ref());
+        }
+        with_ext4_inode_write_set(&changed_inodes, || {
+            if !sticky_rename_allowed(&old_parent, &source, fsuid) {
+                return err(SyscallError::EPERM);
             }
-            return err(SyscallError::EXDEV);
-        }
-
-        if target.is_some() {
-            let rc = remove_rename_target(&new_parent, &new_name);
-            if rc != 0 {
-                return rc;
+            if let Some(target_inode) = target.as_ref() {
+                if !sticky_rename_allowed(&new_parent, target_inode, fsuid) {
+                    return err(SyscallError::EPERM);
+                }
+                if inode_eq(&source, target_inode) {
+                    return 0;
+                }
+                if source.is_dir() && !target_inode.is_dir() {
+                    return err(SyscallError::ENOTDIR);
+                }
+                if !source.is_dir() && target_inode.is_dir() {
+                    return err(SyscallError::EISDIR);
+                }
+                if source.is_dir() && target_inode.is_dir() && !target_inode.ls().is_empty() {
+                    return err(SyscallError::ENOTEMPTY);
+                }
+                if no_replace {
+                    return err(SyscallError::EEXIST);
+                }
             }
-        }
-        if let Err(e) = new_parent.link_inode(&new_name, &source) {
-            return ext4_err_to_errno(e);
-        }
-        if let Err(e) = old_parent.unlink(&old_name) {
-            let _ = new_parent.unlink(&new_name);
-            return ext4_err_to_errno(e);
-        }
-        return 0;
-    }
 
-    if target.is_some() {
-        let rc = remove_rename_target(&old_parent, &new_name);
-        if rc != 0 {
-            return rc;
-        }
-    }
-    match old_parent.rename(&old_name, &new_name) {
-        Ok(_) => 0,
-        Err(e) => ext4_err_to_errno(e),
-    }
+            let same_parent = inode_eq(&old_parent, &new_parent);
+            clear_ext4_path_cache();
+            if !same_parent {
+                if source.is_dir() {
+                    if new_parent.link_count() >= u16::MAX as u32 {
+                        return err(SyscallError::EMLINK);
+                    }
+                    return err(SyscallError::EXDEV);
+                }
+
+                if target.is_some() {
+                    let rc = remove_rename_target(&new_parent, &new_name);
+                    if rc != 0 {
+                        return rc;
+                    }
+                }
+                if let Err(e) = new_parent.link_inode(&new_name, &source) {
+                    return ext4_err_to_errno(e);
+                }
+                if let Err(e) = old_parent.unlink(&old_name) {
+                    let _ = new_parent.unlink(&new_name);
+                    return ext4_err_to_errno(e);
+                }
+                return 0;
+            }
+
+            if target.is_some() {
+                let rc = remove_rename_target(&old_parent, &new_name);
+                if rc != 0 {
+                    return rc;
+                }
+            }
+            match old_parent.rename(&old_name, &new_name) {
+                Ok(_) => 0,
+                Err(e) => ext4_err_to_errno(e),
+            }
+        })
+    })
 }
 
 pub(crate) fn do_renameat_exchange(
@@ -570,7 +579,6 @@ pub(crate) fn do_renameat_exchange(
         return err(SyscallError::EROFS);
     }
 
-    let _ext4_guard = ext4_lock();
     let (fsuid, fsgid) = current_fsuid_gid();
     let (old_parent, old_name) = match resolve_parent_and_name(&old_at, fsuid, fsgid) {
         Ok(v) => v,
@@ -580,78 +588,83 @@ pub(crate) fn do_renameat_exchange(
         Ok(v) => v,
         Err(e) => return e,
     };
+    let _topology_guard = (!inode_eq(&old_parent, &new_parent)).then(ext4_topology_lock);
 
-    if old_name.is_empty() || new_name.is_empty() {
-        return err(SyscallError::ENOENT);
-    }
-    if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
-        return err(SyscallError::EINVAL);
-    }
-    if !inode_mode_allows_uid_gid(&old_parent, 3, fsuid, fsgid)
-        || !inode_mode_allows_uid_gid(&new_parent, 3, fsuid, fsgid)
-    {
-        return err(SyscallError::EACCES);
-    }
-
-    let Some(old_inode) = old_parent.find(&old_name) else {
-        return err(SyscallError::ENOENT);
-    };
-    let Some(new_inode) = new_parent.find(&new_name) else {
-        return err(SyscallError::ENOENT);
-    };
-
-    if !sticky_rename_allowed(&old_parent, &old_inode, fsuid)
-        || !sticky_rename_allowed(&new_parent, &new_inode, fsuid)
-    {
-        return err(SyscallError::EPERM);
-    }
-    if old_inode.is_dir() || new_inode.is_dir() {
-        return err(SyscallError::EINVAL);
-    }
-    if old_inode.device_id() != new_inode.device_id() {
-        return err(SyscallError::EXDEV);
-    }
-    if inode_eq(&old_inode, &new_inode) {
-        return 0;
-    }
-
-    let pid = current_process().getpid();
-    let mut tmp_name = String::new();
-    for i in 0..64 {
-        let candidate = alloc::format!(".rename_swap_{}.{}", pid, i);
-        if old_parent.find(&candidate).is_none() && new_parent.find(&candidate).is_none() {
-            tmp_name = candidate;
-            break;
+    with_ext4_inode_write_set(&[old_parent.as_ref(), new_parent.as_ref()], || {
+        if old_name.is_empty() || new_name.is_empty() {
+            return err(SyscallError::ENOENT);
         }
-    }
-    if tmp_name.is_empty() {
-        return err(SyscallError::EBUSY);
-    }
+        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+            return err(SyscallError::EINVAL);
+        }
+        if !inode_mode_allows_uid_gid(&old_parent, 3, fsuid, fsgid)
+            || !inode_mode_allows_uid_gid(&new_parent, 3, fsuid, fsgid)
+        {
+            return err(SyscallError::EACCES);
+        }
 
-    clear_ext4_path_cache();
-    if let Err(e) = old_parent.link_inode(&tmp_name, &old_inode) {
-        return ext4_err_to_errno(e);
-    }
-    if let Err(e) = old_parent.unlink(&old_name) {
-        let _ = old_parent.unlink(&tmp_name);
-        return ext4_err_to_errno(e);
-    }
-    if let Err(e) = old_parent.link_inode(&old_name, &new_inode) {
-        let _ = old_parent.link_inode(&old_name, &old_inode);
-        let _ = old_parent.unlink(&tmp_name);
-        return ext4_err_to_errno(e);
-    }
-    if let Err(e) = new_parent.unlink(&new_name) {
-        return ext4_err_to_errno(e);
-    }
-    if let Err(e) = new_parent.link_inode(&new_name, &old_inode) {
-        let _ = new_parent.link_inode(&new_name, &new_inode);
-        return ext4_err_to_errno(e);
-    }
-    if let Err(e) = old_parent.unlink(&tmp_name) {
-        return ext4_err_to_errno(e);
-    }
-    0
+        let Some(old_inode) = old_parent.find(&old_name) else {
+            return err(SyscallError::ENOENT);
+        };
+        let Some(new_inode) = new_parent.find(&new_name) else {
+            return err(SyscallError::ENOENT);
+        };
+
+        with_ext4_inode_write_set(&[old_inode.as_ref(), new_inode.as_ref()], || {
+            if !sticky_rename_allowed(&old_parent, &old_inode, fsuid)
+                || !sticky_rename_allowed(&new_parent, &new_inode, fsuid)
+            {
+                return err(SyscallError::EPERM);
+            }
+            if old_inode.is_dir() || new_inode.is_dir() {
+                return err(SyscallError::EINVAL);
+            }
+            if old_inode.device_id() != new_inode.device_id() {
+                return err(SyscallError::EXDEV);
+            }
+            if inode_eq(&old_inode, &new_inode) {
+                return 0;
+            }
+
+            let pid = current_process().getpid();
+            let mut tmp_name = String::new();
+            for i in 0..64 {
+                let candidate = alloc::format!(".rename_swap_{}.{}", pid, i);
+                if old_parent.find(&candidate).is_none() && new_parent.find(&candidate).is_none() {
+                    tmp_name = candidate;
+                    break;
+                }
+            }
+            if tmp_name.is_empty() {
+                return err(SyscallError::EBUSY);
+            }
+
+            clear_ext4_path_cache();
+            if let Err(e) = old_parent.link_inode(&tmp_name, &old_inode) {
+                return ext4_err_to_errno(e);
+            }
+            if let Err(e) = old_parent.unlink(&old_name) {
+                let _ = old_parent.unlink(&tmp_name);
+                return ext4_err_to_errno(e);
+            }
+            if let Err(e) = old_parent.link_inode(&old_name, &new_inode) {
+                let _ = old_parent.link_inode(&old_name, &old_inode);
+                let _ = old_parent.unlink(&tmp_name);
+                return ext4_err_to_errno(e);
+            }
+            if let Err(e) = new_parent.unlink(&new_name) {
+                return ext4_err_to_errno(e);
+            }
+            if let Err(e) = new_parent.link_inode(&new_name, &old_inode) {
+                let _ = new_parent.link_inode(&new_name, &new_inode);
+                return ext4_err_to_errno(e);
+            }
+            if let Err(e) = old_parent.unlink(&tmp_name) {
+                return ext4_err_to_errno(e);
+            }
+            0
+        })
+    })
 }
 
 /// Linux `renameat(2)` (syscall 38 on riscv64).
@@ -675,10 +688,9 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
     }
 
     let inode = os_inode.ext4_inode();
-    let (dev, ino, disk_size) = {
-        let _ext4_guard = ext4_lock();
+    let (dev, ino, disk_size) = super::with_ext4_inode_read(&inode, || {
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
-    };
+    });
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     // 当前进程的 user-buffer write 可以直接按用户地址做旧路径镜像。
@@ -769,10 +781,9 @@ pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
     }
 
     let inode = os_inode.ext4_inode();
-    let (dev, ino, disk_size) = {
-        let _ext4_guard = ext4_lock();
+    let (dev, ino, disk_size) = super::with_ext4_inode_read(&inode, || {
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
-    };
+    });
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     // sendfile/splice/copy_file_range 等 kernel-buffer 写入也要同步 mmap 视图。
@@ -808,10 +819,9 @@ fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize)
 }
 
 pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
-    let (dev, ino, disk_size) = {
-        let _ext4_guard = ext4_lock();
+    let (dev, ino, disk_size) = super::with_ext4_inode_read(inode, || {
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
-    };
+    });
     let file_size = inode_visible_size_with_disk_size(inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     let process = current_process();
@@ -821,10 +831,9 @@ pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
 
 pub(crate) fn update_current_os_inode_mmaps_size(os_inode: &OSInode) {
     let inode = os_inode.ext4_inode();
-    let (dev, ino, disk_size) = {
-        let _ext4_guard = ext4_lock();
+    let (dev, ino, disk_size) = super::with_ext4_inode_read(&inode, || {
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
-    };
+    });
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     let process = current_process();
@@ -942,14 +951,15 @@ pub(crate) fn defer_unlink_open_file(
 
 pub(crate) fn truncate_regular_inode(inode: &Arc<ext4_fs::Inode>, new_len: usize) -> isize {
     let (device_id, inode_num, is_dir, is_file, disk_len) = {
-        let _ext4_guard = ext4_lock();
-        (
-            inode.device_id(),
-            inode.inode_num(),
-            inode.is_dir(),
-            inode.is_file(),
-            inode.size() as usize,
-        )
+        super::with_ext4_inode_read(inode, || {
+            (
+                inode.device_id(),
+                inode.inode_num(),
+                inode.is_dir(),
+                inode.is_file(),
+                inode.size() as usize,
+            )
+        })
     };
     if is_dir {
         return err(SyscallError::EISDIR);
@@ -967,55 +977,54 @@ pub(crate) fn truncate_regular_inode(inode: &Arc<ext4_fs::Inode>, new_len: usize
         }
     }
 
-    let _ext4_guard = ext4_lock();
-    let old_len = inode.size() as usize;
-    let ret = if new_len == old_len {
-        0
-    } else if new_len == 0 {
-        match inode.clear() {
-            Ok(_) => 0,
-            Err(e) => ext4_err_to_errno(e),
-        }
-    } else if new_len < old_len {
-        let mut kept = vec![0u8; new_len];
-        let got = inode.read_at(0, &mut kept);
-        if got < new_len {
-            kept[got..].fill(0);
-        }
-        if let Err(e) = inode.clear() {
-            return ext4_err_to_errno(e);
-        }
-        if kept.is_empty() {
+    let ret = with_ext4_inode_write(inode, || {
+        let old_len = inode.size() as usize;
+        if new_len == old_len {
             0
-        } else {
-            match inode.write_at(0, &kept) {
-                Ok(written) if written == kept.len() => 0,
-                Ok(_) => err(SyscallError::EIO),
+        } else if new_len == 0 {
+            match inode.clear() {
+                Ok(_) => 0,
                 Err(e) => ext4_err_to_errno(e),
             }
-        }
-    } else {
-        let mut off = old_len;
-        let zeros = [0u8; 4096];
-        let mut ret = 0;
-        while off < new_len {
-            let chunk = core::cmp::min(zeros.len(), new_len - off);
-            match inode.write_at(off, &zeros[..chunk]) {
-                Ok(0) => {
-                    ret = err(SyscallError::EIO);
-                    break;
-                }
-                Ok(written) => off += written,
-                Err(e) => {
-                    ret = ext4_err_to_errno(e);
-                    break;
+        } else if new_len < old_len {
+            let mut kept = vec![0u8; new_len];
+            let got = inode.read_at(0, &mut kept);
+            if got < new_len {
+                kept[got..].fill(0);
+            }
+            if let Err(e) = inode.clear() {
+                return ext4_err_to_errno(e);
+            }
+            if kept.is_empty() {
+                0
+            } else {
+                match inode.write_at(0, &kept) {
+                    Ok(written) if written == kept.len() => 0,
+                    Ok(_) => err(SyscallError::EIO),
+                    Err(e) => ext4_err_to_errno(e),
                 }
             }
+        } else {
+            let mut off = old_len;
+            let zeros = [0u8; 4096];
+            let mut ret = 0;
+            while off < new_len {
+                let chunk = core::cmp::min(zeros.len(), new_len - off);
+                match inode.write_at(off, &zeros[..chunk]) {
+                    Ok(0) => {
+                        ret = err(SyscallError::EIO);
+                        break;
+                    }
+                    Ok(written) => off += written,
+                    Err(e) => {
+                        ret = ext4_err_to_errno(e);
+                        break;
+                    }
+                }
+            }
+            ret
         }
-        ret
-    };
-    drop(_ext4_guard);
-
+    });
     if ret == 0 && shrinking_visible_size {
         crate::fs::discard_inode_pending_writes_after_truncate(device_id, inode_num, new_len);
     }
@@ -1030,9 +1039,16 @@ pub(crate) fn read_inode_range(
     if len == 0 {
         return Ok(Vec::new());
     }
+    super::with_ext4_inode_read(inode, || read_inode_range_locked(inode, offset, len))
+}
+
+fn read_inode_range_locked(
+    inode: &Arc<ext4_fs::Inode>,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>, isize> {
     let mut out = vec![0u8; len];
     let mut done = 0usize;
-    let _ext4_guard = ext4_lock();
     while done < len {
         let got = inode.read_at(offset + done, &mut out[done..]);
         if got == 0 {
@@ -1050,7 +1066,10 @@ pub(crate) fn write_inode_range(inode: &Arc<ext4_fs::Inode>, offset: usize, data
     if data.is_empty() {
         return 0;
     }
-    let _ext4_guard = ext4_lock();
+    with_ext4_inode_write(inode, || write_inode_range_locked(inode, offset, data))
+}
+
+fn write_inode_range_locked(inode: &Arc<ext4_fs::Inode>, offset: usize, data: &[u8]) -> isize {
     let mut done = 0usize;
     while done < data.len() {
         match inode.write_at(offset + done, &data[done..]) {
@@ -1069,16 +1088,17 @@ pub(crate) fn write_zeros_range(inode: &Arc<ext4_fs::Inode>, offset: usize, len:
     let zeros = [0u8; 4096];
     let mut off = offset;
     let end = offset.saturating_add(len);
-    let _ext4_guard = ext4_lock();
-    while off < end {
-        let chunk = core::cmp::min(zeros.len(), end - off);
-        match inode.write_at(off, &zeros[..chunk]) {
-            Ok(0) => return err(SyscallError::EIO),
-            Ok(written) => off += written,
-            Err(e) => return ext4_err_to_errno(e),
+    with_ext4_inode_write(inode, || {
+        while off < end {
+            let chunk = core::cmp::min(zeros.len(), end - off);
+            match inode.write_at(off, &zeros[..chunk]) {
+                Ok(0) => return err(SyscallError::EIO),
+                Ok(written) => off += written,
+                Err(e) => return ext4_err_to_errno(e),
+            }
         }
-    }
-    0
+        0
+    })
 }
 
 pub(crate) fn punch_hole_keep_size(
@@ -1086,35 +1106,31 @@ pub(crate) fn punch_hole_keep_size(
     offset: usize,
     len: usize,
 ) -> isize {
-    let old_size = {
-        let _ext4_guard = ext4_lock();
-        inode.size() as usize
-    };
-    if old_size == 0 || offset >= old_size || len == 0 {
-        return 0;
-    }
-    let hole_end = core::cmp::min(offset.saturating_add(len), old_size);
-    if hole_end <= offset {
-        return 0;
-    }
-    let prefix = match read_inode_range(inode, 0, offset) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let suffix_len = old_size - hole_end;
-    let suffix = match read_inode_range(inode, hole_end, suffix_len) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    {
-        let _ext4_guard = ext4_lock();
+    with_ext4_inode_write(inode, || {
+        let old_size = inode.size() as usize;
+        if old_size == 0 || offset >= old_size || len == 0 {
+            return 0;
+        }
+        let hole_end = core::cmp::min(offset.saturating_add(len), old_size);
+        if hole_end <= offset {
+            return 0;
+        }
+        let prefix = match read_inode_range_locked(inode, 0, offset) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let suffix_len = old_size - hole_end;
+        let suffix = match read_inode_range_locked(inode, hole_end, suffix_len) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         if let Err(e) = inode.clear() {
             return ext4_err_to_errno(e);
         }
-    }
-    let ret = write_inode_range(inode, 0, &prefix);
-    if ret != 0 {
-        return ret;
-    }
-    write_inode_range(inode, hole_end, &suffix)
+        let ret = write_inode_range_locked(inode, 0, &prefix);
+        if ret != 0 {
+            return ret;
+        }
+        write_inode_range_locked(inode, hole_end, &suffix)
+    })
 }

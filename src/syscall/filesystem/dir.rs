@@ -3,7 +3,7 @@ use super::{
     S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, SyscallError, align_up, apply_umask,
     cgroup_mkdir, cgroup_rmdir, current_effective_uid_gid, current_fsuid_gid, current_process,
     defer_unlink_open_file, do_renameat, do_renameat_exchange, dt_type_from_ext4, err,
-    ext4_err_to_errno, ext4_lock, final_non_empty_component, get_current_token, get_fd_file,
+    ext4_err_to_errno, ext4_inode_lock, final_non_empty_component, get_current_token, get_fd_file,
     gid_for_created_inode, hardlink_cross_mount, inode_is_immutable_or_append,
     inode_is_rofs_mount_root, inode_logical_path, inode_mode_allows_uid_gid,
     invalidate_ext4_path_cache_for_at, invalidate_ext4_path_cache_inode, maybe_update_inode_atime,
@@ -45,8 +45,9 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
             return err(SyscallError::EINVAL);
         };
-        let _ext4_guard = ext4_lock();
         let inode = os_inode.ext4_inode();
+        let inode_lock = ext4_inode_lock(&inode);
+        let _inode_guard = inode_lock.read();
         if !inode.is_symlink() {
             return err(SyscallError::EINVAL);
         }
@@ -94,11 +95,12 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
     }
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, false) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    let inode_lock = ext4_inode_lock(&inode);
+    let _inode_guard = inode_lock.read();
     if !inode.is_symlink() {
         return err(SyscallError::EINVAL);
     }
@@ -135,11 +137,12 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
     let path_rofs = rofs_for_path(newdirfd, &path);
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    let parent_lock = ext4_inode_lock(&parent);
+    let _parent_guard = parent_lock.write();
     if !parent.is_dir() {
         return err(SyscallError::ENOTDIR);
     }
@@ -240,8 +243,6 @@ pub fn syscall_linkat(
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_old = (flags & AT_SYMLINK_FOLLOW) != 0;
-    let _ext4_guard = ext4_lock();
-
     let source = if let Some(at) = old_at {
         match at {
             AtPath::PseudoAbs(abs) => {
@@ -274,14 +275,18 @@ pub fn syscall_linkat(
         };
         os_inode.ext4_inode()
     };
-    if source.is_dir() {
-        return err(SyscallError::EPERM);
-    }
 
     let (parent, name) = match resolve_parent_and_name(&new_at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    let parent_lock = ext4_inode_lock(&parent);
+    let _parent_guard = parent_lock.write();
+    if source.is_dir() {
+        return err(SyscallError::EPERM);
+    }
+    let source_lock = ext4_inode_lock(&source);
+    let _source_guard = source_lock.write();
     if !parent.is_dir() {
         return err(SyscallError::ENOTDIR);
     }
@@ -393,7 +398,6 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     let path_rofs = rofs_for_path(dirfd, &path);
     let (fsuid, fsgid) = current_fsuid_gid();
 
-    let _ext4_guard = ext4_lock();
     let dirfd_rofs = matches!(
         &at,
         AtPath::Ext4Rel { base, .. } if inode_is_rofs_mount_root(base)
@@ -402,6 +406,8 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
         Ok(v) => v,
         Err(e) => return e,
     };
+    let parent_lock = ext4_inode_lock(&parent);
+    let _parent_guard = parent_lock.write();
     if dirfd_rofs || path_rofs {
         return err(SyscallError::EROFS);
     }
@@ -512,7 +518,6 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     }
     let path_rofs = rofs_for_path(dirfd, &path);
 
-    let _ext4_guard = ext4_lock();
     if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
         return err(SyscallError::EEXIST);
     }
@@ -523,6 +528,8 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
         Ok(v) => v,
         Err(e) => return e,
     };
+    let parent_lock = ext4_inode_lock(&parent);
+    let _parent_guard = parent_lock.write();
     if !parent.is_dir() {
         return err(SyscallError::ENOTDIR);
     }
@@ -590,13 +597,27 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         Err(e) => return e,
     };
 
+    match final_non_empty_component(&path) {
+        // Reject self/parent names before locking the parent inode.  Otherwise
+        // unlink without AT_REMOVEDIR could try to take the same i_rwsem again
+        // after resolving "." or "..".
+        Some(".") => {
+            return err(if remove_dir {
+                SyscallError::EINVAL
+            } else {
+                SyscallError::EISDIR
+            });
+        }
+        Some("..") => {
+            return err(if remove_dir {
+                SyscallError::ENOTEMPTY
+            } else {
+                SyscallError::EISDIR
+            });
+        }
+        _ => {}
+    }
     if remove_dir {
-        if final_non_empty_component(&path) == Some(".") {
-            return err(SyscallError::EINVAL);
-        }
-        if final_non_empty_component(&path) == Some("..") {
-            return err(SyscallError::ENOTEMPTY);
-        }
         if let AtPath::PseudoAbs(abs) = &at {
             let cgroup_rc = cgroup_rmdir(abs);
             if cgroup_rc != err(SyscallError::EROFS) {
@@ -651,7 +672,6 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     let path_rofs = rofs_for_path(dirfd, &path);
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
         return err(SyscallError::EISDIR);
     }
@@ -662,6 +682,8 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         Ok(v) => v,
         Err(e) => return e,
     };
+    let parent_lock = ext4_inode_lock(&parent);
+    let _parent_guard = parent_lock.write();
 
     if !parent.is_dir() {
         return err(SyscallError::ENOTDIR);
@@ -683,6 +705,8 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         }
         return err(SyscallError::ENOENT);
     };
+    let child_lock = ext4_inode_lock(&child);
+    let _child_guard = child_lock.write();
     if remove_dir {
         if !child.is_dir() {
             return err(SyscallError::ENOTDIR);
@@ -839,7 +863,8 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         }
     }
 
-    let ext4_guard = ext4_lock();
+    let inode_lock = ext4_inode_lock(&inode);
+    let _inode_guard = inode_lock.read();
     if !inode.is_dir() {
         return err(SyscallError::ENOTDIR);
     };
@@ -958,7 +983,6 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     }
 
     os_inode.set_dir_offset(off);
-    drop(ext4_guard);
     if written > 0 {
         maybe_update_inode_atime(&inode, true);
     }

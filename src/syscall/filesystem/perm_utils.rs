@@ -1,4 +1,6 @@
-use super::{SyscallError, clear_ext4_path_cache, current_process, err};
+use super::{
+    SyscallError, clear_ext4_path_cache, current_process, err, with_ext4_inode_write,
+};
 
 /// Converts ext4 backend errors into Linux-style `errno` values.
 pub(crate) fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
@@ -61,6 +63,10 @@ pub(crate) fn maybe_clear_suid_sgid_after_chown(inode: &ext4_fs::Inode, touched_
 
 /// Applies `chown`/`chgrp` semantics to an inode using current credentials.
 pub(crate) fn apply_chown_to_inode(inode: &ext4_fs::Inode, uid: usize, gid: usize) -> isize {
+    with_ext4_inode_write(inode, || apply_chown_to_inode_locked(inode, uid, gid))
+}
+
+fn apply_chown_to_inode_locked(inode: &ext4_fs::Inode, uid: usize, gid: usize) -> isize {
     let uid_req = parse_chown_id(uid);
     let gid_req = parse_chown_id(gid);
     let (euid, _egid) = current_effective_uid_gid();

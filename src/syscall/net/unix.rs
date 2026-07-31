@@ -20,7 +20,7 @@ use spin::Mutex;
 use crate::bpf::BpfProgFile;
 use crate::fs::{
     File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, clear_ext4_path_cache,
-    ext4_lock, find_path_in_roots, make_socketpair, wake_tasks,
+    ext4_inode_lock, find_path_in_roots, make_socketpair, wake_tasks,
 };
 use crate::mm::{
     UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
@@ -1313,10 +1313,11 @@ pub(super) fn bind_unix_socket(
         let Some((parent_path, name)) = split_parent_and_name(abs) else {
             return err(SyscallError::EINVAL);
         };
-        let _fs_guard = ext4_lock();
         let Some(parent) = find_path_in_roots(parent_path) else {
             return err(SyscallError::ENOENT);
         };
+        let parent_lock = ext4_inode_lock(&parent);
+        let _parent_guard = parent_lock.write();
         if !parent.is_dir() {
             return err(SyscallError::ENOTDIR);
         }

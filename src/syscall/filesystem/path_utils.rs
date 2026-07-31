@@ -3,8 +3,8 @@ use super::{
     MAX_SYMLINKS, NAME_MAX, O_TRUNC, OSInode, PATH_MAX, PseudoDir, PseudoShmFile, String,
     SyscallError, Vec, XATTR_CREATE, XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX,
     clear_ext4_path_cache, current_cwd_path, current_files, current_fsuid_gid,
-    current_mount_namespace, current_process, err, ext4_lock, ext4_path_cache_lookup,
-    fd_has_o_path, find_path_in_roots, get_current_token, get_fd_file,
+    current_mount_namespace, current_process, err, ext4_inode_lock, fd_has_o_path,
+    find_path_in_roots, get_current_token, get_fd_file,
     inode_is_immutable_or_append, inode_mode_allows_uid_gid, install_open_file_fd,
     invalidate_ext4_path_cache, invalidate_ext4_path_cache_subtree, logical_path_for_inode,
     logical_path_for_open_fd, mount_lookup_for_abs, note_ext4_path_cache, open_pseudo,
@@ -367,7 +367,6 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
         } else {
             String::from(abs[mount.target.len()..].trim_start_matches('/'))
         };
-        let _ext4_guard = ext4_lock();
         let Some(base) = find_path_in_roots(&mount.source) else {
             return Err(err(SyscallError::ENOENT));
         };
@@ -380,7 +379,6 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
         normalize_relative_path(path)
     };
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let mut depth = 0usize;
     let mut seen_symlinks = Vec::new();
     let base = resolve_ext4_abs_path(
@@ -462,7 +460,7 @@ pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize>
 ///
 /// `root_inode_for_path` selects exactly one backing filesystem.  An ENOENT
 /// therefore stays on that filesystem and never falls through to another disk.
-/// 需在调用前持有 `ext4_lock`。
+/// 每个路径分量在查找时获取父目录的共享 inode 锁。
 pub(crate) fn resolve_ext4_abs_path(
     path: &str,
     uid: u32,
@@ -472,9 +470,6 @@ pub(crate) fn resolve_ext4_abs_path(
     seen_symlinks: &mut Vec<u32>,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let abs = crate::fs::normalize_proc_magic_path(path).into_owned();
-    if let Some(inode) = ext4_path_cache_lookup(&abs, uid, gid, follow_final) {
-        return Ok(inode);
-    }
 
     let primary = crate::fs::root_inode_for_path(&abs);
     let lookup_path = crate::fs::path_within_filesystem(&abs);
@@ -719,7 +714,6 @@ pub(crate) fn resolve_xattr_path_inode(
         return Err(err(SyscallError::ENOENT));
     }
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     resolve_at_inode(&at, fsuid, fsgid, follow_final)
 }
 
@@ -879,7 +873,7 @@ pub(crate) fn do_removexattr(inode: &Arc<ext4_fs::Inode>, name: &str) -> isize {
 /// - 目录执行权限检查（`x` 位）；
 /// - 符号链接解引用（`follow_final` 控制是否解引用最后一个分量），
 ///   检测循环（深度 + 已见 inode 集合），绝对符号链接回到根解析。
-/// 需在调用前持有 `ext4_lock`。
+/// 每个路径分量在查找时获取父目录的共享 inode 锁。
 pub(crate) fn resolve_ext4_path(
     start: alloc::sync::Arc<ext4_fs::Inode>,
     path: &str,
@@ -910,6 +904,8 @@ pub(crate) fn resolve_ext4_path(
         }
         if seg == ".." {
             let cur = stack.last().unwrap().clone();
+            let cur_lock = ext4_inode_lock(&cur);
+            let _cur_guard = cur_lock.read();
             if !cur.is_dir() {
                 return Err(err(SyscallError::ENOTDIR));
             }
@@ -930,16 +926,23 @@ pub(crate) fn resolve_ext4_path(
             continue;
         }
         let cur = stack.last().unwrap().clone();
-        if !cur.is_dir() {
-            return Err(err(SyscallError::ENOTDIR));
-        }
-        if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
-            return Err(err(SyscallError::EACCES));
-        }
-        let Some(next) = cur.find(seg) else {
-            return Err(err(SyscallError::ENOENT));
+        let next = {
+            let cur_lock = ext4_inode_lock(&cur);
+            let _cur_guard = cur_lock.read();
+            if !cur.is_dir() {
+                return Err(err(SyscallError::ENOTDIR));
+            }
+            if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
+                return Err(err(SyscallError::EACCES));
+            }
+            let Some(next) = cur.find(seg) else {
+                return Err(err(SyscallError::ENOENT));
+            };
+            next
         };
         let is_last = idx + 1 == components.len();
+        let next_lock = ext4_inode_lock(&next);
+        let next_guard = next_lock.read();
         if next.is_symlink() && (follow_final || !is_last) {
             if *depth >= MAX_SYMLINKS {
                 return Err(err(SyscallError::ELOOP));
@@ -951,6 +954,7 @@ pub(crate) fn resolve_ext4_path(
             seen_symlinks.push(inode_num);
             *depth += 1;
             let target_bytes = next.read_all();
+            drop(next_guard);
             let target = String::from_utf8_lossy(&target_bytes).into_owned();
             if target.is_empty() {
                 return Err(err(SyscallError::ENOENT));
@@ -980,6 +984,7 @@ pub(crate) fn resolve_ext4_path(
             }
             return resolve_ext4_path(cur, &new_path, uid, gid, follow_final, depth, seen_symlinks);
         }
+        drop(next_guard);
         stack.push(next);
         idx += 1;
     }
@@ -999,17 +1004,27 @@ fn resolve_ext4_path_fast_no_symlink(
         if seg == "." || seg == ".." {
             return None;
         }
-        if !cur.is_dir() {
-            return Some(Err(err(SyscallError::ENOTDIR)));
-        }
-        if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
-            return Some(Err(err(SyscallError::EACCES)));
-        }
-        let Some(next) = cur.find(seg) else {
-            return Some(Err(err(SyscallError::ENOENT)));
+        let next = {
+            let cur_lock = ext4_inode_lock(&cur);
+            let _cur_guard = cur_lock.read();
+            if !cur.is_dir() {
+                return Some(Err(err(SyscallError::ENOTDIR)));
+            }
+            if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
+                return Some(Err(err(SyscallError::EACCES)));
+            }
+            let Some(next) = cur.find(seg) else {
+                return Some(Err(err(SyscallError::ENOENT)));
+            };
+            next
         };
         let is_last = components.peek().is_none();
-        if next.is_symlink() && (follow_final || !is_last) {
+        let next_is_symlink = {
+            let next_lock = ext4_inode_lock(&next);
+            let _next_guard = next_lock.read();
+            next.is_symlink()
+        };
+        if next_is_symlink && (follow_final || !is_last) {
             return None;
         }
         cur = next;
@@ -1067,8 +1082,9 @@ pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
         return Err(err(SyscallError::ENOENT));
     }
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+    let inode_lock = ext4_inode_lock(&inode);
+    let _inode_guard = inode_lock.read();
     if !inode.is_file() {
         return Err(err(SyscallError::EACCES));
     }
@@ -1118,17 +1134,19 @@ pub(crate) fn resolve_exec_inode_at(
         if let AtPath::PseudoAbs(_) = &at {
             return Err(err(SyscallError::ENOENT));
         }
-        // Resolve the lookup path before taking `ext4_lock()`: the AT_FDCWD
-        // relative-path branch may need to reopen the base inode under the
-        // same lock, and holding it here would self-deadlock.
-        let _ext4_guard = ext4_lock();
         let inode = resolve_at_inode(&at, fsuid, fsgid, follow_final)?;
-        if !follow_final && inode.is_symlink() {
+        let is_symlink = {
+            let inode_lock = ext4_inode_lock(&inode);
+            let _inode_guard = inode_lock.read();
+            inode.is_symlink()
+        };
+        if !follow_final && is_symlink {
             return Err(err(SyscallError::ELOOP));
         }
         inode
     };
-    let _ext4_guard = ext4_lock();
+    let inode_lock = ext4_inode_lock(&inode);
+    let _inode_guard = inode_lock.read();
     if !inode.is_file() {
         return Err(err(SyscallError::EACCES));
     }
@@ -1146,8 +1164,9 @@ pub(crate) fn resolve_read_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
         return Err(err(SyscallError::ENOENT));
     }
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
     let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+    let inode_lock = ext4_inode_lock(&inode);
+    let _inode_guard = inode_lock.read();
     if !inode.is_file() {
         return Err(err(SyscallError::EACCES));
     }

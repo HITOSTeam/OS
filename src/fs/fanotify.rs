@@ -16,7 +16,7 @@ use spin::Mutex;
 
 use crate::{
     fs::{
-        File, OSInode, POLLIN, POLLOUT, PollWaitQueue, ext4_lock, find_path_in_roots,
+        File, OSInode, POLLIN, POLLOUT, PollWaitQueue, find_path_in_roots,
         inode_raw_logical_path, wake_tasks,
     },
     mm::UserBuffer,
@@ -769,7 +769,6 @@ fn parent_key_for_event_path(path: Option<&str>) -> Option<FanotifyInodeKey> {
         Some(pos) => &trimmed[..pos],
         None => return None,
     };
-    let _guard = ext4_lock();
     find_path_in_roots(&translate_mount_abs(parent))
         .map(|inode| FanotifyInodeKey::from_inode(&inode))
 }

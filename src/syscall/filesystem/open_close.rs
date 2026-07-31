@@ -6,7 +6,7 @@ use super::{
     O_WRONLY, OSInode, Ordering, ProcMagicLinkFile, PseudoShmFile, S_IFBLK, S_IFCHR, S_IFMT,
     SyscallError, TMPFILE_SEQ, apply_umask, clear_ext4_path_cache, current_effective_uid_gid,
     current_files, current_files_and_nofile_limit, current_fsuid_gid, current_process, err,
-    ext4_err_to_errno, ext4_lock, fanotify_notify_close, fanotify_notify_open,
+    ext4_err_to_errno, ext4_inode_lock, fanotify_notify_close, fanotify_notify_open,
     fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key, file_lock_key_from_inode,
     get_current_token, gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid,
     install_open_file_fd_for_path, invalidate_ext4_path_cache_for_at, is_privileged_or_owner,
@@ -16,7 +16,7 @@ use super::{
     remove_process_record_locks_for_key, reopen_proc_link_file, resolve_abs_path, resolve_at_inode,
     resolve_at_path, resolve_parent_and_name, root_inode_for_device, set_inode_all_times_now,
     shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, truncate_regular_inode,
-    try_write_user_value,
+    try_write_user_value, with_ext4_inode_read,
 };
 
 /// Opens or creates a filesystem object across ext4, proc, pseudo-fs, and tmpfile paths.
@@ -90,14 +90,14 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     };
     let create_mode = apply_umask(mode);
     let mut created = false;
-    let mut created_parent: Option<alloc::sync::Arc<ext4_fs::Inode>> = None;
     let mut tmpfile_cleanup_parent: Option<alloc::sync::Arc<ext4_fs::Inode>> = None;
     let mut tmpfile_cleanup_name: Option<alloc::string::String> = None;
     let (fsuid, fsgid) = current_fsuid_gid();
     if let Some(abs) = raw_abs.as_deref() {
         if path_is_nosymfollow(abs) {
-            let _ext4_guard = ext4_lock();
             if let Ok(inode) = resolve_at_inode(&at, fsuid, fsgid, false) {
+                let inode_lock = ext4_inode_lock(&inode);
+                let _inode_guard = inode_lock.read();
                 if inode.is_symlink() {
                     return err(SyscallError::ELOOP);
                 }
@@ -196,8 +196,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         return fd as isize;
     }
 
-    let ext4_guard = ext4_lock();
-
     // ext4 lookup with search permission checks and symlink resolution.
     let mut inode = match resolve_at_inode(&at, fsuid, fsgid, !nofollow) {
         Ok(v) => Some(v),
@@ -212,7 +210,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 
     if !o_path && nofollow {
         if let Some(inode_ref) = inode.as_ref() {
-            if inode_ref.is_symlink() {
+            if with_ext4_inode_read(inode_ref, || inode_ref.is_symlink()) {
                 return err(SyscallError::ELOOP);
             }
         }
@@ -228,18 +226,26 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             Some(ref i) => alloc::sync::Arc::clone(i),
             None => return err(SyscallError::ENOENT),
         };
-        if !dir_inode.is_dir() {
-            return err(SyscallError::ENOTDIR);
-        }
-        if !inode_mode_allows_uid_gid(&dir_inode, 3, fsuid, fsgid) {
-            return err(SyscallError::EACCES);
-        }
+        let (created_gid, created_mode) = {
+            let dir_lock = ext4_inode_lock(&dir_inode);
+            let _dir_guard = dir_lock.read();
+            if !dir_inode.is_dir() {
+                return err(SyscallError::ENOTDIR);
+            }
+            if !inode_mode_allows_uid_gid(&dir_inode, 3, fsuid, fsgid) {
+                return err(SyscallError::EACCES);
+            }
+            let gid = gid_for_created_inode(Some(&dir_inode), fsgid);
+            (gid, mode_for_created_file(create_mode, gid))
+        };
         // Emulate anonymous tmpfile semantics using a hidden per-filesystem pool.
         // Use the known root inode for the same block device to avoid relying on
         // per-directory ".." lookups (which can leave stale hidden entries behind).
         let fs_root = root_inode_for_device(dir_inode.device_id())
             .unwrap_or_else(|| alloc::sync::Arc::clone(&dir_inode));
         let pool_name = ".ltp_tmpfile_pool";
+        let fs_root_lock = ext4_inode_lock(&fs_root);
+        let fs_root_guard = fs_root_lock.write();
         let pool_dir = if let Some(existing) = fs_root.find(pool_name) {
             if !existing.is_dir() {
                 return err(SyscallError::ENOTDIR);
@@ -256,9 +262,12 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                 Err(e) => return ext4_err_to_errno(e),
             }
         };
+        drop(fs_root_guard);
 
         let pid = current_process().getpid();
         let mut tmp_created = None;
+        let pool_lock = ext4_inode_lock(&pool_dir);
+        let _pool_guard = pool_lock.write();
         for _ in 0..64 {
             let seq = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
             let name = alloc::format!(".tmp.{}.{}", pid, seq);
@@ -267,6 +276,11 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             }
             match pool_dir.create_file(&name) {
                 Ok(i) => {
+                    let child_lock = ext4_inode_lock(&i);
+                    let _child_guard = child_lock.write();
+                    i.set_uid_gid(fsuid, created_gid);
+                    i.set_mode(created_mode);
+                    set_inode_all_times_now(&i);
                     clear_ext4_path_cache();
                     tmp_created = Some(i);
                     tmpfile_cleanup_parent = Some(alloc::sync::Arc::clone(&pool_dir));
@@ -279,8 +293,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         let Some(tmp_inode) = tmp_created else {
             return err(SyscallError::ENOSPC);
         };
-        // Use target directory for mode/gid inheritance semantics.
-        created_parent = Some(dir_inode);
         inode = Some(tmp_inode);
         created = true;
     }
@@ -293,6 +305,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                     Ok(v) => v,
                     Err(e) => return e,
                 };
+                let parent_lock = ext4_inode_lock(&parent);
+                let _parent_guard = parent_lock.write();
                 if !parent.is_dir() {
                     if debug_close {
                         crate::println!("[fs] openat close-test parent not dir");
@@ -307,9 +321,15 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                 }
                 inode = match parent.create_file(&name) {
                     Ok(i) => {
+                        let created_gid = gid_for_created_inode(Some(&parent), fsgid);
+                        let created_mode = mode_for_created_file(create_mode, created_gid);
+                        let child_lock = ext4_inode_lock(&i);
+                        let _child_guard = child_lock.write();
+                        i.set_uid_gid(fsuid, created_gid);
+                        i.set_mode(created_mode);
+                        set_inode_all_times_now(&i);
                         invalidate_ext4_path_cache_for_at(&at, false);
                         created = true;
-                        created_parent = Some(alloc::sync::Arc::clone(&parent));
                         Some(i)
                     }
                     Err(e) => {
@@ -336,19 +356,14 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     if let Some(abs) = raw_abs.as_deref() {
-        let mode = inode.mode() & S_IFMT;
+        let mode = with_ext4_inode_read(&inode, || inode.mode() & S_IFMT);
         if path_is_nodev(abs) && matches!(mode, S_IFCHR | S_IFBLK) {
             return err(SyscallError::EACCES);
         }
     }
 
-    if created {
-        let created_gid = gid_for_created_inode(created_parent.as_deref(), fsgid);
-        let created_mode = mode_for_created_file(create_mode, created_gid);
-        inode.set_uid_gid(fsuid, created_gid);
-        inode.set_mode(created_mode);
-        set_inode_all_times_now(&inode);
-    }
+    let inode_lock = ext4_inode_lock(&inode);
+    let inode_guard = inode_lock.read();
     if debug_close {
         crate::println!(
             "[fs] openat close-test inode={} mode=0o{:o} is_dir={} is_file={} created={}",
@@ -416,14 +431,14 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
         let accmode = flags & O_ACCMODE;
         if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
-            drop(ext4_guard);
+            drop(inode_guard);
             return err(SyscallError::ENXIO);
         }
         let Some(file) = state.open_file(accmode) else {
-            drop(ext4_guard);
+            drop(inode_guard);
             return err(SyscallError::EINVAL);
         };
-        drop(ext4_guard);
+        drop(inode_guard);
         let logical_abs = raw_abs.as_deref().unwrap_or("/");
         let fd = match install_open_file_fd_for_path(file, flags, o_path, logical_abs) {
             Ok(fd) => fd,
@@ -470,7 +485,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     let needs_trunc = !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file();
-    drop(ext4_guard);
+    drop(inode_guard);
     if needs_trunc {
         let ret = truncate_regular_inode(&inode, 0);
         if ret != 0 {
@@ -517,9 +532,8 @@ pub fn syscall_close(fd: usize) -> isize {
         };
         // Keep the removed file alive until after `files_lock` is released.
         // Linux likewise detaches the fd under the table lock and performs
-        // filesystem close work outside it.  In particular, ext4_lock() may
-        // cooperatively yield when contended and must never be reached while
-        // holding this shared spin lock.
+        // filesystem close work outside it.  Per-inode sleeping locks must
+        // never be reached while holding this shared spin lock.
         let removed = files
             .clear_fd(fd)
             .expect("fd disappeared while files_lock was held");
@@ -534,10 +548,7 @@ pub fn syscall_close(fd: usize) -> isize {
         .map(|os_inode| {
             let inode = os_inode.ext4_inode();
             let path = os_inode.fanotify_path();
-            let is_dir = {
-                let _guard = ext4_lock();
-                inode.is_dir()
-            };
+            let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
             (inode, file.writable(), is_dir, path)
         });
     if let Some((inode, writable, is_dir, path)) = fanotify_close {
