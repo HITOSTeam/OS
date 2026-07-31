@@ -81,7 +81,7 @@ impl PositiveDentryCache {
             return Ok(found);
         }
 
-        /// Not stable we need to make sure the cached node is equal to the old one .
+        // For dynamic nodes, make sure the cached dentry still names the same node.
         let node = parent.node().lookup(name)?;
         if let Some(found) = self.entries.read().get(&key).and_then(Weak::upgrade)
             && found.node().filesystem_id() == node.filesystem_id()

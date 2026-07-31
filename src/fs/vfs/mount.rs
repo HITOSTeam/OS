@@ -311,11 +311,11 @@ impl VfsMountNamespace {
             .cloned()
             .ok_or(VfsError::Invalid)?;
         if !lazy {
-            /// 仍然在被使用
+            // 仍然在被使用
             if mount.pin_count() != 0 {
                 return Err(VfsError::Busy);
             }
-            /// 仍然有子对象
+            // 仍然有子对象
             if graph
                 .edges
                 .keys()

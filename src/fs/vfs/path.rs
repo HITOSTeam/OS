@@ -91,13 +91,13 @@ impl PathWalker {
             return Err(VfsError::CrossDevice);
         }
 
-        /// clone : 持有，放置访问中途节点的消失 就死了
+        // Clone the root path so nodes remain alive throughout the walk.
         let lookup_root = if flags.contains(LookupFlags::IN_ROOT) {
             start.clone()
         } else {
             process_root.clone()
         };
-        /// relative or absolute：where we start
+        // Select the starting point for relative or absolute lookup.
         let mut current = if path.starts_with('/') {
             lookup_root.clone()
         } else {
@@ -108,23 +108,23 @@ impl PathWalker {
         let mut components = split_components(path);
         let mut symlinks = 0usize;
 
-        /// 以下逻辑是处理路径中的 . 于 ..
+        // Handle `.` and `..` components.
         while let Some(component) = components.pop_front() {
             match component.as_str() {
                 "" | "." => continue,
                 ".." => {
-                    /// 禁止跳出root
+                    // 禁止跳出 root。
                     if current.same_object(&lookup_root) {
                         continue;
                     }
-                    /// 禁止跨设备
+                    // 禁止跨设备。
                     let parent = self.namespace.ascend(&current);
                     if flags.contains(LookupFlags::NO_XDEV)
                         && parent.mount().id() != current.mount().id()
                     {
                         return Err(VfsError::CrossDevice);
                     }
-                    /// BENEATH 标志禁止跨越
+                    // BENEATH 标志禁止跨越。
                     if flags.contains(LookupFlags::BENEATH) && current.same_object(&beneath_root) {
                         return Err(VfsError::CrossDevice);
                     }
@@ -134,10 +134,10 @@ impl PathWalker {
                 _ => {}
             }
 
-            /// 处于目录访问，检查权限
+            // 处于目录访问，检查权限。
             check_search_permission(current.node().metadata()?, credentials)?;
             let parent = current.clone();
-            /// component 是我们下一个要去的地方
+            // component 是我们下一个要去的地方。
             let dentry = self.dcache.lookup(parent.dentry(), &component)?;
             let unmounted = VfsPath::new(Arc::clone(parent.mount()), dentry);
             let mounted = self.namespace.follow_mounts(unmounted.clone());
@@ -217,10 +217,10 @@ fn check_search_permission(metadata: VfsMetadata, credentials: VfsCredentials) -
     if credentials.uid == 0 {
         return Ok(());
     }
-    /// check owner
+    // Check owner permissions first.
     let shift = if credentials.uid == metadata.uid {
         6
-    /// check group id
+    // Otherwise check the owning group.
     } else if credentials.gid == metadata.gid {
         3
     } else {
