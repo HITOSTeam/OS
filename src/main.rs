@@ -174,6 +174,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         clear_bss();
         //顺便标记第一个cpu核心已经进入到初始化阶段了
         BOOT_BSS_CLEARED.store(true, Ordering::Release);
+        //标记现在某个核心去读取DTB
         arch::DTB_data::init(dtb_pa, hart_id);
         let num_of_apps = unsafe { *(num_user_apps as *const i64) };
         println!(

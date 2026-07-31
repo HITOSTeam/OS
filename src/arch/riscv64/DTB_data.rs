@@ -15,23 +15,44 @@ const VIRTIO_MMIO_COMPATIBLE: &[u8] = b"virtio,mmio";
 
 #[derive(Clone, Copy)]
 struct VirtioMmioDevice {
+    /// virtio-mmio 设备控制寄存器区的物理基地址（来自 DTB 的 reg 属性）
     base: usize,
+    /// virtio-mmio 设备控制寄存器区的长度（字节）
     size: usize,
 }
 
 /// 在内存管理初始化前构造完成、随后保持不变的 RISC-V 平台描述。
 pub struct DtbData {
+    /// 活动 hart 位图：第 n 位为 1 表示编号为 n 的 hart 存在且可用
     active_hart_mask: usize,
+
+    /// 时基频率：RISC-V time 计数器（mtime/cycle）每秒的 tick 数，
+    /// 来自 DTB /cpus 节点的 timebase-frequency 属性，用于时钟与时延换算
     timebase_frequency: usize,
-    //是否所有核心都有sstc寄存器
+
+    /// 是否所有活动 hart 都支持 sstc 扩展（S 态直接写 stimecmp 的时钟比较器，
+    /// 支持时无需在 S 态读 mtime，且能避免陷入 M 态处理定时器）
     all_harts_have_sstc: bool,
+
+    /// 物理内存区域数组，每项为闭区间 (起始地址, 结束地址)，
+    /// 已按起始地址排序并合并相邻/重叠区域
     phys_mem_ranges: [(usize, usize); MAX_PHYS_MEMORY_REGIONS],
+    /// 有效物理内存区域的数量（<= phys_mem_ranges 的容量）
     phys_mem_range_count: usize,
+    /// 保留内存区域数组（启动协议保留区及 /reserved-memory 节点），
+    /// 每项为 (起始地址, 结束地址)，同样已排序合并
     reserved_ranges: [(usize, usize); MAX_RESERVED_MEMORY_REGIONS],
+    /// 有效保留内存区域的数量
     reserved_range_count: usize,
+
+    /// 需要建立页表映射的 MMIO 区域数组（串口 ns16550a、fw-cfg、
+    /// syscon、virtio-mmio 等），每项为 (起始地址, 结束地址)
     mmio_ranges: [(usize, usize); MAX_DTB_MMIO_REGIONS],
+    /// 有效 MMIO 区域的数量
     mmio_range_count: usize,
+    /// 检测到的 virtio-mmio 设备数组，按基地址排序
     virtio_mmio_devices: [VirtioMmioDevice; MAX_VIRTIO_MMIO_DEVICES],
+    /// 有效 virtio-mmio 设备的数量
     virtio_mmio_device_count: usize,
 }
 
@@ -286,9 +307,12 @@ fn parse_mmio_ranges(
 
 impl DtbData {
     fn parse(dtb_pa: usize, boot_hart_id: usize) -> Self {
+        // 发现给的dtb地址是空指针
         assert_ne!(dtb_pa, 0, "RISC-V boot protocol supplied a null DTB pointer");
+        // safety：输入的DTB指针是正确的，如果不是的话直接panic
         let fdt = unsafe { Fdt::from_ptr(dtb_pa as *const u8) }
             .unwrap_or_else(|error| panic!("invalid RISC-V DTB at {dtb_pa:#x}: {error:?}"));
+        //查找cpu相关的部分
         let (active_hart_mask, timebase_frequency, all_harts_have_sstc) =
             parse_cpu_topology(&fdt, boot_hart_id);
         let (phys_mem_ranges, phys_mem_range_count) = parse_memory_ranges(&fdt);

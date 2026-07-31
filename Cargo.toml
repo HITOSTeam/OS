@@ -2,6 +2,9 @@
 name = "os"
 version = "0.1.0"
 edition = "2024"
+# 独立内核仅从 `src/main.rs` 构建；`src/lib.rs` 没有下游使用者，启用它会
+# 额外产生一个没有入口点的重复构建目标。
+autolib = false
 
 [lints.rust]
 unreachable_patterns = "warn"

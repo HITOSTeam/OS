@@ -1,10 +1,12 @@
 use crate::syscall::error::{SyscallError, err};
 use alloc::sync::Arc;
 
+#[cfg(target_arch = "riscv64")]
+use crate::fs::UserfaultfdFile;
 use crate::{
     fs::{
         DummyFile, EventFdFile, File, PidFdFile, PseudoShmFile, SignalfdFile, TimerFdFile,
-        UserfaultfdFile, shm_create_anonymous,
+        shm_create_anonymous,
     },
     mm::{try_copy_from_user, try_read_user_value, try_write_user_value},
     task::{
@@ -305,6 +307,7 @@ pub fn syscall_pidfd_open(pid: usize, flags: usize) -> isize {
     alloc_fd(Arc::new(PidFdFile::new(&process)), descriptor_flags)
 }
 
+#[cfg(target_arch = "riscv64")]
 pub fn syscall_userfaultfd(flags: usize) -> isize {
     const UFFD_USER_MODE_ONLY: usize = 0x1;
     let known = CLOEXEC_FLAG | NONBLOCK_FLAG | UFFD_USER_MODE_ONLY;
@@ -321,6 +324,14 @@ pub fn syscall_userfaultfd(flags: usize) -> isize {
     alloc_fd(Arc::new(UserfaultfdFile::new()), descriptor_flags)
 }
 
+// LoongArch 尚无已注册范围的页故障钩子。返回 ENOSYS 比创建一个无法处理缺页的
+// 描述符更安全。
+#[cfg(target_arch = "loongarch64")]
+pub fn syscall_userfaultfd(_flags: usize) -> isize {
+    err(SyscallError::ENOSYS)
+}
+
+#[cfg(target_arch = "riscv64")]
 pub fn try_handle_userfaultfd_page_fault(addr: usize, is_write: bool) -> bool {
     // 页故障可能发生在持有 fd 表锁的 syscall/uaccess 内，不能在 trap 路径再次
     // 阻塞获取同一把锁，否则当前任务会递归等待自己，其他 hart 也会一起堵塞。

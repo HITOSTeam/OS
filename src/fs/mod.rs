@@ -21,6 +21,9 @@ mod socketpair; // socketpair 两端
 mod stdio; // 标准输入输出
 mod timerfd; // timerfd
 mod tty; // tty / pty
+// LoongArch 尚未将 userfaultfd 接入页故障入口；仅为已具备该钩子的架构编译
+// 描述符实现。
+#[cfg(target_arch = "riscv64")]
 mod userfaultfd; // userfaultfd
 use crate::mm::UserBuffer;
 use crate::task::{
@@ -842,11 +845,11 @@ pub(crate) use fanotify::{
 pub use inode::{EXT4_FS, OSInode, OpenFlags, list_apps, open_file};
 pub(crate) use inode::{
     ExecInodeReservation, clear_ext4_path_cache, debug_track_iozone_inode, ext4_lock,
-    ext4_path_cache_lookup, find_path_in_roots, inode_identity_path_in_roots, inode_path_hint,
-    inode_path_hint_by_identity, inode_path_in_roots, invalidate_ext4_path_cache,
-    invalidate_ext4_path_cache_inode, invalidate_ext4_path_cache_subtree,
-    has_open_inode_description, is_inode_currently_executed, note_ext4_path_cache, note_inode_path_hint,
-    note_process_exec_path, path_resolves_to_inode, process_exec_path,
+    ext4_path_cache_lookup, find_path_in_roots, has_open_inode_description,
+    inode_identity_path_in_roots, inode_path_hint, inode_path_hint_by_identity,
+    inode_path_in_roots, invalidate_ext4_path_cache, invalidate_ext4_path_cache_inode,
+    invalidate_ext4_path_cache_subtree, is_inode_currently_executed, note_ext4_path_cache,
+    note_inode_path_hint, note_process_exec_path, path_resolves_to_inode, process_exec_path,
     register_deferred_unlink_cleanup, register_executing_inode, resolve_final_symlink_abs_path,
     resolve_final_symlink_abs_path_locked, root_inode_for_path, secondary_root_inode,
     unregister_executing_inode,
@@ -902,4 +905,5 @@ pub use tty::{
     LinuxTermio, LinuxTermios, LinuxWinSize, PtyMasterFile, PtySlaveFile, TtyFile, dev_pts_exists,
     dev_pts_index_from_path,
 };
+#[cfg(target_arch = "riscv64")]
 pub use userfaultfd::UserfaultfdFile;

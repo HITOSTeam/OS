@@ -59,6 +59,10 @@ impl TrapContext {
     }
 }
 
+/*
+ * 当前 LoongArch 陷阱汇编直接写入上下文。待某个汇编入口路径需要 Rust 侧复制
+ * 时，再启用这个辅助函数。
+ *
 pub fn push_trap_context_at(dst: usize, cx: &TrapContext) {
     // SAFETY: Trap entry passes a writable kernel address reserved for a `TrapContext`, and `cx`
     // is fully initialized. If `dst` were not valid trap-context storage, this would corrupt memory.
@@ -67,3 +71,4 @@ pub fn push_trap_context_at(dst: usize, cx: &TrapContext) {
         *dst_ptr = *cx;
     }
 }
+*/

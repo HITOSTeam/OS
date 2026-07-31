@@ -1,14 +1,16 @@
+#[cfg(target_arch = "riscv64")]
 use crate::{
     config::PAGE_SIZE,
+    fs::UserfaultfdFile,
+    mm::{MapPermission, VirtAddr, try_copy_from_user},
+};
+use crate::{
     fs::{
         LinuxTermio, LinuxTermios, LinuxWinSize, PseudoKindTag, PtyMasterFile, PtySlaveFile,
-        TtyFile, UserfaultfdFile, pseudo_block_is_read_only, pseudo_block_read_ahead,
-        pseudo_block_set_read_ahead, pseudo_block_set_read_only,
+        TtyFile, pseudo_block_is_read_only, pseudo_block_read_ahead, pseudo_block_set_read_ahead,
+        pseudo_block_set_read_only,
     },
-    mm::{
-        MapPermission, VirtAddr, try_copy_from_user, try_copy_to_user, try_read_user_value,
-        try_write_user_value, write_user_value,
-    },
+    mm::{try_copy_to_user, try_read_user_value, try_write_user_value, write_user_value},
     syscall::{
         error::{SyscallError, err},
         filesystem::O_NONBLOCK,
@@ -19,6 +21,7 @@ use crate::{
 use alloc::{format, string::String};
 use core::mem::size_of;
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UffdioApi {
@@ -27,6 +30,7 @@ struct UffdioApi {
     ioctls: u64,
 }
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UffdioRange {
@@ -34,6 +38,7 @@ struct UffdioRange {
     len: u64,
 }
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UffdioRegister {
@@ -42,6 +47,7 @@ struct UffdioRegister {
     ioctls: u64,
 }
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UffdioCopy {
@@ -79,11 +85,17 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const TCSBRKP: usize = 0x5425;
     const N_TTY: i32 = 0;
     const N_HDLC: i32 = 13;
+    #[cfg(target_arch = "riscv64")]
     const UFFD_API: u64 = 0xAA;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_API: usize = 0xc018_aa3f;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_REGISTER: usize = 0xc020_aa00;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_COPY: usize = 0xc028_aa03;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1 << 0;
     const FIONREAD: usize = 0x541B;
     const FIONBIO: usize = 0x5421;
@@ -201,6 +213,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
         return if files.set_flags(fd, flags) { 0 } else { EBADF };
     }
 
+    #[cfg(target_arch = "riscv64")]
     if let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() {
         match request {
             UFFDIO_API => {

@@ -21,7 +21,8 @@ pub struct ConsoleInfo {
 #[derive(Clone, Copy)]
 pub struct PoweroffInfo {
     pub base: usize,
-    pub size: usize,
+    // `size` 已在解析 DTB 时校验；当前运行时关机只需要已校验的寄存器地址和宽度。
+    // pub size: usize,
     pub offset: usize,
     pub value: usize,
     pub reg_io_width: u8,
@@ -34,8 +35,11 @@ pub struct PciHostInfo {
     pub mem32_base: usize,
     pub mem32_size: usize,
     pub bus_start: u8,
-    pub bus_end: u8,
-    pub dma_coherent: bool,
+    // 解析器已校验完整总线范围；当前 PCI 探测只从 `bus_start` 开始，尚未支持
+    // 多总线枚举。
+    // pub bus_end: u8,
+    // 在 DMA 映射层具备架构专用缓存维护路径前，暂不使用 DMA 一致性策略。
+    // pub dma_coherent: bool,
 }
 
 /// 在内存管理初始化前构造完成、随后保持不变的 LoongArch 平台描述。
@@ -65,7 +69,10 @@ fn compatible_contains(node: FdtNode<'_, '_>, needle: &[u8]) -> bool {
 }
 
 fn node_is_available(node: FdtNode<'_, '_>) -> bool {
-    match node.property("status").and_then(|property| property.as_str()) {
+    match node
+        .property("status")
+        .and_then(|property| property.as_str())
+    {
         None | Some("okay") | Some("ok") => true,
         Some(_) => false,
     }
@@ -385,7 +392,9 @@ fn parse_poweroff(fdt: &Fdt<'_>) -> PoweroffInfo {
 
     PoweroffInfo {
         base,
-        size,
+        // 上方已用 `offset + reg_io_width` 校验 `size`；在有运行时边界检查
+        // 调用者前不保存该字段。
+        // size,
         offset,
         value,
         reg_io_width: reg_io_width as u8,
@@ -465,7 +474,9 @@ fn parse_pci_host(fdt: &Fdt<'_>) -> PciHostInfo {
     assert!(
         mem32_base <= u32::MAX as usize
             && mem32_size <= u32::MAX as usize
-            && mem32_base.checked_add(mem32_size).is_some_and(|end| end <= u32::MAX as usize + 1),
+            && mem32_base
+                .checked_add(mem32_size)
+                .is_some_and(|end| end <= u32::MAX as usize + 1),
         "DTB PCI memory aperture cannot be represented by the 32-bit BAR allocator"
     );
 
@@ -475,14 +486,19 @@ fn parse_pci_host(fdt: &Fdt<'_>) -> PciHostInfo {
         mem32_base,
         mem32_size,
         bus_start: bus_start as u8,
-        bus_end: bus_end as u8,
-        dma_coherent: pci.property("dma-coherent").is_some(),
+        // 见 `PciHostInfo`：尚未实现多总线枚举。
+        // bus_end: bus_end as u8,
+        // 见 `PciHostInfo`：尚无 DMA 缓存维护调用者。
+        // dma_coherent: pci.property("dma-coherent").is_some(),
     }
 }
 
 impl DtbData {
     fn parse(dtb_pa: usize, boot_hart_id: usize) -> Self {
-        assert_ne!(dtb_pa, 0, "LoongArch boot protocol supplied a null DTB pointer");
+        assert_ne!(
+            dtb_pa, 0,
+            "LoongArch boot protocol supplied a null DTB pointer"
+        );
         let fdt = unsafe { Fdt::from_ptr(dtb_pa as *const u8) }
             .unwrap_or_else(|error| panic!("invalid LoongArch DTB at {dtb_pa:#x}: {error:?}"));
         let active_hart_mask = parse_cpu_topology(&fdt, boot_hart_id);
@@ -533,17 +549,27 @@ pub fn clock_frequency() -> usize {
     data().clock_frequency
 }
 
+/*
+ * 早期控制台路径必须容忍 DTB 初始化失败，因而使用 `try_console_info`。待普通
+ * 驱动需要已保证初始化的控制台时，再启用这个严格访问器。
+ *
 pub fn console_info() -> ConsoleInfo {
     data().console
 }
+*/
 
 pub fn try_console_info() -> Option<ConsoleInfo> {
     try_data().map(|data| data.console)
 }
 
+/*
+ * 关机路径刻意使用 `try_poweroff_info`，避免 DTB 失败后再次触发 panic。待普通
+ * 电源管理驱动需要时，再启用这个严格访问器。
+ *
 pub fn poweroff_info() -> PoweroffInfo {
     data().poweroff
 }
+*/
 
 /// 返回关机信息；仅供 DTB 初始化失败后的 panic 路径避免再次触发 panic。
 pub fn try_poweroff_info() -> Option<PoweroffInfo> {
@@ -575,5 +601,10 @@ pub fn for_each_mmio_range(mut f: impl FnMut(usize, usize)) {
     }
 }
 
-/// 为架构无关的配置访问器保留；LoongArch 使用 PCI virtio 而非 virtio-mmio。
+// 为架构无关的配置访问器保留；LoongArch 使用 PCI virtio 而非 virtio-mmio。
+/*
+ * LoongArch 当前通过 PCI 发现 virtio，因此这个空迭代器没有调用者。保留预期
+ * 接口说明，供未来的 virtio-mmio 平台使用。
+ *
 pub fn for_each_virtio_mmio_device(_f: impl FnMut(usize, usize)) {}
+*/

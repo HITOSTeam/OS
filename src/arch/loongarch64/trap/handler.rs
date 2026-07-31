@@ -87,11 +87,16 @@ fn set_kernel_trap_entry() {
     write_eentry(alltraps_k as usize);
 }
 
+/*
+ * 当前 LoongArch 返回路径持续安装内核陷阱入口。仅在基于 trampoline 的用户态
+ * 入口转换完整实现后，再重新启用。
+ *
 fn set_user_trap_entry() {
     // Use the trampoline VA so traps from user mode always enter via a
     // user-mapped page (matches the RISC-V flow).
     write_eentry(TRAMPOLINE as usize);
 }
+*/
 
 fn get_trap_context() -> &'static mut TrapContext {
     let now_task_block = crate::task::processor::current_task().unwrap();

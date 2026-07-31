@@ -71,9 +71,13 @@ pub fn active_hart_mask() -> usize {
     crate::arch::DTB_data::active_hart_mask()
 }
 
+/*
+ * 当前没有调用者需要 hart 数量而非位图；保留这个转换，供后续拓扑消费者使用。
+ *
 pub fn active_hart_count() -> usize {
     active_hart_mask().count_ones() as usize
 }
+*/
 #[cfg(target_arch = "riscv64")]
 #[allow(dead_code)]
 pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;
@@ -99,9 +103,13 @@ pub fn clock_freq() -> usize {
 pub const MAX_PHYS_MEMORY_REGIONS: usize = 16;
 pub const MAX_DTB_MMIO_REGIONS: usize = 32;
 pub const MAX_RESERVED_MEMORY_REGIONS: usize = 16;
+// virtio-mmio 发现逻辑仅供 RISC-V 使用；LoongArch 使用 PCI virtio。
+#[cfg(target_arch = "riscv64")]
 pub const MAX_VIRTIO_MMIO_DEVICES: usize = 8;
 
 /// 返回所有物理内存段的最小起始地址。
+// 仅 RISC-V 的页表共享代码需要物理内存的最低地址。
+#[cfg(target_arch = "riscv64")]
 pub fn phys_mem_start() -> usize {
     let mut minimum = usize::MAX;
     for_each_phys_mem_range(|start, _| minimum = minimum.min(start));
@@ -152,9 +160,14 @@ pub fn for_each_reserved_range(mut f: impl FnMut(usize, usize)) {
     crate::arch::DTB_data::for_each_reserved_range(|start, end| f(start, end));
 }
 
-/// 依次访问 DTB 中发现的 virtio-mmio 设备基地址。
+// 依次访问 DTB 中发现的 virtio-mmio 设备基地址。
+/*
+ * RISC-V 块设备驱动直接访问架构专用迭代器，LoongArch 也没有 virtio-mmio
+ * 设备。保留此包装，待其他架构无关的调用者需要它时再启用。
+ *
 pub fn for_each_virtio_mmio_device_base(mut f: impl FnMut(usize)) {
     crate::arch::DTB_data::for_each_virtio_mmio_device(|base, _| f(base));
 }
+*/
 
 pub const TRAP_CONTEXT_BASE: usize = TRAP_CONTEXT;
