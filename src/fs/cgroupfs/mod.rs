@@ -1,7 +1,10 @@
-//! Cgroup 虚拟文件系统的核心模块。
+//! cgroupfs 文件系统视图。
 //!
-//! 提供 cgroupfs 的挂载、节点管理、进程/线程关联、资源统计与限制等关键功能。
-//! 同时支持 unified (cgroup v2) 和 legacy (cgroup v1) 两种层次结构。
+//! cgroupfs 是 `fs::vfs` 的具体后端，因此与 VFS 核心保持同级。当前过渡实现仍
+//! 同时包含路径视图和部分 cgroup 领域状态；节点化时应把进程/线程关联、资源
+//! 统计与限制移入独立领域层，让本模块只保留 `VfsFileSystem`/`VfsNode` 投影。
+//! 在完成迁移前不要继续增加 canonical path 翻译。支持 unified (cgroup v2)
+//! 和 legacy (cgroup v1) 两种层次结构。
 
 extern crate alloc;
 
