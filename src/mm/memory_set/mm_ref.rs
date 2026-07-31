@@ -150,7 +150,13 @@ impl MmRef {
 
     /// 处理写时复制 fault：分配新帧、复制旧页、重映射为可写。
     pub fn resolve_cow_fault(&self, fault_va: usize) -> bool {
-        self.lock().resolve_cow_fault(fault_va)
+        let resolved = self.lock().resolve_cow_fault(fault_va);
+        #[cfg(target_arch = "loongarch64")]
+        if resolved {
+            // 等待必须发生在释放 mm 锁之后，避免远端 fault 正在等待同一把锁。
+            crate::arch::loongarch64::mm::wait_remote_user_tlb_flush(self.asid.as_ref());
+        }
+        resolved
     }
 
     /// 处理 lazy fault：按需分配/复用 frame 并安装 PTE。
@@ -204,8 +210,13 @@ impl MmRef {
 
     /// fork：以 COW 方式克隆父进程地址空间，子进程与父进程共享物理页直到写操作。
     pub fn from_existed_user_cow(parent: &Self) -> Self {
-        let mut parent = parent.lock();
-        Self::new(MemorySet::from_existed_user_cow(&mut parent))
+        let child = {
+            let mut parent_memory_set = parent.lock();
+            Self::new(MemorySet::from_existed_user_cow(&mut parent_memory_set))
+        };
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::loongarch64::mm::wait_remote_user_tlb_flush(parent.asid.as_ref());
+        child
     }
 
     /// fork（LoongArch）：深拷贝父进程地址空间（不使用 COW）。

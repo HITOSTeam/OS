@@ -904,7 +904,7 @@ impl OSInode {
         self.inner.lock().inode.clone()
     }
 
-    fn write_at_zeroing_gap(
+    fn write_at_preserving_holes(
         inode: &Arc<Inode>,
         offset: usize,
         data: &[u8],
@@ -912,21 +912,8 @@ impl OSInode {
         if data.is_empty() {
             return Ok(0);
         }
-
-        let size = inode.size() as usize;
-        if offset > size {
-            let zeros = [0u8; 4096];
-            let mut off = size;
-            while off < offset {
-                let chunk = core::cmp::min(zeros.len(), offset - off);
-                match inode.write_at(off, &zeros[..chunk]) {
-                    Ok(0) => return Err(ext4_fs::Ext4Error::NoSpace),
-                    Ok(written) => off += written,
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
+        // Linux 的 pwrite 越过 EOF 时保留稀疏 hole，只分配实际写入范围。
+        // extent 读路径会把未映射区间补零，不需要逐页写零填满整个间隙。
         inode.write_at(offset, data)
     }
 
@@ -1006,7 +993,7 @@ impl OSInode {
             }
             let result = {
                 let _fs_guard = ext4_lock();
-                Self::write_at_zeroing_gap(&inner.inode, offset, buf)
+                Self::write_at_preserving_holes(&inner.inode, offset, buf)
             };
             if debug_iozone_tracked(inode_num) {
                 let size_after = inner.inode.size() as usize;
@@ -1075,7 +1062,7 @@ impl OSInode {
         let size_before = inner.inode.size() as usize;
         let result = {
             let _fs_guard = ext4_lock();
-            Self::write_at_zeroing_gap(&inner.inode, off, &data)
+            Self::write_at_preserving_holes(&inner.inode, off, &data)
         };
         if debug_iozone_tracked(inode_num) {
             let size_after = inner.inode.size() as usize;
@@ -1677,7 +1664,7 @@ impl Drop for OSInode {
             let data = core::mem::take(&mut inner.write_buf);
             let _ = {
                 let _fs_guard = ext4_lock();
-                Self::write_at_zeroing_gap(&inner.inode, off, &data)
+                Self::write_at_preserving_holes(&inner.inode, off, &data)
             };
             Self::mark_write_buf_clean(&mut inner);
         }

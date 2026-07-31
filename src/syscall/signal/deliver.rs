@@ -185,8 +185,8 @@ pub fn maybe_deliver_signal() {
                     t_inner.task_status = TaskStatus::Blocked;
                     t_inner.stopped_by_signal = true;
                 }
-                t.wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
+                drop(t_inner);
+                t.discard_deferred_wakeup();
             }
             wake_parent_waiters();
             restore_sigsuspend_mask(&task);
@@ -250,8 +250,8 @@ pub fn maybe_deliver_signal() {
                     t_inner.task_status = TaskStatus::Blocked;
                     t_inner.stopped_by_signal = true;
                 }
-                t.wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
+                drop(t_inner);
+                t.discard_deferred_wakeup();
             }
             wake_parent_waiters();
             restore_sigsuspend_mask(&task);

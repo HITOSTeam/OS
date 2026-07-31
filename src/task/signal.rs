@@ -67,8 +67,7 @@ fn send_signal_ipis(mask: usize) {
 
 pub(crate) fn request_reschedule_for_signal_target(task: &Arc<TaskControlBlock>) {
     let local_hart = hart_id() % crate::config::MAX_HARTS;
-    let running_hart = task.on_cpu.load(core::sync::atomic::Ordering::Acquire);
-    if running_hart != TaskControlBlock::OFF_CPU {
+    if let Some(running_hart) = task.running_hart() {
         if running_hart == local_hart {
             crate::task::processor::request_reschedule_current_hart();
         } else if running_hart < crate::config::MAX_HARTS {
@@ -747,8 +746,7 @@ pub fn kill(pid: usize, signum: i32) -> isize {
             if prompt_user_handler_wakeup || fatal_default_wakeup {
                 request_reschedule_for_signal_target(t);
             }
-            let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
-            if on_cpu != TaskControlBlock::OFF_CPU {
+            if let Some(on_cpu) = t.running_hart() {
                 running_signal_ipi_mask |= hart_mask_bit(on_cpu);
             }
             crate::log_if!(
@@ -822,8 +820,7 @@ pub fn kill_current(signum: i32) -> isize {
         }
         t.mark_signal_pending();
         request_reschedule_for_signal_target(t);
-        let on_cpu = t.on_cpu.load(core::sync::atomic::Ordering::Acquire);
-        if on_cpu != TaskControlBlock::OFF_CPU {
+        if let Some(on_cpu) = t.running_hart() {
             running_signal_ipi_mask |= hart_mask_bit(on_cpu);
         }
     }
@@ -885,7 +882,7 @@ pub fn queue_process_signal_info(
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
         (
             tid,
-            task.on_cpu.load(core::sync::atomic::Ordering::Acquire),
+            task.running_hart().unwrap_or(TaskControlBlock::OFF_CPU),
             !already,
         )
     };

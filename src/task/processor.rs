@@ -20,7 +20,7 @@ use crate::{
         runtime::{monotonic_time_ns, start_task_runtime_slice},
         sched::{RT_PRIO_MIN, SchedClass, rr_timeslice_ticks, sched_class},
         switch,
-        task_block::{TaskControlBlock, TaskStatus},
+        task_block::{PendingWakeup, TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
     },
     trap::init_trap,
@@ -40,6 +40,31 @@ static TASK_DROP_REF_DIAG_SEQ: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static TASK_FETCH_REF_DIAG_SEQ: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+const SCHED_TRACE_LEN: usize = 64;
+
+struct SchedTraceEntry {
+    seq: AtomicUsize,
+    task: AtomicUsize,
+    hart: AtomicUsize,
+    phase: AtomicUsize,
+    aux: AtomicUsize,
+}
+
+impl SchedTraceEntry {
+    const fn new() -> Self {
+        Self {
+            seq: AtomicUsize::new(0),
+            task: AtomicUsize::new(0),
+            hart: AtomicUsize::new(0),
+            phase: AtomicUsize::new(0),
+            aux: AtomicUsize::new(0),
+        }
+    }
+}
+
+static SCHED_TRACE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static SCHED_TRACE: [SchedTraceEntry; SCHED_TRACE_LEN] =
+    [const { SchedTraceEntry::new() }; SCHED_TRACE_LEN];
 const IDLE_CLEANUP_BUDGET: usize = 4;
 const IDLE_FILES_STRUCT_DROP_BUDGET: usize = 2;
 const IDLE_FILES_STRUCT_CLOSE_BATCH: usize = 2;
@@ -64,6 +89,57 @@ fn maybe_log_task_drop(event: &str) {
             inflight,
             queued,
             done
+        );
+    }
+}
+
+#[inline]
+fn trace_scheduler_transition(phase: usize, task: &Arc<TaskControlBlock>, aux: usize) {
+    if !crate::debug_config::DEBUG_WATCHDOG {
+        return;
+    }
+    let seq = SCHED_TRACE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let entry = &SCHED_TRACE[seq % SCHED_TRACE_LEN];
+    entry
+        .task
+        .store(Arc::as_ptr(task) as usize, Ordering::Relaxed);
+    entry.hart.store(hart_id(), Ordering::Relaxed);
+    entry.phase.store(phase, Ordering::Relaxed);
+    entry.aux.store(aux, Ordering::Relaxed);
+    entry.seq.store(seq, Ordering::Release);
+}
+
+pub fn debug_dump_scheduler_trace() {
+    if !crate::debug_config::DEBUG_WATCHDOG {
+        return;
+    }
+    let end = SCHED_TRACE_SEQ.load(Ordering::Acquire);
+    let start = end.saturating_sub(SCHED_TRACE_LEN - 1).max(1);
+    for seq in start..=end {
+        let entry = &SCHED_TRACE[seq % SCHED_TRACE_LEN];
+        if entry.seq.load(Ordering::Acquire) != seq {
+            continue;
+        }
+        let phase = match entry.phase.load(Ordering::Relaxed) {
+            1 => "fetch",
+            2 => "set_current",
+            3 => "take_current",
+            4 => "set_pending_ready",
+            5 => "set_pending_blocked",
+            6 => "idle_take_blocked",
+            7 => "idle_finish_blocked",
+            8 => "idle_take_ready",
+            9 => "idle_requeue_ready",
+            10 => "queue_exit_drop",
+            _ => "unknown",
+        };
+        log::warn!(
+            "[sched-trace] seq={} hart={} task={:#x} phase={} aux={}",
+            seq,
+            entry.hart.load(Ordering::Relaxed),
+            entry.task.load(Ordering::Relaxed),
+            phase,
+            entry.aux.load(Ordering::Relaxed),
         );
     }
 }
@@ -224,6 +300,7 @@ fn reparent_orphaned_children(process: &Arc<ProcessControlBlock>) {
 }
 
 fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
+    trace_scheduler_transition(10, &task, 0);
     if crate::debug_config::DEBUG_TASK_LIFECYCLE {
         let seq = TASK_DROP_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if seq <= 16 || (seq & (seq - 1)) == 0 {
@@ -543,8 +620,7 @@ fn cleanup_process_threads_for_group_exit(
             if Arc::ptr_eq(member, current_task) {
                 continue;
             }
-            let running_hart = member.on_cpu.load(core::sync::atomic::Ordering::Acquire);
-            if running_hart < MAX_HARTS {
+            if let Some(running_hart) = member.running_hart().filter(|hart| *hart < MAX_HARTS) {
                 running_mask |= 1usize << running_hart;
             }
         }
@@ -997,6 +1073,9 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
     let mut processor = local_processor().lock();
     let task = processor.take_current_task();
     drop(processor);
+    if let Some(task) = task.as_ref() {
+        trace_scheduler_transition(3, task, 0);
+    }
     task
 }
 /// 调度核心函数,直接完成任务的切换，传入参数为我们需要切换的任务的上下文
@@ -1189,23 +1268,24 @@ pub fn idle_task() {
         // 此时任务已不在 CPU 上（已切到 idle 上下文），可以安全清理 on_cpu。
         // NOTE: 如果在这之前就将task 入队，那么另一个hart 可能进入 从而导致问题
         if let Some(task) = local_processor().lock().take_pending_blocked() {
-            task.clear_on_cpu();
-            // 切走期间有人尝试唤醒它（wakeup_pending）→ 补唤醒。
+            // 切走期间有人尝试唤醒它时，由 on_cpu 原子字携带 pending 位。
             // 对应 Linux try_to_wake_up() 等 prev 离开 CPU 后再走正常唤醒路径，
             // 使 wakeup_preempt() 能正确设 NEED_RESCHED。
-            if task
-                .wakeup_pending
-                .swap(false, core::sync::atomic::Ordering::AcqRel)
-            {
-                let sync_hart = task.wakeup_sync_hart.swap(
-                    TaskControlBlock::OFF_CPU,
-                    core::sync::atomic::Ordering::AcqRel,
-                );
-                if sync_hart < MAX_HARTS {
+            trace_scheduler_transition(6, &task, 0);
+            let pending_wakeup = task.finish_running();
+            let pending_wakeup_code = match pending_wakeup {
+                PendingWakeup::None => 0,
+                PendingWakeup::Normal => 1,
+                PendingWakeup::Sync(hart) => hart.saturating_add(2),
+            };
+            trace_scheduler_transition(7, &task, pending_wakeup_code);
+            match pending_wakeup {
+                PendingWakeup::None => {}
+                PendingWakeup::Normal => wakeup_task(task),
+                PendingWakeup::Sync(sync_hart) if sync_hart < MAX_HARTS => {
                     wakeup_sync_task_on_hart(task, sync_hart);
-                } else {
-                    wakeup_task(task);
                 }
+                PendingWakeup::Sync(_) => wakeup_task(task),
             }
         }
 
@@ -1213,14 +1293,13 @@ pub fn idle_task() {
         // 延迟到 idle 上下文才入队，保证任务不再使用自己的内核栈时才
         // 对其他 hart 可见，避免 SMP 下同一任务被两个 hart 同时调度。
         if let Some(task) = local_processor().lock().take_pending_ready() {
-            task.clear_on_cpu();
-            task.wakeup_pending
-                .store(false, core::sync::atomic::Ordering::Release);
-            task.wakeup_sync_hart.store(
-                TaskControlBlock::OFF_CPU,
-                core::sync::atomic::Ordering::Release,
-            );
-            requeue_task(task);
+            trace_scheduler_transition(8, &task, 0);
+            let _ = task.finish_running();
+            let task_for_trace = Arc::clone(&task);
+            let target = requeue_task(task)
+                .map(|hart| hart.saturating_add(1))
+                .unwrap_or(0);
+            trace_scheduler_transition(9, &task_for_trace, target);
         }
 
         // 处理内核态定时器中断延迟的工作（只置位、不立即处理的那部分）。
@@ -1313,7 +1392,7 @@ pub fn idle_task() {
                     );
                 }
             }
-            task.clear_on_cpu();
+            let _ = task.finish_running();
             // 尝试从进程的线程列表中清掉这个 task 的 slot。
             // 僵尸进程且有额外引用时保留 slot，让 wait4 能 reap。
             if let Some(process) = task.process.upgrade() {
@@ -1349,6 +1428,7 @@ pub fn idle_task() {
         let _ = arch::disable_interrupts();
         drain_deferred_kernel_timer_work();
         if let Some(task) = fetch_task() {
+            trace_scheduler_transition(1, &task, 0);
             // 恢复目标任务的浮点寄存器状态。
             arch::restore_user_fp_state(&task);
             if crate::debug_config::DEBUG_TASK_LIFECYCLE {
@@ -1428,6 +1508,7 @@ pub fn idle_task() {
 
             drop(task_inner);
             // 把目标任务设为当前任务。
+            trace_scheduler_transition(2, &task, 0);
             processor.now_task_block = Some(task);
             drop(processor);
 
@@ -1455,7 +1536,7 @@ pub fn idle_task() {
             // 4b：watchdog 诊断——空转太久则 dump 系统状态。
             if crate::debug_config::DEBUG_WATCHDOG {
                 let c = EMPTY_SPINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if c == 1_000 {
+                if c == 1_000 || (c > 1_000 && c % 10_000 == 0) {
                     crate::task::manager::dump_system_state();
                 }
             }
@@ -1570,6 +1651,7 @@ fn suspend_current_and_run_next_unchecked(task_snapshot: Arc<TaskControlBlock>) 
     // Instead, stash it on this hart and let `idle_task()` enqueue it after the
     // context switch completes.
     arch::save_user_fp_state(&task);
+    trace_scheduler_transition(4, &task, 0);
     local_processor().lock().set_pending_ready(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
@@ -1704,11 +1786,13 @@ pub fn block_current_and_run_next() {
     if should_block {
         record_fair_sleep_lag(&task);
         arch::save_user_fp_state(&task);
+        trace_scheduler_transition(5, &task, 1);
         local_processor().lock().set_pending_blocked(task);
     } else {
         // Behave like a yield: enqueue after we have switched back to idle
         // to avoid "run on two harts".
         arch::save_user_fp_state(&task);
+        trace_scheduler_transition(4, &task, 1);
         local_processor().lock().set_pending_ready(task);
     }
     // jump to scheduling cycle

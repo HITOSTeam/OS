@@ -58,6 +58,8 @@ pub const IOCSR_IPI_SEND_BLOCKING: usize = 1 << 31;
 pub const IOCSR_IPI_SEND_CPU_SHIFT: usize = 16;
 /// Linux ACTION_RESCHEDULE/SMP_RESCHEDULE bit.
 pub const IPI_ACTION_RESCHEDULE: usize = 1 << 0;
+/// 远端用户 TLB 刷新动作。
+pub const IPI_ACTION_TLB_FLUSH: usize = 1 << 1;
 
 // ── TCFG (Timer Config, CSR 0x41) ─────────────────────────────────────────
 /// Bit [0] — Timer Enable (also doubles as periodic-mode flag on some revisions).

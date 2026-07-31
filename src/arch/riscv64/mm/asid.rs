@@ -67,12 +67,6 @@ impl AsidContext {
         self.asid.store(asid, Ordering::Release);
     }
 
-    pub fn invalidate(&self) {
-        self.asid.store(0, Ordering::Release);
-        self.generation.store(0, Ordering::Release);
-        self.active_hart_mask.store(0, Ordering::Release);
-    }
-
     fn mark_local_active(&self) {
         let bit = local_hart_bit();
         if bit != 0 {
@@ -215,12 +209,51 @@ pub fn prepare_user_satp(ctx: &AsidContext, token: usize) -> (usize, bool, bool)
     (token_with_asid(token, asid), false, need_icache_flush)
 }
 
-pub fn drop_user_asid(ctx: &AsidContext) {
-    ctx.invalidate();
-}
-
 pub fn mark_icache_stale(ctx: &AsidContext) {
     ctx.mark_icache_stale();
+}
+
+pub fn flush_user_all(ctx: &AsidContext) {
+    let generation = ASID_GENERATION.load(Ordering::Acquire);
+    if asid_fast_path_enabled() && ctx.valid_for(generation) {
+        let asid = ctx.asid.load(Ordering::Acquire);
+        let remote_mask = ctx.remote_active_harts();
+        crate::sbi::remote_sfence_vma_all(remote_mask);
+        // SAFETY: ASID 由内核分配；仅清除当前 hart 上属于该地址空间的翻译。
+        unsafe {
+            asm!(
+                "sfence.vma zero, {asid}",
+                asid = in(reg) asid,
+                options(nostack)
+            );
+        }
+    } else {
+        // SAFETY: 尚未分配 ASID 时，本地全量刷新可清除 ASID 0 的旧翻译。
+        unsafe {
+            asm!("sfence.vma", options(nostack));
+        }
+    }
+}
+
+pub fn flush_local_user_page(ctx: &AsidContext, vaddr: usize) {
+    let generation = ASID_GENERATION.load(Ordering::Acquire);
+    if asid_fast_path_enabled() && ctx.valid_for(generation) {
+        let asid = ctx.asid.load(Ordering::Acquire);
+        // SAFETY: 首次 lazy 映射只需清除当前 fault hart 的负缓存翻译。
+        unsafe {
+            asm!(
+                "sfence.vma {addr}, {asid}",
+                addr = in(reg) vaddr,
+                asid = in(reg) asid,
+                options(nostack)
+            );
+        }
+    } else {
+        // SAFETY: 无有效 ASID 时按地址清除本地所有 ASID 的翻译。
+        unsafe {
+            asm!("sfence.vma {addr}, zero", addr = in(reg) vaddr, options(nostack));
+        }
+    }
 }
 
 pub fn flush_user_page(ctx: &AsidContext, vaddr: usize) {

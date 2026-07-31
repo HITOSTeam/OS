@@ -8,7 +8,7 @@
 /// You can override it by building with `LOG=error|warn|info|debug|trace`.
 pub const DEFAULT_LOG_LEVEL: log::LevelFilter = if DEBUG_UNIXBENCH {
     log::LevelFilter::Info
-} else if DEBUG_CYCLICTEST {
+} else if DEBUG_CYCLICTEST || DEBUG_WATCHDOG {
     log::LevelFilter::Warn
 } else {
     log::LevelFilter::Off

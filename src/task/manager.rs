@@ -255,23 +255,11 @@ fn wakeup_task_with_batch_inner(
         if task_inner.task_status == TaskStatus::Blocked {
             if task_inner.cgroup_frozen {
                 task_inner.wake_on_cgroup_thaw = true;
-                task.wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
-                task.wakeup_sync_hart.store(
-                    TaskControlBlock::OFF_CPU,
-                    core::sync::atomic::Ordering::Release,
-                );
                 return;
             }
             task_inner.task_status = TaskStatus::Ready;
             task_inner.parked_by_cgroup = false;
             task_inner.wake_on_cgroup_thaw = false;
-            task.wakeup_pending
-                .store(false, core::sync::atomic::Ordering::Release);
-            task.wakeup_sync_hart.store(
-                TaskControlBlock::OFF_CPU,
-                core::sync::atomic::Ordering::Release,
-            );
             drop(task_inner);
             if let Some((hart_id, was_empty)) = enqueue_task_with_wakeup_flags(
                 Arc::clone(&task),
@@ -295,24 +283,16 @@ fn wakeup_task_with_batch_inner(
         (hart < MAX_HARTS).then_some(hart)
     }
 
-    // SMP 安全性：如果任务确实仍在某个 hart 上执行，不要直接入队
-    // （否则会在同一个内核栈上竞争）。改为标记待处理唤醒，让该 hart
-    // 切回 idle 后再把任务入队。
-    if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
-        if let Some(source_hart) = sync_source_hart.filter(|hart| *hart < MAX_HARTS) {
-            task.wakeup_sync_hart
-                .store(source_hart, core::sync::atomic::Ordering::Release);
-        }
-        task.wakeup_pending
-            .store(true, core::sync::atomic::Ordering::Release);
-        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) == TaskControlBlock::OFF_CPU {
-            let effective_sync_source = sync_source_hart.or_else(|| take_pending_sync_hart(&task));
-            wake_if_blocked_inner(task, batch, allow_fair_preempt, effective_sync_source);
-        }
+    // 与 Linux try_to_wake_up()/finish_task() 相同，任务仍在旧内核栈上时不能
+    // 直接入队。on_cpu 的 pending 位与切出方的 swap 在同一个原子字上排序，
+    // 因而不需要用两次独立 load 猜测切出是否已经完成。
+    let sync_source_hart = sync_source_hart.filter(|hart| *hart < MAX_HARTS);
+    if task.defer_wakeup_if_on_cpu(sync_source_hart) {
         return;
     }
 
-    let effective_sync_source = sync_source_hart.or_else(|| take_pending_sync_hart(&task));
+    let pending_sync_source = take_pending_sync_hart(&task);
+    let effective_sync_source = sync_source_hart.or(pending_sync_source);
     wake_if_blocked_inner(task, batch, allow_fair_preempt, effective_sync_source);
 }
 
@@ -379,7 +359,7 @@ pub fn refresh_task_runqueue(task: &Arc<TaskControlBlock>) {
     }
 }
 
-/// 唤醒一个阻塞中的任务。SMP 安全：如果任务还在其他 hart 上执行，则标记 wakeup_pending 让其自行处理。
+/// 唤醒一个阻塞中的任务。SMP 安全：任务仍在其他 hart 上时登记原子延迟唤醒。
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     let mut batch = WakeupBatch::default();
     wakeup_task_with_batch(task, &mut batch);

@@ -1350,8 +1350,7 @@ impl ProcessControlBlock {
         loop {
             let mut running_mask = 0usize;
             for task in &to_cleanup {
-                let running_hart = task.on_cpu.load(Ordering::Acquire);
-                if running_hart < MAX_HARTS {
+                if let Some(running_hart) = task.running_hart().filter(|hart| *hart < MAX_HARTS) {
                     running_mask |= 1usize << running_hart;
                 }
             }

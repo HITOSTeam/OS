@@ -310,7 +310,7 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
             (
                 inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
                 inner.task_status,
-                task.on_cpu.load(Ordering::Acquire),
+                task.running_hart().unwrap_or(TaskControlBlock::OFF_CPU),
             )
         };
         log::debug!(

@@ -116,12 +116,7 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
             Err(MprotectError::Unmapped) => return err(SyscallError::ENOMEM),
         }
     }
-    // Ensure permission changes take effect immediately.
-    #[cfg(target_arch = "riscv64")]
-    // SAFETY: sfence.vma is a privileged instruction valid in S-mode; flushes TLB.
-    unsafe {
-        core::arch::asm!("sfence.vma");
-    }
+    // RISC-V 的 MemorySet 路径已按 mm 的 active hart 集合同步刷新 TLB。
     #[cfg(target_arch = "loongarch64")]
     // SAFETY: invtlb is a privileged instruction valid in S-mode; flushes TLB.
     unsafe {

@@ -182,11 +182,11 @@ fn queue_signal_to_task(
         }
     }
     task.mark_signal_pending();
-    let on_cpu = task.on_cpu.load(Ordering::Acquire);
+    let on_cpu = task.running_hart();
     request_reschedule_for_signal_target(&task);
     wakeup_task(task.clone());
     request_reschedule_for_signal_target(&task);
-    if on_cpu != TaskControlBlock::OFF_CPU {
+    if let Some(on_cpu) = on_cpu {
         arch::send_ipi(on_cpu);
     }
 }

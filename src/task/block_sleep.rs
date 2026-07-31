@@ -1018,7 +1018,7 @@ fn deliver_alarm(pid: usize) {
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
         (
             tid,
-            task.on_cpu.load(AtomicOrdering::Acquire),
+            task.running_hart().unwrap_or(TaskControlBlock::OFF_CPU),
             inner.signal_mask,
             inner.pending_signals,
         )

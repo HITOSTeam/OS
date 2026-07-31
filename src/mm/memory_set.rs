@@ -308,13 +308,13 @@ impl MemorySet {
     }
 
     #[cfg(target_arch = "loongarch64")]
-    pub fn drop_user_asid(&self) {
+    pub fn flush_user_tlb(&self) {
         crate::arch::loongarch64::mm::drop_user_asid(self.asid.as_ref());
     }
 
     #[cfg(target_arch = "riscv64")]
-    pub fn drop_user_asid(&self) {
-        crate::arch::riscv64::mm::drop_user_asid(self.asid.as_ref());
+    pub fn flush_user_tlb(&self) {
+        crate::arch::riscv64::mm::flush_user_all(self.asid.as_ref());
         crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
     }
 
@@ -326,6 +326,19 @@ impl MemorySet {
     #[cfg(target_arch = "riscv64")]
     pub fn flush_user_page(&self, va: usize) {
         crate::arch::riscv64::mm::flush_user_page(self.asid.as_ref(), va);
+    }
+
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub fn flush_local_user_page(&self, va: usize) {
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::loongarch64::mm::flush_local_user_page(self.asid.as_ref(), va);
+        #[cfg(target_arch = "riscv64")]
+        crate::arch::riscv64::mm::flush_local_user_page(self.asid.as_ref(), va);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn flush_user_tlb_all(&self) {
+        crate::arch::riscv64::mm::flush_user_all(self.asid.as_ref());
     }
 
     fn inherit_user_vm_metadata_from(&mut self, parent: &MemorySet) {
@@ -1459,6 +1472,15 @@ impl MemorySet {
                 return Err(MprotectError::Unmapped);
             }
         }
+        #[cfg(target_arch = "riscv64")]
+        {
+            // mprotect 修改的是共享页表；同一进程的其他线程可能正在其他 hart
+            // 使用相同 ASID，必须在返回用户态前完成跨 hart TLB shootdown。
+            self.flush_user_tlb_all();
+            if (new_prot & VmRegion::PROT_EXEC) != 0 {
+                crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
+            }
+        }
         let backing_ids = self.backing_ids_for_vma_range(start, end);
         self.refresh_mmap_backing_states(backing_ids);
         self.debug_assert_user_vm_invariants();
@@ -1977,7 +1999,7 @@ impl MemorySet {
         self.areas.push(map_area);
         self.sort_user_areas();
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        self.drop_user_asid();
+        self.flush_user_tlb();
         true
     }
 
@@ -1985,7 +2007,7 @@ impl MemorySet {
         self.areas.push(map_area);
         self.sort_user_areas();
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        self.drop_user_asid();
+        self.flush_user_tlb();
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -3026,7 +3048,7 @@ impl MemorySet {
             // needed for a task that is concurrently running on another hart.
             #[cfg(target_arch = "loongarch64")]
             {
-                user_space.drop_user_asid();
+                user_space.flush_user_tlb();
             }
         }
         if diag_enabled {
@@ -3225,7 +3247,7 @@ impl MemorySet {
         {
             let changed = self.page_table.set_flags_deferred(vpn, flags);
             if changed {
-                self.drop_user_asid();
+                self.flush_user_tlb();
             }
             changed
         }
@@ -3233,7 +3255,7 @@ impl MemorySet {
         {
             let changed = self.page_table.set_flags(vpn, flags);
             if changed {
-                self.drop_user_asid();
+                self.flush_user_tlb();
             }
             changed
         }
@@ -3253,7 +3275,7 @@ impl MemorySet {
             area.shrink_to(&mut self.page_table, new_end.ceil());
             self.sort_user_areas();
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            self.drop_user_asid();
+            self.flush_user_tlb();
             self.debug_assert_user_vm_invariants();
             true
         } else {
@@ -3271,7 +3293,7 @@ impl MemorySet {
             if appended {
                 self.sort_user_areas();
                 #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-                self.drop_user_asid();
+                self.flush_user_tlb();
                 self.debug_assert_user_vm_invariants();
             }
             appended
@@ -3290,7 +3312,7 @@ impl MemorySet {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            self.drop_user_asid();
+            self.flush_user_tlb();
             self.debug_assert_user_vm_invariants();
         };
     }
@@ -3381,7 +3403,7 @@ impl MemorySet {
         self.areas.extend(moved_areas);
         self.sort_user_areas();
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        self.drop_user_asid();
+        self.flush_user_tlb();
         true
     }
 
@@ -3404,7 +3426,7 @@ impl MemorySet {
             let mut area = self.areas.remove(idx);
             area.unmap(&mut self.page_table);
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            self.drop_user_asid();
+            self.flush_user_tlb();
             return;
         }
 
@@ -3446,7 +3468,7 @@ impl MemorySet {
         self.sort_user_areas();
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         if changed {
-            self.drop_user_asid();
+            self.flush_user_tlb();
         }
     }
 
@@ -3530,9 +3552,9 @@ impl MemorySet {
         }
         self.areas = new_areas;
         self.sort_user_areas();
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        #[cfg(target_arch = "loongarch64")]
         if touched_area {
-            self.drop_user_asid();
+            self.flush_user_tlb();
         }
         debug_assert!(
             touched_area || start_vpn >= end_vpn,
@@ -3573,7 +3595,7 @@ impl MemorySet {
         }
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         if changed {
-            self.drop_user_asid();
+            self.flush_user_tlb();
         }
     }
 
@@ -3629,7 +3651,7 @@ impl MemorySet {
         self.sort_user_areas();
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         if changed {
-            self.drop_user_asid();
+            self.flush_user_tlb();
         }
     }
 
@@ -3730,7 +3752,7 @@ impl MemorySet {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            self.drop_user_asid();
+            self.flush_user_tlb();
             self.debug_assert_user_vm_invariants();
         };
     }

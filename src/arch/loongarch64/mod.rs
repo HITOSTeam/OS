@@ -11,7 +11,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use csr_defs::{
     CRMD_DA, CRMD_IE, CRMD_PG, ECFG_LIE_IPI, ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT,
     IOCSR_IPI_CLEAR, IOCSR_IPI_EN, IOCSR_IPI_SEND, IOCSR_IPI_SEND_BLOCKING,
-    IOCSR_IPI_SEND_CPU_SHIFT, IOCSR_IPI_STATUS, IPI_ACTION_RESCHEDULE, TCFG_EN, TCFG_INITVAL_MASK,
+    IOCSR_IPI_SEND_CPU_SHIFT, IOCSR_IPI_STATUS, IPI_ACTION_RESCHEDULE, IPI_ACTION_TLB_FLUSH,
+    TCFG_EN, TCFG_INITVAL_MASK,
 };
 
 global_asm!(include_str!("tlb_refill.S"));
@@ -129,6 +130,8 @@ pub fn enable_interrupts() {
 }
 
 pub fn wait_for_interrupt() {
+    // IPI 只负责把 idle hart 唤醒；共享请求序号才是 TLB flush 的可靠状态。
+    mm::service_pending_user_tlb_flush();
     // Linux 的 LoongArch 空闲路径使用 level 0。不要调用第三方封装中的
     // `idle 1`，该封装自身也注明尚不清楚 level 的含义。
     // 安全性：调度器只会在本 hart 已开中断且没有可运行任务时进入这里。
@@ -206,6 +209,13 @@ pub fn send_ipi(hart_id: usize) {
     // out of user/kernel execution so pending scheduler work is observed.
     let value = (IOCSR_IPI_SEND_BLOCKING
         | IPI_ACTION_RESCHEDULE
+        | (hart_id << IOCSR_IPI_SEND_CPU_SHIFT)) as u32;
+    iocsr_write32(IOCSR_IPI_SEND, value);
+}
+
+pub fn send_tlb_flush_ipi(hart_id: usize) {
+    let value = (IOCSR_IPI_SEND_BLOCKING
+        | IPI_ACTION_TLB_FLUSH
         | (hart_id << IOCSR_IPI_SEND_CPU_SHIFT)) as u32;
     iocsr_write32(IOCSR_IPI_SEND, value);
 }

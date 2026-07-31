@@ -1023,6 +1023,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
 
     if crate::syscall::net::is_socket_file(file.as_ref()) {
         let net_sock = file.as_any().downcast_ref::<crate::fs::NetSocketFile>();
+
+        //TODO 后期把这些移动到网路库里面
         #[repr(C)]
         #[derive(Clone, Copy)]
         struct Ifconf {

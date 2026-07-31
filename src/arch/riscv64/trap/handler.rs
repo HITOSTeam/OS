@@ -4,9 +4,9 @@ use core::{
 };
 
 use super::context::TrapContext;
-use crate::config::TRAMPOLINE;
+use crate::config::{MAX_HARTS, TRAMPOLINE};
 use crate::debug_config::DEBUG_TRAP;
-use crate::mm::{LazyFaultResult, MapPermission, PageTable, VirtAddr};
+use crate::mm::{LazyFaultResult, MapPermission, PTEFlags, PageTable, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
 use crate::task::block_sleep::{
@@ -56,6 +56,10 @@ static FIRST_TRAP_RETURN_LOGGED: AtomicBool = AtomicBool::new(false);
 static TRAP_RETURN_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Count trap_handler invocations for debugging.
 static TRAP_HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
+static UNRESOLVED_FAULT_LOGS: AtomicUsize = AtomicUsize::new(0);
+static SPURIOUS_FAULT_RETRY_LOGS: AtomicUsize = AtomicUsize::new(0);
+static SPURIOUS_FAULT_RETRY_KEYS: [AtomicUsize; MAX_HARTS] =
+    [const { AtomicUsize::new(0) }; MAX_HARTS];
 
 type KernelTrap = Trap<usize, usize>;
 
@@ -263,6 +267,18 @@ pub fn trap_handler() {
     let scause = scause::read();
     let stval = stval::read();
     let code = scause.cause(); // usize
+    let page_fault = matches!(
+        code,
+        Trap::Exception(INSTRUCTION_PAGE_FAULT)
+            | Trap::Exception(LOAD_PAGE_FAULT)
+            | Trap::Exception(STORE_PAGE_FAULT)
+    );
+    if !page_fault {
+        let hart = crate::arch::hart_id();
+        if hart < MAX_HARTS {
+            SPURIOUS_FAULT_RETRY_KEYS[hart].store(0, Ordering::Relaxed);
+        }
+    }
     let mut syscall_return = false;
     match code {
         // user env call ...
@@ -411,6 +427,63 @@ fn fault_hits_mmap_sigbus_tail(addr: usize) -> bool {
     process.memory_set().fault_hits_mmap_sigbus_tail(addr)
 }
 
+fn retry_spurious_user_page_fault(code: usize, stval: usize) -> bool {
+    let required = match code {
+        LOAD_PAGE_FAULT => PTEFlags::R,
+        STORE_PAGE_FAULT => PTEFlags::W,
+        INSTRUCTION_PAGE_FAULT => PTEFlags::X,
+        _ => return false,
+    };
+    let process = crate::task::processor::current_process();
+    let memory_set = process.memory_set();
+    let Some(pte) = memory_set.translate(VirtAddr::from(stval).floor()) else {
+        return false;
+    };
+    let flags = pte.flags();
+    if !pte.is_valid() || !flags.contains(PTEFlags::U) || !flags.contains(required) {
+        return false;
+    }
+
+    let sepc = get_trap_context().sepc;
+    let mut key = stval
+        ^ sepc.rotate_left(17)
+        ^ process.getpid().rotate_left(9)
+        ^ code.rotate_left(3);
+    if key == 0 {
+        key = 1;
+    }
+    let hart = crate::arch::hart_id();
+    if hart < MAX_HARTS {
+        let previous = SPURIOUS_FAULT_RETRY_KEYS[hart].swap(key, Ordering::Relaxed);
+        if previous == key {
+            SPURIOUS_FAULT_RETRY_KEYS[hart].store(0, Ordering::Relaxed);
+            return false;
+        }
+    }
+
+    // SAFETY: 页表已经允许本次访问；清除当前 hart 的旧翻译后重试一次。
+    unsafe {
+        asm!("sfence.vma {addr}, zero", addr = in(reg) stval, options(nostack));
+        if code == INSTRUCTION_PAGE_FAULT {
+            asm!("fence.i", options(nostack));
+        }
+    }
+    if crate::debug_config::DEBUG_SIGNAL
+        && SPURIOUS_FAULT_RETRY_LOGS.fetch_add(1, Ordering::Relaxed) < 16
+    {
+        crate::println!(
+            "[spurious_fault_retry] pid={} hart={} code={} sepc={:#x} stval={:#x} pte={:#x}",
+            process.getpid(),
+            hart,
+            code,
+            sepc,
+            stval,
+            pte.bits
+        );
+    }
+    true
+}
+
 fn current_signal_handler(signum: usize) -> usize {
     let process = crate::task::processor::current_process();
     let inner = process.signal();
@@ -521,14 +594,21 @@ fn handle_user_exception(code: usize, stval: usize) {
             return;
         }
     }
+    // 页表修改与远端 hart 并发时，异常入口可能看到已经更新的有效 PTE。
+    // 这类旧 TLB fault 只在本 hart 重试一次，防止错误投递 SIGSEGV。
+    if retry_spurious_user_page_fault(code, stval) {
+        return;
+    }
     let cx = get_trap_context();
     // Diagnostics only: dump the faulting registers for an unresolved page
     // fault. This has no effect on control flow, so it stays gated behind
     // DEBUG_SYSCALL (default off). Keep functional fault handling (the stages
     // above, especially the lazy-fault one) OUT of this guard.
-    if crate::debug_config::DEBUG_SYSCALL
+    let log_unresolved_fault = (crate::debug_config::DEBUG_SYSCALL
+        || crate::debug_config::DEBUG_SIGNAL)
         && (code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT)
-    {
+        && UNRESOLVED_FAULT_LOGS.fetch_add(1, Ordering::Relaxed) < 8;
+    if log_unresolved_fault {
         let pid = crate::task::processor::current_process().getpid();
         crate::println!(
             "[user_exn_regs] pid={} code={} ({}) sepc={:#x} stval={:#x}",
@@ -573,6 +653,15 @@ fn handle_user_exception(code: usize, stval: usize) {
             cx.x[26],
             cx.x[27]
         );
+
+        let access = match code {
+            LOAD_PAGE_FAULT => MapPermission::R,
+            STORE_PAGE_FAULT => MapPermission::W,
+            INSTRUCTION_PAGE_FAULT => MapPermission::X,
+            _ => MapPermission::R,
+        };
+        let process = crate::task::processor::current_process();
+        process.memory_set().lock().debug_fault_state(stval, access);
 
         // Extra diagnostics for the recurring glibc ld-linux crash:
         // sepc ends with 0x11dce and stval==0x8 (NULL+8 deref).

@@ -91,10 +91,9 @@ fn task_is_current(task: &Arc<TaskControlBlock>) -> bool {
 }
 
 fn request_reschedule_for_running_task(task: &Arc<TaskControlBlock>) {
-    let running_hart = task.on_cpu.load(core::sync::atomic::Ordering::Acquire);
-    if running_hart == TaskControlBlock::OFF_CPU {
+    let Some(running_hart) = task.running_hart() else {
         return;
-    }
+    };
     if task_is_current(task) {
         request_reschedule_current_hart();
     } else if running_hart < usize::BITS as usize {

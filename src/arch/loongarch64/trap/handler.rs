@@ -118,7 +118,8 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             return;
         }
         if (estat & ESTAT_IS_IPI) != 0 {
-            super::super::clear_ipi_interrupt();
+            let actions = super::super::clear_ipi_interrupt();
+            super::super::mm::handle_ipi_actions(actions);
             return;
         }
     }
@@ -137,7 +138,7 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
                 inner.res.as_ref().map(|res| res.tid).unwrap_or(usize::MAX),
                 inner.task_cx.ra,
                 inner.task_cx.sp,
-                task.on_cpu.load(Ordering::Acquire),
+                task.running_hart().unwrap_or(usize::MAX),
             )
         })
         .unwrap_or((usize::MAX, usize::MAX, 0, 0, usize::MAX));
@@ -309,7 +310,8 @@ pub fn trap_handler() {
                 suspend_current_and_run_next();
             }
         } else if (estat & ESTAT_IS_IPI) != 0 {
-            super::super::clear_ipi_interrupt();
+            let actions = super::super::clear_ipi_interrupt();
+            super::super::mm::handle_ipi_actions(actions);
         } else {
             //非时钟中断目前先panic
             panic!(
@@ -421,6 +423,8 @@ pub fn trap_return() -> ! {
         let cx = get_trap_context();
         cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
     }
+    // 即使同类 IPI 被合并，返回用户态前也必须消费共享的 TLB 刷新序号。
+    super::super::mm::service_pending_user_tlb_flush();
     if let Some(task) = crate::task::processor::current_task() {
         // LoongArch returns with the user ASID programmed in the trampoline.
         // Prepare the lazy-FPU gate before switching away from kernel ASID 0.

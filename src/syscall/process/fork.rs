@@ -525,9 +525,7 @@ fn clone_from_parts(
                 }
             };
             if !should_block {
-                parent_task
-                    .wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
+                parent_task.discard_deferred_wakeup();
                 break;
             }
             block_current_and_run_next();
