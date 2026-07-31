@@ -69,7 +69,7 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
 
     if let AtPath::PseudoAbs(abs) = &at {
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
-            if let Some(target) = crate::fs::proc_readlink(proc_path) {
+            if let Some(target) = crate::fs::mounted_proc_readlink(&proc_path) {
                 let bytes = target.as_bytes();
                 let len = min(bytes.len(), bufsiz);
                 if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {

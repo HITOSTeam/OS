@@ -1,15 +1,14 @@
 use super::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, BTreeMap, ClassifiedAbsPath, File,
-    INODE_XATTRS, MAX_SYMLINKS, NAME_MAX, O_TRUNC, OSInode, PATH_MAX, PseudoDir, PseudoDirent,
-    PseudoShmFile, String, SyscallError, Vec, XATTR_CREATE, XATTR_NAME_MAX, XATTR_REPLACE,
-    XATTR_SIZE_MAX, clear_ext4_path_cache, current_cwd_path, current_files, current_fsuid_gid,
-    current_mount_namespace, current_process, dt_type_from_ext4, err, ext4_lock,
-    ext4_path_cache_lookup, fd_has_o_path, find_path_in_roots, get_current_token, get_fd_file,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, ClassifiedAbsPath, File, INODE_XATTRS,
+    MAX_SYMLINKS, NAME_MAX, O_TRUNC, OSInode, PATH_MAX, PseudoDir, PseudoShmFile, String,
+    SyscallError, Vec, XATTR_CREATE, XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX,
+    clear_ext4_path_cache, current_cwd_path, current_files, current_fsuid_gid,
+    current_mount_namespace, current_process, err, ext4_lock, ext4_path_cache_lookup,
+    fd_has_o_path, find_path_in_roots, get_current_token, get_fd_file,
     inode_is_immutable_or_append, inode_mode_allows_uid_gid, install_open_file_fd,
     invalidate_ext4_path_cache, invalidate_ext4_path_cache_subtree, logical_path_for_inode,
     logical_path_for_open_fd, mount_lookup_for_abs, note_ext4_path_cache, open_pseudo,
-    path_is_noexec, path_is_rofs, pseudo_abs_for_ext4_dirfd,
-    resolve_proc_magic_intermediate_abs_path, secondary_root_inode, shm_get, shm_object_name,
+    path_is_noexec, path_is_rofs, pseudo_abs_for_ext4_dirfd, shm_get, shm_object_name,
     syscall_ftruncate, touch_inode_mtime_ctime_now, translate_mount_abs, try_copy_from_user,
     try_copy_to_user, try_read_user_value,
 };
@@ -60,6 +59,52 @@ pub(crate) fn normalize_path(cwd: &str, path: &str) -> String {
         out.pop();
     }
     out
+}
+
+/// Expand procfs magic components in the canonical provider namespace, then
+/// map results that remain inside that procfs instance back to its logical
+/// mountpoint.  Targets such as `/proc/self/cwd` that escape procfs re-enter
+/// normal absolute-path resolution.
+fn resolve_mounted_proc_magic_intermediate_abs_path(abs: &str) -> Result<String, isize> {
+    let Some((mount, canonical)) = crate::fs::current_pseudo_canonical_abs(abs) else {
+        return Ok(String::from(abs));
+    };
+    if !matches!(&mount.backend, crate::fs::MountBackend::Proc { .. }) {
+        return Ok(String::from(abs));
+    }
+    if canonical == "/proc/self" || canonical == "/proc/thread-self" {
+        return Ok(String::from(abs));
+    }
+    let pid_namespace_id = match &mount.backend {
+        crate::fs::MountBackend::Proc { pid_namespace_id } => *pid_namespace_id,
+        _ => unreachable!(),
+    };
+    let provider = crate::fs::proc_provider_path_for_namespace(&canonical, pid_namespace_id)
+        .unwrap_or(canonical);
+    let resolved = crate::fs::resolve_proc_magic_intermediate_abs_path(&provider)?;
+    if resolved == "/proc" || resolved.starts_with("/proc/") {
+        let mut visible = resolved;
+        if let Some(rest) = visible.strip_prefix("/proc/") {
+            let (pid_part, suffix) = rest.split_once('/').unwrap_or((rest, ""));
+            if let Ok(global_pid) = pid_part.parse::<usize>()
+                && let Some(process) = crate::task::manager::pid2process(global_pid)
+                && let Some(visible_pid) =
+                    crate::task::process_pid_in_pid_namespace(&process, pid_namespace_id)
+            {
+                visible = if suffix.is_empty() {
+                    alloc::format!("/proc/{visible_pid}")
+                } else {
+                    alloc::format!("/proc/{visible_pid}/{suffix}")
+                };
+            }
+        }
+        let suffix = visible.strip_prefix("/proc").unwrap_or("");
+        return Ok(normalize_path(
+            &mount.target,
+            suffix.trim_start_matches('/'),
+        ));
+    }
+    Ok(resolved)
 }
 
 /// 返回当前进程的根目录（`chroot` 设置的路径，默认 `"/"`）。
@@ -205,14 +250,11 @@ pub(crate) enum AtPath {
     /// An ext4 lookup rooted at `/`.
     Ext4Abs(String),
     /// An ext4 lookup rooted at an open directory fd.
-    /// if we dont find file in the base + rel w,then go to fallback abs
-    /// THIS is used becuase current environmemt has 2 disks,and we need to cover some files in no.2
-    /// by no.1 disk.This will cause the relative search in disk no.1 can't find the file in no.2.
-    /// So we use this.Should be removed in future
     Ext4Rel {
         base: alloc::sync::Arc<ext4_fs::Inode>,
         rel: String,
-        fallback_abs: Option<String>,
+        /// Translated absolute path used only for path-cache invalidation.
+        cache_abs: Option<String>,
     },
     /// A pseudo filesystem lookup expressed as an absolute path.
     PseudoAbs(String),
@@ -222,7 +264,7 @@ pub(crate) fn invalidate_ext4_path_cache_for_at(at: &AtPath, subtree: bool) {
     let Some(path) = (match at {
         AtPath::Ext4Abs(abs) => Some(abs.as_str()),
         AtPath::Ext4Rel {
-            fallback_abs: Some(abs),
+            cache_abs: Some(abs),
             ..
         } => Some(abs.as_str()),
         AtPath::Ext4Rel { .. } => None,
@@ -297,7 +339,7 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
 ) -> Result<AtPath, isize> {
     let logical_abs = normalize_path(base_path, path);
     // abs main contain some magic part like self
-    let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
+    let abs = resolve_mounted_proc_magic_intermediate_abs_path(&logical_abs)?;
     let classified_abs = classify_current_abs_path(&abs);
     if matches!(classified_abs, ClassifiedAbsPath::Pseudo(_)) {
         return Ok(AtPath::PseudoAbs(abs));
@@ -332,7 +374,7 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
         return Ok(AtPath::Ext4Rel {
             base,
             rel: suffix,
-            fallback_abs: None,
+            cache_abs: Some(translate_mount_abs(&abs)),
         });
     } else {
         normalize_relative_path(path)
@@ -352,7 +394,7 @@ pub(crate) fn resolve_relative_at_path_from_logical_base(
     Ok(AtPath::Ext4Rel {
         base,
         rel,
-        fallback_abs: Some(translate_mount_abs(&abs)),
+        cache_abs: Some(translate_mount_abs(&abs)),
     })
 }
 
@@ -366,7 +408,7 @@ pub(crate) fn resolve_relative_at_path_from_ext4_base(
 ) -> Result<AtPath, isize> {
     if let Some(logical_base) = logical_base {
         let logical_abs = normalize_path(&logical_base, path);
-        let abs = resolve_proc_magic_intermediate_abs_path(&logical_abs)?;
+        let abs = resolve_mounted_proc_magic_intermediate_abs_path(&logical_abs)?;
         if abs != logical_abs {
             return Ok(classify_abs_at_path(abs));
         }
@@ -378,7 +420,7 @@ pub(crate) fn resolve_relative_at_path_from_ext4_base(
     Ok(AtPath::Ext4Rel {
         base,
         rel,
-        fallback_abs: None,
+        cache_abs: None,
     })
 }
 
@@ -401,7 +443,7 @@ pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize>
     // This is decided in the classify function
     if path.starts_with('/') {
         let jail_abs = normalize_path("/", path);
-        let abs = resolve_proc_magic_intermediate_abs_path(&apply_process_root(&jail_abs))?;
+        let abs = resolve_mounted_proc_magic_intermediate_abs_path(&apply_process_root(&jail_abs))?;
         return Ok(classify_abs_at_path(abs));
     }
 
@@ -416,9 +458,10 @@ pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize>
     }
 }
 
-/// 从 ext4 绝对路径解析 inode，自动在主磁盘和辅助磁盘之间回退。
-/// 主磁盘承载 packer 生成的 overlay，应优先命中；辅助磁盘仅作为完整
-/// LTP 根目录的后备来源。
+/// 从挂载翻译后的 ext4 绝对路径解析 inode。
+///
+/// `root_inode_for_path` selects exactly one backing filesystem.  An ENOENT
+/// therefore stays on that filesystem and never falls through to another disk.
 /// 需在调用前持有 `ext4_lock`。
 pub(crate) fn resolve_ext4_abs_path(
     path: &str,
@@ -434,76 +477,43 @@ pub(crate) fn resolve_ext4_abs_path(
     }
 
     let primary = crate::fs::root_inode_for_path(&abs);
-    if let Some(result) =
-        resolve_ext4_abs_path_fast_cached(primary.clone(), &abs, uid, gid, follow_final)
-    {
-        return match result {
-            Ok(v) => Ok(v),
-            Err(e) if e == err(SyscallError::ENOENT) => {
-                let Some(secondary) = secondary_root_inode() else {
-                    return Err(err(SyscallError::ENOENT));
-                };
-                if let Some(sec_result) = resolve_ext4_abs_path_fast_cached(
-                    secondary.clone(),
-                    &abs,
-                    uid,
-                    gid,
-                    follow_final,
-                ) {
-                    return sec_result;
-                }
-                let mut sec_depth = 0usize;
-                let mut sec_seen = Vec::new();
-                resolve_ext4_path(
-                    secondary,
-                    &abs,
-                    uid,
-                    gid,
-                    follow_final,
-                    &mut sec_depth,
-                    &mut sec_seen,
-                )
-            }
-            Err(e) => Err(e),
-        };
+    let lookup_path = crate::fs::path_within_filesystem(&abs);
+    if let Some(result) = resolve_ext4_abs_path_fast_cached(
+        primary.clone(),
+        &abs,
+        lookup_path,
+        uid,
+        gid,
+        follow_final,
+    ) {
+        return result;
     }
-    match resolve_ext4_path(primary, &abs, uid, gid, follow_final, depth, seen_symlinks) {
-        Ok(v) => Ok(v),
-        Err(e) if e == err(SyscallError::ENOENT) => {
-            let Some(secondary) = secondary_root_inode() else {
-                return Err(err(SyscallError::ENOENT));
-            };
-            if let Some(sec_result) =
-                resolve_ext4_abs_path_fast_cached(secondary.clone(), &abs, uid, gid, follow_final)
-            {
-                return sec_result;
-            }
-            let mut sec_depth = 0usize;
-            let mut sec_seen = Vec::new();
-            resolve_ext4_path(
-                secondary,
-                &abs,
-                uid,
-                gid,
-                follow_final,
-                &mut sec_depth,
-                &mut sec_seen,
-            )
-        }
-        Err(e) => Err(e),
+    let result = resolve_ext4_path(
+        primary,
+        lookup_path,
+        uid,
+        gid,
+        follow_final,
+        depth,
+        seen_symlinks,
+    );
+    if let Ok(inode) = &result {
+        note_ext4_path_cache(&abs, uid, gid, follow_final, inode);
     }
+    result
 }
 
 fn resolve_ext4_abs_path_fast_cached(
     start: alloc::sync::Arc<ext4_fs::Inode>,
-    abs: &str,
+    cache_key: &str,
+    lookup_path: &str,
     uid: u32,
     gid: u32,
     follow_final: bool,
 ) -> Option<Result<alloc::sync::Arc<ext4_fs::Inode>, isize>> {
-    let result = resolve_ext4_path_fast_no_symlink(start, abs, uid, gid, follow_final)?;
+    let result = resolve_ext4_path_fast_no_symlink(start, lookup_path, uid, gid, follow_final)?;
     if let Ok(inode) = &result {
-        note_ext4_path_cache(abs, uid, gid, follow_final, inode);
+        note_ext4_path_cache(cache_key, uid, gid, follow_final, inode);
     }
     Some(result)
 }
@@ -568,16 +578,13 @@ pub(crate) fn maybe_dispatch_proc_fd_at(
 
 /// 若原始绝对路径或 `AtPath` 指向 `/proc` 伪文件系统，返回对应路径字符串引用，
 /// 供调用方走 proc 特殊处理分支。
-pub(crate) fn proc_path_for_at<'a>(raw_abs: Option<&'a str>, at: &'a AtPath) -> Option<&'a str> {
-    if let Some(abs) = raw_abs {
-        if crate::fs::is_proc_pseudo_path(abs) {
-            return Some(abs);
-        }
-    }
-    match at {
-        AtPath::PseudoAbs(abs) if crate::fs::is_proc_pseudo_path(abs) => Some(abs.as_str()),
+pub(crate) fn proc_path_for_at(raw_abs: Option<&str>, at: &AtPath) -> Option<String> {
+    let logical = raw_abs.or_else(|| match at {
+        AtPath::PseudoAbs(abs) => Some(abs.as_str()),
         _ => None,
-    }
+    })?;
+    let (mount, _) = crate::fs::current_pseudo_canonical_abs(logical)?;
+    matches!(mount.backend, crate::fs::MountBackend::Proc { .. }).then(|| String::from(logical))
 }
 
 /// 以指定模式重新打开一个已有文件（通常来自 `/proc/self/fd` 符号链接解析），
@@ -623,50 +630,6 @@ pub(crate) fn pseudo_path_exists_result(abs: &str) -> isize {
     } else {
         err(SyscallError::ENOENT)
     }
-}
-
-/// 将 ext4 根目录的所有目录项（跳过 `.` 和 `..`）合并到 `entries` 映射中，
-/// 已存在的项不覆盖（用于主磁盘优先的 union 合并）。
-pub(crate) fn add_root_dir_entries(
-    root: &alloc::sync::Arc<ext4_fs::Inode>,
-    entries: &mut BTreeMap<String, (u64, u8)>,
-) {
-    for (name, ino, ftype) in root.dir_entries() {
-        if name == "." || name == ".." {
-            continue;
-        }
-        entries
-            .entry(name)
-            .or_insert((ino as u64, dt_type_from_ext4(ftype)));
-    }
-}
-
-/// Build a merged root directory listing from the primary and secondary disks.
-///
-/// Caller should hold `ext4_lock`.
-pub(crate) fn union_root_dir_entries() -> Vec<PseudoDirent> {
-    let mut merged: BTreeMap<String, (u64, u8)> = BTreeMap::new();
-    let primary = crate::fs::root_inode_for_path("/");
-    add_root_dir_entries(&primary, &mut merged);
-    if let Some(secondary) = secondary_root_inode() {
-        add_root_dir_entries(&secondary, &mut merged);
-    }
-
-    let mut entries = Vec::with_capacity(merged.len() + 2);
-    entries.push(PseudoDirent {
-        name: alloc::string::String::from("."),
-        ino: 1,
-        dtype: 4,
-    });
-    entries.push(PseudoDirent {
-        name: alloc::string::String::from(".."),
-        ino: 1,
-        dtype: 4,
-    });
-    for (name, (ino, dtype)) in merged {
-        entries.push(PseudoDirent { name, ino, dtype });
-    }
-    entries
 }
 
 /// read a C string by ptr from the space specified by token,
@@ -1071,12 +1034,12 @@ pub(crate) fn resolve_at_inode(
         AtPath::Ext4Rel {
             base,
             rel,
-            fallback_abs,
+            cache_abs: _,
         } => {
             if rel.is_empty() {
                 Ok(alloc::sync::Arc::clone(base))
             } else {
-                match resolve_ext4_path(
+                resolve_ext4_path(
                     alloc::sync::Arc::clone(base),
                     rel,
                     uid,
@@ -1084,27 +1047,7 @@ pub(crate) fn resolve_at_inode(
                     follow_final,
                     &mut depth,
                     &mut seen_symlinks,
-                ) {
-                    Ok(inode) => Ok(inode),
-                    Err(e) if e == err(SyscallError::ENOENT) => {
-                        // the relative path's basic node is at no.1 disk
-                        // The file is at no.2 disk.we should resolve that by an abs path
-                        let Some(abs) = fallback_abs else {
-                            return Err(e);
-                        };
-                        let mut abs_depth = 0usize;
-                        let mut abs_seen = Vec::new();
-                        resolve_ext4_abs_path(
-                            abs,
-                            uid,
-                            gid,
-                            follow_final,
-                            &mut abs_depth,
-                            &mut abs_seen,
-                        )
-                    }
-                    Err(e) => Err(e),
-                }
+                )
             }
         }
         AtPath::PseudoAbs(_) => Err(err(SyscallError::ENOENT)),
@@ -1304,7 +1247,7 @@ pub(crate) fn resolve_abs_path(dirfd: isize, path: &str) -> Result<Option<String
         }
     };
     // handle magic part like self or /proc/self/fd/4 . changes these to real path
-    resolve_proc_magic_intermediate_abs_path(&abs).map(Some)
+    resolve_mounted_proc_magic_intermediate_abs_path(&abs).map(Some)
 }
 
 /// is path on Read only file sytem?

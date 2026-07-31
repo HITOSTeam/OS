@@ -11,10 +11,10 @@ use crate::task::manager::{PID2PCB, wakeup_tasks};
 use crate::{
     fs::{
         CgroupFile, CgroupMountSpec, ClassifiedAbsPath, EventFdFile, FanotifyFile, File,
-        MountNamespace, MountNamespaceState, MountPropagation, MountRecord, NamespaceFile,
-        NetSocketFile, OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir,
-        PseudoDirent, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
-        SocketPairEnd, TimerFdFile, TtyFile, cgroup_charge_file_write,
+        MountBackend, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
+        NamespaceFile, NetSocketFile, OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile,
+        PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
+        SocketPairEnd, TimerFdFile, TtyFile, block_device_source_path, cgroup_charge_file_write,
         cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
         cgroup_umount, clear_ext4_path_cache, ext4_lock, ext4_path_cache_lookup,
         fanotify_notify_access, fanotify_notify_close, fanotify_notify_modify,
@@ -24,7 +24,7 @@ use crate::{
         mount_namespace_id, note_ext4_path_cache, note_inode_path_hint, open_pseudo,
         pseudo_block_is_read_only, pseudo_block_note_sync, register_deferred_unlink_cleanup,
         resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked,
-        resolve_proc_magic_intermediate_abs_path, secondary_root_inode, shm_create, shm_get,
+        resolve_proc_magic_intermediate_abs_path, root_inode_for_device, shm_create, shm_get,
         shm_object_name, shm_remove,
     },
     mm::{

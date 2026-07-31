@@ -47,8 +47,37 @@ pub(crate) struct KStatFs {
 
 /// Fills a userspace `statfs` buffer with best-effort ext4 superblock data.
 pub(crate) fn fill_statfs(st_ptr: usize, mount_flags: i64) -> isize {
+    fill_statfs_for_backend(st_ptr, crate::fs::MountBackend::Storage, mount_flags)
+}
+
+pub(crate) fn fill_statfs_for_backend(
+    st_ptr: usize,
+    backend: crate::fs::MountBackend,
+    mount_flags: i64,
+) -> isize {
     if st_ptr == 0 {
         return err(SyscallError::EFAULT);
+    }
+    if !matches!(backend, crate::fs::MountBackend::Storage) {
+        let st = KStatFs {
+            f_type: backend.statfs_magic(),
+            f_bsize: 4096,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_fsid: [0, 0],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: mount_flags,
+            f_spare: [0; 4],
+        };
+        let token = get_current_token();
+        if try_write_user_value(token, st_ptr as *mut KStatFs, &st).is_err() {
+            return err(SyscallError::EFAULT);
+        }
+        return 0;
     }
     // ext4 statfs (best-effort; our ext4 allocator does not yet update
     // on-disk free counters, so these values may be stale after heavy writes,

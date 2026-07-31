@@ -52,6 +52,12 @@ pub(crate) struct WaitingRecordLock {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct FlockLock {
+    pub(crate) owner: usize,
+    pub(crate) exclusive: bool,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct FileLease {
     pub(crate) owner_pid: usize,
     pub(crate) lease_type: i16,
@@ -64,6 +70,8 @@ lazy_static! {
     pub(crate) static ref RECORD_LOCK_WAITERS: Mutex<BTreeMap<FileLockKey, VecDeque<Arc<TaskControlBlock>>>> =
         Mutex::new(BTreeMap::new());
     pub(crate) static ref RECORD_LOCK_BLOCKED: Mutex<BTreeMap<usize, WaitingRecordLock>> =
+        Mutex::new(BTreeMap::new());
+    pub(crate) static ref FLOCK_LOCKS: Mutex<BTreeMap<FileLockKey, Vec<FlockLock>>> =
         Mutex::new(BTreeMap::new());
     pub(crate) static ref FILE_LEASES: Mutex<BTreeMap<FileLockKey, FileLease>> =
         Mutex::new(BTreeMap::new());
@@ -422,6 +430,75 @@ pub(crate) fn take_record_lock_waiters(key: FileLockKey) -> Vec<Arc<TaskControlB
 /// Wakes every task currently blocked on a record-lock key.
 pub(crate) fn wake_record_lock_waiters(key: FileLockKey) {
     wakeup_tasks(take_record_lock_waiters(key));
+}
+
+/// Tries to install or convert a BSD `flock` owned by one open file description.
+///
+/// The owner is removed before conflict checking so a SH->EX conversion cannot
+/// deadlock while retaining its old shared lock. The table update itself stays
+/// atomic when the conversion can be granted immediately.
+pub(crate) fn try_apply_flock(key: FileLockKey, owner: usize, exclusive: bool) -> (bool, bool) {
+    let mut table = FLOCK_LOCKS.lock();
+    let locks = table.entry(key).or_insert_with(Vec::new);
+    let old = locks
+        .iter()
+        .find(|lock| lock.owner == owner)
+        .map(|lock| lock.exclusive);
+    locks.retain(|lock| lock.owner != owner);
+
+    let conflict = locks.iter().any(|lock| exclusive || lock.exclusive);
+    if conflict {
+        if locks.is_empty() {
+            table.remove(&key);
+        }
+        return (false, old.is_some());
+    }
+
+    locks.push(FlockLock { owner, exclusive });
+    (
+        true,
+        old.is_some_and(|old_exclusive| old_exclusive != exclusive),
+    )
+}
+
+/// Returns whether another open file description conflicts with this request.
+pub(crate) fn flock_has_conflict(key: FileLockKey, owner: usize, exclusive: bool) -> bool {
+    FLOCK_LOCKS.lock().get(&key).is_some_and(|locks| {
+        locks
+            .iter()
+            .any(|lock| lock.owner != owner && (exclusive || lock.exclusive))
+    })
+}
+
+/// Releases a BSD lock and wakes tasks waiting on this inode.
+pub(crate) fn release_flock_owner(key: FileLockKey, owner: usize) {
+    let changed = {
+        let mut table = FLOCK_LOCKS.lock();
+        let Some(locks) = table.get_mut(&key) else {
+            return;
+        };
+        let before = locks.len();
+        locks.retain(|lock| lock.owner != owner);
+        let changed = locks.len() != before;
+        if locks.is_empty() {
+            table.remove(&key);
+        }
+        changed
+    };
+    if changed {
+        wake_record_lock_waiters(key);
+    }
+}
+
+/// Drop hook used by `OSInode` when its open file description disappears.
+pub(crate) fn release_flock_owner_for_inode(dev: usize, ino: u32, owner: usize) {
+    release_flock_owner(
+        FileLockKey {
+            dev: dev as u64,
+            ino: ino as u64,
+        },
+        owner,
+    );
 }
 
 /// Removes all process-owned locks for `key` and wakes waiters if anything changed.

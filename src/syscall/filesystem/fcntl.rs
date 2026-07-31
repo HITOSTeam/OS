@@ -5,10 +5,10 @@ use super::{
     block_current_and_run_next, clear_record_lock_waiting, collect_conflict_process_owners,
     current_files, current_files_and_nofile_limit, current_process, current_task,
     detect_record_lock_deadlock, enqueue_record_lock_waiter, err, file_lock_key,
-    first_conflicting_lock, get_current_token, get_file_lease_type, has_pending_unmasked_signal,
-    lock_conflicts, lock_range_from_flock, ofd_lock_owner_id, remove_record_lock_waiter,
-    set_file_lease, set_record_lock_waiting, try_read_user_value, try_write_user_value,
-    wake_record_lock_waiters,
+    first_conflicting_lock, flock_has_conflict, get_current_token, get_file_lease_type,
+    has_pending_unmasked_signal, lock_conflicts, lock_range_from_flock, ofd_lock_owner_id,
+    release_flock_owner, remove_record_lock_waiter, set_file_lease, set_record_lock_waiting,
+    try_apply_flock, try_read_user_value, try_write_user_value, wake_record_lock_waiters,
 };
 
 fn get_fcntl_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
@@ -16,6 +16,74 @@ fn get_fcntl_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
         .lock()
         .get_file(fd)
         .ok_or(err(SyscallError::EBADF))
+}
+
+/// Applies BSD whole-file locks owned by the open file description.
+pub fn syscall_flock(fd: usize, operation: usize) -> isize {
+    const LOCK_SH: usize = 1;
+    const LOCK_EX: usize = 2;
+    const LOCK_NB: usize = 4;
+    const LOCK_UN: usize = 8;
+
+    let mode = operation & !LOCK_NB;
+    if !matches!(mode, LOCK_SH | LOCK_EX | LOCK_UN)
+        || (operation & !(LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN)) != 0
+    {
+        return err(SyscallError::EINVAL);
+    }
+
+    let file = match get_fcntl_file(fd) {
+        Ok(file) => file,
+        Err(e) => return e,
+    };
+    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        return err(SyscallError::EOPNOTSUPP);
+    };
+    let Some(key) = file_lock_key(&file) else {
+        return err(SyscallError::EOPNOTSUPP);
+    };
+    let owner = os_inode.flock_owner_id();
+
+    if mode == LOCK_UN {
+        release_flock_owner(key, owner);
+        return 0;
+    }
+
+    let exclusive = mode == LOCK_EX;
+    let nonblock = (operation & LOCK_NB) != 0;
+    let waiter = if nonblock { None } else { current_task() };
+    loop {
+        let (granted, should_wake) = try_apply_flock(key, owner, exclusive);
+        if should_wake {
+            wake_record_lock_waiters(key);
+        }
+        if granted {
+            if let Some(task) = waiter.as_ref() {
+                remove_record_lock_waiter(key, task);
+            }
+            return 0;
+        }
+        if nonblock {
+            return err(SyscallError::EAGAIN);
+        }
+        let Some(task) = waiter.as_ref() else {
+            return err(SyscallError::EINTR);
+        };
+        enqueue_record_lock_waiter(key, task);
+        if !flock_has_conflict(key, owner, exclusive) {
+            remove_record_lock_waiter(key, task);
+            continue;
+        }
+        if has_pending_unmasked_signal() {
+            remove_record_lock_waiter(key, task);
+            return err(SyscallError::EINTR);
+        }
+        block_current_and_run_next();
+        if has_pending_unmasked_signal() {
+            remove_record_lock_waiter(key, task);
+            return err(SyscallError::EINTR);
+        }
+    }
 }
 
 /// Handles descriptor flags, record locks, leases, and async-owner state for `fcntl(2)`.
@@ -545,6 +613,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let Some((file, old_flags)) = files.get_file_and_flags(fd) else {
                 return err(SyscallError::EBADF);
             };
+            let mount = files.get_mount_ref(fd);
             let minfd = arg;
             if minfd >= limit {
                 return err(SyscallError::EINVAL);
@@ -562,7 +631,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             } else {
                 new_flags |= FD_CLOEXEC;
             }
-            let _ = files.install_fd_at(newfd, file, new_flags, limit);
+            let _ = files.replace_fd_at_with_mount(newfd, file, new_flags, mount, limit);
             newfd as isize
         }
         _ => err(SyscallError::EINVAL),

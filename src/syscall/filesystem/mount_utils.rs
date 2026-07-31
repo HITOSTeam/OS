@@ -2,15 +2,16 @@ use super::{
     AT_FDCWD, Arc, BTreeMap, BTreeSet, CgroupMountSpec, File, InodeTimes, MNT_DETACH, MNT_EXPIRE,
     MNT_FORCE, MS_BIND, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID,
     MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_REMOUNT, MS_SHARED, MS_SLAVE, MS_STRICTATIME,
-    MS_UNBINDABLE, MountNamespace, MountNamespaceState, MountPropagation, MountRecord, Mutex,
-    NEXT_MOUNT_EVENT_ID, NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ, OSInode, Ordering,
-    PID2PCB, ProcessControlBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile, ST_NOSYMFOLLOW,
-    String, SyscallError, TMPFILE_SEQ, UMOUNT_NOFOLLOW, Vec, cgroup_logical_path_for_file,
-    cgroup_mount, cgroup_umount, clear_ext4_path_cache, current_fsuid_gid, current_process,
-    current_timespec, err, ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token,
-    get_inode_times, inode_logical_path, inode_raw_logical_path, mount_namespace_id,
-    normalize_path, open_pseudo, pseudo_block_is_read_only, read_user_cstring, resolve_at_inode,
-    resolve_at_path, set_inode_times,
+    MS_UNBINDABLE, MountBackend, MountNamespace, MountNamespaceState, MountPropagation,
+    MountRecord, Mutex, NEXT_MOUNT_EVENT_ID, NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ,
+    OSInode, Ordering, PID2PCB, ProcessControlBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile,
+    ST_NOSYMFOLLOW, String, SyscallError, TMPFILE_SEQ, UMOUNT_NOFOLLOW, Vec,
+    block_device_source_path, cgroup_logical_path_for_file, cgroup_mount, cgroup_umount,
+    clear_ext4_path_cache, current_fsuid_gid, current_process, current_timespec, err,
+    ext4_err_to_errno, ext4_lock, find_path_in_roots, get_current_token, get_inode_times,
+    inode_logical_path, inode_raw_logical_path, mount_namespace_id, normalize_path, open_pseudo,
+    pseudo_block_is_read_only, read_user_cstring, resolve_at_inode, resolve_at_path,
+    set_inode_times,
 };
 use alloc::vec;
 use lazy_static::lazy_static;
@@ -73,6 +74,18 @@ pub(crate) fn current_mount_namespace() -> MountNamespace {
     current_process().mount_namespace()
 }
 
+pub(crate) fn mount_backend_for_fs_type(fs_type: &str) -> MountBackend {
+    match fs_type {
+        "proc" => MountBackend::Proc {
+            pid_namespace_id: current_process().pid_namespace_id(),
+        },
+        "sysfs" => MountBackend::SysFs,
+        "devtmpfs" => MountBackend::DevTmpFs,
+        "cgroup" | "cgroup2" => MountBackend::Cgroup,
+        _ => MountBackend::Storage,
+    }
+}
+
 pub(crate) fn next_mount_stack_seq() -> usize {
     NEXT_MOUNT_STACK_SEQ.fetch_add(1, Ordering::Relaxed)
 }
@@ -117,6 +130,7 @@ pub(crate) fn push_mount_record_in(
     source: &str,
     source_display: &str,
     fs_type: &str,
+    backend: MountBackend,
     flags: usize,
     propagation: MountPropagation,
     peer_group_id: Option<usize>,
@@ -130,6 +144,7 @@ pub(crate) fn push_mount_record_in(
             source: String::from(source),
             source_display: String::from(source_display),
             fs_type: String::from(fs_type),
+            backend,
             flags,
             stack_seq,
             event_id,
@@ -151,6 +166,7 @@ fn ensure_root_mount_record(state: &mut MountNamespaceState) {
         source: String::from("/"),
         source_display: String::from("/dev/root"),
         fs_type: String::from("ext4"),
+        backend: MountBackend::Storage,
         flags: 0,
         stack_seq: next_mount_stack_seq(),
         event_id: next_mount_event_id(),
@@ -196,6 +212,7 @@ pub(crate) fn push_mount_record(
     source: &str,
     source_display: &str,
     fs_type: &str,
+    backend: MountBackend,
     flags: usize,
     propagation: MountPropagation,
     peer_group_id: Option<usize>,
@@ -208,6 +225,7 @@ pub(crate) fn push_mount_record(
         source,
         source_display,
         fs_type,
+        backend,
         flags,
         propagation,
         peer_group_id,
@@ -459,9 +477,20 @@ pub(crate) fn pseudo_abs_for_ext4_dirfd(base: &Arc<ext4_fs::Inode>, path: &str) 
 }
 
 pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
-    let self_bind_root = mount_record_for_target(target)
+    let top_record = mount_record_for_target(target);
+    let self_bind_root = top_record
+        .as_ref()
         .map(|record| record.source == target)
         .unwrap_or(false);
+    if let Some(record) = top_record.as_ref() {
+        let ns = current_mount_namespace();
+        let state = ns.lock();
+        if state.mounts().iter().any(|child| {
+            child.stack_seq != record.stack_seq && path_strictly_under_mount(&child.target, target)
+        }) {
+            return true;
+        }
+    }
     let current_ns_id = current_process().mount_namespace_id();
     let processes = {
         let map = PID2PCB.lock();
@@ -493,7 +522,25 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }
-        for (_fd, file) in files.lock().iter_files_snapshot() {
+        let files_guard = files.lock();
+        if let Some(record) = top_record.as_ref() {
+            for (fd, mount_ref) in files_guard.iter_mount_refs_snapshot() {
+                if mount_ref.event_id != record.event_id
+                    || mount_ref.stack_seq != record.stack_seq
+                    || mount_ref.target != record.target
+                {
+                    continue;
+                }
+                if writable_only && !files_guard.get_file(fd).is_some_and(|file| file.writable()) {
+                    continue;
+                }
+                return true;
+            }
+        }
+        for (fd, file) in files_guard.iter_files_snapshot() {
+            if files_guard.get_mount_ref(fd).is_some() {
+                continue;
+            }
             if writable_only && !file.writable() {
                 continue;
             }
@@ -945,6 +992,7 @@ pub(crate) fn push_mount_to_destination(
     source: &str,
     source_display: &str,
     fs_type: &str,
+    backend: MountBackend,
     flags: usize,
     event_id: usize,
 ) {
@@ -956,6 +1004,7 @@ pub(crate) fn push_mount_to_destination(
                 source,
                 source_display,
                 fs_type,
+                backend,
                 flags,
                 MountPropagation::Shared,
                 dest.peer_group_id,
@@ -970,6 +1019,7 @@ pub(crate) fn push_mount_to_destination(
                 source,
                 source_display,
                 fs_type,
+                backend,
                 flags,
                 MountPropagation::Slave,
                 None,
@@ -1023,12 +1073,25 @@ pub(crate) fn create_mount_record_with_propagation(
     fs_type: &str,
     flags: usize,
 ) {
+    let backend = mount_backend_for_fs_type(fs_type);
+    create_mount_record_with_backend(target, source, source_display, fs_type, backend, flags);
+}
+
+fn create_mount_record_with_backend(
+    target: &str,
+    source: &str,
+    source_display: &str,
+    fs_type: &str,
+    backend: MountBackend,
+    flags: usize,
+) {
     let Some(base) = mount_lookup_for_abs(target) else {
         push_mount_record(
             target,
             source,
             source_display,
             fs_type,
+            backend,
             flags,
             MountPropagation::Private,
             None,
@@ -1045,7 +1108,15 @@ pub(crate) fn create_mount_record_with_propagation(
         let mut created_any = false;
         for dest in shared_group_destinations(&base, target, new_peer_group, None) {
             created_any = true;
-            push_mount_to_destination(&dest, source, source_display, fs_type, flags, event_id);
+            push_mount_to_destination(
+                &dest,
+                source,
+                source_display,
+                fs_type,
+                backend.clone(),
+                flags,
+                event_id,
+            );
         }
         if !created_any {
             push_mount_record(
@@ -1053,6 +1124,7 @@ pub(crate) fn create_mount_record_with_propagation(
                 source,
                 source_display,
                 fs_type,
+                backend,
                 flags,
                 MountPropagation::Shared,
                 Some(new_peer_group),
@@ -1070,6 +1142,7 @@ pub(crate) fn create_mount_record_with_propagation(
         source,
         source_display,
         fs_type,
+        backend,
         flags,
         propagation,
         peer_group_id,
@@ -1088,6 +1161,10 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     recursive_bind: bool,
 ) {
     let source_mount = mount_lookup_for_abs(source_display);
+    let backend = source_mount
+        .as_ref()
+        .map(|mount| mount.backend.clone())
+        .unwrap_or_else(|| mount_backend_for_fs_type(fs_type));
     let source_is_exact_mount = source_mount
         .as_ref()
         .map(|mount| mount.target == source_display)
@@ -1125,7 +1202,15 @@ pub(crate) fn create_bind_mount_record_with_propagation(
                 shared_group_destinations(&base, target, event_peer_group, origin_master_group)
             {
                 created_any = true;
-                push_mount_to_destination(&dest, source, source_display, fs_type, flags, event_id);
+                push_mount_to_destination(
+                    &dest,
+                    source,
+                    source_display,
+                    fs_type,
+                    backend.clone(),
+                    flags,
+                    event_id,
+                );
                 clone_subtree_mount_records_to_destination(
                     &dest,
                     source_display,
@@ -1139,6 +1224,7 @@ pub(crate) fn create_bind_mount_record_with_propagation(
                     source,
                     source_display,
                     fs_type,
+                    backend,
                     flags,
                     MountPropagation::Shared,
                     Some(event_peer_group),
@@ -1171,6 +1257,7 @@ pub(crate) fn create_bind_mount_record_with_propagation(
             source,
             source_display,
             fs_type,
+            backend,
             flags,
             MountPropagation::Shared,
             Some(peer_group),
@@ -1196,6 +1283,7 @@ pub(crate) fn create_bind_mount_record_with_propagation(
             source,
             source_display,
             fs_type,
+            backend,
             flags,
             MountPropagation::Slave,
             None,
@@ -1220,6 +1308,7 @@ pub(crate) fn create_bind_mount_record_with_propagation(
         source,
         source_display,
         fs_type,
+        backend,
         flags,
         MountPropagation::Private,
         None,
@@ -1626,6 +1715,41 @@ pub(crate) fn syscall_mount_impl(
                 }
                 return 0;
             }
+            if let Err(e) = bind_target_matches_source_kind(&target, true) {
+                return e;
+            }
+            let source_mount = match mount_lookup_for_abs(&source_abs) {
+                Some(mount) if mount.backend.is_pseudo() => mount,
+                _ => return err(SyscallError::EINVAL),
+            };
+            let canonical_source = {
+                let ns = current_mount_namespace();
+                let state = ns.lock();
+                match state.canonical_pseudo_abs(&source_abs) {
+                    Some((_, canonical)) => canonical,
+                    None => return err(SyscallError::EINVAL),
+                }
+            };
+            let base_flags = source_mount.flags;
+            let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
+            create_bind_mount_record_with_propagation(
+                &target,
+                &canonical_source,
+                &source_abs,
+                &source_mount.fs_type,
+                bind_flags,
+                (flags & MS_REC) != 0,
+            );
+            if (flags & propagation_flags) != 0 {
+                return match apply_mount_propagation_change(
+                    &target,
+                    flags & (propagation_flags | MS_REC),
+                ) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                };
+            }
+            return 0;
         }
 
         let source = translate_mount_abs(&source_abs);
@@ -1738,8 +1862,30 @@ pub(crate) fn syscall_mount_impl(
     if source_display.is_empty() || fsname.is_empty() {
         return err(SyscallError::EINVAL);
     }
-    if mount_record_for_target(&target).is_some() {
+    // Linux permits overmounting an existing mount point, but rejects a
+    // direct duplicate of the current top mount when both source and target
+    // are unchanged.  Keep the check this narrow so a different filesystem
+    // can still be stacked on the same target.
+    if mount_record_for_target(&target)
+        .is_some_and(|record| record.source_display == source_display && record.fs_type == fsname)
+    {
         return err(SyscallError::EBUSY);
+    }
+    if matches!(fsname, "proc" | "sysfs" | "devtmpfs") {
+        let canonical_source = match fsname {
+            "proc" => "/proc",
+            "sysfs" => "/sys",
+            "devtmpfs" => "/dev",
+            _ => unreachable!(),
+        };
+        create_mount_record_with_propagation(
+            &target,
+            canonical_source,
+            source_display,
+            fsname,
+            flags & mount_flag_mask(),
+        );
+        return 0;
     }
     if fsname == "cgroup2" {
         let spec = CgroupMountSpec::unified();
@@ -1787,10 +1933,17 @@ pub(crate) fn syscall_mount_impl(
             }
         }
     }
-    let key = alloc::format!("{}:{}", fsname, source_display);
-    let source = match source_for_device_mount(&key) {
-        Ok(v) => v,
-        Err(e) => return e,
+    let source = if fsname == "ext4" {
+        let Some(source) = block_device_source_path(source_display) else {
+            return err(SyscallError::ENODEV);
+        };
+        source
+    } else {
+        let key = alloc::format!("{}:{}", fsname, source_display);
+        match source_for_device_mount(&key) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
     };
     create_mount_record_with_propagation(
         &target,
@@ -2117,6 +2270,12 @@ pub(crate) fn proc_mountinfo_snapshot_for_process(process: &Arc<ProcessControlBl
 
 pub(crate) fn statfs_mount_flags_for_abs(abs: &str) -> i64 {
     mount_flags_to_statfs(mount_flags_for_abs(abs))
+}
+
+pub(crate) fn statfs_mount_backend_for_abs(abs: &str) -> MountBackend {
+    mount_lookup_for_abs(abs)
+        .map(|mount| mount.backend)
+        .unwrap_or(MountBackend::Storage)
 }
 
 pub(crate) fn register_rofs_mount(abs: &str) {

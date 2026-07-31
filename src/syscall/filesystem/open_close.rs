@@ -1,21 +1,22 @@
+use alloc::{sync::Arc, vec::Vec};
+
 use super::{
     AtPath, BTreeSet, FD_CLOEXEC, File, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY,
     O_EXCL, O_NOATIME, O_NOFOLLOW, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_TMPFILE, O_TRUNC,
-    O_WRONLY, OSInode, Ordering, ProcMagicLinkFile, PseudoDir, PseudoShmFile, S_IFBLK, S_IFCHR,
-    S_IFMT, SyscallError, TMPFILE_SEQ, apply_umask, clear_ext4_path_cache,
-    current_effective_uid_gid, current_files, current_files_and_nofile_limit, current_fsuid_gid,
-    current_process, err, ext4_err_to_errno, ext4_lock, fanotify_notify_close,
-    fanotify_notify_open, fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key,
-    file_lock_key_from_inode, get_current_token, gid_for_created_inode, inode_mode_allows,
-    inode_mode_allows_uid_gid, install_open_file_fd, invalidate_ext4_path_cache_for_at,
-    is_privileged_or_owner, make_pipe, maybe_signal_lease_break, mode_for_created_file,
-    note_inode_path_hint, open_existing_target_path, open_pseudo, path_is_nodev,
-    path_is_nosymfollow, path_is_rofs, proc_path_for_at, read_user_cstring,
-    remove_owner_file_lease_for_key, remove_process_record_locks_for_key, reopen_proc_link_file,
-    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
-    secondary_root_inode, set_inode_all_times_now, shm_create, shm_get, shm_object_name,
-    touch_inode_mtime_ctime_now, truncate_regular_inode, try_write_user_value,
-    union_root_dir_entries,
+    O_WRONLY, OSInode, Ordering, ProcMagicLinkFile, PseudoShmFile, S_IFBLK, S_IFCHR, S_IFMT,
+    SyscallError, TMPFILE_SEQ, apply_umask, clear_ext4_path_cache, current_effective_uid_gid,
+    current_files, current_files_and_nofile_limit, current_fsuid_gid, current_process, err,
+    ext4_err_to_errno, ext4_lock, fanotify_notify_close, fanotify_notify_open,
+    fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key, file_lock_key_from_inode,
+    get_current_token, gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid,
+    install_open_file_fd_for_path, invalidate_ext4_path_cache_for_at, is_privileged_or_owner,
+    make_pipe, maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint,
+    open_existing_target_path, open_pseudo, path_is_nodev, path_is_nosymfollow, path_is_rofs,
+    proc_path_for_at, read_user_cstring, remove_owner_file_lease_for_key,
+    remove_process_record_locks_for_key, reopen_proc_link_file, resolve_abs_path, resolve_at_inode,
+    resolve_at_path, resolve_parent_and_name, root_inode_for_device, set_inode_all_times_now,
+    shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, truncate_regular_inode,
+    try_write_user_value,
 };
 
 /// Opens or creates a filesystem object across ext4, proc, pseudo-fs, and tmpfile paths.
@@ -76,20 +77,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     if write_intent && readonly_fs {
         return err(SyscallError::EROFS);
     }
-    if !nofollow {
-        if let Some(proc_path) = raw_abs
-            .as_deref()
-            .filter(|abs| crate::fs::is_proc_pseudo_path(abs))
-        {
-            if let Some(src_file) = crate::fs::proc_fd_link_file(proc_path) {
-                let fd = match reopen_proc_link_file(src_file, flags, readable, writable, o_path) {
-                    Ok(fd) => fd,
-                    Err(e) => return e,
-                };
-                return fd as isize;
-            }
-        }
-    }
     let append = !o_path && (flags & O_APPEND) != 0;
 
     let at = match resolve_at_path(dirfd, &path) {
@@ -124,7 +111,17 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             return err(SyscallError::EOPNOTSUPP);
         }
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
-            if crate::fs::proc_magic_link_exists(proc_path) {
+            if !nofollow {
+                if let Some(src_file) = crate::fs::mounted_proc_fd_link_file(&proc_path) {
+                    let fd =
+                        match reopen_proc_link_file(src_file, flags, readable, writable, o_path) {
+                            Ok(fd) => fd,
+                            Err(e) => return e,
+                        };
+                    return fd as isize;
+                }
+            }
+            if crate::fs::mounted_proc_magic_link_exists(&proc_path) {
                 if nofollow {
                     if !o_path {
                         return err(SyscallError::ELOOP);
@@ -132,17 +129,18 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                     if (flags & O_DIRECTORY) != 0 {
                         return err(SyscallError::ENOTDIR);
                     }
-                    let fd = match install_open_file_fd(
-                        ProcMagicLinkFile::new(proc_path),
+                    let fd = match install_open_file_fd_for_path(
+                        ProcMagicLinkFile::new(&proc_path),
                         flags,
                         true,
+                        abs,
                     ) {
                         Ok(fd) => fd,
                         Err(e) => return e,
                     };
                     return fd as isize;
                 }
-                if let Some(target) = crate::fs::proc_readlink(proc_path) {
+                if let Some(target) = crate::fs::mounted_proc_readlink(&proc_path) {
                     if target.starts_with('/') {
                         let fd = match open_existing_target_path(
                             &target, flags, readable, writable, append, o_path,
@@ -153,11 +151,11 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                         return fd as isize;
                     }
                 }
-                let file = match open_pseudo(proc_path) {
+                let file = match open_pseudo(abs) {
                     Some(f) => f,
                     None => return err(SyscallError::ENOENT),
                 };
-                let fd = match install_open_file_fd(file, flags, o_path) {
+                let fd = match install_open_file_fd_for_path(file, flags, o_path, abs) {
                     Ok(fd) => fd,
                     Err(e) => return e,
                 };
@@ -185,7 +183,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             } else {
                 return err(SyscallError::ENOENT);
             };
-        let fd = match install_open_file_fd(file, flags, o_path) {
+        let fd = match install_open_file_fd_for_path(file, flags, o_path, abs) {
             Ok(fd) => fd,
             Err(e) => return e,
         };
@@ -196,25 +194,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             }
         }
         return fd as isize;
-    }
-
-    // If we have a secondary disk, expose a merged view of `/` for directory listing.
-    if let AtPath::Ext4Abs(abs) = &at {
-        if abs == "/" && secondary_root_inode().is_some() {
-            if write_intent && !o_path {
-                return err(SyscallError::EISDIR);
-            }
-            let _ext4_guard = ext4_lock();
-            let entries = union_root_dir_entries();
-            drop(_ext4_guard);
-            let file: alloc::sync::Arc<dyn File + Send + Sync> =
-                alloc::sync::Arc::new(PseudoDir::new("/", entries));
-            let fd = match install_open_file_fd(file, flags, o_path) {
-                Ok(fd) => fd,
-                Err(e) => return e,
-            };
-            return fd as isize;
-        }
     }
 
     let ext4_guard = ext4_lock();
@@ -258,19 +237,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         // Emulate anonymous tmpfile semantics using a hidden per-filesystem pool.
         // Use the known root inode for the same block device to avoid relying on
         // per-directory ".." lookups (which can leave stale hidden entries behind).
-        let mut fs_root = crate::fs::root_inode_for_path("/");
-        if fs_root.device_id() != dir_inode.device_id() {
-            if let Some(sec_root) = secondary_root_inode() {
-                if sec_root.device_id() == dir_inode.device_id() {
-                    fs_root = sec_root;
-                } else {
-                    // Fallback: best effort on the opened directory's filesystem.
-                    fs_root = alloc::sync::Arc::clone(&dir_inode);
-                }
-            } else {
-                fs_root = alloc::sync::Arc::clone(&dir_inode);
-            }
-        }
+        let fs_root = root_inode_for_device(dir_inode.device_id())
+            .unwrap_or_else(|| alloc::sync::Arc::clone(&dir_inode));
         let pool_name = ".ltp_tmpfile_pool";
         let pool_dir = if let Some(existing) = fs_root.find(pool_name) {
             if !existing.is_dir() {
@@ -456,7 +424,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             return err(SyscallError::EINVAL);
         };
         drop(ext4_guard);
-        let fd = match install_open_file_fd(file, flags, o_path) {
+        let logical_abs = raw_abs.as_deref().unwrap_or("/");
+        let fd = match install_open_file_fd_for_path(file, flags, o_path, logical_abs) {
             Ok(fd) => fd,
             Err(e) => return e,
         };
@@ -521,7 +490,8 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     {
         return e;
     }
-    let fd = match install_open_file_fd(os_inode, flags, o_path) {
+    let logical_abs = raw_abs.as_deref().unwrap_or("/");
+    let fd = match install_open_file_fd_for_path(os_inode, flags, o_path, logical_abs) {
         Ok(fd) => fd,
         Err(e) => return e,
     };
@@ -540,9 +510,21 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 /// Closes a single file descriptor and releases any lock or lease state tied to it.
 pub fn syscall_close(fd: usize) -> isize {
     let files = current_files();
-    let mut files = files.lock();
-    let Some(file) = files.get_file(fd) else {
-        return err(SyscallError::EBADF);
+    let file = {
+        let mut files = files.lock();
+        let Some(file) = files.get_file(fd) else {
+            return err(SyscallError::EBADF);
+        };
+        // Keep the removed file alive until after `files_lock` is released.
+        // Linux likewise detaches the fd under the table lock and performs
+        // filesystem close work outside it.  In particular, ext4_lock() may
+        // cooperatively yield when contended and must never be reached while
+        // holding this shared spin lock.
+        let removed = files
+            .clear_fd(fd)
+            .expect("fd disappeared while files_lock was held");
+        debug_assert!(Arc::ptr_eq(&file, &removed));
+        removed
     };
     let lock_key = file_lock_key(&file);
     let fanotify_close = file
@@ -558,8 +540,6 @@ pub fn syscall_close(fd: usize) -> isize {
             };
             (inode, file.writable(), is_dir, path)
         });
-    let _ = files.clear_fd(fd);
-    drop(files);
     if let Some((inode, writable, is_dir, path)) = fanotify_close {
         fanotify_notify_close(&inode, writable, is_dir, path.as_deref());
     }
@@ -601,6 +581,7 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
     }
 
     let mut lock_keys = BTreeSet::new();
+    let mut removed_files = Vec::new();
     for fd in first..=end {
         if set_cloexec {
             if files.is_fd_open(fd) {
@@ -611,10 +592,15 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
             if let Some(key) = file_lock_key(&file) {
                 lock_keys.insert(key);
             }
-            let _ = files.clear_fd(fd);
+            if let Some(removed) = files.clear_fd(fd) {
+                removed_files.push(removed);
+            }
         }
     }
     drop(files);
+    // File destructors may flush ext4 state or wake waiters, so they must run
+    // after the descriptor-table spin lock is released.
+    drop(removed_files);
     if !set_cloexec {
         let owner_pid = current_process().getpid();
         for key in lock_keys {
@@ -679,7 +665,9 @@ pub fn syscall_dup(oldfd: usize) -> isize {
     let Some((file, old_flags)) = files.get_file_and_flags(oldfd) else {
         return err(SyscallError::EBADF);
     };
-    let Some(newfd) = files.install_fd(file, old_flags & !FD_CLOEXEC, limit) else {
+    let mount = files.get_mount_ref(oldfd);
+    let Some(newfd) = files.install_fd_with_mount(file, old_flags & !FD_CLOEXEC, mount, limit)
+    else {
         return err(SyscallError::EMFILE);
     };
     newfd as isize
@@ -702,13 +690,16 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let Some((file, old_flags)) = files.get_file_and_flags(oldfd) else {
         return err(SyscallError::EBADF);
     };
+    let mount = files.get_mount_ref(oldfd);
     let mut new_flags = old_flags;
     if (flags & O_CLOEXEC) != 0 {
         new_flags |= FD_CLOEXEC;
     } else {
         new_flags &= !FD_CLOEXEC;
     }
-    let replaced_file = files.replace_fd_at(newfd, file, new_flags, limit).flatten();
+    let replaced_file = files
+        .replace_fd_at_with_mount(newfd, file, new_flags, mount, limit)
+        .flatten();
     drop(files);
     if let Some(replaced_file) = replaced_file {
         if let Some(key) = file_lock_key(&replaced_file) {

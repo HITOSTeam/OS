@@ -3,7 +3,7 @@ use super::{
     O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe,
     ProcPseudoFile, PseudoFile, PseudoShmFile, SocketPairEnd, SyscallError, TaskControlBlock,
     UserBuffer, current_files, current_files_and_nofile_limit, err, ext4_lock, get_current_token,
-    make_pipe, try_read_user_value, try_write_user_value,
+    make_pipe, mount_lookup_for_abs, try_read_user_value, try_write_user_value,
 };
 use lazy_static::lazy_static;
 
@@ -139,6 +139,10 @@ pub(crate) fn get_fd_file_and_flags(
     fd: usize,
 ) -> Option<(alloc::sync::Arc<dyn File + Send + Sync>, u32)> {
     current_files().lock().get_file_and_flags(fd)
+}
+
+pub(crate) fn get_fd_mount_ref(fd: usize) -> Option<crate::fs::FdMountRef> {
+    current_files().lock().get_mount_ref(fd)
 }
 
 /// Get the file for `fd`, returning `-EBADF` if the descriptor is not open.
@@ -373,6 +377,25 @@ pub(crate) fn install_open_file_fd(
         .lock()
         .install_fd(file, open_descriptor_flags(flags, o_path), limit)
     else {
+        return Err(err(SyscallError::EMFILE));
+    };
+    Ok(fd)
+}
+
+pub(crate) fn install_open_file_fd_for_path(
+    file: alloc::sync::Arc<dyn File + Send + Sync>,
+    flags: usize,
+    o_path: bool,
+    logical_abs: &str,
+) -> Result<usize, isize> {
+    let mount = mount_lookup_for_abs(logical_abs).map(|record| (&record).into());
+    let (files, limit) = current_files_and_nofile_limit();
+    let Some(fd) = files.lock().install_fd_with_mount(
+        file,
+        open_descriptor_flags(flags, o_path),
+        mount,
+        limit,
+    ) else {
         return Err(err(SyscallError::EMFILE));
     };
     Ok(fd)

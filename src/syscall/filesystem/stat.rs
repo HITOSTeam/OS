@@ -5,17 +5,17 @@ use super::{
     Pipe, ProcPseudoFile, ProcessControlBlock, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
     RtcFile, Statx, String, SyscallError, TimeSpec, Vec, current_effective_uid_gid,
     current_fsuid_gid, current_process, current_timespec, err, ext4_lock, fd_has_o_path,
-    file_lock_key_from_inode, fill_statfs, find_path_in_roots, flush_open_inode_views,
-    fsize_limit_allows, get_current_token, get_fd_file, get_inode_times, inode_fs_flags,
-    inode_mode_allows_uid_gid, inode_visible_size_with_disk_size, is_privileged_or_owner,
-    kstat_from_dev_pts_path, kstat_from_ext4_snapshot, kstat_from_fd, kstat_from_file,
-    kstat_from_followed_proc_symlink, maybe_signal_lease_break, open_pseudo,
+    file_lock_key_from_inode, fill_statfs, fill_statfs_for_backend, find_path_in_roots,
+    flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file, get_fd_mount_ref,
+    get_inode_times, inode_fs_flags, inode_mode_allows_uid_gid, inode_visible_size_with_disk_size,
+    is_privileged_or_owner, kstat_from_dev_pts_path, kstat_from_ext4_snapshot, kstat_from_fd,
+    kstat_from_file, kstat_from_followed_proc_symlink, maybe_signal_lease_break, open_pseudo,
     proc_magic_link_target_kstat, proc_path_for_at, proc_symlink_kstat, pseudo_block_note_sync,
     punch_hole_keep_size, read_user_cstring, require_fd_file, resolve_abs_path, resolve_at_inode,
-    resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, statfs_mount_flags_for_abs,
-    statx_from_kstat, sync_all, touch_inode_mtime_ctime_now, truncate_regular_inode,
-    try_copy_to_user, try_read_user_value, try_write_user_value, update_current_inode_mmaps_size,
-    update_current_os_inode_mmaps_size, write_zeros_range,
+    resolve_at_path, resolve_utime, rofs_for_path, set_inode_times, statfs_mount_backend_for_abs,
+    statfs_mount_flags_for_abs, statx_from_kstat, sync_all, touch_inode_mtime_ctime_now,
+    truncate_regular_inode, try_copy_to_user, try_read_user_value, try_write_user_value,
+    update_current_inode_mmaps_size, update_current_os_inode_mmaps_size, write_zeros_range,
 };
 use crate::fs::TunTapFile;
 
@@ -254,6 +254,13 @@ pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
     if get_fd_file(fd).is_none() {
         return err(SyscallError::EBADF);
     }
+    if let Some(mount) = get_fd_mount_ref(fd) {
+        return fill_statfs_for_backend(
+            st_ptr,
+            mount.backend,
+            super::mount_flags_to_statfs(mount.flags),
+        );
+    }
     let _ext4_guard = ext4_lock();
     fill_statfs(st_ptr, 0)
 }
@@ -278,7 +285,11 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
             if open_pseudo(&abs).is_none() {
                 return err(SyscallError::ENOENT);
             }
-            fill_statfs(st_ptr, statfs_mount_flags_for_abs(&abs))
+            fill_statfs_for_backend(
+                st_ptr,
+                statfs_mount_backend_for_abs(&abs),
+                statfs_mount_flags_for_abs(&abs),
+            )
         }
         AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
             let (fsuid, fsgid) = current_fsuid_gid();
@@ -290,7 +301,11 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| String::from("/"));
-            fill_statfs(st_ptr, statfs_mount_flags_for_abs(&abs))
+            fill_statfs_for_backend(
+                st_ptr,
+                statfs_mount_backend_for_abs(&abs),
+                statfs_mount_flags_for_abs(&abs),
+            )
         }
     }
 }
@@ -863,14 +878,26 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
             Err(e) => return e,
         };
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
-            if crate::fs::proc_magic_link_exists(proc_path) {
+            if crate::fs::mounted_proc_magic_link_exists(&proc_path) {
                 let st = if (_flags & AT_SYMLINK_NOFOLLOW) != 0 {
-                    let link_len = crate::fs::proc_readlink(proc_path)
+                    let link_len = crate::fs::mounted_proc_readlink(&proc_path)
                         .map(|target| target.len())
                         .unwrap_or(0);
                     proc_symlink_kstat(link_len)
+                } else if proc_path.ends_with("/self") || proc_path.ends_with("/thread-self") {
+                    let Some(node) = open_pseudo(&proc_path) else {
+                        return err(SyscallError::ENOENT);
+                    };
+                    match kstat_from_file(&node) {
+                        Ok(st) => st,
+                        Err(e) => return e,
+                    }
                 } else {
-                    match proc_magic_link_target_kstat(proc_path) {
+                    let Some(provider_path) = crate::fs::mounted_proc_provider_path(&proc_path)
+                    else {
+                        return err(SyscallError::ENOENT);
+                    };
+                    match proc_magic_link_target_kstat(&provider_path) {
                         Ok(Some(st)) => st,
                         Ok(None) => return err(SyscallError::ENOENT),
                         Err(e) => return e,
@@ -882,7 +909,8 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
                 return 0;
             }
         }
-        let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
+        let proc_path = proc_path_for_at(raw_abs.as_deref(), &at);
+        let pseudo_path = proc_path.as_deref().unwrap_or(abs);
         let st = if let Some(st) = kstat_from_dev_pts_path(pseudo_path) {
             st
         } else {
@@ -979,14 +1007,26 @@ pub fn syscall_statx(
             Err(e) => return e,
         };
         if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
-            if crate::fs::proc_magic_link_exists(proc_path) {
+            if crate::fs::mounted_proc_magic_link_exists(&proc_path) {
                 let st = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
-                    let link_len = crate::fs::proc_readlink(proc_path)
+                    let link_len = crate::fs::mounted_proc_readlink(&proc_path)
                         .map(|target| target.len())
                         .unwrap_or(0);
                     proc_symlink_kstat(link_len)
+                } else if proc_path.ends_with("/self") || proc_path.ends_with("/thread-self") {
+                    let Some(node) = open_pseudo(&proc_path) else {
+                        return err(SyscallError::ENOENT);
+                    };
+                    match kstat_from_file(&node) {
+                        Ok(st) => st,
+                        Err(e) => return e,
+                    }
                 } else {
-                    match proc_magic_link_target_kstat(proc_path) {
+                    let Some(provider_path) = crate::fs::mounted_proc_provider_path(&proc_path)
+                    else {
+                        return err(SyscallError::ENOENT);
+                    };
+                    match proc_magic_link_target_kstat(&provider_path) {
                         Ok(Some(st)) => st,
                         Ok(None) => return err(SyscallError::ENOENT),
                         Err(e) => return e,
@@ -999,7 +1039,8 @@ pub fn syscall_statx(
                 return 0;
             }
         }
-        let pseudo_path = proc_path_for_at(raw_abs.as_deref(), &at).unwrap_or(abs);
+        let proc_path = proc_path_for_at(raw_abs.as_deref(), &at);
+        let pseudo_path = proc_path.as_deref().unwrap_or(abs);
         let st = if let Some(st) = kstat_from_dev_pts_path(pseudo_path) {
             st
         } else {
