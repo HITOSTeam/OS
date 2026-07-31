@@ -25,6 +25,7 @@ use super::{
 };
 
 const SOCK_DGRAM: usize = 2;
+const SOCK_SEQPACKET: usize = 5;
 
 fn wait_until_deadline(deadline_ms: Option<usize>) -> Result<(), isize> {
     let Some(deadline_ms) = deadline_ms else {
@@ -430,8 +431,9 @@ impl SocketPairEnd {
         self.peer_cred
     }
 
-    pub fn is_dgram(&self) -> bool {
-        self.socket_type == SOCK_DGRAM
+    /// Datagram and sequenced-packet sockets both preserve send boundaries.
+    pub fn is_record_oriented(&self) -> bool {
+        matches!(self.socket_type, SOCK_DGRAM | SOCK_SEQPACKET)
     }
 
     pub fn set_reuseaddr(&self, enabled: bool) {
@@ -812,7 +814,7 @@ pub fn make_socketpair() -> (Arc<SocketPairEnd>, Arc<SocketPairEnd>) {
 
 /// Create a bidirectional pair of endpoints with the userspace-visible socket type.
 pub fn make_socketpair_with_type(socket_type: usize) -> (Arc<SocketPairEnd>, Arc<SocketPairEnd>) {
-    if socket_type == SOCK_DGRAM {
+    if matches!(socket_type, SOCK_DGRAM | SOCK_SEQPACKET) {
         let queue0 = Arc::new(DatagramQueue::new());
         let queue1 = Arc::new(DatagramQueue::new());
         let end0 = Arc::new(SocketPairEnd::new_datagram(

@@ -445,7 +445,7 @@ fn recvmsg_deadline_waitall_stream(fd: usize, flags: usize) -> bool {
     }
     file.as_any()
         .downcast_ref::<SocketPairEnd>()
-        .is_some_and(|sock| !sock.is_dgram())
+        .is_some_and(|sock| !sock.is_record_oriented())
         || file
             .as_any()
             .downcast_ref::<UnixSocketFile>()
@@ -1461,7 +1461,7 @@ fn sendmsg_inner(fd: usize, msg: &MsgHdr, flags: usize) -> isize {
             Ok(v) => v,
             Err(e) => return e,
         };
-        if !sock.is_dgram() && kbuf.is_empty() {
+        if !sock.is_record_oriented() && kbuf.is_empty() {
             if scm.is_empty() {
                 return 0;
             }
@@ -1897,7 +1897,7 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize, deadline_ms: Option<
     }
     if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
         let mut scratch = vec![0u8; total_len];
-        let (copied, packet_len, control) = if sock.is_dgram() {
+        let (copied, packet_len, control) = if sock.is_record_oriented() {
             match sock.recv_to_slice(
                 &mut scratch,
                 (flags & MSG_DONTWAIT) != 0,
@@ -1963,7 +1963,7 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize, deadline_ms: Option<
             Ok(v) => v,
             Err(e) => return e,
         };
-        if sock.is_dgram() && copied_to_user < packet_len {
+        if sock.is_record_oriented() && copied_to_user < packet_len {
             msg.msg_flags |= MSG_TRUNC as i32;
         }
         let r = write_msg_name_un(msg, None);
@@ -1979,7 +1979,7 @@ fn recvmsg_inner(fd: usize, msg: &mut MsgHdr, flags: usize, deadline_ms: Option<
         if r != 0 {
             return r;
         }
-        return if sock.is_dgram() && (flags & MSG_TRUNC) != 0 {
+        return if sock.is_record_oriented() && (flags & MSG_TRUNC) != 0 {
             packet_len as isize
         } else {
             copied_to_user as isize
@@ -2727,7 +2727,7 @@ pub fn syscall_sendto(
         if send_flag_check != 0 {
             return send_flag_check;
         }
-        if !sock.is_dgram() && len == 0 {
+        if !sock.is_record_oriented() && len == 0 {
             return 0;
         }
         let token = get_current_token();
@@ -3159,12 +3159,12 @@ pub fn syscall_recvfrom(
         };
     }
     if let Some(sock) = file.as_any().downcast_ref::<SocketPairEnd>() {
-        if !sock.is_dgram() && len == 0 {
+        if !sock.is_record_oriented() && len == 0 {
             return 0;
         }
         let token = get_current_token();
         let mut kbuf = alloc::vec![0u8; len];
-        let (copied, packet_len) = if sock.is_dgram() {
+        let (copied, packet_len) = if sock.is_record_oriented() {
             match sock.recv_to_slice(
                 &mut kbuf,
                 (flags & MSG_DONTWAIT) != 0,
@@ -3217,7 +3217,7 @@ pub fn syscall_recvfrom(
                 return r;
             }
         }
-        return if sock.is_dgram() && (flags & MSG_TRUNC) != 0 {
+        return if sock.is_record_oriented() && (flags & MSG_TRUNC) != 0 {
             packet_len as isize
         } else {
             copied as isize

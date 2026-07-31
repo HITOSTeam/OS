@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use crate::{
     fs::{
         DummyFile, EventFdFile, File, PidFdFile, PseudoShmFile, SignalfdFile, TimerFdFile,
-        UserfaultfdFile, shm_create_anonymous,
+        UserfaultfdFile, shm_create_anonymous, userfaultfd_active,
     },
     mm::{try_copy_from_user, try_read_user_value, try_write_user_value},
     task::{
@@ -322,6 +322,9 @@ pub fn syscall_userfaultfd(flags: usize) -> isize {
 }
 
 pub fn try_handle_userfaultfd_page_fault(addr: usize, is_write: bool) -> bool {
+    if !userfaultfd_active() {
+        return false;
+    }
     let files = current_files().lock().iter_files_snapshot();
     for (_fd, file) in files {
         let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() else {
