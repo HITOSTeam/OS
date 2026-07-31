@@ -3,7 +3,8 @@
 
 use super::{PhysAddr, PhysPageNum};
 use crate::{config::phys_mem_end, println};
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{
     fmt::{self, Debug, Formatter},
@@ -12,16 +13,25 @@ use core::{
 use lazy_static::*;
 use spin::Mutex;
 
-lazy_static! {
-    /// Reference counts for physical frames (for COW/shared mappings).
-    static ref FRAME_REFCOUNTS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+static FRAME_ALLOC_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FRAME_OWNER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct FrameOwner {
+    ppn: PhysPageNum,
 }
 
-static FRAME_ALLOC_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+impl Drop for FrameOwner {
+    fn drop(&mut self) {
+        FRAME_OWNER_COUNT.fetch_sub(1, Ordering::Relaxed);
+        frame_dealloc(self.ppn);
+    }
+}
 
 /// manage a frame which has the same lifecycle as the tracker
+#[derive(Clone)]
 pub struct FrameTracker {
     pub ppn: PhysPageNum,
+    owner: Arc<FrameOwner>,
 }
 
 impl FrameTracker {
@@ -31,43 +41,21 @@ impl FrameTracker {
         for i in bytes_array {
             *i = 0;
         }
-        {
-            let mut rc = FRAME_REFCOUNTS.lock();
-            rc.insert(ppn.0, 1);
+        FRAME_OWNER_COUNT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            ppn,
+            owner: Arc::new(FrameOwner { ppn }),
         }
-        Self { ppn }
     }
-}
 
-impl Clone for FrameTracker {
-    fn clone(&self) -> Self {
-        let mut rc = FRAME_REFCOUNTS.lock();
-        let e = rc.entry(self.ppn.0).or_insert(0);
-        *e += 1;
-        Self { ppn: self.ppn }
+    pub fn refcount(&self) -> usize {
+        Arc::strong_count(&self.owner)
     }
 }
 
 impl Debug for FrameTracker {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_fmt(format_args!("FrameTracker:PPN={:#x}", self.ppn.0))
-    }
-}
-
-impl Drop for FrameTracker {
-    fn drop(&mut self) {
-        let mut rc = FRAME_REFCOUNTS.lock();
-        let Some(cnt) = rc.get_mut(&self.ppn.0) else {
-            // Should not happen, but avoid double-free.
-            return;
-        };
-        if *cnt <= 1 {
-            rc.remove(&self.ppn.0);
-            drop(rc);
-            frame_dealloc(self.ppn);
-        } else {
-            *cnt -= 1;
-        }
     }
 }
 
@@ -204,7 +192,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         let end = allocator.end;
         let recycled = allocator.recycled.len();
         drop(allocator);
-        let refcnt_entries = FRAME_REFCOUNTS.lock().len();
+        let refcnt_entries = FRAME_OWNER_COUNT.load(Ordering::Relaxed);
         println!(
             "[mm-debug] frame_alloc failed count={} current={:#x} end={:#x} recycled={} refcnt_entries={}",
             fails, current, end, recycled, refcnt_entries
@@ -214,11 +202,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
 }
 
 pub fn frame_refcount_entries() -> usize {
-    FRAME_REFCOUNTS.lock().len()
-}
-
-pub(crate) fn frame_refcount(ppn: PhysPageNum) -> usize {
-    FRAME_REFCOUNTS.lock().get(&ppn.0).copied().unwrap_or(0)
+    FRAME_OWNER_COUNT.load(Ordering::Relaxed)
 }
 
 pub fn frame_available_pages() -> usize {

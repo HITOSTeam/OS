@@ -1,25 +1,110 @@
-//! The global allocator
+//! The global allocator.
 
-use crate::{config::KERNEL_HEAP_SIZE, println};
-use buddy_system_allocator::LockedHeap;
-use core::ptr::addr_of_mut;
+use crate::{
+    config::{KERNEL_HEAP_SIZE, MAX_HARTS},
+    println,
+};
+use buddy_system_allocator::Heap;
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    ptr::{NonNull, addr_of, addr_of_mut},
+};
+use spin::mutex::SpinMutex;
+
+const HEAP_SHARD_SIZE: usize = KERNEL_HEAP_SIZE / MAX_HARTS;
+
+/// Per-hart buddy heaps.
+///
+/// Rust's `buddy_system_allocator::LockedHeap` serializes every allocation and
+/// free through one ticket lock.  Fork-heavy builds create and destroy enough
+/// Arcs and vectors for that lock to dominate all harts.  Linux uses per-CPU
+/// allocator fast paths for the same reason.  Keep buddy allocation semantics,
+/// but partition the fixed heap into independently locked arenas.  Allocation
+/// falls back to another arena when the local one is full; deallocation routes
+/// by address, so tasks may migrate freely between the two operations.
+struct ShardedHeap {
+    shards: [SpinMutex<Heap>; MAX_HARTS],
+}
+
+impl ShardedHeap {
+    const fn empty() -> Self {
+        Self {
+            // Use the non-ticket spin mutex explicitly. A global allocator
+            // cannot sleep, and ticket head-of-line blocking is especially
+            // costly when QEMU schedules virtual harts cooperatively.
+            shards: [const { SpinMutex::new(Heap::new()) }; MAX_HARTS],
+        }
+    }
+
+    unsafe fn init(&self, start: usize, size: usize) {
+        debug_assert_eq!(size, KERNEL_HEAP_SIZE);
+        debug_assert_eq!(size % MAX_HARTS, 0);
+        for (index, shard) in self.shards.iter().enumerate() {
+            let shard_start = start + index * HEAP_SHARD_SIZE;
+            // SAFETY: init_heap calls this once before secondary harts and
+            // userspace start. The ranges are disjoint and cover HEAP_SPACE.
+            unsafe {
+                shard.lock().init(shard_start, HEAP_SHARD_SIZE);
+            }
+        }
+    }
+
+    fn stats(&self) -> (usize, usize, usize) {
+        self.shards
+            .iter()
+            .fold((0usize, 0usize, 0usize), |(user, actual, total), shard| {
+                let shard = shard.lock();
+                (
+                    user.saturating_add(shard.stats_alloc_user()),
+                    actual.saturating_add(shard.stats_alloc_actual()),
+                    total.saturating_add(shard.stats_total_bytes()),
+                )
+            })
+    }
+
+    fn shard_for_ptr(&self, ptr: *mut u8) -> Option<&SpinMutex<Heap>> {
+        let heap_start = addr_of!(HEAP_SPACE) as usize;
+        let offset = (ptr as usize).checked_sub(heap_start)?;
+        if offset >= KERNEL_HEAP_SIZE {
+            return None;
+        }
+        self.shards.get(offset / HEAP_SHARD_SIZE)
+    }
+}
+
+unsafe impl GlobalAlloc for ShardedHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let local = crate::arch::hart_id() % MAX_HARTS;
+        for offset in 0..MAX_HARTS {
+            let index = (local + offset) % MAX_HARTS;
+            if let Ok(allocation) = self.shards[index].lock().alloc(layout) {
+                return allocation.as_ptr();
+            }
+        }
+        core::ptr::null_mut()
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let shard = self
+            .shard_for_ptr(ptr)
+            .expect("global allocator received a pointer outside HEAP_SPACE");
+        // SAFETY: GlobalAlloc requires `ptr` to come from a previous successful
+        // allocation with the same layout. Address routing selects that
+        // allocation's original, disjoint buddy arena.
+        shard
+            .lock()
+            .dealloc(unsafe { NonNull::new_unchecked(ptr) }, layout);
+    }
+}
 
 #[global_allocator]
-/// heap allocator instance
-static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
+static HEAP_ALLOCATOR: ShardedHeap = ShardedHeap::empty();
 
 #[alloc_error_handler]
 /// panic when heap allocation error occurs
 pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     let (id, args) = crate::syscall::last_syscall_snapshot();
-    let (alloc_user, alloc_actual, total_bytes) = {
-        let heap = HEAP_ALLOCATOR.lock();
-        (
-            heap.stats_alloc_user(),
-            heap.stats_alloc_actual(),
-            heap.stats_total_bytes(),
-        )
-    };
+    let (alloc_user, alloc_actual, total_bytes) = HEAP_ALLOCATOR.stats();
     let frame_refs = crate::mm::frame_refcount_entries();
     crate::println!(
         "[oom] heap alloc failed: layout={:?} user={} actual={} total={} frame_refs={} last_syscall={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
@@ -50,9 +135,7 @@ static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 #[allow(dead_code)]
 pub fn init_heap() {
     unsafe {
-        HEAP_ALLOCATOR
-            .lock()
-            .init(addr_of_mut!(HEAP_SPACE) as usize, KERNEL_HEAP_SIZE);
+        HEAP_ALLOCATOR.init(addr_of_mut!(HEAP_SPACE) as usize, KERNEL_HEAP_SIZE);
     }
 }
 

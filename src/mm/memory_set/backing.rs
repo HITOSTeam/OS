@@ -164,7 +164,7 @@ pub(super) fn shared_file_page_cache_reclaim_unreferenced() -> usize {
     let mut cache = SHARED_FILE_PAGE_CACHE.lock();
     let stale_keys = cache
         .iter()
-        .filter(|(_, frame)| crate::mm::frame_refcount(frame.ppn) <= 1)
+        .filter(|(_, frame)| frame.refcount() <= 1)
         .map(|(key, _)| *key)
         .collect::<Vec<_>>();
     let reclaimed = stale_keys.len();

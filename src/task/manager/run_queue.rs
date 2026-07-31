@@ -30,7 +30,7 @@ pub(super) fn resolve_enqueue_hart(
     task: &Arc<TaskControlBlock>,
     current_hart: usize,
     mask: usize,
-    kind: EnqueueKind,
+    _kind: EnqueueKind,
 ) -> usize {
     let affinity_mask = {
         let inner = task.borrow_mut();
@@ -46,10 +46,11 @@ pub(super) fn resolve_enqueue_hart(
         affinity_mask
     };
     if matches!(task_queue_slot(task), ReadyQueueSlot::Fair) {
-        if kind == EnqueueKind::Initial && (allowed_mask & (1usize << current_hart)) != 0 {
-            task.set_cpu_id(current_hart);
-            return current_hart;
-        }
+        // Linux can correct fork placement through sched-domain balancing.
+        // Until this scheduler has an equivalent periodic balancer, pinning
+        // every new fair task to the forking CPU leaves parallel compiler
+        // children concentrated on a few harts. Use the same least-loaded
+        // placement as fair wakeups while still respecting affinity.
         let picked = pick_least_loaded_hart_from_mask(allowed_mask);
         task.set_cpu_id(picked);
         return picked;
@@ -74,7 +75,19 @@ pub(super) fn pick_least_loaded_hart_from_mask(mask: usize) -> usize {
         if (mask & (1usize << hart_id)) == 0 {
             continue;
         }
-        let len = TASK_MANAGER.ready_queues[hart_id].lock().len();
+        // A hart with an empty runqueue may still be executing a CPU-bound
+        // task. Counting only queued entities repeatedly selects the first
+        // such hart and defeats SMP distribution. Linux's rq load includes
+        // the current entity; approximate that here without blocking on a
+        // remote processor lock.
+        let running = usize::from(
+            crate::task::processor::current_task_on_hart(hart_id)
+                .is_some_and(|task| task.get_cpu_id() == hart_id),
+        );
+        let len = TASK_MANAGER.ready_queues[hart_id]
+            .lock()
+            .len()
+            .saturating_add(running);
         if len < best_len {
             best_len = len;
             best_hart = Some(hart_id);

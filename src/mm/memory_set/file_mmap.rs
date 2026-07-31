@@ -5,9 +5,7 @@ use super::range::{align_down_to_page, align_up_to_page, normalize_ranges};
 use super::vma::VmRegion;
 use crate::config::PAGE_SIZE;
 use crate::fs::{File, OSInode};
-use crate::mm::{
-    FrameTracker, PTEFlags, PhysAddr, PhysPageNum, VPNRange, VirtAddr, VirtPageNum, frame_refcount,
-};
+use crate::mm::{FrameTracker, PTEFlags, PhysAddr, PhysPageNum, VPNRange, VirtAddr, VirtPageNum};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -303,20 +301,20 @@ impl MemorySet {
         &self,
         backing_id: usize,
         file_page: usize,
-        ppn: PhysPageNum,
+        frame: &FrameTracker,
         local_refs: usize,
     ) -> bool {
-        let backing_state_ref = self
-            .mmap_backings
-            .get(&backing_id)
-            .and_then(|backing| backing.resident_pages.get(&file_page))
-            .and_then(|state| state.frame.as_ref())
-            .is_some_and(|frame| frame.ppn == ppn) as usize;
+        let backing_state_ref =
+            self.mmap_backings
+                .get(&backing_id)
+                .and_then(|backing| backing.resident_pages.get(&file_page))
+                .and_then(|state| state.frame.as_ref())
+                .is_some_and(|backing_frame| backing_frame.ppn == frame.ppn) as usize;
         let expected_local_refs = local_refs
             .saturating_add(1) // global shared file page cache
             .saturating_add(backing_state_ref)
             .saturating_add(1); // resident_page_for_vpn() clone held by the caller
-        frame_refcount(ppn) > expected_local_refs
+        frame.refcount() > expected_local_refs
     }
 
     fn shared_file_page_needs_writeback(
@@ -344,7 +342,7 @@ impl MemorySet {
             return true;
         }
 
-        self.shared_file_page_has_external_refs(backing_id, file_page, frame.ppn, local_refs)
+        self.shared_file_page_has_external_refs(backing_id, file_page, frame, local_refs)
     }
 
     /// 收集 [start, end) 内所有需要写回的共享文件页数据块。

@@ -32,20 +32,29 @@ mod riscv {
         ret
     }
 
-    fn sbi_call_ext(eid: usize, fid: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
-        let mut ret;
-        // SAFETY: ecall follows RISC-V SBI calling convention; args in a0-a2, fid in a6, eid in a7.
+    fn sbi_call_ext(
+        eid: usize,
+        fid: usize,
+        arg0: usize,
+        arg1: usize,
+        arg2: usize,
+    ) -> (usize, usize) {
+        let mut error;
+        let mut value;
+        // SAFETY: ecall follows the SBI v0.2 calling convention.  Unlike the
+        // legacy calls, an extension call returns both `error` in a0 and
+        // `value` in a1, so both registers must be declared as outputs.
         unsafe {
             asm!(
                 "ecall",
-                inlateout("a0") arg0 => ret,
-                in("a1") arg1,
+                inlateout("a0") arg0 => error,
+                inlateout("a1") arg1 => value,
                 in("a2") arg2,
                 in("a6") fid,
                 in("a7") eid,
             );
         }
-        ret
+        (error, value)
     }
 
     pub fn set_timer(timer: usize) {
@@ -85,24 +94,31 @@ mod riscv {
         }
     }
 
-    /// Request a full remote TLB flush on the selected harts.
+    /// Request a remote TLB flush for one virtual-address range on the
+    /// selected harts.
     ///
     /// Legacy SBI expects a pointer to a hart mask in memory. We reuse the same
     /// low, identity-mapped `.bss` storage as `send_ipi()`.
-    pub fn remote_sfence_vma_all(hart_mask: usize) {
+    pub fn remote_sfence_vma(hart_mask: usize, start: usize, size: usize) {
         if hart_mask == 0 {
             return;
         }
         let _g = IPI_LOCK.lock();
         // SAFETY: IPI_LOCK serializes access to IPI_HART_MASK, which lives in
         // low identity-mapped `.bss`, so its address is a valid SBI hart-mask
-        // pointer. start=0,size=0 requests a full TLB flush on the target harts.
+        // pointer. The legacy SBI call accepts this virtual-address range
+        // directly; start=0,size=0 requests a full flush.
         unsafe {
             IPI_HART_MASK = hart_mask;
             let mask_ptr = &raw const IPI_HART_MASK as usize;
-            sbi_call(SBI_REMOTE_SFENCE_VMA, mask_ptr, 0, 0);
+            sbi_call(SBI_REMOTE_SFENCE_VMA, mask_ptr, start, size);
             IPI_HART_MASK = 0;
         }
+    }
+
+    /// Request a full remote TLB flush on the selected harts.
+    pub fn remote_sfence_vma_all(hart_mask: usize) {
+        remote_sfence_vma(hart_mask, 0, 0);
     }
 
     pub fn shutdown() -> ! {
@@ -118,6 +134,7 @@ mod riscv {
             start_addr,
             opaque,
         )
+        .0
     }
 }
 
@@ -149,6 +166,10 @@ mod stub {
 
     pub fn remote_sfence_vma_all(_hart_mask: usize) {
         unsupported("remote_sfence_vma_all");
+    }
+
+    pub fn remote_sfence_vma(_hart_mask: usize, _start: usize, _size: usize) {
+        unsupported("remote_sfence_vma");
     }
 
     pub fn shutdown() -> ! {

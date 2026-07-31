@@ -106,6 +106,17 @@ impl MemorySet {
         };
         let flags = pte.flags();
         if !flags.contains(PTEFlags::COW) {
+            // Another hart may have resolved this COW page after the current
+            // hart took its store fault but before it acquired the mm lock.
+            // The fault is then stale: the authoritative PTE is already
+            // writable, so invalidate the local cached translation and retry
+            // the user instruction. Linux handles the same race by rechecking
+            // the PTE under the page-table lock.
+            if flags.contains(PTEFlags::W) {
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                self.flush_user_page(fault_va);
+                return true;
+            }
             return false;
         }
         if flags.contains(PTEFlags::SHARED) {
@@ -156,6 +167,23 @@ impl MemorySet {
         // 刷新 TLB，使新 PTE 立即生效。
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         self.flush_user_page(fault_va);
+        #[cfg(target_arch = "riscv64")]
+        {
+            // This mm may be running concurrently on another hart. Once COW
+            // replaces the PPN, every such hart must stop using the old
+            // translation before the shared frame can be reused. Linux tracks
+            // an mm's active CPUs; until we have that bookkeeping, target all
+            // other online harts with a page-sized shootdown.
+            let remote_hart_mask =
+                crate::task::manager::online_hart_mask() & !(1usize << crate::arch::hart_id());
+            if remote_hart_mask != 0 {
+                crate::sbi::remote_sfence_vma(
+                    remote_hart_mask,
+                    fault_va & !(PAGE_SIZE - 1),
+                    PAGE_SIZE,
+                );
+            }
+        }
         true
     }
 
