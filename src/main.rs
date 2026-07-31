@@ -174,6 +174,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         clear_bss();
         //顺便标记第一个cpu核心已经进入到初始化阶段了
         BOOT_BSS_CLEARED.store(true, Ordering::Release);
+        arch::DTB_data::init(dtb_pa, hart_id);
         let num_of_apps = unsafe { *(num_user_apps as *const i64) };
         println!(
             "Number of user apps: {}, from adress {}",
@@ -183,9 +184,8 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
             "[kernel] bootstrap hart {} starting with dtb @ {:#x}",
             hart_id, dtb_pa
         );
-        arch::bootstrap_init(dtb_pa);
-        mm::init_phys_mem_from_dtb(dtb_pa);
-        let active_hart_mask = mm::init_hart_topology_from_dtb(dtb_pa, hart_id);
+        arch::bootstrap_init();
+        let active_hart_mask = arch::DTB_data::active_hart_mask();
         mm::init();
         mm::remap_test();
         log::init();
@@ -308,12 +308,12 @@ fn rust_main(hart_id: usize, efi_system_table_pa: usize) -> ! {
     {
         clear_bss();
         BOOT_BSS_CLEARED.store(true, Ordering::Release);
+        let dtb_pa = loongarch_dtb_from_efi(efi_system_table_pa)
+            .expect("LoongArch EFI configuration table has no device-tree pointer");
+        arch::DTB_data::init(dtb_pa, hart_id);
         println!("[kernel] loongarch64 boot hart {}", hart_id);
         arch::bootstrap_init();
-        // DTB 是 EFI configuration table 中的一项，先按标准 GUID 查找它。
-        let dtb_pa = loongarch_dtb_from_efi(efi_system_table_pa).unwrap_or(0);
-        mm::init_phys_mem_from_dtb(dtb_pa);
-        let active_hart_mask = mm::init_hart_topology_from_dtb(dtb_pa, hart_id);
+        let active_hart_mask = arch::DTB_data::active_hart_mask();
         mm::init();
         arch::disable_direct_map_windows();
         log::init();

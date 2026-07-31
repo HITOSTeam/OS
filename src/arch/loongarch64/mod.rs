@@ -1,4 +1,6 @@
 pub mod csr_defs;
+#[allow(non_snake_case)]
+pub mod DTB_data;
 pub mod mm;
 pub mod task;
 pub mod trap;
@@ -7,7 +9,6 @@ use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
 use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
 use csr_defs::{
     CRMD_DA, CRMD_IE, CRMD_PG, ECFG_LIE_IPI, ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT,
     IOCSR_IPI_CLEAR, IOCSR_IPI_EN, IOCSR_IPI_SEND, IOCSR_IPI_SEND_BLOCKING,
@@ -50,55 +51,90 @@ const IOCSR_MBUF_SEND_BUF_SHIFT: usize = 32;
 const IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
 const IPI_ACTION_BOOT_CPU: u32 = 1 << 0;
 
-#[cfg(feature = "loongarch_board")]
-const UART_BASE: usize = 0x8000_0000_1fe2_0000;
-#[cfg(not(feature = "loongarch_board"))]
-const UART_BASE: usize = 0x1fe0_01e0;
-
-const UART_RBR_THR: usize = UART_BASE + 0x0;
-const UART_FCR: usize = UART_BASE + 0x2;
-const UART_LCR: usize = UART_BASE + 0x3;
-const UART_LSR: usize = UART_BASE + 0x5;
+const UART_RBR_THR: usize = 0;
+const UART_FCR: usize = 2;
+const UART_LCR: usize = 3;
+const UART_LSR: usize = 5;
 pub const UART_FIFO_DEPTH: usize = 16;
 
-static UART_INITED: AtomicBool = AtomicBool::new(false);
+static UART_INITED: spin::Once<()> = spin::Once::new();
 
-fn uart_init_once() {
-    if UART_INITED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        // SAFETY: UART_LCR and UART_FCR are MMIO addresses for 16550-compatible UART.
-        unsafe {
-            // 8N1 + enable FIFO, clear RX/TX queues.
-            write_volatile(UART_LCR as *mut u8, 0x03);
-            write_volatile(UART_FCR as *mut u8, 0x07);
+fn uart_register_address(console: DTB_data::ConsoleInfo, register: usize) -> usize {
+    let offset = register
+        .checked_shl(console.reg_shift as u32)
+        .expect("DTB UART register offset overflows");
+    let end = offset
+        .checked_add(console.reg_io_width as usize)
+        .expect("DTB UART register width overflows");
+    assert!(
+        end <= console.size,
+        "DTB UART register lies outside its reg range"
+    );
+    console
+        .base
+        .checked_add(offset)
+        .expect("DTB UART address overflows")
+}
+
+fn uart_write(console: DTB_data::ConsoleInfo, register: usize, value: u8) {
+    let address = uart_register_address(console, register);
+    // 安全性：地址和访问宽度均由已校验的 DTB 串口节点提供。
+    unsafe {
+        match console.reg_io_width {
+            1 => write_volatile(address as *mut u8, value),
+            2 => write_volatile(address as *mut u16, value as u16),
+            4 => write_volatile(address as *mut u32, value as u32),
+            _ => unreachable!("DTB parser only permits 1/2/4-byte UART accesses"),
         }
     }
+}
+
+fn uart_read(console: DTB_data::ConsoleInfo, register: usize) -> u8 {
+    let address = uart_register_address(console, register);
+    // 安全性：地址和访问宽度均由已校验的 DTB 串口节点提供。
+    unsafe {
+        match console.reg_io_width {
+            1 => read_volatile(address as *const u8),
+            2 => read_volatile(address as *const u16) as u8,
+            4 => read_volatile(address as *const u32) as u8,
+            _ => unreachable!("DTB parser only permits 1/2/4-byte UART accesses"),
+        }
+    }
+}
+
+fn uart_init_once(console: DTB_data::ConsoleInfo) {
+    UART_INITED.call_once(|| {
+        // 8N1，并启用 FIFO、清空收发队列。
+        uart_write(console, UART_LCR, 0x03);
+        uart_write(console, UART_FCR, 0x07);
+    });
 }
 
 pub fn console_putchar(c: usize) {
-    uart_init_once();
-    // SAFETY: UART_RBR_THR is the MMIO address for UART transmit hold register.
-    unsafe {
-        write_volatile(UART_RBR_THR as *mut u8, c as u8);
-    }
+    let Some(console) = DTB_data::try_console_info() else {
+        return;
+    };
+    uart_init_once(console);
+    uart_write(console, UART_RBR_THR, c as u8);
 }
 
 pub fn console_flush() {
-    uart_init_once();
-    // SAFETY: UART_LSR is the MMIO address for UART line status register.
-    unsafe { while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {} }
+    let Some(console) = DTB_data::try_console_info() else {
+        return;
+    };
+    uart_init_once(console);
+    while uart_read(console, UART_LSR) & 0x20 == 0 {}
 }
 
 pub fn console_getchar() -> usize {
-    uart_init_once();
-    // SAFETY: UART_LSR and UART_RBR_THR are MMIO addresses for UART status and data registers.
-    unsafe {
-        if read_volatile(UART_LSR as *const u8) & 0x01 == 0 {
-            return usize::MAX;
-        }
-        read_volatile(UART_RBR_THR as *const u8) as usize
+    let Some(console) = DTB_data::try_console_info() else {
+        return usize::MAX;
+    };
+    uart_init_once(console);
+    if uart_read(console, UART_LSR) & 0x01 == 0 {
+        usize::MAX
+    } else {
+        uart_read(console, UART_RBR_THR) as usize
     }
 }
 
@@ -249,9 +285,25 @@ pub fn hart_start(hart_id: usize, start_addr: usize, _opaque: usize) -> usize {
 }
 
 pub fn shutdown() -> ! {
-    // SAFETY: 0x100e_001c is the power control MMIO address on LoongArch QEMU virt.
+    let Some(poweroff) = DTB_data::try_poweroff_info() else {
+        loop {
+            // DTB 初始化失败时不能再依赖任何平台 MMIO 地址。
+            core::hint::spin_loop();
+        }
+    };
+    let address = poweroff
+        .base
+        .checked_add(poweroff.offset)
+        .expect("DTB poweroff register address overflows");
+    // 安全性：地址、访问宽度和值均由已校验的 DTB syscon-poweroff 节点提供。
     unsafe {
-        (0x100e_001c as *mut u8).write_volatile(0x34);
+        match poweroff.reg_io_width {
+            1 => write_volatile(address as *mut u8, poweroff.value as u8),
+            2 => write_volatile(address as *mut u16, poweroff.value as u16),
+            4 => write_volatile(address as *mut u32, poweroff.value as u32),
+            8 => write_volatile(address as *mut u64, poweroff.value as u64),
+            _ => unreachable!("DTB parser only permits 1/2/4/8-byte syscon accesses"),
+        }
     }
     loop {}
 }
@@ -572,18 +624,22 @@ fn read_cpucfg(index: u32) -> u32 {
     value
 }
 
-fn detect_clock_freq() -> Option<usize> {
+/// 从 CPUCFG 计算 LoongArch 的计时器频率；该硬件信息没有 DTB 属性可替代。
+pub(super) fn detect_clock_frequency() -> usize {
     let base = read_cpucfg(4) as u64;
     let cfg5 = read_cpucfg(5) as u64;
     let mul = (cfg5 & 0xffff) as u64;
     let div = (cfg5 >> 16) as u64;
-    if base == 0 || mul == 0 || div == 0 {
-        return None;
-    }
-    base.checked_mul(mul)
-        .map(|freq| freq / div)
-        .filter(|freq| *freq != 0)
-        .map(|freq| freq as usize)
+    assert!(
+        base != 0 && mul != 0 && div != 0,
+        "LoongArch CPUCFG does not provide a valid clock frequency"
+    );
+    let frequency = base
+        .checked_mul(mul)
+        .expect("LoongArch clock frequency overflows")
+        / div;
+    assert_ne!(frequency, 0, "LoongArch CPUCFG clock frequency is zero");
+    usize::try_from(frequency).expect("LoongArch clock frequency exceeds usize")
 }
 
 pub fn bootstrap_init() {
@@ -642,8 +698,5 @@ pub fn bootstrap_init() {
         asm!("invtlb 0x0, $r0, $r0");
     }
 
-    if let Some(freq) = detect_clock_freq() {
-        crate::config::set_clock_freq(freq);
-    }
     enable_ipi_interrupt();
 }

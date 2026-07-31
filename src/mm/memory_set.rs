@@ -19,8 +19,8 @@ use crate::arch::riscv64::mm::AsidContext;
 #[cfg(target_arch = "riscv64")]
 use crate::config::{KERNEL_STACK_TOP, phys_mem_end, phys_mem_start};
 use crate::config::{
-    MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
-    USER_STACK_SIZE, for_each_dtb_mmio_range, for_each_phys_mem_range,
+    PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP, USER_STACK_SIZE,
+    for_each_dtb_mmio_range, for_each_phys_mem_range,
 };
 use crate::fs::File;
 use crate::println;
@@ -2278,17 +2278,6 @@ impl MemorySet {
             );
         });
         println!("mapping memory-mapped registers");
-        for pair in MMIO {
-            memory_set.push(
-                MapArea::new(
-                    (*pair).0.into(),
-                    ((*pair).0 + (*pair).1).into(),
-                    MapType::Identical,
-                    MapPermission::R | MapPermission::W | MapPermission::IO,
-                ),
-                None,
-            );
-        }
         for_each_dtb_mmio_range(|start, end| {
             memory_set.map_identical_range_skip_mapped(
                 start,
@@ -2296,12 +2285,6 @@ impl MemorySet {
                 MapPermission::R | MapPermission::W | MapPermission::IO,
             );
         });
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let dtb_start = crate::config::DEVICE_TREE_ADDR;
-            let dtb_end = dtb_start + crate::config::DEVICE_TREE_MAX_SIZE;
-            memory_set.map_identical_range_skip_mapped(dtb_start, dtb_end, MapPermission::R);
-        }
         #[cfg(target_arch = "riscv64")]
         assert!(
             memory_set.prepare_riscv_kernel_shared_roots(),

@@ -1,3 +1,5 @@
+#[allow(non_snake_case)]
+pub mod DTB_data;
 pub mod mm;
 pub mod task;
 pub mod trap;
@@ -12,55 +14,12 @@ use riscv::register::sstatus::{self, FS};
 /// 有SSTC寄存器的话就不需要使用 SBI 来设置时钟中断了。
 static RISCV_HAS_SSTC: AtomicBool = AtomicBool::new(false);
 #[allow(dead_code)]
-fn detect_timebase_frequency(dtb_pa: usize) -> Option<usize> {
-    if dtb_pa == 0 {
-        return None;
-    }
-    let fdt = unsafe { fdt::Fdt::from_ptr(dtb_pa as *const u8).ok()? };
-    fdt.find_node("/cpus")
-        .and_then(|node| node.property("timebase-frequency"))
-        .and_then(|property| property.as_usize())
-        .filter(|freq| *freq != 0)
-}
-
-fn detect_isa_extension(dtb_pa: usize, extension: &[u8]) -> bool {
-    if dtb_pa == 0 {
-        return false;
-    }
-    let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(dtb_pa as *const u8) }) else {
-        return false;
-    };
-    let Some(cpus) = fdt.find_node("/cpus") else {
-        return false;
-    };
-    for cpu in cpus.children() {
-        if cpu.property("riscv,isa").is_some_and(|prop| {
-            prop.value
-                .windows(extension.len())
-                .any(|window| window == extension)
-        }) {
-            return true;
-        }
-        if cpu.property("riscv,isa-extensions").is_some_and(|prop| {
-            prop.value
-                .windows(extension.len())
-                .any(|window| window == extension)
-        }) {
-            return true;
-        }
-    }
-    false
-}
-
-#[allow(dead_code)]
-pub fn bootstrap_init(dtb_pa: usize) {
-    if let Some(freq) = detect_timebase_frequency(dtb_pa) {
-        crate::config::set_clock_freq(freq);
-        crate::println!("[kernel] riscv timebase frequency: {} Hz", freq);
-    }
+pub fn bootstrap_init() {
+    let freq = DTB_data::timebase_frequency();
+    crate::println!("[kernel] riscv timebase frequency: {} Hz", freq);
     // 一般的 RISC-V S-mode 内核通过 SBI 设置下一次 timer interrupt；
     // 支持 Sstc 时可以直接写 stimecmp CSR，少一次 ecall/M-mode 代理。
-    let has_sstc = detect_isa_extension(dtb_pa, b"sstc");
+    let has_sstc = DTB_data::all_harts_have_sstc();
     RISCV_HAS_SSTC.store(has_sstc, Ordering::Release);
     if has_sstc {
         crate::println!("[kernel] riscv sstc clockevent enabled");

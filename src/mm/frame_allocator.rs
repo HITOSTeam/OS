@@ -3,7 +3,7 @@
 
 use super::{PhysAddr, PhysPageNum};
 use crate::{
-    config::{BOOT_RESERVED_MEMORY_SIZE, for_each_phys_mem_range, phys_mem_start},
+    config::{MAX_RESERVED_MEMORY_REGIONS, for_each_phys_mem_range, for_each_reserved_range},
     println,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -192,34 +192,65 @@ pub fn init_frame_allocator() {
         safe fn ekernel();
         safe fn stext();
     }
-    let kernel_end = PhysAddr::from(ekernel as usize).ceil();
-    let kernel_start = PhysAddr::from(stext as usize).floor();
-    let reserved_start = phys_mem_start();
-    let reserved_end = reserved_start.saturating_add(BOOT_RESERVED_MEMORY_SIZE);
-    let mut allocator = FRAME_ALLOCATOR.lock();
-    allocator.init(PhysPageNum(0), PhysPageNum(0));
-    for_each_phys_mem_range(|start, end| {
-        let mut start = start;
-        if start == reserved_start {
-            start = start.max(reserved_end);
-        }
+    let mut exclusions = [(0usize, 0usize); MAX_RESERVED_MEMORY_REGIONS + 1];
+    let mut exclusion_count = 0usize;
+    let mut add_exclusion = |start: usize, end: usize| {
+        let start = PhysAddr::from(start).floor().0;
+        let end = PhysAddr::from(end).ceil().0;
         if end <= start {
             return;
         }
-        let start_ppn = PhysAddr::from(start).ceil();
-        let end_ppn = PhysAddr::from(end).floor();
+        assert!(
+            exclusion_count < exclusions.len(),
+            "too many frame allocator exclusion ranges"
+        );
+        exclusions[exclusion_count] = (start, end);
+        exclusion_count += 1;
+    };
+    add_exclusion(stext as usize, ekernel as usize);
+    for_each_reserved_range(|start, end| add_exclusion(start, end));
+    drop(add_exclusion);
+
+    exclusions[..exclusion_count].sort_unstable_by_key(|range| range.0);
+    let mut merged_count = 0usize;
+    for index in 0..exclusion_count {
+        let (start, end) = exclusions[index];
+        if merged_count != 0 && start <= exclusions[merged_count - 1].1 {
+            exclusions[merged_count - 1].1 = exclusions[merged_count - 1].1.max(end);
+        } else {
+            exclusions[merged_count] = (start, end);
+            merged_count += 1;
+        }
+    }
+    let mut allocator = FRAME_ALLOCATOR.lock();
+    allocator.init(PhysPageNum(0), PhysPageNum(0));
+    for_each_phys_mem_range(|start, end| {
+        let start_ppn = PhysAddr::from(start).ceil().0;
+        let end_ppn = PhysAddr::from(end).floor().0;
         if end_ppn <= start_ppn {
             return;
         }
-        if end_ppn <= kernel_start || start_ppn >= kernel_end {
-            allocator.add_range(start_ppn, end_ppn);
-            return;
+        let mut cursor = start_ppn;
+        for &(excluded_start, excluded_end) in &exclusions[..merged_count] {
+            if excluded_end <= cursor {
+                continue;
+            }
+            if excluded_start >= end_ppn {
+                break;
+            }
+            if cursor < excluded_start {
+                allocator.add_range(
+                    PhysPageNum(cursor),
+                    PhysPageNum(excluded_start.min(end_ppn)),
+                );
+            }
+            cursor = cursor.max(excluded_end);
+            if cursor >= end_ppn {
+                break;
+            }
         }
-        if start_ppn < kernel_start {
-            allocator.add_range(start_ppn, kernel_start);
-        }
-        if kernel_end < end_ppn {
-            allocator.add_range(kernel_end, end_ppn);
+        if cursor < end_ppn {
+            allocator.add_range(PhysPageNum(cursor), PhysPageNum(end_ppn));
         }
     });
 }

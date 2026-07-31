@@ -1,8 +1,5 @@
 //! Constants used in rCore
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::Once;
-
 // Linux userland can place MiB-scale buffers on the initial stack.
 // Keep this modest because current user stacks are eagerly framed.
 pub const USER_STACK_SIZE: usize = 4096 * 512; // 2 MiB
@@ -67,28 +64,11 @@ pub const fn supported_hart_mask() -> usize {
     }
 }
 
-/// 启动核从 DTB 发布的实际 hart 集合。0 表示拓扑尚未初始化。
-static ACTIVE_HART_MASK: AtomicUsize = AtomicUsize::new(0);
-
-/// 发布本次启动可用的 hart 集合，并永远限制在静态容量内。
+/// 返回 DTB 描述的运行时 hart 集合。
 ///
-/// 平台没有可用 DTB 时调用方会至少保留启动 hart，因而不会回退为一个
-/// 虚假的全 12 hart 拓扑。
-pub fn set_active_hart_mask(mask: usize) {
-    let mask = mask & supported_hart_mask();
-    if mask != 0 {
-        ACTIVE_HART_MASK.store(mask, Ordering::Release);
-    }
-}
-
-/// 返回 DTB 描述的运行时 hart 集合；早期启动阶段尚未发布时保留旧的容量语义。
+/// 启动 DTB 尚未发布时，架构数据访问器会直接 panic，避免以静态容量伪造拓扑。
 pub fn active_hart_mask() -> usize {
-    let mask = ACTIVE_HART_MASK.load(Ordering::Acquire);
-    if mask == 0 {
-        supported_hart_mask()
-    } else {
-        mask
-    }
+    crate::arch::DTB_data::active_hart_mask()
 }
 
 pub fn active_hart_count() -> usize {
@@ -112,164 +92,41 @@ pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
     (bottom, top)
 }
 
-#[cfg(target_arch = "loongarch64")]
-pub const DEFAULT_CLOCK_FREQ: usize = 100_000_000;
-#[cfg(target_arch = "riscv64")]
-pub const DEFAULT_CLOCK_FREQ: usize = 10_000_000;
-
-///会从DTB里面更新
-static CLOCK_FREQ: AtomicUsize = AtomicUsize::new(0);
-
-#[allow(dead_code)]
-pub fn set_clock_freq(freq: usize) {
-    if freq != 0 {
-        CLOCK_FREQ.store(freq, Ordering::Relaxed);
-    }
-}
-
 pub fn clock_freq() -> usize {
-    let freq = CLOCK_FREQ.load(Ordering::Relaxed);
-    if freq == 0 { DEFAULT_CLOCK_FREQ } else { freq }
+    crate::arch::DTB_data::clock_frequency()
 }
 
-// QEMU virt RAM starts at 0x8000_0000. Default to 512MiB to match common `-m 512M`.
-pub const DEFAULT_MEMORY_START: usize = 0x8000_0000;
-pub const DEFAULT_MEMORY_END: usize = 0xA000_0000;
-/// DTB memory nodes may include firmware/boot-reserved memory without a
-/// reserved-memory node. Keep the first 2 MiB of the lowest RAM range unused.
-pub const BOOT_RESERVED_MEMORY_SIZE: usize = 0x20_0000;
-
-#[cfg(target_arch = "loongarch64")]
-pub const DEVICE_TREE_ADDR: usize = 0x100000;
-#[cfg(target_arch = "loongarch64")]
-pub const DEVICE_TREE_MAX_SIZE: usize = 0x200000;
-
-pub const MAX_PHYS_MEMORY_REGIONS: usize = 3;
+pub const MAX_PHYS_MEMORY_REGIONS: usize = 16;
 pub const MAX_DTB_MMIO_REGIONS: usize = 32;
+pub const MAX_RESERVED_MEMORY_REGIONS: usize = 16;
 pub const MAX_VIRTIO_MMIO_DEVICES: usize = 8;
-
-/// DTB 在早期启动阶段解析出的平台资源。
-///
-/// 这些信息只由启动核写入一次，所以用 [`Once`] 整体发布即可，
-/// 无需为每个 range 的起止地址分别维护原子变量。
-struct PlatformInfo {
-    phys_mem_ranges: [(usize, usize); MAX_PHYS_MEMORY_REGIONS],
-    phys_mem_range_count: usize,
-    dtb_mmio_ranges: [(usize, usize); MAX_DTB_MMIO_REGIONS],
-    dtb_mmio_range_count: usize,
-    virtio_mmio_bases: [usize; MAX_VIRTIO_MMIO_DEVICES],
-    virtio_mmio_base_count: usize,
-}
-
-const DEFAULT_PLATFORM_INFO: PlatformInfo = PlatformInfo {
-    phys_mem_ranges: {
-        let mut ranges = [(0, 0); MAX_PHYS_MEMORY_REGIONS];
-        ranges[0] = (DEFAULT_MEMORY_START, DEFAULT_MEMORY_END);
-        ranges
-    },
-    phys_mem_range_count: 1,
-    dtb_mmio_ranges: [(0, 0); MAX_DTB_MMIO_REGIONS],
-    dtb_mmio_range_count: 0,
-    virtio_mmio_bases: [0; MAX_VIRTIO_MMIO_DEVICES],
-    virtio_mmio_base_count: 0,
-};
-
-static PLATFORM_INFO: Once<PlatformInfo> = Once::new();
-
-/// 发布从 DTB 中解析出的物理内存、MMIO 和 virtio-mmio 资源。
-///
-/// 该函数必须在堆和其他 CPU 启动前由启动核调用，且只有首次调用生效。
-/// 传入的物理内存列表为空时，保留 QEMU 的默认内存区间。
-pub fn init_platform_info(
-    phys_mem_ranges: &[(usize, usize)],
-    dtb_mmio_ranges: &[(usize, usize)],
-    virtio_mmio_bases: &[usize],
-) {
-    PLATFORM_INFO.call_once(|| {
-        let mut info = PlatformInfo {
-            ..DEFAULT_PLATFORM_INFO
-        };
-
-        let mut count = 0;
-        for &(start, end) in phys_mem_ranges {
-            if count == MAX_PHYS_MEMORY_REGIONS {
-                break;
-            }
-            if end > start {
-                info.phys_mem_ranges[count] = (start, end);
-                count += 1;
-            }
-        }
-        if count != 0 {
-            info.phys_mem_range_count = count;
-        }
-
-        info.dtb_mmio_range_count = 0;
-        for &(start, end) in dtb_mmio_ranges {
-            if info.dtb_mmio_range_count == MAX_DTB_MMIO_REGIONS {
-                break;
-            }
-            if end > start {
-                info.dtb_mmio_ranges[info.dtb_mmio_range_count] = (start, end);
-                info.dtb_mmio_range_count += 1;
-            }
-        }
-
-        for &base in virtio_mmio_bases {
-            if info.virtio_mmio_base_count == MAX_VIRTIO_MMIO_DEVICES {
-                break;
-            }
-            if base != 0 && !info.virtio_mmio_bases[..info.virtio_mmio_base_count].contains(&base) {
-                info.virtio_mmio_bases[info.virtio_mmio_base_count] = base;
-                info.virtio_mmio_base_count += 1;
-            }
-        }
-        info
-    });
-}
-
-#[inline]
-/// 读取已发布的平台信息；DTB 尚未解析时返回默认配置。
-fn platform_info() -> &'static PlatformInfo {
-    PLATFORM_INFO.get().unwrap_or(&DEFAULT_PLATFORM_INFO)
-}
 
 /// 返回所有物理内存段的最小起始地址。
 pub fn phys_mem_start() -> usize {
-    let info = platform_info();
-    info.phys_mem_ranges[..info.phys_mem_range_count]
-        .iter()
-        .map(|&(start, _)| start)
-        .min()
-        .unwrap_or(DEFAULT_MEMORY_START)
+    let mut minimum = usize::MAX;
+    for_each_phys_mem_range(|start, _| minimum = minimum.min(start));
+    assert_ne!(minimum, usize::MAX, "DTB contains no physical memory range");
+    minimum
 }
 
 /// 返回所有物理内存段的最大结束地址，中间可能存在空洞。
 pub fn phys_mem_end() -> usize {
-    let info = platform_info();
-    info.phys_mem_ranges[..info.phys_mem_range_count]
-        .iter()
-        .map(|&(_, end)| end)
-        .max()
-        .unwrap_or(DEFAULT_MEMORY_END)
+    let mut maximum = 0usize;
+    for_each_phys_mem_range(|_, end| maximum = maximum.max(end));
+    assert_ne!(maximum, 0, "DTB contains no physical memory range");
+    maximum
 }
 
 /// 依次访问 DTB 报告的每一段物理内存，不会把中间的空洞合并成 RAM。
 pub fn for_each_phys_mem_range(mut f: impl FnMut(usize, usize)) {
-    let info = platform_info();
-    for &(start, end) in &info.phys_mem_ranges[..info.phys_mem_range_count] {
-        f(start, end);
-    }
+    crate::arch::DTB_data::for_each_phys_mem_range(|start, end| f(start, end));
 }
 
 /// 返回各段物理内存容量之和，不计入段之间的地址空洞。
 pub fn phys_mem_total() -> usize {
-    let info = platform_info();
-    info.phys_mem_ranges[..info.phys_mem_range_count]
-        .iter()
-        .fold(0usize, |total, &(start, end)| {
-            total.saturating_add(end - start)
-        })
+    let mut total = 0usize;
+    for_each_phys_mem_range(|start, end| total = total.saturating_add(end - start));
+    total
 }
 
 /// 检查整个物理地址区间是否落在同一段 RAM 内。
@@ -278,45 +135,26 @@ pub fn phys_range_in_ram(start: usize, len: usize) -> bool {
     let Some(end) = start.checked_add(len) else {
         return false;
     };
-    let info = platform_info();
-    info.phys_mem_ranges[..info.phys_mem_range_count]
-        .iter()
-        .any(|&(range_start, range_end)| start >= range_start && end <= range_end)
+    let mut in_ram = false;
+    for_each_phys_mem_range(|range_start, range_end| {
+        in_ram |= start >= range_start && end <= range_end;
+    });
+    in_ram
 }
 
 /// 依次访问从 DTB 中发现、需要进行恒等映射的 MMIO 区间。
 pub fn for_each_dtb_mmio_range(mut f: impl FnMut(usize, usize)) {
-    let info = platform_info();
-    for &(start, end) in &info.dtb_mmio_ranges[..info.dtb_mmio_range_count] {
-        f(start, end);
-    }
+    crate::arch::DTB_data::for_each_mmio_range(|start, end| f(start, end));
+}
+
+/// 依次访问 DTB 中声明的保留物理内存区间。
+pub fn for_each_reserved_range(mut f: impl FnMut(usize, usize)) {
+    crate::arch::DTB_data::for_each_reserved_range(|start, end| f(start, end));
 }
 
 /// 依次访问 DTB 中发现的 virtio-mmio 设备基地址。
 pub fn for_each_virtio_mmio_device_base(mut f: impl FnMut(usize)) {
-    let info = platform_info();
-    for &base in &info.virtio_mmio_bases[..info.virtio_mmio_base_count] {
-        f(base);
-    }
+    crate::arch::DTB_data::for_each_virtio_mmio_device(|base, _| f(base));
 }
-
-#[cfg(not(target_arch = "loongarch64"))]
-pub const MMIO: &[(usize, usize)] = &[
-    (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
-    (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
-    (0x1000_2000, 0x00_1000), // Virtio Block (bus 1) in virt machine
-];
-#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
-const UART_MMIO_BASE: usize = 0x8000_0000_1fe2_0000;
-#[cfg(all(target_arch = "loongarch64", not(feature = "loongarch_board")))]
-const UART_MMIO_BASE: usize = 0x1fe0_01e0;
-#[cfg(target_arch = "loongarch64")]
-pub const MMIO: &[(usize, usize)] = &[
-    (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
-    (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
-    (0x1000_2000, 0x00_1000), // Virtio Block (bus 1) in virt machine
-    (0x100e_0000, 0x00_1000), // QEMU virt poweroff device (shutdown register)
-    (UART_MMIO_BASE, 0x1000), // UART for console output
-];
 
 pub const TRAP_CONTEXT_BASE: usize = TRAP_CONTEXT;

@@ -53,6 +53,11 @@ impl Ext4Lock {
             // 已知锁被持有后只做共享读取，避免每个 hart 持续用 CAS 抢占
             // 同一缓存行。锁释放后再回到外层尝试一次原子获取。
             while self.held.load(Ordering::Relaxed) {
+                #[cfg(target_arch = "loongarch64")]
+                // 懒缺页持有 mm 锁时不可调度，也可能在这里等待 Ext4 锁。
+                // 同步 TLB shootdown 的目标 hart 必须在这类长自旋中主动确认
+                // 请求，否则持有 Ext4 锁的一方可能正在等本 hart 的 ACK，形成环等。
+                crate::arch::loongarch64::mm::service_pending_user_tlb_flush();
                 spin_loop();
                 spins += 1;
                 if spins < Self::SPINS_BEFORE_YIELD {
