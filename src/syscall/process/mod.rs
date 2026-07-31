@@ -20,7 +20,7 @@ use crate::{
         CgroupAttachTarget, PidFdFile, cgroup_attach_process_to_target, cgroup_attach_thread,
         cgroup_clone_into_target_from_file, cgroup_current_path, cgroup_fork_precheck, ext4_lock,
         fanotify_notify_open_exec, fanotify_permission_open,
-        refresh_thread_legacy_cpu_fair_group_cache, root_inode_for_path, secondary_root_inode,
+        refresh_thread_legacy_cpu_fair_group_cache,
     },
     mm::{
         MapPermission, MemorySet, kernel_token, try_copy_from_user, try_read_user_value,

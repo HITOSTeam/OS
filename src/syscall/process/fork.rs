@@ -5,6 +5,50 @@ static FORK_DIAG_PARENT_PID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static FORK_DIAG_START_MS: AtomicUsize = AtomicUsize::new(0);
 static FORK_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+fn log_clone_tid_write_failure(
+    process: &Arc<ProcessControlBlock>,
+    task: &Arc<TaskControlBlock>,
+    target: &str,
+    token: usize,
+    ptr: usize,
+    flags: usize,
+) {
+    let pte = crate::mm::PageTable::from_token(token)
+        .translate(crate::mm::VirtAddr::from(ptr).floor())
+        .map(|pte| pte.bits);
+    log::error!(
+        "[clone] {} write failed pid={} ptr={:#x} flags={:#x} pte={:#x?} \
+         free_pages={} token={:#x} task_token={:#x}",
+        target,
+        process.getpid(),
+        ptr,
+        flags,
+        pte,
+        crate::mm::frame_available_pages(),
+        token,
+        task.get_user_token(),
+    );
+}
+
+fn rollback_unstarted_thread(
+    process: &Arc<ProcessControlBlock>,
+    task: &Arc<TaskControlBlock>,
+    tid: usize,
+) {
+    {
+        let mut process_inner = process.borrow_mut();
+        if process_inner
+            .tasks
+            .get(tid)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, task))
+        {
+            process_inner.tasks[tid] = None;
+        }
+    }
+    crate::fs::cgroup_exit_thread(process.getpid(), tid);
+}
+
 fn should_report_fork_diag(count: usize) -> bool {
     count <= 16 || count % 128 == 0
 }
@@ -192,6 +236,9 @@ fn clone_from_parts(
             *inner.get_trap_cx()
         };
         let process = current_process();
+        if process.exec_in_progress() {
+            return err(SyscallError::EAGAIN);
+        }
         // 在当前进程下新建一个 Linux 风格线程的 TCB（共享地址空间/文件等）
         let new_task = match TaskControlBlock::try_new_linux_thread(Arc::clone(&process)) {
             Ok(t) => Arc::new(t),
@@ -213,6 +260,13 @@ fn clone_from_parts(
             // 将新线程登记进进程的 tasks 数组；按 tid_index 扩容并填入对应槽位
             {
                 let mut process_inner = process.borrow_mut();
+                // Serialize the insertion against exec's task-table snapshot.
+                // If exec published its owner while this thread was being
+                // allocated, discard the unstarted task instead of letting a
+                // new peer enter the old mm after the snapshot.
+                if process.exec_in_progress() {
+                    return err(SyscallError::EAGAIN);
+                }
                 let tasks = &mut process_inner.tasks;
                 while tasks.len() < tid_index + 1 {
                     tasks.push(None);
@@ -290,12 +344,16 @@ fn clone_from_parts(
         // CLONE_PARENT_SETTID：把新 TID 回写到父线程指定的用户地址
         if (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
             if try_write_user_value(token, _ptid as *mut i32, &(linux_tid as i32)).is_err() {
+                log_clone_tid_write_failure(&process, &new_task, "parent_tid", token, _ptid, flags);
+                rollback_unstarted_thread(&process, &new_task, _tid_index);
                 return err(SyscallError::EFAULT);
             }
         }
         // CLONE_CHILD_SETTID：把新 TID 写到子线程视角的用户地址（此处地址空间共享，等价）
         if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
             if try_write_user_value(token, _ctid as *mut i32, &(linux_tid as i32)).is_err() {
+                log_clone_tid_write_failure(&process, &new_task, "child_tid", token, _ctid, flags);
+                rollback_unstarted_thread(&process, &new_task, _tid_index);
                 return err(SyscallError::EFAULT);
             }
         }
@@ -672,6 +730,7 @@ fn install_child_pidfd(
 fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>) {
     let child_pid = child.getpid();
     crate::fs::cgroup_exit_process(child_pid);
+    child.files().lock().release_process_owner();
     let (exec_dev, exec_ino, shm_attaches, parent) = {
         let mut child_inner = child.borrow_mut();
         let shm_attaches = child_inner.memory_set.take_sysv_shm_attaches_for_cleanup();

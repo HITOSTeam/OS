@@ -10,7 +10,12 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
-use core::{arch::asm, cmp::min, mem::MaybeUninit};
+use core::{
+    arch::asm,
+    cmp::min,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 bitflags! {
     /// page table entry flags
@@ -489,16 +494,11 @@ fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(task) = current_task() else {
         return false;
     };
-    let Some(process) = task.process.upgrade() else {
-        return false;
-    };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if token != inner.memory_set.token() {
+    let memory_set = task.memory_set();
+    if token != memory_set.token() {
         return false;
     }
-    match inner.memory_set.resolve_lazy_fault(va, access) {
+    match memory_set.resolve_lazy_fault(va, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => crate::task::processor::exit_group_and_run_next(-9),
         LazyFaultResult::Invalid => false,
@@ -509,19 +509,14 @@ fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(task) = current_task() else {
         return false;
     };
-    let Some(process) = task.process.upgrade() else {
-        return false;
-    };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if token != inner.memory_set.token() {
+    let memory_set = task.memory_set();
+    if token != memory_set.token() {
         return false;
     }
-    if access.contains(MapPermission::W) && inner.memory_set.resolve_cow_fault(va) {
+    if access.contains(MapPermission::W) && memory_set.resolve_cow_fault(va) {
         return true;
     }
-    match inner.memory_set.resolve_lazy_fault(va, access) {
+    match memory_set.resolve_lazy_fault(va, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => crate::task::processor::exit_group_and_run_next(-9),
         LazyFaultResult::Invalid => false,
@@ -757,6 +752,26 @@ pub fn try_write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) -> Re
         core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
     };
     try_copy_to_user(token, dst as *mut u8, src_bytes)
+}
+
+/// Atomically replace one user-space futex word after resolving COW/lazy
+/// mappings for write.
+pub fn try_compare_exchange_user_u32(
+    token: usize,
+    dst: *mut u32,
+    current: u32,
+    new: u32,
+) -> Result<Result<u32, u32>, ()> {
+    let va = dst as usize;
+    if !va.is_multiple_of(core::mem::align_of::<u32>()) {
+        return Err(());
+    }
+    let pte = resolve_user_pte(token, va, MapPermission::W)?;
+    let pa: PhysAddr = pte.ppn().into();
+    let ptr = (pa.0 + VirtAddr::from(va).page_offset()) as *const AtomicU32;
+    // SAFETY: the page-table lookup verified write access, `ptr` is naturally
+    // aligned, and the four-byte object is wholly contained in this page.
+    Ok(unsafe { &*ptr }.compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst))
 }
 /// translate a single pointer
 pub fn translated_single_address(token: usize, ptr: *const u8) -> &'static mut u8 {

@@ -853,6 +853,40 @@ pub fn kill_current(signum: i32) -> isize {
     0
 }
 
+/// Deliver the unmaskable exec teardown request to a preselected set of
+/// thread-group peers without setting a process-wide SIGKILL bit.
+///
+/// A process-wide signal would also kill the exec caller. Peers recognize
+/// their per-task exec request in `exit_group_and_run_next()` and leave through
+/// the ordinary thread-exit cleanup path.
+pub(crate) fn terminate_tasks_for_exec(tasks: alloc::vec::Vec<Arc<TaskControlBlock>>) {
+    if tasks.is_empty() {
+        return;
+    }
+    let (sender_pid, sender_uid, _, _) = current_sender_ids();
+    let mut running_signal_ipi_mask = 0usize;
+    for task in &tasks {
+        {
+            let mut inner = task.borrow_mut();
+            mark_pending_signal(&mut inner, SIGKILL_NUM, sender_pid, sender_uid, 0, 0);
+        }
+        task.mark_signal_pending();
+        prime_fair_sync_wakeup_lag(task);
+        request_reschedule_for_signal_target(task);
+        let on_cpu = task.on_cpu.load(core::sync::atomic::Ordering::Acquire);
+        if on_cpu != TaskControlBlock::OFF_CPU {
+            running_signal_ipi_mask |= hart_mask_bit(on_cpu);
+        }
+    }
+    wakeup_signal_tasks(tasks.clone());
+    for task in &tasks {
+        request_reschedule_for_signal_target(task);
+    }
+    if running_signal_ipi_mask != 0 {
+        send_signal_ipis(running_signal_ipi_mask);
+    }
+}
+
 /// Queue a non-fatal signal to one thread in the target process.
 ///
 /// This mirrors the "one thread" delivery behavior used for alarms and keeps

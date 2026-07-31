@@ -10,7 +10,11 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
-use core::{cmp::min, mem::MaybeUninit};
+use core::{
+    cmp::min,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 bitflags! {
     /// page table entry flags
@@ -453,21 +457,18 @@ fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(task) = current_task() else {
         return false;
     };
-    let Some(process) = task.process.upgrade() else {
-        return false;
-    };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if token != inner.memory_set.token() {
+    // Page-fault resolution is an mm operation, not a PCB operation. Taking
+    // the PCB with try_lock made transient contention with another thread's
+    // fork/mmap look like EFAULT (notably pthread_create's TID write after a
+    // concurrent fork had COW-demoted the page). The TCB's cached MmRef is
+    // updated atomically with exec and remains valid through task exit.
+    let memory_set = task.memory_set();
+    if token != memory_set.token() {
         return false;
     }
-    match inner.memory_set.resolve_lazy_fault(va, access) {
+    match memory_set.resolve_lazy_fault(va, access) {
         LazyFaultResult::Resolved => true,
-        LazyFaultResult::Oom => {
-            drop(inner);
-            crate::task::processor::exit_group_and_run_next(-9)
-        }
+        LazyFaultResult::Oom => crate::task::processor::exit_group_and_run_next(-9),
         LazyFaultResult::Invalid => false,
     }
 }
@@ -476,34 +477,86 @@ fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(task) = current_task() else {
         return false;
     };
-    let Some(process) = task.process.upgrade() else {
-        return false;
-    };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if token != inner.memory_set.token() {
+    let memory_set = task.memory_set();
+    if token != memory_set.token() {
         return false;
     }
-    if access.contains(MapPermission::W) && inner.memory_set.resolve_cow_fault(va) {
+    if access.contains(MapPermission::W) && memory_set.resolve_cow_fault(va) {
         return true;
     }
-    match inner.memory_set.resolve_lazy_fault(va, access) {
+    match memory_set.resolve_lazy_fault(va, access) {
         LazyFaultResult::Resolved => true,
-        LazyFaultResult::Oom => {
-            drop(inner);
-            crate::task::processor::exit_group_and_run_next(-9)
-        }
+        LazyFaultResult::Oom => crate::task::processor::exit_group_and_run_next(-9),
         LazyFaultResult::Invalid => false,
     }
 }
 
-fn user_access_fail(va: usize, access: MapPermission) -> ! {
+#[track_caller]
+fn user_access_fail(token: usize, va: usize, access: MapPermission) -> ! {
     const EFAULT: i32 = -14;
+    let caller = core::panic::Location::caller();
+    let pte_bits = PageTable::from_token(token)
+        .translate(VirtAddr::from(va).floor())
+        .map(|pte| pte.bits);
+    let (pid, tid, syscall_id, syscall_args, task_token, process_token) =
+        if let Some(task) = current_task() {
+            let task_token = task.get_user_token();
+            let (tid, syscall_id, syscall_args) = task
+                .try_borrow_mut()
+                .map(|inner| {
+                    (
+                        inner.res.as_ref().map(|res| res.tid).unwrap_or(usize::MAX),
+                        inner.last_syscall_id,
+                        inner.last_syscall_args,
+                    )
+                })
+                .unwrap_or((usize::MAX, usize::MAX, [0; 6]));
+            let (pid, process_token) = task
+                .process
+                .upgrade()
+                .map(|process| {
+                    let pid = process.getpid();
+                    let process_token = process
+                        .try_borrow_mut()
+                        .map(|inner| inner.memory_set.token())
+                        .unwrap_or(usize::MAX);
+                    (pid, process_token)
+                })
+                .unwrap_or((usize::MAX, usize::MAX));
+            (
+                pid,
+                tid,
+                syscall_id,
+                syscall_args,
+                task_token,
+                process_token,
+            )
+        } else {
+            (
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                [0; 6],
+                usize::MAX,
+                usize::MAX,
+            )
+        };
     log::error!(
-        "[uaccess] invalid user access addr={:#x} access={:?}",
+        "[uaccess] invalid user access pid={} tid={} syscall={} args={:#x?} \
+         addr={:#x} access={:?} caller={}:{} pte={:#x?} token={:#x} \
+         task_token={:#x} process_token={:#x}",
+        pid,
+        tid,
+        syscall_id,
+        syscall_args,
         va,
-        access
+        access,
+        caller.file(),
+        caller.line(),
+        pte_bits,
+        token,
+        task_token,
+        process_token,
     );
     crate::task::processor::exit_current_and_run_next(EFAULT)
 }
@@ -548,7 +601,8 @@ fn resolve_user_pte(token: usize, va: usize, access: MapPermission) -> Result<Pa
 
 fn translated_address_with(token: usize, ptr: *const u8, access: MapPermission) -> &'static mut u8 {
     let va = ptr as usize;
-    let pte = resolve_user_pte(token, va, access).unwrap_or_else(|_| user_access_fail(va, access));
+    let pte =
+        resolve_user_pte(token, va, access).unwrap_or_else(|_| user_access_fail(token, va, access));
     let ppn = pte.ppn();
     let page_off = VirtAddr::from(va).page_offset();
     &mut ppn.get_bytes_array()[page_off]
@@ -580,9 +634,10 @@ pub fn translated_mutref<T>(token: usize, ptr: *mut T) -> &'static mut T {
 /// Copy bytes from user space into a kernel buffer.
 ///
 /// Terminates the current task if any user page in the range is invalid.
+#[track_caller]
 pub fn copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) {
     if try_copy_from_user(token, src, dst).is_err() {
-        user_access_fail(src as usize, MapPermission::R);
+        user_access_fail(token, src as usize, MapPermission::R);
     }
 }
 
@@ -622,9 +677,10 @@ pub fn try_copy_from_user(token: usize, src: *const u8, dst: &mut [u8]) -> Resul
 /// Copy bytes from a kernel buffer into user space.
 ///
 /// Terminates the current task if any user page in the range is invalid.
+#[track_caller]
 pub fn copy_to_user(token: usize, dst: *mut u8, src: &[u8]) {
     if try_copy_to_user(token, dst, src).is_err() {
-        user_access_fail(dst as usize, MapPermission::W);
+        user_access_fail(token, dst as usize, MapPermission::W);
     }
 }
 
@@ -690,6 +746,7 @@ pub fn try_copy_to_user_unchecked(token: usize, dst: *mut u8, src: &[u8]) -> Res
 // Why we use MaybeUninit Here? On the one hand,it is because we want to use this function for
 // multi-types, we don't know if this type have Default trait and for some types,it can be heavy to initialize an empty value.This is a very
 // frequently used function.So we use this to optimiz
+#[track_caller]
 pub fn read_user_value<T: Copy>(token: usize, src: *const T) -> T {
     let mut value = MaybeUninit::<T>::uninit();
     // SAFETY: `value` is stack-allocated and we expose exactly `size_of::<T>()` bytes of its
@@ -718,6 +775,7 @@ pub fn try_read_user_value<T: Copy>(token: usize, src: *const T) -> Option<T> {
     Some(unsafe { value.assume_init() })
 }
 
+#[track_caller]
 pub fn write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) {
     // SAFETY: `value` is a valid reference to `T`, so reborrowing exactly its object bytes is
     // sound for copying into userspace. A wrong length would read beyond `value`.
@@ -734,6 +792,31 @@ pub fn try_write_user_value<T: Copy>(token: usize, dst: *mut T, value: &T) -> Re
         core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>())
     };
     try_copy_to_user(token, dst as *mut u8, src_bytes)
+}
+
+/// Atomically replace one user-space futex word.
+///
+/// Resolving the destination for write first gives COW/lazy mappings the same
+/// fault-in behavior as the ordinary uaccess helpers. Robust-futex teardown
+/// needs an actual compare/exchange: a read followed by a write can overwrite a
+/// concurrent userspace owner transition.
+pub fn try_compare_exchange_user_u32(
+    token: usize,
+    dst: *mut u32,
+    current: u32,
+    new: u32,
+) -> Result<Result<u32, u32>, ()> {
+    let va = dst as usize;
+    if !va.is_multiple_of(core::mem::align_of::<u32>()) {
+        return Err(());
+    }
+    let pte = resolve_user_pte(token, va, MapPermission::W)?;
+    let pa: PhysAddr = pte.ppn().into();
+    let ptr = (pa.0 + VirtAddr::from(va).page_offset()) as *const AtomicU32;
+    // SAFETY: `resolve_user_pte` established a writable user mapping, the
+    // alignment check above satisfies `AtomicU32`, and a naturally aligned
+    // 32-bit word cannot cross a page boundary.
+    Ok(unsafe { &*ptr }.compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst))
 }
 /// translate a single pointer
 pub fn translated_single_address(token: usize, ptr: *const u8) -> &'static mut u8 {
@@ -752,14 +835,14 @@ pub fn translated_byte_buffer(
     let mut start = ptr as usize;
     let end = match start.checked_add(len) {
         Some(v) => v,
-        None => user_access_fail(start, access),
+        None => user_access_fail(token, start, access),
     };
     let mut v = Vec::new();
     while start < end {
         let start_va = VirtAddr::from(start);
         let mut vpn = start_va.floor();
         let pte = resolve_user_pte(token, start, access).unwrap_or_else(|_| {
-            user_access_fail(start, access);
+            user_access_fail(token, start, access);
         });
         let ppn = pte.ppn();
         vpn.step();

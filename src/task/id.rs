@@ -397,6 +397,10 @@ impl TaskUserRes {
     }
 
     pub fn reset_for_exec(&mut self, ustack_base: usize) {
+        // After de-threading, the exec caller becomes the sole thread-group
+        // leader. The old address space (including its old TID-indexed
+        // resources) is about to be discarded.
+        self.tid = 0;
         self.trap_cx_slot = 0;
         self.ustack_base = ustack_base;
         self.owns_ustack = true;

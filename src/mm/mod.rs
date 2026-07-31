@@ -26,7 +26,6 @@ pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
 #[allow(unused_imports)]
 pub use dtb::init_phys_mem_from_dtb;
-pub(crate) use frame_allocator::frame_refcount;
 pub use frame_allocator::{
     FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages, frame_managed_pages,
     frame_refcount_entries,
@@ -137,8 +136,8 @@ pub use page_table::{
     translated_single_address, try_translated_byte_buffer, write_user_value,
 };
 pub use page_table::{
-    try_copy_from_user, try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
-    try_write_user_value,
+    try_compare_exchange_user_u32, try_copy_from_user, try_copy_to_user,
+    try_copy_to_user_unchecked, try_read_user_value, try_write_user_value,
 };
 pub struct UserBuffer {
     pub buffers: Vec<&'static mut [u8]>,

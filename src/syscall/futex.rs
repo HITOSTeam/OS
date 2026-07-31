@@ -16,7 +16,7 @@ use crate::{
     syscall::time_sys::realtime_now_timespec,
     task::block_sleep::add_timer,
     task::{
-        manager::{prime_fair_sync_wakeup_lag, wakeup_task},
+        manager::{pid2process, prime_fair_sync_wakeup_lag, wakeup_task},
         processor::{block_current_and_run_next, current_process, current_task},
         signal::has_wait_interrupting_pending,
         task_block::TaskControlBlock,
@@ -126,13 +126,31 @@ pub(crate) fn shared_futex_addr_key(token: usize, uaddr: usize) -> usize {
 }
 
 fn futex_key(pid: usize, token: usize, uaddr: usize, private: bool) -> FutexKey {
-    if private {
-        (pid, uaddr)
+    // Linux keys private futexes, and non-private futexes placed in a private
+    // anonymous mapping, by (mm, virtual address). Using a physical address for
+    // the latter is incorrect: resolving COW while clearing child_tid changes
+    // the PTE after the waiter has queued and makes the wake miss its bucket.
+    let mapping_is_shared = if private {
+        false
     } else {
-        // Process-shared futex: key by physical address to survive exec() where
-        // user virtual addresses often change (notably in glibc test helpers).
-        (0, shared_futex_addr_key(token, uaddr))
+        pid2process(pid)
+            .and_then(|process| {
+                let inner = process.borrow_mut();
+                if inner.memory_set.token() != token {
+                    return None;
+                }
+                let end = uaddr.checked_add(core::mem::size_of::<u32>())?;
+                inner.memory_set.lock().vm_region_containing(uaddr, end)
+            })
+            .is_some_and(|region| region.shared)
+    };
+    if !mapping_is_shared {
+        return (token, uaddr);
     }
+
+    // A MAP_SHARED mapping resolves to the common backing frame in every mm,
+    // providing the object/page identity needed for process-shared futexes.
+    (0, shared_futex_addr_key(token, uaddr))
 }
 
 fn remove_waiter(in_queue: &Arc<AtomicBool>) -> Option<FutexKey> {
@@ -277,6 +295,15 @@ pub(crate) fn futex_wake(key: FutexKey, uaddr: usize, nr_wake: usize) -> isize {
     futex_wake_with_mask(key, uaddr, nr_wake, FUTEX_BITSET_MATCH_ANY)
 }
 
+/// Wake waiters through Linux's non-private futex key.
+///
+/// The kernel-side robust-list and `clear_child_tid` paths do not receive a
+/// `FUTEX_PRIVATE_FLAG`; Linux consequently performs these wakes with the
+/// shared-key lookup.
+pub(crate) fn futex_wake_shared(pid: usize, token: usize, uaddr: usize, nr_wake: usize) -> isize {
+    futex_wake(futex_key(pid, token, uaddr, false), uaddr, nr_wake)
+}
+
 /// Wake futex waiters when caller doesn't know whether the waiter used
 /// `FUTEX_PRIVATE_FLAG`.
 ///
@@ -289,8 +316,8 @@ pub(crate) fn futex_wake_private_and_shared(
     uaddr: usize,
     nr_wake: usize,
 ) -> isize {
-    let woke_private = futex_wake((pid, uaddr), uaddr, nr_wake);
-    let shared_key = (0, shared_futex_addr_key(token, uaddr));
+    let woke_private = futex_wake(futex_key(pid, token, uaddr, true), uaddr, nr_wake);
+    let shared_key = futex_key(pid, token, uaddr, false);
     let woke_shared = futex_wake(shared_key, uaddr, nr_wake);
     if woke_private < 0 {
         return woke_private;

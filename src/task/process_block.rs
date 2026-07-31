@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
@@ -17,20 +17,22 @@ use crate::mm::{
     ElfAux, KERNEL_SPACE, MemorySet, MmRef, read_user_value, translated_mutref, write_user_value,
 };
 use crate::println;
-use crate::task::FilesStruct;
 use crate::task::condvar::Condvar;
 use crate::task::id::{PidAllocError, PidHandle, pid_alloc};
 use crate::task::manager::{
     PID2PCB, add_task, insert_into_pid2process, prime_fair_exec_start, release_process_mm_owner,
-    remove_inactive_task, select_hart_for_new_task, wakeup_task,
+    select_hart_for_new_task, wakeup_task,
 };
-use crate::task::processor::current_task;
+use crate::task::processor::{
+    current_task, exit_current_and_run_next, suspend_current_and_run_next,
+};
 use crate::task::sched::{SCHED_DEADLINE, SCHED_FIFO, SCHED_OTHER, SCHED_RR};
 use crate::task::semaphore::Semaphore;
 use crate::task::signal::{
     RT_SIG_MAX, RtSigAction, SIG_IGN, SIGCHLD_NUM, SignalAction, SignalActions, SignalFlags,
 };
 use crate::task::task_block::{TaskAllocError, TaskControlBlock};
+use crate::task::{FilesLock, FilesStruct};
 use crate::trap::context::TrapContext;
 use crate::trap::trap_handler;
 use crate::utils::RecycleAllocator;
@@ -174,6 +176,29 @@ pub fn process_visible_in_pid_namespace(
     pid_namespace_descends_from(process.pid_namespace_id(), namespace_id)
 }
 
+/// Return the PID by which `process` is named in `namespace_id`.
+///
+/// The current PID namespace implementation stores one virtual PID for the
+/// process' own namespace.  Initial-namespace callers use the global PID; an
+/// exact namespace match uses the stored virtual PID.  Descendants remain
+/// visible to ancestors and use the global PID until per-ancestor PID arrays
+/// are introduced.
+pub fn process_pid_in_pid_namespace(
+    process: &Arc<ProcessControlBlock>,
+    namespace_id: usize,
+) -> Option<usize> {
+    if !process_visible_in_pid_namespace(process, namespace_id) {
+        return None;
+    }
+    if namespace_id == 0 {
+        return Some(process.getpid());
+    }
+    if process.pid_namespace_id() == namespace_id {
+        return Some(process.visible_pid());
+    }
+    Some(process.getpid())
+}
+
 pub fn resolve_process_in_pid_namespace(
     namespace_id: usize,
     pid: usize,
@@ -188,10 +213,7 @@ pub fn resolve_process_in_pid_namespace(
             .find(|process| process.getpid() == pid);
     }
     for process in processes {
-        if process.pid_namespace_id() != namespace_id {
-            continue;
-        }
-        if process.visible_pid() == pid {
+        if process_pid_in_pid_namespace(&process, namespace_id) == Some(pid) {
             return Some(process);
         }
     }
@@ -992,6 +1014,18 @@ pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
     parent_visible_pid: AtomicUsize,
+    /// Coordinates process-wide exit on SMP.
+    ///
+    /// `NO_GROUP_EXIT_OWNER` means no group exit is in progress,
+    /// `GROUP_EXIT_STARTING` protects initialization, and any other value is
+    /// the TID that initiated the exit. Threads leave independently; the last
+    /// one performs process-wide teardown.
+    group_exit_owner: AtomicUsize,
+    group_exit_remaining: AtomicUsize,
+    group_exit_code: AtomicI32,
+    /// Coordinates the exec caller with peers that are still using the old mm.
+    exec_owner: AtomicUsize,
+    exec_remaining: AtomicUsize,
     // mutable
     inner: SpinMutex<ProcessControlBlockInner>,
 }
@@ -1054,6 +1088,8 @@ pub struct ProcessControlBlockInner {
     /// 可执行文件 inode 身份，用于可写打开时的 ETXTBSY 检查。
     pub exec_inode_dev: usize,
     pub exec_inode_num: u32,
+    /// 当前可执行文件的逻辑绝对路径，用于 `/proc/<pid>/exe`。
+    pub exe_path: String,
     /// `prctl(PR_*_TIMERSLACK)` 使用的当前/默认 timer slack。
     pub timer_slack_ns: u64,
     pub timer_slack_default_ns: u64,
@@ -1091,7 +1127,7 @@ pub struct ProcessControlBlockInner {
     pub umask: usize,
     /// 文件描述符表。普通 fork 会快照这个对象；CLONE_FILES 共享同一个 Arc，
     /// 让生命周期跟随引用，而不是依赖进程所有者转发模型。
-    pub(crate) files: Arc<SpinMutex<FilesStruct>>,
+    pub(crate) files: Arc<FilesLock>,
     /// 所有 POSIX 资源限制。
     pub rlimits: ProcessResourceLimits,
     /// 进程根目录（宿主绝对路径），用于 `chroot`。
@@ -1226,6 +1262,172 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    const NO_GROUP_EXIT_OWNER: usize = usize::MAX;
+    const GROUP_EXIT_STARTING: usize = usize::MAX - 1;
+    const NO_EXEC_OWNER: usize = usize::MAX;
+    const EXEC_STARTING: usize = usize::MAX - 1;
+
+    /// Start a process-wide exit, returning true only to the initiating thread.
+    ///
+    /// The short STARTING phase makes the member snapshot visible before peers
+    /// can decrement it. No thread spins waiting for another hart to leave the
+    /// CPU; each member exits on its own and the final arrival tears down the
+    /// shared process resources.
+    pub(crate) fn begin_group_exit(&self, tid: usize, exit_code: i32) -> bool {
+        if self
+            .group_exit_owner
+            .compare_exchange(
+                Self::NO_GROUP_EXIT_OWNER,
+                Self::GROUP_EXIT_STARTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let members = {
+                let inner = self.borrow_mut();
+                inner.tasks.iter().filter(|slot| slot.is_some()).count()
+            };
+            self.group_exit_remaining
+                .store(members.max(1), Ordering::Relaxed);
+            self.group_exit_code.store(exit_code, Ordering::Relaxed);
+            self.group_exit_owner.store(tid, Ordering::Release);
+            true
+        } else {
+            while self.group_exit_owner.load(Ordering::Acquire) == Self::GROUP_EXIT_STARTING {
+                core::hint::spin_loop();
+            }
+            false
+        }
+    }
+
+    /// Mark one thread as having stopped using process-wide resources.
+    /// Returns true to the last departing thread.
+    pub(crate) fn finish_group_exit_thread(&self) -> bool {
+        self.group_exit_remaining.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    pub(crate) fn group_exit_code(&self) -> i32 {
+        self.group_exit_code.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn exec_in_progress(&self) -> bool {
+        self.exec_owner.load(Ordering::Acquire) != Self::NO_EXEC_OWNER
+    }
+
+    /// Stop every peer through its own exit path and wait until no other hart
+    /// can still execute in the old address space.
+    ///
+    /// The per-task request bit is also the exact accounting token: a thread
+    /// that had already left the task table before the snapshot is not counted,
+    /// while every counted peer decrements `exec_remaining` exactly once.
+    fn quiesce_threads_for_exec(self: &Arc<Self>) -> (Arc<TaskControlBlock>, usize) {
+        let current = current_task().expect("exec without a current task");
+        let owner_tid = {
+            let inner = current.borrow_mut();
+            inner
+                .res
+                .as_ref()
+                .map(|res| res.tid)
+                .expect("exec task has no user resources")
+        };
+
+        loop {
+            if self
+                .exec_owner
+                .compare_exchange(
+                    Self::NO_EXEC_OWNER,
+                    Self::EXEC_STARTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+            while self.exec_owner.load(Ordering::Acquire) == Self::EXEC_STARTING {
+                core::hint::spin_loop();
+            }
+            // A competing exec owns the thread group and included us in its
+            // snapshot. Leave through the normal per-thread cleanup path.
+            if current.exec_exit_requested() {
+                exit_current_and_run_next(0);
+            }
+            suspend_current_and_run_next();
+        }
+
+        let candidates = {
+            let inner = self.borrow_mut();
+            inner
+                .tasks
+                .iter()
+                .filter_map(|slot| slot.as_ref())
+                .filter(|task| !Arc::ptr_eq(task, &current))
+                .map(|task| {
+                    task.request_exec_exit();
+                    Arc::clone(task)
+                })
+                .collect::<Vec<_>>()
+        };
+        let peers = candidates
+            .into_iter()
+            .filter(|task| {
+                let active = task.borrow_mut().res.is_some();
+                if active {
+                    task.confirm_exec_exit();
+                } else {
+                    task.cancel_exec_exit();
+                }
+                active
+            })
+            .collect::<Vec<_>>();
+        self.exec_remaining.store(peers.len(), Ordering::Relaxed);
+        self.exec_owner.store(owner_tid, Ordering::Release);
+
+        if !peers.is_empty() {
+            log::debug!(
+                "[exec] pid={} owner_tid={} waiting_for={}",
+                self.getpid(),
+                owner_tid,
+                peers.len()
+            );
+            crate::task::signal::terminate_tasks_for_exec(peers);
+            while self.exec_remaining.load(Ordering::Acquire) != 0 {
+                suspend_current_and_run_next();
+            }
+        }
+
+        // All peers are off CPU and have completed robust-list/clear_child_tid
+        // cleanup. Normalize the surviving exec task to thread-group slot zero.
+        {
+            let mut inner = self.borrow_mut();
+            inner.tasks.clear();
+            inner.tasks.push(Some(Arc::clone(&current)));
+        }
+        (current, owner_tid)
+    }
+
+    pub(crate) fn finish_exec_peer_exit(&self, task: &Arc<TaskControlBlock>) {
+        while self.exec_owner.load(Ordering::Acquire) == Self::EXEC_STARTING {
+            core::hint::spin_loop();
+        }
+        if !task.take_exec_exit_request() {
+            return;
+        }
+        let previous = self.exec_remaining.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "exec peer accounting underflow");
+    }
+
+    fn complete_thread_group_exec(&self, owner_tid: usize) {
+        debug_assert_eq!(self.exec_remaining.load(Ordering::Acquire), 0);
+        let _ = self.exec_owner.compare_exchange(
+            owner_tid,
+            Self::NO_EXEC_OWNER,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     fn cached_parent_visible_pid(
         child_pid_ns_id: usize,
         parent_pid_ns_id: usize,
@@ -1284,42 +1486,6 @@ impl ProcessControlBlock {
         }
     }
 
-    fn terminate_other_threads(&self) {
-        let current = current_task();
-        let current_ptr = current.as_ref().map(Arc::as_ptr);
-        let mut to_cleanup = Vec::new();
-        {
-            let mut inner = self.borrow_mut();
-            for slot in inner.tasks.iter_mut() {
-                let Some(task) = slot.as_ref() else {
-                    continue;
-                };
-                if current_ptr
-                    .map(|ptr| ptr == Arc::as_ptr(task))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                to_cleanup.push(task.clone());
-                *slot = None;
-            }
-        }
-        for task in to_cleanup {
-            remove_inactive_task(task.clone());
-            let (res, join_waiters) = {
-                let mut inner = task.borrow_mut();
-                inner.exit_code = Some(0);
-                let res = inner.res.take();
-                let join_waiters = inner.join_waiters.drain(..).collect::<Vec<_>>();
-                (res, join_waiters)
-            };
-            drop(res);
-            for waiter in join_waiters {
-                wakeup_task(waiter);
-            }
-        }
-    }
-
     pub fn borrow_mut(&self) -> MutexGuard<'_, ProcessControlBlockInner> {
         self.inner.lock()
     }
@@ -1328,7 +1494,7 @@ impl ProcessControlBlock {
         self.inner.try_lock()
     }
 
-    pub(crate) fn files(&self) -> Arc<SpinMutex<FilesStruct>> {
+    pub(crate) fn files(&self) -> Arc<FilesLock> {
         let inner = self.borrow_mut();
         Arc::clone(&inner.files)
     }
@@ -1347,18 +1513,20 @@ impl ProcessControlBlock {
     pub fn unshare_files(self: &Arc<Self>) {
         let old_files = {
             let inner = self.borrow_mut();
-            if Arc::strong_count(&inner.files) == 1 {
-                return;
-            }
             Arc::clone(&inner.files)
         };
         let new_files = {
             let files = old_files.lock();
-            Arc::new(SpinMutex::new(files.clone_private()))
+            if files.process_owner_count() == 1 {
+                return;
+            }
+            Arc::new(FilesLock::new(files.clone_private()))
         };
         let mut inner = self.borrow_mut();
         if Arc::ptr_eq(&inner.files, &old_files) && Arc::strong_count(&inner.files) > 1 {
             inner.files = new_files;
+            drop(inner);
+            old_files.lock().release_process_owner();
         }
     }
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
@@ -1383,6 +1551,11 @@ impl ProcessControlBlock {
         let process = Arc::new(Self {
             pid: pid_handle,
             parent_visible_pid: AtomicUsize::new(0),
+            group_exit_owner: AtomicUsize::new(Self::NO_GROUP_EXIT_OWNER),
+            group_exit_remaining: AtomicUsize::new(0),
+            group_exit_code: AtomicI32::new(0),
+            exec_owner: AtomicUsize::new(Self::NO_EXEC_OWNER),
+            exec_remaining: AtomicUsize::new(0),
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
                 dumped_core: false,
@@ -1409,6 +1582,7 @@ impl ProcessControlBlock {
                 pdeath_signal: 0,
                 exec_inode_dev: 0,
                 exec_inode_num: 0,
+                exe_path: String::from("/user/init_proc.bin"),
                 timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
                 timer_slack_default_ns: DEFAULT_TIMER_SLACK_NS,
                 start_time_ms: crate::time::get_time_ms(),
@@ -1431,7 +1605,7 @@ impl ProcessControlBlock {
                 personality: 0,
                 ioprio: 0,
                 umask: 0,
-                files: Arc::new(SpinMutex::new(FilesStruct::with_stdio())),
+                files: Arc::new(FilesLock::new(FilesStruct::with_stdio())),
                 rlimits: ProcessResourceLimits {
                     rlimit_nofile_cur: 1024,
                     rlimit_nofile_max: 1024,
@@ -1568,6 +1742,7 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
         exec_inode: (usize, u32),
+        exe_path: String,
         comm_override: Option<String>,
     ) -> Result<(), isize> {
         let (memory_set, ustack_base, entry_point, elf_aux) = MemorySet::from_elf(elf_data)?;
@@ -1579,6 +1754,7 @@ impl ProcessControlBlock {
             envs,
             elf_aux,
             exec_inode,
+            exe_path,
             comm_override,
         );
         Ok(())
@@ -1594,6 +1770,7 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
         exec_inode: (usize, u32),
+        exe_path: String,
         comm_override: Option<String>,
     ) -> Result<(), isize> {
         let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
@@ -1609,6 +1786,7 @@ impl ProcessControlBlock {
             args,
             envs,
             exec_inode,
+            exe_path,
             comm_override,
         );
         Ok(())
@@ -1623,23 +1801,15 @@ impl ProcessControlBlock {
         envs: Vec<String>,
         elf_aux: ElfAux,
         exec_inode: (usize, u32),
+        exe_path: String,
         comm_override: Option<String>,
     ) {
+        let (task, exec_owner_tid) = self.quiesce_threads_for_exec();
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
-        let thread_count = { self.borrow_mut().thread_count() };
-        if thread_count != 1 {
-            log::warn!(
-                "[exec] pid={} thread_count={} (terminating other threads)",
-                self.getpid(),
-                thread_count
-            );
-            self.terminate_other_threads();
-        }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
         let new_memory_set = MmRef::new(memory_set);
-        let task = self.borrow_mut().get_task(0);
         let old_trap_cx_slot = {
             let task_inner = task.borrow_mut();
             task_inner.res.as_ref().map(|res| res.trap_cx_slot())
@@ -1674,6 +1844,7 @@ impl ProcessControlBlock {
             );
             inner.exec_inode_dev = exec_inode.0;
             inner.exec_inode_num = exec_inode.1;
+            inner.exe_path = exe_path;
             crate::syscall::process::register_executing_inode(exec_inode.0, exec_inode.1);
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
@@ -1716,6 +1887,7 @@ impl ProcessControlBlock {
         task.reset_fp_state();
         crate::arch::restore_user_fp_state(&task);
         prime_fair_exec_start(&task);
+        self.complete_thread_group_exec(exec_owner_tid);
     }
 
     pub fn exec_dyn_with_memory_set(
@@ -1730,23 +1902,15 @@ impl ProcessControlBlock {
         args: Vec<String>,
         envs: Vec<String>,
         exec_inode: (usize, u32),
+        exe_path: String,
         comm_override: Option<String>,
     ) {
+        let (task, exec_owner_tid) = self.quiesce_threads_for_exec();
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
-        let thread_count = { self.borrow_mut().thread_count() };
-        if thread_count != 1 {
-            log::warn!(
-                "[exec_dyn] pid={} thread_count={} (terminating other threads)",
-                self.getpid(),
-                thread_count
-            );
-            self.terminate_other_threads();
-        }
         self.files().lock().close_cloexec_fds();
         let new_token = memory_set.token();
         let new_memory_set = MmRef::new(memory_set);
-        let task = self.borrow_mut().get_task(0);
         let old_trap_cx_slot = {
             let task_inner = task.borrow_mut();
             task_inner.res.as_ref().map(|res| res.trap_cx_slot())
@@ -1781,6 +1945,7 @@ impl ProcessControlBlock {
             );
             inner.exec_inode_dev = exec_inode.0;
             inner.exec_inode_num = exec_inode.1;
+            inner.exe_path = exe_path;
             crate::syscall::process::register_executing_inode(exec_inode.0, exec_inode.1);
             inner.did_exec = true;
             (old_shm_cleanup, old_mm_token)
@@ -1831,6 +1996,7 @@ impl ProcessControlBlock {
         task.reset_fp_state();
         crate::arch::restore_user_fp_state(&task);
         prime_fair_exec_start(&task);
+        self.complete_thread_group_exec(exec_owner_tid);
     }
 
     fn fork_impl(
@@ -2003,6 +2169,7 @@ impl ProcessControlBlock {
         let pid_ns_id = parent.pid_ns_id;
         let exec_inode_dev = parent.exec_inode_dev;
         let exec_inode_num = parent.exec_inode_num;
+        let exe_path = parent.exe_path.clone();
         // Remember parent's user-stack base for the calling thread.
         let parent_ustack_base = caller_task_res.map(|(_, base)| base).unwrap_or_else(|| {
             parent
@@ -2019,15 +2186,21 @@ impl ProcessControlBlock {
         // lock.
         drop(parent);
         let child_files = if share_files {
+            parent_files.lock().acquire_process_owner();
             Arc::clone(&parent_files)
         } else {
-            Arc::new(SpinMutex::new(parent_files.lock().clone_private()))
+            Arc::new(FilesLock::new(parent_files.lock().clone_private()))
         };
 
         // create child process pcb
         let child = Arc::new(Self {
             pid,
             parent_visible_pid: AtomicUsize::new(parent_visible_pid),
+            group_exit_owner: AtomicUsize::new(Self::NO_GROUP_EXIT_OWNER),
+            group_exit_remaining: AtomicUsize::new(0),
+            group_exit_code: AtomicI32::new(0),
+            exec_owner: AtomicUsize::new(Self::NO_EXEC_OWNER),
+            exec_remaining: AtomicUsize::new(0),
             inner: SpinMutex::new(ProcessControlBlockInner {
                 is_zombie: false,
                 dumped_core: false,
@@ -2091,6 +2264,7 @@ impl ProcessControlBlock {
                 pid_ns_init: false,
                 exec_inode_dev,
                 exec_inode_num,
+                exe_path,
                 // Pending signals are not inherited across fork.
                 signals: SignalFlags::empty(),
                 signals_actions: SignalActions::default(),
@@ -2122,11 +2296,11 @@ impl ProcessControlBlock {
         }
 
         // create main thread of child process (allocates a fresh kernel stack)
-        let task = Arc::new(if share_vm {
+        let task_result = if share_vm {
             // Process-style CLONE_VM shares the mm but is not a thread-group
             // member. Its user stack is supplied by clone(2), so only allocate
             // a distinct trap-context slot in the shared mm.
-            TaskControlBlock::try_new_linux_thread(Arc::clone(&child))?
+            TaskControlBlock::try_new_linux_thread(Arc::clone(&child))
         } else {
             TaskControlBlock::try_new(
                 Arc::clone(&child),
@@ -2134,8 +2308,15 @@ impl ProcessControlBlock {
                 // here we do not allocate trap_cx or ustack again
                 // but mention that we allocate a new kstack here
                 false,
-            )?
-        });
+            )
+        };
+        let task = match task_result {
+            Ok(task) => Arc::new(task),
+            Err(error) => {
+                child.files().lock().release_process_owner();
+                return Err(error.into());
+            }
+        };
         if !share_vm {
             crate::syscall::net::clone_packet_ring_mmaps_for_fork(parent_mm_token, child_mm_token);
         }

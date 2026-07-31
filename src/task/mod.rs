@@ -19,7 +19,7 @@ pub mod block_sleep;
 pub mod condvar;
 mod files_struct;
 mod id;
-pub(crate) use files_struct::FilesStruct;
+pub(crate) use files_struct::{FilesLock, FilesStruct};
 pub(crate) use id::{PidAllocError, pid_max, pid_max_bounds, set_pid_max};
 pub mod manager;
 pub mod mutex;
@@ -27,9 +27,9 @@ mod process_block;
 pub(crate) use process_block::{
     ForkError, ProcessControlBlock, UtsNamespaceState, alloc_ipc_namespace_id,
     alloc_net_namespace_id, alloc_pid_namespace_id, pid_namespace_member_pids,
-    pid_namespace_parent, pid_namespace_reaper, process_visible_in_pid_namespace,
-    register_pid_namespace, register_pid_namespace_reaper, resolve_process_in_pid_namespace,
-    unregister_pid_namespace_reaper_for_process,
+    pid_namespace_parent, pid_namespace_reaper, process_pid_in_pid_namespace,
+    process_visible_in_pid_namespace, register_pid_namespace, register_pid_namespace_reaper,
+    resolve_process_in_pid_namespace, unregister_pid_namespace_reaper_for_process,
 };
 pub mod processor;
 pub mod runtime;
@@ -41,8 +41,8 @@ pub mod task_block;
 pub mod task_context;
 lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
-        let inode = open_file("/user/init_proc.bin", OpenFlags::RDONLY)
-            .expect("failed to open /user/init_proc.bin — check sdcard image");
+        let inode = open_file("init_proc.bin", OpenFlags::RDONLY)
+            .expect("failed to open /user/init_proc.bin — check user image");
         let data = inode.read_all();
         ProcessControlBlock::new(&data)
     };

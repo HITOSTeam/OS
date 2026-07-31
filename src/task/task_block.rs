@@ -1,6 +1,6 @@
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 
 use crate::{
@@ -43,6 +43,9 @@ pub struct TaskControlBlock {
     /// 对应 Linux 的 `TIF_SIGPENDING` 思路：返回用户态前先看这个原子标志，
     /// 无信号的热路径不需要进入 TCB 内层锁。
     signal_pending: AtomicBool,
+    /// Set by the thread-group exec coordinator for every peer that must leave
+    /// the old address space before it can be replaced.
+    exec_exit_state: AtomicU8,
     /// 当前任务是否已经进入某个每 hart 就绪队列。
     pub in_ready_queue: AtomicBool,
     /// 当前持有该任务的 hart 运行队列；未入队时为 `OFF_CPU`。
@@ -84,6 +87,9 @@ fn maybe_log_tcb_inflight(event: &str) {
 
 impl TaskControlBlock {
     pub const OFF_CPU: usize = usize::MAX;
+    const EXEC_EXIT_NONE: u8 = 0;
+    const EXEC_EXIT_PREPARING: u8 = 1;
+    const EXEC_EXIT_COUNTED: u8 = 2;
 
     pub fn set_cpu_id(&self, cpu_id: usize) {
         self.cpu_id.store(cpu_id, Ordering::Release);
@@ -116,6 +122,50 @@ impl TaskControlBlock {
 
     pub fn has_signal_pending(&self) -> bool {
         self.signal_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn request_exec_exit(&self) {
+        let previous = self.exec_exit_state.compare_exchange(
+            Self::EXEC_EXIT_NONE,
+            Self::EXEC_EXIT_PREPARING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert!(previous.is_ok(), "duplicate exec exit request");
+    }
+
+    pub(crate) fn confirm_exec_exit(&self) {
+        let previous = self.exec_exit_state.compare_exchange(
+            Self::EXEC_EXIT_PREPARING,
+            Self::EXEC_EXIT_COUNTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert!(previous.is_ok(), "exec exit request was not preparing");
+    }
+
+    pub(crate) fn cancel_exec_exit(&self) {
+        let _ = self.exec_exit_state.compare_exchange(
+            Self::EXEC_EXIT_PREPARING,
+            Self::EXEC_EXIT_NONE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn exec_exit_requested(&self) -> bool {
+        self.exec_exit_state.load(Ordering::Acquire) != Self::EXEC_EXIT_NONE
+    }
+
+    pub(crate) fn take_exec_exit_request(&self) -> bool {
+        self.exec_exit_state
+            .compare_exchange(
+                Self::EXEC_EXIT_COUNTED,
+                Self::EXEC_EXIT_NONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
@@ -409,6 +459,7 @@ impl TaskControlBlock {
             wakeup_pending: AtomicBool::new(false),
             wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
+            exec_exit_state: AtomicU8::new(Self::EXEC_EXIT_NONE),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
             futex_wait: Mutex::new(None),
@@ -514,6 +565,7 @@ impl TaskControlBlock {
             wakeup_pending: AtomicBool::new(false),
             wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
+            exec_exit_state: AtomicU8::new(Self::EXEC_EXIT_NONE),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
             futex_wait: Mutex::new(None),

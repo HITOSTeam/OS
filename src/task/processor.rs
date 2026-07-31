@@ -4,9 +4,9 @@ use crate::{
     fs::{File, cgroup_exit_process, cgroup_exit_thread},
     mm::{MemorySet, MmRef, try_write_user_value},
     println,
-    syscall::futex::futex_wake_private_and_shared,
+    syscall::futex::futex_wake_shared,
     task::{
-        FilesStruct, INITPROC,
+        FilesLock, FilesStruct, INITPROC,
         id::{KernelStack, TaskUserRes},
         manager::{
             PID2PCB, account_rt_runtime, fair_current_deadline_expired, fair_task_is_next_on_hart,
@@ -365,7 +365,7 @@ fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
 /// 表本身不会在此刻释放，无需排队。只有唯一引用时才放入
 /// `pending_files_struct_drop`，由 idle 渐进关闭所有 fd 并释放表，
 /// 避免 exit 路径里同步 close 大量文件造成延迟。
-fn queue_files_struct_drop(files: Arc<spin::Mutex<FilesStruct>>) {
+fn queue_files_struct_drop(files: Arc<FilesLock>) {
     if Arc::strong_count(&files) != 1 {
         drop(files);
         return;
@@ -377,10 +377,8 @@ fn queue_files_struct_drop(files: Arc<spin::Mutex<FilesStruct>>) {
         .set_pending_files_struct_drop(files);
 }
 
-fn close_files_struct_fd_refs_if_unshared(files: &Arc<spin::Mutex<FilesStruct>>) {
-    if Arc::strong_count(files) == 1 {
-        files.lock().close_all_fd_refs();
-    }
+fn close_files_struct_fd_refs_if_unshared(files: &Arc<FilesLock>) {
+    files.lock().release_process_owner();
 }
 
 /// 将一个地址空间（mm）延迟到 idle 循环释放。
@@ -396,7 +394,7 @@ fn clear_child_tid_now(pid: usize, token: usize, ctid: usize) {
         return;
     }
     let _ = try_write_user_value(token, ctid as *mut i32, &0);
-    let _ = futex_wake_private_and_shared(pid, token, ctid, 1);
+    let _ = futex_wake_shared(pid, token, ctid, 1);
 }
 
 struct ThreadExitCleanup {
@@ -411,6 +409,8 @@ struct ThreadExitCleanup {
 fn take_thread_exit_cleanup(task: &Arc<TaskControlBlock>, exit_code: i32) -> ThreadExitCleanup {
     let mut task_inner = task.borrow_mut();
     task_inner.exit_code = Some(exit_code);
+    let robust_list_head = core::mem::take(&mut task_inner.robust_list_head);
+    task_inner.robust_list_len = 0;
     ThreadExitCleanup {
         tid: task_inner
             .res
@@ -425,7 +425,7 @@ fn take_thread_exit_cleanup(task: &Arc<TaskControlBlock>, exit_code: i32) -> Thr
         res_to_drop: task_inner.res.take(),
         join_waiters: task_inner.join_waiters.drain(..).collect::<Vec<_>>(),
         clear_child_tid_addr: task_inner.clear_child_tid.take(),
-        robust_list_head: task_inner.robust_list_head,
+        robust_list_head,
     }
 }
 
@@ -582,7 +582,7 @@ pub struct Processor {
     /// 进程退出时摘下的完整文件描述符表。退出时应尽快发布空表，
     /// idle 再把旧表转成逐文件的 fput 工作，对应 Linux
     /// `exit_files()`/task-work 形态。
-    pending_files_struct_drop: VecDeque<Arc<spin::Mutex<FilesStruct>>>,
+    pending_files_struct_drop: VecDeque<Arc<FilesLock>>,
     /// 摘下待最终释放的地址空间。drop mm 要遍历页表和帧元数据，
     /// 放到 idle 里做，避免阻塞不可抢占的 exit 路径。
     pending_mm_drop: VecDeque<MmRef>,
@@ -668,13 +668,13 @@ impl Processor {
     }
 
     /// 取出一个待释放的文件描述符表，由 idle 渐进关闭其内所有 fd。
-    pub fn take_pending_files_struct_drop(&mut self) -> Option<Arc<spin::Mutex<FilesStruct>>> {
+    pub fn take_pending_files_struct_drop(&mut self) -> Option<Arc<FilesLock>> {
         self.pending_files_struct_drop.pop_front()
     }
 
     /// 将一个文件描述符表排入待释放队列。仅当引用计数为 1（唯一持有）
     /// 时才需要排队，否则直接 drop 当前引用即可。
-    pub fn set_pending_files_struct_drop(&mut self, files: Arc<spin::Mutex<FilesStruct>>) {
+    pub fn set_pending_files_struct_drop(&mut self, files: Arc<FilesLock>) {
         self.pending_files_struct_drop.push_back(files);
     }
 
@@ -885,12 +885,12 @@ pub fn reschedule_before_user_return_if_needed() {
     }
 }
 
-pub(crate) fn current_files() -> Arc<spin::Mutex<FilesStruct>> {
+pub(crate) fn current_files() -> Arc<FilesLock> {
     let process = current_process();
     process.files()
 }
 
-pub(crate) fn current_files_and_nofile_limit() -> (Arc<spin::Mutex<FilesStruct>>, usize) {
+pub(crate) fn current_files_and_nofile_limit() -> (Arc<FilesLock>, usize) {
     let process = current_process();
     let inner = process.borrow_mut();
     (
@@ -1581,12 +1581,17 @@ pub const IDLE_PID: usize = 0;
 
 // 线程(task)  单位的推出
 pub fn exit_current_and_run_next(exit_code: i32) -> ! {
-    // 标记线程状态,
-    let task = take_current_task().unwrap();
-    charge_task_runtime_for_scheduler(&task);
-    // This task will never be scheduled again; ensure it is considered off CPU.
-    task.clear_on_cpu();
+    // Keep the task installed as this hart's current task until robust-futex
+    // and clear_child_tid uaccess has completed. Linux performs both while
+    // `current` still owns its mm; removing it earlier prevents lazy/COW fault
+    // resolution in the uaccess helpers.
+    let task = current_task().expect("exit without a current task");
     let Some(process) = task.process.upgrade() else {
+        let installed_task = take_current_task().unwrap();
+        debug_assert!(Arc::ptr_eq(&task, &installed_task));
+        drop(installed_task);
+        charge_task_runtime_for_scheduler(&task);
+        task.clear_on_cpu();
         if DEBUG_SCHED {
             log::warn!("[exit] task lost process; dropping task and scheduling idle");
         }
@@ -1595,7 +1600,6 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         schedule(&mut _unused as *mut _);
         unreachable!("schedule should not return after task exit");
     };
-
     // Extract exit bookkeeping first, then perform Linux-thread cleanup without
     // holding the TCB lock so the same logic can be reused by exit_group().
     let cleanup = take_thread_exit_cleanup(&task, exit_code);
@@ -1603,6 +1607,49 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     let drop_user_res = drop_user_res || cleanup.is_linux_thread;
     let (tid, is_linux_thread, clear_child_tid_addr) =
         finish_thread_exit_cleanup(&process, cleanup, drop_user_res);
+    let exec_victim = task.exec_exit_requested();
+
+    let installed_task = take_current_task().expect("current task disappeared during exit cleanup");
+    debug_assert!(Arc::ptr_eq(&task, &installed_task));
+    // `current_task()` above cloned the TCB so robust-list and clear_child_tid
+    // cleanup could run while the task remained installed on this hart. Drop
+    // the processor-owned clone explicitly: this function switches away via
+    // `schedule()` and never unwinds, so shadowing it would leak the TCB and
+    // therefore the complete user mm on every process exit.
+    drop(installed_task);
+    charge_task_runtime_for_scheduler(&task);
+    // This task will never be scheduled again; ensure it is considered off CPU.
+    task.clear_on_cpu();
+
+    if exec_victim {
+        if tid != 0 && tid != usize::MAX {
+            cgroup_exit_thread(process.getpid(), tid);
+        }
+        let thread_cpu_ns = crate::task::runtime::task_cpu_time_ns(&task);
+        {
+            let mut process_inner = process.borrow_mut();
+            let remove_slot = process_inner
+                .tasks
+                .get(tid)
+                .and_then(|slot| slot.as_ref())
+                .map(|candidate| Arc::ptr_eq(candidate, &task))
+                .unwrap_or(false);
+            if remove_slot {
+                process_inner.cpu_time_ns = process_inner.cpu_time_ns.saturating_add(thread_cpu_ns);
+                process_inner.tasks[tid] = None;
+            }
+        }
+        // A signal wake may leave references in futex/timer/ready queues.
+        // Remove them before notifying the exec owner that this task is fully
+        // quiescent and can no longer touch the old mm.
+        remove_inactive_task(task.clone());
+        process.finish_exec_peer_exit(&task);
+        queue_exiting_task_drop(task);
+        drop(process);
+        let mut _unused = TaskContext::new();
+        schedule(&mut _unused as *mut _);
+        unreachable!("schedule should not return for an exec peer");
+    }
 
     if tid != 0 && tid != usize::MAX {
         if DEBUG_PTHREAD {
@@ -1680,7 +1727,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             );
             let old_files = core::mem::replace(
                 &mut process_inner.files,
-                Arc::new(spin::Mutex::new(FilesStruct::new())),
+                Arc::new(FilesLock::new(FilesStruct::new())),
             );
             close_files_struct_fd_refs_if_unshared(&old_files);
             process_inner.is_zombie = true;
@@ -1769,23 +1816,52 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
 /// Terminate the entire process, even when called from a non-main thread.
 pub fn exit_group_and_run_next(exit_code: i32) -> ! {
-    let task = take_current_task().unwrap();
-    charge_task_runtime_for_scheduler(&task);
-    task.clear_on_cpu();
+    let task = current_task().expect("exit_group without a current task");
     let Some(process) = task.process.upgrade() else {
-        if DEBUG_SCHED {
-            log::warn!("[exit_group] task lost process; dropping task and scheduling idle");
-        }
+        let installed_task = take_current_task().unwrap();
+        debug_assert!(Arc::ptr_eq(&task, &installed_task));
+        drop(installed_task);
+        task.clear_on_cpu();
         queue_exiting_task_drop(task);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
         unreachable!("schedule should not return after group exit");
     };
+    // SIGKILL sent by de-threading is task-local: it must retire this peer,
+    // not start a process-wide group exit that would also kill the exec caller.
+    if task.exec_exit_requested() {
+        exit_current_and_run_next(0);
+    }
+    let tid = task
+        .borrow_mut()
+        .res
+        .as_ref()
+        .map(|res| res.tid)
+        .unwrap_or(usize::MAX - 1);
+
+    // The initiating thread broadcasts SIGKILL to the complete thread group.
+    // Every member then exits independently. This mirrors Linux's group-exit
+    // rendezvous and, crucially, never spins waiting for a remote hart that may
+    // currently be inside a long-running syscall.
+    if process.begin_group_exit(tid, exit_code) {
+        let _ = crate::task::signal::kill_current(crate::task::signal::SIGKILL_NUM as i32);
+    }
+    let exit_code = process.group_exit_code();
 
     let cleanup = take_thread_exit_cleanup(&task, exit_code);
     let drop_user_res = cleanup.is_linux_thread;
     let (tid, _is_linux_thread, _clear_child_tid_addr) =
         finish_thread_exit_cleanup(&process, cleanup, drop_user_res);
+
+    let installed_task =
+        take_current_task().expect("current task disappeared during group-exit cleanup");
+    debug_assert!(Arc::ptr_eq(&task, &installed_task));
+    // See exit_current_and_run_next(): the initial `current_task()` clone must
+    // be the one moved into deferred drop, while the processor-owned reference
+    // is released before this never-returning context switch.
+    drop(installed_task);
+    charge_task_runtime_for_scheduler(&task);
+    task.clear_on_cpu();
 
     log::debug!(
         "[exit_group] pid={} tid={} exit_code={}",
@@ -1793,6 +1869,17 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         tid,
         exit_code
     );
+
+    if !process.finish_group_exit_thread() {
+        // This member is fully detached from user resources. Keep its TCB alive
+        // through the context switch; the final member will perform shared PCB
+        // cleanup after every peer has reached this point.
+        queue_exiting_task_drop(task);
+        drop(process);
+        let mut _unused = TaskContext::new();
+        schedule(&mut _unused as *mut _);
+        unreachable!("schedule should not return for a group-exit member");
+    }
 
     let dumped_core = process_dumped_core(&process, exit_code);
     let process_cpu_ns =
@@ -1819,7 +1906,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         );
         let old_files = core::mem::replace(
             &mut process_inner.files,
-            Arc::new(spin::Mutex::new(FilesStruct::new())),
+            Arc::new(FilesLock::new(FilesStruct::new())),
         );
         close_files_struct_fd_refs_if_unshared(&old_files);
         process_inner.is_zombie = true;
