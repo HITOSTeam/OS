@@ -512,6 +512,9 @@ fn peek_fair_group_task(group: &FairGroupQueue, hart_id: usize) -> Option<u64> {
 /// timer/control task is correctly placed at the front of a large runqueue but
 /// the direct pairwise comparison still preserves the current task.
 pub fn fair_task_is_next_on_hart(task: &Arc<TaskControlBlock>, hart_id: usize) -> bool {
+    // These runqueue reads participate in the same IRQ lock domain as enqueue
+    // and dequeue.  This mirrors Linux's rq_lock_irqsave requirement.
+    let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
     let hart_id = hart_id % MAX_HARTS;
     let task_id = fair_task_id(task);
     let group_id = task.borrow_mut().fair_group_id;
@@ -587,6 +590,7 @@ pub fn fair_wakeup_preempts_current_on_hart(
     hart_id: usize,
     now_ns: u64,
 ) -> bool {
+    let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
     let (current_vruntime, current_deadline) = fair_task_vruntime_deadline_at(current, now_ns);
     // 步骤 1：当前任务自己的 deadline 已到 → 直接抢。
     if current_deadline == 0 || current_vruntime >= current_deadline {
@@ -649,6 +653,7 @@ pub fn fair_wakeup_preempts_current_on_hart(
 ///    （约一个切片 + 一个 tick），防止睡很久的任务带巨额 lag 回来。
 /// 5. 存入 `fair_vlag_ns`，唤醒时由 `place_fair_task_entity` 的 Wakeup 分支消费。
 pub fn record_fair_sleep_lag(task: &Arc<TaskControlBlock>) {
+    let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
     let policy = task.borrow_mut().scheduling.sched_policy;
     // 只对 fair 类任务保存 lag；RT 类不参与 EEVDF。
     if !matches!(sched_class(policy), Some(SchedClass::Fair)) {

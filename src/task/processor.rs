@@ -1164,14 +1164,19 @@ pub fn idle_task() {
         // 此时任务已不在 CPU 上（已切到 idle 上下文），可以安全清理 on_cpu。
         // NOTE: 如果在这之前就将task 入队，那么另一个hart 可能进入 从而导致问题
         if let Some(task) = local_processor().lock().take_pending_blocked() {
-            task.clear_on_cpu();
+            let should_wake = {
+                // Pairs with the irq-safe task transition lock in
+                // try_to_wake_up(): publish on_cpu=OFF and consume a pending
+                // wake atomically with respect to the waker's decision.
+                let _wakeup_guard = task.lock_wakeup_transition();
+                task.clear_on_cpu();
+                task.wakeup_pending
+                    .swap(false, core::sync::atomic::Ordering::AcqRel)
+            };
             // 切走期间有人尝试唤醒它（wakeup_pending）→ 补唤醒。
             // 对应 Linux try_to_wake_up() 等 prev 离开 CPU 后再走正常唤醒路径，
             // 使 wakeup_preempt() 能正确设 NEED_RESCHED。
-            if task
-                .wakeup_pending
-                .swap(false, core::sync::atomic::Ordering::AcqRel)
-            {
+            if should_wake {
                 let sync_hart = task.wakeup_sync_hart.swap(
                     TaskControlBlock::OFF_CPU,
                     core::sync::atomic::Ordering::AcqRel,
@@ -1188,13 +1193,16 @@ pub fn idle_task() {
         // 延迟到 idle 上下文才入队，保证任务不再使用自己的内核栈时才
         // 对其他 hart 可见，避免 SMP 下同一任务被两个 hart 同时调度。
         if let Some(task) = local_processor().lock().take_pending_ready() {
-            task.clear_on_cpu();
-            task.wakeup_pending
-                .store(false, core::sync::atomic::Ordering::Release);
-            task.wakeup_sync_hart.store(
-                TaskControlBlock::OFF_CPU,
-                core::sync::atomic::Ordering::Release,
-            );
+            {
+                let _wakeup_guard = task.lock_wakeup_transition();
+                task.clear_on_cpu();
+                task.wakeup_pending
+                    .store(false, core::sync::atomic::Ordering::Release);
+                task.wakeup_sync_hart.store(
+                    TaskControlBlock::OFF_CPU,
+                    core::sync::atomic::Ordering::Release,
+                );
+            }
             requeue_task(task);
         }
 
@@ -1493,13 +1501,15 @@ pub fn go_to_first_task() -> ! {
     idle_task();
     panic!("Unreachable in go_to_first_task!");
 }
-pub fn suspend_current_and_run_next() {
+fn suspend_current_and_run_next_impl(interruptible: bool) {
     // If the current process has a fatal pending signal, terminate it even if we are
     // inside a long-running/blocking syscall loop (where we may never return to the
     // trap handler's "check signal then return to user" path).
     //
     // Use `try_borrow_mut` to avoid deadlocking if the caller already holds the PCB lock.
-    if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
+    if interruptible
+        && let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error()
+    {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
@@ -1528,10 +1538,23 @@ pub fn suspend_current_and_run_next() {
     schedule(task_cx_ptr);
 }
 
-pub fn block_current_and_run_next() {
-    // Same rationale as in `suspend_current_and_run_next()`: a task can be stuck
-    // yielding within a syscall (interrupts disabled), so handle fatal signals here.
-    if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
+pub fn suspend_current_and_run_next() {
+    suspend_current_and_run_next_impl(true);
+}
+
+/// Cooperatively yield while retaining ownership of an in-flight kernel
+/// resource. Pending fatal signals are handled after the resource completes.
+pub fn suspend_current_and_run_next_uninterruptible() {
+    suspend_current_and_run_next_impl(false);
+}
+
+fn block_current_and_run_next_impl(interruptible: bool) {
+    // Ordinary syscall waits remain killable.  Kernel-owned resources such as
+    // an in-flight DMA request use the uninterruptible entry point below so a
+    // fatal signal cannot abandon device-owned memory or a lock hand-off.
+    if interruptible
+        && let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error()
+    {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
@@ -1574,6 +1597,20 @@ pub fn block_current_and_run_next() {
     }
     // jump to scheduling cycle
     schedule(task_cx_ptr);
+}
+
+pub fn block_current_and_run_next() {
+    block_current_and_run_next_impl(true);
+}
+
+/// Block without consuming fatal signals until the wait condition is complete.
+///
+/// This is reserved for kernel-internal waits whose owner cannot disappear
+/// safely, notably sleeping locks and submitted DMA requests.  The normal trap
+/// return path observes any pending signal immediately after the resource has
+/// been released.
+pub fn block_current_and_run_next_uninterruptible() {
+    block_current_and_run_next_impl(false);
 }
 
 /// pid of usertests app in make run TEST=1

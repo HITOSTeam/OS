@@ -32,6 +32,8 @@ pub const ECFG_VS_MASK: usize = 0x7;
 pub const ECFG_LIE_TI: usize = 1 << 11;
 /// Bit [12] — IPI local enable (LIE.IPI).
 pub const ECFG_LIE_IPI: usize = 1 << 12;
+/// Bit [3] — external EIOINTC delivery.
+pub const ECFG_LIE_EIOINTC: usize = 1 << 3;
 
 // ── ESTAT (Exception Status, CSR 0x5) ─────────────────────────────────────
 /// Bits [21:16] — Exception Code shift.
@@ -42,6 +44,8 @@ pub const ESTAT_ECODE_MASK: usize = 0x3f;
 pub const ESTAT_IS_TIMER: usize = 1 << 11;
 /// Bit [12] — IPI interrupt pending.
 pub const ESTAT_IS_IPI: usize = 1 << 12;
+/// Bit [3] — EIOINTC interrupt pending.
+pub const ESTAT_IS_EIOINTC: usize = 1 << 3;
 
 // ── IOCSR IPI registers ─────────────────────────────────────────────────
 /// Per-core IPI pending action register.

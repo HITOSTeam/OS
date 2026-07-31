@@ -31,8 +31,8 @@ const ECODE_ADDR_ALIGN: usize = 0x9;
 const ECODE_FP_DISABLED: usize = 0xf;
 
 use super::super::csr_defs::{
-    ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, ESTAT_IS_IPI, ESTAT_IS_TIMER, PRMD_USER_IE,
-    PRMD_USER_IE_MASK,
+    ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, ESTAT_IS_EIOINTC, ESTAT_IS_IPI, ESTAT_IS_TIMER,
+    PRMD_USER_IE, PRMD_USER_IE_MASK,
 };
 
 /// Log only the first trap_return to see initial user entry.
@@ -113,6 +113,11 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             super::super::clear_timer_interrupt();
             set_next_trigger();
             crate::task::block_sleep::note_kernel_timer_tick();
+            crate::drivers::block::poll_all();
+            return;
+        }
+        if (estat & ESTAT_IS_EIOINTC) != 0 {
+            crate::arch::handle_external_interrupt();
             return;
         }
         if (estat & ESTAT_IS_IPI) != 0 {
@@ -244,6 +249,7 @@ pub fn trap_handler() {
             super::super::clear_timer_interrupt();
             crate::time::loongarch_record_timer_tick();
             set_next_trigger();
+            crate::drivers::block::poll_all();
             check_timer();
             crate::task::processor::account_current_task_tick();
             crate::syscall::misc::check_current_rlimit_cpu();
@@ -276,6 +282,8 @@ pub fn trap_handler() {
             if crate::task::processor::should_preempt_current_on_tick() {
                 suspend_current_and_run_next();
             }
+        } else if (estat & ESTAT_IS_EIOINTC) != 0 {
+            crate::arch::handle_external_interrupt();
         } else if (estat & ESTAT_IS_IPI) != 0 {
             super::super::clear_ipi_interrupt();
         } else {

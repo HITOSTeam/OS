@@ -49,6 +49,7 @@ const LOAD_PAGE_FAULT: usize = 13;
 const STORE_PAGE_FAULT: usize = 15;
 const TIME_INTERVAL: usize = 5;
 const SOFTWARE_INTERRUPT: usize = 1;
+const EXTERNAL_INTERRUPT: usize = 9;
 
 /// Log only the first trap_return to see initial user entry.
 static FIRST_TRAP_RETURN_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -132,6 +133,10 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             stop_current_clockevent();
             set_next_trigger();
             crate::task::block_sleep::note_kernel_timer_tick();
+            crate::drivers::block::poll_all();
+        }
+        Trap::Interrupt(EXTERNAL_INTERRUPT) => {
+            crate::arch::handle_external_interrupt();
         }
         //
         Trap::Interrupt(_) => {
@@ -316,6 +321,7 @@ pub fn trap_handler() {
         Trap::Interrupt(TIME_INTERVAL) => {
             stop_current_clockevent();
             set_next_trigger();
+            crate::drivers::block::poll_all();
             check_timer();
             crate::task::processor::account_current_task_tick();
             crate::syscall::misc::check_current_rlimit_cpu();
@@ -335,6 +341,9 @@ pub fn trap_handler() {
             // Used as an IPI to wake up harts from `wfi` (e.g., when a remote hart enqueues a task).
             // SAFETY: sip CSR write is valid in S-mode.
             unsafe { riscv::register::sip::clear_ssoft() };
+        }
+        Trap::Interrupt(EXTERNAL_INTERRUPT) => {
+            crate::arch::handle_external_interrupt();
         }
         Trap::Interrupt(interrupt) => {
             panic!(

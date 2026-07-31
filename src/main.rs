@@ -23,6 +23,7 @@ mod perf;
 #[cfg(target_arch = "riscv64")]
 mod sbi;
 mod syscall;
+mod sync;
 mod task;
 mod time;
 mod trap;
@@ -116,6 +117,7 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
     // Activate the page table built by the boot hart so we can safely run in S-mode.
     mm::activate_kernel_space();
     trap::init_trap();
+    arch::init_external_interrupts();
     trap::trap::enable_timer_interrupt();
     time::set_next_trigger();
     println!(
@@ -157,6 +159,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         mm::init();
         mm::remap_test();
         log::init();
+        arch::init_external_interrupts();
         if debug_config::DEBUG_LOG_TEST {
             log::test();
         }
@@ -194,6 +197,7 @@ fn rust_main(hart_id: usize) -> ! {
         arch::disable_direct_map_windows();
         log::init();
         trap::init_trap();
+        arch::init_external_interrupts();
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();
         list_apps();

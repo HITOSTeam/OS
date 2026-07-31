@@ -121,6 +121,7 @@ pub fn phys_mem_end() -> usize {
 #[cfg(not(target_arch = "loongarch64"))]
 pub const MMIO: &[(usize, usize)] = &[
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
+    (0x0c00_0000, 0x60_0000), // RISC-V PLIC
     // QEMU virt exposes eight ordered virtio-mmio transports.
     (0x1000_1000, 0x00_8000),
 ];
@@ -131,6 +132,7 @@ const UART_MMIO_BASE: usize = 0x1fe0_01e0;
 #[cfg(target_arch = "loongarch64")]
 pub const MMIO: &[(usize, usize)] = &[
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
+    (0x1000_0000, 0x00_1000), // LoongArch PCH-PIC
     (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
     (0x1000_2000, 0x00_1000), // Virtio Block (bus 1) in virt machine
     (0x100e_0000, 0x00_1000), // QEMU virt poweroff device (shutdown register)

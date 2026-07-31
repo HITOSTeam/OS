@@ -32,6 +32,13 @@ pub struct TaskControlBlock {
     pub on_cpu: AtomicUsize,
     /// 当唤醒方尝试唤醒仍处于 `on_cpu` 状态的任务时置位。
     pub wakeup_pending: AtomicBool,
+    /// Serializes the blocked/on-CPU/wakeup transition.
+    ///
+    /// This is the minimal counterpart of Linux `task_struct::pi_lock` in
+    /// `try_to_wake_up()`: the outgoing CPU and a concurrent hardirq waker
+    /// must agree whether the task is still on-CPU or already enqueueable.
+    /// Every acquisition is made with local interrupts disabled.
+    wakeup_lock: Mutex<()>,
     /// `wakeup_pending` 对应的同步唤醒来源 hart。
     ///
     /// Linux `WF_SYNC` 风格 handoff 可能发生在目标任务还位于自己的内核栈上时。
@@ -110,6 +117,10 @@ impl TaskControlBlock {
 
     pub fn clear_on_cpu(&self) {
         self.on_cpu.store(Self::OFF_CPU, Ordering::Release);
+    }
+
+    pub fn lock_wakeup_transition(&self) -> MutexGuard<'_, ()> {
+        self.wakeup_lock.lock()
     }
 
     pub fn mark_signal_pending(&self) {
@@ -457,6 +468,7 @@ impl TaskControlBlock {
             cpu_id: AtomicUsize::new(0),
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             wakeup_pending: AtomicBool::new(false),
+            wakeup_lock: Mutex::new(()),
             wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
             exec_exit_state: AtomicU8::new(Self::EXEC_EXIT_NONE),
@@ -563,6 +575,7 @@ impl TaskControlBlock {
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             // 唤醒标记/就绪队列标记的初值均为 false：刚创建还未排队
             wakeup_pending: AtomicBool::new(false),
+            wakeup_lock: Mutex::new(()),
             wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
             exec_exit_state: AtomicU8::new(Self::EXEC_EXIT_NONE),

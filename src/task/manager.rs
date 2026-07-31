@@ -295,6 +295,14 @@ fn wakeup_task_with_batch_inner(
         (hart < MAX_HARTS).then_some(hart)
     }
 
+    // Linux try_to_wake_up() serializes task state with p->pi_lock taken using
+    // irqsave, then orders the on_cpu hand-off before enqueueing.  Use the
+    // task-local transition lock for the same purpose.  In particular, this
+    // closes the window where idle has observed `wakeup_pending == false`
+    // while a waker still observes the old on_cpu value.
+    let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
+    let _wakeup_guard = task.lock_wakeup_transition();
+
     // SMP 安全性：如果任务确实仍在某个 hart 上执行，不要直接入队
     // （否则会在同一个内核栈上竞争）。改为标记待处理唤醒，让该 hart
     // 切回 idle 后再把任务入队。
@@ -305,15 +313,16 @@ fn wakeup_task_with_batch_inner(
         }
         task.wakeup_pending
             .store(true, core::sync::atomic::Ordering::Release);
-        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) == TaskControlBlock::OFF_CPU {
-            let effective_sync_source = sync_source_hart.or_else(|| take_pending_sync_hart(&task));
-            wake_if_blocked_inner(task, batch, allow_fair_preempt, effective_sync_source);
-        }
         return;
     }
 
     let effective_sync_source = sync_source_hart.or_else(|| take_pending_sync_hart(&task));
-    wake_if_blocked_inner(task, batch, allow_fair_preempt, effective_sync_source);
+    wake_if_blocked_inner(
+        Arc::clone(&task),
+        batch,
+        allow_fair_preempt,
+        effective_sync_source,
+    );
 }
 
 /// 在进程调度策略/优先级/nice 值变更后，重新将其所有可运行线程入队到正确的位置
@@ -469,11 +478,16 @@ pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
 
 /// 返回每个 hart 的就绪队列长度（用于调试和负载均衡）
 pub fn ready_queue_lengths() -> alloc::vec::Vec<usize> {
+    // Linux runqueue locks are acquired with rq_lock_irqsave: VirtIO
+    // completion can wake a task from hardirq context and must never recurse
+    // into a runqueue lock held by the interrupted context.
+    let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
     TASK_MANAGER.ready_queue_lengths()
 }
 
 /// 当前系统是否已有可运行任务在等待调度。
 pub fn has_ready_tasks() -> bool {
+    let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
     TASK_MANAGER.has_ready_tasks()
 }
 

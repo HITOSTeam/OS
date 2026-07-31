@@ -17,6 +17,7 @@ mod mm;
 mod net;
 mod perf;
 mod sbi;
+mod sync;
 mod syscall;
 mod task;
 mod time;

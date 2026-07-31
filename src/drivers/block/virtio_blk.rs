@@ -1,5 +1,6 @@
 #[cfg(target_arch = "riscv64")]
 mod virtio_mmio {
+    use super::super::async_queue::{AsyncBlockDiagnostics, AsyncVirtIOBlock};
     use alloc::vec;
     use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 
@@ -25,7 +26,10 @@ mod virtio_mmio {
     const VIRTIO_MMIO_STRIDE: usize = 0x1000;
     const VIRTIO_MMIO_SLOTS: usize = 8;
 
-    pub struct VirtIOBlock(Mutex<VirtIOBlk<VirtioHal, MmioTransport>>);
+    pub struct VirtIOBlock {
+        queue: AsyncVirtIOBlock<VirtioHal, MmioTransport>,
+        irq: usize,
+    }
 
     lazy_static! {
         static ref DMA_FRAMES: Mutex<BTreeMap<usize, Vec<FrameTracker>>> =
@@ -33,6 +37,14 @@ mod virtio_mmio {
     }
 
     impl BlockDevice for VirtIOBlock {
+        fn io_relax(&self) {
+            if crate::task::processor::current_task().is_some() {
+                crate::task::processor::suspend_current_and_run_next();
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+
         fn read_block(&self, block_id: usize, buf: &mut [u8]) {
             self.read_blocks(block_id, buf);
         }
@@ -48,8 +60,7 @@ mod virtio_mmio {
             // RISC-V user page tables share only selected kernel roots, so enter
             // the full kernel page table around the MMIO driver call.
             let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
-            self.0
-                .lock()
+            self.queue
                 .read_blocks(base_sector, buf)
                 .expect("Error when reading VirtIOBlk");
             crate::perf::block_read_end(start, buf.len());
@@ -61,8 +72,7 @@ mod virtio_mmio {
             let start = crate::perf::block_write_begin();
             // See read path: the driver must run with the kernel direct map active.
             let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
-            self.0
-                .lock()
+            self.queue
                 .write_blocks(base_sector, buf)
                 .expect("Error when writing VirtIOBlk");
             crate::perf::block_write_end(start, buf.len());
@@ -93,8 +103,38 @@ mod virtio_mmio {
                 return None;
             }
             let blk = VirtIOBlk::<VirtioHal, _>::new(transport).ok()?;
-            println!("VirtIOBlock initialized at {:#x}.", base);
-            Some(Self(Mutex::new(blk)))
+            let irq = (base.checked_sub(VIRTIO_MMIO_BASE)? / VIRTIO_MMIO_STRIDE) + 1;
+            crate::arch::enable_external_irq(irq);
+            println!("VirtIOBlock initialized at {:#x}, irq {}.", base, irq);
+            Some(Self {
+                queue: AsyncVirtIOBlock::new(blk),
+                irq,
+            })
+        }
+
+        pub fn handle_irq(&self, irq: usize) -> bool {
+            if irq != self.irq {
+                return false;
+            }
+            // Linux device interrupt handlers always run with kernel mappings
+            // active.  Keep that invariant at the driver boundary as well as
+            // at the PLIC entry so future dispatch paths cannot touch VirtIO
+            // MMIO or DMA buffers through a user page table.
+            let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
+            self.queue.handle_interrupt()
+        }
+
+        pub fn poll(&self) {
+            // Timer/watchdog fallback polling can run directly from a user
+            // trap, where this kernel deliberately retains the user SATP.
+            // Linux's block polling path still executes in kernel address
+            // space, so switch before acknowledging MMIO or draining DMA.
+            let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
+            self.queue.poll();
+        }
+
+        pub fn diagnostics(&self) -> AsyncBlockDiagnostics {
+            self.queue.diagnostics()
         }
     }
 
@@ -157,6 +197,7 @@ mod virtio_mmio {
 
 #[cfg(target_arch = "loongarch64")]
 mod virtio_pci {
+    use super::super::async_queue::{AsyncBlockDiagnostics, AsyncVirtIOBlock};
     use crate::{
         config::{DEVICE_TREE_ADDR, PAGE_SIZE, phys_mem_end, phys_mem_start},
         mm::{
@@ -173,7 +214,7 @@ mod virtio_pci {
     };
     use core::{
         ptr::NonNull,
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, Ordering},
     };
     use ext4_fs::BlockDevice;
     use fdt::{Fdt, node::FdtNode};
@@ -193,11 +234,12 @@ mod virtio_pci {
     };
 
     static PCI_ECAM_MAPPED: AtomicBool = AtomicBool::new(false);
-    static READ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static WRITE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
     const FORCE_DMA_CACHEABLE: bool = true;
 
-    pub struct VirtIOBlock(Mutex<VirtIOBlk<HalImpl, PciTransport>>);
+    pub struct VirtIOBlock {
+        queue: AsyncVirtIOBlock<HalImpl, PciTransport>,
+        irq: usize,
+    }
 
     lazy_static! {
         static ref DMA_FRAMES: Mutex<BTreeMap<usize, Vec<FrameTracker>>> =
@@ -288,14 +330,23 @@ mod virtio_pci {
                 return;
             }
             if let BufferDirection::DeviceToDriver | BufferDirection::Both = direction {
-                let src = core::slice::from_raw_parts(paddr as *const u8, buffer.len());
-                let dst = core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
-                dst.copy_from_slice(src);
+                // SAFETY: `paddr` names the bounce buffer allocated by `share`,
+                // and `buffer` is the original non-null slice of the same length.
+                unsafe {
+                    let src = core::slice::from_raw_parts(paddr as *const u8, buffer.len());
+                    let dst =
+                        core::slice::from_raw_parts_mut(buffer.as_ptr() as *mut u8, buffer.len());
+                    dst.copy_from_slice(src);
+                }
             }
-            let _shared = Box::from_raw(core::ptr::slice_from_raw_parts_mut(
-                paddr as *mut u8,
-                buffer.len(),
-            ));
+            // SAFETY: `paddr` was produced by `Box::into_raw` in `share`, with
+            // this exact slice length, and this is its single matching release.
+            let _shared = unsafe {
+                Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                    paddr as *mut u8,
+                    buffer.len(),
+                ))
+            };
         }
     }
 
@@ -304,6 +355,14 @@ mod virtio_pci {
     }
 
     impl BlockDevice for VirtIOBlock {
+        fn io_relax(&self) {
+            if crate::task::processor::current_task().is_some() {
+                crate::task::processor::suspend_current_and_run_next();
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+
         fn read_block(&self, block_id: usize, buf: &mut [u8]) {
             self.read_blocks(block_id, buf);
         }
@@ -314,59 +373,21 @@ mod virtio_pci {
             assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
-            let idx = READ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if idx < 8 {
-                println!(
-                    "[virtio_pci] read block_id={} sector={} sectors={} bytes={}",
-                    block_id,
-                    base_sector,
-                    buf.len() / 512,
-                    buf.len()
-                );
-            }
             let start = crate::perf::block_read_begin();
-            self.0
-                .lock()
+            self.queue
                 .read_blocks(base_sector, buf)
                 .expect("Error when reading VirtIOBlk");
             crate::perf::block_read_end(start, buf.len());
-            if idx < 8 {
-                println!(
-                    "[virtio_pci] read done block_id={} sector={} bytes={}",
-                    block_id,
-                    base_sector,
-                    buf.len()
-                );
-            }
         }
         fn write_blocks(&self, block_id: usize, buf: &[u8]) {
             assert_eq!(buf.len() % ext4_fs::BLOCK_SZ, 0);
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
-            let idx = WRITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if idx < 8 {
-                println!(
-                    "[virtio_pci] write block_id={} sector={} sectors={} bytes={}",
-                    block_id,
-                    base_sector,
-                    buf.len() / 512,
-                    buf.len()
-                );
-            }
             let start = crate::perf::block_write_begin();
-            self.0
-                .lock()
+            self.queue
                 .write_blocks(base_sector, buf)
                 .expect("Error when writing VirtIOBlk");
             crate::perf::block_write_end(start, buf.len());
-            if idx < 8 {
-                println!(
-                    "[virtio_pci] write done block_id={} sector={} bytes={}",
-                    block_id,
-                    base_sector,
-                    buf.len()
-                );
-            }
         }
     }
 
@@ -557,10 +578,14 @@ mod virtio_pci {
         }
     }
 
-    fn virtio_blk_pci(transport: PciTransport) -> VirtIOBlock {
+    fn virtio_blk_pci(transport: PciTransport, irq: usize) -> VirtIOBlock {
         let blk = VirtIOBlk::<HalImpl, PciTransport>::new(transport)
             .expect("failed to create virtio block driver");
-        VirtIOBlock(Mutex::new(blk))
+        crate::arch::enable_external_irq(irq);
+        VirtIOBlock {
+            queue: AsyncVirtIOBlock::new(blk),
+            irq,
+        }
     }
 
     impl VirtIOBlock {
@@ -619,14 +644,43 @@ mod virtio_pci {
                     }
                     map_device_bars(&mut pci_root, device_function);
                     if blk_index == index {
+                        let pin = pci_root.interrupt_pin(device_function);
+                        if !(1..=4).contains(&pin) {
+                            println!(
+                                "[virtio_pci] invalid INTx pin {} for {}, skipping",
+                                pin, device_function
+                            );
+                            return None;
+                        }
+                        // QEMU's LoongArch virt host bridge follows the PCI
+                        // INTx swizzle encoded by its FDT interrupt-map:
+                        // input = 16 + (device + pin - 1) mod 4.
+                        let irq =
+                            16 + (usize::from(device_function.device) + usize::from(pin) - 1) % 4;
                         let transport =
                             PciTransport::new::<HalImpl>(&mut pci_root, device_function).ok()?;
-                        return Some(virtio_blk_pci(transport));
+                        println!(
+                            "[virtio_pci] block {} pin {} routed to irq {}",
+                            device_function, pin, irq
+                        );
+                        return Some(virtio_blk_pci(transport, irq));
                     }
                     blk_index += 1;
                 }
             }
             None
+        }
+
+        pub fn handle_irq(&self, irq: usize) -> bool {
+            irq == self.irq && self.queue.handle_interrupt()
+        }
+
+        pub fn poll(&self) {
+            self.queue.poll();
+        }
+
+        pub fn diagnostics(&self) -> AsyncBlockDiagnostics {
+            self.queue.diagnostics()
         }
     }
 }
