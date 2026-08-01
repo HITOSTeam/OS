@@ -53,11 +53,6 @@ impl MmRef {
         crate::arch::riscv64::mm::prepare_user_satp(&self.asid, self.token)
     }
 
-    #[cfg(target_arch = "riscv64")]
-    pub(super) fn active_user_hart_mask(&self) -> usize {
-        crate::arch::riscv64::mm::active_user_hart_mask(self.asid.as_ref())
-    }
-
     #[cfg(target_arch = "loongarch64")]
     pub(super) fn flush_user_page(&self, va: usize) {
         crate::arch::loongarch64::mm::flush_user_page(self.asid.as_ref(), va);
@@ -65,7 +60,12 @@ impl MmRef {
 
     #[cfg(target_arch = "riscv64")]
     pub(super) fn flush_user_page(&self, va: usize) {
-        crate::arch::riscv64::mm::flush_user_page(self.asid.as_ref(), va);
+        crate::arch::riscv64::mm::flush_user_page(&self.asid, va);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn leave_user_satp(&self) {
+        crate::arch::riscv64::mm::leave_user_satp(self.asid.as_ref());
     }
 
     /// 为新线程分配 TrapContext 槽位，返回槽号。

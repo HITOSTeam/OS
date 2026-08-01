@@ -91,6 +91,12 @@ pub fn flush_user_page(ctx: &AsidContext, vaddr: usize) {
     }
 }
 
+pub fn flush_user_range(ctx: &AsidContext, _start: usize, _end: usize) {
+    // The current LoongArch mainline is single-hart. Retiring the context is
+    // the range-batch equivalent: the next user return receives a fresh ASID.
+    ctx.invalidate();
+}
+
 #[inline(always)]
 pub fn write_kernel_asid() {
     write_asid(KERNEL_ASID);

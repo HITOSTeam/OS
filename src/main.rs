@@ -183,6 +183,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         );
         mm::init_phys_mem_from_dtb(dtb_pa);
         mm::init();
+        arch::mm::init_asid_allocator(topology.present_mask);
         mm::remap_test();
         log::init();
         arch::init_external_interrupts();

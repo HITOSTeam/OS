@@ -3,7 +3,7 @@ use super::backing::{
     shared_file_page_cache_insert_or_get,
 };
 use super::{
-    LazyFaultResult, MapPermission, MapType, MemorySet, MmRef, VmRegion,
+    LazyFaultResult, MapPermission, MapType, MemorySet, MmRef, PageTableUpdateBatch, VmRegion,
     vm_region_map_area_type_compatible,
 };
 use crate::config::{PAGE_SIZE, USER_STACK_GUARD_GAP};
@@ -219,24 +219,20 @@ impl MemorySet {
         let mut new_flags = flags;
         new_flags.remove(PTEFlags::COW);
         new_flags.insert(PTEFlags::W | PTEFlags::D);
-        #[cfg(target_arch = "loongarch64")]
-        {
-            if !self
-                .page_table
-                .remap_deferred(plan.vpn, frame.ppn, new_flags)
-            {
-                return CowFaultCommit::Retry;
-            }
+        let mut batch: PageTableUpdateBatch = self.begin_page_table_update();
+        let Some(changed) = self
+            .page_table
+            .remap_deferred_changed(plan.vpn, frame.ppn, new_flags)
+        else {
+            return CowFaultCommit::Retry;
+        };
+        if changed {
+            batch.record_page(fault_va);
         }
-        #[cfg(not(target_arch = "loongarch64"))]
-        {
-            if !self.page_table.remap(plan.vpn, frame.ppn, new_flags) {
-                return CowFaultCommit::Retry;
-            }
-        }
-        // The plan keeps the old frame pinned until the caller completes the
-        // local and remote TLB invalidations.
-        self.areas[area_idx].insert_tracked_frame(plan.vpn, frame.clone());
+        // Keep the old frame pinned until every target hart has acknowledged
+        // the invalidation for the newly installed PTE.
+        self.areas[area_idx].replace_tracked_frame_batched(plan.vpn, frame.clone(), &mut batch);
+        batch.commit();
         CowFaultCommit::Installed
     }
 
@@ -404,6 +400,7 @@ impl MemorySet {
             },
         };
 
+        let mut batch = self.begin_page_table_update();
         self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
         #[cfg(target_arch = "riscv64")]
         if plan.pte_flags.contains(PTEFlags::X) {
@@ -421,6 +418,8 @@ impl MemorySet {
                 plan.pte_flags.contains(PTEFlags::D),
             );
         }
+        batch.record_page(fault_va);
+        batch.commit();
         LazyFaultCommit::Installed
     }
 }
@@ -453,25 +452,7 @@ impl MmRef {
 
             let commit = self.lock().commit_cow_fault(&plan, &frame);
             match commit {
-                CowFaultCommit::Installed => {
-                    self.flush_user_page(fault_va);
-                    #[cfg(target_arch = "riscv64")]
-                    {
-                        let local_hart = crate::arch::hart_id();
-                        let local_bit = 1usize.checked_shl(local_hart as u32).unwrap_or(0);
-                        let remote_hart_mask = self.active_user_hart_mask()
-                            & crate::task::manager::online_hart_mask()
-                            & !local_bit;
-                        if remote_hart_mask != 0 {
-                            crate::sbi::remote_sfence_vma(
-                                remote_hart_mask,
-                                fault_va & !(PAGE_SIZE - 1),
-                                PAGE_SIZE,
-                            );
-                        }
-                    }
-                    return true;
-                }
+                CowFaultCommit::Installed => return true,
                 CowFaultCommit::Resolved => {
                     self.flush_user_page(fault_va);
                     return true;
@@ -560,7 +541,8 @@ impl MmRef {
                 .lock()
                 .commit_lazy_fault(fault_va, access, &plan, &frame, charge_pid);
             match commit {
-                LazyFaultCommit::Installed | LazyFaultCommit::Resolved => {
+                LazyFaultCommit::Installed => return LazyFaultResult::Resolved,
+                LazyFaultCommit::Resolved => {
                     self.flush_user_page(fault_va);
                     return LazyFaultResult::Resolved;
                 }

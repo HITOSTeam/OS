@@ -178,6 +178,18 @@ impl MapArea {
         self.data_frames.insert(vpn, frame);
     }
 
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub(super) fn replace_tracked_frame_batched(
+        &mut self,
+        vpn: VirtPageNum,
+        frame: FrameTracker,
+        batch: &mut PageTableUpdateBatch,
+    ) {
+        if let Some(old_frame) = self.data_frames.insert(vpn, frame) {
+            batch.defer_frame(old_frame);
+        }
+    }
+
     pub(super) fn save_pte_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) {
         self.saved_pte_flags.insert(vpn, flags);
     }
@@ -329,6 +341,49 @@ impl MapArea {
         page_table.unmap_if_mapped(vpn);
     }
 
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub(super) fn unmap_one_maybe_batched(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        batch: &mut PageTableUpdateBatch,
+    ) {
+        let changed = page_table.unmap_if_mapped_deferred(vpn);
+        if !self.is_identical()
+            && let Some(frame) = self.data_frames.remove(&vpn)
+        {
+            batch.defer_frame(frame);
+        }
+        self.saved_pte_flags.remove(&vpn);
+        if changed {
+            batch.record_page(vpn.0 << 12);
+        }
+    }
+
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub(super) fn unmap_range_maybe_batched(
+        &mut self,
+        page_table: &mut PageTable,
+        start: VirtPageNum,
+        end: VirtPageNum,
+        batch: &mut PageTableUpdateBatch,
+    ) {
+        for vpn in VPNRange::new(start, end) {
+            self.unmap_one_maybe_batched(page_table, vpn, batch);
+        }
+    }
+
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub(super) fn unmap_batched(
+        &mut self,
+        page_table: &mut PageTable,
+        batch: &mut PageTableUpdateBatch,
+    ) {
+        for vpn in self.vpn_range {
+            self.unmap_one_maybe_batched(page_table, vpn, batch);
+        }
+    }
+
     /// 清理内存,并且将内存进行映射,内部使用map_one 逐个映射.
     pub fn map(&mut self, page_table: &mut PageTable) -> bool {
         if self.is_lazy() {
@@ -347,6 +402,39 @@ impl MapArea {
         }
         true
     }
+
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub(super) fn map_batched(
+        &mut self,
+        page_table: &mut PageTable,
+        batch: &mut PageTableUpdateBatch,
+    ) -> bool {
+        if self.is_lazy() {
+            return true;
+        }
+        let mut mapped: Vec<VirtPageNum> = Vec::new();
+        for vpn in self.vpn_range {
+            if !self.map_one(page_table, vpn) {
+                // Keep frames from a partially installed mapping alive until
+                // any concurrently filled translations have been evicted.
+                for vpn in mapped {
+                    self.unmap_one_maybe_batched(page_table, vpn, batch);
+                }
+                if !self.contains_perm(MapPermission::U) {
+                    batch.force_kernel_full();
+                }
+                return false;
+            }
+            mapped.push(vpn);
+        }
+        if self.contains_perm(MapPermission::U) {
+            batch.record_range(
+                self.vpn_range.get_start().0 << 12,
+                self.vpn_range.get_end().0 << 12,
+            );
+        }
+        true
+    }
     #[allow(unused)]
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
@@ -357,6 +445,19 @@ impl MapArea {
     pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
             self.unmap_one(page_table, vpn)
+        }
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+    }
+
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    pub(super) fn shrink_to_batched(
+        &mut self,
+        page_table: &mut PageTable,
+        new_end: VirtPageNum,
+        batch: &mut PageTableUpdateBatch,
+    ) {
+        for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
+            self.unmap_one_maybe_batched(page_table, vpn, batch);
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }

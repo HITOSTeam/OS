@@ -223,6 +223,11 @@ impl TaskControlBlock {
         self.memory_set.lock().prepare_user_satp()
     }
 
+    #[cfg(target_arch = "riscv64")]
+    pub fn leave_user_satp(&self) {
+        self.memory_set.lock().leave_user_satp();
+    }
+
     /// 将保存的用户态浮点状态重置为 Linux exec/线程初始状态：
     /// 所有 FP 寄存器和控制位均为 0。
     /// 初始化 fp 相关寄存器。

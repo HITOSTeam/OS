@@ -1,168 +1,109 @@
-use core::arch::asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 use alloc::sync::Arc;
+use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
+
 use riscv::register::satp::{self, Satp};
 use spin::Mutex;
 
-use crate::config::MAX_HARTS;
+use crate::config::{MAX_HARTS, PAGE_SIZE};
 
-/// Linux-style per-mm ASID and deferred I-cache state.
-///
-/// RISC-V SATP carries both the page-table PPN and ASID, so each `MemorySet`
-/// caches an ASID generation here and only asks the trampoline for `sfence.vma`
-/// when the ASID is new or hardware ASID is unavailable. Executable mapping
-/// changes mark the mm's I-cache stale; on SMP we keep the conservative
-/// `fence.i` behaviour until active-mm tracking can safely target remote harts.
 const SATP_ASID_SHIFT: usize = 44;
 const SATP_ASID_MASK: usize = 0xffff;
+const CONTEXT_ASID_BITS: usize = SATP_ASID_MASK.count_ones() as usize;
 const KERNEL_ASID: usize = 0;
 const FIRST_USER_ASID: usize = 1;
-const HW_ASID_MASK_UNPROBED: usize = usize::MAX;
+const TLB_SMALL_RANGE_PAGES: usize = 64;
 
-static NEXT_USER_ASID: AtomicUsize = AtomicUsize::new(FIRST_USER_ASID);
+struct AsidAllocator {
+    next: usize,
+    generation: usize,
+}
+
+impl AsidAllocator {
+    const fn new() -> Self {
+        Self {
+            next: FIRST_USER_ASID,
+            generation: 1,
+        }
+    }
+}
+
+static ASID_ALLOCATOR: Mutex<AsidAllocator> = Mutex::new(AsidAllocator::new());
 static ASID_GENERATION: AtomicUsize = AtomicUsize::new(1);
-static HW_ASID_MASK: AtomicUsize = AtomicUsize::new(HW_ASID_MASK_UNPROBED);
-/// Address space whose translations each hart may currently consume.
-///
-/// Linux keeps the equivalent per-CPU `active_mm` pointer and updates
-/// `mm_cpumask()` during `switch_mm()`. Holding an `Arc` here gives the same
-/// lifetime guarantee: a writer can snapshot the target mask without racing an
-/// `AsidContext` free, and the bit is cleared only after the hart has installed
-/// the kernel SATP.
-static ACTIVE_USER_CONTEXTS: [Mutex<Option<Arc<AsidContext>>>; MAX_HARTS] =
-    [const { Mutex::new(None) }; MAX_HARTS];
+static HW_ASID_MASK: AtomicUsize = AtomicUsize::new(0);
+static ASID_ENABLED: AtomicBool = AtomicBool::new(false);
+static POSSIBLE_HART_MASK: AtomicUsize = AtomicUsize::new(1);
+static PENDING_LOCAL_FLUSH: AtomicUsize = AtomicUsize::new(0);
 
+/// Per-address-space RISC-V MMU state.
+///
+/// `context` is the generation-tagged ASID allocated for new users of this
+/// address space. `hart_contexts` records what each hart actually loaded, so a
+/// generation rollover can coexist briefly with an old user context without
+/// losing shootdown coverage. The even/odd sequence closes the race between a
+/// page-table edit and the final transition back to userspace.
 pub struct AsidContext {
-    asid: AtomicUsize,
-    generation: AtomicUsize,
+    context: AtomicUsize,
+    hart_contexts: [AtomicUsize; MAX_HARTS],
+    resident_harts: AtomicUsize,
+    active_harts: AtomicUsize,
+    invalidation_sequence: AtomicUsize,
     icache_stale_mask: AtomicUsize,
-    /// Harts that may consume translations from this address space.
-    ///
-    /// This is the local equivalent of Linux's `mm_cpumask(mm)`: COW PTE
-    /// replacement only needs a remote TLB invalidation on CPUs that can still
-    /// consume this mm's old translation. The bit remains set in a syscall
-    /// because the RISC-V trap path deliberately keeps the user SATP active.
-    active_hart_mask: AtomicUsize,
 }
 
 impl AsidContext {
     pub const fn new() -> Self {
         Self {
-            asid: AtomicUsize::new(0),
-            generation: AtomicUsize::new(0),
+            context: AtomicUsize::new(0),
+            hart_contexts: [const { AtomicUsize::new(0) }; MAX_HARTS],
+            resident_harts: AtomicUsize::new(0),
+            active_harts: AtomicUsize::new(0),
+            invalidation_sequence: AtomicUsize::new(0),
             icache_stale_mask: AtomicUsize::new(configured_hart_mask()),
-            active_hart_mask: AtomicUsize::new(0),
         }
     }
 
-    fn current(&self) -> (usize, usize) {
-        (
-            self.asid.load(Ordering::Acquire),
-            self.generation.load(Ordering::Acquire),
-        )
+    fn begin_invalidation(&self) -> usize {
+        loop {
+            let sequence = self.invalidation_sequence.load(Ordering::Acquire);
+            if sequence & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let odd = sequence.wrapping_add(1) | 1;
+            if self
+                .invalidation_sequence
+                .compare_exchange(sequence, odd, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return odd;
+            }
+        }
     }
 
-    fn valid_for(&self, generation: usize) -> bool {
-        let (asid, ctx_generation) = self.current();
-        asid != KERNEL_ASID && ctx_generation == generation
+    fn finish_invalidation(&self, odd_sequence: usize) {
+        let mut even = odd_sequence.wrapping_add(1) & !1;
+        if even == 0 {
+            even = 2;
+        }
+        self.invalidation_sequence.store(even, Ordering::Release);
     }
 
-    fn store(&self, asid: usize, generation: usize) {
-        self.generation.store(generation, Ordering::Release);
-        self.asid.store(asid, Ordering::Release);
-    }
-
-    pub fn invalidate(&self) {
-        self.asid.store(0, Ordering::Release);
-        self.generation.store(0, Ordering::Release);
-    }
-
-    pub fn mark_icache_stale(&self) {
+    fn mark_icache_stale(&self) {
         self.icache_stale_mask
-            .fetch_or(online_hart_mask(), Ordering::Release);
+            .fetch_or(possible_hart_mask(), Ordering::Release);
     }
 
-    fn take_local_icache_stale(&self, single_hart: bool) -> bool {
-        // Until we track active mm contexts and can issue remote fence.i like
-        // Linux, keep the old conservative behaviour on SMP. The SMP=1 path is
-        // the hot cyclictest/hackbench case and can safely defer I-cache flushes
-        // per mm/hart.
-        if !single_hart {
+    fn take_local_icache_stale(&self) -> bool {
+        // This is refined to active-hart remote fence.i in the following
+        // I-cache commit. Keeping the conservative SMP behaviour here makes
+        // this ASID/TLB commit independently safe and bisectable.
+        if crate::task::manager::online_hart_mask().count_ones() > 1 {
             return true;
         }
         let bit = local_hart_bit();
-        if bit == 0 {
-            return self.icache_stale_mask.swap(0, Ordering::AcqRel) != 0;
-        }
         self.icache_stale_mask.fetch_and(!bit, Ordering::AcqRel) & bit != 0
     }
-
-    fn mark_local_active(&self) {
-        let bit = local_hart_bit();
-        if bit != 0 {
-            // Acquiring the writer's zero-bit RMW below ensures page-table
-            // stores become visible before the final local sfence/user return
-            // when the writer raced just before this activation.
-            self.active_hart_mask.fetch_or(bit, Ordering::AcqRel);
-        }
-    }
-
-    fn mark_local_inactive(&self) {
-        let bit = local_hart_bit();
-        if bit != 0 {
-            self.active_hart_mask.fetch_and(!bit, Ordering::AcqRel);
-        }
-    }
-
-    fn active_harts_after_pte_update(&self) -> usize {
-        // A zero-bit RMW publishes all preceding PTE writes. If a returning
-        // hart activates after this snapshot, its AcqRel RMW observes this
-        // release sequence before it performs the mandatory local sfence. If
-        // it activates first, this operation observes its bit and the caller
-        // sends a remote shootdown.
-        self.active_hart_mask.fetch_or(0, Ordering::AcqRel)
-    }
-}
-
-fn switch_local_active_context(ctx: &Arc<AsidContext>) {
-    let hart = crate::arch::hart_id() % MAX_HARTS;
-    let mut active = ACTIVE_USER_CONTEXTS[hart].lock();
-    if active
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, ctx))
-    {
-        ctx.mark_local_active();
-        return;
-    }
-    if let Some(previous) = active.replace(Arc::clone(ctx)) {
-        previous.mark_local_inactive();
-    }
-    ctx.mark_local_active();
-}
-
-/// Pin the user address space currently associated with this hart.
-///
-/// A temporary kernel-page-table guard can outlive a scheduler switch while
-/// waiting for block I/O.  Keeping this `Arc` lets the guard publish the same
-/// active-mm again before it restores the saved user SATP, even when the task
-/// resumes on a different hart.
-pub fn pin_local_user_mm() -> Option<Arc<AsidContext>> {
-    let hart = crate::arch::hart_id() % MAX_HARTS;
-    ACTIVE_USER_CONTEXTS[hart].lock().as_ref().map(Arc::clone)
-}
-
-/// Publish a pinned user address space on the current hart.
-///
-/// This must run before restoring a user SATP. It provides the same ordering
-/// as `prepare_user_satp()`: a concurrent PTE writer either observes the hart
-/// bit and sends a shootdown, or its update precedes the local SATP flush.
-pub fn restore_pinned_user_mm(ctx: &Arc<AsidContext>) {
-    switch_local_active_context(ctx);
-}
-
-fn single_hart_online() -> bool {
-    crate::task::manager::online_hart_mask().count_ones() <= 1
 }
 
 const fn configured_hart_mask() -> usize {
@@ -173,14 +114,13 @@ const fn configured_hart_mask() -> usize {
     }
 }
 
-fn online_hart_mask() -> usize {
-    let mask = crate::task::manager::online_hart_mask() & configured_hart_mask();
-    if mask == 0 { 1 } else { mask }
+fn possible_hart_mask() -> usize {
+    POSSIBLE_HART_MASK.load(Ordering::Acquire) & configured_hart_mask()
 }
 
 fn local_hart_bit() -> usize {
-    let hart = crate::arch::hart_id();
-    if hart < usize::BITS as usize {
+    let hart = super::super::hart_id();
+    if hart < MAX_HARTS && hart < usize::BITS as usize {
         1usize << hart
     } else {
         0
@@ -190,14 +130,13 @@ fn local_hart_bit() -> usize {
 fn probe_hw_asid_mask() -> usize {
     let old = satp::read().bits();
     let trial = old | (SATP_ASID_MASK << SATP_ASID_SHIFT);
-    // SAFETY: probing SATP ASID bits follows the Linux approach: write ones to
-    // the ASID field, read back implemented bits, then restore the old SATP.
+    // SAFETY: write-ones/read-back is the architectural WARL ASID-width probe.
     unsafe {
         satp::write(Satp::from_bits(trial));
     }
     let supported = (satp::read().bits() >> SATP_ASID_SHIFT) & SATP_ASID_MASK;
-    // SAFETY: restore the exact SATP value and discard any translations that
-    // may have been populated while the temporary ASID was active.
+    // SAFETY: restore the exact original address space and discard anything
+    // filled while the temporary ASID value was installed.
     unsafe {
         satp::write(Satp::from_bits(old));
         asm!("sfence.vma", options(nostack));
@@ -205,115 +144,386 @@ fn probe_hw_asid_mask() -> usize {
     supported
 }
 
-fn hw_asid_mask() -> usize {
-    let cached = HW_ASID_MASK.load(Ordering::Acquire);
-    if cached != HW_ASID_MASK_UNPROBED {
-        return cached;
-    }
-
-    let probed = probe_hw_asid_mask();
-    let _ = HW_ASID_MASK.compare_exchange(
-        HW_ASID_MASK_UNPROBED,
-        probed,
-        Ordering::AcqRel,
-        Ordering::Acquire,
+/// Probe ASID width after kernel paging is active and decide whether the
+/// namespace is large enough for Linux-style SMP allocation.
+pub fn init_asid_allocator(present_harts: usize) {
+    let possible = present_harts & configured_hart_mask();
+    POSSIBLE_HART_MASK.store(if possible == 0 { 1 } else { possible }, Ordering::Release);
+    let mask = probe_hw_asid_mask();
+    HW_ASID_MASK.store(mask, Ordering::Release);
+    let asid_count = mask.saturating_add(1);
+    let enabled = mask != 0 && asid_count > 2 * possible.count_ones() as usize;
+    ASID_ENABLED.store(enabled, Ordering::Release);
+    crate::println!(
+        "[mm] riscv ASID bits={} count={} enabled={} possible_harts={:#x}",
+        mask.count_ones(),
+        asid_count,
+        enabled,
+        possible
     );
-    HW_ASID_MASK.load(Ordering::Acquire)
 }
 
-fn asid_fast_path_enabled() -> bool {
-    single_hart_online() && hw_asid_mask() != 0
+#[inline]
+fn encode_context(asid: usize, generation: usize) -> usize {
+    (generation << CONTEXT_ASID_BITS) | (asid & SATP_ASID_MASK)
 }
 
-fn allocate_user_asid(max_asid: usize) -> (usize, usize, bool) {
-    let asid = NEXT_USER_ASID.fetch_add(1, Ordering::AcqRel);
-    if asid <= max_asid {
-        return (asid, ASID_GENERATION.load(Ordering::Acquire), false);
+#[inline]
+fn context_asid(context: usize) -> usize {
+    context & SATP_ASID_MASK
+}
+
+#[inline]
+fn context_generation(context: usize) -> usize {
+    context >> CONTEXT_ASID_BITS
+}
+
+fn allocate_context_locked(allocator: &mut AsidAllocator) -> usize {
+    let max_asid = HW_ASID_MASK.load(Ordering::Acquire);
+    if allocator.next > max_asid {
+        let mut generation = allocator.generation.wrapping_add(1);
+        if generation == 0 {
+            generation = 1;
+        }
+        allocator.generation = generation;
+        allocator.next = FIRST_USER_ASID;
+        ASID_GENERATION.store(generation, Ordering::Release);
+        PENDING_LOCAL_FLUSH.fetch_or(possible_hart_mask(), Ordering::AcqRel);
+        crate::perf::record_tlb_asid_wrap();
+    }
+    let asid = allocator.next;
+    allocator.next = allocator.next.saturating_add(1);
+    encode_context(asid, allocator.generation)
+}
+
+fn current_or_allocate_context(ctx: &AsidContext) -> usize {
+    let generation = ASID_GENERATION.load(Ordering::Acquire);
+    let current = ctx.context.load(Ordering::Acquire);
+    if context_asid(current) != KERNEL_ASID && context_generation(current) == generation {
+        return current;
     }
 
-    let current = ASID_GENERATION.load(Ordering::Acquire);
-    let mut next_generation = current.wrapping_add(1);
-    if next_generation == 0 {
-        next_generation = 1;
+    let mut allocator = ASID_ALLOCATOR.lock();
+    let generation = allocator.generation;
+    let current = ctx.context.load(Ordering::Acquire);
+    if context_asid(current) != KERNEL_ASID && context_generation(current) == generation {
+        return current;
     }
-    ASID_GENERATION.store(next_generation, Ordering::Release);
-    NEXT_USER_ASID.store(FIRST_USER_ASID + 1, Ordering::Release);
-    (FIRST_USER_ASID, next_generation, true)
+    let context = allocate_context_locked(&mut allocator);
+    ctx.context.store(context, Ordering::Release);
+    context
 }
 
+#[inline]
 fn token_with_asid(token: usize, asid: usize) -> usize {
     (token & !(SATP_ASID_MASK << SATP_ASID_SHIFT)) | ((asid & SATP_ASID_MASK) << SATP_ASID_SHIFT)
 }
 
-pub fn prepare_user_satp(ctx: &Arc<AsidContext>, token: usize) -> (usize, bool, bool) {
-    let single_hart = single_hart_online();
-    let need_icache_flush = ctx.take_local_icache_stale(single_hart);
-    let max_asid = hw_asid_mask();
-    // Publish mm activity before the trampoline can install user SATP. On SMP
-    // the no-ASID path below always performs a local sfence.vma, so a racing PTE
-    // update either observes this bit and shoots us down, or precedes that
-    // final local flush. This is the same ordering role as Linux's active-mm
-    // CPU mask around context switch and TLB gather.
-    switch_local_active_context(ctx);
-    if !(single_hart && max_asid != 0) {
-        return (token_with_asid(token, KERNEL_ASID), true, need_icache_flush);
+/// Prepare the final SATP value and mark this hart active in the mm.
+pub fn prepare_user_satp(ctx: &AsidContext, token: usize) -> (usize, bool, bool) {
+    let hart_id = super::super::hart_id();
+    assert!(hart_id < MAX_HARTS, "hart {} exceeds MAX_HARTS", hart_id);
+    let hart_bit = 1usize << hart_id;
+    let mut need_flush = false;
+    let need_icache_flush = ctx.take_local_icache_stale();
+
+    loop {
+        let sequence = ctx.invalidation_sequence.load(Ordering::Acquire);
+        if sequence & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+
+        let context = if ASID_ENABLED.load(Ordering::Acquire) {
+            let context = current_or_allocate_context(ctx);
+            if PENDING_LOCAL_FLUSH.fetch_and(!hart_bit, Ordering::AcqRel) & hart_bit != 0 {
+                need_flush = true;
+            }
+            context
+        } else {
+            need_flush = true;
+            0
+        };
+
+        ctx.hart_contexts[hart_id].store(context, Ordering::Release);
+        ctx.resident_harts.fetch_or(hart_bit, Ordering::AcqRel);
+        ctx.active_harts.fetch_or(hart_bit, Ordering::AcqRel);
+        if ctx.invalidation_sequence.load(Ordering::Acquire) == sequence {
+            return (
+                token_with_asid(token, context_asid(context)),
+                need_flush,
+                need_icache_flush,
+            );
+        }
+
+        ctx.active_harts.fetch_and(!hart_bit, Ordering::AcqRel);
+    }
+}
+
+/// The trampoline has trapped out of userspace. The user SATP may remain
+/// installed while the kernel runs, so the hart stays in `resident_harts` and
+/// is still included in page-table shootdowns.
+pub fn leave_user_satp(ctx: &AsidContext) {
+    let bit = local_hart_bit();
+    if bit != 0 {
+        ctx.active_harts.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+#[inline(always)]
+fn page_table_write_barrier() {
+    fence(Ordering::SeqCst);
+    // SAFETY: order PTE stores before the local fence and SBI RFENCE request.
+    unsafe {
+        asm!("fence rw, rw", options(nostack));
+    }
+}
+
+fn uniform_target_asid(ctx: &AsidContext, hart_mask: usize) -> Option<usize> {
+    let mut selected = None;
+    for hart_id in 0..MAX_HARTS {
+        if hart_mask & (1usize << hart_id) == 0 {
+            continue;
+        }
+        let asid = context_asid(ctx.hart_contexts[hart_id].load(Ordering::Acquire));
+        if asid == KERNEL_ASID {
+            return None;
+        }
+        if let Some(existing) = selected {
+            if existing != asid {
+                return None;
+            }
+        } else {
+            selected = Some(asid);
+        }
+    }
+    selected
+}
+
+fn local_flush_range(asid: Option<usize>, start: usize, end: usize) {
+    let mut address = start & !(PAGE_SIZE - 1);
+    let aligned_end = end.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    crate::perf::record_tlb_exact_pairs(aligned_end.saturating_sub(address) / PAGE_SIZE);
+    while address < aligned_end {
+        // SAFETY: invalidate exactly one page, optionally scoped to the mm ASID.
+        unsafe {
+            if let Some(asid) = asid {
+                asm!(
+                    "sfence.vma {address}, {asid}",
+                    address = in(reg) address,
+                    asid = in(reg) asid,
+                    options(nostack)
+                );
+            } else {
+                asm!("sfence.vma {address}, zero", address = in(reg) address, options(nostack));
+            }
+        }
+        address = address.saturating_add(PAGE_SIZE);
+    }
+}
+
+fn shootdown_range(ctx: &AsidContext, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    let targets = ctx.resident_harts.load(Ordering::Acquire)
+        & crate::task::manager::online_hart_mask()
+        & configured_hart_mask();
+    if targets == 0 {
+        return;
+    }
+    page_table_write_barrier();
+    let local_bit = local_hart_bit();
+    if targets & local_bit != 0 {
+        let local_asid = uniform_target_asid(ctx, local_bit);
+        local_flush_range(local_asid, start, end);
     }
 
-    let generation = ASID_GENERATION.load(Ordering::Acquire);
-    if ctx.valid_for(generation) {
-        return (
-            token_with_asid(token, ctx.asid.load(Ordering::Acquire)),
-            false,
-            need_icache_flush,
-        );
+    let remote = targets & !local_bit;
+    if remote == 0 {
+        return;
+    }
+    let size = end.saturating_sub(start);
+    let wait_start = if crate::perf::enabled() {
+        super::super::read_time()
+    } else {
+        0
+    };
+    let ret = if let Some(asid) = uniform_target_asid(ctx, remote) {
+        crate::sbi::remote_sfence_vma_asid(remote, start, size, asid)
+    } else {
+        crate::sbi::remote_sfence_vma(remote, start, size)
+    };
+    assert_eq!(ret.error, 0, "remote RISC-V TLB range fence failed");
+    let wait_cycles = if crate::perf::enabled() {
+        super::super::read_time().wrapping_sub(wait_start)
+    } else {
+        0
+    };
+    crate::perf::record_tlb_shootdown(remote.count_ones() as usize, wait_cycles);
+}
+
+fn shootdown_and_retire_context(ctx: &AsidContext) {
+    let targets = ctx.resident_harts.load(Ordering::Acquire)
+        & crate::task::manager::online_hart_mask()
+        & configured_hart_mask();
+    // Retire the context used by future trap returns, but retain the per-hart
+    // residency footprint and the ASID each hart actually loaded. A remote
+    // hart may continue executing this mm after the synchronous RFENCE and
+    // refill from the now-current PTEs; retaining it in the footprint ensures
+    // a following page-table edit still targets it before its next trap.
+    ctx.context.store(0, Ordering::Release);
+    let target_asid = uniform_target_asid(ctx, targets);
+    if targets == 0 {
+        return;
     }
 
-    let (asid, generation, need_flush) = allocate_user_asid(max_asid);
-    ctx.store(asid, generation);
-    (token_with_asid(token, asid), need_flush, need_icache_flush)
+    page_table_write_barrier();
+    let local_bit = local_hart_bit();
+    if targets & local_bit != 0 {
+        // SAFETY: a full-ASID fence retires the old address-space context;
+        // ASID 0 fallback must invalidate every non-global translation.
+        unsafe {
+            if let Some(asid) = target_asid {
+                asm!("sfence.vma zero, {asid}", asid = in(reg) asid, options(nostack));
+            } else {
+                asm!("sfence.vma", options(nostack));
+            }
+        }
+    }
+
+    let remote = targets & !local_bit;
+    if remote == 0 {
+        return;
+    }
+    let wait_start = if crate::perf::enabled() {
+        super::super::read_time()
+    } else {
+        0
+    };
+    let ret = if let Some(asid) = target_asid {
+        crate::sbi::remote_sfence_vma_asid(remote, 0, usize::MAX, asid)
+    } else {
+        crate::sbi::remote_sfence_vma(remote, 0, usize::MAX)
+    };
+    assert_eq!(ret.error, 0, "remote RISC-V ASID fence failed");
+    let wait_cycles = if crate::perf::enabled() {
+        super::super::read_time().wrapping_sub(wait_start)
+    } else {
+        0
+    };
+    crate::perf::record_tlb_shootdown(remote.count_ones() as usize, wait_cycles);
+}
+
+/// One mm-local transaction. All edits are reduced to one page-aligned
+/// envelope while it remains at most 64 pages; larger/overflowing batches
+/// retire the mm ASID instead.
+pub struct UserTlbInvalidationBatch {
+    ctx: Arc<AsidContext>,
+    odd_sequence: usize,
+    start: usize,
+    end: usize,
+    edit_count: usize,
+    full_mm: bool,
+    committed: bool,
+}
+
+impl UserTlbInvalidationBatch {
+    fn new(ctx: &Arc<AsidContext>) -> Self {
+        Self {
+            ctx: Arc::clone(ctx),
+            odd_sequence: ctx.begin_invalidation(),
+            start: usize::MAX,
+            end: 0,
+            edit_count: 0,
+            full_mm: false,
+            committed: false,
+        }
+    }
+
+    pub fn record_page(&mut self, vaddr: usize) {
+        let start = vaddr & !(PAGE_SIZE - 1);
+        self.record_range(start, start.saturating_add(PAGE_SIZE));
+    }
+
+    pub fn record_range(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        self.edit_count = self.edit_count.saturating_add(1);
+        if self.full_mm {
+            return;
+        }
+        let aligned_start = start & !(PAGE_SIZE - 1);
+        let Some(aligned_end) = end
+            .checked_add(PAGE_SIZE - 1)
+            .map(|value| value & !(PAGE_SIZE - 1))
+        else {
+            self.full_mm = true;
+            return;
+        };
+        self.start = self.start.min(aligned_start);
+        self.end = self.end.max(aligned_end);
+        let pages = self.end.saturating_sub(self.start) / PAGE_SIZE;
+        if pages > TLB_SMALL_RANGE_PAGES {
+            self.full_mm = true;
+        }
+    }
+
+    pub fn force_full_mm(&mut self) {
+        self.full_mm = true;
+    }
+
+    fn commit_inner(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.full_mm {
+            crate::perf::record_tlb_asid_drop(self.edit_count);
+            shootdown_and_retire_context(&self.ctx);
+        } else if self.start < self.end {
+            let pages = (self.end - self.start) / PAGE_SIZE;
+            crate::perf::record_tlb_exact_batch(self.edit_count, 1, pages);
+            shootdown_range(&self.ctx, self.start, self.end);
+        }
+        self.ctx.finish_invalidation(self.odd_sequence);
+        self.committed = true;
+    }
+
+    pub fn commit(mut self) {
+        self.commit_inner();
+    }
+}
+
+impl Drop for UserTlbInvalidationBatch {
+    fn drop(&mut self) {
+        self.commit_inner();
+    }
+}
+
+pub fn begin_user_tlb_batch(ctx: &Arc<AsidContext>) -> UserTlbInvalidationBatch {
+    UserTlbInvalidationBatch::new(ctx)
 }
 
 pub fn drop_user_asid(ctx: &AsidContext) {
-    ctx.invalidate();
+    let odd = ctx.begin_invalidation();
+    crate::perf::record_tlb_asid_drop(0);
+    shootdown_and_retire_context(ctx);
+    ctx.finish_invalidation(odd);
+}
+
+pub fn flush_user_page(ctx: &Arc<AsidContext>, vaddr: usize) {
+    let mut batch = begin_user_tlb_batch(ctx);
+    batch.record_page(vaddr);
+    batch.commit();
+}
+
+pub fn flush_user_range(ctx: &Arc<AsidContext>, start: usize, end: usize) {
+    let mut batch = begin_user_tlb_batch(ctx);
+    batch.record_range(start, end);
+    batch.commit();
 }
 
 pub fn mark_icache_stale(ctx: &AsidContext) {
     ctx.mark_icache_stale();
-}
-
-/// Drop this hart's active-mm reference after the kernel SATP is installed.
-///
-/// Do not call this at trap entry: `alltraps` intentionally continues on the
-/// user page table and kernel uaccess may still consume its translations.
-pub fn leave_user_mm() {
-    let hart = crate::arch::hart_id() % MAX_HARTS;
-    if let Some(active) = ACTIVE_USER_CONTEXTS[hart].lock().take() {
-        active.mark_local_inactive();
-    }
-}
-
-pub fn active_user_hart_mask(ctx: &AsidContext) -> usize {
-    ctx.active_harts_after_pte_update()
-}
-
-pub fn flush_user_page(ctx: &AsidContext, vaddr: usize) {
-    let generation = ASID_GENERATION.load(Ordering::Acquire);
-    if asid_fast_path_enabled() && ctx.valid_for(generation) {
-        let asid = ctx.asid.load(Ordering::Acquire);
-        // SAFETY: the address and ASID are kernel-managed; this invalidates one
-        // non-global user translation while preserving unrelated ASIDs.
-        unsafe {
-            asm!(
-                "sfence.vma {addr}, {asid}",
-                addr = in(reg) vaddr,
-                asid = in(reg) asid,
-                options(nostack)
-            );
-        }
-    } else {
-        // SAFETY: when no valid ASID is assigned, flush the address for all ASIDs.
-        unsafe {
-            asm!("sfence.vma {addr}, zero", addr = in(reg) vaddr, options(nostack));
-        }
-    }
 }

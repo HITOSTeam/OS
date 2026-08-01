@@ -321,6 +321,12 @@ impl PageTable {
         *pte = PageTableEntry::empty();
         true
     }
+
+    /// RISC-V page-table edits are naturally deferred: the owning mm batches
+    /// the required local/remote `sfence.vma` after publishing all PTE stores.
+    pub fn unmap_if_mapped_deferred(&mut self, vpn: VirtPageNum) -> bool {
+        self.unmap_if_mapped(vpn)
+    }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
     }
@@ -364,15 +370,27 @@ impl PageTable {
     ///
     /// Returns `false` if the vpn is not mapped.
     pub fn set_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
+        self.set_flags_deferred_changed(vpn, flags).is_some()
+    }
+
+    pub fn set_flags_deferred_changed(
+        &mut self,
+        vpn: VirtPageNum,
+        flags: PTEFlags,
+    ) -> Option<bool> {
         let Some(pte) = self.find_pte(vpn) else {
-            return false;
+            return None;
         };
         if !pte.is_valid() {
-            return false;
+            return None;
         }
         let ppn = pte.ppn();
-        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
-        true
+        let new_pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        if pte.bits == new_pte.bits {
+            return Some(false);
+        }
+        *pte = new_pte;
+        Some(true)
     }
 
     /// Batched flag update for sorted/nearby VPN streams.
@@ -386,12 +404,21 @@ impl PageTable {
         flags: PTEFlags,
         cache: &mut PageWalkCache,
     ) -> bool {
+        self.set_flags_cached_changed(vpn, flags, cache).is_some()
+    }
+
+    pub fn set_flags_cached_changed(
+        &mut self,
+        vpn: VirtPageNum,
+        flags: PTEFlags,
+        cache: &mut PageWalkCache,
+    ) -> Option<bool> {
         let idxs = vpn.indexes();
         if !cache.l0_valid || cache.l0_idx != idxs[0] {
             let pte_l0 = &mut self.root_ppn.get_pte_array()[idxs[0]];
             if !pte_l0.is_valid() {
                 cache.reset();
-                return false;
+                return None;
             }
             cache.l0_idx = idxs[0];
             cache.l0_ppn = pte_l0.ppn();
@@ -402,7 +429,7 @@ impl PageTable {
             let pte_l1 = &mut cache.l0_ppn.get_pte_array()[idxs[1]];
             if !pte_l1.is_valid() {
                 cache.l1_valid = false;
-                return false;
+                return None;
             }
             cache.l1_idx = idxs[1];
             cache.l1_ppn = pte_l1.ppn();
@@ -410,25 +437,42 @@ impl PageTable {
         }
         let pte_leaf = &mut cache.l1_ppn.get_pte_array()[idxs[2]];
         if !pte_leaf.is_valid() {
-            return false;
+            return None;
         }
         let ppn = pte_leaf.ppn();
-        *pte_leaf = PageTableEntry::new(ppn, flags | PTEFlags::V);
-        true
+        let new_pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        if pte_leaf.bits == new_pte.bits {
+            return Some(false);
+        }
+        *pte_leaf = new_pte;
+        Some(true)
     }
 
     /// Update an existing leaf PTE's mapped PPN and flags.
     ///
     /// Returns `false` if the vpn is not mapped.
     pub fn remap(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        self.remap_deferred_changed(vpn, ppn, flags).is_some()
+    }
+
+    pub fn remap_deferred_changed(
+        &mut self,
+        vpn: VirtPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+    ) -> Option<bool> {
         let Some(pte) = self.find_pte(vpn) else {
-            return false;
+            return None;
         };
         if !pte.is_valid() {
-            return false;
+            return None;
         }
-        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
-        true
+        let new_pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        if pte.bits == new_pte.bits {
+            return Some(false);
+        }
+        *pte = new_pte;
+        Some(true)
     }
     /// Translate `VirtAddr` to `PhysAddr`
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {

@@ -179,14 +179,8 @@ impl Drop for KernelStack {
         KERNEL_SPACE
             .lock()
             .remove_area(kernel_stack_bottom_va.into(), kernel_stack_top_va.into());
-        #[cfg(target_arch = "riscv64")]
-        {
-            // RISC-V user page tables share the kernel-stack root entries with
-            // KERNEL_SPACE. After removing a stack PTE from that shared subtree,
-            // every hart must drop any stale stack translation before the frame
-            // can be reused for a future stack.
-            crate::mm::flush_kernel_shared_tlb();
-        }
+        // MemorySet::remove_area completes the architecture-specific shared
+        // kernel shootdown before releasing the stack frames.
         KSTACK_ALLOCATOR.lock().dealloc(self.0);
         KSTACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         maybe_log_kstack_inflight("drop");

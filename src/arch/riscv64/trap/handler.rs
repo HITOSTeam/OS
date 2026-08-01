@@ -240,6 +240,12 @@ pub fn get_current_token() -> usize {
 
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
+    // Withdraw the active-user bit before taking any process/mm locks. The
+    // user SATP remains installed in this kernel design, so the hart stays in
+    // the mm's resident mask and still receives synchronous TLB shootdowns.
+    if let Some(task) = crate::task::processor::current_task() {
+        task.leave_user_satp();
+    }
     if DEBUG_TRAP {
         let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
         if idx < 6 {

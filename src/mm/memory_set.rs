@@ -15,7 +15,7 @@ use super::{StepByOne, VPNRange};
 #[cfg(target_arch = "loongarch64")]
 use crate::arch::loongarch64::mm::AsidContext;
 #[cfg(target_arch = "riscv64")]
-use crate::arch::riscv64::mm::AsidContext;
+use crate::arch::riscv64::mm::{AsidContext, UserTlbInvalidationBatch};
 #[cfg(target_arch = "riscv64")]
 use crate::config::{KERNEL_STACK_TOP, phys_mem_start};
 use crate::config::{
@@ -72,6 +72,102 @@ static COW_CLONE_DIAG_SEQ: AtomicUsize = AtomicUsize::new(0);
 static MMAP_ASLR_SEQ: AtomicUsize = AtomicUsize::new(0);
 const DEFAULT_MMAP_BASE: usize = 0x34_0000_0000;
 const MMAP_ASLR_RANGE: usize = 256 * 1024 * 1024;
+
+#[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+pub(super) struct PageTableUpdateBatch {
+    #[cfg(target_arch = "riscv64")]
+    tlb: Option<UserTlbInvalidationBatch>,
+    #[cfg(target_arch = "loongarch64")]
+    asid: Arc<AsidContext>,
+    #[cfg(target_arch = "loongarch64")]
+    user_changed: bool,
+    deferred_frames: Vec<FrameTracker>,
+    kernel_full: bool,
+}
+
+#[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+impl PageTableUpdateBatch {
+    fn new(asid: &Arc<AsidContext>) -> Self {
+        Self {
+            #[cfg(target_arch = "riscv64")]
+            tlb: Some(crate::arch::riscv64::mm::begin_user_tlb_batch(asid)),
+            #[cfg(target_arch = "loongarch64")]
+            asid: Arc::clone(asid),
+            #[cfg(target_arch = "loongarch64")]
+            user_changed: false,
+            deferred_frames: Vec::new(),
+            kernel_full: false,
+        }
+    }
+
+    pub(super) fn record_page(&mut self, vaddr: usize) {
+        #[cfg(target_arch = "riscv64")]
+        if let Some(tlb) = self.tlb.as_mut() {
+            tlb.record_page(vaddr);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let _ = vaddr;
+            self.user_changed = true;
+        }
+    }
+
+    pub(super) fn record_range(&mut self, start: usize, end: usize) {
+        #[cfg(target_arch = "riscv64")]
+        if let Some(tlb) = self.tlb.as_mut() {
+            tlb.record_range(start, end);
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let _ = (start, end);
+            self.user_changed = true;
+        }
+    }
+
+    pub(super) fn force_kernel_full(&mut self) {
+        self.kernel_full = true;
+    }
+
+    pub(super) fn defer_frame(&mut self, frame: FrameTracker) {
+        self.deferred_frames.push(frame);
+    }
+
+    fn finish(&mut self) {
+        if self.kernel_full {
+            #[cfg(target_arch = "loongarch64")]
+            crate::arch::loongarch64::mm::flush_tlb_all();
+            #[cfg(target_arch = "riscv64")]
+            crate::mm::flush_kernel_shared_tlb();
+            self.kernel_full = false;
+        }
+        #[cfg(target_arch = "riscv64")]
+        if let Some(tlb) = self.tlb.take() {
+            tlb.commit();
+        }
+        #[cfg(target_arch = "loongarch64")]
+        if core::mem::take(&mut self.user_changed) {
+            // The current LoongArch mainline starts one hart. Retiring the mm
+            // ASID before releasing deferred frames makes the old translations
+            // unreachable on the next user return without importing the
+            // separate LoongArch SMP series.
+            crate::arch::loongarch64::mm::drop_user_asid(self.asid.as_ref());
+        }
+        // Physical frames become reusable only after every target hart has
+        // acknowledged the invalidation above.
+        self.deferred_frames.clear();
+    }
+
+    pub(super) fn commit(mut self) {
+        self.finish();
+    }
+}
+
+#[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+impl Drop for PageTableUpdateBatch {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
 
 lazy_static! {
     /// a memory set instance through lazy_static! managing kernel space
@@ -308,6 +404,11 @@ impl MemorySet {
         self.page_table.token()
     }
 
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    fn begin_page_table_update(&self) -> PageTableUpdateBatch {
+        PageTableUpdateBatch::new(&self.asid)
+    }
+
     #[cfg(target_arch = "loongarch64")]
     pub fn drop_user_asid(&self) {
         crate::arch::loongarch64::mm::drop_user_asid(self.asid.as_ref());
@@ -317,6 +418,26 @@ impl MemorySet {
     pub fn drop_user_asid(&self) {
         crate::arch::riscv64::mm::drop_user_asid(self.asid.as_ref());
         crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn flush_user_page(&self, va: usize) {
+        crate::arch::loongarch64::mm::flush_user_page(&self.asid, va);
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn flush_user_range(&self, start: usize, end: usize) {
+        crate::arch::loongarch64::mm::flush_user_range(&self.asid, start, end);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn flush_user_page(&self, va: usize) {
+        crate::arch::riscv64::mm::flush_user_page(&self.asid, va);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn flush_user_range(&self, start: usize, end: usize) {
+        crate::arch::riscv64::mm::flush_user_range(&self.asid, start, end);
     }
 
     fn inherit_user_vm_metadata_from(&mut self, parent: &MemorySet) {
@@ -1232,6 +1353,8 @@ impl MemorySet {
     fn restore_user_range(&mut self, snapshot: UserRangeSnapshot) {
         self.unmap_user_vma_range(snapshot.start.into(), snapshot.end.into());
 
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut batch = self.begin_page_table_update();
         self.areas.extend(snapshot.areas);
         self.sort_user_areas();
         for (vpn, ppn, flags) in snapshot.ptes {
@@ -1255,6 +1378,11 @@ impl MemorySet {
             .unwrap_or(0)
             .saturating_add(1);
         self.next_mmap_backing_id = snapshot.next_mmap_backing_id.max(next_live_backing_id);
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            batch.record_range(snapshot.start, snapshot.end);
+            batch.commit();
+        }
         self.debug_assert_user_vm_invariants();
     }
 
@@ -1427,29 +1555,51 @@ impl MemorySet {
         self.vm_regions
             .apply_mprotect_range(start, end, new_prot)
             .map_err(|_| MprotectError::AccessDenied)?;
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut tlb_batch = self.begin_page_table_update();
         for region in self.vm_regions.snapshot_range(start, end) {
             let valid_start = region.start;
             let valid_end = core::cmp::min(region.end(), region.sigbus_start());
-            if valid_start < valid_end
-                && !self.mprotect_user_range(
+            if valid_start < valid_end {
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                let updated = self.mprotect_user_range_inner(
                     valid_start.into(),
                     valid_end.into(),
                     region.map_permission(),
-                )
-            {
-                return Err(MprotectError::Unmapped);
+                    &mut tlb_batch,
+                );
+                #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+                let updated = self.mprotect_user_range(
+                    valid_start.into(),
+                    valid_end.into(),
+                    region.map_permission(),
+                );
+                if !updated {
+                    return Err(MprotectError::Unmapped);
+                }
             }
             let tail_start = valid_end;
-            if tail_start < region.end()
-                && !self.mprotect_user_range(
+            if tail_start < region.end() {
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                let updated = self.mprotect_user_range_inner(
                     tail_start.into(),
                     region.end().into(),
                     MapPermission::U,
-                )
-            {
-                return Err(MprotectError::Unmapped);
+                    &mut tlb_batch,
+                );
+                #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+                let updated = self.mprotect_user_range(
+                    tail_start.into(),
+                    region.end().into(),
+                    MapPermission::U,
+                );
+                if !updated {
+                    return Err(MprotectError::Unmapped);
+                }
             }
         }
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        tlb_batch.commit();
         let backing_ids = self.backing_ids_for_vma_range(start, end);
         self.refresh_mmap_backing_states(backing_ids);
         self.debug_assert_user_vm_invariants();
@@ -1474,7 +1624,19 @@ impl MemorySet {
         let Some(old_end) = old_addr.checked_add(old_len) else {
             return false;
         };
-        if !self.move_user_range_raw(old_addr.into(), old_end.into(), new_start.into()) {
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut batch = self.begin_page_table_update();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let moved = self.move_user_range_raw_inner(
+            old_addr.into(),
+            old_end.into(),
+            new_start.into(),
+            &mut batch,
+        );
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+        let moved =
+            self.move_user_range_raw_inner(old_addr.into(), old_end.into(), new_start.into());
+        if !moved {
             return false;
         }
         let mut backing_ids = self.backing_ids_for_vma_range(old_addr, old_end);
@@ -1486,6 +1648,8 @@ impl MemorySet {
             }
         }
         self.refresh_mmap_backing_states(backing_ids);
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        batch.commit();
         self.debug_assert_user_vm_invariants();
         true
     }
@@ -1504,12 +1668,46 @@ impl MemorySet {
         };
         let rollback =
             UserRangeRollback::capture(self, &[(old_addr, old_end), (new_start, new_end)]);
-        self.unmap_user_vma_range(new_start.into(), new_end.into());
-        if self.move_user_vma_range(old_addr, old_len, new_start) {
-            return true;
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            let mut batch = self.begin_page_table_update();
+            self.unmap_user_range_inner(new_start.into(), new_end.into(), &mut batch);
+            self.trim_vm_regions(new_start, new_end);
+            self.trim_locked_ranges(new_start, new_end);
+
+            let moved = self.move_user_range_raw_inner(
+                old_addr.into(),
+                old_end.into(),
+                new_start.into(),
+                &mut batch,
+            );
+            if moved {
+                let mut backing_ids = self.backing_ids_for_vma_range(old_addr, old_end);
+                self.move_vm_region_metadata_raw(old_addr, old_len, new_start);
+                self.move_locked_ranges(old_addr, old_len, new_start);
+                for backing_id in self.backing_ids_for_vma_range(new_start, new_end) {
+                    Self::push_unique_backing_id(&mut backing_ids, backing_id);
+                }
+                self.refresh_mmap_backing_states(backing_ids);
+                batch.commit();
+                self.debug_assert_user_vm_invariants();
+                return true;
+            }
+            // End the failed transaction before restore invokes its own
+            // unmap/map invalidation operations.
+            batch.commit();
+            rollback.restore(self);
+            return false;
         }
-        rollback.restore(self);
-        false
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+        {
+            self.unmap_user_vma_range(new_start.into(), new_end.into());
+            if self.move_user_vma_range(old_addr, old_len, new_start) {
+                return true;
+            }
+            rollback.restore(self);
+            false
+        }
     }
 
     pub fn try_grow_user_vma_range<F>(
@@ -1959,7 +2157,13 @@ impl MemorySet {
         if self.concrete_range_overlaps(start_va, end_va) {
             return false;
         }
-        if !map_area.map(&mut self.page_table) {
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut batch = self.begin_page_table_update();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mapped = map_area.map_batched(&mut self.page_table, &mut batch);
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+        let mapped = map_area.map(&mut self.page_table);
+        if !mapped {
             return false;
         }
         if let Some(data) = data {
@@ -1968,15 +2172,13 @@ impl MemorySet {
         self.areas.push(map_area);
         self.sort_user_areas();
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        self.drop_user_asid();
+        batch.commit();
         true
     }
 
     fn push_mapped_raw(&mut self, map_area: MapArea) {
         self.areas.push(map_area);
         self.sort_user_areas();
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        self.drop_user_asid();
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -2885,6 +3087,8 @@ impl MemorySet {
         assert!(memory_set.map_user_trampoline_pages());
 
         let mut parent_update_count = 0usize;
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut parent_tlb_batch: Option<PageTableUpdateBatch> = None;
         let mut src_walk_cache = PageWalkCache::new();
         let mut dst_walk_cache = PageWalkCache::new();
         let mut area_count = 0usize;
@@ -2967,6 +3171,20 @@ impl MemorySet {
                             src_flags.insert(PTEFlags::COW);
                             // Apply parent PTE demotion immediately to minimize the window where
                             // another thread could write through a still-writable PTE on another hart.
+                            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                            if parent_tlb_batch.is_none() {
+                                parent_tlb_batch = Some(user_space.begin_page_table_update());
+                            }
+                            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                            let changed = matches!(
+                                user_space.page_table.set_flags_cached_changed(
+                                    vpn,
+                                    src_flags,
+                                    &mut src_walk_cache,
+                                ),
+                                Some(true)
+                            );
+                            #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
                             let changed = user_space.page_table.set_flags_cached(
                                 vpn,
                                 src_flags,
@@ -2974,6 +3192,8 @@ impl MemorySet {
                             );
                             if changed {
                                 parent_update_count = parent_update_count.saturating_add(1);
+                                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                                parent_tlb_batch.as_mut().unwrap().record_page(vpn.0 << 12);
                             }
                         }
                         memory_set.page_table.map_cached(
@@ -2999,29 +3219,14 @@ impl MemorySet {
             // After fork demotes parent PTEs from writable to read-only+COW,
             // the parent must not resume with stale writable translations.
             //
-            // RISC-V updates the parent's active page table in-place, so the
-            // current hart must flush stale writable translations immediately.
-            // Other harts that may already be executing the same mm need a
-            // remote shootdown as well.
-            #[cfg(target_arch = "riscv64")]
-            {
-                let remote_hart_mask =
-                    crate::task::manager::online_hart_mask() & !(1usize << crate::arch::hart_id());
-                unsafe {
-                    asm!("sfence.vma");
-                }
-                if remote_hart_mask != 0 {
-                    crate::sbi::remote_sfence_vma_all(remote_hart_mask);
-                }
-            }
-            // SAFETY: LoongArch64 currently runs single-core only (no SMP boot),
-            // so dropping this address space's ASID is sufficient. When SMP is
-            // added, a remote TLB shootdown (IPI + invtlb on each hart) will be
-            // needed for a task that is concurrently running on another hart.
-            #[cfg(target_arch = "loongarch64")]
-            {
-                user_space.drop_user_asid();
-            }
+            // The parent batch below coalesces every demotion and completes a
+            // synchronous architecture-specific shootdown before fork returns.
+        }
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        if let Some(batch) = parent_tlb_batch {
+            // All COW demotions are coalesced into one precise range request,
+            // or one ASID drop when the hardware-derived cutoff is exceeded.
+            batch.commit();
         }
         if diag_enabled {
             let end_cycles = crate::arch::read_time();
@@ -3177,11 +3382,18 @@ impl MemorySet {
         }
 
         let pte_flags = area.pte_flags() | PTEFlags::SHARED;
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut batch = self.begin_page_table_update();
         for (vpn, frame) in area.vpn_range().into_iter().zip(frames.into_iter()) {
             self.page_table.map(vpn, frame.ppn, pte_flags);
             area.insert_tracked_frame(vpn, frame);
         }
         self.push_mapped_raw(area);
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            batch.record_range(start_va.0, end_va.0);
+            batch.commit();
+        }
         true
     }
 
@@ -3215,21 +3427,29 @@ impl MemorySet {
     }
 
     pub fn set_pte_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
-        #[cfg(target_arch = "loongarch64")]
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         {
-            let changed = self.page_table.set_flags_deferred(vpn, flags);
-            if changed {
-                self.drop_user_asid();
+            if !flags.contains(PTEFlags::U) {
+                let Some(changed) = self.page_table.set_flags_deferred_changed(vpn, flags) else {
+                    return false;
+                };
+                if changed {
+                    #[cfg(target_arch = "loongarch64")]
+                    crate::arch::loongarch64::mm::flush_tlb_all();
+                    #[cfg(target_arch = "riscv64")]
+                    crate::mm::flush_kernel_shared_tlb();
+                }
+                return true;
             }
-            changed
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            let changed = self.page_table.set_flags(vpn, flags);
+            let mut batch = self.begin_page_table_update();
+            let Some(changed) = self.page_table.set_flags_deferred_changed(vpn, flags) else {
+                return false;
+            };
             if changed {
-                self.drop_user_asid();
+                batch.record_page(vpn.0 << 12);
             }
-            changed
+            batch.commit();
+            true
         }
         #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
         {
@@ -3239,6 +3459,23 @@ impl MemorySet {
     }
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            let Some(idx) = self
+                .areas
+                .iter()
+                .position(|area| area.start_vpn() == start.floor())
+            else {
+                return false;
+            };
+            let mut batch = self.begin_page_table_update();
+            self.areas[idx].shrink_to_batched(&mut self.page_table, new_end.ceil(), &mut batch);
+            self.sort_user_areas();
+            batch.commit();
+            self.debug_assert_user_vm_invariants();
+            return true;
+        }
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
         if let Some(area) = self
             .areas
             .iter_mut()
@@ -3246,8 +3483,6 @@ impl MemorySet {
         {
             area.shrink_to(&mut self.page_table, new_end.ceil());
             self.sort_user_areas();
-            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            self.drop_user_asid();
             self.debug_assert_user_vm_invariants();
             true
         } else {
@@ -3256,6 +3491,30 @@ impl MemorySet {
     }
     #[allow(unused)]
     pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            let Some(idx) = self
+                .areas
+                .iter()
+                .position(|area| area.start_vpn() == start.floor())
+            else {
+                return false;
+            };
+            let old_end = self.areas[idx].end_vpn();
+            let mut batch = self.begin_page_table_update();
+            let appended = self.areas[idx].append_to(&mut self.page_table, new_end.ceil());
+            if appended {
+                let new_end = new_end.ceil();
+                if old_end < new_end {
+                    batch.record_range(old_end.0 << 12, new_end.0 << 12);
+                }
+                self.sort_user_areas();
+                self.debug_assert_user_vm_invariants();
+            }
+            batch.commit();
+            return appended;
+        }
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
         if let Some(area) = self
             .areas
             .iter_mut()
@@ -3264,8 +3523,6 @@ impl MemorySet {
             let appended = area.append_to(&mut self.page_table, new_end.ceil());
             if appended {
                 self.sort_user_areas();
-                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-                self.drop_user_asid();
                 self.debug_assert_user_vm_invariants();
             }
             appended
@@ -3275,25 +3532,45 @@ impl MemorySet {
     }
 
     pub fn remove_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
-        if let Some((idx, area)) = self
+        let Some(idx) = self
             .areas
-            .iter_mut()
-            .enumerate()
-            .find(|(_idx, area)| area.has_exact_vpn_range(start_va.floor(), end_va.ceil()))
-        {
-            area.unmap(&mut self.page_table);
-            self.areas.remove(idx);
-            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            self.drop_user_asid();
-            self.debug_assert_user_vm_invariants();
+            .iter()
+            .position(|area| area.has_exact_vpn_range(start_va.floor(), end_va.ceil()))
+        else {
+            return;
         };
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            if !self.areas[idx].contains_perm(MapPermission::U) {
+                let mut batch = self.begin_page_table_update();
+                self.areas[idx].unmap_batched(&mut self.page_table, &mut batch);
+                batch.force_kernel_full();
+                self.areas.remove(idx);
+                batch.commit();
+                self.debug_assert_user_vm_invariants();
+                return;
+            }
+            let mut batch = self.begin_page_table_update();
+            self.areas[idx].unmap_batched(&mut self.page_table, &mut batch);
+            self.areas.remove(idx);
+            batch.commit();
+            self.debug_assert_user_vm_invariants();
+        }
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+        {
+            self.areas[idx].unmap(&mut self.page_table);
+            self.areas.remove(idx);
+            self.debug_assert_user_vm_invariants();
+        }
     }
 
-    fn move_user_range_raw(
+    fn move_user_range_raw_inner(
         &mut self,
         old_start_va: VirtAddr,
         old_end_va: VirtAddr,
         new_start_va: VirtAddr,
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        batch: &mut PageTableUpdateBatch,
     ) -> bool {
         let old_start_vpn = old_start_va.floor();
         let old_end_vpn = old_end_va.ceil();
@@ -3338,9 +3615,11 @@ impl MemorySet {
                             return false;
                         };
                         moved_ptes.push((new_vpn, pte.ppn(), pte.flags()));
-                        #[cfg(target_arch = "loongarch64")]
-                        self.page_table.unmap_if_mapped_deferred(vpn);
-                        #[cfg(not(target_arch = "loongarch64"))]
+                        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                        if self.page_table.unmap_if_mapped_deferred(vpn) {
+                            batch.record_page(vpn.0 << 12);
+                        }
+                        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
                         self.page_table.unmap_if_mapped(vpn);
                     }
                 }
@@ -3371,11 +3650,11 @@ impl MemorySet {
         self.areas = new_areas;
         for (vpn, ppn, flags) in moved_ptes {
             self.page_table.map(vpn, ppn, flags);
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            batch.record_page(vpn.0 << 12);
         }
         self.areas.extend(moved_areas);
         self.sort_user_areas();
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        self.drop_user_asid();
         true
     }
 
@@ -3384,6 +3663,23 @@ impl MemorySet {
     /// This is primarily used to implement Linux `mmap(MAP_FIXED)` semantics, which
     /// replace existing mappings in the target range.
     pub fn unmap_user_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            let mut batch = self.begin_page_table_update();
+            self.unmap_user_range_inner(start_va, end_va, &mut batch);
+            batch.commit();
+        }
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+        self.unmap_user_range_inner(start_va, end_va);
+    }
+
+    fn unmap_user_range_inner(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        batch: &mut PageTableUpdateBatch,
+    ) {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
         if start_vpn >= end_vpn {
@@ -3396,14 +3692,13 @@ impl MemorySet {
             area.contains_perm(MapPermission::U) && area.has_exact_vpn_range(start_vpn, end_vpn)
         }) {
             let mut area = self.areas.remove(idx);
-            area.unmap(&mut self.page_table);
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            self.drop_user_asid();
+            area.unmap_batched(&mut self.page_table, batch);
+            #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+            area.unmap(&mut self.page_table);
             return;
         }
 
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        let mut changed = false;
         let mut new_areas: Vec<MapArea> = Vec::new();
         let mut areas = core::mem::take(&mut self.areas);
         for mut area in areas.drain(..) {
@@ -3422,11 +3717,10 @@ impl MemorySet {
             let ov_start = core::cmp::max(start_vpn, area_start);
             let ov_end = core::cmp::min(end_vpn, area_end);
 
-            area.unmap_range_maybe(&mut self.page_table, ov_start, ov_end);
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            {
-                changed = true;
-            }
+            area.unmap_range_maybe_batched(&mut self.page_table, ov_start, ov_end, batch);
+            #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+            area.unmap_range_maybe(&mut self.page_table, ov_start, ov_end);
 
             let (left, _mid, right) = area.split_around(ov_start, ov_end);
             if let Some(left) = left {
@@ -3438,10 +3732,6 @@ impl MemorySet {
         }
         self.areas = new_areas;
         self.sort_user_areas();
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        if changed {
-            self.drop_user_asid();
-        }
     }
 
     /// Update concrete user mapping permissions in `[start_va, end_va)`.
@@ -3454,6 +3744,27 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         new_perm: MapPermission,
+    ) -> bool {
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            let mut batch = self.begin_page_table_update();
+            let updated = self.mprotect_user_range_inner(start_va, end_va, new_perm, &mut batch);
+            batch.commit();
+            updated
+        }
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+        {
+            self.mprotect_user_range_inner(start_va, end_va, new_perm)
+        }
+    }
+
+    fn mprotect_user_range_inner(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        new_perm: MapPermission,
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        batch: &mut PageTableUpdateBatch,
     ) -> bool {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
@@ -3486,18 +3797,28 @@ impl MemorySet {
                         if new_perm == MapPermission::U {
                             // PROT_NONE: unmap but keep the frame tracker.
                             mid.save_pte_flags(vpn, pte.flags());
-                            #[cfg(target_arch = "loongarch64")]
-                            self.page_table.unmap_deferred(vpn);
-                            #[cfg(not(target_arch = "loongarch64"))]
+                            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                            if self.page_table.unmap_if_mapped_deferred(vpn) {
+                                batch.record_page(vpn.0 << 12);
+                            }
+                            #[cfg(not(any(
+                                target_arch = "loongarch64",
+                                target_arch = "riscv64"
+                            )))]
                             self.page_table.unmap(vpn);
                             continue;
                         }
                         let old_flags = pte.flags();
                         let pte_flags = pte_flags_for_mprotect(new_perm, Some(old_flags));
                         let _ = mid.take_saved_pte_flags(vpn);
-                        #[cfg(target_arch = "loongarch64")]
-                        let _ = self.page_table.set_flags_deferred(vpn, pte_flags);
-                        #[cfg(not(target_arch = "loongarch64"))]
+                        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                        if matches!(
+                            self.page_table.set_flags_deferred_changed(vpn, pte_flags),
+                            Some(true)
+                        ) {
+                            batch.record_page(vpn.0 << 12);
+                        }
+                        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
                         let _ = self.page_table.set_flags(vpn, pte_flags);
                         continue;
                     }
@@ -3507,6 +3828,8 @@ impl MemorySet {
                         let old_flags = mid.take_saved_pte_flags(vpn);
                         let pte_flags = pte_flags_for_mprotect(new_perm, old_flags);
                         self.page_table.map(vpn, ppn, pte_flags);
+                        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                        batch.record_page(vpn.0 << 12);
                     }
                 }
             }
@@ -3524,10 +3847,6 @@ impl MemorySet {
         }
         self.areas = new_areas;
         self.sort_user_areas();
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        if touched_area {
-            self.drop_user_asid();
-        }
         debug_assert!(
             touched_area || start_vpn >= end_vpn,
             "mprotect concrete update had no MapArea coverage for {:?}..{:?}",
@@ -3537,14 +3856,18 @@ impl MemorySet {
         true
     }
 
-    fn discard_lazy_concrete_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+    fn discard_lazy_concrete_range(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        batch: &mut PageTableUpdateBatch,
+    ) {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
         if start_vpn >= end_vpn {
             return;
         }
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        let mut changed = false;
         for area in self.areas.iter_mut() {
             if !area.is_lazy() {
                 continue;
@@ -3559,15 +3882,10 @@ impl MemorySet {
             }
             let ov_start = core::cmp::max(start_vpn, area_start);
             let ov_end = core::cmp::min(end_vpn, area_end);
-            area.unmap_range_maybe(&mut self.page_table, ov_start, ov_end);
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            {
-                changed = true;
-            }
-        }
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        if changed {
-            self.drop_user_asid();
+            area.unmap_range_maybe_batched(&mut self.page_table, ov_start, ov_end, batch);
+            #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+            area.unmap_range_maybe(&mut self.page_table, ov_start, ov_end);
         }
     }
 
@@ -3576,6 +3894,8 @@ impl MemorySet {
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        batch: &mut PageTableUpdateBatch,
     ) {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
@@ -3584,8 +3904,6 @@ impl MemorySet {
         }
 
         let mut new_areas: Vec<MapArea> = Vec::new();
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        let mut changed = false;
         let mut areas = core::mem::take(&mut self.areas);
         for area in areas.drain(..) {
             if !area.contains_perm(MapPermission::U)
@@ -3600,11 +3918,10 @@ impl MemorySet {
             let ov_start = core::cmp::max(start_vpn, area.start_vpn());
             let ov_end = core::cmp::min(end_vpn, area.end_vpn());
             let (left, mut mid, right) = area.split_around(ov_start, ov_end);
-            mid.unmap(&mut self.page_table);
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            {
-                changed = true;
-            }
+            mid.unmap_batched(&mut self.page_table, batch);
+            #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+            mid.unmap(&mut self.page_table);
 
             if let Some(left) = left {
                 new_areas.push(left);
@@ -3621,10 +3938,6 @@ impl MemorySet {
         }
         self.areas = new_areas;
         self.sort_user_areas();
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        if changed {
-            self.drop_user_asid();
-        }
     }
 
     /// Discard pages for `madvise(MADV_DONTNEED)`.
@@ -3641,6 +3954,8 @@ impl MemorySet {
         if start >= end {
             return;
         }
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut batch = self.begin_page_table_update();
         let regions = self.vm_regions.snapshot_range(start, end);
         for region in regions {
             if region.shared {
@@ -3649,10 +3964,32 @@ impl MemorySet {
             let discard_start = core::cmp::max(start, region.start);
             let discard_end = core::cmp::min(end, region.end());
             if region.map_type == MapType::Lazy || region.is_file_like() {
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                self.discard_lazy_concrete_range(
+                    discard_start.into(),
+                    discard_end.into(),
+                    &mut batch,
+                );
+                #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
                 self.discard_lazy_concrete_range(discard_start.into(), discard_end.into());
             }
             if region.can_file_framed_refault() || region.can_zero_fill_framed_refault() {
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                self.discard_lazy_concrete_range(
+                    discard_start.into(),
+                    discard_end.into(),
+                    &mut batch,
+                );
+                #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
                 self.discard_lazy_concrete_range(discard_start.into(), discard_end.into());
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                self.discard_framed_concrete_to_lazy_range(
+                    discard_start.into(),
+                    discard_end.into(),
+                    region.map_permission(),
+                    &mut batch,
+                );
+                #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
                 self.discard_framed_concrete_to_lazy_range(
                     discard_start.into(),
                     discard_end.into(),
@@ -3660,6 +3997,8 @@ impl MemorySet {
                 );
             }
         }
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        batch.commit();
         self.debug_assert_user_vm_invariants();
     }
 
@@ -3715,18 +4054,23 @@ impl MemorySet {
     }
 
     pub fn remove_area_with_start_vpn(&mut self, start_va: VirtAddr) {
-        if let Some((idx, area)) = self
+        let Some(idx) = self
             .areas
-            .iter_mut()
-            .enumerate()
-            .find(|(_idx, area)| area.start_vpn() == start_va.floor())
-        {
-            area.unmap(&mut self.page_table);
-            self.areas.remove(idx);
-            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-            self.drop_user_asid();
-            self.debug_assert_user_vm_invariants();
+            .iter()
+            .position(|area| area.start_vpn() == start_va.floor())
+        else {
+            return;
         };
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        let mut batch = self.begin_page_table_update();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        self.areas[idx].unmap_batched(&mut self.page_table, &mut batch);
+        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+        self.areas[idx].unmap(&mut self.page_table);
+        self.areas.remove(idx);
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        batch.commit();
+        self.debug_assert_user_vm_invariants();
     }
 
     #[allow(dead_code)]

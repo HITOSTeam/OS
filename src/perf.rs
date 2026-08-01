@@ -20,6 +20,16 @@ static BLK_WRITE_OPS: AtomicU64 = AtomicU64::new(0);
 static BLK_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 static BLK_WRITE_CYCLES: AtomicU64 = AtomicU64::new(0);
 
+static TLB_PAGE_BATCHES: AtomicU64 = AtomicU64::new(0);
+static TLB_RANGE_BATCHES: AtomicU64 = AtomicU64::new(0);
+static TLB_ASID_DROPS: AtomicU64 = AtomicU64::new(0);
+static TLB_BATCHED_EDITS: AtomicU64 = AtomicU64::new(0);
+static TLB_MERGED_RANGES: AtomicU64 = AtomicU64::new(0);
+static TLB_EXACT_PAIRS: AtomicU64 = AtomicU64::new(0);
+static TLB_REMOTE_IPIS: AtomicU64 = AtomicU64::new(0);
+static TLB_SHOOTDOWN_WAIT_CYCLES: AtomicU64 = AtomicU64::new(0);
+static TLB_ASID_WRAPS: AtomicU64 = AtomicU64::new(0);
+
 #[inline]
 #[allow(dead_code)]
 pub fn enabled() -> bool {
@@ -87,6 +97,52 @@ pub fn block_write_end(start: usize, bytes: usize) {
     BLK_WRITE_CYCLES.fetch_add(delta, Ordering::Relaxed);
 }
 
+#[inline]
+pub fn record_tlb_exact_batch(edits: usize, ranges: usize, pairs: usize) {
+    if !DEBUG_PERF {
+        return;
+    }
+    if ranges == 1 && pairs == 1 {
+        TLB_PAGE_BATCHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TLB_RANGE_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+    TLB_BATCHED_EDITS.fetch_add(edits as u64, Ordering::Relaxed);
+    TLB_MERGED_RANGES.fetch_add(ranges as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_tlb_asid_drop(edits: usize) {
+    if !DEBUG_PERF {
+        return;
+    }
+    TLB_ASID_DROPS.fetch_add(1, Ordering::Relaxed);
+    TLB_BATCHED_EDITS.fetch_add(edits as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_tlb_exact_pairs(pairs: usize) {
+    if DEBUG_PERF && pairs != 0 {
+        TLB_EXACT_PAIRS.fetch_add(pairs as u64, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_tlb_shootdown(remote_ipis: usize, wait_cycles: usize) {
+    if !DEBUG_PERF {
+        return;
+    }
+    TLB_REMOTE_IPIS.fetch_add(remote_ipis as u64, Ordering::Relaxed);
+    TLB_SHOOTDOWN_WAIT_CYCLES.fetch_add(wait_cycles as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_tlb_asid_wrap() {
+    if DEBUG_PERF {
+        TLB_ASID_WRAPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn dump() -> String {
     if !DEBUG_PERF {
         return String::from("perf disabled (set DEBUG_PERF=true)\n");
@@ -100,6 +156,15 @@ pub fn dump() -> String {
     let blk_write_ops = BLK_WRITE_OPS.load(Ordering::Relaxed);
     let blk_write_bytes = BLK_WRITE_BYTES.load(Ordering::Relaxed);
     let blk_write_cycles = BLK_WRITE_CYCLES.load(Ordering::Relaxed);
+    let tlb_page_batches = TLB_PAGE_BATCHES.load(Ordering::Relaxed);
+    let tlb_range_batches = TLB_RANGE_BATCHES.load(Ordering::Relaxed);
+    let tlb_asid_drops = TLB_ASID_DROPS.load(Ordering::Relaxed);
+    let tlb_batched_edits = TLB_BATCHED_EDITS.load(Ordering::Relaxed);
+    let tlb_merged_ranges = TLB_MERGED_RANGES.load(Ordering::Relaxed);
+    let tlb_exact_pairs = TLB_EXACT_PAIRS.load(Ordering::Relaxed);
+    let tlb_remote_ipis = TLB_REMOTE_IPIS.load(Ordering::Relaxed);
+    let tlb_shootdown_wait_cycles = TLB_SHOOTDOWN_WAIT_CYCLES.load(Ordering::Relaxed);
+    let tlb_asid_wraps = TLB_ASID_WRAPS.load(Ordering::Relaxed);
     let (cache_hits, cache_misses) = ext4_fs::cache_stats();
     let cache_total = cache_hits.saturating_add(cache_misses);
     let cache_hit_pct = if cache_total == 0 {
@@ -118,6 +183,15 @@ block_read_cycles: {blk_read_cycles}\n\
 block_write_ops: {blk_write_ops}\n\
 block_write_bytes: {blk_write_bytes}\n\
 block_write_cycles: {blk_write_cycles}\n\
+tlb_page_batches: {tlb_page_batches}\n\
+tlb_range_batches: {tlb_range_batches}\n\
+tlb_asid_drops: {tlb_asid_drops}\n\
+tlb_batched_edits: {tlb_batched_edits}\n\
+tlb_merged_ranges: {tlb_merged_ranges}\n\
+tlb_exact_pairs: {tlb_exact_pairs}\n\
+tlb_remote_ipis: {tlb_remote_ipis}\n\
+tlb_shootdown_wait_cycles: {tlb_shootdown_wait_cycles}\n\
+tlb_asid_wraps: {tlb_asid_wraps}\n\
 ext4_cache_hits: {cache_hits}\n\
 ext4_cache_misses: {cache_misses}\n\
 ext4_cache_hit_pct: {cache_hit_pct}\n"
