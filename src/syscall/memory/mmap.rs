@@ -64,6 +64,7 @@ fn populate_file_mapping(
     start: usize,
     len: usize,
     off: usize,
+    executable: bool,
 ) -> bool {
     let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() else {
         return true;
@@ -72,6 +73,7 @@ fn populate_file_mapping(
     let _ = inode_file.flush();
     let token = memory_set.token();
     let mut pos = 0usize;
+    let mut wrote = false;
     let mut tmp = [0u8; 512];
     while pos < len {
         let to_read = min(tmp.len(), len - pos);
@@ -82,7 +84,11 @@ fn populate_file_mapping(
         if try_copy_to_user_unchecked(token, (start + pos) as *mut u8, &tmp[..read]).is_err() {
             return false;
         }
+        wrote = true;
         pos += read;
+    }
+    if wrote && executable {
+        memory_set.mark_user_icache_stale();
     }
     true
 }
@@ -212,13 +218,14 @@ fn commit_mmap_vma(
     len: usize,
     off: usize,
 ) -> bool {
+    let executable = region.map_permission().contains(MapPermission::X);
     match (replace, populate_file) {
         (true, Some(file)) => memory_set.try_replace_user_vma_with(
             region,
             areas,
             lock_range,
             backing_file,
-            |memory_set| populate_file_mapping(memory_set, file, start, len, off),
+            |memory_set| populate_file_mapping(memory_set, file, start, len, off, executable),
         ),
         (true, None) => memory_set.try_replace_user_vma(region, areas, lock_range, backing_file),
         (false, Some(file)) => memory_set.try_insert_user_vma_with(
@@ -226,7 +233,7 @@ fn commit_mmap_vma(
             areas,
             lock_range,
             backing_file,
-            |memory_set| populate_file_mapping(memory_set, file, start, len, off),
+            |memory_set| populate_file_mapping(memory_set, file, start, len, off, executable),
         ),
         (false, None) => memory_set.try_insert_user_vma(region, areas, lock_range, backing_file),
     }
@@ -1132,6 +1139,7 @@ pub fn syscall_mremap(
                     }
                     let token = memory_set.token();
                     let mut pos = 0usize;
+                    let mut wrote = false;
                     let mut tmp = [0u8; 512];
                     while pos < file_mapped_grow_len {
                         let to_read = min(tmp.len(), file_mapped_grow_len - pos);
@@ -1148,7 +1156,11 @@ pub fn syscall_mremap(
                         {
                             return false;
                         }
+                        wrote = true;
                         pos += read;
+                    }
+                    if wrote && src_region.map_permission().contains(MapPermission::X) {
+                        memory_set.mark_user_icache_stale();
                     }
                     true
                 },

@@ -501,9 +501,10 @@ impl MemorySet {
     }
 
     /// 将 data 写入已驻留的用户页（仅覆盖已 fault 的页，未 fault 页由后续 lazy fault 从文件读）。
-    fn copy_to_resident_user_bytes(&self, start: usize, data: &[u8]) {
+    fn copy_to_resident_user_bytes(&self, start: usize, data: &[u8]) -> bool {
         // fd 写入只镜像已经 resident 的 mmap 页；未 fault 页由后续 lazy fault 读文件/cache。
         let mut copied = 0usize;
+        let mut wrote_resident = false;
         while copied < data.len() {
             let va = start.saturating_add(copied);
             let vpn = VirtAddr::from(va).floor();
@@ -522,10 +523,12 @@ impl MemorySet {
                 }
                 frame.ppn.get_bytes_array()[page_off..page_off + len]
                     .copy_from_slice(&data[copied..copied + len]);
+                wrote_resident = true;
                 break;
             }
             copied += len;
         }
+        wrote_resident
     }
 
     /// fd write 后将数据镜像到所有共享文件映射的驻留页，保持 mmap 与文件内容一致。
@@ -556,6 +559,7 @@ impl MemorySet {
         }
 
         let mut refreshed_backings = Vec::new();
+        let mut wrote_executable = false;
         for region in regions {
             // 只更新 VMA 中当前文件有效范围，SIGBUS tail 不参与镜像。
             let mapped_len = region.file_mapped_len();
@@ -577,16 +581,23 @@ impl MemorySet {
                 .saturating_add(overlap_start.saturating_sub(region.file_offset));
             let src_off = overlap_start.saturating_sub(write_off);
             let len = overlap_end - overlap_start;
-            self.copy_to_resident_user_bytes(dst, &data[src_off..src_off + len]);
+            let wrote_resident =
+                self.copy_to_resident_user_bytes(dst, &data[src_off..src_off + len]);
+            wrote_executable |=
+                wrote_resident && region.map_permission().contains(MapPermission::X);
             Self::push_unique_backing_id(&mut refreshed_backings, region.backing_id);
+        }
+        if wrote_executable {
+            self.mark_user_icache_stale();
         }
         self.refresh_mmap_backing_states(refreshed_backings);
         self.debug_assert_user_vm_invariants();
     }
 
     /// 将 [start, end) 内已驻留的用户页清零（truncate 缩短文件后清理 EOF 残留数据）。
-    fn zero_mapped_user_bytes(&mut self, start: usize, end: usize) {
+    fn zero_mapped_user_bytes(&mut self, start: usize, end: usize) -> bool {
         let mut cur = start;
+        let mut wrote_resident = false;
         while cur < end {
             let va = VirtAddr::from(cur);
             let vpn = va.floor();
@@ -600,10 +611,12 @@ impl MemorySet {
                     unsafe {
                         core::ptr::write_bytes((pa.0 + page_off) as *mut u8, 0, len);
                     }
+                    wrote_resident = true;
                 }
             }
             cur += len;
         }
+        wrote_resident
     }
 
     /// 文件大小变化（truncate/write 扩展）后同步所有映射了该文件的 VMA：
@@ -647,6 +660,7 @@ impl MemorySet {
         }
 
         let mut ok = true;
+        let mut wrote_executable = false;
 
         for (
             start,
@@ -655,7 +669,7 @@ impl MemorySet {
             new_valid_len,
             old_sigbus,
             new_sigbus,
-            _perm,
+            perm,
             _backing_id,
         ) in updates.iter().copied()
         {
@@ -678,9 +692,14 @@ impl MemorySet {
                         .min(old_sigbus.saturating_sub(start)),
                 );
                 if zero_start < zero_end {
-                    self.zero_mapped_user_bytes(zero_start, zero_end);
+                    wrote_executable |= self.zero_mapped_user_bytes(zero_start, zero_end)
+                        && perm.contains(MapPermission::X);
                 }
             }
+        }
+
+        if wrote_executable {
+            self.mark_user_icache_stale();
         }
 
         for (_start, end, _old_valid, _new_valid, old_sigbus, new_sigbus, _perm, _backing_id) in

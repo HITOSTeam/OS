@@ -90,17 +90,44 @@ impl AsidContext {
     }
 
     fn mark_icache_stale(&self) {
+        // Publish instruction bytes before any local or remote instruction
+        // cache synchronization observes this stale generation.
+        fence(Ordering::Release);
+        // SAFETY: pair ordinary stores with fence.i/RFENCE on every target.
+        unsafe {
+            asm!("fence rw, rw", options(nostack));
+        }
         self.icache_stale_mask
             .fetch_or(possible_hart_mask(), Ordering::Release);
+
+        let local_bit = local_hart_bit();
+        if local_bit != 0 {
+            // A fence now is sufficient even when this hart is not currently
+            // executing the mm: future instruction fetches are ordered after
+            // the code stores that preceded this call.
+            // SAFETY: fence.i is required by the RISC-V ISA after publishing
+            // instruction bytes and has no memory operands.
+            unsafe {
+                asm!("fence.i", options(nostack));
+            }
+            crate::perf::record_icache_local_fence(false);
+            self.icache_stale_mask
+                .fetch_and(!local_bit, Ordering::AcqRel);
+        }
+
+        let remote = self.active_harts.load(Ordering::Acquire)
+            & crate::task::manager::online_hart_mask()
+            & configured_hart_mask()
+            & !local_bit;
+        if remote != 0 {
+            let ret = crate::sbi::remote_fence_i(remote);
+            assert_eq!(ret.error, 0, "remote RISC-V fence.i failed");
+            crate::perf::record_icache_remote_fence(remote.count_ones() as usize);
+            self.icache_stale_mask.fetch_and(!remote, Ordering::AcqRel);
+        }
     }
 
     fn take_local_icache_stale(&self) -> bool {
-        // This is refined to active-hart remote fence.i in the following
-        // I-cache commit. Keeping the conservative SMP behaviour here makes
-        // this ASID/TLB commit independently safe and bisectable.
-        if crate::task::manager::online_hart_mask().count_ones() > 1 {
-            return true;
-        }
         let bit = local_hart_bit();
         self.icache_stale_mask.fetch_and(!bit, Ordering::AcqRel) & bit != 0
     }
@@ -225,7 +252,6 @@ pub fn prepare_user_satp(ctx: &AsidContext, token: usize) -> (usize, bool, bool)
     assert!(hart_id < MAX_HARTS, "hart {} exceeds MAX_HARTS", hart_id);
     let hart_bit = 1usize << hart_id;
     let mut need_flush = false;
-    let need_icache_flush = ctx.take_local_icache_stale();
 
     loop {
         let sequence = ctx.invalidation_sequence.load(Ordering::Acquire);
@@ -249,6 +275,10 @@ pub fn prepare_user_satp(ctx: &AsidContext, token: usize) -> (usize, bool, bool)
         ctx.resident_harts.fetch_or(hart_bit, Ordering::AcqRel);
         ctx.active_harts.fetch_or(hart_bit, Ordering::AcqRel);
         if ctx.invalidation_sequence.load(Ordering::Acquire) == sequence {
+            // Take the I-cache marker only after publishing active_harts. A
+            // concurrent code update then either leaves this bit set for us,
+            // or observes us as active and completes an SBI remote fence.i.
+            let need_icache_flush = ctx.take_local_icache_stale();
             return (
                 token_with_asid(token, context_asid(context)),
                 need_flush,
@@ -472,6 +502,10 @@ impl UserTlbInvalidationBatch {
 
     pub fn force_full_mm(&mut self) {
         self.full_mm = true;
+    }
+
+    pub fn mark_icache_stale(&self) {
+        self.ctx.mark_icache_stale();
     }
 
     fn commit_inner(&mut self) {

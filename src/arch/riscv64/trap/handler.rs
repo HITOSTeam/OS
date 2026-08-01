@@ -790,6 +790,7 @@ pub fn trap_return() -> ! {
         unsafe {
             asm!("fence.i", options(nostack));
         }
+        crate::perf::record_icache_local_fence(true);
     }
     unsafe {
         asm!(

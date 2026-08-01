@@ -432,6 +432,10 @@ impl MapArea {
                 self.vpn_range.get_start().0 << 12,
                 self.vpn_range.get_end().0 << 12,
             );
+            #[cfg(target_arch = "riscv64")]
+            if self.contains_perm(MapPermission::X) {
+                batch.mark_icache_stale();
+            }
         }
         true
     }

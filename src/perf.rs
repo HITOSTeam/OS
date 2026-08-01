@@ -29,6 +29,10 @@ static TLB_EXACT_PAIRS: AtomicU64 = AtomicU64::new(0);
 static TLB_REMOTE_IPIS: AtomicU64 = AtomicU64::new(0);
 static TLB_SHOOTDOWN_WAIT_CYCLES: AtomicU64 = AtomicU64::new(0);
 static TLB_ASID_WRAPS: AtomicU64 = AtomicU64::new(0);
+static ICACHE_LOCAL_FENCES: AtomicU64 = AtomicU64::new(0);
+static ICACHE_DEFERRED_FENCES: AtomicU64 = AtomicU64::new(0);
+static ICACHE_REMOTE_FENCES: AtomicU64 = AtomicU64::new(0);
+static ICACHE_REMOTE_TARGETS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 #[allow(dead_code)]
@@ -143,6 +147,26 @@ pub fn record_tlb_asid_wrap() {
     }
 }
 
+#[inline]
+pub fn record_icache_local_fence(deferred: bool) {
+    if !DEBUG_PERF {
+        return;
+    }
+    ICACHE_LOCAL_FENCES.fetch_add(1, Ordering::Relaxed);
+    if deferred {
+        ICACHE_DEFERRED_FENCES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_icache_remote_fence(targets: usize) {
+    if !DEBUG_PERF {
+        return;
+    }
+    ICACHE_REMOTE_FENCES.fetch_add(1, Ordering::Relaxed);
+    ICACHE_REMOTE_TARGETS.fetch_add(targets as u64, Ordering::Relaxed);
+}
+
 pub fn dump() -> String {
     if !DEBUG_PERF {
         return String::from("perf disabled (set DEBUG_PERF=true)\n");
@@ -165,6 +189,10 @@ pub fn dump() -> String {
     let tlb_remote_ipis = TLB_REMOTE_IPIS.load(Ordering::Relaxed);
     let tlb_shootdown_wait_cycles = TLB_SHOOTDOWN_WAIT_CYCLES.load(Ordering::Relaxed);
     let tlb_asid_wraps = TLB_ASID_WRAPS.load(Ordering::Relaxed);
+    let icache_local_fences = ICACHE_LOCAL_FENCES.load(Ordering::Relaxed);
+    let icache_deferred_fences = ICACHE_DEFERRED_FENCES.load(Ordering::Relaxed);
+    let icache_remote_fences = ICACHE_REMOTE_FENCES.load(Ordering::Relaxed);
+    let icache_remote_targets = ICACHE_REMOTE_TARGETS.load(Ordering::Relaxed);
     let (cache_hits, cache_misses) = ext4_fs::cache_stats();
     let cache_total = cache_hits.saturating_add(cache_misses);
     let cache_hit_pct = if cache_total == 0 {
@@ -192,6 +220,10 @@ tlb_exact_pairs: {tlb_exact_pairs}\n\
 tlb_remote_ipis: {tlb_remote_ipis}\n\
 tlb_shootdown_wait_cycles: {tlb_shootdown_wait_cycles}\n\
 tlb_asid_wraps: {tlb_asid_wraps}\n\
+icache_local_fences: {icache_local_fences}\n\
+icache_deferred_fences: {icache_deferred_fences}\n\
+icache_remote_fences: {icache_remote_fences}\n\
+icache_remote_targets: {icache_remote_targets}\n\
 ext4_cache_hits: {cache_hits}\n\
 ext4_cache_misses: {cache_misses}\n\
 ext4_cache_hit_pct: {cache_hit_pct}\n"

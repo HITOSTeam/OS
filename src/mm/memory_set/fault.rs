@@ -229,6 +229,10 @@ impl MemorySet {
         if changed {
             batch.record_page(fault_va);
         }
+        #[cfg(target_arch = "riscv64")]
+        if new_flags.contains(PTEFlags::X) {
+            batch.mark_icache_stale();
+        }
         // Keep the old frame pinned until every target hart has acknowledged
         // the invalidation for the newly installed PTE.
         self.areas[area_idx].replace_tracked_frame_batched(plan.vpn, frame.clone(), &mut batch);
@@ -402,10 +406,6 @@ impl MemorySet {
 
         let mut batch = self.begin_page_table_update();
         self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
-        #[cfg(target_arch = "riscv64")]
-        if plan.pte_flags.contains(PTEFlags::X) {
-            crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
-        }
         let shared_file_backing_frame = plan.shared_inode_backed.then(|| frame.clone());
         self.areas[area_idx].insert_tracked_frame(plan.vpn, frame);
         if let (Some(backing), Some(file_page)) = (
@@ -419,6 +419,10 @@ impl MemorySet {
             );
         }
         batch.record_page(fault_va);
+        #[cfg(target_arch = "riscv64")]
+        if plan.pte_flags.contains(PTEFlags::X) {
+            batch.mark_icache_stale();
+        }
         batch.commit();
         LazyFaultCommit::Installed
     }

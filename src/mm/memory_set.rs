@@ -83,6 +83,7 @@ pub(super) struct PageTableUpdateBatch {
     user_changed: bool,
     deferred_frames: Vec<FrameTracker>,
     kernel_full: bool,
+    icache_stale: bool,
 }
 
 #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
@@ -97,6 +98,7 @@ impl PageTableUpdateBatch {
             user_changed: false,
             deferred_frames: Vec::new(),
             kernel_full: false,
+            icache_stale: false,
         }
     }
 
@@ -128,11 +130,25 @@ impl PageTableUpdateBatch {
         self.kernel_full = true;
     }
 
+    pub(super) fn mark_icache_stale(&mut self) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.icache_stale = true;
+        }
+    }
+
     pub(super) fn defer_frame(&mut self, frame: FrameTracker) {
         self.deferred_frames.push(frame);
     }
 
     fn finish(&mut self) {
+        if self.icache_stale {
+            #[cfg(target_arch = "riscv64")]
+            if let Some(tlb) = self.tlb.as_ref() {
+                tlb.mark_icache_stale();
+            }
+            self.icache_stale = false;
+        }
         if self.kernel_full {
             #[cfg(target_arch = "loongarch64")]
             crate::arch::loongarch64::mm::flush_tlb_all();
@@ -256,7 +272,6 @@ fn vm_region_map_area_type_compatible(region: &VmRegion, area: &MapArea) -> bool
         || (region.can_have_lazy_concrete() && area.map_type() == MapType::Lazy)
 }
 
-#[cfg(debug_assertions)]
 fn pte_flags_executable(flags: PTEFlags) -> bool {
     #[cfg(target_arch = "riscv64")]
     {
@@ -417,6 +432,14 @@ impl MemorySet {
     #[cfg(target_arch = "riscv64")]
     pub fn drop_user_asid(&self) {
         crate::arch::riscv64::mm::drop_user_asid(self.asid.as_ref());
+    }
+
+    /// Publish kernel-written instruction bytes to every hart that may enter
+    /// this address space. RISC-V uses eager RFENCE for active harts and a
+    /// per-mm deferred fence for inactive harts; other architectures need no
+    /// action here.
+    pub fn mark_user_icache_stale(&self) {
+        #[cfg(target_arch = "riscv64")]
         crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
     }
 
@@ -1359,6 +1382,10 @@ impl MemorySet {
         self.sort_user_areas();
         for (vpn, ppn, flags) in snapshot.ptes {
             self.page_table.map(vpn, ppn, flags);
+            #[cfg(target_arch = "riscv64")]
+            if flags.contains(PTEFlags::X) {
+                batch.mark_icache_stale();
+            }
         }
 
         for region in snapshot.vm_regions {
@@ -2799,6 +2826,7 @@ impl MemorySet {
         let ph_table_size = ph_entry_size.saturating_mul(ph_count);
 
         let mut phdr_vaddr: usize = 0;
+        let mut wrote_executable = false;
         for ph in phdrs {
             if ph.p_type == PT_PHDR && phdr_vaddr == 0 {
                 phdr_vaddr = load_bias + ph.p_vaddr as usize;
@@ -2851,6 +2879,7 @@ impl MemorySet {
                     }
                     offset += to_read;
                 }
+                wrote_executable |= map_perm.contains(MapPermission::X);
             }
 
             // Best-effort: compute AT_PHDR when PHDR table bytes live in this segment.
@@ -2863,6 +2892,10 @@ impl MemorySet {
                     phdr_vaddr = load_bias + ph.p_vaddr as usize + (ph_offset - seg_off);
                 }
             }
+        }
+
+        if wrote_executable {
+            memory_set.mark_user_icache_stale();
         }
 
         Ok(ElfAux {
@@ -3272,6 +3305,7 @@ impl MemorySet {
         assert!(memory_set.map_user_trampoline_pages());
         let mut src_walk_cache = PageWalkCache::new();
         let mut dst_walk_cache = PageWalkCache::new();
+        let mut wrote_executable = false;
 
         for area in user_space.areas.iter() {
             src_walk_cache.reset();
@@ -3322,6 +3356,7 @@ impl MemorySet {
                             .get_bytes_array()
                             .copy_from_slice(src_ppn.get_bytes_array());
                         let pte_flags = area.pte_flags();
+                        wrote_executable |= pte_flags_executable(pte_flags);
                         memory_set.page_table.map_cached(
                             vpn,
                             frame.ppn,
@@ -3336,6 +3371,9 @@ impl MemorySet {
             memory_set.push_mapped_raw(new_area);
         }
 
+        if wrote_executable {
+            memory_set.mark_user_icache_stale();
+        }
         memory_set.inherit_user_vm_metadata_from(user_space);
         memory_set
     }
@@ -3392,6 +3430,10 @@ impl MemorySet {
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         {
             batch.record_range(start_va.0, end_va.0);
+            #[cfg(target_arch = "riscv64")]
+            if permission.contains(MapPermission::X) {
+                batch.mark_icache_stale();
+            }
             batch.commit();
         }
         true
@@ -3442,11 +3484,20 @@ impl MemorySet {
                 return true;
             }
             let mut batch = self.begin_page_table_update();
+            #[cfg(target_arch = "riscv64")]
+            let was_executable = self
+                .page_table
+                .translate(vpn)
+                .is_some_and(|pte| pte.is_valid() && pte.flags().contains(PTEFlags::X));
             let Some(changed) = self.page_table.set_flags_deferred_changed(vpn, flags) else {
                 return false;
             };
             if changed {
                 batch.record_page(vpn.0 << 12);
+                #[cfg(target_arch = "riscv64")]
+                if flags.contains(PTEFlags::X) && !was_executable {
+                    batch.mark_icache_stale();
+                }
             }
             batch.commit();
             true
@@ -3509,6 +3560,10 @@ impl MemorySet {
                     batch.record_range(old_end.0 << 12, new_end.0 << 12);
                 }
                 self.sort_user_areas();
+                #[cfg(target_arch = "riscv64")]
+                if self.areas[idx].contains_perm(MapPermission::X) {
+                    batch.mark_icache_stale();
+                }
                 self.debug_assert_user_vm_invariants();
             }
             batch.commit();
@@ -3615,6 +3670,10 @@ impl MemorySet {
                             return false;
                         };
                         moved_ptes.push((new_vpn, pte.ppn(), pte.flags()));
+                        #[cfg(target_arch = "riscv64")]
+                        if pte.flags().contains(PTEFlags::X) {
+                            batch.mark_icache_stale();
+                        }
                         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
                         if self.page_table.unmap_if_mapped_deferred(vpn) {
                             batch.record_page(vpn.0 << 12);
@@ -3769,6 +3828,8 @@ impl MemorySet {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
         let mut touched_area = false;
+        #[cfg(target_arch = "riscv64")]
+        let mut made_executable = false;
 
         let mut new_areas: Vec<MapArea> = Vec::new();
         let mut areas = core::mem::take(&mut self.areas);
@@ -3810,6 +3871,10 @@ impl MemorySet {
                         }
                         let old_flags = pte.flags();
                         let pte_flags = pte_flags_for_mprotect(new_perm, Some(old_flags));
+                        #[cfg(target_arch = "riscv64")]
+                        if pte_flags.contains(PTEFlags::X) && !old_flags.contains(PTEFlags::X) {
+                            made_executable = true;
+                        }
                         let _ = mid.take_saved_pte_flags(vpn);
                         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
                         if matches!(
@@ -3827,6 +3892,12 @@ impl MemorySet {
                     if let Some(ppn) = mid.tracked_frame(vpn).map(|frame| frame.ppn) {
                         let old_flags = mid.take_saved_pte_flags(vpn);
                         let pte_flags = pte_flags_for_mprotect(new_perm, old_flags);
+                        #[cfg(target_arch = "riscv64")]
+                        if pte_flags.contains(PTEFlags::X) {
+                            // A PROT_NONE page can be modified through a
+                            // shared alias while its executable PTE is absent.
+                            made_executable = true;
+                        }
                         self.page_table.map(vpn, ppn, pte_flags);
                         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
                         batch.record_page(vpn.0 << 12);
@@ -3847,6 +3918,10 @@ impl MemorySet {
         }
         self.areas = new_areas;
         self.sort_user_areas();
+        #[cfg(target_arch = "riscv64")]
+        if made_executable {
+            batch.mark_icache_stale();
+        }
         debug_assert!(
             touched_area || start_vpn >= end_vpn,
             "mprotect concrete update had no MapArea coverage for {:?}..{:?}",
@@ -4076,6 +4151,7 @@ impl MemorySet {
     #[allow(dead_code)]
     pub fn clone(&self) -> Self {
         let mut new_memory_set = Self::new_bare();
+        let mut wrote_executable = false;
         let has_user = self
             .areas
             .iter()
@@ -4109,6 +4185,7 @@ impl MemorySet {
                         .ppn
                         .get_bytes_array()
                         .copy_from_slice(src_ppn.get_bytes_array());
+                    wrote_executable |= pte_flags_executable(pte_flags);
                     new_memory_set.page_table.map(vpn, frame.ppn, pte_flags);
                     new_area.insert_tracked_frame(vpn, frame);
                 }
@@ -4126,8 +4203,12 @@ impl MemorySet {
                 let dst_bytes = dst_ppn.get_bytes_array();
                 dst_bytes.copy_from_slice(&src_bytes);
             }
+            wrote_executable |= area.contains_perm(MapPermission::X);
         }
 
+        if wrote_executable {
+            new_memory_set.mark_user_icache_stale();
+        }
         new_memory_set.inherit_user_vm_metadata_from(self);
         new_memory_set
     }
