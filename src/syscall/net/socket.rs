@@ -4570,8 +4570,13 @@ pub fn syscall_socket(domain: usize, socket_type: usize, protocol: usize) -> isi
 
     // 安装到进程 fd 表，超出 nofile 限制时返回 EMFILE。
     let (files, limit) = current_files_and_nofile_limit();
-    let Some(fd) = files.lock().install_fd(file, descriptor_flags, limit) else {
-        return err(SyscallError::EMFILE);
+    let installed = files.lock().install_fd(file, descriptor_flags, limit);
+    let fd = match installed {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            rejected.discard();
+            return err(SyscallError::EMFILE);
+        }
     };
     if crate::debug_config::DEBUG_NET {
         let pid = current_process().getpid();
@@ -4795,14 +4800,22 @@ fn syscall_accept_inner(fd: usize, addr: usize, addrlen: usize, flags: usize) ->
         let mut files = files.lock();
         let new_file: FileArc = new_sock;
         // Linux accept() 不继承监听 fd 的文件状态 flag；accept4() 仅按参数设置新 fd。
-        let Some(newfd) = files.install_fd(new_file, new_fd_flags, limit) else {
-            return err(SyscallError::EMFILE);
-        };
+        let installed = files.install_fd(new_file, new_fd_flags, limit);
         drop(files);
+        let newfd = match installed {
+            Ok(fd) => fd,
+            Err(rejected) => {
+                rejected.discard();
+                return err(SyscallError::EMFILE);
+            }
+        };
         if addr != 0 {
             let r = write_sockaddr_un(addr, addrlen, peer_addr.as_ref());
             if r != 0 {
-                let _ = current_files().lock().clear_fd(newfd);
+                let detached = current_files().lock().clear_fd(newfd);
+                if let Some(detached) = detached {
+                    drop(detached.complete_close());
+                }
                 return r;
             }
         }
@@ -4840,15 +4853,23 @@ fn syscall_accept_inner(fd: usize, addr: usize, addrlen: usize, flags: usize) ->
     let (files, limit) = current_files_and_nofile_limit();
     let mut files = files.lock();
     // Linux accept() 不继承监听 fd 的文件状态 flag；accept4() 仅按参数设置新 fd。
-    let Some(newfd) = files.install_fd(new_sock, new_fd_flags, limit) else {
-        return err(SyscallError::EMFILE);
-    };
+    let installed = files.install_fd(new_sock, new_fd_flags, limit);
     drop(files);
+    let newfd = match installed {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            rejected.discard();
+            return err(SyscallError::EMFILE);
+        }
+    };
     if addr != 0 {
         if let Some((_lip, _lport, rip, rport)) = peer {
             let r = write_sockaddr_in_for_domain(addr, addrlen, listener_domain, rip, rport);
             if r != 0 {
-                let _ = current_files().lock().clear_fd(newfd);
+                let detached = current_files().lock().clear_fd(newfd);
+                if let Some(detached) = detached {
+                    drop(detached.complete_close());
+                }
                 return r;
             }
         }

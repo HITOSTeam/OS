@@ -618,11 +618,13 @@ pub fn syscall_epoll_create1(flags: usize) -> isize {
         descriptor_flags |= FD_CLOEXEC;
     }
     let (files, limit) = current_files_and_nofile_limit();
-    files
+    let installed = files
         .lock()
-        .install_fd(Arc::new(EpollFile::new()), descriptor_flags, limit)
-        .map(|fd| fd as isize)
-        .unwrap_or_else(|| err(SyscallError::EMFILE))
+        .install_fd(Arc::new(EpollFile::new()), descriptor_flags, limit);
+    installed.map(|fd| fd as isize).unwrap_or_else(|rejected| {
+        rejected.discard();
+        err(SyscallError::EMFILE)
+    })
 }
 
 pub fn syscall_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {

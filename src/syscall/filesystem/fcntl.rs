@@ -631,7 +631,22 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             } else {
                 new_flags |= FD_CLOEXEC;
             }
-            let _ = files.replace_fd_at_with_mount(newfd, file, new_flags, mount, limit);
+            let replace_result =
+                files.replace_fd_at_with_mount(newfd, file, new_flags, mount, limit);
+            drop(files);
+            let replaced = match replace_result {
+                Ok(replaced) => replaced,
+                Err(rejected) => {
+                    rejected.discard();
+                    return err(SyscallError::EMFILE);
+                }
+            };
+            if let Some(replaced) = replaced {
+                // The slot was observed free above; retain a defensive close
+                // path for a future allocator change without doing it under
+                // FilesLock.
+                drop(replaced.complete_close());
+            }
             newfd as isize
         }
         _ => err(SyscallError::EINVAL),

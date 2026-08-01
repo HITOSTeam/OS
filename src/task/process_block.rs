@@ -1526,7 +1526,8 @@ impl ProcessControlBlock {
         if Arc::ptr_eq(&inner.files, &old_files) && Arc::strong_count(&inner.files) > 1 {
             inner.files = new_files;
             drop(inner);
-            old_files.lock().release_process_owner();
+            let detached = old_files.lock().release_process_owner();
+            crate::task::complete_fd_closes(detached);
         }
     }
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
@@ -1807,7 +1808,9 @@ impl ProcessControlBlock {
         let (task, exec_owner_tid) = self.quiesce_threads_for_exec();
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
-        self.files().lock().close_cloexec_fds();
+        let files = self.files();
+        let detached = files.lock().close_cloexec_fds();
+        crate::task::complete_fd_closes(detached);
         let new_token = memory_set.token();
         let new_memory_set = MmRef::new(memory_set);
         let old_trap_cx_slot = {
@@ -1908,7 +1911,9 @@ impl ProcessControlBlock {
         let (task, exec_owner_tid) = self.quiesce_threads_for_exec();
         // Linux execve unshares CLONE_FILES state before applying CLOEXEC.
         self.unshare_files();
-        self.files().lock().close_cloexec_fds();
+        let files = self.files();
+        let detached = files.lock().close_cloexec_fds();
+        crate::task::complete_fd_closes(detached);
         let new_token = memory_set.token();
         let new_memory_set = MmRef::new(memory_set);
         let old_trap_cx_slot = {
@@ -2313,7 +2318,8 @@ impl ProcessControlBlock {
         let task = match task_result {
             Ok(task) => Arc::new(task),
             Err(error) => {
-                child.files().lock().release_process_owner();
+                let detached = child.files().lock().release_process_owner();
+                crate::task::complete_fd_closes(detached);
                 return Err(error.into());
             }
         };

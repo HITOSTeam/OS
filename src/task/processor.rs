@@ -378,7 +378,8 @@ fn queue_files_struct_drop(files: Arc<FilesLock>) {
 }
 
 fn close_files_struct_fd_refs_if_unshared(files: &Arc<FilesLock>) {
-    files.lock().release_process_owner();
+    let detached = files.lock().release_process_owner();
+    crate::task::complete_fd_closes(detached);
 }
 
 /// 将一个地址空间（mm）延迟到 idle 循环释放。
@@ -1234,12 +1235,15 @@ pub fn idle_task() {
                 let Some(files) = local_processor().lock().take_pending_files_struct_drop() else {
                     break;
                 };
-                let (files_to_drop, files_done) = {
+                let (detached, files_done) = {
                     let mut files_guard = files.lock();
-                    let files_to_drop =
-                        files_guard.take_file_close_batch(IDLE_FILES_STRUCT_CLOSE_BATCH);
-                    (files_to_drop, files_guard.is_empty())
+                    let detached = files_guard.take_file_close_batch(IDLE_FILES_STRUCT_CLOSE_BATCH);
+                    (detached, files_guard.is_empty())
                 };
+                let files_to_drop = detached
+                    .into_iter()
+                    .map(|detached| detached.complete_close())
+                    .collect::<Vec<_>>();
                 if !files_done {
                     // 还有剩余，放回 pending 队列下轮继续。
                     local_processor()

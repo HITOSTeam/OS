@@ -19,7 +19,7 @@ pub mod block_sleep;
 pub mod condvar;
 mod files_struct;
 mod id;
-pub(crate) use files_struct::{FilesLock, FilesStruct};
+pub(crate) use files_struct::{DetachedFd, FilesLock, FilesStruct, complete_fd_closes};
 pub(crate) use id::{PidAllocError, pid_max, pid_max_bounds, set_pid_max};
 pub mod manager;
 pub mod mutex;

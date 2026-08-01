@@ -141,8 +141,13 @@ pub(crate) fn alloc_internal_fd(
     descriptor_flags: u32,
 ) -> Result<isize, isize> {
     let (files, limit) = current_files_and_nofile_limit();
-    let Some(fd) = files.lock().install_fd(file, descriptor_flags, limit) else {
-        return Err(err(SyscallError::EMFILE));
+    let installed = files.lock().install_fd(file, descriptor_flags, limit);
+    let fd = match installed {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            rejected.discard();
+            return Err(err(SyscallError::EMFILE));
+        }
     };
     Ok(fd as isize)
 }

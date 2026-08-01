@@ -1,7 +1,7 @@
 use super::{
     AT_FDCWD, FanotifyFile, File, MapPermission, SyscallError, current_files,
-    current_files_and_nofile_limit, current_fsuid_gid, err, get_current_token,
-    read_user_cstring, resolve_abs_path, resolve_at_inode, resolve_at_path, translate_mount_abs,
+    current_files_and_nofile_limit, current_fsuid_gid, err, get_current_token, read_user_cstring,
+    resolve_abs_path, resolve_at_inode, resolve_at_path, translate_mount_abs,
     try_translated_byte_buffer, with_ext4_inode_read,
 };
 use alloc::sync::Arc;
@@ -15,11 +15,14 @@ pub fn syscall_fanotify_init(flags: usize, _event_f_flags: usize) -> isize {
     };
     let file: Arc<dyn File + Send + Sync> = file;
     let (files, limit) = current_files_and_nofile_limit();
-    files
-        .lock()
-        .install_fd(file, crate::fs::fanotify_descriptor_flags(flags), limit)
-        .map(|fd| fd as isize)
-        .unwrap_or_else(|| err(SyscallError::EMFILE))
+    let installed =
+        files
+            .lock()
+            .install_fd(file, crate::fs::fanotify_descriptor_flags(flags), limit);
+    installed.map(|fd| fd as isize).unwrap_or_else(|rejected| {
+        rejected.discard();
+        err(SyscallError::EMFILE)
+    })
 }
 
 pub fn syscall_fanotify_mark(

@@ -102,11 +102,11 @@ fn copy_user_insns(user_ptr: usize, count: usize) -> BpfResult<Vec<BpfInsn>> {
 /// 将文件对象安装到当前进程的文件描述符表，返回分配的 fd 或 EMFILE。
 fn alloc_fd(file: Arc<dyn File + Send + Sync>) -> isize {
     let (files, limit) = current_files_and_nofile_limit();
-    files
-        .lock()
-        .install_fd(file, 0, limit)
-        .map(|fd| fd as isize)
-        .unwrap_or_else(|| err(EMFILE))
+    let installed = files.lock().install_fd(file, 0, limit);
+    installed.map(|fd| fd as isize).unwrap_or_else(|rejected| {
+        rejected.discard();
+        err(EMFILE)
+    })
 }
 
 /// 将验证器错误信息写入用户空间日志缓冲区（若 attr 中指定了 log_buf）。

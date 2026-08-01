@@ -716,17 +716,30 @@ fn install_child_pidfd(
     // 即便 PID 数值未来被复用，本 pidfd 也只解析到这一次 fork 的子进程，
     // 不会误投递到无关进程。
     let pidfd: Arc<dyn crate::fs::File + Send + Sync> = Arc::new(PidFdFile::new(child));
-    let fd = files
+    let installed = files
         .lock()
-        .install_fd(Arc::clone(&pidfd), FD_CLOEXEC, limit)
-        .ok_or(SyscallError::EMFILE)? as i32;
+        .install_fd(Arc::clone(&pidfd), FD_CLOEXEC, limit);
+    let fd = match installed {
+        Ok(fd) => fd as i32,
+        Err(rejected) => {
+            rejected.discard();
+            return Err(SyscallError::EMFILE);
+        }
+    };
     if try_write_user_value(token, user_ptr as *mut i32, &fd).is_err() {
-        let mut files = files.lock();
-        if files
-            .get_file(fd as usize)
-            .is_some_and(|current| Arc::ptr_eq(&current, &pidfd))
-        {
-            files.clear_fd(fd as usize);
+        let detached = {
+            let mut files = files.lock();
+            if files
+                .get_file(fd as usize)
+                .is_some_and(|current| Arc::ptr_eq(&current, &pidfd))
+            {
+                files.clear_fd(fd as usize)
+            } else {
+                None
+            }
+        };
+        if let Some(detached) = detached {
+            drop(detached.complete_close());
         }
         return Err(SyscallError::EFAULT);
     }
@@ -736,7 +749,8 @@ fn install_child_pidfd(
 fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>) {
     let child_pid = child.getpid();
     crate::fs::cgroup_exit_process(child_pid);
-    child.files().lock().release_process_owner();
+    let detached = child.files().lock().release_process_owner();
+    crate::task::complete_fd_closes(detached);
     let (exec_dev, exec_ino, shm_attaches, parent) = {
         let mut child_inner = child.borrow_mut();
         let shm_attaches = child_inner.memory_set.take_sysv_shm_attaches_for_cleanup();

@@ -10,7 +10,7 @@ use crate::{
         try_write_user_value, write_user_value,
     },
     syscall::error::{SyscallError, err},
-    task::processor::{current_files, current_process},
+    task::processor::{current_files, current_process, current_task},
     trap::get_current_token,
 };
 use alloc::{format, string::String};
@@ -278,8 +278,9 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                     return err(SyscallError::EFAULT);
                 }
                 {
-                    let process = current_process();
-                    let inner = process.borrow_mut();
+                    let memory_set = current_task()
+                        .expect("UFFDIO_COPY requires a current task")
+                        .memory_set();
                     let start = copy.dst as usize & !(PAGE_SIZE - 1);
                     let end = ((copy.dst as usize)
                         .saturating_add(len)
@@ -287,13 +288,12 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                         & !(PAGE_SIZE - 1);
                     let mut page = start;
                     while page < end {
-                        let mapped = inner
-                            .memory_set
+                        let mapped = memory_set
                             .translate(VirtAddr::from(page).floor())
                             .map(|pte| pte.is_valid())
                             .unwrap_or(false);
                         if !mapped {
-                            match inner.memory_set.resolve_lazy_fault(page, MapPermission::W) {
+                            match memory_set.resolve_lazy_fault(page, MapPermission::W) {
                                 crate::mm::LazyFaultResult::Resolved => {}
                                 crate::mm::LazyFaultResult::Oom => {
                                     return err(SyscallError::ENOMEM);

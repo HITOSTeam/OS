@@ -42,11 +42,11 @@ struct ITimerSpec {
 
 fn alloc_fd(file: Arc<dyn File + Send + Sync>, descriptor_flags: u32) -> isize {
     let (files, limit) = current_files_and_nofile_limit();
-    files
-        .lock()
-        .install_fd(file, descriptor_flags, limit)
-        .map(|fd| fd as isize)
-        .unwrap_or_else(|| err(SyscallError::EMFILE))
+    let installed = files.lock().install_fd(file, descriptor_flags, limit);
+    installed.map(|fd| fd as isize).unwrap_or_else(|rejected| {
+        rejected.discard();
+        err(SyscallError::EMFILE)
+    })
 }
 
 // this function allocates a dummy file descriptor with given flags

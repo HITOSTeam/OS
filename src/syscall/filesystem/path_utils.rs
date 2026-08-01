@@ -4,13 +4,13 @@ use super::{
     SyscallError, Vec, XATTR_CREATE, XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX,
     clear_ext4_path_cache, current_cwd_path, current_files, current_fsuid_gid,
     current_mount_namespace, current_process, err, ext4_inode_lock, fd_has_o_path,
-    find_path_in_roots, get_current_token, get_fd_file,
-    inode_is_immutable_or_append, inode_mode_allows_uid_gid, install_open_file_fd,
-    invalidate_ext4_path_cache, invalidate_ext4_path_cache_subtree, logical_path_for_inode,
-    logical_path_for_open_fd, mount_lookup_for_abs, note_ext4_path_cache, open_pseudo,
-    path_is_noexec, path_is_rofs, pseudo_abs_for_ext4_dirfd, shm_get, shm_object_name,
-    syscall_ftruncate, touch_inode_mtime_ctime_now, translate_mount_abs, try_copy_from_user,
-    try_copy_to_user, try_read_user_value,
+    find_path_in_roots, get_current_token, get_fd_file, inode_is_immutable_or_append,
+    inode_mode_allows_uid_gid, install_open_file_fd, invalidate_ext4_path_cache,
+    invalidate_ext4_path_cache_subtree, logical_path_for_inode, logical_path_for_open_fd,
+    mount_lookup_for_abs, note_ext4_path_cache, open_pseudo, path_is_noexec, path_is_rofs,
+    pseudo_abs_for_ext4_dirfd, shm_get, shm_object_name, syscall_ftruncate,
+    touch_inode_mtime_ctime_now, translate_mount_abs, try_copy_from_user, try_copy_to_user,
+    try_read_user_value,
 };
 use alloc::vec;
 
@@ -603,7 +603,10 @@ pub(crate) fn reopen_proc_link_file(
         let tr = syscall_ftruncate(fd, 0);
         if tr != 0 {
             let files = current_files();
-            let _ = files.lock().clear_fd(fd);
+            let detached = files.lock().clear_fd(fd);
+            if let Some(detached) = detached {
+                drop(detached.complete_close());
+            }
             return Err(tr);
         }
     }

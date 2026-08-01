@@ -86,10 +86,11 @@ fn install_descriptor(desc: Arc<MqDescriptor>, oflag: usize) -> Result<usize, is
         descriptor_flags |= O_NONBLOCK as u32;
     }
     let (files, limit) = current_files_and_nofile_limit();
-    files
-        .lock()
-        .install_fd(file, descriptor_flags, limit)
-        .ok_or(err(SyscallError::EMFILE))
+    let installed = files.lock().install_fd(file, descriptor_flags, limit);
+    installed.map_err(|rejected| {
+        rejected.discard();
+        err(SyscallError::EMFILE)
+    })
 }
 
 /// mq_open(2)：打开或创建一个 POSIX 消息队列，返回消息队列文件描述符（mqd_t）

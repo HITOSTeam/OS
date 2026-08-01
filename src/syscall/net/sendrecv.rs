@@ -986,11 +986,20 @@ fn write_scm_control_cmsgs(
                 let (files_table, limit) = current_files_and_nofile_limit();
                 let mut files_table = files_table.lock();
                 for file in rights.iter().take(pass_count) {
-                    let Some(fd) = files_table.install_fd(Arc::clone(file), fd_flags, limit) else {
-                        for fd in installed {
-                            let _ = files_table.clear_fd(fd);
+                    let fd = match files_table.install_fd(Arc::clone(file), fd_flags, limit) {
+                        Ok(fd) => fd,
+                        Err(rejected) => {
+                            let mut detached = Vec::new();
+                            for fd in installed.drain(..) {
+                                if let Some(removed) = files_table.clear_fd(fd) {
+                                    detached.push(removed);
+                                }
+                            }
+                            drop(files_table);
+                            rejected.discard();
+                            crate::task::complete_fd_closes(detached);
+                            return err(SyscallError::EMFILE);
                         }
-                        return err(SyscallError::EMFILE);
                     };
                     installed.push(fd);
                 }
@@ -1037,9 +1046,14 @@ fn write_scm_control_cmsgs(
     if ret < 0 {
         let files_table = current_files();
         let mut files_table = files_table.lock();
+        let mut detached = Vec::new();
         for fd in installed {
-            let _ = files_table.clear_fd(fd);
+            if let Some(removed) = files_table.clear_fd(fd) {
+                detached.push(removed);
+            }
         }
+        drop(files_table);
+        crate::task::complete_fd_closes(detached);
     }
     ret
 }

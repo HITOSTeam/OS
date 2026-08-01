@@ -16,8 +16,8 @@ use spin::Mutex;
 
 use crate::{
     fs::{
-        File, OSInode, POLLIN, POLLOUT, PollWaitQueue, find_path_in_roots,
-        inode_raw_logical_path, wake_tasks,
+        File, OSInode, POLLIN, POLLOUT, PollWaitQueue, find_path_in_roots, inode_raw_logical_path,
+        wake_tasks,
     },
     mm::UserBuffer,
     syscall::{
@@ -847,11 +847,11 @@ fn select_permission_event(mark_mask: u64, candidates: u64) -> Option<u64> {
 fn install_event_fd(inode: Arc<Inode>) -> Result<i32, isize> {
     let file: Arc<dyn File + Send + Sync> = Arc::new(OSInode::new_fanotify_event(inode));
     let (files, limit) = current_files_and_nofile_limit();
-    files
-        .lock()
-        .install_fd(file, 0, limit)
-        .map(|fd| fd as i32)
-        .ok_or_else(|| err(SyscallError::EMFILE))
+    let installed = files.lock().install_fd(file, 0, limit);
+    installed.map(|fd| fd as i32).map_err(|rejected| {
+        rejected.discard();
+        err(SyscallError::EMFILE)
+    })
 }
 
 fn wait_permission_response(permission: &Arc<FanotifyPermission>) -> Result<(), isize> {

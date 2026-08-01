@@ -78,12 +78,25 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
     }
     let (files, limit) = current_files_and_nofile_limit();
     let mut files = files.lock();
-    let Some(fd0) = files.install_fd(end0, descriptor_flags, limit) else {
-        return err(SyscallError::EMFILE);
+    let fd0 = match files.install_fd(end0, descriptor_flags, limit) {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            drop(files);
+            rejected.discard();
+            return err(SyscallError::EMFILE);
+        }
     };
-    let Some(fd1) = files.install_fd(end1, descriptor_flags, limit) else {
-        let _ = files.clear_fd(fd0);
-        return err(SyscallError::EMFILE);
+    let fd1 = match files.install_fd(end1, descriptor_flags, limit) {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            let detached = files
+                .clear_fd(fd0)
+                .expect("newly installed socketpair fd disappeared");
+            drop(files);
+            rejected.discard();
+            drop(detached.complete_close());
+            return err(SyscallError::EMFILE);
+        }
     };
     drop(files);
 
@@ -99,8 +112,15 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
     {
         let (files, _) = current_files_and_nofile_limit();
         let mut files = files.lock();
-        let _ = files.clear_fd(fd0);
-        let _ = files.clear_fd(fd1);
+        let end0 = files.clear_fd(fd0);
+        let end1 = files.clear_fd(fd1);
+        drop(files);
+        if let Some(end0) = end0 {
+            drop(end0.complete_close());
+        }
+        if let Some(end1) = end1 {
+            drop(end1.complete_close());
+        }
         return err(SyscallError::EFAULT);
     }
     0

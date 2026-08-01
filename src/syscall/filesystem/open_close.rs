@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 
 use super::{
     AtPath, BTreeSet, FD_CLOEXEC, File, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY,
@@ -525,7 +525,7 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 /// Closes a single file descriptor and releases any lock or lease state tied to it.
 pub fn syscall_close(fd: usize) -> isize {
     let files = current_files();
-    let file = {
+    let detached = {
         let mut files = files.lock();
         let Some(file) = files.get_file(fd) else {
             return err(SyscallError::EBADF);
@@ -537,9 +537,10 @@ pub fn syscall_close(fd: usize) -> isize {
         let removed = files
             .clear_fd(fd)
             .expect("fd disappeared while files_lock was held");
-        debug_assert!(Arc::ptr_eq(&file, &removed));
+        drop(file);
         removed
     };
+    let file = detached.complete_close();
     let lock_key = file_lock_key(&file);
     let fanotify_close = file
         .as_any()
@@ -609,9 +610,9 @@ pub fn syscall_close_range(first: usize, last: usize, flags: usize) -> isize {
         }
     }
     drop(files);
-    // File destructors may flush ext4 state or wake waiters, so they must run
-    // after the descriptor-table spin lock is released.
-    drop(removed_files);
+    for removed in removed_files {
+        drop(removed.complete_close());
+    }
     if !set_cloexec {
         let owner_pid = current_process().getpid();
         for key in lock_keys {
@@ -641,12 +642,25 @@ pub fn syscall_pipe2(pipefd: usize, flags: usize) -> isize {
         descriptor_flags |= O_NONBLOCK as u32;
     }
     let mut files_guard = files.lock();
-    let Some(read_fd) = files_guard.install_fd(pipe_read, descriptor_flags, limit) else {
-        return err(SyscallError::EMFILE);
+    let read_fd = match files_guard.install_fd(pipe_read, descriptor_flags, limit) {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            drop(files_guard);
+            rejected.discard();
+            return err(SyscallError::EMFILE);
+        }
     };
-    let Some(write_fd) = files_guard.install_fd(pipe_write, descriptor_flags, limit) else {
-        let _ = files_guard.clear_fd(read_fd);
-        return err(SyscallError::EMFILE);
+    let write_fd = match files_guard.install_fd(pipe_write, descriptor_flags, limit) {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            let removed = files_guard
+                .clear_fd(read_fd)
+                .expect("newly installed pipe fd disappeared");
+            drop(files_guard);
+            rejected.discard();
+            drop(removed.complete_close());
+            return err(SyscallError::EMFILE);
+        }
     };
     // Drop PCB borrow before user-memory writes: uaccess may need to resolve
     // lazy/COW pages via `process.try_borrow_mut()`.
@@ -662,8 +676,15 @@ pub fn syscall_pipe2(pipefd: usize, flags: usize) -> isize {
         .is_err()
     {
         let mut files_guard = files.lock();
-        let _ = files_guard.clear_fd(read_fd);
-        let _ = files_guard.clear_fd(write_fd);
+        let read_end = files_guard.clear_fd(read_fd);
+        let write_end = files_guard.clear_fd(write_fd);
+        drop(files_guard);
+        if let Some(read_end) = read_end {
+            drop(read_end.complete_close());
+        }
+        if let Some(write_end) = write_end {
+            drop(write_end.complete_close());
+        }
         return err(SyscallError::EFAULT);
     }
     0
@@ -677,9 +698,14 @@ pub fn syscall_dup(oldfd: usize) -> isize {
         return err(SyscallError::EBADF);
     };
     let mount = files.get_mount_ref(oldfd);
-    let Some(newfd) = files.install_fd_with_mount(file, old_flags & !FD_CLOEXEC, mount, limit)
-    else {
-        return err(SyscallError::EMFILE);
+    let installed = files.install_fd_with_mount(file, old_flags & !FD_CLOEXEC, mount, limit);
+    drop(files);
+    let newfd = match installed {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            rejected.discard();
+            return err(SyscallError::EMFILE);
+        }
     };
     newfd as isize
 }
@@ -708,11 +734,17 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     } else {
         new_flags &= !FD_CLOEXEC;
     }
-    let replaced_file = files
-        .replace_fd_at_with_mount(newfd, file, new_flags, mount, limit)
-        .flatten();
+    let replaced = files.replace_fd_at_with_mount(newfd, file, new_flags, mount, limit);
     drop(files);
+    let replaced_file = match replaced {
+        Ok(replaced) => replaced,
+        Err(rejected) => {
+            rejected.discard();
+            return err(SyscallError::EBADF);
+        }
+    };
     if let Some(replaced_file) = replaced_file {
+        let replaced_file = replaced_file.complete_close();
         if let Some(key) = file_lock_key(&replaced_file) {
             remove_process_record_locks_for_key(owner_pid, key);
             remove_owner_file_lease_for_key(owner_pid, key);

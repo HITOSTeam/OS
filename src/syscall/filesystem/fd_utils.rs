@@ -370,11 +370,15 @@ pub(crate) fn install_open_file_fd(
     o_path: bool,
 ) -> Result<usize, isize> {
     let (files, limit) = current_files_and_nofile_limit();
-    let Some(fd) = files
+    let installed = files
         .lock()
-        .install_fd(file, open_descriptor_flags(flags, o_path), limit)
-    else {
-        return Err(err(SyscallError::EMFILE));
+        .install_fd(file, open_descriptor_flags(flags, o_path), limit);
+    let fd = match installed {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            rejected.discard();
+            return Err(err(SyscallError::EMFILE));
+        }
     };
     Ok(fd)
 }
@@ -387,13 +391,18 @@ pub(crate) fn install_open_file_fd_for_path(
 ) -> Result<usize, isize> {
     let mount = mount_lookup_for_abs(logical_abs).map(|record| (&record).into());
     let (files, limit) = current_files_and_nofile_limit();
-    let Some(fd) = files.lock().install_fd_with_mount(
+    let installed = files.lock().install_fd_with_mount(
         file,
         open_descriptor_flags(flags, o_path),
         mount,
         limit,
-    ) else {
-        return Err(err(SyscallError::EMFILE));
+    );
+    let fd = match installed {
+        Ok(fd) => fd,
+        Err(rejected) => {
+            rejected.discard();
+            return Err(err(SyscallError::EMFILE));
+        }
     };
     Ok(fd)
 }
