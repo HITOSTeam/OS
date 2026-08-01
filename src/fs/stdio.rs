@@ -4,27 +4,19 @@ use super::File;
 use crate::arch::console_flush;
 use crate::arch::{console_getchar, console_putchar};
 use crate::mm::UserBuffer;
-use crate::sync::{KernelMutex, KernelMutexGuard};
 use crate::task::processor::suspend_current_and_run_next;
+use spin::Mutex;
 ///Standard input
 pub struct Stdin;
 ///Standard output
 pub struct Stdout;
 
-// Linux takes tty_write_lock() before importing the userspace iterator.  Keep
-// the same lifetime boundary: syscall_write acquires this sleepable lock before
-// translating user pages, then holds it through the complete terminal write.
-static STDOUT_WRITE_LOCK: KernelMutex<()> = KernelMutex::new(());
-
-impl Stdout {
-    pub fn lock_write(nonblock: bool) -> Option<KernelMutexGuard<'static, ()>> {
-        if nonblock {
-            STDOUT_WRITE_LOCK.try_lock()
-        } else {
-            Some(STDOUT_WRITE_LOCK.lock())
-        }
-    }
-}
+// Like Linux tty_write_lock(), keep one userspace write contiguous on the
+// terminal. UserBuffer currently contains translated, unpinned physical-page
+// slices, so the existing wait queue cannot safely sleep after translation.
+// Keep this narrow non-sleeping boundary around byte emission until user pages
+// can be pinned and the lock can move before import_iovec()/copy_from_iter().
+static STDOUT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 impl File for Stdin {
     fn readable(&self) -> bool {
@@ -80,6 +72,7 @@ impl File for Stdout {
         0
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
+        let _write_guard = STDOUT_WRITE_LOCK.lock();
         #[cfg(target_arch = "loongarch64")]
         {
             let flush_threshold = crate::arch::UART_FIFO_DEPTH.saturating_sub(2).max(4);

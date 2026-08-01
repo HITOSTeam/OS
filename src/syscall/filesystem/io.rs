@@ -14,7 +14,7 @@ use super::{
     try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
     with_ext4_inode_read, write_optional_offset,
 };
-use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, Stdout, TunTapFile};
+use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, TunTapFile};
 use alloc::vec;
 
 /// Reads from regular files and special waitable descriptors into a user buffer.
@@ -323,17 +323,6 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if len == 0 {
         return 0;
     }
-    // Match Linux tty_write_lock(): serialize one userspace terminal write as
-    // a unit, and acquire the sleepable lock before translating unpinned user
-    // pages. O_NONBLOCK observes lock contention as EAGAIN.
-    let _stdout_write_guard = if file.as_any().downcast_ref::<Stdout>().is_some() {
-        let Some(guard) = Stdout::lock_write(nonblock) else {
-            return err(SyscallError::EAGAIN);
-        };
-        Some(guard)
-    } else {
-        None
-    };
     if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
         let Ok(user_bufs) = try_translated_byte_buffer(
             get_current_token(),
