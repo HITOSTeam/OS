@@ -1520,6 +1520,13 @@ impl File for OSInode {
                 None
             }
         };
+        // Linux runs the potentially sleeping part of fput from task/workqueue
+        // context.  Flush our per-description write buffer while the last fd
+        // is being closed, before the Arc can be reclaimed by the idle cleanup
+        // path where there is no current task to sleep on an inode rwsem.
+        if last_fd && self.writable {
+            let _ = self.flush_with_error();
+        }
         if let Some((dev, ino)) = key {
             unregister_write_open_inode(dev, ino);
         }
@@ -1692,18 +1699,22 @@ impl File for OSInode {
 
 impl Drop for OSInode {
     fn drop(&mut self) {
-        let inode_key = {
+        let inode_key = (self.inode_device_id, self.inode_num);
+        // A read-only close does not need i_rwsem.  Linux ext4_release_file()
+        // only enters write-side data synchronization for a last writer; an
+        // unconditional inode write lock here can deadlock idle-side fput with
+        // file-backed page faults that hold a read lock while sleeping on I/O.
+        let has_pending_write = self.writable && !self.inner.lock().write_buf.is_empty();
+        if has_pending_write {
             let _inode_guard = self.inode_lock.write();
             let mut inner = self.inner.lock();
-            let inode_key = (inner.inode.device_id(), inner.inode.inode_num());
             if !inner.write_buf.is_empty() {
                 let off = inner.write_buf_off;
                 let data = core::mem::take(&mut inner.write_buf);
                 let _ = Self::write_at_zeroing_gap(&inner.inode, off, &data);
                 Self::mark_write_buf_clean(&mut inner);
             }
-            inode_key
-        };
+        }
         crate::syscall::filesystem::release_flock_owner_for_inode(
             inode_key.0,
             inode_key.1,
