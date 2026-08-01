@@ -583,6 +583,8 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
     LAST_SYSCALL_A4.store(args[4], Ordering::Relaxed);
     LAST_SYSCALL_A5.store(args[5], Ordering::Relaxed);
     trace_syscall_entry(id, &args);
+    #[cfg(debug_assertions)]
+    let __perf_start = crate::perf::syscall_begin(id);
     let ret = match id {
         SYSCALL_GETCWD => filesystem::syscall_getcwd(args[0], args[1]),
         SYSCALL_FCNTL => filesystem::syscall_fcntl(args[0], args[1], args[2]),
@@ -1003,5 +1005,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             args[5]
         );
     }
+    #[cfg(debug_assertions)]
+    crate::perf::syscall_end(id, __perf_start);
     ret
 }
