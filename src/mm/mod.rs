@@ -25,6 +25,10 @@ use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
 #[allow(unused_imports)]
+pub use dtb::HartTopology;
+#[allow(unused_imports)]
+pub use dtb::hart_topology_from_dtb;
+#[allow(unused_imports)]
 pub use dtb::init_phys_mem_from_dtb;
 pub use frame_allocator::{
     FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages, frame_managed_pages,

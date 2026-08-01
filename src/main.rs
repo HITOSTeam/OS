@@ -6,7 +6,7 @@
 use core::{arch::global_asm, panic};
 extern crate alloc;
 use crate::fs::list_apps;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 mod arch;
 mod bpf;
 mod config;
@@ -48,6 +48,9 @@ static BOOT_BSS_CLEARED: AtomicBool = AtomicBool::new(false);
 // Secondary harts must not enter the scheduler before the boot hart finishes global init.
 #[unsafe(link_section = ".data")]
 static BOOT_GLOBAL_INIT_DONE: AtomicBool = AtomicBool::new(false);
+// QEMU's FDT-derived physical-hart mask.  It is published before the global
+// init barrier releases secondary harts.
+static BOOT_PRESENT_HART_MASK: AtomicUsize = AtomicUsize::new(0);
 
 fn clear_bss() {
     unsafe extern "C" {
@@ -64,25 +67,15 @@ fn clear_bss() {
 
 // boot hart will run this
 #[cfg(target_arch = "riscv64")]
-fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
-    // spin loop until the hart start
-    fn wait_until_online(hart_id: usize) -> bool {
-        let started_at = arch::read_time();
-        let timeout_ticks = config::clock_freq();
-        while task::manager::online_hart_mask() & (1usize << hart_id) == 0 {
-            if arch::read_time().wrapping_sub(started_at) >= timeout_ticks {
-                return false;
-            }
-            core::hint::spin_loop();
-        }
-        true
-    }
-
+fn start_other_harts(boot_hart_id: usize, dtb_pa: usize, present_mask: usize) {
     // Mark the boot hart online immediately. Secondary harts become online only
     // after they finish their own trap/timer setup and are about to enter idle.
     task::manager::mark_hart_online(boot_hart_id);
+    let mut started_mask = 1usize << boot_hart_id;
+    let mut failed_mask = 0usize;
     for hart_id in 0..config::MAX_HARTS {
-        if hart_id == boot_hart_id {
+        let hart_bit = 1usize << hart_id;
+        if hart_id == boot_hart_id || present_mask & hart_bit == 0 {
             continue;
         }
         let error = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
@@ -91,17 +84,37 @@ fn start_other_harts(boot_hart_id: usize, dtb_pa: usize) {
                 "[kernel] failed to start hart {} via SBI HSM: error={}",
                 hart_id, error as isize
             );
+            failed_mask |= hart_bit;
             continue;
         }
-        // Bring harts up one at a time.  This keeps early per-hart
-        // initialization deterministic and ensures userspace cannot observe a
-        // transiently incomplete online mask immediately after boot.
-        if !wait_until_online(hart_id) {
+        started_mask |= hart_bit;
+    }
+
+    let started_at = arch::read_time();
+    let timeout_ticks = config::clock_freq().saturating_mul(5);
+    loop {
+        let online = task::manager::online_hart_mask();
+        if online & started_mask == started_mask {
             println!(
-                "[kernel] timed out waiting for hart {} to become online",
-                hart_id
+                "[kernel] riscv64 SMP online mask {:#x} ({} harts), failed={:#x}",
+                online & present_mask,
+                (online & present_mask).count_ones(),
+                failed_mask
             );
+            return;
         }
+        if arch::read_time().wrapping_sub(started_at) >= timeout_ticks {
+            println!(
+                "[kernel] riscv64 SMP startup timeout: present={:#x} started={:#x} online={:#x} missing={:#x} failed={:#x}",
+                present_mask,
+                started_mask,
+                online,
+                started_mask & !online,
+                failed_mask
+            );
+            return;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -114,8 +127,15 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
     while !BOOT_GLOBAL_INIT_DONE.load(Ordering::SeqCst) {
         core::hint::spin_loop();
     }
+    let present_mask = BOOT_PRESENT_HART_MASK.load(Ordering::Acquire);
+    if hart_id >= config::MAX_HARTS || present_mask & (1usize << hart_id) == 0 {
+        loop {
+            arch::wait_for_interrupt();
+        }
+    }
     // Activate the page table built by the boot hart so we can safely run in S-mode.
     mm::activate_kernel_space();
+    arch::init_secondary_mmu_state();
     trap::init_trap();
     arch::init_external_interrupts();
     trap::trap::enable_timer_interrupt();
@@ -155,6 +175,12 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
             hart_id, dtb_pa
         );
         arch::bootstrap_init(dtb_pa);
+        let topology = mm::hart_topology_from_dtb(dtb_pa, hart_id);
+        BOOT_PRESENT_HART_MASK.store(topology.present_mask, Ordering::Release);
+        println!(
+            "[kernel] riscv64 boot hart {}, FDT harts={} mask={:#x} ignored={}",
+            hart_id, topology.discovered, topology.present_mask, topology.ignored
+        );
         mm::init_phys_mem_from_dtb(dtb_pa);
         mm::init();
         mm::remap_test();
@@ -165,7 +191,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         }
         println!("[kernel] memory management initialized.");
         BOOT_GLOBAL_INIT_DONE.store(true, Ordering::SeqCst);
-        start_other_harts(hart_id, dtb_pa);
+        start_other_harts(hart_id, dtb_pa, topology.present_mask);
         trap::init_trap();
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();

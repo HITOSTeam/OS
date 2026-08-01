@@ -62,6 +62,7 @@ fn detect_isa_extension(dtb_pa: usize, extension: &[u8]) -> bool {
 
 #[allow(dead_code)]
 pub fn bootstrap_init(dtb_pa: usize) {
+    crate::sbi::init();
     if let Some(freq) = detect_timebase_frequency(dtb_pa) {
         crate::config::set_clock_freq(freq);
         crate::println!("[kernel] riscv timebase frequency: {} Hz", freq);
@@ -70,6 +71,16 @@ pub fn bootstrap_init(dtb_pa: usize) {
     RISCV_HAS_SSTC.store(has_sstc, Ordering::Release);
     if has_sstc {
         crate::println!("[kernel] riscv sstc timer enabled");
+    }
+}
+
+/// Discard firmware/boot-time translations and instruction-cache state before
+/// a secondary hart becomes visible to the scheduler.
+pub fn init_secondary_mmu_state() {
+    // SAFETY: both fences are privileged architectural synchronization
+    // operations valid in S-mode during per-hart initialization.
+    unsafe {
+        asm!("sfence.vma", "fence.i", options(nostack));
     }
 }
 
