@@ -338,9 +338,11 @@ impl DtbData {
 
 /// 在堆和内存管理初始化前，恰好一次地解析并发布启动 DTB。
 pub fn init(dtb_pa: usize, boot_hart_id: usize) {
+    //once 类型的数据使用callone初始化一次
     DTB_DATA.call_once(|| DtbData::parse(dtb_pa, boot_hart_id));
 }
 
+///返回失败说明有人在初始化之前访问数据
 pub fn data() -> &'static DtbData {
     DTB_DATA
         .get()

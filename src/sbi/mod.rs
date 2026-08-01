@@ -32,6 +32,22 @@ mod riscv {
         ret
     }
 
+    fn sbi_call4(which: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> usize {
+        let mut ret;
+        // SAFETY: ecall 遵循 RISC-V SBI 调用约定；四个参数依次放入 a0-a3。
+        unsafe {
+            asm!(
+                "ecall",
+                inlateout("x10") arg0 => ret,
+                in("x11") arg1,
+                in("x12") arg2,
+                in("x13") arg3,
+                in("x17") which,
+            );
+        }
+        ret
+    }
+
     fn sbi_call_ext(eid: usize, fid: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
         let mut ret;
         // SAFETY: ecall follows RISC-V SBI calling convention; args in a0-a2, fid in a6, eid in a7.
@@ -105,6 +121,25 @@ mod riscv {
         }
     }
 
+    /// 仅失效指定 ASID 在目标 hart 上的全部非全局翻译。
+    ///
+    /// 使用 legacy SBI 的 `remote_sfence_vma_asid`，与现有远端全量失效共用
+    /// 同一份低地址 hart mask 存储。QEMU 默认 OpenSBI 支持该接口。
+    pub fn remote_sfence_vma_asid(hart_mask: usize, asid: usize) {
+        if hart_mask == 0 {
+            return;
+        }
+        let _g = IPI_LOCK.lock();
+        // SAFETY: hart mask 的地址与 remote_sfence_vma_all 相同，均为固件可访问的
+        // 恒等映射内核地址；start=0,size=0 表示该 ASID 的完整地址空间。
+        unsafe {
+            IPI_HART_MASK = hart_mask;
+            let mask_ptr = &raw const IPI_HART_MASK as usize;
+            sbi_call4(SBI_REMOTE_SFENCE_VMA_ASID, mask_ptr, 0, 0, asid);
+            IPI_HART_MASK = 0;
+        }
+    }
+
     pub fn shutdown() -> ! {
         sbi_call(SBI_SHUTDOWN, 0, 0, 0);
         panic!("It should shutdown!");
@@ -149,6 +184,10 @@ mod stub {
 
     pub fn remote_sfence_vma_all(_hart_mask: usize) {
         unsupported("remote_sfence_vma_all");
+    }
+
+    pub fn remote_sfence_vma_asid(_hart_mask: usize, _asid: usize) {
+        unsupported("remote_sfence_vma_asid");
     }
 
     pub fn shutdown() -> ! {

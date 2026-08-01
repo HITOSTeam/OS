@@ -158,7 +158,7 @@ pub(crate) fn cleanup_namespace(ns_id: usize) {
 
 /// 驱动网络栈前进一步：处理 dev 中积压的数据包，推进所有 socket 的状态机，
 /// 并将待发送的应答包（ACK、SYN-ACK 等）写回 dev。
-/// 完成后通知等待网络事件的 task 重新检查（类似软中断下半部）。
+/// 仅在协议栈实际处理或发出报文后，通知等待网络事件的 task 重新检查。
 pub fn poll_in(ns_id: usize) {
     init_in(ns_id);
     let mut net = NET.lock();
@@ -166,9 +166,11 @@ pub fn poll_in(ns_id: usize) {
         return;
     };
     sync_iface_ip_addrs(ns_id, &mut stack.iface);
-    let _ = stack.iface.poll(now(), &mut stack.dev, &mut stack.sockets);
+    let changed = stack.iface.poll(now(), &mut stack.dev, &mut stack.sockets);
     drop(net);
-    crate::fs::notify_net_poll_events_in(ns_id);
+    if changed {
+        crate::fs::notify_net_poll_events_in(ns_id);
+    }
     drain_pending_veth_ip_deliveries();
 }
 

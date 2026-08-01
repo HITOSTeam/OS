@@ -176,6 +176,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         BOOT_BSS_CLEARED.store(true, Ordering::Release);
         //标记现在某个核心去读取DTB
         arch::DTB_data::init(dtb_pa, hart_id);
+        //保存userapp的数量，这个是rcore教学里面的，我们现在先保留
         let num_of_apps = unsafe { *(num_user_apps as *const i64) };
         println!(
             "Number of user apps: {}, from adress {}",

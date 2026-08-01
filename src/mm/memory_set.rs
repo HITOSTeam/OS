@@ -85,6 +85,22 @@ fn riscv_satp_asid(token: usize) -> usize {
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
+pub(crate) fn riscv_satp_has_user_asid(token: usize) -> bool {
+    riscv_satp_asid(token) != 0
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub(crate) fn riscv_write_satp_without_flush(token: usize) {
+    // SAFETY: 调用方只在两个不同 ASID 之间切换，且没有修改对应页表；保留
+    // 各自已有的 TLB 项可避免块 I/O 往返时反复丢失用户地址空间的热翻译。
+    unsafe {
+        satp::write(Satp::from_bits(token));
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
 fn riscv_write_satp_and_flush_asid(token: usize) {
     let asid = riscv_satp_asid(token);
     // SAFETY: `token` is a kernel-created SATP value. Using a non-x0 rs2 keeps
@@ -117,6 +133,10 @@ pub struct MemorySet {
     page_table: PageTable,
     #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
     asid: Arc<AsidContext>,
+    /// 新建用户页表在发布给任务前不可能残留硬件 TLB 项，构造阶段可以合并
+    /// 每个 VMA 原本会触发的无效化操作。
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    defer_user_tlb_flush: bool,
     /// 已物化页的跟踪表，包括 frame、COW 和 PROT_NONE 保存的 PTE 标志。
     areas: Vec<MapArea>,
     /// 用户态 VMA 的权威元数据，类似 Linux mm_struct 里的 VMA 集合。
@@ -286,6 +306,8 @@ impl MemorySet {
             page_table: PageTable::new(),
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
             asid: Arc::new(AsidContext::new()),
+            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+            defer_user_tlb_flush: false,
             areas: Vec::new(),
             vm_regions: VmRegionSet::new(),
             sysv_shm_attaches: Vec::new(),
@@ -303,33 +325,72 @@ impl MemorySet {
             has_user_kernel_mappings: false,
         }
     }
+
+    /// 构造尚未安装到任何 hart 的用户地址空间。
+    fn new_user_bare() -> Self {
+        let mut memory_set = Self::new_bare();
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            memory_set.defer_user_tlb_flush = true;
+        }
+        memory_set
+    }
+
+    fn finish_user_build(&mut self) {
+        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+        {
+            self.defer_user_tlb_flush = false;
+        }
+    }
+
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    #[inline]
+    fn user_tlb_flush_deferred(&self) -> bool {
+        self.defer_user_tlb_flush
+    }
+
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
 
     #[cfg(target_arch = "loongarch64")]
     pub fn flush_user_tlb(&self) {
+        if self.user_tlb_flush_deferred() {
+            return;
+        }
         crate::arch::loongarch64::mm::drop_user_asid(self.asid.as_ref());
     }
 
     #[cfg(target_arch = "riscv64")]
     pub fn flush_user_tlb(&self) {
+        if self.user_tlb_flush_deferred() {
+            return;
+        }
         crate::arch::riscv64::mm::flush_user_all(self.asid.as_ref());
         crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
     }
 
     #[cfg(target_arch = "loongarch64")]
     pub fn flush_user_page(&self, va: usize) {
+        if self.user_tlb_flush_deferred() {
+            return;
+        }
         crate::arch::loongarch64::mm::flush_user_page(self.asid.as_ref(), va);
     }
 
     #[cfg(target_arch = "riscv64")]
     pub fn flush_user_page(&self, va: usize) {
+        if self.user_tlb_flush_deferred() {
+            return;
+        }
         crate::arch::riscv64::mm::flush_user_page(self.asid.as_ref(), va);
     }
 
     #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
     pub fn flush_local_user_page(&self, va: usize) {
+        if self.user_tlb_flush_deferred() {
+            return;
+        }
         #[cfg(target_arch = "loongarch64")]
         crate::arch::loongarch64::mm::flush_local_user_page(self.asid.as_ref(), va);
         #[cfg(target_arch = "riscv64")]
@@ -338,6 +399,9 @@ impl MemorySet {
 
     #[cfg(target_arch = "riscv64")]
     pub fn flush_user_tlb_all(&self) {
+        if self.user_tlb_flush_deferred() {
+            return;
+        }
         crate::arch::riscv64::mm::flush_user_all(self.asid.as_ref());
     }
 
@@ -2296,7 +2360,7 @@ impl MemorySet {
     /// also returns user_sp and entry poremove_areeint.
     /// 用户占 被设计为 程序地址 (虚拟地址) 的最高端.
     pub fn from_elf(elf_data: &[u8]) -> Result<(Self, usize, usize, ElfAux), isize> {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_user_bare();
         // map trap trampoline (kernel-only) and sigreturn trampoline (user accessible)
         if !memory_set.map_user_trampoline_pages() {
             return Err(ENOMEM);
@@ -2411,6 +2475,7 @@ impl MemorySet {
         memory_set.reset_user_layout(user_stack_bottom);
         // map TrapContext
         assert!(memory_set.try_insert_initial_trap_context());
+        memory_set.finish_user_build();
         // Return user_stack_bottom as ustack_base for thread allocation
         // Each thread will calculate its stack as: ustack_base + tid * (PAGE_SIZE + USER_STACK_SIZE)
         Ok((
@@ -2456,7 +2521,7 @@ impl MemorySet {
     where
         F: FnMut(usize, &mut [u8]) -> usize,
     {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_user_bare();
         if !memory_set.map_user_trampoline_pages() {
             return Err(ENOMEM);
         }
@@ -2506,6 +2571,7 @@ impl MemorySet {
         if !memory_set.try_insert_initial_trap_context() {
             return Err(ENOMEM);
         }
+        memory_set.finish_user_build();
 
         Ok((
             memory_set,
@@ -2687,7 +2753,7 @@ impl MemorySet {
         main_elf: &[u8],
         interp_elf: &[u8],
     ) -> Result<(Self, usize, usize, usize, ElfAux, usize), isize> {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_user_bare();
         if !memory_set.map_user_trampoline_pages() {
             return Err(ENOMEM);
         }
@@ -2757,6 +2823,7 @@ impl MemorySet {
         memory_set.reset_user_layout(user_stack_bottom);
         // map TrapContext
         assert!(memory_set.try_insert_initial_trap_context());
+        memory_set.finish_user_build();
 
         Ok((
             memory_set,
@@ -2809,7 +2876,7 @@ impl MemorySet {
     where
         F: FnMut(usize, &mut [u8]) -> usize,
     {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_user_bare();
         if !memory_set.map_user_trampoline_pages() {
             return Err(ENOMEM);
         }
@@ -2870,6 +2937,7 @@ impl MemorySet {
         if !memory_set.try_insert_initial_trap_context() {
             return Err(ENOMEM);
         }
+        memory_set.finish_user_build();
 
         Ok((
             memory_set,
@@ -2892,7 +2960,7 @@ impl MemorySet {
         } else {
             0
         };
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_user_bare();
         assert!(memory_set.map_user_trampoline_pages());
 
         let mut parent_update_count = 0usize;
@@ -3010,20 +3078,10 @@ impl MemorySet {
             // After fork demotes parent PTEs from writable to read-only+COW,
             // the parent must not resume with stale writable translations.
             //
-            // RISC-V updates the parent's active page table in-place, so the
-            // current hart must flush stale writable translations immediately.
-            // Other harts that may already be executing the same mm need a
-            // remote shootdown as well.
+            // RISC-V 原地修改父进程页表时，只需刷新实际运行过该 mm 的 hart。
             #[cfg(target_arch = "riscv64")]
             {
-                let remote_hart_mask =
-                    crate::task::manager::online_hart_mask() & !(1usize << crate::arch::hart_id());
-                unsafe {
-                    asm!("sfence.vma");
-                }
-                if remote_hart_mask != 0 {
-                    crate::sbi::remote_sfence_vma_all(remote_hart_mask);
-                }
+                user_space.flush_user_tlb_all();
             }
             // SAFETY: LoongArch64 currently runs single-core only (no SMP boot),
             // so dropping this address space's ASID is sufficient. When SMP is
@@ -3066,6 +3124,7 @@ impl MemorySet {
         }
 
         memory_set.inherit_user_vm_metadata_from(user_space);
+        memory_set.finish_user_build();
         memory_set
     }
 
@@ -3074,7 +3133,7 @@ impl MemorySet {
     /// This is slower than COW but avoids COW corner cases on some platforms.
     #[allow(dead_code)]
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
-        let mut memory_set = Self::new_bare();
+        let mut memory_set = Self::new_user_bare();
         assert!(memory_set.map_user_trampoline_pages());
         let mut src_walk_cache = PageWalkCache::new();
         let mut dst_walk_cache = PageWalkCache::new();
@@ -3143,6 +3202,7 @@ impl MemorySet {
         }
 
         memory_set.inherit_user_vm_metadata_from(user_space);
+        memory_set.finish_user_build();
         memory_set
     }
 

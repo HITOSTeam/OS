@@ -218,7 +218,7 @@ pub fn flush_user_all(ctx: &AsidContext) {
     if asid_fast_path_enabled() && ctx.valid_for(generation) {
         let asid = ctx.asid.load(Ordering::Acquire);
         let remote_mask = ctx.remote_active_harts();
-        crate::sbi::remote_sfence_vma_all(remote_mask);
+        crate::sbi::remote_sfence_vma_asid(remote_mask, asid);
         // SAFETY: ASID 由内核分配；仅清除当前 hart 上属于该地址空间的翻译。
         unsafe {
             asm!(
@@ -228,7 +228,10 @@ pub fn flush_user_all(ctx: &AsidContext) {
             );
         }
     } else {
-        // SAFETY: 尚未分配 ASID 时，本地全量刷新可清除 ASID 0 的旧翻译。
+        // 未分配 ASID 时所有用户页表共用 ASID 0，远端也必须失效，不能只刷新
+        // 当前 hart；active_hart_mask 只包含曾装入过当前页表的 CPU。
+        crate::sbi::remote_sfence_vma_all(ctx.remote_active_harts());
+        // SAFETY: 本地全量刷新可清除 ASID 0 的旧翻译。
         unsafe {
             asm!("sfence.vma", options(nostack));
         }
@@ -260,14 +263,11 @@ pub fn flush_user_page(ctx: &AsidContext, vaddr: usize) {
     let generation = ASID_GENERATION.load(Ordering::Acquire);
     if asid_fast_path_enabled() && ctx.valid_for(generation) {
         let asid = ctx.asid.load(Ordering::Acquire);
-        // 同一个 mm 的线程可能在其他 hart 上运行，或者该 mm 最近曾在其他
-        // hart 上留下 TLB 项。先请求远端完整刷新，再清除本地指定 ASID/页。
-        // 当前 SBI 封装尚未提供按 ASID 的远端接口，页表更新远少于 trap
-        // 返回，因此这里采用正确性优先的远端全量 shootdown。
+        // 同一个 mm 的线程可能在其他 hart 上运行，或在迁移前留下 TLB 项。
+        // 仅失效该 mm 的 ASID，保留其他进程和内核的热翻译。
         let remote_mask = ctx.remote_active_harts();
-        crate::sbi::remote_sfence_vma_all(remote_mask);
-        // SAFETY: the address and ASID are kernel-managed; this invalidates one
-        // non-global user translation while preserving unrelated ASIDs.
+        crate::sbi::remote_sfence_vma_asid(remote_mask, asid);
+        // SAFETY: 地址和 ASID 均由内核管理；这只会失效对应的非全局用户翻译。
         unsafe {
             asm!(
                 "sfence.vma {addr}, {asid}",
@@ -277,7 +277,10 @@ pub fn flush_user_page(ctx: &AsidContext, vaddr: usize) {
             );
         }
     } else {
-        // SAFETY: when no valid ASID is assigned, flush the address for all ASIDs.
+        // 无有效 ASID 时不能按 ASID 定向失效；先清除曾运行过该页表的远端 hart，
+        // 再按地址清除本地所有 ASID 的翻译。
+        crate::sbi::remote_sfence_vma_all(ctx.remote_active_harts());
+        // SAFETY: 此时按地址刷新所有 ASID 的翻译。
         unsafe {
             asm!("sfence.vma {addr}, zero", addr = in(reg) vaddr, options(nostack));
         }
