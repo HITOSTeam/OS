@@ -135,13 +135,38 @@ impl VmaInsertArea {
 #[derive(Clone, Default)]
 pub(super) struct VmRegionSet {
     pub(super) regions: BTreeMap<usize, VmRegion>,
+    anon_private_writable_bytes: usize,
 }
 
 impl VmRegionSet {
     pub(super) fn new() -> Self {
         Self {
             regions: BTreeMap::new(),
+            anon_private_writable_bytes: 0,
         }
+    }
+
+    fn committed_charge(region: VmRegion) -> usize {
+        if region.is_mmap()
+            && region.is_private_anonymous()
+            && region.map_permission().contains(MapPermission::W)
+        {
+            region.len
+        } else {
+            0
+        }
+    }
+
+    fn remove_by_start(&mut self, start: usize) -> Option<VmRegion> {
+        let region = self.regions.remove(&start)?;
+        self.anon_private_writable_bytes = self
+            .anon_private_writable_bytes
+            .saturating_sub(Self::committed_charge(region));
+        Some(region)
+    }
+
+    pub(super) fn anon_private_writable_bytes(&self) -> usize {
+        self.anon_private_writable_bytes
     }
 
     /// 按起始地址升序遍历所有 VmRegion。
@@ -225,6 +250,14 @@ impl VmRegionSet {
         }
         let old = self.regions.insert(region.start, region);
         debug_assert!(old.is_none(), "VmRegionSet replaced an existing start key");
+        if let Some(old_region) = old {
+            self.anon_private_writable_bytes = self
+                .anon_private_writable_bytes
+                .saturating_sub(Self::committed_charge(old_region));
+        }
+        self.anon_private_writable_bytes = self
+            .anon_private_writable_bytes
+            .saturating_add(Self::committed_charge(region));
     }
 
     /// 插入 region，并尝试与前驱和后继合并以减少碎片。
@@ -237,7 +270,7 @@ impl VmRegionSet {
         if let Some((&prev_key, prev)) = self.regions.range(..region.start).next_back() {
             let mut prev = *prev;
             if prev.merge_with(region) {
-                self.regions.remove(&prev_key);
+                self.remove_by_start(prev_key);
                 region = prev;
             }
         }
@@ -250,7 +283,7 @@ impl VmRegionSet {
             if !region.merge_with(next) {
                 break;
             }
-            self.regions.remove(&next_key);
+            self.remove_by_start(next_key);
         }
 
         self.insert_unmerged(region);
@@ -387,7 +420,7 @@ impl VmRegionSet {
     pub(super) fn trim_range(&mut self, start: usize, end: usize) {
         let overlaps = self.collect_overlaps_where(start, end, |_| true);
         for region in overlaps {
-            self.regions.remove(&region.start);
+            self.remove_by_start(region.start);
             let r_end = region.end();
             if start > region.start {
                 self.insert_merged(region.slice(region.start, start - region.start));
@@ -402,7 +435,7 @@ impl VmRegionSet {
     pub(super) fn trim_heap_range(&mut self, start: usize, end: usize) {
         let overlaps = self.collect_overlaps_where(start, end, |region| region.is_heap());
         for region in overlaps {
-            self.regions.remove(&region.start);
+            self.remove_by_start(region.start);
             let r_end = region.end();
             if start > region.start {
                 self.insert_merged(region.slice(region.start, start - region.start));
@@ -451,7 +484,7 @@ impl VmRegionSet {
         }
 
         for region in overlaps {
-            self.regions.remove(&region.start);
+            self.remove_by_start(region.start);
             let r_end = region.end();
             if start > region.start {
                 self.insert_merged(region.slice(region.start, start - region.start));
@@ -478,7 +511,7 @@ impl VmRegionSet {
         let old_end = old_addr.saturating_add(old_len);
         let overlaps = self.collect_overlaps_where(old_addr, old_end, |_| true);
         for region in overlaps {
-            self.regions.remove(&region.start);
+            self.remove_by_start(region.start);
             let r_end = region.end();
             let ov_start = core::cmp::max(old_addr, region.start);
             let ov_end = core::cmp::min(old_end, r_end);
@@ -514,7 +547,7 @@ impl VmRegionSet {
             return false;
         }
 
-        self.regions.remove(&region.start);
+        self.remove_by_start(region.start);
         if start > region.start {
             self.insert_unmerged(region.slice(region.start, start - region.start));
         }
@@ -527,7 +560,7 @@ impl VmRegionSet {
 
     /// 按起始地址找到对应 region 并更新其 len，更新后尝试与相邻 region 合并。
     pub(super) fn set_len_by_start(&mut self, start: usize, len: usize) -> bool {
-        let Some(mut region) = self.regions.remove(&start) else {
+        let Some(mut region) = self.remove_by_start(start) else {
             return false;
         };
         region.set_len(len);
@@ -542,7 +575,7 @@ impl VmRegionSet {
         len: usize,
         file_valid_len: usize,
     ) -> bool {
-        let Some(mut region) = self.regions.remove(&start) else {
+        let Some(mut region) = self.remove_by_start(start) else {
             return false;
         };
         region.set_len_and_file_valid(len, file_valid_len);
@@ -560,7 +593,7 @@ impl VmRegionSet {
         file_valid_len: usize,
         sigbus_start: usize,
     ) -> bool {
-        let Some(mut region) = self.regions.remove(&start) else {
+        let Some(mut region) = self.remove_by_start(start) else {
             return false;
         };
         if region.file_dev != dev || region.file_ino != ino {
@@ -629,11 +662,11 @@ impl VmRegionSet {
 
     /// 将 old_start 处的 growsdown region 向下扩展到 new_start。
     pub(super) fn expand_growsdown_at(&mut self, old_start: usize, new_start: usize) -> bool {
-        let Some(mut region) = self.regions.remove(&old_start) else {
+        let Some(mut region) = self.remove_by_start(old_start) else {
             return false;
         };
         if !region.growsdown {
-            self.regions.insert(old_start, region);
+            self.insert_unmerged(region);
             return false;
         };
         region.expand_down_to(new_start);

@@ -1494,6 +1494,22 @@ impl ProcessControlBlock {
         self.inner.try_lock()
     }
 
+    /// Pin this process's address space without retaining the PCB lock.
+    ///
+    /// This is the local equivalent of Linux `get_task_mm()`: only the short
+    /// task lookup is protected by the task lock; callers then acquire the
+    /// sleeping mmap lock independently.  Keeping the monolithic PCB spinlock
+    /// while waiting for MemorySet can otherwise strand the mm owner and make
+    /// signal/procfs walkers spin behind the same process.
+    pub fn memory_set(&self) -> MmRef {
+        self.borrow_mut().memory_set.clone()
+    }
+
+    /// Non-blocking variant used by best-effort procfs/global-mm scans.
+    pub fn try_memory_set(&self) -> Option<MmRef> {
+        self.try_borrow_mut().map(|inner| inner.memory_set.clone())
+    }
+
     pub(crate) fn files(&self) -> Arc<FilesLock> {
         let inner = self.borrow_mut();
         Arc::clone(&inner.files)

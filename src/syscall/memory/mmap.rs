@@ -266,7 +266,14 @@ fn mmap_packet_socket_ring(
     }
 
     let process = current_process();
-    let inner = process.borrow_mut();
+    // The PCB spinlock only protects the MmRef pointer.  Linux serializes
+    // mmap through the mm's mmap_lock and never keeps tasklist/task locks
+    // across filesystem I/O.  Clone the stable mm handle and release the PCB
+    // before private file mappings can wait on the inode rwsem.
+    let mm = {
+        let inner = process.borrow_mut();
+        inner.memory_set.clone()
+    };
     let is_fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     let start = if is_fixed {
         if addr == 0 || addr % PAGE_SIZE != 0 {
@@ -274,7 +281,7 @@ fn mmap_packet_socket_ring(
         }
         addr
     } else {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let Some(start) =
             memory_set.find_free_mmap_range((addr != 0).then_some(addr), map_len, USER_VA_TOP)
         else {
@@ -294,7 +301,7 @@ fn mmap_packet_socket_ring(
     }
 
     let lock_range = {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         if !is_fixed && !memory_set.user_range_is_free(start, end, USER_VA_TOP) {
             return err(SyscallError::ENOMEM);
         }
@@ -342,7 +349,7 @@ fn mmap_packet_socket_ring(
     };
     let areas = vec![VmaInsertArea::Framed { start, end }];
     let replace_existing = (flags & MAP_FIXED) != 0;
-    let mut memory_set = inner.memory_set.lock();
+    let mut memory_set = mm.lock();
     let inserted = commit_mmap_vma(
         &mut memory_set,
         replace_existing,
@@ -363,7 +370,6 @@ fn mmap_packet_socket_ring(
     }
     let token = memory_set.token();
     drop(memory_set);
-    drop(inner);
 
     if replace_existing {
         crate::syscall::net::clear_packet_ring_mmaps_for_range(token, start, end);
@@ -508,7 +514,13 @@ pub fn syscall_mmap(
     }
 
     let process = current_process();
-    let inner = process.borrow_mut();
+    // Keep only the address-space reference while mmap validates and commits
+    // the VMA.  Private file mappings may sleep on the inode rwsem while they
+    // populate pages; a PCB ticket lock must never span that wait.
+    let mm = {
+        let inner = process.borrow_mut();
+        inner.memory_set.clone()
+    };
 
     // 非 MAP_FIXED 时 addr 仅作为地址建议；MemorySet 会从高地址向下找空闲区间，
     // 找不到时回退到 brk 附近的低地址（与 Linux 行为一致）。
@@ -519,7 +531,7 @@ pub fn syscall_mmap(
         }
         addr
     } else {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let Some(start) =
             memory_set.find_free_mmap_range((addr != 0).then_some(addr), map_len, USER_VA_TOP)
         else {
@@ -542,7 +554,7 @@ pub fn syscall_mmap(
     let perm = VmRegion::permission_from_prot(prot);
     // 是否锁定 对应区间,目前还没有swap 实现(TODO)
     let lock_range = {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         // 非 MAP_FIXED 时目标区间必须在两套数据结构中均空闲，vma 以及 真实数据映射
         if !is_fixed && !memory_set.user_range_is_free(map_start, map_end, USER_VA_TOP) {
             return err(SyscallError::ENOMEM);
@@ -664,7 +676,7 @@ pub fn syscall_mmap(
     let populate_file = should_populate_file.then_some(backing_file).flatten();
     let replace_existing = (flags & MAP_FIXED) != 0;
     let (detached_shmids, fixed_packet_ring_token) = {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let fixed_attach_update = if replace_existing {
             let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
             let Some(release_shmids) =
@@ -706,7 +718,6 @@ pub fn syscall_mmap(
         (detached_shmids, clear_token)
     };
     let pid = process.getpid() as u32;
-    drop(inner);
     if let Some(token) = fixed_packet_ring_token {
         crate::syscall::net::clear_packet_ring_mmaps_for_range(token, map_start, map_end);
     }

@@ -1,10 +1,86 @@
 //! memoryset 多进程、多线程包装。
 use super::*;
-use spin::MutexGuard;
+use crate::sync::{KernelMutex, KernelMutexGuard};
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Linux exposes `vm_committed_as` through a percpu counter instead of walking
+/// every task and taking every `mmap_lock` on each `/proc/meminfo` read.  A
+/// single relaxed counter is sufficient for this smaller kernel.
+static VM_COMMITTED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+struct MmState {
+    memory_set: KernelMutex<MemorySet>,
+    committed_bytes: AtomicUsize,
+}
+
+impl MmState {
+    fn new(memory_set: MemorySet) -> Self {
+        let committed_bytes = memory_set.committed_vm_bytes();
+        VM_COMMITTED_BYTES.fetch_add(committed_bytes, Ordering::Relaxed);
+        Self {
+            memory_set: KernelMutex::new(memory_set),
+            committed_bytes: AtomicUsize::new(committed_bytes),
+        }
+    }
+
+    fn update_committed_bytes(&self, committed_bytes: usize) {
+        let previous = self.committed_bytes.load(Ordering::Relaxed);
+        if committed_bytes == previous {
+            return;
+        }
+        self.committed_bytes
+            .store(committed_bytes, Ordering::Relaxed);
+        if committed_bytes >= previous {
+            VM_COMMITTED_BYTES.fetch_add(committed_bytes - previous, Ordering::Relaxed);
+        } else {
+            VM_COMMITTED_BYTES.fetch_sub(previous - committed_bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for MmState {
+    fn drop(&mut self) {
+        VM_COMMITTED_BYTES.fetch_sub(
+            self.committed_bytes.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+pub struct MmGuard<'a> {
+    guard: KernelMutexGuard<'a, MemorySet>,
+    state: &'a MmState,
+}
+
+impl Deref for MmGuard<'_> {
+    type Target = MemorySet;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for MmGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for MmGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .update_committed_bytes(self.guard.committed_vm_bytes());
+    }
+}
 
 #[derive(Clone)]
 pub struct MmRef {
-    inner: Arc<Mutex<MemorySet>>,
+    /// Linux protects the VMA tree with `mm_struct::mmap_lock`, a sleeping
+    /// rwsem.  MemorySet is still serialized exclusively for now, but it must
+    /// likewise sleep under contention: mmap and file-backed fault paths may
+    /// block on I/O while the address-space lock is held.
+    inner: Arc<MmState>,
     /// Serialize only the rare slow retry path after repeated optimistic fault
     /// commit races. Normal faults never acquire this lock.
     pub(super) fault_retry_lock: Arc<crate::sync::KernelMutex<()>>,
@@ -25,7 +101,7 @@ impl MmRef {
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         let asid = Arc::clone(&memory_set.asid);
         Self {
-            inner: Arc::new(Mutex::new(memory_set)),
+            inner: Arc::new(MmState::new(memory_set)),
             fault_retry_lock: Arc::new(crate::sync::KernelMutex::new(())),
             token,
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
@@ -34,8 +110,16 @@ impl MmRef {
     }
 
     /// 获取 MemorySet 的互斥锁守卫。
-    pub fn lock(&self) -> MutexGuard<'_, MemorySet> {
-        self.inner.lock()
+    pub fn lock(&self) -> MmGuard<'_> {
+        MmGuard {
+            guard: self.inner.memory_set.lock(),
+            state: self.inner.as_ref(),
+        }
+    }
+
+    /// Current system-wide committed address-space bytes.
+    pub fn global_committed_bytes() -> usize {
+        VM_COMMITTED_BYTES.load(Ordering::Relaxed)
     }
 
     /// 返回页表根地址 token（用于切换地址空间）。

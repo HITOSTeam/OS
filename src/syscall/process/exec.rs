@@ -668,9 +668,7 @@ fn execve_with_inode(
         let inode = Arc::clone(&inode);
         let inode_lock = ext4_inode_lock(&inode);
         let _inode_guard = inode_lock.read();
-        let mut read_at = |offset: usize, buf: &mut [u8]| {
-            inode.read_at(offset, buf)
-        };
+        let mut read_at = |offset: usize, buf: &mut [u8]| inode.read_at(offset, buf);
         match crate::mm::elf_load_info_from_reader(&mut read_at) {
             Ok(v) => Some(v),
             Err(ENOEXEC) => None,
@@ -689,16 +687,19 @@ fn execve_with_inode(
             }
             let inode = Arc::clone(&inode);
             let inode_lock = ext4_inode_lock(&inode);
-            let _inode_guard = inode_lock.read();
-            let loader = |offset: usize, buf: &mut [u8]| {
-                inode.read_at(offset, buf)
-            };
+            let inode_guard = inode_lock.read();
+            let loader = |offset: usize, buf: &mut [u8]| inode.read_at(offset, buf);
             let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
                 match MemorySet::from_elf_with_interp_info_reader(loader, &info, &interp_data.data)
                 {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
+            // Linux does not carry an inode's i_rwsem into exec commit or
+            // vfork completion.  In particular, wake_vfork_parent_waiters()
+            // may contend on the parent's process lock, so retaining this
+            // read guard would make an inode -> parent lock edge.
+            drop(inode_guard);
             let process = current_process();
             process.exec_dyn_with_memory_set(
                 memory_set,
@@ -720,15 +721,17 @@ fn execve_with_inode(
 
         let inode = Arc::clone(&inode);
         let inode_lock = ext4_inode_lock(&inode);
-        let _inode_guard = inode_lock.read();
-        let loader = |offset: usize, buf: &mut [u8]| {
-            inode.read_at(offset, buf)
-        };
+        let inode_guard = inode_lock.read();
+        let loader = |offset: usize, buf: &mut [u8]| inode.read_at(offset, buf);
         let (memory_set, ustack_base, entry_point, elf_aux) =
             match MemorySet::from_elf_info_reader(loader, &info) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
+        // The ELF image has been materialized.  Drop the inode read side
+        // before replacing the mm and notifying a vfork parent, matching
+        // Linux's separation between file loading and exec commit.
+        drop(inode_guard);
         let process = current_process();
         process.exec_with_memory_set(
             memory_set,

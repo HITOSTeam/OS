@@ -982,16 +982,17 @@ impl MemorySet {
     }
 
     pub fn anon_private_writable_vm_bytes(&self) -> usize {
-        self.vm_regions.iter().fold(0usize, |sum, region| {
-            if region.is_mmap()
-                && Self::vm_region_is_private_anonymous(*region)
-                && region.map_permission().contains(MapPermission::W)
-            {
-                sum.saturating_add(region.len)
-            } else {
-                sum
-            }
-        })
+        self.vm_regions.anon_private_writable_bytes()
+    }
+
+    /// Bytes charged by this address space to the overcommit statistic.
+    ///
+    /// Linux updates `vm_committed_as` at mapping mutation points and reads a
+    /// global counter from `/proc/meminfo`; keeping VMA accounting inside
+    /// `VmRegionSet` gives the same O(1) read path without scanning every VMA.
+    pub fn committed_vm_bytes(&self) -> usize {
+        self.heap_size()
+            .saturating_add(self.anon_private_writable_vm_bytes())
     }
 
     pub fn vm_regions_overlap(&self, start: usize, end: usize) -> bool {
