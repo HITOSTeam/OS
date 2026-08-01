@@ -20,9 +20,9 @@ use virtio_drivers::{
 use crate::sync::{LocalIrqSaveGuard, WaitQueue};
 
 const MAX_TRACKED_REQUESTS: usize = 32;
-// Poll in small batches so IRQ completion can interleave between queue-lock
-// acquisitions. The caller cannot sleep yet because ext4 may hold spin-based
-// inode or directory locks across this synchronous BlockDevice call.
+// Linux blk_hctx_poll() busy-polls only while the current task does not need
+// rescheduling.  A small fixed budget is sufficient for QEMU's short VirtIO
+// completion latency and avoids a sleep/wakeup cycle for every 4 KiB request.
 const COMPLETION_POLL_SPINS: usize = 64;
 const STALL_WARNING_MS: usize = 1_000;
 // Linux blk-mq defaults to a 30-second request timeout when a driver does not
@@ -320,7 +320,7 @@ impl<H: Hal, T: Transport> AsyncVirtIOBlock<H, T> {
         } else {
             let mut polled_completions = 0;
             while !request.completed.load(Ordering::Acquire) {
-                for _ in 0..COMPLETION_POLL_SPINS {
+                for spin in 0..COMPLETION_POLL_SPINS {
                     if request.completed.load(Ordering::Acquire) {
                         break;
                     }
@@ -328,18 +328,20 @@ impl<H: Hal, T: Transport> AsyncVirtIOBlock<H, T> {
                     if request.completed.load(Ordering::Acquire) {
                         break;
                     }
+                    // Match Linux blk_hctx_poll(): stop burning CPU once the
+                    // scheduler has higher-priority work to run.
+                    if spin % 8 == 7 && crate::task::processor::should_resched_for_busy_poll() {
+                        break;
+                    }
                     core::hint::spin_loop();
                 }
                 if !request.completed.load(Ordering::Acquire) {
-                    // Linux can sleep after blk-mq submission because callers
-                    // hold sleepable mutexes/rwsems, not raw spinlocks. CongCore
-                    // ext4 still holds spin-based inode/directory locks across
-                    // block I/O. Scheduling their owner here can leave every
-                    // hart spinning on that lock while the owner is unable to
-                    // run. Keep the request and virtqueue fully concurrent,
-                    // but continue bounded polling until those filesystem locks
-                    // are converted to sleepable locks.
-                    core::hint::spin_loop();
+                    // Linux's poll loop returns at need_resched/budget expiry.
+                    // Our minimal block layer has no upper completion waiter,
+                    // so yield to the scheduler and resume polling. Keep the
+                    // request uninterruptible while DMA owns its buffers.
+                    self.cooperative_yields.fetch_add(1, Ordering::Relaxed);
+                    crate::task::processor::suspend_current_and_run_next_uninterruptible();
                 }
             }
             self.short_poll_completions
