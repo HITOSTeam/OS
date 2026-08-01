@@ -202,15 +202,8 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
     let Some(task) = crate::task::processor::current_task() else {
         return false;
     };
-    let Some(process) = task.process.upgrade() else {
-        return false;
-    };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if matches!(cause, Trap::Exception(STORE_PAGE_FAULT))
-        && inner.memory_set.resolve_cow_fault(stval)
-    {
+    let memory_set = task.memory_set();
+    if matches!(cause, Trap::Exception(STORE_PAGE_FAULT)) && memory_set.resolve_cow_fault(stval) {
         return true;
     }
     let access = match cause {
@@ -219,12 +212,9 @@ fn try_handle_kernel_page_fault(cause: KernelTrap, stval: usize) -> bool {
         Trap::Exception(INSTRUCTION_PAGE_FAULT) => MapPermission::X,
         _ => return false,
     };
-    match inner.memory_set.resolve_lazy_fault(stval, access) {
+    match memory_set.resolve_lazy_fault(stval, access) {
         LazyFaultResult::Resolved => true,
-        LazyFaultResult::Oom => {
-            drop(inner);
-            exit_group_and_run_next(-9);
-        }
+        LazyFaultResult::Oom => exit_group_and_run_next(-9),
         LazyFaultResult::Invalid => false,
     }
 }
@@ -409,22 +399,19 @@ fn exception_name(code: usize) -> &'static str {
 }
 
 fn try_expand_mmap_growsdown(fault_va: usize, access: MapPermission) -> bool {
-    let process = crate::task::processor::current_process();
-    let inner = process.borrow_mut();
-    match inner.memory_set.try_expand_growsdown(fault_va, access) {
+    let memory_set = crate::task::processor::current_task().unwrap().memory_set();
+    match memory_set.try_expand_growsdown(fault_va, access) {
         LazyFaultResult::Resolved => true,
-        LazyFaultResult::Oom => {
-            drop(inner);
-            exit_group_and_run_next(-9);
-        }
+        LazyFaultResult::Oom => exit_group_and_run_next(-9),
         LazyFaultResult::Invalid => false,
     }
 }
 
 fn fault_hits_mmap_sigbus_tail(addr: usize) -> bool {
-    let process = crate::task::processor::current_process();
-    let inner = process.borrow_mut();
-    inner.memory_set.fault_hits_mmap_sigbus_tail(addr)
+    crate::task::processor::current_task()
+        .unwrap()
+        .memory_set()
+        .fault_hits_mmap_sigbus_tail(addr)
 }
 
 fn current_signal_handler(signum: usize) -> usize {
@@ -488,9 +475,8 @@ fn handle_user_exception(code: usize, stval: usize) {
     }
     // 2. Copy-on-write: resolve store faults on COW-tagged pages instead of killing the process.
     if code == STORE_PAGE_FAULT {
-        let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
-        if inner.memory_set.resolve_cow_fault(stval) {
+        let memory_set = crate::task::processor::current_task().unwrap().memory_set();
+        if memory_set.resolve_cow_fault(stval) {
             return;
         }
     }
@@ -508,20 +494,16 @@ fn handle_user_exception(code: usize, stval: usize) {
     //    never be gated behind a debug flag. `Oom` terminates the process;
     //    `Invalid` falls through to the stages below.
     if code == LOAD_PAGE_FAULT || code == STORE_PAGE_FAULT || code == INSTRUCTION_PAGE_FAULT {
-        let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
         let access = match code {
             LOAD_PAGE_FAULT => MapPermission::R,
             STORE_PAGE_FAULT => MapPermission::W,
             INSTRUCTION_PAGE_FAULT => MapPermission::X,
             _ => MapPermission::R,
         };
-        match inner.memory_set.resolve_lazy_fault(stval, access) {
+        let memory_set = crate::task::processor::current_task().unwrap().memory_set();
+        match memory_set.resolve_lazy_fault(stval, access) {
             LazyFaultResult::Resolved => return,
-            LazyFaultResult::Oom => {
-                drop(inner);
-                exit_group_and_run_next(-9);
-            }
+            LazyFaultResult::Oom => exit_group_and_run_next(-9),
             LazyFaultResult::Invalid => {}
         }
     }

@@ -46,6 +46,7 @@ pub fn activate_kernel_space() {
         if riscv::register::satp::read().bits() == cached {
             // RISC-V SATP switches require sfence.vma in activate_token(); skip
             // that cost when the caller is already running on the kernel root.
+            crate::arch::riscv64::mm::leave_user_mm();
             return;
         }
         memory_set::activate_token(cached);
@@ -59,6 +60,10 @@ pub fn activate_kernel_space() {
         }
         memory_set::activate_token(token);
     }
+    #[cfg(target_arch = "riscv64")]
+    // The hart can no longer consume user translations. This is the
+    // `switch_mm()` point where Linux clears the previous mm's CPU mask.
+    crate::arch::riscv64::mm::leave_user_mm();
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -67,6 +72,7 @@ pub fn activate_kernel_space() {
 pub struct KernelPageTableGuard {
     previous_satp: usize,
     switched: bool,
+    previous_user_mm: Option<alloc::sync::Arc<crate::arch::riscv64::mm::AsidContext>>,
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -84,12 +90,16 @@ impl KernelPageTableGuard {
             }
         };
         let switched = previous_satp != kernel_satp;
+        let previous_user_mm = switched
+            .then(crate::arch::riscv64::mm::pin_local_user_mm)
+            .flatten();
         if switched {
             memory_set::activate_token(kernel_satp);
         }
         Self {
             previous_satp,
             switched,
+            previous_user_mm,
         }
     }
 }
@@ -98,6 +108,12 @@ impl KernelPageTableGuard {
 impl Drop for KernelPageTableGuard {
     fn drop(&mut self) {
         if self.switched {
+            // The async block path may have scheduled while this guard was
+            // alive. `activate_kernel_space()` then cleared the old active-mm
+            // bit. Republish it before making the saved user SATP observable.
+            if let Some(ctx) = self.previous_user_mm.as_ref() {
+                crate::arch::riscv64::mm::restore_pinned_user_mm(ctx);
+            }
             memory_set::activate_token(self.previous_satp);
         }
     }

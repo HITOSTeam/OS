@@ -3,12 +3,68 @@ use super::backing::{
     shared_file_page_cache_insert_or_get,
 };
 use super::{
-    LazyFaultResult, MapPermission, MapType, MemorySet, vm_region_map_area_type_compatible,
+    LazyFaultResult, MapPermission, MapType, MemorySet, MmRef, VmRegion,
+    vm_region_map_area_type_compatible,
 };
 use crate::config::{PAGE_SIZE, USER_STACK_GUARD_GAP};
 use crate::fs::{OSInode, cgroup_charge_anon_current};
-use crate::mm::{PTEFlags, VirtAddr, VirtPageNum, frame_alloc};
+use crate::mm::{FrameTracker, PTEFlags, PageTableEntry, VirtAddr, VirtPageNum, frame_alloc};
 use crate::task::processor::current_process;
+
+const FAULT_FAST_RETRIES: usize = 3;
+
+struct CowFaultPlan {
+    vpn: VirtPageNum,
+    region: VmRegion,
+    old_frame: FrameTracker,
+}
+
+enum CowFaultPrepare {
+    Ready(CowFaultPlan),
+    Resolved,
+    Invalid,
+}
+
+enum CowFaultCommit {
+    Installed,
+    Resolved,
+    Retry,
+}
+
+struct LazyFaultPlan {
+    vpn: VirtPageNum,
+    region: VmRegion,
+    perm: MapPermission,
+    pte_flags: PTEFlags,
+    file_page: Option<usize>,
+    anon_page: Option<usize>,
+    shared_inode_backed: bool,
+    shared_anon_backed: bool,
+    backing_resident_frame: Option<FrameTracker>,
+    file: Option<alloc::sync::Arc<dyn crate::fs::File + Send + Sync>>,
+    file_off: usize,
+    read_len: usize,
+}
+
+enum LazyFaultPrepare {
+    Ready(LazyFaultPlan),
+    Resolved,
+    Invalid,
+}
+
+enum LazyFaultCommit {
+    Installed,
+    Resolved,
+    Retry,
+    Oom,
+}
+
+fn pte_allows_access(pte: PageTableEntry, access: MapPermission) -> bool {
+    pte.is_valid()
+        && (!access.contains(MapPermission::R) || pte.readable())
+        && (!access.contains(MapPermission::W) || pte.writable())
+        && (!access.contains(MapPermission::X) || pte.executable())
+}
 
 impl MemorySet {
     /// 检查 addr 是否落在文件映射的 SIGBUS tail 区（EOF 之后的不可访问段）。
@@ -18,48 +74,45 @@ impl MemorySet {
             .is_some_and(|region| addr >= region.sigbus_start())
     }
 
-    /// 处理 MAP_GROWSDOWN 栈向下扩展的 guard page fault：
-    /// 检查扩展合法性（guard gap、无重叠），扩展 VMA 和 MapArea，再物化页面。
-    #[allow(dead_code)]
-    pub fn try_expand_growsdown(
-        &mut self,
-        fault_va: usize,
-        access: MapPermission,
-    ) -> LazyFaultResult {
-        // 栈向下增长：先扩 VMA/MapArea，再按普通 lazy fault 物化页面。
+    /// Validate and extend MAP_GROWSDOWN metadata for one guard-page fault.
+    ///
+    /// Page allocation is deliberately left to `MmRef::resolve_lazy_fault`
+    /// after the mm lock is released. Linux similarly changes the VMA under
+    /// mmap locking, then resolves/installs the page through the fault path.
+    fn expand_growsdown_metadata(&mut self, fault_va: usize, access: MapPermission) -> bool {
         let fault_page = fault_va & !(PAGE_SIZE - 1);
 
         if let Some(region) = self.vm_regions.growsdown_candidate_before(fault_page) {
             let perm = region.map_permission();
             if !perm.contains(access) {
-                return LazyFaultResult::Invalid;
+                return false;
             }
             if self.concrete_range_overlaps(fault_page.into(), region.start.into()) {
-                return LazyFaultResult::Invalid;
+                return false;
             }
             // 保留 Linux 风格的 guard gap，防止栈无限扩展覆盖其他映射。
             let Some(next_guard_start) = fault_page.checked_sub(USER_STACK_GUARD_GAP) else {
-                return LazyFaultResult::Invalid;
+                return false;
             };
             if self.map_area_range_overlaps_except(next_guard_start, fault_page, None)
                 || self.vm_region_range_overlaps_except(next_guard_start, fault_page, None)
             {
-                return LazyFaultResult::Invalid;
+                return false;
             }
             if !self.try_insert_lazy_area_raw(fault_page.into(), region.start.into(), perm) {
-                return LazyFaultResult::Invalid;
+                return false;
             }
 
             if !self
                 .vm_regions
                 .expand_growsdown_at(region.start, fault_page)
             {
-                return LazyFaultResult::Invalid;
+                return false;
             }
             self.debug_assert_user_vm_invariants();
-            return self.resolve_lazy_fault(fault_va, access);
+            return true;
         }
-        LazyFaultResult::Invalid
+        false
     }
 
     /// 返回 fork/COW 内存压力诊断统计：
@@ -91,125 +144,140 @@ impl MemorySet {
         )
     }
 
-    /// 处理 COW fault：PTE 标有 COW 位时，分配新帧、复制旧页内容、
-    /// 重映射为可写，更新 MapArea frame tracker，刷新 TLB。
-    pub fn resolve_cow_fault(&mut self, fault_va: usize) -> bool {
+    fn prepare_cow_fault(&self, fault_va: usize) -> CowFaultPrepare {
         let vpn: VirtPageNum = VirtAddr::from(fault_va).floor();
         let Some(region) = self.vm_region_containing_addr(fault_va) else {
-            return false;
+            return CowFaultPrepare::Invalid;
         };
         if !region.allows_cow_fault(fault_va) {
-            return false;
+            return CowFaultPrepare::Invalid;
         }
         let Some(pte) = self.translate(vpn) else {
-            return false;
+            return CowFaultPrepare::Invalid;
         };
         let flags = pte.flags();
         if !flags.contains(PTEFlags::COW) {
-            // Another hart may have resolved this COW page after the current
-            // hart took its store fault but before it acquired the mm lock.
-            // The fault is then stale: the authoritative PTE is already
-            // writable, so invalidate the local cached translation and retry
-            // the user instruction. Linux handles the same race by rechecking
-            // the PTE under the page-table lock.
-            if flags.contains(PTEFlags::W) {
-                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-                self.flush_user_page(fault_va);
-                return true;
-            }
-            return false;
+            return if pte.writable() {
+                CowFaultPrepare::Resolved
+            } else {
+                CowFaultPrepare::Invalid
+            };
         }
         if flags.contains(PTEFlags::SHARED) {
-            return false;
+            return CowFaultPrepare::Invalid;
         }
-        let old_ppn = pte.ppn();
-        let Some(frame) = frame_alloc() else {
-            return false;
+        let Some(old_frame) = self
+            .areas
+            .iter()
+            .filter(|area| !area.is_identical() && area.contains_vpn(vpn))
+            .find_map(|area| area.tracked_frame(vpn))
+            .filter(|frame| frame.ppn == pte.ppn())
+            .cloned()
+        else {
+            return CowFaultPrepare::Invalid;
         };
-        // 复制旧页内容到新帧（COW 写时复制语义）。
-        frame
-            .ppn
-            .get_bytes_array()
-            .copy_from_slice(old_ppn.get_bytes_array());
+
+        CowFaultPrepare::Ready(CowFaultPlan {
+            vpn,
+            region,
+            old_frame,
+        })
+    }
+
+    fn commit_cow_fault(&mut self, plan: &CowFaultPlan, frame: &FrameTracker) -> CowFaultCommit {
+        let fault_va = plan.vpn.0.saturating_mul(PAGE_SIZE);
+        let Some(region) = self.vm_region_containing_addr(fault_va) else {
+            return CowFaultCommit::Retry;
+        };
+        if region != plan.region || !region.allows_cow_fault(fault_va) {
+            return CowFaultCommit::Retry;
+        }
+        let Some(pte) = self.translate(plan.vpn) else {
+            return CowFaultCommit::Retry;
+        };
+        let flags = pte.flags();
+        if !flags.contains(PTEFlags::COW) {
+            return if pte.writable() {
+                CowFaultCommit::Resolved
+            } else {
+                CowFaultCommit::Retry
+            };
+        }
+        if flags.contains(PTEFlags::SHARED) || pte.ppn() != plan.old_frame.ppn {
+            return CowFaultCommit::Retry;
+        }
+        let Some(area_idx) = self.areas.iter().position(|area| {
+            !area.is_identical()
+                && area.contains_vpn(plan.vpn)
+                && area
+                    .tracked_frame(plan.vpn)
+                    .is_some_and(|tracked| tracked.ppn == plan.old_frame.ppn)
+        }) else {
+            return CowFaultCommit::Retry;
+        };
 
         let mut new_flags = flags;
         new_flags.remove(PTEFlags::COW);
-        new_flags.insert(PTEFlags::W);
-        new_flags.insert(PTEFlags::D);
+        new_flags.insert(PTEFlags::W | PTEFlags::D);
         #[cfg(target_arch = "loongarch64")]
         {
-            // Keep the COW remap and the visible TLB invalidation separate:
-            // the ASID helper below can invalidate exactly this user address
-            // without falling back to a full context-switch flush.
-            if !self.page_table.remap_deferred(vpn, frame.ppn, new_flags) {
-                return false;
+            if !self
+                .page_table
+                .remap_deferred(plan.vpn, frame.ppn, new_flags)
+            {
+                return CowFaultCommit::Retry;
             }
         }
         #[cfg(not(target_arch = "loongarch64"))]
         {
-            if !self.page_table.remap(vpn, frame.ppn, new_flags) {
-                return false;
+            if !self.page_table.remap(plan.vpn, frame.ppn, new_flags) {
+                return CowFaultCommit::Retry;
             }
         }
-
-        // 更新 MapArea 的 frame tracker，旧共享帧引用计数随之减少。
-        for area in self.areas.iter_mut() {
-            if area.is_identical() {
-                continue;
-            }
-            if !area.contains_vpn(vpn) {
-                continue;
-            }
-            area.insert_tracked_frame(vpn, frame);
-            break;
-        }
-
-        // 刷新 TLB，使新 PTE 立即生效。
-        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-        self.flush_user_page(fault_va);
-        #[cfg(target_arch = "riscv64")]
-        {
-            // This mm may be running concurrently on another hart. Once COW
-            // replaces the PPN, every such hart must stop using the old
-            // translation before the shared frame can be reused. Linux tracks
-            // an mm's active CPUs; until we have that bookkeeping, target all
-            // other online harts with a page-sized shootdown.
-            let remote_hart_mask =
-                crate::task::manager::online_hart_mask() & !(1usize << crate::arch::hart_id());
-            if remote_hart_mask != 0 {
-                crate::sbi::remote_sfence_vma(
-                    remote_hart_mask,
-                    fault_va & !(PAGE_SIZE - 1),
-                    PAGE_SIZE,
-                );
-            }
-        }
-        true
+        // The plan keeps the old frame pinned until the caller completes the
+        // local and remote TLB invalidations.
+        self.areas[area_idx].insert_tracked_frame(plan.vpn, frame.clone());
+        CowFaultCommit::Installed
     }
 
-    /// 处理 lazy fault：从 VmRegion 取策略，按需分配/复用 frame 并安装 PTE。
-    ///
-    /// 处理流程：
-    /// 1. 查 VmRegion 确认地址合法且有 lazy 策略；
-    /// 2. 对共享映射优先从全局缓存复用 frame；
-    /// 3. 新帧对文件映射从文件读入内容（EOF 尾保持零填充）；
-    /// 4. 共享映射通过 insert_or_get 保证同文件页全局唯一帧；
-    /// 5. 私有匿名映射向 cgroup 记账；
-    /// 6. 安装 PTE、更新 MapArea frame tracker、记录 backing resident 页、刷 TLB。
-    pub fn resolve_lazy_fault(
-        &mut self,
-        fault_va: usize,
-        access: MapPermission,
-    ) -> LazyFaultResult {
+    fn prepare_lazy_fault(&self, fault_va: usize, access: MapPermission) -> LazyFaultPrepare {
         let vpn: VirtPageNum = VirtAddr::from(fault_va).floor();
-        // 查找对应vma 记录
         let Some(region) = self.vm_region_containing_addr(fault_va) else {
-            return LazyFaultResult::Invalid;
+            return LazyFaultPrepare::Invalid;
         };
-        // 获取对应 新页 的PTE 记录 以及 映射 类型
         let Some((perm, pte_flags)) = region.lazy_fault_policy(fault_va, access) else {
-            return LazyFaultResult::Invalid;
+            return LazyFaultPrepare::Invalid;
         };
+        let Some(area) = self
+            .areas
+            .iter()
+            .find(|area| area.is_lazy() && area.contains_vpn(vpn))
+        else {
+            return LazyFaultPrepare::Invalid;
+        };
+        debug_assert_eq!(
+            area.map_perm(),
+            perm,
+            "lazy MapArea permission drift at fault address {:#x}",
+            fault_va
+        );
+        debug_assert!(
+            vm_region_map_area_type_compatible(&region, area),
+            "lazy MapArea type drift at fault address {:#x}: area={:?}, region={:?}",
+            fault_va,
+            area.map_type(),
+            region.map_type
+        );
+        if let Some(pte) = self.page_table.translate(vpn)
+            && pte.is_valid()
+        {
+            return if pte_allows_access(pte, access) {
+                LazyFaultPrepare::Resolved
+            } else {
+                LazyFaultPrepare::Invalid
+            };
+        }
+
         let page_start = vpn.0.saturating_mul(PAGE_SIZE);
         let file_page = (region.backing_id != 0).then(|| {
             region
@@ -225,136 +293,295 @@ impl MemorySet {
                 .saturating_add(page_start.saturating_sub(region.start))
                 / PAGE_SIZE
         });
-        // MAP_SHARED fault 优先复用全局共享页缓存。
-        let mut cached_shared_frame = if shared_inode_backed {
-            file_page.and_then(|file_page| {
-                shared_file_page_cache_get(region.file_dev, region.file_ino, file_page)
-                    .or_else(|| self.mmap_backing_resident_frame(region.backing_id, file_page))
-            })
-        } else if shared_anon_backed {
-            anon_page
-                .and_then(|anon_page| shared_anon_page_cache_get(region.anon_shared_id, anon_page))
+        let backing_resident_frame = if shared_inode_backed {
+            file_page.and_then(|page| self.mmap_backing_resident_frame(region.backing_id, page))
         } else {
             None
         };
-        for area in self.areas.iter_mut() {
-            if !area.is_lazy() {
-                continue;
-            }
-            if !area.contains_vpn(vpn) {
-                continue;
-            }
-            debug_assert_eq!(
-                area.map_perm(),
-                perm,
-                "lazy MapArea permission drift at fault address {:#x}",
-                fault_va
-            );
-            debug_assert!(
-                vm_region_map_area_type_compatible(&region, area),
-                "lazy MapArea type drift at fault address {:#x}: area={:?}, region={:?}",
-                fault_va,
-                area.map_type(),
-                region.map_type
-            );
-            if let Some(pte) = self.page_table.translate(vpn) {
-                if pte.is_valid() {
-                    return LazyFaultResult::Invalid;
-                }
-            }
-            let total_pages = area.page_count();
-            let accounted_pages = area.charged_or_tracked_pages();
-            let new_charge_pages = total_pages.saturating_sub(accounted_pages);
-            let (frame, reused_cached_frame) = if let Some(frame) = cached_shared_frame.take() {
-                // 命中共享缓存，直接复用不读文件。
-                (frame, true)
+        let file = self
+            .mmap_backings
+            .get(&region.backing_id)
+            .map(|backing| backing.file());
+        let region_delta = page_start.saturating_sub(region.start);
+        let file_off = region.file_offset.saturating_add(region_delta);
+        let read_len = region
+            .file_valid_len()
+            .saturating_sub(region_delta)
+            .min(PAGE_SIZE);
+
+        LazyFaultPrepare::Ready(LazyFaultPlan {
+            vpn,
+            region,
+            perm,
+            pte_flags,
+            file_page,
+            anon_page,
+            shared_inode_backed,
+            shared_anon_backed,
+            backing_resident_frame,
+            file,
+            file_off,
+            read_len,
+        })
+    }
+
+    fn commit_lazy_fault(
+        &mut self,
+        fault_va: usize,
+        access: MapPermission,
+        plan: &LazyFaultPlan,
+        candidate: &FrameTracker,
+        pid: usize,
+    ) -> LazyFaultCommit {
+        let Some(region) = self.vm_region_containing_addr(fault_va) else {
+            return LazyFaultCommit::Retry;
+        };
+        if region != plan.region {
+            return LazyFaultCommit::Retry;
+        }
+        let Some((perm, pte_flags)) = region.lazy_fault_policy(fault_va, access) else {
+            return LazyFaultCommit::Retry;
+        };
+        if perm != plan.perm || pte_flags != plan.pte_flags {
+            return LazyFaultCommit::Retry;
+        }
+        if let Some(pte) = self.page_table.translate(plan.vpn)
+            && pte.is_valid()
+        {
+            return if pte_allows_access(pte, access) {
+                LazyFaultCommit::Resolved
             } else {
-                let Some(frame) = frame_alloc() else {
-                    crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", vpn);
-                    return LazyFaultResult::Oom;
-                };
-                (frame, false)
+                LazyFaultCommit::Retry
             };
-            if !reused_cached_frame {
-                if region.file_backed {
-                    if let Some(file) = self
-                        .mmap_backings
-                        .get(&region.backing_id)
-                        .map(|backing| backing.file())
+        }
+
+        let Some(area_idx) = self
+            .areas
+            .iter()
+            .position(|area| area.is_lazy() && area.contains_vpn(plan.vpn))
+        else {
+            return LazyFaultCommit::Retry;
+        };
+        debug_assert_eq!(self.areas[area_idx].map_perm(), plan.perm);
+        debug_assert!(vm_region_map_area_type_compatible(
+            &region,
+            &self.areas[area_idx]
+        ));
+
+        let total_pages = self.areas[area_idx].page_count();
+        let accounted_pages = self.areas[area_idx].charged_or_tracked_pages();
+        let new_charge_pages = total_pages.saturating_sub(accounted_pages);
+        if new_charge_pages > 0
+            && region.is_private_anonymous()
+            && plan.perm.contains(MapPermission::U)
+            && plan.perm.contains(MapPermission::W)
+        {
+            let charge_bytes = new_charge_pages.saturating_mul(PAGE_SIZE);
+            if !cgroup_charge_anon_current(pid, charge_bytes) {
+                return LazyFaultCommit::Oom;
+            }
+            self.areas[area_idx]
+                .set_charged_pages(accounted_pages.saturating_add(new_charge_pages));
+        }
+
+        // Cache arbitration is intentionally delayed until after the PTE/VMA
+        // recheck. It is short metadata work; allocation and filesystem I/O
+        // have already happened without holding the mm lock.
+        let frame = match (plan.shared_inode_backed, plan.file_page) {
+            (true, Some(file_page)) => shared_file_page_cache_insert_or_get(
+                region.file_dev,
+                region.file_ino,
+                file_page,
+                candidate.clone(),
+            ),
+            _ => match (plan.shared_anon_backed, plan.anon_page) {
+                (true, Some(anon_page)) => shared_anon_page_cache_insert_or_get(
+                    region.anon_shared_id,
+                    anon_page,
+                    candidate.clone(),
+                ),
+                _ => candidate.clone(),
+            },
+        };
+
+        self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
+        #[cfg(target_arch = "riscv64")]
+        if plan.pte_flags.contains(PTEFlags::X) {
+            crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
+        }
+        let shared_file_backing_frame = plan.shared_inode_backed.then(|| frame.clone());
+        self.areas[area_idx].insert_tracked_frame(plan.vpn, frame);
+        if let (Some(backing), Some(file_page)) = (
+            self.mmap_backings.get_mut(&region.backing_id),
+            plan.file_page,
+        ) {
+            backing.add_resident_page_ref(
+                file_page,
+                shared_file_backing_frame.as_ref(),
+                plan.pte_flags.contains(PTEFlags::D),
+            );
+        }
+        LazyFaultCommit::Installed
+    }
+}
+
+impl MmRef {
+    /// Resolve a COW fault in three phases, following Linux's
+    /// `do_cow_fault()`/PTE-lock pattern: snapshot and pin the source page,
+    /// allocate/copy without the mm lock, then recheck the authoritative PTE
+    /// before committing the new mapping.
+    pub fn resolve_cow_fault(&self, fault_va: usize) -> bool {
+        let mut retries = 0usize;
+        let mut slow_guard = None;
+        loop {
+            let plan = match self.lock().prepare_cow_fault(fault_va) {
+                CowFaultPrepare::Ready(plan) => plan,
+                CowFaultPrepare::Resolved => {
+                    self.flush_user_page(fault_va);
+                    return true;
+                }
+                CowFaultPrepare::Invalid => return false,
+            };
+
+            let Some(frame) = frame_alloc() else {
+                return false;
+            };
+            frame
+                .ppn
+                .get_bytes_array()
+                .copy_from_slice(plan.old_frame.ppn.get_bytes_array());
+
+            let commit = self.lock().commit_cow_fault(&plan, &frame);
+            match commit {
+                CowFaultCommit::Installed => {
+                    self.flush_user_page(fault_va);
+                    #[cfg(target_arch = "riscv64")]
                     {
-                        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-                            // 新分配的 file-backed 页从文件读入，EOF 页尾保持零填充。
-                            let region_delta = page_start.saturating_sub(region.start);
-                            let file_off = region.file_offset.saturating_add(region_delta);
-                            let valid_len = region.file_valid_len();
-                            let read_len = valid_len.saturating_sub(region_delta).min(PAGE_SIZE);
-                            if read_len > 0 {
-                                let page = frame.ppn.get_bytes_array();
-                                let _ = os_inode.pread_at(file_off, &mut page[..read_len]);
-                            }
+                        let local_hart = crate::arch::hart_id();
+                        let local_bit = 1usize.checked_shl(local_hart as u32).unwrap_or(0);
+                        let remote_hart_mask = self.active_user_hart_mask()
+                            & crate::task::manager::online_hart_mask()
+                            & !local_bit;
+                        if remote_hart_mask != 0 {
+                            crate::sbi::remote_sfence_vma(
+                                remote_hart_mask,
+                                fault_va & !(PAGE_SIZE - 1),
+                                PAGE_SIZE,
+                            );
                         }
                     }
+                    return true;
                 }
-            }
-            let frame = match (shared_inode_backed, file_page) {
-                (true, Some(file_page)) => {
-                    // insert_or_get 处理并发/重入语义：若已有共享页，统一使用已有 frame。
-                    shared_file_page_cache_insert_or_get(
-                        region.file_dev,
-                        region.file_ino,
-                        file_page,
-                        frame,
-                    )
+                CowFaultCommit::Resolved => {
+                    self.flush_user_page(fault_va);
+                    return true;
                 }
-                _ => match (shared_anon_backed, anon_page) {
-                    (true, Some(anon_page)) => shared_anon_page_cache_insert_or_get(
-                        region.anon_shared_id,
-                        anon_page,
-                        frame,
-                    ),
-                    _ => frame,
-                },
-            };
-            // 先分配帧再 cgroup 记账，避免 OOM 导致记账泄漏。
-            if new_charge_pages > 0
-                && region.is_private_anonymous()
-                && perm.contains(MapPermission::U)
-                && perm.contains(MapPermission::W)
-            {
-                let charge_bytes = new_charge_pages.saturating_mul(PAGE_SIZE);
-                if !cgroup_charge_anon_current(current_process().getpid(), charge_bytes) {
-                    return LazyFaultResult::Oom;
-                }
-                area.set_charged_pages(accounted_pages.saturating_add(new_charge_pages));
-            }
-            self.page_table.map(vpn, frame.ppn, pte_flags);
-            #[cfg(target_arch = "riscv64")]
-            if pte_flags.contains(PTEFlags::X) {
-                // Newly faulted executable pages may contain instructions from
-                // a file mapping. Defer the fence.i to the next return to this
-                // mm instead of issuing it for every lazy fault.
-                crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
-            }
-            let shared_file_backing_frame = shared_inode_backed.then(|| frame.clone());
-            area.insert_tracked_frame(vpn, frame);
-            if region.backing_id != 0 {
-                if let Some(file_page) = file_page {
-                    // 记录 resident 页，供 msync/munmap/writeback 和 debug invariant 使用。
-                    if let Some(backing) = self.mmap_backings.get_mut(&region.backing_id) {
-                        backing.add_resident_page_ref(
-                            file_page,
-                            shared_file_backing_frame.as_ref(),
-                            pte_flags.contains(PTEFlags::D),
-                        );
+                CowFaultCommit::Retry => {
+                    retries = retries.saturating_add(1);
+                    if retries >= FAULT_FAST_RETRIES && slow_guard.is_none() {
+                        // Linux may retry a fault after dropping mmap/PTE locks.
+                        // Do not turn repeated revalidation races into SIGSEGV:
+                        // serialize only contended retrying faults, then keep
+                        // using the same prepare/work/recheck protocol.
+                        slow_guard = Some(self.fault_retry_lock.lock());
                     }
                 }
             }
-            #[cfg(target_arch = "loongarch64")]
-            self.flush_user_page(fault_va);
-            #[cfg(target_arch = "riscv64")]
-            self.flush_user_page(fault_va);
-            return LazyFaultResult::Resolved;
         }
-        LazyFaultResult::Invalid
+    }
+
+    /// Resolve a lazy page fault without keeping the process or mm lock across
+    /// page allocation, zeroing, or file I/O. The final VMA/PTE recheck is the
+    /// local analogue of Linux's `finish_fault()` validation.
+    pub fn resolve_lazy_fault(&self, fault_va: usize, access: MapPermission) -> LazyFaultResult {
+        self.resolve_lazy_fault_for(fault_va, access, current_process().getpid())
+    }
+
+    /// Resolve a lazy fault and charge anonymous memory to `charge_pid`.
+    ///
+    /// Normal hardware faults use the current process through
+    /// `resolve_lazy_fault()`. Kernel-assisted faults into another mm (for
+    /// example CLONE_CHILD_SETTID) must name that mm's process explicitly.
+    /// Linux carries this ownership in the fault/memcg context; inferring it
+    /// from the currently executing task would charge a child fault to its
+    /// parent and could bypass the child's memory limit.
+    pub fn resolve_lazy_fault_for(
+        &self,
+        fault_va: usize,
+        access: MapPermission,
+        charge_pid: usize,
+    ) -> LazyFaultResult {
+        let mut retries = 0usize;
+        let mut slow_guard = None;
+        loop {
+            let plan = match self.lock().prepare_lazy_fault(fault_va, access) {
+                LazyFaultPrepare::Ready(plan) => plan,
+                LazyFaultPrepare::Resolved => {
+                    self.flush_user_page(fault_va);
+                    return LazyFaultResult::Resolved;
+                }
+                LazyFaultPrepare::Invalid => return LazyFaultResult::Invalid,
+            };
+
+            // Consult shared caches without nesting them under the mm lock.
+            let cached_frame = if plan.shared_inode_backed {
+                plan.file_page.and_then(|page| {
+                    shared_file_page_cache_get(plan.region.file_dev, plan.region.file_ino, page)
+                })
+            } else if plan.shared_anon_backed {
+                plan.anon_page
+                    .and_then(|page| shared_anon_page_cache_get(plan.region.anon_shared_id, page))
+            } else {
+                None
+            }
+            .or_else(|| plan.backing_resident_frame.clone());
+
+            let (frame, needs_file_fill) = if let Some(frame) = cached_frame {
+                (frame, false)
+            } else {
+                let Some(frame) = frame_alloc() else {
+                    crate::println!("[mm] OOM: lazy fault alloc failed for vpn={:?}", plan.vpn);
+                    return LazyFaultResult::Oom;
+                };
+                (frame, true)
+            };
+
+            if needs_file_fill
+                && plan.region.file_backed
+                && plan.read_len != 0
+                && let Some(file) = plan.file.as_ref()
+                && let Some(os_inode) = file.as_any().downcast_ref::<OSInode>()
+            {
+                let page = frame.ppn.get_bytes_array();
+                let _ = os_inode.pread_at(plan.file_off, &mut page[..plan.read_len]);
+            }
+
+            let commit = self
+                .lock()
+                .commit_lazy_fault(fault_va, access, &plan, &frame, charge_pid);
+            match commit {
+                LazyFaultCommit::Installed | LazyFaultCommit::Resolved => {
+                    self.flush_user_page(fault_va);
+                    return LazyFaultResult::Resolved;
+                }
+                LazyFaultCommit::Oom => return LazyFaultResult::Oom,
+                LazyFaultCommit::Retry => {
+                    retries = retries.saturating_add(1);
+                    if retries >= FAULT_FAST_RETRIES && slow_guard.is_none() {
+                        slow_guard = Some(self.fault_retry_lock.lock());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn try_expand_growsdown(&self, fault_va: usize, access: MapPermission) -> LazyFaultResult {
+        {
+            let mut memory_set = self.lock();
+            let _ = memory_set.expand_growsdown_metadata(fault_va, access);
+        }
+        // A racing thread may already have expanded the VMA, so always re-run
+        // the normal resolver after releasing the metadata lock.
+        self.resolve_lazy_fault(fault_va, access)
     }
 }

@@ -538,12 +538,18 @@ fn clone_from_parts(
     // CLONE_CHILD_SETTID：把子 PID 写入子地址空间的 _ctid 指针
     // 子的页表与父不同（除非 CLONE_VM），写入前需先处理 COW/lazy 缺页
     if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
-        let child_token = {
+        let child_memory_set = {
             let inner = child.borrow_mut();
-            let _ = inner.memory_set.resolve_cow_fault(_ctid);
-            let _ = inner.memory_set.resolve_lazy_fault(_ctid, MapPermission::W);
-            inner.memory_set.token()
+            inner.memory_set.clone()
         };
+        // Fault preparation can allocate/copy pages. Keep the child PCB lock
+        // out of that path, just as Linux drops task-level locking before
+        // faulting in CLONE_CHILD_SETTID storage. Charge a newly materialized
+        // anonymous page to the child: current_process() is still the parent,
+        // while Linux memcg accounting follows the target fault context.
+        let _ = child_memory_set.resolve_cow_fault(_ctid);
+        let _ = child_memory_set.resolve_lazy_fault_for(_ctid, MapPermission::W, child_pid);
+        let child_token = child_memory_set.token();
         if try_write_user_value(child_token, _ctid as *mut i32, &(child_pid as i32)).is_err() {
             rollback_unstarted_child(&child);
             return err(SyscallError::EFAULT);

@@ -93,44 +93,51 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
     if !user_range_valid(start, end) {
         return err(SyscallError::ENOMEM);
     }
-    let process = current_process();
-    let inner = process.borrow_mut();
-    let euid = inner.euid;
-    let memlock_limit = inner.rlimits.rlimit_memlock_cur as usize;
-    let mut memory_set = inner.memory_set.lock();
-    if !memory_set.user_range_fully_mapped(start.into(), end.into()) {
-        return err(SyscallError::ENOMEM);
-    }
-    let next_locked_bytes = memory_set.locked_bytes_after_add(start, end);
-    if euid != 0 {
-        if memlock_limit == 0 {
-            return err(SyscallError::EPERM);
-        }
-        if next_locked_bytes > memlock_limit {
+    let (euid, memlock_limit, memory_set) = {
+        let process = current_process();
+        let inner = process.borrow_mut();
+        (
+            inner.euid,
+            inner.rlimits.rlimit_memlock_cur as usize,
+            inner.memory_set.clone(),
+        )
+    };
+    let pages_to_populate = {
+        let memory_set_guard = memory_set.lock();
+        if !memory_set_guard.user_range_fully_mapped(start.into(), end.into()) {
             return err(SyscallError::ENOMEM);
         }
-    }
-
-    let mut pages_to_populate = 0usize;
-    let mut cur = start;
-    while cur < end {
-        let vpn = crate::mm::VirtAddr::from(cur).floor();
-        let present = memory_set
-            .translate(vpn)
-            .map(|pte| pte.is_valid())
-            .unwrap_or(false);
-        if !present {
-            let Some(region) = memory_set.vm_region_containing(cur, cur + PAGE_SIZE) else {
-                return err(SyscallError::ENOMEM);
-            };
-            if mlock_prefault_access(region.map_permission()).is_none() {
-                cur += PAGE_SIZE;
-                continue;
+        let next_locked_bytes = memory_set_guard.locked_bytes_after_add(start, end);
+        if euid != 0 {
+            if memlock_limit == 0 {
+                return err(SyscallError::EPERM);
             }
-            pages_to_populate = pages_to_populate.saturating_add(1);
+            if next_locked_bytes > memlock_limit {
+                return err(SyscallError::ENOMEM);
+            }
         }
-        cur += PAGE_SIZE;
-    }
+        let mut pages_to_populate = 0usize;
+        let mut cur = start;
+        while cur < end {
+            let vpn = crate::mm::VirtAddr::from(cur).floor();
+            let present = memory_set_guard
+                .translate(vpn)
+                .map(|pte| pte.is_valid())
+                .unwrap_or(false);
+            if !present {
+                let Some(region) = memory_set_guard.vm_region_containing(cur, cur + PAGE_SIZE)
+                else {
+                    return err(SyscallError::ENOMEM);
+                };
+                if mlock_prefault_access(region.map_permission()).is_some() {
+                    pages_to_populate = pages_to_populate.saturating_add(1);
+                }
+            }
+            cur += PAGE_SIZE;
+        }
+        pages_to_populate
+    };
+
     let mut available_pages =
         frame_available_pages().saturating_sub(MLOCK_POPULATE_FRAME_RESERVE_PAGES);
     if pages_to_populate > available_pages {
@@ -144,19 +151,24 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
 
     let mut cur = start;
     while cur < end {
-        let vpn = crate::mm::VirtAddr::from(cur).floor();
-        let present = memory_set
-            .translate(vpn)
-            .map(|pte| pte.is_valid())
-            .unwrap_or(false);
-        if !present {
-            let Some(region) = memory_set.vm_region_containing(cur, cur + PAGE_SIZE) else {
-                return err(SyscallError::ENOMEM);
-            };
-            let Some(access) = mlock_prefault_access(region.map_permission()) else {
-                cur += PAGE_SIZE;
-                continue;
-            };
+        let access = {
+            let memory_set_guard = memory_set.lock();
+            let vpn = crate::mm::VirtAddr::from(cur).floor();
+            let present = memory_set_guard
+                .translate(vpn)
+                .map(|pte| pte.is_valid())
+                .unwrap_or(false);
+            if present {
+                None
+            } else {
+                let Some(region) = memory_set_guard.vm_region_containing(cur, cur + PAGE_SIZE)
+                else {
+                    return err(SyscallError::ENOMEM);
+                };
+                mlock_prefault_access(region.map_permission())
+            }
+        };
+        if let Some(access) = access {
             match memory_set.resolve_lazy_fault(cur, access) {
                 crate::mm::LazyFaultResult::Resolved => {}
                 crate::mm::LazyFaultResult::Oom => return err(SyscallError::ENOMEM),
@@ -165,7 +177,15 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
         }
         cur += PAGE_SIZE;
     }
-    memory_set.add_locked_range(start, end);
+
+    let mut memory_set_guard = memory_set.lock();
+    if !memory_set_guard.user_range_fully_mapped(start.into(), end.into()) {
+        return err(SyscallError::ENOMEM);
+    }
+    if euid != 0 && memory_set_guard.locked_bytes_after_add(start, end) > memlock_limit {
+        return err(SyscallError::ENOMEM);
+    }
+    memory_set_guard.add_locked_range(start, end);
     0
 }
 

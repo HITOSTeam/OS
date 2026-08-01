@@ -170,19 +170,23 @@ pub fn init_frame_allocator() {
 /// allocate a frame
 /// 优先分配，分配失败 尝试回收
 pub fn frame_alloc() -> Option<FrameTracker> {
-    let mut allocator = FRAME_ALLOCATOR.lock();
-    if let Some(ppn) = allocator.alloc() {
+    // Keep the allocator lock around free-list metadata only.  In particular,
+    // do not zero the 4 KiB page or allocate the Arc control block while every
+    // other faulting hart is waiting for FRAME_ALLOCATOR.  Linux follows the
+    // same split: rmqueue() removes a page under allocator locking, then
+    // prep_new_page()/post_alloc_hook() initialize it after the free-list
+    // operation has completed.
+    let ppn = FRAME_ALLOCATOR.lock().alloc();
+    if let Some(ppn) = ppn {
         return Some(FrameTracker::new(ppn));
     }
-    drop(allocator);
 
     let reclaimed = super::memory_set::reclaim_shared_file_page_cache();
     if reclaimed > 0 {
-        let mut allocator = FRAME_ALLOCATOR.lock();
-        if let Some(ppn) = allocator.alloc() {
+        let ppn = FRAME_ALLOCATOR.lock().alloc();
+        if let Some(ppn) = ppn {
             return Some(FrameTracker::new(ppn));
         }
-        drop(allocator);
     }
 
     if crate::debug_config::DEBUG_PERF {

@@ -5,6 +5,9 @@ use spin::MutexGuard;
 #[derive(Clone)]
 pub struct MmRef {
     inner: Arc<Mutex<MemorySet>>,
+    /// Serialize only the rare slow retry path after repeated optimistic fault
+    /// commit races. Normal faults never acquire this lock.
+    pub(super) fault_retry_lock: Arc<crate::sync::KernelMutex<()>>,
     /// Stable page-table token cached outside the large mm lock. Trap return
     /// uses this on the hot path; page-table root replacement creates a new
     /// MmRef instead of mutating the token in place.
@@ -23,6 +26,7 @@ impl MmRef {
         let asid = Arc::clone(&memory_set.asid);
         Self {
             inner: Arc::new(Mutex::new(memory_set)),
+            fault_retry_lock: Arc::new(crate::sync::KernelMutex::new(())),
             token,
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
             asid,
@@ -46,7 +50,22 @@ impl MmRef {
 
     #[cfg(target_arch = "riscv64")]
     pub fn prepare_user_satp(&self) -> (usize, bool, bool) {
-        crate::arch::riscv64::mm::prepare_user_satp(self.asid.as_ref(), self.token)
+        crate::arch::riscv64::mm::prepare_user_satp(&self.asid, self.token)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(super) fn active_user_hart_mask(&self) -> usize {
+        crate::arch::riscv64::mm::active_user_hart_mask(self.asid.as_ref())
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub(super) fn flush_user_page(&self, va: usize) {
+        crate::arch::loongarch64::mm::flush_user_page(self.asid.as_ref(), va);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(super) fn flush_user_page(&self, va: usize) {
+        crate::arch::riscv64::mm::flush_user_page(self.asid.as_ref(), va);
     }
 
     /// 为新线程分配 TrapContext 槽位，返回槽号。
@@ -129,25 +148,10 @@ impl MmRef {
             .try_insert_framed_area(start_va, end_va, permission)
     }
 
-    /// 处理写时复制 fault：分配新帧、复制旧页、重映射为可写。
-    pub fn resolve_cow_fault(&self, fault_va: usize) -> bool {
-        self.lock().resolve_cow_fault(fault_va)
-    }
-
-    /// 处理 lazy fault：按需分配/复用 frame 并安装 PTE。
-    pub fn resolve_lazy_fault(&self, fault_va: usize, access: MapPermission) -> LazyFaultResult {
-        self.lock().resolve_lazy_fault(fault_va, access)
-    }
-
     /// 检查 addr 是否落在文件映射的 SIGBUS tail 区。
     #[cfg(target_arch = "riscv64")]
     pub fn fault_hits_mmap_sigbus_tail(&self, addr: usize) -> bool {
         self.lock().fault_hits_mmap_sigbus_tail(addr)
-    }
-
-    /// 处理 MAP_GROWSDOWN 栈向下扩展的 guard page fault。
-    pub fn try_expand_growsdown(&self, fault_va: usize, access: MapPermission) -> LazyFaultResult {
-        self.lock().try_expand_growsdown(fault_va, access)
     }
 
     /// 查询 vpn 对应的页表项。

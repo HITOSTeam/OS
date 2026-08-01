@@ -319,16 +319,6 @@ impl MemorySet {
         crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
     }
 
-    #[cfg(target_arch = "loongarch64")]
-    pub fn flush_user_page(&self, va: usize) {
-        crate::arch::loongarch64::mm::flush_user_page(self.asid.as_ref(), va);
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    pub fn flush_user_page(&self, va: usize) {
-        crate::arch::riscv64::mm::flush_user_page(self.asid.as_ref(), va);
-    }
-
     fn inherit_user_vm_metadata_from(&mut self, parent: &MemorySet) {
         self.vm_regions = parent.vm_regions.clone();
         self.vm_regions.mark_fork_inherited_anonymous_mmap();
