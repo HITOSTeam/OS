@@ -3,19 +3,18 @@ use super::{
     OSInode, PIPE_BUF, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
     SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK, SocketPairEnd,
     SyscallError, TimerFdFile, UserBuffer, Vec, cgroup_charge_file_write, current_process, err,
-    ext4_err_to_errno, fanotify_notify_access, fanotify_notify_modify,
-    fanotify_permission_access, fanotify_read_result, fanotify_write_result, fd_has_append,
-    fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe, file_is_seekable_for_preadwrite,
-    get_current_token, get_fd_file_and_flags, inode_visible_size_with_disk_size,
-    maybe_update_inode_atime, mirror_inode_kernel_write_to_shared_mmaps,
-    mirror_inode_write_to_current_mmaps, pipe_read_to_kernel, pipe_write_from_kernel,
-    queue_process_signal, read_optional_offset, read_vm_iovec, require_fd_file,
-    socketpair_write_from_kernel, touch_inode_mtime_ctime_now, try_copy_from_user,
-    try_copy_to_user, try_read_user_value, try_translated_byte_buffer, try_write_proc_pseudo_file,
-    try_write_user_value, validate_direct_io_request, with_ext4_inode_read,
-    write_optional_offset,
+    ext4_err_to_errno, fanotify_notify_access, fanotify_notify_modify, fanotify_permission_access,
+    fanotify_read_result, fanotify_write_result, fd_has_append, fd_has_noatime, fd_has_nonblock,
+    fd_has_o_path, file_is_pipe, file_is_seekable_for_preadwrite, get_current_token,
+    get_fd_file_and_flags, inode_visible_size_with_disk_size, maybe_update_inode_atime,
+    mirror_inode_kernel_write_to_shared_mmaps, mirror_inode_write_to_current_mmaps,
+    pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal, read_optional_offset,
+    read_vm_iovec, require_fd_file, socketpair_write_from_kernel, touch_inode_mtime_ctime_now,
+    try_copy_from_user, try_copy_to_user, try_read_user_value, try_translated_byte_buffer,
+    try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
+    with_ext4_inode_read, write_optional_offset,
 };
-use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, TunTapFile};
+use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, Stdout, TunTapFile};
 use alloc::vec;
 
 /// Reads from regular files and special waitable descriptors into a user buffer.
@@ -324,6 +323,17 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     if len == 0 {
         return 0;
     }
+    // Match Linux tty_write_lock(): serialize one userspace terminal write as
+    // a unit, and acquire the sleepable lock before translating unpinned user
+    // pages. O_NONBLOCK observes lock contention as EAGAIN.
+    let _stdout_write_guard = if file.as_any().downcast_ref::<Stdout>().is_some() {
+        let Some(guard) = Stdout::lock_write(nonblock) else {
+            return err(SyscallError::EAGAIN);
+        };
+        Some(guard)
+    } else {
+        None
+    };
     if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
         let Ok(user_bufs) = try_translated_byte_buffer(
             get_current_token(),

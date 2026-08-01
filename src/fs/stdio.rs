@@ -4,11 +4,27 @@ use super::File;
 use crate::arch::console_flush;
 use crate::arch::{console_getchar, console_putchar};
 use crate::mm::UserBuffer;
+use crate::sync::{KernelMutex, KernelMutexGuard};
 use crate::task::processor::suspend_current_and_run_next;
 ///Standard input
 pub struct Stdin;
 ///Standard output
 pub struct Stdout;
+
+// Linux takes tty_write_lock() before importing the userspace iterator.  Keep
+// the same lifetime boundary: syscall_write acquires this sleepable lock before
+// translating user pages, then holds it through the complete terminal write.
+static STDOUT_WRITE_LOCK: KernelMutex<()> = KernelMutex::new(());
+
+impl Stdout {
+    pub fn lock_write(nonblock: bool) -> Option<KernelMutexGuard<'static, ()>> {
+        if nonblock {
+            STDOUT_WRITE_LOCK.try_lock()
+        } else {
+            Some(STDOUT_WRITE_LOCK.lock())
+        }
+    }
+}
 
 impl File for Stdin {
     fn readable(&self) -> bool {
