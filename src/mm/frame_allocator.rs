@@ -2,7 +2,7 @@
 //! controls all the frames in the operating system.
 
 use super::{PhysAddr, PhysPageNum};
-use crate::{config::phys_mem_end, println};
+use crate::{config::phys_mem_end, println, sync::LocalIrqSaveGuard};
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -147,6 +147,16 @@ lazy_static! {
     pub static ref FRAME_ALLOCATOR: Mutex<FrameAllocatorImpl> = Mutex::new(FrameAllocatorImpl::new());
 }
 
+/// Run a frame free-list operation with Linux-style irq-save spinlock
+/// semantics.  The `spin` crate lock alone does not disable timer preemption,
+/// so its owner could otherwise be switched out while other harts spin on the
+/// ticket lock.
+fn with_frame_allocator<R>(f: impl FnOnce(&mut FrameAllocatorImpl) -> R) -> R {
+    let _irq_guard = LocalIrqSaveGuard::new();
+    let mut allocator = FRAME_ALLOCATOR.lock();
+    f(&mut allocator)
+}
+
 /// initiate the frame allocator using `ekernel` and detected physical memory end
 #[allow(dead_code)]
 pub fn init_frame_allocator() {
@@ -156,15 +166,16 @@ pub fn init_frame_allocator() {
         safe fn stext();
     }
     let kernel_end = PhysAddr::from(ekernel as usize).ceil();
-    let mut allocator = FRAME_ALLOCATOR.lock();
-    allocator.init(kernel_end, PhysAddr::from(phys_mem_end()).floor());
-    #[cfg(target_arch = "loongarch64")]
-    {
-        use crate::config::phys_mem_start;
-        let low_start = PhysAddr::from(phys_mem_start()).ceil();
-        let kernel_start = PhysAddr::from(stext as usize).floor();
-        allocator.add_range(low_start, kernel_start);
-    }
+    with_frame_allocator(|allocator| {
+        allocator.init(kernel_end, PhysAddr::from(phys_mem_end()).floor());
+        #[cfg(target_arch = "loongarch64")]
+        {
+            use crate::config::phys_mem_start;
+            let low_start = PhysAddr::from(phys_mem_start()).ceil();
+            let kernel_start = PhysAddr::from(stext as usize).floor();
+            allocator.add_range(low_start, kernel_start);
+        }
+    });
 }
 
 /// allocate a frame
@@ -176,26 +187,24 @@ pub fn frame_alloc() -> Option<FrameTracker> {
     // same split: rmqueue() removes a page under allocator locking, then
     // prep_new_page()/post_alloc_hook() initialize it after the free-list
     // operation has completed.
-    let ppn = FRAME_ALLOCATOR.lock().alloc();
+    let ppn = with_frame_allocator(|allocator| allocator.alloc());
     if let Some(ppn) = ppn {
         return Some(FrameTracker::new(ppn));
     }
 
     let reclaimed = super::memory_set::reclaim_shared_file_page_cache();
     if reclaimed > 0 {
-        let ppn = FRAME_ALLOCATOR.lock().alloc();
+        let ppn = with_frame_allocator(|allocator| allocator.alloc());
         if let Some(ppn) = ppn {
             return Some(FrameTracker::new(ppn));
         }
     }
 
     if crate::debug_config::DEBUG_PERF {
-        let allocator = FRAME_ALLOCATOR.lock();
+        let (current, end, recycled) = with_frame_allocator(|allocator| {
+            (allocator.current, allocator.end, allocator.recycled.len())
+        });
         let fails = FRAME_ALLOC_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        let current = allocator.current;
-        let end = allocator.end;
-        let recycled = allocator.recycled.len();
-        drop(allocator);
         let refcnt_entries = FRAME_OWNER_COUNT.load(Ordering::Relaxed);
         println!(
             "[mm-debug] frame_alloc failed count={} current={:#x} end={:#x} recycled={} refcnt_entries={}",
@@ -210,16 +219,17 @@ pub fn frame_refcount_entries() -> usize {
 }
 
 pub fn frame_available_pages() -> usize {
-    let allocator = FRAME_ALLOCATOR.lock();
-    allocator.recycled.len() + allocator.end.saturating_sub(allocator.current)
+    with_frame_allocator(|allocator| {
+        allocator.recycled.len() + allocator.end.saturating_sub(allocator.current)
+    })
 }
 
 pub fn frame_managed_pages() -> usize {
-    FRAME_ALLOCATOR.lock().managed_pages
+    with_frame_allocator(|allocator| allocator.managed_pages)
 }
 
 pub fn frame_alloc_contiguous(pages: usize) -> Option<Vec<FrameTracker>> {
-    let start = FRAME_ALLOCATOR.lock().alloc_contiguous(pages)?;
+    let start = with_frame_allocator(|allocator| allocator.alloc_contiguous(pages))?;
     let mut frames = Vec::with_capacity(pages);
     for i in 0..pages {
         frames.push(FrameTracker::new(PhysPageNum(start.0 + i)));
@@ -229,7 +239,7 @@ pub fn frame_alloc_contiguous(pages: usize) -> Option<Vec<FrameTracker>> {
 
 /// deallocate a frame
 pub fn frame_dealloc(ppn: PhysPageNum) {
-    FRAME_ALLOCATOR.lock().dealloc(ppn);
+    with_frame_allocator(|allocator| allocator.dealloc(ppn));
 }
 
 #[allow(unused)]

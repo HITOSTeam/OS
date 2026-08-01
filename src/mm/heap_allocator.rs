@@ -3,6 +3,7 @@
 use crate::{
     config::{KERNEL_HEAP_SIZE, MAX_HARTS},
     println,
+    sync::LocalIrqSaveGuard,
 };
 use buddy_system_allocator::Heap;
 use core::{
@@ -43,8 +44,10 @@ impl ShardedHeap {
             let shard_start = start + index * HEAP_SHARD_SIZE;
             // SAFETY: init_heap calls this once before secondary harts and
             // userspace start. The ranges are disjoint and cover HEAP_SPACE.
+            let _irq_guard = LocalIrqSaveGuard::new();
+            let mut shard = shard.lock();
             unsafe {
-                shard.lock().init(shard_start, HEAP_SHARD_SIZE);
+                shard.init(shard_start, HEAP_SHARD_SIZE);
             }
         }
     }
@@ -53,6 +56,7 @@ impl ShardedHeap {
         self.shards
             .iter()
             .fold((0usize, 0usize, 0usize), |(user, actual, total), shard| {
+                let _irq_guard = LocalIrqSaveGuard::new();
                 let shard = shard.lock();
                 (
                     user.saturating_add(shard.stats_alloc_user()),
@@ -77,7 +81,17 @@ unsafe impl GlobalAlloc for ShardedHeap {
         let local = crate::arch::hart_id() % MAX_HARTS;
         for offset in 0..MAX_HARTS {
             let index = (local + offset) % MAX_HARTS;
-            if let Ok(allocation) = self.shards[index].lock().alloc(layout) {
+            // Linux spin_lock() disables preemption, and allocator locks that
+            // are reachable from hardirq paths use irq-save semantics. Keep
+            // the owning task on this hart until the shard lock is released;
+            // otherwise a timer interrupt could schedule it out permanently
+            // while another hart spins on the same allocator shard.
+            let allocation = {
+                let _irq_guard = LocalIrqSaveGuard::new();
+                let mut shard = self.shards[index].lock();
+                shard.alloc(layout)
+            };
+            if let Ok(allocation) = allocation {
                 return allocation.as_ptr();
             }
         }
@@ -91,9 +105,9 @@ unsafe impl GlobalAlloc for ShardedHeap {
         // SAFETY: GlobalAlloc requires `ptr` to come from a previous successful
         // allocation with the same layout. Address routing selects that
         // allocation's original, disjoint buddy arena.
-        shard
-            .lock()
-            .dealloc(unsafe { NonNull::new_unchecked(ptr) }, layout);
+        let _irq_guard = LocalIrqSaveGuard::new();
+        let mut shard = shard.lock();
+        shard.dealloc(unsafe { NonNull::new_unchecked(ptr) }, layout);
     }
 }
 
