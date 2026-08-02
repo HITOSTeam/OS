@@ -150,8 +150,8 @@ pub use memory_set::{
     MprotectError, ShmAttach, ShmAttachRef, VmRegion, VmRegionKind, VmaInsertArea,
 };
 pub(crate) use memory_set::{
-    allocate_shared_anon_id, reclaim_shared_file_page_cache, resize_shared_file_page_cache,
-    update_shared_file_page_cache,
+    allocate_shared_anon_id, reclaim_file_page_cache, resize_file_page_cache,
+    update_file_page_cache,
 };
 pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub use page_table::{

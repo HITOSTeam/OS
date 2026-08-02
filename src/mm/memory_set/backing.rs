@@ -4,13 +4,64 @@
 //! 需要同步的 backing、dirty 和生命周期信息。
 
 use super::*;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::WaitQueue;
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SharedFilePageKey {
+struct FilePageCacheKey {
     dev: usize,
     ino: u32,
     file_page: usize,
+}
+
+const FILE_PAGE_LOADING: u8 = 0;
+const FILE_PAGE_READY: u8 = 1;
+const FILE_PAGE_INVALIDATED: u8 = 2;
+
+struct FilePageLoadState {
+    status: AtomicU8,
+    waiters: WaitQueue,
+}
+
+impl FilePageLoadState {
+    fn new() -> Self {
+        Self {
+            status: AtomicU8::new(FILE_PAGE_LOADING),
+            waiters: WaitQueue::new(),
+        }
+    }
+
+    /// Wait for the page owner to finish I/O.  As with Linux's locked folio,
+    /// the acquire pairs with publication of the initialized page contents.
+    fn wait_ready(&self) -> bool {
+        self.waiters
+            .wait_until(|| self.status.load(Ordering::Acquire) != FILE_PAGE_LOADING);
+        self.status.load(Ordering::Acquire) == FILE_PAGE_READY
+    }
+
+    fn finish(&self, status: u8) {
+        debug_assert!(status == FILE_PAGE_READY || status == FILE_PAGE_INVALIDATED);
+        self.status.store(status, Ordering::Release);
+        self.waiters.wake_all();
+    }
+}
+
+enum FilePageCacheSlot {
+    /// The frame is already indexed, but must not be mapped until its owner
+    /// finishes the filesystem read and publishes `Ready`.
+    Loading {
+        _frame: FrameTracker,
+        state: Arc<FilePageLoadState>,
+    },
+    Ready(FrameTracker),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FilePageCacheLoadError {
+    Oom,
+    /// A truncate invalidated the cache slot while its page was being read.
+    /// The fault must rebuild its VMA/file-size snapshot before retrying.
+    Invalidated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,11 +73,13 @@ struct SharedAnonPageKey {
 static NEXT_SHARED_ANON_ID: AtomicUsize = AtomicUsize::new(1);
 
 lazy_static::lazy_static! {
-    /// OSInode-backed MAP_SHARED 的第一阶段共享页缓存。
+    /// OSInode-backed regular-file page cache, keyed like Linux
+    /// `address_space::i_pages` by inode identity and page index.
     ///
-    /// 只覆盖普通文件共享映射；memfd/SysV shm 走各自的 shared-frame，
-    /// MAP_PRIVATE 不能复用这里的 frame。
-    static ref SHARED_FILE_PAGE_CACHE: Mutex<BTreeMap<SharedFilePageKey, FrameTracker>> =
+    /// Clean MAP_PRIVATE pages and MAP_SHARED pages both reference the same
+    /// frame.  A private write replaces that mapping through COW; memfd and
+    /// SysV shm keep using their own shared-frame stores.
+    static ref FILE_PAGE_CACHE: Mutex<BTreeMap<FilePageCacheKey, FilePageCacheSlot>> =
         Mutex::new(BTreeMap::new());
     /// MAP_SHARED|MAP_ANONYMOUS 的 lazy 页缓存。
     ///
@@ -37,8 +90,8 @@ lazy_static::lazy_static! {
 }
 
 /// 用 (dev, ino, file_page) 构造缓存键。
-fn shared_file_page_key(dev: usize, ino: u32, file_page: usize) -> SharedFilePageKey {
-    SharedFilePageKey {
+fn file_page_cache_key(dev: usize, ino: u32, file_page: usize) -> FilePageCacheKey {
+    FilePageCacheKey {
         dev,
         ino,
         file_page,
@@ -53,30 +106,103 @@ pub(super) fn allocate_shared_anon_id() -> u64 {
     NEXT_SHARED_ANON_ID.fetch_add(1, Ordering::Relaxed) as u64
 }
 
-/// 查询全局共享文件页缓存，返回对应 FrameTracker（不存在则 None）。
-pub(super) fn shared_file_page_cache_get(
+/// Find or read one regular-file page through the global inode page cache.
+///
+/// The first fault inserts a loading slot before starting I/O.  Concurrent
+/// faults sleep on that slot and reuse the published frame, matching Linux's
+/// `FGP_CREAT|FGP_FOR_MMAP` plus locked-folio protocol instead of issuing one
+/// disk read per process.
+pub(super) fn file_page_cache_get_or_load<F>(
     dev: usize,
     ino: u32,
     file_page: usize,
-) -> Option<FrameTracker> {
-    SHARED_FILE_PAGE_CACHE
-        .lock()
-        .get(&shared_file_page_key(dev, ino, file_page))
-        .cloned()
-}
+    fill: F,
+) -> Result<FrameTracker, FilePageCacheLoadError>
+where
+    F: FnOnce(&mut [u8]),
+{
+    let key = file_page_cache_key(dev, ino, file_page);
+    let mut fill = Some(fill);
+    let mut must_observe_published = false;
 
-/// 插入缓存页；若该页已存在则直接返回已有 frame（保证同一文件页全局唯一物理帧）。
-pub(super) fn shared_file_page_cache_insert_or_get(
-    dev: usize,
-    ino: u32,
-    file_page: usize,
-    frame: FrameTracker,
-) -> FrameTracker {
-    SHARED_FILE_PAGE_CACHE
-        .lock()
-        .entry(shared_file_page_key(dev, ino, file_page))
-        .or_insert(frame)
-        .clone()
+    loop {
+        let loading = {
+            let cache = FILE_PAGE_CACHE.lock();
+            match cache.get(&key) {
+                Some(FilePageCacheSlot::Ready(frame)) => return Ok(frame.clone()),
+                Some(FilePageCacheSlot::Loading { state, .. }) => Some(Arc::clone(state)),
+                None if must_observe_published => {
+                    return Err(FilePageCacheLoadError::Invalidated);
+                }
+                None => None,
+            }
+        };
+        if let Some(state) = loading {
+            if !state.wait_ready() {
+                return Err(FilePageCacheLoadError::Invalidated);
+            }
+            // Pin the ready frame under the cache lock on the next iteration.
+            // If truncate removes it first, force a fresh VMA/EOF snapshot
+            // rather than starting another read from this stale fault plan.
+            must_observe_published = true;
+            continue;
+        }
+
+        // Page allocation and zeroing stay outside the cache metadata lock.
+        let candidate = frame_alloc().ok_or(FilePageCacheLoadError::Oom)?;
+        let state = Arc::new(FilePageLoadState::new());
+        let competing_load = {
+            let mut cache = FILE_PAGE_CACHE.lock();
+            match cache.get(&key) {
+                Some(FilePageCacheSlot::Ready(frame)) => return Ok(frame.clone()),
+                Some(FilePageCacheSlot::Loading { state, .. }) => Some(Arc::clone(state)),
+                None => {
+                    cache.insert(
+                        key,
+                        FilePageCacheSlot::Loading {
+                            _frame: candidate.clone(),
+                            state: Arc::clone(&state),
+                        },
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(competing_load) = competing_load {
+            if !competing_load.wait_ready() {
+                return Err(FilePageCacheLoadError::Invalidated);
+            }
+            must_observe_published = true;
+            continue;
+        }
+
+        // We own this cache miss.  Fill the zeroed frame without holding the
+        // global cache lock or an mm lock.
+        fill.take().expect("file page fill called more than once")(candidate.ppn.get_bytes_array());
+
+        let published = {
+            let mut cache = FILE_PAGE_CACHE.lock();
+            let owns_slot = matches!(
+                cache.get(&key),
+                Some(FilePageCacheSlot::Loading { state: current, .. })
+                    if Arc::ptr_eq(current, &state)
+            );
+            if owns_slot {
+                cache.insert(key, FilePageCacheSlot::Ready(candidate.clone()));
+            }
+            owns_slot
+        };
+        if published {
+            state.finish(FILE_PAGE_READY);
+            return Ok(candidate);
+        }
+
+        // truncate removed the loading slot while filesystem I/O was in
+        // progress.  Wake coalesced faults and make every caller revalidate
+        // its VMA/EOF snapshot before trying again.
+        state.finish(FILE_PAGE_INVALIDATED);
+        return Err(FilePageCacheLoadError::Invalidated);
+    }
 }
 
 pub(super) fn shared_anon_page_cache_get(id: u64, page: usize) -> Option<FrameTracker> {
@@ -106,29 +232,45 @@ pub(super) fn shared_anon_page_cache_insert_or_get(
 
 /// 将 write 数据同步到全局缓存中已驻留的共享文件页，
 /// 保证其他进程后续 fault 能看到最新内容。
-pub(super) fn shared_file_page_cache_write(dev: usize, ino: u32, write_off: usize, data: &[u8]) {
+pub(super) fn file_page_cache_write(dev: usize, ino: u32, write_off: usize, data: &[u8]) {
     if data.is_empty() {
         return;
     }
 
-    // fd 写入也更新全局缓存，保证其他 mm 后续 fault 能看到新内容。
-    let cache = SHARED_FILE_PAGE_CACHE.lock();
     let mut copied = 0usize;
     while copied < data.len() {
         let file_off = write_off.saturating_add(copied);
         let file_page = file_off / PAGE_SIZE;
         let page_off = file_off & (PAGE_SIZE - 1);
         let chunk = core::cmp::min(PAGE_SIZE - page_off, data.len() - copied);
-        if let Some(frame) = cache.get(&shared_file_page_key(dev, ino, file_page)) {
-            frame.ppn.get_bytes_array()[page_off..page_off + chunk]
-                .copy_from_slice(&data[copied..copied + chunk]);
+        let key = file_page_cache_key(dev, ino, file_page);
+        loop {
+            let loading = {
+                let cache = FILE_PAGE_CACHE.lock();
+                match cache.get(&key) {
+                    Some(FilePageCacheSlot::Ready(frame)) => {
+                        frame.ppn.get_bytes_array()[page_off..page_off + chunk]
+                            .copy_from_slice(&data[copied..copied + chunk]);
+                        None
+                    }
+                    Some(FilePageCacheSlot::Loading { state, .. }) => Some(Arc::clone(state)),
+                    None => None,
+                }
+            };
+            let Some(state) = loading else {
+                break;
+            };
+            // OSInode's inode lock orders the underlying read and write.  The
+            // cache publication may still trail that I/O completion, so wait
+            // here to avoid racing two mutable frame copies.
+            let _ = state.wait_ready();
         }
         copied += chunk;
     }
 }
 
 /// 文件 truncate 后同步缓存：EOF 页尾部清零，超出新 file_size 的缓存页全部丢弃。
-pub(super) fn shared_file_page_cache_resize(dev: usize, ino: u32, file_size: usize) {
+pub(super) fn file_page_cache_resize(dev: usize, ino: u32, file_size: usize) {
     let eof_page = file_size / PAGE_SIZE;
     let eof_off = file_size & (PAGE_SIZE - 1);
     let remove_from = if eof_off == 0 {
@@ -137,11 +279,20 @@ pub(super) fn shared_file_page_cache_resize(dev: usize, ino: u32, file_size: usi
         eof_page.saturating_add(1)
     };
 
-    let mut cache = SHARED_FILE_PAGE_CACHE.lock();
+    let mut invalidated = Vec::new();
+    let mut cache = FILE_PAGE_CACHE.lock();
     // truncate 后 EOF 页尾清零，EOF 之后的缓存页必须丢弃，避免 shrink/grow 复用旧脏页。
     if eof_off != 0 {
-        if let Some(frame) = cache.get(&shared_file_page_key(dev, ino, eof_page)) {
-            frame.ppn.get_bytes_array()[eof_off..PAGE_SIZE].fill(0);
+        let eof_key = file_page_cache_key(dev, ino, eof_page);
+        match cache.get(&eof_key) {
+            Some(FilePageCacheSlot::Ready(frame)) => {
+                frame.ppn.get_bytes_array()[eof_off..PAGE_SIZE].fill(0);
+            }
+            Some(FilePageCacheSlot::Loading { state, .. }) => {
+                invalidated.push(Arc::clone(state));
+                cache.remove(&eof_key);
+            }
+            None => {}
         }
     }
 
@@ -151,7 +302,13 @@ pub(super) fn shared_file_page_cache_resize(dev: usize, ino: u32, file_size: usi
         .copied()
         .collect::<Vec<_>>();
     for key in stale_keys {
-        cache.remove(&key);
+        if let Some(FilePageCacheSlot::Loading { state, .. }) = cache.remove(&key) {
+            invalidated.push(state);
+        }
+    }
+    drop(cache);
+    for state in invalidated {
+        state.finish(FILE_PAGE_INVALIDATED);
     }
 }
 
@@ -160,12 +317,14 @@ pub(super) fn shared_file_page_cache_resize(dev: usize, ino: u32, file_size: usi
 /// Linux page cache 可以在内存压力下回收 clean cache page；当前内核没有完整
 /// reclaim，因此在分配失败前只丢弃 refcount==1 的页，也就是仅由全局 cache
 /// 自己持有、没有 resident PTE/MapArea 继续使用的页。
-pub(super) fn shared_file_page_cache_reclaim_unreferenced() -> usize {
-    let mut cache = SHARED_FILE_PAGE_CACHE.lock();
+pub(super) fn file_page_cache_reclaim_unreferenced() -> usize {
+    let mut cache = FILE_PAGE_CACHE.lock();
     let stale_keys = cache
         .iter()
-        .filter(|(_, frame)| frame.refcount() <= 1)
-        .map(|(key, _)| *key)
+        .filter_map(|(key, slot)| match slot {
+            FilePageCacheSlot::Ready(frame) if frame.refcount() <= 1 => Some(*key),
+            FilePageCacheSlot::Loading { .. } | FilePageCacheSlot::Ready(_) => None,
+        })
         .collect::<Vec<_>>();
     let reclaimed = stale_keys.len();
     for key in stale_keys {
@@ -268,13 +427,6 @@ impl MmapBacking {
     /// 检查 region 是否归属于本 backing。
     pub(super) fn matches_region(&self, region: &VmRegion) -> bool {
         self.kind.matches_region(region)
-    }
-
-    /// 返回指定 file_page 的驻留共享 frame（MAP_PRIVATE 不使用）。
-    pub(super) fn resident_frame(&self, file_page: usize) -> Option<FrameTracker> {
-        self.resident_pages
-            .get(&file_page)
-            .and_then(|state| state.frame.as_ref().cloned())
     }
 
     /// fault 路径：增加 file_page 的驻留引用计数，可选记录 frame 和 dirty 状态。

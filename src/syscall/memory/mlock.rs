@@ -141,7 +141,7 @@ pub fn syscall_mlock(addr: usize, len: usize) -> isize {
     let mut available_pages =
         frame_available_pages().saturating_sub(MLOCK_POPULATE_FRAME_RESERVE_PAGES);
     if pages_to_populate > available_pages {
-        reclaim_shared_file_page_cache();
+        reclaim_file_page_cache();
         available_pages =
             frame_available_pages().saturating_sub(MLOCK_POPULATE_FRAME_RESERVE_PAGES);
     }

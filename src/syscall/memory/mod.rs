@@ -15,8 +15,8 @@ pub(super) use crate::{
     },
     mm::{
         BrkUpdate, MapPermission, MapType, MemorySet, MprotectError, PTEFlags, VmRegion,
-        VmRegionKind, VmaInsertArea, frame_available_pages, reclaim_shared_file_page_cache,
-        try_copy_to_user, try_copy_to_user_unchecked,
+        VmRegionKind, VmaInsertArea, frame_available_pages, reclaim_file_page_cache,
+        try_copy_to_user,
     },
     task::{
         manager::PID2PCB,

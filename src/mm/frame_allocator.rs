@@ -281,7 +281,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         return Some(FrameTracker::new(ppn));
     }
 
-    let reclaimed = super::memory_set::reclaim_shared_file_page_cache();
+    let reclaimed = super::memory_set::reclaim_file_page_cache();
     if reclaimed > 0 {
         let ppn = with_frame_allocator(|allocator| allocator.alloc());
         if let Some(ppn) = ppn {

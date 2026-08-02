@@ -189,17 +189,6 @@ impl MemorySet {
         self.refresh_mmap_backing_states(backing_ids);
     }
 
-    /// 返回指定 backing 中 file_page 对应的驻留共享 frame。
-    pub(super) fn mmap_backing_resident_frame(
-        &self,
-        backing_id: usize,
-        file_page: usize,
-    ) -> Option<FrameTracker> {
-        self.mmap_backings
-            .get(&backing_id)
-            .and_then(|backing| backing.resident_frame(file_page))
-    }
-
     /// 清除指定 backing 中 file_page 的 dirty 标记（msync 写回后调用）。
     #[cfg(target_arch = "riscv64")]
     fn clear_mmap_backing_dirty_page(&mut self, backing_id: usize, file_page: usize) {
@@ -311,7 +300,7 @@ impl MemorySet {
                 .and_then(|state| state.frame.as_ref())
                 .is_some_and(|backing_frame| backing_frame.ppn == frame.ppn) as usize;
         let expected_local_refs = local_refs
-            .saturating_add(1) // global shared file page cache
+            .saturating_add(1) // global file page cache
             .saturating_add(backing_state_ref)
             .saturating_add(1); // resident_page_for_vpn() clone held by the caller
         frame.refcount() > expected_local_refs
@@ -486,8 +475,8 @@ impl MemorySet {
         })
     }
 
-    /// 返回需要将 fd write 数据镜像到用户内存的 (va, src_offset, len) 列表，
-    /// 并同步更新对应 VmRegion 的 file_valid_len。
+    /// 返回需要将 fd write 数据镜像到 MAP_SHARED 用户内存的
+    /// (va, src_offset, len) 列表。
     pub fn file_vm_copy_targets(
         &mut self,
         dev: usize,

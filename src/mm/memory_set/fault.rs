@@ -1,6 +1,6 @@
 use super::backing::{
-    shared_anon_page_cache_get, shared_anon_page_cache_insert_or_get, shared_file_page_cache_get,
-    shared_file_page_cache_insert_or_get,
+    FilePageCacheLoadError, file_page_cache_get_or_load, shared_anon_page_cache_get,
+    shared_anon_page_cache_insert_or_get,
 };
 use super::{
     LazyFaultResult, MapPermission, MapType, MemorySet, MmRef, PageTableUpdateBatch, VmRegion,
@@ -38,17 +38,17 @@ struct LazyFaultPlan {
     pte_flags: PTEFlags,
     file_page: Option<usize>,
     anon_page: Option<usize>,
-    shared_inode_backed: bool,
+    inode_backed: bool,
+    private_file_cow: bool,
     shared_anon_backed: bool,
-    backing_resident_frame: Option<FrameTracker>,
     file: Option<alloc::sync::Arc<dyn crate::fs::File + Send + Sync>>,
     file_off: usize,
-    read_len: usize,
 }
 
 enum LazyFaultPrepare {
     Ready(LazyFaultPlan),
     Resolved,
+    Cow,
     Invalid,
 }
 
@@ -64,6 +64,18 @@ fn pte_allows_access(pte: PageTableEntry, access: MapPermission) -> bool {
         && (!access.contains(MapPermission::R) || pte.readable())
         && (!access.contains(MapPermission::W) || pte.writable())
         && (!access.contains(MapPermission::X) || pte.executable())
+}
+
+/// Apply Linux's clean private-file mapping policy to a VMA-derived PTE.
+/// Keep this transformation shared by prepare and commit so their recheck
+/// compares identical policy snapshots.
+fn private_file_cache_pte_flags(region: &VmRegion, mut flags: PTEFlags) -> (PTEFlags, bool) {
+    let private_file_cow = region.file_backed && region.memfd_id == 0 && !region.shared;
+    if private_file_cow {
+        flags.remove(PTEFlags::W | PTEFlags::D | PTEFlags::SHARED);
+        flags.insert(PTEFlags::COW);
+    }
+    (flags, private_file_cow)
 }
 
 impl MemorySet {
@@ -273,6 +285,8 @@ impl MemorySet {
         {
             return if pte_allows_access(pte, access) {
                 LazyFaultPrepare::Resolved
+            } else if access.contains(MapPermission::W) && pte.flags().contains(PTEFlags::COW) {
+                LazyFaultPrepare::Cow
             } else {
                 LazyFaultPrepare::Invalid
             };
@@ -285,7 +299,12 @@ impl MemorySet {
                 .saturating_add(page_start.saturating_sub(region.start))
                 / PAGE_SIZE
         });
-        let shared_inode_backed = region.shared && region.file_backed && region.memfd_id == 0;
+        let inode_backed = region.file_backed && region.memfd_id == 0;
+        // Linux maps a clean MAP_PRIVATE file folio read-only into every mm.
+        // The first private write goes through do_cow_fault() and must never
+        // modify the inode page-cache frame, even if the VMA is currently
+        // read-only and is upgraded later with mprotect(PROT_WRITE).
+        let (pte_flags, private_file_cow) = private_file_cache_pte_flags(&region, pte_flags);
         let shared_anon_backed = region.shared && region.anon_shared_id != 0;
         let anon_page = shared_anon_backed.then(|| {
             region
@@ -293,22 +312,12 @@ impl MemorySet {
                 .saturating_add(page_start.saturating_sub(region.start))
                 / PAGE_SIZE
         });
-        let backing_resident_frame = if shared_inode_backed {
-            file_page.and_then(|page| self.mmap_backing_resident_frame(region.backing_id, page))
-        } else {
-            None
-        };
         let file = self
             .mmap_backings
             .get(&region.backing_id)
             .map(|backing| backing.file());
         let region_delta = page_start.saturating_sub(region.start);
         let file_off = region.file_offset.saturating_add(region_delta);
-        let read_len = region
-            .file_valid_len()
-            .saturating_sub(region_delta)
-            .min(PAGE_SIZE);
-
         LazyFaultPrepare::Ready(LazyFaultPlan {
             vpn,
             region,
@@ -316,12 +325,11 @@ impl MemorySet {
             pte_flags,
             file_page,
             anon_page,
-            shared_inode_backed,
+            inode_backed,
+            private_file_cow,
             shared_anon_backed,
-            backing_resident_frame,
             file,
             file_off,
-            read_len,
         })
     }
 
@@ -342,7 +350,11 @@ impl MemorySet {
         let Some((perm, pte_flags)) = region.lazy_fault_policy(fault_va, access) else {
             return LazyFaultCommit::Retry;
         };
-        if perm != plan.perm || pte_flags != plan.pte_flags {
+        let (pte_flags, private_file_cow) = private_file_cache_pte_flags(&region, pte_flags);
+        if perm != plan.perm
+            || pte_flags != plan.pte_flags
+            || private_file_cow != plan.private_file_cow
+        {
             return LazyFaultCommit::Retry;
         }
         if let Some(pte) = self.page_table.translate(plan.vpn)
@@ -384,29 +396,21 @@ impl MemorySet {
                 .set_charged_pages(accounted_pages.saturating_add(new_charge_pages));
         }
 
-        // Cache arbitration is intentionally delayed until after the PTE/VMA
-        // recheck. It is short metadata work; allocation and filesystem I/O
-        // have already happened without holding the mm lock.
-        let frame = match (plan.shared_inode_backed, plan.file_page) {
-            (true, Some(file_page)) => shared_file_page_cache_insert_or_get(
-                region.file_dev,
-                region.file_ino,
-                file_page,
+        // Shared-anonymous cache arbitration is intentionally delayed until
+        // after the PTE/VMA recheck.  Regular-file cache I/O and publication
+        // already happened without holding the mm lock.
+        let frame = match (plan.shared_anon_backed, plan.anon_page) {
+            (true, Some(anon_page)) => shared_anon_page_cache_insert_or_get(
+                region.anon_shared_id,
+                anon_page,
                 candidate.clone(),
             ),
-            _ => match (plan.shared_anon_backed, plan.anon_page) {
-                (true, Some(anon_page)) => shared_anon_page_cache_insert_or_get(
-                    region.anon_shared_id,
-                    anon_page,
-                    candidate.clone(),
-                ),
-                _ => candidate.clone(),
-            },
+            _ => candidate.clone(),
         };
 
         let mut batch = self.begin_page_table_update();
         self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
-        let shared_file_backing_frame = plan.shared_inode_backed.then(|| frame.clone());
+        let shared_file_backing_frame = (plan.inode_backed && region.shared).then(|| frame.clone());
         self.areas[area_idx].insert_tracked_frame(plan.vpn, frame);
         if let (Some(backing), Some(file_page)) = (
             self.mmap_backings.get_mut(&region.backing_id),
@@ -499,27 +503,73 @@ impl MmRef {
         let mut retries = 0usize;
         let mut slow_guard = None;
         loop {
-            let plan = match self.lock().prepare_lazy_fault(fault_va, access) {
-                LazyFaultPrepare::Ready(plan) => plan,
-                LazyFaultPrepare::Resolved => {
-                    self.flush_user_page(fault_va);
-                    return LazyFaultResult::Resolved;
-                }
-                LazyFaultPrepare::Invalid => return LazyFaultResult::Invalid,
-            };
+            let plan =
+                match self.lock().prepare_lazy_fault(fault_va, access) {
+                    LazyFaultPrepare::Ready(plan) => plan,
+                    LazyFaultPrepare::Resolved => {
+                        self.flush_user_page(fault_va);
+                        return LazyFaultResult::Resolved;
+                    }
+                    LazyFaultPrepare::Cow => {
+                        if self.resolve_cow_fault(fault_va) {
+                            return LazyFaultResult::Resolved;
+                        }
+                        let vpn = VirtAddr::from(fault_va).floor();
+                        if self.lock().translate(vpn).is_some_and(|pte| {
+                            pte.is_valid() && pte.flags().contains(PTEFlags::COW)
+                        }) {
+                            return LazyFaultResult::Oom;
+                        }
+                        retries = retries.saturating_add(1);
+                        continue;
+                    }
+                    LazyFaultPrepare::Invalid => return LazyFaultResult::Invalid,
+                };
 
             // Consult shared caches without nesting them under the mm lock.
-            let cached_frame = if plan.shared_inode_backed {
-                plan.file_page.and_then(|page| {
-                    shared_file_page_cache_get(plan.region.file_dev, plan.region.file_ino, page)
-                })
-            } else if plan.shared_anon_backed {
+            // Regular-file pages use a locked/loading cache slot so only one
+            // concurrent fault performs filesystem I/O.
+            let file_cache_frame = if plan.inode_backed {
+                let Some(file_page) = plan.file_page else {
+                    return LazyFaultResult::Invalid;
+                };
+                let Some(file) = plan.file.as_ref() else {
+                    return LazyFaultResult::Invalid;
+                };
+                let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+                    return LazyFaultResult::Invalid;
+                };
+                match file_page_cache_get_or_load(
+                    plan.region.file_dev,
+                    plan.region.file_ino,
+                    file_page,
+                    |page| {
+                        // Linux fills the complete cache folio independently
+                        // of the VMA that triggered the miss.  pread_at()
+                        // naturally stops at EOF and the freshly allocated
+                        // frame keeps the remainder zero-filled.
+                        let _ = os_inode.pread_at(plan.file_off, page);
+                    },
+                ) {
+                    Ok(frame) => Some(frame),
+                    Err(FilePageCacheLoadError::Oom) => return LazyFaultResult::Oom,
+                    Err(FilePageCacheLoadError::Invalidated) => {
+                        retries = retries.saturating_add(1);
+                        if retries >= FAULT_FAST_RETRIES && slow_guard.is_none() {
+                            slow_guard = Some(self.fault_retry_lock.lock());
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let cached_frame = if plan.shared_anon_backed {
                 plan.anon_page
                     .and_then(|page| shared_anon_page_cache_get(plan.region.anon_shared_id, page))
             } else {
-                None
-            }
-            .or_else(|| plan.backing_resident_frame.clone());
+                file_cache_frame
+            };
 
             let (frame, needs_file_fill) = if let Some(frame) = cached_frame {
                 (frame, false)
@@ -531,21 +581,31 @@ impl MmRef {
                 (frame, true)
             };
 
-            if needs_file_fill
-                && plan.region.file_backed
-                && plan.read_len != 0
-                && let Some(file) = plan.file.as_ref()
-                && let Some(os_inode) = file.as_any().downcast_ref::<OSInode>()
-            {
-                let page = frame.ppn.get_bytes_array();
-                let _ = os_inode.pread_at(plan.file_off, &mut page[..plan.read_len]);
-            }
+            debug_assert!(!needs_file_fill || !plan.region.file_backed);
 
             let commit = self
                 .lock()
                 .commit_lazy_fault(fault_va, access, &plan, &frame, charge_pid);
             match commit {
-                LazyFaultCommit::Installed => return LazyFaultResult::Resolved,
+                LazyFaultCommit::Installed => {
+                    // A write fault on a clean MAP_PRIVATE file page follows
+                    // Linux do_cow_fault(): copy the page-cache frame into an
+                    // anonymous private frame before reporting the write as
+                    // resolved.  Read/exec faults keep sharing the clean page.
+                    if access.contains(MapPermission::W) && plan.private_file_cow {
+                        if self.resolve_cow_fault(fault_va) {
+                            return LazyFaultResult::Resolved;
+                        }
+                        if self.lock().translate(plan.vpn).is_some_and(|pte| {
+                            pte.is_valid() && pte.flags().contains(PTEFlags::COW)
+                        }) {
+                            return LazyFaultResult::Oom;
+                        }
+                        retries = retries.saturating_add(1);
+                        continue;
+                    }
+                    return LazyFaultResult::Resolved;
+                }
                 LazyFaultCommit::Resolved => {
                     self.flush_user_page(fault_va);
                     return LazyFaultResult::Resolved;

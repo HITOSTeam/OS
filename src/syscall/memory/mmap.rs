@@ -57,42 +57,6 @@ pub fn syscall_brk(addr: usize) -> isize {
     update.result_brk() as isize
 }
 
-/// 使用 文件 填充 mmap 地方的内容
-fn populate_file_mapping(
-    memory_set: &mut MemorySet,
-    file: &Arc<dyn File + Send + Sync>,
-    start: usize,
-    len: usize,
-    off: usize,
-    executable: bool,
-) -> bool {
-    let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() else {
-        return true;
-    };
-    // Ensure buffered writes are reflected in file-backed mappings.
-    let _ = inode_file.flush();
-    let token = memory_set.token();
-    let mut pos = 0usize;
-    let mut wrote = false;
-    let mut tmp = [0u8; 512];
-    while pos < len {
-        let to_read = min(tmp.len(), len - pos);
-        let read = inode_file.pread_at(off + pos, &mut tmp[..to_read]);
-        if read == 0 {
-            break;
-        }
-        if try_copy_to_user_unchecked(token, (start + pos) as *mut u8, &tmp[..read]).is_err() {
-            return false;
-        }
-        wrote = true;
-        pos += read;
-    }
-    if wrote && executable {
-        memory_set.mark_user_icache_stale();
-    }
-    true
-}
-
 #[derive(Clone, Copy)]
 enum MmapSource<'a> {
     Anonymous,
@@ -144,8 +108,10 @@ fn build_vma_areas(
 ) -> Result<Vec<VmaInsertArea>, isize> {
     let mut areas = Vec::new();
     match (is_shared, source) {
-        (true, MmapSource::RegularFile { .. }) => {
-            // 普通文件 MAP_SHARED 走 lazy fault + shared file cache。
+        (_, MmapSource::RegularFile { .. }) => {
+            // Linux does not read regular files in mmap(2).  Both MAP_SHARED
+            // and MAP_PRIVATE fault through the inode page cache; private
+            // writes split from the clean cache page with COW.
             if map_start < sigbus_start {
                 areas.push(VmaInsertArea::Lazy {
                     start: map_start,
@@ -181,7 +147,7 @@ fn build_vma_areas(
                 end: map_end,
             });
         }
-        (false, MmapSource::RegularFile { .. } | MmapSource::Shm { .. }) => {
+        (false, MmapSource::Shm { .. }) => {
             if map_start < sigbus_start {
                 areas.push(VmaInsertArea::Framed {
                     start: map_start,
@@ -213,29 +179,11 @@ fn commit_mmap_vma(
     areas: Vec<VmaInsertArea>,
     lock_range: bool,
     backing_file: Option<&Arc<dyn File + Send + Sync>>,
-    populate_file: Option<&Arc<dyn File + Send + Sync>>,
-    start: usize,
-    len: usize,
-    off: usize,
 ) -> bool {
-    let executable = region.map_permission().contains(MapPermission::X);
-    match (replace, populate_file) {
-        (true, Some(file)) => memory_set.try_replace_user_vma_with(
-            region,
-            areas,
-            lock_range,
-            backing_file,
-            |memory_set| populate_file_mapping(memory_set, file, start, len, off, executable),
-        ),
-        (true, None) => memory_set.try_replace_user_vma(region, areas, lock_range, backing_file),
-        (false, Some(file)) => memory_set.try_insert_user_vma_with(
-            region,
-            areas,
-            lock_range,
-            backing_file,
-            |memory_set| populate_file_mapping(memory_set, file, start, len, off, executable),
-        ),
-        (false, None) => memory_set.try_insert_user_vma(region, areas, lock_range, backing_file),
+    if replace {
+        memory_set.try_replace_user_vma(region, areas, lock_range, backing_file)
+    } else {
+        memory_set.try_insert_user_vma(region, areas, lock_range, backing_file)
     }
 }
 
@@ -357,10 +305,6 @@ fn mmap_packet_socket_ring(
         areas,
         lock_range,
         None,
-        None,
-        start,
-        len,
-        off,
     );
     if !inserted {
         return err(SyscallError::ENOMEM);
@@ -491,7 +435,6 @@ pub fn syscall_mmap(
             }
         }
     }
-    let shared_inode_backed = is_shared && matches!(source, MmapSource::RegularFile { .. });
     let shared_anon_backed =
         is_shared && matches!(source, MmapSource::Anonymous | MmapSource::DevZero);
     // 对齐len
@@ -639,12 +582,10 @@ pub fn syscall_mmap(
         len: map_len,
         prot: prot & (PROT_READ | PROT_WRITE | PROT_EXEC),
         map_type: match (is_shared, source) {
-            (true, MmapSource::RegularFile { .. })
+            (_, MmapSource::RegularFile { .. })
             | (true, MmapSource::Anonymous | MmapSource::DevZero)
             | (false, MmapSource::Anonymous | MmapSource::DevZero) => MapType::Lazy,
-            (true, MmapSource::Shm { .. })
-            | (false, MmapSource::RegularFile { .. })
-            | (false, MmapSource::Shm { .. }) => MapType::Framed,
+            (true, MmapSource::Shm { .. }) | (false, MmapSource::Shm { .. }) => MapType::Framed,
         },
         map_perm: perm,
         file_valid_len,
@@ -662,14 +603,10 @@ pub fn syscall_mmap(
         growsdown: (flags & MAP_GROWSDOWN) != 0,
         fork_inherited_anon: false,
     };
-    // shared OSInode 页由 fault 从文件/cache 装入；private/file framed 映射仍可预填充。
-    let should_populate_file =
-        matches!(source, MmapSource::RegularFile { .. }) && !shared_inode_backed;
     let backing_file = match source {
         MmapSource::RegularFile { .. } | MmapSource::Shm { .. } => file.as_ref(),
         _ => None,
     };
-    let populate_file = should_populate_file.then_some(backing_file).flatten();
     let replace_existing = (flags & MAP_FIXED) != 0;
     let (detached_shmids, fixed_packet_ring_token) = {
         let mut memory_set = mm.lock();
@@ -691,10 +628,6 @@ pub fn syscall_mmap(
             vma_areas,
             lock_range,
             backing_file,
-            populate_file,
-            start,
-            len,
-            off,
         );
         if !inserted {
             return err(SyscallError::ENOMEM);
@@ -1102,18 +1035,13 @@ pub fn syscall_mremap(
         let mut grow_areas = Vec::new();
         if grow_start < final_sigbus_start {
             let grow_valid_end = min(final_sigbus_start, target_new_end);
-            if src_region.shared {
-                // shared grow 的新有效页保持 lazy，避免和全局 shared cache 分裂。
-                grow_areas.push(VmaInsertArea::Lazy {
-                    start: grow_start,
-                    end: grow_valid_end,
-                });
-            } else {
-                grow_areas.push(VmaInsertArea::Framed {
-                    start: grow_start,
-                    end: grow_valid_end,
-                });
-            }
+            // Regular-file growth remains non-resident for both MAP_SHARED
+            // and MAP_PRIVATE.  Faults resolve through the same inode page
+            // cache as the original range.
+            grow_areas.push(VmaInsertArea::Lazy {
+                start: grow_start,
+                end: grow_valid_end,
+            });
         }
         if final_sigbus_start < target_new_end {
             grow_areas.push(VmaInsertArea::Lazy {
@@ -1121,17 +1049,6 @@ pub fn syscall_mremap(
                 end: target_new_end,
             });
         }
-        let Some(grow_file_offset) = src_file_offset.checked_add(old_len) else {
-            return err(SyscallError::ENOMEM);
-        };
-        let file_mapped_grow_len = min(
-            target_new_end.saturating_sub(grow_start),
-            final_sigbus_start.saturating_sub(grow_start),
-        );
-        if grow_file_offset.checked_add(file_mapped_grow_len).is_none() {
-            return err(SyscallError::ENOMEM);
-        }
-
         {
             let mut memory_set = memory_set.lock();
             memory_set.try_grow_user_vma_range_with_file_len(
@@ -1141,38 +1058,7 @@ pub fn syscall_mremap(
                 new_len,
                 grow_areas,
                 final_file_valid_len,
-                |memory_set| {
-                    if src_region.shared {
-                        // shared file 新页不在 mremap 时拷贝，后续 fault 统一走 cache/file。
-                        return true;
-                    }
-                    let token = memory_set.token();
-                    let mut pos = 0usize;
-                    let mut wrote = false;
-                    let mut tmp = [0u8; 512];
-                    while pos < file_mapped_grow_len {
-                        let to_read = min(tmp.len(), file_mapped_grow_len - pos);
-                        let read = os_inode.pread_at(grow_file_offset + pos, &mut tmp[..to_read]);
-                        if read == 0 {
-                            break;
-                        }
-                        if try_copy_to_user_unchecked(
-                            token,
-                            (grow_start + pos) as *mut u8,
-                            &tmp[..read],
-                        )
-                        .is_err()
-                        {
-                            return false;
-                        }
-                        wrote = true;
-                        pos += read;
-                    }
-                    if wrote && src_region.map_permission().contains(MapPermission::X) {
-                        memory_set.mark_user_icache_stale();
-                    }
-                    true
-                },
+                |_| true,
             )
         }
     } else {

@@ -177,16 +177,16 @@ fn riscv_write_satp_and_flush_asid(token: usize) {
     }
 }
 
-pub(crate) fn update_shared_file_page_cache(dev: usize, ino: u32, write_off: usize, data: &[u8]) {
-    backing::shared_file_page_cache_write(dev, ino, write_off, data);
+pub(crate) fn update_file_page_cache(dev: usize, ino: u32, write_off: usize, data: &[u8]) {
+    backing::file_page_cache_write(dev, ino, write_off, data);
 }
 
-pub(crate) fn resize_shared_file_page_cache(dev: usize, ino: u32, file_size: usize) {
-    backing::shared_file_page_cache_resize(dev, ino, file_size);
+pub(crate) fn resize_file_page_cache(dev: usize, ino: u32, file_size: usize) {
+    backing::file_page_cache_resize(dev, ino, file_size);
 }
 
-pub(crate) fn reclaim_shared_file_page_cache() -> usize {
-    backing::shared_file_page_cache_reclaim_unreferenced()
+pub(crate) fn reclaim_file_page_cache() -> usize {
+    backing::file_page_cache_reclaim_unreferenced()
 }
 
 pub(crate) fn allocate_shared_anon_id() -> u64 {

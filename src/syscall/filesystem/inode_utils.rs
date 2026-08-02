@@ -14,7 +14,7 @@ use super::{
     rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
     with_ext4_inode_write, with_ext4_inode_write_set,
 };
-use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
+use crate::mm::{resize_file_page_cache, update_file_page_cache};
 use alloc::vec;
 use lazy_static::lazy_static;
 
@@ -693,7 +693,8 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
     });
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
-    // 当前进程的 user-buffer write 可以直接按用户地址做旧路径镜像。
+    // 当前进程的 user-buffer write 可以直接对 MAP_SHARED 做旧路径镜像。
+    // MAP_PRIVATE 由 inode page cache + COW 保持 Linux 语义。
     let copies: Vec<(usize, usize, usize)> = {
         let process = current_process();
         let memory_set = process.memory_set();
@@ -753,7 +754,7 @@ fn mirror_inode_write_to_shared_mmaps_all_processes(
             return;
         }
         // 同步全局 cache 和所有已 resident 的 MAP_SHARED 页。
-        update_shared_file_page_cache(dev, ino, write_off + done, &tmp[..chunk]);
+        update_file_page_cache(dev, ino, write_off + done, &tmp[..chunk]);
         for process in processes.iter() {
             let Some(memory_set) = process.try_memory_set() else {
                 continue;
@@ -785,7 +786,7 @@ pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     // sendfile/splice/copy_file_range 等 kernel-buffer 写入也要同步 mmap 视图。
-    update_shared_file_page_cache(dev, ino, write_off, data);
+    update_file_page_cache(dev, ino, write_off, data);
 
     let processes = {
         let map = PID2PCB.lock();
@@ -801,7 +802,7 @@ pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
 
 fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize) {
     // inode size 是全局事实，所有 mm 的 file_valid_len/SIGBUS tail 都要更新。
-    resize_shared_file_page_cache(dev, ino, file_size);
+    resize_file_page_cache(dev, ino, file_size);
     let processes = {
         let map = PID2PCB.lock();
         map.values().cloned().collect::<Vec<_>>()
