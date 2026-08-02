@@ -1,4 +1,6 @@
 pub mod csr_defs;
+#[allow(non_snake_case)]
+pub mod DTB_data;
 pub mod mm;
 pub mod task;
 pub mod trap;
@@ -7,13 +9,11 @@ use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
 use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
-use spin::MutexGuard;
-
 use csr_defs::{
     CRMD_DA, CRMD_IE, CRMD_PG, ECFG_LIE_IPI, ECFG_LIE_TI, ECFG_VS_MASK, ECFG_VS_SHIFT,
     IOCSR_IPI_CLEAR, IOCSR_IPI_EN, IOCSR_IPI_SEND, IOCSR_IPI_SEND_BLOCKING,
-    IOCSR_IPI_SEND_CPU_SHIFT, IOCSR_IPI_STATUS, IPI_ACTION_RESCHEDULE, TCFG_EN, TCFG_INITVAL_MASK,
+    IOCSR_IPI_SEND_CPU_SHIFT, IOCSR_IPI_STATUS, IPI_ACTION_RESCHEDULE, IPI_ACTION_TLB_FLUSH,
+    TCFG_EN, TCFG_INITVAL_MASK,
 };
 
 global_asm!(include_str!("tlb_refill.S"));
@@ -37,56 +37,104 @@ pub const REG_A6: usize = 10;
 pub const REG_A7: usize = 11;
 
 const EUEN_FPEN: usize = 1 << 0;
+const EUEN_LSXEN: usize = 1 << 1;
+const EUEN_LASXEN: usize = 1 << 2;
+const EUEN_USER_FP_MASK: usize = EUEN_FPEN | EUEN_LSXEN | EUEN_LASXEN;
 
-#[cfg(feature = "loongarch_board")]
-const UART_BASE: usize = 0x8000_0000_1fe2_0000;
-#[cfg(not(feature = "loongarch_board"))]
-const UART_BASE: usize = 0x1fe0_01e0;
+// 龙芯/QEMU 次级核心启动协议：固件先暂停 AP，启动核把入口地址写入
+// 0 号邮箱并触发 IPI 动作位 0 后，AP 才开始执行。
+const IOCSR_MBUF_SEND: usize = 0x1048;
+const IOCSR_MBUF_SEND_BLOCKING: u64 = 1 << 31;
+const IOCSR_MBUF_SEND_BOX_SHIFT: usize = 2;
+const IOCSR_MBUF_SEND_CPU_SHIFT: usize = 16;
+const IOCSR_MBUF_SEND_BUF_SHIFT: usize = 32;
+const IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
+const IPI_ACTION_BOOT_CPU: u32 = 1 << 0;
 
-const UART_RBR_THR: usize = UART_BASE + 0x0;
-const UART_FCR: usize = UART_BASE + 0x2;
-const UART_LCR: usize = UART_BASE + 0x3;
-const UART_LSR: usize = UART_BASE + 0x5;
+const UART_RBR_THR: usize = 0;
+const UART_FCR: usize = 2;
+const UART_LCR: usize = 3;
+const UART_LSR: usize = 5;
 pub const UART_FIFO_DEPTH: usize = 16;
 
-static UART_INITED: AtomicBool = AtomicBool::new(false);
+static UART_INITED: spin::Once<()> = spin::Once::new();
 
-fn uart_init_once() {
-    if UART_INITED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        // SAFETY: UART_LCR and UART_FCR are MMIO addresses for 16550-compatible UART.
-        unsafe {
-            // 8N1 + enable FIFO, clear RX/TX queues.
-            write_volatile(UART_LCR as *mut u8, 0x03);
-            write_volatile(UART_FCR as *mut u8, 0x07);
+fn uart_register_address(console: DTB_data::ConsoleInfo, register: usize) -> usize {
+    let offset = register
+        .checked_shl(console.reg_shift as u32)
+        .expect("DTB UART register offset overflows");
+    let end = offset
+        .checked_add(console.reg_io_width as usize)
+        .expect("DTB UART register width overflows");
+    assert!(
+        end <= console.size,
+        "DTB UART register lies outside its reg range"
+    );
+    console
+        .base
+        .checked_add(offset)
+        .expect("DTB UART address overflows")
+}
+
+fn uart_write(console: DTB_data::ConsoleInfo, register: usize, value: u8) {
+    let address = uart_register_address(console, register);
+    // 安全性：地址和访问宽度均由已校验的 DTB 串口节点提供。
+    unsafe {
+        match console.reg_io_width {
+            1 => write_volatile(address as *mut u8, value),
+            2 => write_volatile(address as *mut u16, value as u16),
+            4 => write_volatile(address as *mut u32, value as u32),
+            _ => unreachable!("DTB parser only permits 1/2/4-byte UART accesses"),
         }
     }
+}
+
+fn uart_read(console: DTB_data::ConsoleInfo, register: usize) -> u8 {
+    let address = uart_register_address(console, register);
+    // 安全性：地址和访问宽度均由已校验的 DTB 串口节点提供。
+    unsafe {
+        match console.reg_io_width {
+            1 => read_volatile(address as *const u8),
+            2 => read_volatile(address as *const u16) as u8,
+            4 => read_volatile(address as *const u32) as u8,
+            _ => unreachable!("DTB parser only permits 1/2/4-byte UART accesses"),
+        }
+    }
+}
+
+fn uart_init_once(console: DTB_data::ConsoleInfo) {
+    UART_INITED.call_once(|| {
+        // 8N1，并启用 FIFO、清空收发队列。
+        uart_write(console, UART_LCR, 0x03);
+        uart_write(console, UART_FCR, 0x07);
+    });
 }
 
 pub fn console_putchar(c: usize) {
-    uart_init_once();
-    // SAFETY: UART_RBR_THR is the MMIO address for UART transmit hold register.
-    unsafe {
-        write_volatile(UART_RBR_THR as *mut u8, c as u8);
-    }
+    let Some(console) = DTB_data::try_console_info() else {
+        return;
+    };
+    uart_init_once(console);
+    uart_write(console, UART_RBR_THR, c as u8);
 }
 
 pub fn console_flush() {
-    uart_init_once();
-    // SAFETY: UART_LSR is the MMIO address for UART line status register.
-    unsafe { while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {} }
+    let Some(console) = DTB_data::try_console_info() else {
+        return;
+    };
+    uart_init_once(console);
+    while uart_read(console, UART_LSR) & 0x20 == 0 {}
 }
 
 pub fn console_getchar() -> usize {
-    uart_init_once();
-    // SAFETY: UART_LSR and UART_RBR_THR are MMIO addresses for UART status and data registers.
-    unsafe {
-        if read_volatile(UART_LSR as *const u8) & 0x01 == 0 {
-            return usize::MAX;
-        }
-        read_volatile(UART_RBR_THR as *const u8) as usize
+    let Some(console) = DTB_data::try_console_info() else {
+        return usize::MAX;
+    };
+    uart_init_once(console);
+    if uart_read(console, UART_LSR) & 0x01 == 0 {
+        usize::MAX
+    } else {
+        uart_read(console, UART_RBR_THR) as usize
     }
 }
 
@@ -97,7 +145,7 @@ pub fn disable_interrupts() -> bool {
     let prev = (crmd & CRMD_IE) != 0;
     crmd &= !CRMD_IE;
     // SAFETY: CRMD write disables interrupts.
-    unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
+    unsafe { asm!("csrwr {}, 0x0", inout(reg) crmd => _) };
     prev
 }
 
@@ -114,18 +162,23 @@ pub fn enable_interrupts() {
     crmd |= CRMD_IE;
     // SAFETY: This writes the updated interrupt-enable bit back to CRMD in kernel mode. Writing
     // an invalid value would leave interrupts misconfigured for the current hart.
-    unsafe { asm!("csrwr {}, 0x0", in(reg) crmd) };
+    unsafe { asm!("csrwr {}, 0x0", inout(reg) crmd => _) };
 }
 
 pub fn wait_for_interrupt() {
-    core::hint::spin_loop();
+    // IPI 只负责把 idle hart 唤醒；共享请求序号才是 TLB flush 的可靠状态。
+    mm::service_pending_user_tlb_flush();
+    // Linux 的 LoongArch 空闲路径使用 level 0。不要调用第三方封装中的
+    // `idle 1`，该封装自身也注明尚不清楚 level 的含义。
+    // 安全性：调度器只会在本 hart 已开中断且没有可运行任务时进入这里。
+    unsafe { asm!("idle 0", options(nostack)) };
 }
 
 pub fn disable_direct_map_windows() {
     // SAFETY: DMW0/DMW1 (CSR 0x180/0x181) write and invtlb are valid in kernel mode.
     unsafe {
-        asm!("csrwr {}, 0x180", in(reg) 0usize);
-        asm!("csrwr {}, 0x181", in(reg) 0usize);
+        asm!("csrwr {}, 0x180", inout(reg) 0usize => _);
+        asm!("csrwr {}, 0x181", inout(reg) 0usize => _);
         asm!("invtlb 0x0, $r0, $r0");
     }
 }
@@ -164,11 +217,41 @@ fn iocsr_read32(reg: usize) -> u32 {
     value
 }
 
+#[inline(always)]
+fn iocsr_write64(reg: usize, value: u64) {
+    // 安全性：IOCSR 写入是特权操作，本函数只访问架构规定的龙芯邮箱寄存器。
+    unsafe {
+        asm!("iocsrwr.d {}, {}", in(reg) value, in(reg) reg, options(nostack));
+    }
+}
+
+fn mail_send(data: u64, hart_id: usize, mailbox: usize) {
+    // 邮箱每次传输 32 位数据；Linux/龙芯固件也使用这一协议发布 AP 入口地址。
+    let common = IOCSR_MBUF_SEND_BLOCKING | ((hart_id as u64) << IOCSR_MBUF_SEND_CPU_SHIFT);
+    let high_box = ((mailbox << 1) + 1) << IOCSR_MBUF_SEND_BOX_SHIFT;
+    let low_box = (mailbox << 1) << IOCSR_MBUF_SEND_BOX_SHIFT;
+    iocsr_write64(
+        IOCSR_MBUF_SEND,
+        common | high_box as u64 | (data & IOCSR_MBUF_SEND_H32_MASK),
+    );
+    iocsr_write64(
+        IOCSR_MBUF_SEND,
+        common | low_box as u64 | (data << IOCSR_MBUF_SEND_BUF_SHIFT),
+    );
+}
+
 pub fn send_ipi(hart_id: usize) {
     // We only need Linux's reschedule action for now: it breaks a remote hart
     // out of user/kernel execution so pending scheduler work is observed.
     let value = (IOCSR_IPI_SEND_BLOCKING
         | IPI_ACTION_RESCHEDULE
+        | (hart_id << IOCSR_IPI_SEND_CPU_SHIFT)) as u32;
+    iocsr_write32(IOCSR_IPI_SEND, value);
+}
+
+pub fn send_tlb_flush_ipi(hart_id: usize) {
+    let value = (IOCSR_IPI_SEND_BLOCKING
+        | IPI_ACTION_TLB_FLUSH
         | (hart_id << IOCSR_IPI_SEND_CPU_SHIFT)) as u32;
     iocsr_write32(IOCSR_IPI_SEND, value);
 }
@@ -180,7 +263,7 @@ pub fn enable_ipi_interrupt() {
     ecfg &= !(ECFG_VS_MASK << ECFG_VS_SHIFT);
     ecfg |= ECFG_LIE_IPI;
     // SAFETY: This only changes the local IPI interrupt-enable bit.
-    unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
+    unsafe { asm!("csrwr {}, 0x4", inout(reg) ecfg => _) };
     iocsr_write32(IOCSR_IPI_EN, u32::MAX);
 }
 
@@ -192,14 +275,35 @@ pub fn clear_ipi_interrupt() -> u32 {
     action
 }
 
-pub fn hart_start(_hart_id: usize, _start_addr: usize, _opaque: usize) -> usize {
-    1
+pub fn hart_start(hart_id: usize, start_addr: usize, _opaque: usize) -> usize {
+    mail_send(start_addr as u64, hart_id, 0);
+    let value = (IOCSR_IPI_SEND_BLOCKING as u32)
+        | IPI_ACTION_BOOT_CPU
+        | ((hart_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT);
+    iocsr_write32(IOCSR_IPI_SEND, value);
+    0
 }
 
 pub fn shutdown() -> ! {
-    // SAFETY: 0x100e_001c is the power control MMIO address on LoongArch QEMU virt.
+    let Some(poweroff) = DTB_data::try_poweroff_info() else {
+        loop {
+            // DTB 初始化失败时不能再依赖任何平台 MMIO 地址。
+            core::hint::spin_loop();
+        }
+    };
+    let address = poweroff
+        .base
+        .checked_add(poweroff.offset)
+        .expect("DTB poweroff register address overflows");
+    // 安全性：地址、访问宽度和值均由已校验的 DTB syscon-poweroff 节点提供。
     unsafe {
-        (0x100e_001c as *mut u8).write_volatile(0x34);
+        match poweroff.reg_io_width {
+            1 => write_volatile(address as *mut u8, poweroff.value as u8),
+            2 => write_volatile(address as *mut u16, poweroff.value as u16),
+            4 => write_volatile(address as *mut u32, poweroff.value as u32),
+            8 => write_volatile(address as *mut u64, poweroff.value as u64),
+            _ => unreachable!("DTB parser only permits 1/2/4/8-byte syscon accesses"),
+        }
     }
     loop {}
 }
@@ -213,14 +317,14 @@ pub fn enable_timer_interrupt() {
     ecfg |= ECFG_LIE_TI;
     // SAFETY: This writes back a kernel-constructed ECFG value that only changes timer interrupt
     // delivery bits. A malformed write would route interrupts incorrectly on this hart.
-    unsafe { asm!("csrwr {}, 0x4", in(reg) ecfg) };
+    unsafe { asm!("csrwr {}, 0x4", inout(reg) ecfg => _) };
     enable_ipi_interrupt();
 }
 
 pub fn clear_timer_interrupt() {
     // SAFETY: TIClr (CSR 0x44) write is valid in kernel mode; clears timer interrupt.
     unsafe {
-        asm!("csrwr {}, 0x44", in(reg) 1usize);
+        asm!("csrwr {}, 0x44", inout(reg) 1usize => _);
     }
 }
 /// riscv 是设置绝对触发时间,设置某个tick处发生中断
@@ -232,7 +336,7 @@ pub fn set_timer(timer: usize) {
     let tcfg = (delta & TCFG_INITVAL_MASK) | TCFG_EN;
     // SAFETY: TCFG (CSR 0x41) write is valid in kernel mode; configures timer countdown.
     unsafe {
-        asm!("csrwr {}, 0x41", in(reg) tcfg);
+        asm!("csrwr {}, 0x41", inout(reg) tcfg => _);
     }
 }
 
@@ -254,27 +358,44 @@ fn ensure_fp_enabled() {
         asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
         if (euen & EUEN_FPEN) == 0 {
             euen |= EUEN_FPEN;
-            asm!("csrwr {}, 0x2", in(reg) euen, options(nostack));
+            asm!("csrwr {}, 0x2", inout(reg) euen => _, options(nostack));
         }
     }
 }
 
 #[inline]
 fn disable_fp() {
-    // SAFETY: Clearing EUEN.FPEN is the LoongArch lazy-FPU gate. User FP instructions will trap
-    // with FPDIS until the task first owns FPU state.
+    // SAFETY: Clearing the scalar and vector EUEN bits is the LoongArch lazy-FPU
+    // gate. It prevents a newly scheduled task from observing the previous
+    // task's live FP/LSX/LASX register state.
     unsafe {
         let mut euen: usize;
         asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
-        if (euen & EUEN_FPEN) != 0 {
-            euen &= !EUEN_FPEN;
-            asm!("csrwr {}, 0x2", in(reg) euen, options(nostack));
+        if (euen & EUEN_USER_FP_MASK) != 0 {
+            euen &= !EUEN_USER_FP_MASK;
+            asm!("csrwr {}, 0x2", inout(reg) euen => _, options(nostack));
         }
     }
 }
 
 #[inline]
-fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
+fn enable_user_vector(mask: usize) {
+    // LSX/LASX share the floating-point register file, so FPEN must be set
+    // together with the requested vector extension before retrying the user
+    // instruction that raised LSXDIS/LASXDIS.
+    unsafe {
+        let mut euen: usize;
+        asm!("csrrd {}, 0x2", out(reg) euen, options(nostack));
+        let required = EUEN_FPEN | mask;
+        if (euen & required) != required {
+            euen |= required;
+            asm!("csrwr {}, 0x2", inout(reg) euen => _, options(nostack));
+        }
+    }
+}
+
+#[inline]
+fn save_fp_registers(inner: &mut TaskControlBlockInner) {
     ensure_fp_enabled();
     let ptr = inner.fp_regs.as_mut_ptr();
     // SAFETY: ptr points to a valid fp_regs array in the task control block;
@@ -361,7 +482,7 @@ fn save_fp_registers(inner: &mut MutexGuard<'_, TaskControlBlockInner>) {
 }
 
 #[inline]
-fn restore_fp_registers(inner: &MutexGuard<'_, TaskControlBlockInner>) {
+fn restore_fp_registers(inner: &TaskControlBlockInner) {
     if !inner.fp_valid {
         return;
     }
@@ -476,6 +597,16 @@ pub fn handle_user_fp_disabled() {
     inner.fp_used = true;
 }
 
+pub fn handle_user_lsx_disabled() {
+    handle_user_fp_disabled();
+    enable_user_vector(EUEN_LSXEN);
+}
+
+pub fn handle_user_lasx_disabled() {
+    handle_user_fp_disabled();
+    enable_user_vector(EUEN_LSXEN | EUEN_LASXEN);
+}
+
 pub fn prepare_user_fp_state(task: &Arc<TaskControlBlock>) {
     if task.borrow_mut().fp_used {
         ensure_fp_enabled();
@@ -493,18 +624,22 @@ fn read_cpucfg(index: u32) -> u32 {
     value
 }
 
-fn detect_clock_freq() -> Option<usize> {
+/// 从 CPUCFG 计算 LoongArch 的计时器频率；该硬件信息没有 DTB 属性可替代。
+pub(super) fn detect_clock_frequency() -> usize {
     let base = read_cpucfg(4) as u64;
     let cfg5 = read_cpucfg(5) as u64;
     let mul = (cfg5 & 0xffff) as u64;
     let div = (cfg5 >> 16) as u64;
-    if base == 0 || mul == 0 || div == 0 {
-        return None;
-    }
-    base.checked_mul(mul)
-        .map(|freq| freq / div)
-        .filter(|freq| *freq != 0)
-        .map(|freq| freq as usize)
+    assert!(
+        base != 0 && mul != 0 && div != 0,
+        "LoongArch CPUCFG does not provide a valid clock frequency"
+    );
+    let frequency = base
+        .checked_mul(mul)
+        .expect("LoongArch clock frequency overflows")
+        / div;
+    assert_ne!(frequency, 0, "LoongArch CPUCFG clock frequency is zero");
+    usize::try_from(frequency).expect("LoongArch clock frequency exceeds usize")
 }
 
 pub fn bootstrap_init() {
@@ -516,15 +651,16 @@ pub fn bootstrap_init() {
     // target machine-defined paging state for the current hart. Programming inconsistent values
     // here would break address translation or trap refill before the kernel can recover.
     unsafe {
-        // Start with FP disabled. User FP instructions trap once and lazily acquire state.
+        // Start with scalar/vector FP disabled. User instructions trap once
+        // and lazily acquire the current task's state.
         let mut euen: usize;
         asm!("csrrd {}, 0x2", out(reg) euen);
-        euen &= !EUEN_FPEN;
-        asm!("csrwr {}, 0x2", in(reg) euen);
+        euen &= !EUEN_USER_FP_MASK;
+        asm!("csrwr {}, 0x2", inout(reg) euen => _);
 
         // Clear pending timer interrupt and disable timer while bootstrapping.
-        asm!("csrwr {}, 0x44", in(reg) 1usize); // TIClr
-        asm!("csrwr {}, 0x41", in(reg) 0usize); // TCFG
+        asm!("csrwr {}, 0x44", inout(reg) 1usize => _); // TIClr
+        asm!("csrwr {}, 0x41", inout(reg) 0usize => _); // TCFG
 
         // Enable paging: CRMD.PG=1, CRMD.DA=0, CRMD.IE=0.
         let mut crmd: usize;
@@ -532,15 +668,15 @@ pub fn bootstrap_init() {
         crmd &= !CRMD_IE;
         crmd &= !CRMD_DA;
         crmd |= CRMD_PG;
-        asm!("csrwr {}, 0x0", in(reg) crmd);
+        asm!("csrwr {}, 0x0", inout(reg) crmd => _);
 
         // TLB refill entry (must be 4K aligned).
-        asm!("csrwr {}, 0x88", in(reg) __rfill as usize);
+        asm!("csrwr {}, 0x88", inout(reg) __rfill as usize => _);
 
         // STLB page size and refill page size (4KB).
         let page_bits = crate::config::PAGE_SIZE_BITS;
-        asm!("csrwr {}, 0x1e", in(reg) page_bits);
-        asm!("csrwr {}, 0x8e", in(reg) page_bits);
+        asm!("csrwr {}, 0x1e", inout(reg) page_bits => _);
+        asm!("csrwr {}, 0x8e", inout(reg) page_bits => _);
 
         // Configure page walk controller for 3-level, 4KB pages, 8-byte PTEs.
         let dir_width = crate::config::PAGE_SIZE_BITS - 3;
@@ -556,14 +692,11 @@ pub fn bootstrap_init() {
         pwcl |= (dir_width & 0x1f) << 25;
         // PTE width: 8 bytes -> 0
         pwcl |= 0 << 30;
-        asm!("csrwr {}, 0x1c", in(reg) pwcl);
-        asm!("csrwr {}, 0x1d", in(reg) 0usize);
+        asm!("csrwr {}, 0x1c", inout(reg) pwcl => _);
+        asm!("csrwr {}, 0x1d", inout(reg) 0usize => _);
 
         asm!("invtlb 0x0, $r0, $r0");
     }
 
-    if let Some(freq) = detect_clock_freq() {
-        crate::config::set_clock_freq(freq);
-    }
     enable_ipi_interrupt();
 }

@@ -4,8 +4,7 @@ use super::{File, POLLIN, POLLOUT};
 use crate::drivers::{BLOCK_DEVICE, USER_BLOCK_DEVICE};
 use crate::mm::UserBuffer;
 use crate::println;
-use crate::task::manager::PID2PCB;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -28,6 +27,9 @@ struct Ext4Lock {
 }
 
 impl Ext4Lock {
+    /// 先让锁持有者有机会结束短临界区，再尝试进入调度器。
+    const SPINS_BEFORE_YIELD: usize = 64;
+
     const fn new() -> Self {
         Self {
             held: AtomicBool::new(false),
@@ -35,6 +37,7 @@ impl Ext4Lock {
     }
 
     fn lock(&self) {
+        let mut spins = 0usize;
         loop {
             // Attempt to acquire: CAS is more efficient than swap on
             // weakly-ordered architectures (RISC-V, LoongArch) because it
@@ -46,10 +49,25 @@ impl Ext4Lock {
             {
                 return;
             }
-            // Hint the CPU we are in a spin-wait before deciding to yield.
-            spin_loop();
-            if crate::task::processor::current_task().is_some() {
-                crate::task::processor::suspend_current_and_run_next();
+
+            // 已知锁被持有后只做共享读取，避免每个 hart 持续用 CAS 抢占
+            // 同一缓存行。锁释放后再回到外层尝试一次原子获取。
+            while self.held.load(Ordering::Relaxed) {
+                #[cfg(target_arch = "loongarch64")]
+                // 懒缺页持有 mm 锁时不可调度，也可能在这里等待 Ext4 锁。
+                // 同步 TLB shootdown 的目标 hart 必须在这类长自旋中主动确认
+                // 请求，否则持有 Ext4 锁的一方可能正在等本 hart 的 ACK，形成环等。
+                crate::arch::loongarch64::mm::service_pending_user_tlb_flush();
+                spin_loop();
+                spins += 1;
+                if spins < Self::SPINS_BEFORE_YIELD {
+                    continue;
+                }
+                spins = 0;
+
+                // 不可调度上下文只继续短暂自旋，避免持有 TCB/mm 锁时
+                // 重入调度器；可调度时让锁持有者获得实际运行时间。
+                let _ = crate::task::processor::try_suspend_current_and_run_next();
             }
         }
     }
@@ -87,11 +105,20 @@ struct PendingWriteRegistration {
 
 // Serialize ext4 operations across harts.
 lazy_static! {
+    ///手动实现的EXT4文件系统的锁，方便自定义获取锁失败之后的行为，比如这里是调度下一个任务
     static ref EXT4_LOCK: Arc<Ext4Lock> = Arc::new(Ext4Lock::new());
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref DEFERRED_UNLINK_CLEANUP: Mutex<BTreeMap<(usize, u32), TmpfileCleanup>> =
         Mutex::new(BTreeMap::new());
+    /// Linux inode/open-file-description 风格的打开引用计数。unlink 判断文件
+    /// 生命周期时查询该表，不再遍历并锁住所有进程的 fd 表。
+    static ref OPEN_INODE_DESCRIPTIONS: Mutex<BTreeMap<(usize, u32), usize>> =
+        Mutex::new(BTreeMap::new());
     static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> =
+        Mutex::new(BTreeMap::new());
+    // 另一 hart 短暂持有进程控制块锁时，`/proc/<pid>/exe` 仍必须可用。
+    // 独立保存最近一次成功 exec 的路径，供 procfs 快速读取，避免依赖 PCB 锁。
+    static ref PROCESS_EXEC_PATHS: Mutex<BTreeMap<usize, String>> =
         Mutex::new(BTreeMap::new());
     static ref EXT4_PATH_CACHE: Mutex<BTreeMap<String, Vec<Ext4PathCacheEntry>>> =
         Mutex::new(BTreeMap::new());
@@ -378,6 +405,28 @@ pub(crate) fn inode_path_hint(inode: &Arc<Inode>) -> Option<String> {
         .cloned()
 }
 
+/// 按 inode 身份返回最近记录的绝对路径。
+///
+/// 进程表只保存可执行文件的 `(设备号, inode 号)`，用于 ETXTBSY 记账。
+/// procfs 通过此映射实现 `/proc/<pid>/exe`，避免每次 `readlink(2)` 都递归遍历
+/// 可能很大的第二块测试镜像。
+pub(crate) fn inode_path_hint_by_identity(device_id: usize, inode_num: u32) -> Option<String> {
+    INODE_PATH_HINTS
+        .lock()
+        .get(&(device_id, inode_num))
+        .cloned()
+}
+
+/// 记录一次成功 `execve` 安装的绝对路径。
+pub(crate) fn note_process_exec_path(pid: usize, path: &str) {
+    PROCESS_EXEC_PATHS.lock().insert(pid, String::from(path));
+}
+
+/// 返回不依赖进程控制块锁的 `/proc/<pid>/exe` procfs 快速路径。
+pub(crate) fn process_exec_path(pid: usize) -> Option<String> {
+    PROCESS_EXEC_PATHS.lock().get(&pid).cloned()
+}
+
 fn normalize_inode_abs_path(cwd: &str, path: &str) -> String {
     let mut parts = Vec::new();
     let absolute = path.starts_with('/');
@@ -469,9 +518,11 @@ fn find_inode_path_in_subtree(
     None
 }
 
-pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
-    let target_dev = target.device_id();
-    let target_ino = target.inode_num();
+/// Resolve an ext4 inode identity to its absolute path on either root disk.
+/// This is intentionally independent of the fast path-hint cache: procfs
+/// magic links must remain usable after an exec path was reached through a
+/// symlink or fallback root lookup.
+pub(crate) fn inode_identity_path_in_roots(target_dev: usize, target_ino: u32) -> Option<String> {
     let _guard = ext4_lock();
 
     let primary = root_inode_for_path("/");
@@ -487,6 +538,10 @@ pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
         return Some(String::from("/"));
     }
     find_inode_path_in_subtree(&secondary, "/", target_dev, target_ino, 64)
+}
+
+pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
+    inode_identity_path_in_roots(target.device_id(), target.inode_num())
 }
 
 pub(crate) fn path_resolves_to_inode(path: &str, target: &Arc<Inode>) -> bool {
@@ -554,6 +609,7 @@ pub struct OSInode {
     fanotify_path: Option<String>,
     tmpfile_cleanup: Option<TmpfileCleanup>,
     write_open: Mutex<WriteOpenState>,
+    inode_key: Option<(usize, u32)>,
     inner: Arc<Mutex<OSInodeInner>>,
 }
 
@@ -760,6 +816,11 @@ impl OSInode {
     ) -> Result<Self, isize> {
         let regular_file_poll_ready = inode.is_file();
         let write_open = WriteOpenState::register_for_inode(writable, &inode)?;
+        let inode_key = regular_file_poll_ready.then(|| (inode.device_id(), inode.inode_num()));
+        if let Some(key) = inode_key {
+            let mut refs = OPEN_INODE_DESCRIPTIONS.lock();
+            *refs.entry(key).or_insert(0) += 1;
+        }
         let inner = Arc::new_cyclic(|inner_weak| {
             Mutex::new(OSInodeInner {
                 offset: 0,
@@ -786,6 +847,7 @@ impl OSInode {
             fanotify_path: None,
             tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
             write_open: Mutex::new(write_open),
+            inode_key,
             inner,
         })
     }
@@ -847,16 +909,7 @@ impl OSInode {
         self.inner.lock().inode.clone()
     }
 
-    /// Return the end offset of buffered (not-yet-flushed) writes.
-    ///
-    /// This is used to report a correct file size to userspace (`fstat`, `lseek(SEEK_END)`)
-    /// even when we are buffering writes in memory.
-    pub fn pending_write_end(&self) -> usize {
-        let inner = self.inner.lock();
-        inner.write_buf_off.saturating_add(inner.write_buf.len())
-    }
-
-    fn write_at_zeroing_gap(
+    fn write_at_preserving_holes(
         inode: &Arc<Inode>,
         offset: usize,
         data: &[u8],
@@ -864,21 +917,8 @@ impl OSInode {
         if data.is_empty() {
             return Ok(0);
         }
-
-        let size = inode.size() as usize;
-        if offset > size {
-            let zeros = [0u8; 4096];
-            let mut off = size;
-            while off < offset {
-                let chunk = core::cmp::min(zeros.len(), offset - off);
-                match inode.write_at(off, &zeros[..chunk]) {
-                    Ok(0) => return Err(ext4_fs::Ext4Error::NoSpace),
-                    Ok(written) => off += written,
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
+        // Linux 的 pwrite 越过 EOF 时保留稀疏 hole，只分配实际写入范围。
+        // extent 读路径会把未映射区间补零，不需要逐页写零填满整个间隙。
         inode.write_at(offset, data)
     }
 
@@ -958,7 +998,7 @@ impl OSInode {
             }
             let result = {
                 let _fs_guard = ext4_lock();
-                Self::write_at_zeroing_gap(&inner.inode, offset, buf)
+                Self::write_at_preserving_holes(&inner.inode, offset, buf)
             };
             if debug_iozone_tracked(inode_num) {
                 let size_after = inner.inode.size() as usize;
@@ -1027,7 +1067,7 @@ impl OSInode {
         let size_before = inner.inode.size() as usize;
         let result = {
             let _fs_guard = ext4_lock();
-            Self::write_at_zeroing_gap(&inner.inode, off, &data)
+            Self::write_at_preserving_holes(&inner.inode, off, &data)
         };
         if debug_iozone_tracked(inode_num) {
             let size_after = inner.inode.size() as usize;
@@ -1180,41 +1220,16 @@ pub(crate) fn register_deferred_unlink_cleanup(
 }
 
 fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    let mut seen_tables = BTreeSet::new();
-    for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            // Cannot inspect this process (lock held) — conservatively assume
-            // it may reference the inode.  The cleanup will be retried on the
-            // next OSInode::drop for the same inode.
-            return true;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
-        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
-            continue;
-        }
-        if files
-            .lock()
-            .iter_files_snapshot()
-            .into_iter()
-            .any(|(_fd, file)| {
-                file.as_any()
-                    .downcast_ref::<OSInode>()
-                    .map(|o| {
-                        let inode = o.ext4_inode();
-                        inode.inode_num() == inode_num && inode.device_id() == device_id
-                    })
-                    .unwrap_or(false)
-            })
-        {
-            return true;
-        }
-    }
-    false
+    has_open_inode_description(device_id, inode_num)
+}
+
+pub(crate) fn has_open_inode_description(device_id: usize, inode_num: u32) -> bool {
+    OPEN_INODE_DESCRIPTIONS
+        .lock()
+        .get(&(device_id, inode_num))
+        .copied()
+        .unwrap_or(0)
+        != 0
 }
 
 /// Attempt to clean up any lingering deferred-unlink entries whose inodes
@@ -1281,6 +1296,11 @@ lazy_static! {
     pub static ref USER_INODE: Arc<Inode> = {
         ROOT_INODE
             .find("user")
+            .or_else(|| {
+                SECONDARY_ROOT_INODE
+                    .as_ref()
+                    .and_then(|root| root.find("user"))
+            })
             .expect("[ext4] /user directory not found!")
     };
 }
@@ -1303,8 +1323,10 @@ pub(crate) fn find_path_in_roots(path: &str) -> Option<Arc<Inode>> {
     }
     SECONDARY_ROOT_INODE.as_ref()?.find_path(path)
 }
-//if a disk has a /user directory while the other does not, prefer the one with /user
-//todo: better solution.
+// 主根盘以 /home 作为完整 rootfs 标记。eval 模式的本地 disk0 故意不创建
+// /home，因此带完整用户态的官方 disk1 会成为主根；本地 /user 仍可通过
+// secondary root 回退访问。两块盘都具备 /home 时保持 disk0 为主，兼容
+// patched 模式。
 struct RootSelection {
     primary_root: Arc<Inode>,
     secondary_root: Option<Arc<Inode>>,
@@ -1322,13 +1344,13 @@ impl RootSelection {
     ) -> Self {
         // Avoid taking ext4_lock() here; this may run during lazy_static initialization
         // while a caller already holds the lock.
-        let has_user0 = root0.find("user").is_some();
-        let has_user1 = root1
+        let has_home0 = root0.find_path("/home").is_some();
+        let has_home1 = root1
             .as_ref()
-            .map(|root| root.find("user").is_some())
+            .map(|root| root.find_path("/home").is_some())
             .unwrap_or(false);
 
-        if root1.is_some() && !has_user0 && has_user1 {
+        if root1.is_some() && !has_home0 && has_home1 {
             RootSelection {
                 primary_root: root1.as_ref().unwrap().clone(),
                 secondary_root: Some(root0.clone()),
@@ -1637,6 +1659,9 @@ impl File for OSInode {
 
 impl Drop for OSInode {
     fn drop(&mut self) {
+        // `flock(2)` 锁属于 open-file-description；OSInode 析构意味着所有
+        // `dup`/`fork` 共享引用均已关闭，此时必须清除锁，避免 Cargo 永久重试。
+        crate::syscall::filesystem::release_flock_locks_for_owner(self as *const OSInode as usize);
         let mut inner = self.inner.lock();
         let inode_key = (inner.inode.device_id(), inner.inode.inode_num());
         if !inner.write_buf.is_empty() {
@@ -1644,11 +1669,20 @@ impl Drop for OSInode {
             let data = core::mem::take(&mut inner.write_buf);
             let _ = {
                 let _fs_guard = ext4_lock();
-                Self::write_at_zeroing_gap(&inner.inode, off, &data)
+                Self::write_at_preserving_holes(&inner.inode, off, &data)
             };
             Self::mark_write_buf_clean(&mut inner);
         }
         drop(inner);
+        if let Some(key) = self.inode_key.take() {
+            let mut refs = OPEN_INODE_DESCRIPTIONS.lock();
+            if let Some(count) = refs.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    refs.remove(&key);
+                }
+            }
+        }
         if let Some(cleanup) = self.tmpfile_cleanup.take() {
             if {
                 let _fs_guard = ext4_lock();

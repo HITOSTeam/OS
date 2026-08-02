@@ -135,14 +135,7 @@ pub fn task_cpu_time_ns(task: &Arc<TaskControlBlock>) -> u64 {
 ///
 /// 包含所有存活线程 TCB 引用的向量；已退出（槽位为 `None`）的线程不包含在内。
 pub fn process_tasks(process: &Arc<ProcessControlBlock>) -> Vec<Arc<TaskControlBlock>> {
-    // borrow_mut 在此处获取 PCB 内部自旋锁（名称虽为 mut，但语义为"获取独占访问"）；
-    // 返回的 MutexGuard 在 collect() 完成后即离开作用域，锁自动释放。
-    let inner = process.borrow_mut();
-    inner
-        .tasks
-        .iter()
-        .filter_map(|task| task.as_ref().cloned()) // 过滤已退出（None）的线程槽位
-        .collect()
+    process.tasks_snapshot()
 }
 
 /// 通过内部 tid 索引定位进程的某一线程。
@@ -163,9 +156,7 @@ pub fn process_task_by_index(
     process: &Arc<ProcessControlBlock>,
     tid_index: usize,
 ) -> Option<Arc<TaskControlBlock>> {
-    // 同 process_tasks，持锁期间只做 Arc 克隆，立即释放锁
-    let inner = process.borrow_mut();
-    inner.tasks.get(tid_index)?.as_ref().cloned()
+    process.task_at(tid_index)
 }
 
 /// 在固定时间基准 `now_ns` 下，查询进程所有线程的累计 CPU 时间之和。
@@ -183,15 +174,11 @@ pub fn process_task_by_index(
 ///
 /// 进程所有存活线程到 `now_ns` 的累计 CPU 时间总和（纳秒）。
 pub fn process_cpu_time_ns_at(process: &Arc<ProcessControlBlock>, now_ns: u64) -> u64 {
-    let (saved_cpu_ns, tasks) = {
+    let saved_cpu_ns = {
         let inner = process.borrow_mut();
-        let tasks = inner
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().cloned())
-            .collect::<Vec<_>>();
-        (inner.cpu_time_ns, tasks)
+        inner.cpu_time_ns
     };
+    let tasks = process.tasks_snapshot();
     tasks
         .into_iter()
         .map(|task| task_cpu_time_ns_at(&task, now_ns))

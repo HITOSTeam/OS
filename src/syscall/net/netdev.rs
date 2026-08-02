@@ -1886,17 +1886,14 @@ pub(crate) fn set_primary_ipv4_addr(
         entry.broadcast_addr = broadcast_addr;
         entry.scope = scope;
     } else {
-        dev.addrs.insert(
-            0,
-            Ipv4AddrEntry {
-                addr,
-                peer_addr: addr,
-                prefix_len,
-                label: None,
-                broadcast_addr,
-                scope,
-            },
-        );
+        dev.addrs.insert(0, Ipv4AddrEntry {
+            addr,
+            peer_addr: addr,
+            prefix_len,
+            label: None,
+            broadcast_addr,
+            scope,
+        });
     }
     Ok(())
 }
@@ -2950,11 +2947,7 @@ fn collect_proc_sockets() -> ProcSocketSnapshot {
     let mut seen_tables = BTreeSet::new();
     let mut seen_files = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }

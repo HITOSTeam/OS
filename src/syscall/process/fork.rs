@@ -211,14 +211,7 @@ fn clone_from_parts(
 
             // Attach to process thread table.
             // 将新线程登记进进程的 tasks 数组；按 tid_index 扩容并填入对应槽位
-            {
-                let mut process_inner = process.borrow_mut();
-                let tasks = &mut process_inner.tasks;
-                while tasks.len() < tid_index + 1 {
-                    tasks.push(None);
-                }
-                tasks[tid_index] = Some(Arc::clone(&new_task));
-            }
+            process.install_task(tid_index, Arc::clone(&new_task));
 
             // 继承父线程的信号屏蔽字
             new_inner.signal_mask = parent_mask;
@@ -250,15 +243,7 @@ fn clone_from_parts(
                 tid_index,
                 clone_into_cgroup.as_ref(),
             ) {
-                let mut process_inner = process.borrow_mut();
-                if process_inner
-                    .tasks
-                    .get(tid_index)
-                    .and_then(|slot| slot.as_ref())
-                    .is_some_and(|task| Arc::ptr_eq(task, &new_task))
-                {
-                    process_inner.tasks[tid_index] = None;
-                }
+                process.remove_task_if(tid_index, &new_task);
                 return e;
             }
             (tid_index, linux_tid)
@@ -351,16 +336,13 @@ fn clone_from_parts(
     // 父进程继承下来的 System V 共享内存挂载需要回滚（新 ns 内不应可见），
     // 然后再分配一个独立的 ipc_ns_id
     if (flags & CLONE_NEWIPC) != 0 {
-        let inherited_attaches = {
-            let child_inner = child.borrow_mut();
-            child_inner.memory_set.sysv_shm_attaches_snapshot()
-        };
+        let child_mm = child.memory_set();
+        let inherited_attaches = child_mm.sysv_shm_attaches_snapshot();
         if !share_vm && !inherited_attaches.is_empty() {
             crate::syscall::sysv_shm::rollback_fork_inherit(&inherited_attaches);
         }
-        let mut child_inner = child.borrow_mut();
-        child_inner.memory_set.replace_sysv_shm_attaches(Vec::new());
-        child_inner.ipc_ns_id = crate::task::alloc_ipc_namespace_id();
+        child_mm.replace_sysv_shm_attaches(Vec::new());
+        child.borrow_mut().ipc_ns_id = crate::task::alloc_ipc_namespace_id();
     }
     // CLONE_NEWUTS：拆出独立的 UTS（hostname/domain）命名空间
     if (flags & CLONE_NEWUTS) != 0 {
@@ -480,12 +462,10 @@ fn clone_from_parts(
     // CLONE_CHILD_SETTID：把子 PID 写入子地址空间的 _ctid 指针
     // 子的页表与父不同（除非 CLONE_VM），写入前需先处理 COW/lazy 缺页
     if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
-        let child_token = {
-            let inner = child.borrow_mut();
-            let _ = inner.memory_set.resolve_cow_fault(_ctid);
-            let _ = inner.memory_set.resolve_lazy_fault(_ctid, MapPermission::W);
-            inner.memory_set.token()
-        };
+        let child_mm = child.memory_set();
+        let _ = child_mm.resolve_cow_fault(_ctid);
+        let _ = child_mm.resolve_lazy_fault(_ctid, MapPermission::W);
+        let child_token = child_mm.token();
         if try_write_user_value(child_token, _ctid as *mut i32, &(child_pid as i32)).is_err() {
             rollback_unstarted_child(&child);
             return err(SyscallError::EFAULT);
@@ -509,7 +489,7 @@ fn clone_from_parts(
         );
     }
     if share_vm {
-        let shared_mm_token = child.borrow_mut().memory_set.token();
+        let shared_mm_token = child.memory_set().token();
         register_shared_mm_process_owner(shared_mm_token);
     }
     // 将子任务推入调度队列；至此子才真正可被调度执行
@@ -545,9 +525,7 @@ fn clone_from_parts(
                 }
             };
             if !should_block {
-                parent_task
-                    .wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
+                parent_task.discard_deferred_wakeup();
                 break;
             }
             block_current_and_run_next();
@@ -672,13 +650,13 @@ fn install_child_pidfd(
 fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>) {
     let child_pid = child.getpid();
     crate::fs::cgroup_exit_process(child_pid);
-    let (exec_dev, exec_ino, shm_attaches, parent) = {
-        let mut child_inner = child.borrow_mut();
-        let shm_attaches = child_inner.memory_set.take_sysv_shm_attaches_for_cleanup();
+    let mut child_mm = child.memory_set();
+    let shm_attaches = child_mm.take_sysv_shm_attaches_for_cleanup();
+    let (exec_dev, exec_ino, parent) = {
+        let child_inner = child.borrow_mut();
         (
             child_inner.exec_inode_dev,
             child_inner.exec_inode_num,
-            shm_attaches,
             child_inner.parent.as_ref().and_then(|p| p.upgrade()),
         )
     };
@@ -738,6 +716,9 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
     const CLONE_NEWIPC: usize = 0x0800_0000; // 新建 IPC namespace
     const CLONE_NEWPID: usize = 0x2000_0000; // 新建 PID namespace
     const CLONE_NEWNET: usize = 0x4000_0000; // 新建 network namespace
+    // glibc 的 posix_spawn 会将该标志与 CLONE_VM | CLONE_VFORK 组合使用。
+    // 子进程会立即 exec，而现有 exec 路径会重置信号处理器。
+    const CLONE_CLEAR_SIGHAND: usize = 0x0000_0001_0000_0000;
     const CLONE_INTO_CGROUP: usize = 0x0000_0002_0000_0000; // 原子性加入目标 cgroup
     const CLONE_ARGS_CGROUP_SIZE: usize = size_of::<Clone3Args>();
     const SUPPORTED_CLONE3_FLAGS: usize = CLONE_VM
@@ -759,6 +740,7 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
         | CLONE_NEWIPC
         | CLONE_NEWPID
         | CLONE_NEWNET
+        | CLONE_CLEAR_SIGHAND
         | CLONE_INTO_CGROUP;
 
     // 从用户空间安全读取 clone_args；按 size 兼容更短/更长版本，
@@ -848,8 +830,18 @@ pub fn syscall_clone3(args_ptr: usize, size: usize) -> isize {
             None => return err(SyscallError::EINVAL),
         }
     };
-    // 把 exit_signal 合并回 flags 的低 8 位，使下层 clone_from_parts 沿用 clone(2) 的约定
-    let clone_flags = flags | exit_signal;
+    // 把 exit_signal 合并回 flags 的低 8 位，使下层 clone_from_parts 沿用 clone(2) 的约定。
+    //
+    // glibc 的 posix_spawn 使用 CLEAR_SIGHAND | VM | VFORK。父进程还有其他线程
+    // 运行时，内核的共享地址空间进程路径尚不安全；因此对这一种 spawn 形式降级为
+    // 私有地址空间的 fork。socketpair 错误通道仍会让 posix_spawn 等待 exec 失败结果，
+    // 而 exec 本身已会重置信号处理器。
+    let mut clone_flags = flags | exit_signal;
+    if (flags & CLONE_CLEAR_SIGHAND) != 0
+        && (flags & (CLONE_VM | CLONE_VFORK)) == (CLONE_VM | CLONE_VFORK)
+    {
+        clone_flags &= !(CLONE_CLEAR_SIGHAND | CLONE_VM | CLONE_VFORK);
+    }
     // 真正执行 clone：复制进程/线程、构造 trap 上下文、做命名空间分裂等
     let child_pid = clone_from_parts(
         clone_flags,

@@ -10,20 +10,16 @@ fn deliver_signal_to_process(
     sender_pid: i32,
     sender_uid: u32,
 ) {
-    let tasks = {
-        let mut process_ref = target.borrow_mut();
-        if process_ref.is_zombie {
-            return;
-        }
+    if target.borrow_mut().is_zombie {
+        return;
+    }
+    {
+        let mut process_ref = target.signal();
         if let Some(flag) = legacy_flag {
             process_ref.signals.insert(flag);
         }
-        process_ref
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<Vec<_>>()
-    };
+    }
+    let tasks = target.tasks_snapshot();
     for task in tasks {
         queue_signal_to_task(task, signum as usize, sender_pid, sender_uid, 0, 0);
     }
@@ -261,14 +257,7 @@ pub fn syscall_pidfd_send_signal(pidfd: usize, sig: i32, info_ptr: usize, flags:
     let Some(bit) = signal_bit(signum) else {
         return err(SyscallError::EINVAL);
     };
-    let tasks = {
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<Vec<_>>()
-    };
+    let tasks = process.tasks_snapshot();
     let Some(task) = crate::task::signal::pick_task_for_signal(&tasks, bit) else {
         return err(SyscallError::ESRCH);
     };
@@ -298,10 +287,7 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
     if !can_signal_process(&proc, sig) {
         return err(SyscallError::EPERM);
     }
-    let task = {
-        let inner = proc.borrow_mut();
-        inner.tasks.get(tid_index).and_then(|t| t.as_ref()).cloned()
-    };
+    let task = proc.task_at(tid_index);
     let Some(task) = task else {
         return err(SyscallError::ESRCH);
     };
@@ -324,7 +310,7 @@ pub fn syscall_tgkill(tgid: usize, tid: usize, sig: i32) -> isize {
             (
                 inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
                 inner.task_status,
-                task.on_cpu.load(Ordering::Acquire),
+                task.running_hart().unwrap_or(TaskControlBlock::OFF_CPU),
             )
         };
         log::debug!(

@@ -45,6 +45,9 @@ struct FutexWaiter {
     task: Arc<TaskControlBlock>,
     bitset: u32,
     in_queue: Arc<AtomicBool>,
+    /// 匿名页发生 COW 后物理地址会变化；保留 mm/VA 身份供唤醒端稳定匹配。
+    token: usize,
+    uaddr: usize,
 }
 
 lazy_static! {
@@ -221,7 +224,13 @@ pub fn debug_count_task_waiters(task: &Arc<TaskControlBlock>) -> usize {
         .sum()
 }
 
-fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask: u32) -> isize {
+fn futex_wake_with_mask(
+    key: FutexKey,
+    uaddr: usize,
+    nr_wake: usize,
+    bitset_mask: u32,
+    same_mm_fallback: Option<(usize, usize)>,
+) -> isize {
     if uaddr == 0 {
         return err(SyscallError::EINVAL);
     }
@@ -238,33 +247,67 @@ fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask
         );
     }
     let mut wake_list = Vec::new();
-    let woke = {
+    let mut woke = 0usize;
+    {
         let mut map = FUTEX_QUEUES.lock();
-        let Some(queue) = map.get_mut(&key) else {
-            return 0;
-        };
-        let mut woke = 0usize;
-        let mut remain = VecDeque::new();
-        while let Some(waiter) = queue.pop_front() {
-            // 跳过已被其它路径（超时/信号/已被唤醒）标记出队的陈旧条目：in_queue
-            // 为 false 说明它逻辑上已不在队列，不能再次计入唤醒。
-            if !waiter.in_queue.load(Ordering::Acquire) {
-                continue;
+
+        // 先处理精确 key，保证真正的跨进程共享 waiter 保持 FIFO 优先级。
+        if let Some(mut queue) = map.remove(&key) {
+            let mut remain = VecDeque::new();
+            while let Some(waiter) = queue.pop_front() {
+                if !waiter.in_queue.load(Ordering::Acquire) {
+                    continue;
+                }
+                if woke < nr_wake && (waiter.bitset & bitset_mask) != 0 {
+                    waiter.in_queue.store(false, Ordering::Release);
+                    wake_list.push((waiter.task, waiter.in_queue));
+                    woke += 1;
+                } else {
+                    remain.push_back(waiter);
+                }
             }
-            if woke < nr_wake && (waiter.bitset & bitset_mask) != 0 {
-                waiter.in_queue.store(false, Ordering::Release);
-                wake_list.push((waiter.task, waiter.in_queue));
-                woke += 1;
-            } else {
-                remain.push_back(waiter);
+            if !remain.is_empty() {
+                map.insert(key, remain);
             }
         }
-        *queue = remain;
-        if queue.is_empty() {
-            map.remove(&key);
+
+        // Linux 对匿名共享 futex 使用 mm + VA，而不是会在 COW 时变化的裸 PA。
+        // 保留 PA 精确路径用于跨 mm 共享映射；仅在额度尚未用完时扫描同一 mm/VA。
+        if let Some((token, fallback_uaddr)) = same_mm_fallback
+            && woke < nr_wake
+        {
+            let fallback_keys = map
+                .keys()
+                .copied()
+                .filter(|candidate| *candidate != key)
+                .collect::<Vec<_>>();
+            for fallback_key in fallback_keys {
+                if woke >= nr_wake {
+                    break;
+                }
+                let Some(mut queue) = map.remove(&fallback_key) else {
+                    continue;
+                };
+                let mut remain = VecDeque::new();
+                while let Some(waiter) = queue.pop_front() {
+                    if !waiter.in_queue.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let same_mm_address = waiter.token == token && waiter.uaddr == fallback_uaddr;
+                    if same_mm_address && woke < nr_wake && (waiter.bitset & bitset_mask) != 0 {
+                        waiter.in_queue.store(false, Ordering::Release);
+                        wake_list.push((waiter.task, waiter.in_queue));
+                        woke += 1;
+                    } else {
+                        remain.push_back(waiter);
+                    }
+                }
+                if !remain.is_empty() {
+                    map.insert(fallback_key, remain);
+                }
+            }
         }
-        woke
-    };
+    }
     for (task, in_queue) in wake_list {
         task.clear_futex_wait(&in_queue);
         prime_fair_sync_wakeup_lag(&task);
@@ -274,7 +317,7 @@ fn futex_wake_with_mask(key: FutexKey, uaddr: usize, nr_wake: usize, bitset_mask
 }
 
 pub(crate) fn futex_wake(key: FutexKey, uaddr: usize, nr_wake: usize) -> isize {
-    futex_wake_with_mask(key, uaddr, nr_wake, FUTEX_BITSET_MATCH_ANY)
+    futex_wake_with_mask(key, uaddr, nr_wake, FUTEX_BITSET_MATCH_ANY, None)
 }
 
 /// Wake futex waiters when caller doesn't know whether the waiter used
@@ -291,7 +334,13 @@ pub(crate) fn futex_wake_private_and_shared(
 ) -> isize {
     let woke_private = futex_wake((pid, uaddr), uaddr, nr_wake);
     let shared_key = (0, shared_futex_addr_key(token, uaddr));
-    let woke_shared = futex_wake(shared_key, uaddr, nr_wake);
+    let woke_shared = futex_wake_with_mask(
+        shared_key,
+        uaddr,
+        nr_wake,
+        FUTEX_BITSET_MATCH_ANY,
+        Some((token, uaddr)),
+    );
     if woke_private < 0 {
         return woke_private;
     }
@@ -358,6 +407,18 @@ pub fn syscall_futex(
             let key = futex_key(pid, token, uaddr, _private);
             let in_queue = Arc::new(AtomicBool::new(true));
             let mut map = FUTEX_QUEUES.lock();
+            // 第一次读值到取得等待队列锁之间，另一个核心可能已经改值并执行
+            // FUTEX_WAKE。若不在锁内复查，wake 会先看到空队列，而本线程随后
+            // 按旧值入睡，造成永久丢失唤醒。这里与 wake 共用同一把队列锁，
+            // 建立“复查条件并入队”相对于唤醒方的原子顺序。
+            let cur_after_lock = read_user_value(token, uaddr as *const i32);
+            if cur_after_lock != val as i32 {
+                return if pending_unmasked_signal() {
+                    err(SyscallError::EINTR)
+                } else {
+                    err(SyscallError::EAGAIN)
+                };
+            }
             let queue_len_before = map.get(&key).map(VecDeque::len).unwrap_or(0);
             if crate::debug_config::DEBUG_PTHREAD {
                 let (tid, pending_sig, mask) = {
@@ -416,6 +477,8 @@ pub fn syscall_futex(
                     task: Arc::clone(&task),
                     bitset,
                     in_queue: Arc::clone(&in_queue),
+                    token,
+                    uaddr,
                 });
             task.set_futex_wait(key, Arc::clone(&in_queue));
             if DEBUG_FUTEX && queue_len_before == 0 {
@@ -570,7 +633,13 @@ pub fn syscall_futex(
             // Validate/fault-in mapping before PA-based shared-key lookup.
             let _ = read_user_value(token, uaddr as *const i32);
             let key = futex_key(pid, token, uaddr, _private);
-            futex_wake_with_mask(key, uaddr, nr_wake as usize, bitset_mask)
+            futex_wake_with_mask(
+                key,
+                uaddr,
+                nr_wake as usize,
+                bitset_mask,
+                (!_private).then_some((token, uaddr)),
+            )
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if uaddr == 0 || _uaddr2 == 0 {
@@ -668,7 +737,7 @@ pub fn syscall_futex(
                 if val2 > 0 && !queue1.is_empty() && key2 != key1 {
                     let target = map.entry(key2).or_insert_with(VecDeque::new);
                     while moved < val2 {
-                        let Some(waiter) = queue1.pop_front() else {
+                        let Some(mut waiter) = queue1.pop_front() else {
                             break;
                         };
                         // 搬移到 key2 时同样跳过陈旧条目，避免迁移已出队的 waiter。
@@ -680,6 +749,8 @@ pub fn syscall_futex(
                             Arc::clone(&waiter.in_queue),
                             key2,
                         ));
+                        waiter.token = token;
+                        waiter.uaddr = _uaddr2;
                         target.push_back(waiter);
                         moved += 1;
                     }

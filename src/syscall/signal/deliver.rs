@@ -134,7 +134,7 @@ pub fn maybe_deliver_signal() {
 
     let action = {
         let process = current_process();
-        let inner = process.borrow_mut();
+        let inner = process.signal();
         inner
             .rt_sig_handlers
             .get(signum)
@@ -160,19 +160,20 @@ pub fn maybe_deliver_signal() {
     if signum != SIGKILL_NUM {
         let trace_stop_tasks = {
             let process = current_process();
-            let mut inner = process.borrow_mut();
-            if inner.ptrace_tracer_pid.is_some() {
-                inner.stopped = true;
-                inner.stop_signal = signum as i32;
-                inner.stop_pending = true;
-                inner.continued = false;
-                Some(
-                    inner
-                        .tasks
-                        .iter()
-                        .filter_map(|t| t.as_ref().cloned())
-                        .collect::<Vec<_>>(),
-                )
+            let traced = {
+                let mut inner = process.borrow_mut();
+                if inner.ptrace_tracer_pid.is_some() {
+                    inner.stopped = true;
+                    inner.stop_signal = signum as i32;
+                    inner.stop_pending = true;
+                    inner.continued = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if traced {
+                Some(process.tasks_snapshot())
             } else {
                 None
             }
@@ -184,8 +185,8 @@ pub fn maybe_deliver_signal() {
                     t_inner.task_status = TaskStatus::Blocked;
                     t_inner.stopped_by_signal = true;
                 }
-                t.wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
+                drop(t_inner);
+                t.discard_deferred_wakeup();
             }
             wake_parent_waiters();
             restore_sigsuspend_mask(&task);
@@ -207,15 +208,7 @@ pub fn maybe_deliver_signal() {
             }
         };
         if was_stopped {
-            let tasks = {
-                let process = current_process();
-                let inner = process.borrow_mut();
-                inner
-                    .tasks
-                    .iter()
-                    .filter_map(|t| t.as_ref().cloned())
-                    .collect::<Vec<_>>()
-            };
+            let tasks = current_process().tasks_snapshot();
             for t in tasks {
                 let mut t_inner = t.borrow_mut();
                 if !t_inner.stopped_by_signal {
@@ -240,18 +233,16 @@ pub fn maybe_deliver_signal() {
         if action.handler == SIG_DFL || signum == SIGSTOP_NUM {
             let tasks = {
                 let process = current_process();
-                let mut inner = process.borrow_mut();
-                if !inner.stopped {
-                    inner.stopped = true;
-                    inner.stop_signal = signum as i32;
-                    inner.stop_pending = true;
-                    inner.continued = false;
+                {
+                    let mut inner = process.borrow_mut();
+                    if !inner.stopped {
+                        inner.stopped = true;
+                        inner.stop_signal = signum as i32;
+                        inner.stop_pending = true;
+                        inner.continued = false;
+                    }
                 }
-                inner
-                    .tasks
-                    .iter()
-                    .filter_map(|t| t.as_ref().cloned())
-                    .collect::<Vec<_>>()
+                process.tasks_snapshot()
             };
             for t in tasks {
                 let mut t_inner = t.borrow_mut();
@@ -259,8 +250,8 @@ pub fn maybe_deliver_signal() {
                     t_inner.task_status = TaskStatus::Blocked;
                     t_inner.stopped_by_signal = true;
                 }
-                t.wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
+                drop(t_inner);
+                t.discard_deferred_wakeup();
             }
             wake_parent_waiters();
             restore_sigsuspend_mask(&task);

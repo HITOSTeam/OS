@@ -37,6 +37,14 @@ pub(crate) struct RecordLock {
     pub(crate) end: Option<i64>,
 }
 
+/// `flock(2)` 安装的建议锁。
+/// Linux 规定它与 POSIX `fcntl(F_SETLK)` 记录锁互不影响，因此单独维护表。
+#[derive(Clone, Copy)]
+pub(crate) struct FlockLock {
+    pub(crate) owner: usize,
+    pub(crate) exclusive: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RecordLockOwner {
     Process(usize),
@@ -60,6 +68,8 @@ pub(crate) struct FileLease {
 
 lazy_static! {
     pub(crate) static ref RECORD_LOCKS: Mutex<BTreeMap<FileLockKey, Vec<RecordLock>>> =
+        Mutex::new(BTreeMap::new());
+    pub(crate) static ref FLOCK_LOCKS: Mutex<BTreeMap<FileLockKey, Vec<FlockLock>>> =
         Mutex::new(BTreeMap::new());
     pub(crate) static ref RECORD_LOCK_WAITERS: Mutex<BTreeMap<FileLockKey, VecDeque<Arc<TaskControlBlock>>>> =
         Mutex::new(BTreeMap::new());
@@ -87,6 +97,18 @@ pub(crate) fn file_lock_key_from_inode(inode: &Arc<ext4_fs::Inode>) -> FileLockK
 /// Returns a stable owner id for open-file-description locks on this handle.
 pub(crate) fn ofd_lock_owner_id(file: &Arc<dyn File + Send + Sync>) -> usize {
     Arc::as_ptr(file) as *const () as usize
+}
+
+/// 当 open-file-description 最后一个引用析构时释放其 `flock(2)` 锁。
+///
+/// owner 是底层 `File` 对象的地址，因此 `dup` 和 `fork` 共享同一个 owner；
+/// 只有该对象真正析构后才清锁，不会被其中一个描述符提前释放。
+pub(crate) fn release_flock_locks_for_owner(owner: usize) {
+    let mut table = FLOCK_LOCKS.lock();
+    table.retain(|_, locks| {
+        locks.retain(|lock| lock.owner != owner);
+        !locks.is_empty()
+    });
 }
 
 /// Treats `None` as an unbounded range end for comparisons.
@@ -466,11 +488,7 @@ pub(crate) fn count_open_fds_for_key(key: FileLockKey) -> usize {
     let mut count = 0usize;
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let table = alloc::sync::Arc::clone(&inner.files);
-        drop(inner);
+        let table = process.files();
         if !seen_tables.insert(alloc::sync::Arc::as_ptr(&table) as usize) {
             continue;
         }
@@ -531,14 +549,11 @@ pub(crate) fn set_file_lease(
             }
         }
 
-        table.insert(
-            key,
-            FileLease {
-                owner_pid,
-                lease_type,
-                pending_break_write: false,
-            },
-        );
+        table.insert(key, FileLease {
+            owner_pid,
+            lease_type,
+            pending_break_write: false,
+        });
         0
     }
 }

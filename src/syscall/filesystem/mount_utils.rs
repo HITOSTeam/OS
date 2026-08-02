@@ -469,13 +469,12 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
     };
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let (cwd, root, is_zombie, namespace, files) = match process.try_borrow_mut() {
+        let (cwd, root, is_zombie, namespace) = match process.try_borrow_mut() {
             Some(inner) => (
                 inner.cwd.clone(),
                 inner.root.clone(),
                 inner.is_zombie,
                 Arc::clone(&inner.mnt_ns),
-                Arc::clone(&inner.files),
             ),
             None => continue,
         };
@@ -490,6 +489,7 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
         if cwd_busy || root_busy {
             return true;
         }
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }

@@ -29,6 +29,8 @@ const ECODE_PAGE_PRIV: usize = 0x7;
 const ECODE_ADDR_ERROR: usize = 0x8;
 const ECODE_ADDR_ALIGN: usize = 0x9;
 const ECODE_FP_DISABLED: usize = 0xf;
+const ECODE_LSX_DISABLED: usize = 0x10;
+const ECODE_LASX_DISABLED: usize = 0x11;
 
 use super::super::csr_defs::{
     ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, ESTAT_IS_IPI, ESTAT_IS_TIMER, PRMD_USER_IE,
@@ -75,7 +77,7 @@ fn read_badi() -> usize {
 fn write_eentry(val: usize) {
     // SAFETY: `val` is a kernel trap-entry address chosen by the caller, and writing EENTRY is
     // only valid in kernel mode. A bad address here would redirect traps to invalid code.
-    unsafe { asm!("csrwr {}, 0xc", in(reg) val) };
+    unsafe { asm!("csrwr {}, 0xc", inout(reg) val => _) };
 }
 
 fn set_kernel_trap_entry() {
@@ -85,11 +87,16 @@ fn set_kernel_trap_entry() {
     write_eentry(alltraps_k as usize);
 }
 
+/*
+ * 当前 LoongArch 返回路径持续安装内核陷阱入口。仅在基于 trampoline 的用户态
+ * 入口转换完整实现后，再重新启用。
+ *
 fn set_user_trap_entry() {
     // Use the trampoline VA so traps from user mode always enter via a
     // user-mapped page (matches the RISC-V flow).
     write_eentry(TRAMPOLINE as usize);
 }
+*/
 
 fn get_trap_context() -> &'static mut TrapContext {
     let now_task_block = crate::task::processor::current_task().unwrap();
@@ -116,16 +123,45 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             return;
         }
         if (estat & ESTAT_IS_IPI) != 0 {
-            super::super::clear_ipi_interrupt();
+            let actions = super::super::clear_ipi_interrupt();
+            super::super::mm::handle_ipi_actions(actions);
             return;
         }
     }
+    let current = crate::task::processor::current_task();
+    let (pid, tid, task_ra, task_sp, on_cpu) = current
+        .as_ref()
+        .map(|task| {
+            let pid = task
+                .process
+                .upgrade()
+                .map(|process| process.getpid())
+                .unwrap_or(usize::MAX);
+            let inner = task.borrow_mut();
+            (
+                pid,
+                inner.res.as_ref().map(|res| res.tid).unwrap_or(usize::MAX),
+                inner.task_cx.ra,
+                inner.task_cx.sp,
+                task.running_hart().unwrap_or(usize::MAX),
+            )
+        })
+        .unwrap_or((usize::MAX, usize::MAX, 0, 0, usize::MAX));
     panic!(
-        "Unhandled kernel trap: ecode={} badv={:#x} badi={:#x} era={:#x}",
+        "Unhandled kernel trap: hart={} ecode={} badv={:#x} badi={:#x} era={:#x} ra={:#x} sp={:#x} a0={:#x} pid={} tid={} task_ra={:#x} task_sp={:#x} on_cpu={}",
+        super::super::hart_id(),
         ecode,
         read_badv(),
         read_badi(),
-        trap_cx.sepc
+        trap_cx.sepc,
+        trap_cx.x[super::super::REG_RA],
+        trap_cx.x[super::super::REG_SP],
+        trap_cx.x[4],
+        pid,
+        tid,
+        task_ra,
+        task_sp,
+        on_cpu,
     );
 }
 
@@ -137,8 +173,8 @@ fn handle_user_exception(ecode: usize, badv: usize) {
     }
     if matches!(ecode, ECODE_PAGE_INVALID_STORE | ECODE_PAGE_MODIFY) {
         let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
-        if inner.memory_set.resolve_cow_fault(badv) {
+        let memory_set = process.memory_set();
+        if memory_set.resolve_cow_fault(badv) {
             return;
         }
     }
@@ -153,16 +189,16 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             | ECODE_PAGE_PRIV
     ) {
         let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         let access = match ecode {
             ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
             ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
             _ => MapPermission::W,
         };
-        match inner.memory_set.resolve_lazy_fault(badv, access) {
+        match memory_set.resolve_lazy_fault(badv, access) {
             LazyFaultResult::Resolved => return,
             LazyFaultResult::Oom => {
-                drop(inner);
+                drop(memory_set);
                 exit_group_and_run_next(-9);
             }
             LazyFaultResult::Invalid => {}
@@ -179,16 +215,16 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             | ECODE_PAGE_PRIV
     ) {
         let process = crate::task::processor::current_process();
-        let inner = process.borrow_mut();
+        let memory_set = process.memory_set();
         let access = match ecode {
             ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
             ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
             _ => MapPermission::W,
         };
-        match inner.memory_set.try_expand_growsdown(badv, access) {
+        match memory_set.try_expand_growsdown(badv, access) {
             LazyFaultResult::Resolved => return,
             LazyFaultResult::Oom => {
-                drop(inner);
+                drop(memory_set);
                 exit_group_and_run_next(-9);
             }
             LazyFaultResult::Invalid => {}
@@ -199,10 +235,12 @@ fn handle_user_exception(ecode: usize, badv: usize) {
         exit_group_and_run_next(errno);
     }
     let cx = get_trap_context();
+    let badi = read_badi();
     println!(
-        "[user_exn] ecode={} badv={:#x} era={:#x} ra={:#x} sp={:#x} tp={:#x}",
+        "[user_exn] ecode={} badv={:#x} badi={:#010x} era={:#x} ra={:#x} sp={:#x} tp={:#x}",
         ecode,
         badv,
+        badi,
         cx.sepc,
         cx.x[super::super::REG_RA],
         cx.x[super::super::REG_SP],
@@ -277,7 +315,8 @@ pub fn trap_handler() {
                 suspend_current_and_run_next();
             }
         } else if (estat & ESTAT_IS_IPI) != 0 {
-            super::super::clear_ipi_interrupt();
+            let actions = super::super::clear_ipi_interrupt();
+            super::super::mm::handle_ipi_actions(actions);
         } else {
             //非时钟中断目前先panic
             panic!(
@@ -298,6 +337,12 @@ pub fn trap_handler() {
             cx.x[super::super::REG_A5],
         ];
         let syscall_id = cx.x[super::super::REG_A7];
+        if let Some(task) = crate::task::processor::current_task() {
+            let mut inner = task.borrow_mut();
+            inner.last_syscall_id = syscall_id;
+            inner.last_syscall_args = args;
+            inner.last_syscall_valid = true;
+        }
         let result = syscall(syscall_id, args);
         let cx = get_trap_context();
         cx.x[super::super::REG_A0] = result as usize;
@@ -305,6 +350,14 @@ pub fn trap_handler() {
         // Lazy-FPU path: enable/restore the task's FP state and retry the
         // trapped user instruction instead of saving FP on every context switch.
         super::super::handle_user_fp_disabled();
+    } else if ecode == ECODE_LSX_DISABLED {
+        // LSX shares the FP register file. Restore the task's state, enable
+        // LSX for this quantum and retry the trapped vector instruction.
+        super::super::handle_user_lsx_disabled();
+    } else if ecode == ECODE_LASX_DISABLED {
+        // LASX is layered on LSX and the scalar FPU, so all three gates must
+        // be enabled before retrying.
+        super::super::handle_user_lasx_disabled();
     } else {
         match ecode {
             ECODE_ADDR_ERROR | ECODE_ADDR_ALIGN => handle_user_exception(ecode, badv),
@@ -375,6 +428,8 @@ pub fn trap_return() -> ! {
         let cx = get_trap_context();
         cx.sstatus = (cx.sstatus & !PRMD_USER_IE_MASK) | PRMD_USER_IE;
     }
+    // 即使同类 IPI 被合并，返回用户态前也必须消费共享的 TLB 刷新序号。
+    super::super::mm::service_pending_user_tlb_flush();
     if let Some(task) = crate::task::processor::current_task() {
         // LoongArch returns with the user ASID programmed in the trampoline.
         // Prepare the lazy-FPU gate before switching away from kernel ASID 0.
@@ -464,6 +519,5 @@ pub fn trap_return() -> ! {
 pub fn get_current_token() -> usize {
     let now_task_block = crate::task::processor::current_task().unwrap();
     let process = now_task_block.process.upgrade().unwrap();
-    let process_inner = process.borrow_mut();
-    process_inner.memory_set.token()
+    process.memory_set().token()
 }

@@ -651,7 +651,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     let path_rofs = rofs_for_path(dirfd, &path);
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let _ext4_guard = ext4_lock();
+    let ext4_guard = ext4_lock();
     if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
         return err(SyscallError::EISDIR);
     }
@@ -705,6 +705,9 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         return err(SyscallError::EROFS);
     }
 
+    // 打开文件引用检查会遍历 fd 表并读取 OSInode 内锁，不能同时持有全局
+    // ext4 锁；其他读写路径按“OSInode -> ext4”顺序获取，否则会形成反向锁序。
+    drop(ext4_guard);
     if !remove_dir {
         match defer_unlink_open_file(&parent, &name, &child) {
             Ok(true) => return 0,
@@ -713,6 +716,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         }
     }
 
+    let _ext4_guard = ext4_lock();
     match parent.unlink(&name) {
         Ok(_) => {
             invalidate_ext4_path_cache_for_at(&at, remove_dir);

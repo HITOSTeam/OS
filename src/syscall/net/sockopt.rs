@@ -35,6 +35,8 @@ const TC_PRIO_INTERACTIVE: i32 = 6;
 const MAX_TCP_KEEPIDLE: i32 = 32_767;
 const MAX_TCP_KEEPINTVL: i32 = 32_767;
 const MAX_TCP_KEEPCNT: i32 = 127;
+const LOOPBACK_TCP_MAXSEG: u32 = 24 * 1024;
+const TCP_INFO_LEN: usize = 232;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -268,6 +270,14 @@ fn write_socket_timeval_ms(
         )
     };
     write_sockopt_bytes(optval, optlen, user_len, bytes)
+}
+
+fn write_tcp_info(optval: usize, optlen: usize, user_len: usize) -> isize {
+    let mut info = [0u8; TCP_INFO_LEN];
+    // Linux tcp_info starts with tcpi_state. ESTABLISHED is enough for iperf's
+    // stats path; the rest of this lightweight struct may stay zero.
+    info[0] = 1;
+    write_sockopt_bytes(optval, optlen, user_len, &info)
 }
 
 fn read_sockopt_ifname(optval: usize, optlen: usize) -> Result<String, isize> {
@@ -2024,6 +2034,22 @@ pub fn syscall_setsockopt(
         Some(s) => s,
         None => return err(SyscallError::ENOTSOCK),
     };
+    if level == SOL_IPV6 {
+        if optname != IPV6_V6ONLY || sock.domain() != AF_INET6 {
+            return err(SyscallError::ENOPROTOOPT);
+        }
+        if optlen < size_of::<i32>() {
+            return err(SyscallError::EINVAL);
+        }
+        let val = match read_sockopt_int(optval, optlen) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        return match sock.set_ipv6_v6only(val != 0) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
+    }
     if level == SOL_TCP {
         if optlen < size_of::<i32>() {
             return err(SyscallError::EINVAL);
@@ -2033,6 +2059,16 @@ pub fn syscall_setsockopt(
             Err(e) => return e,
         };
         return match optname {
+            TCP_MAXSEG => {
+                if !matches!(
+                    sock.kind(),
+                    crate::fs::NetSocketKind::TcpStream | crate::fs::NetSocketKind::TcpListener
+                ) {
+                    err(SyscallError::ENOPROTOOPT)
+                } else {
+                    0
+                }
+            }
             TCP_NODELAY => match sock.set_tcp_nodelay(val != 0) {
                 Ok(()) => 0,
                 Err(e) => e,
@@ -3054,6 +3090,16 @@ pub fn syscall_getsockopt(
         Some(s) => s,
         None => return err(SyscallError::ENOTSOCK),
     };
+    if level == SOL_IPV6 {
+        if optname != IPV6_V6ONLY || sock.domain() != AF_INET6 {
+            return err(SyscallError::ENOPROTOOPT);
+        }
+        if user_len < size_of::<i32>() {
+            return err(SyscallError::EINVAL);
+        }
+        let val = i32::from(sock.ipv6_v6only());
+        return write_sockopt_bytes(optval, optlen, user_len, &val.to_ne_bytes());
+    }
     let val: u32 = match level {
         SOL_SOCKET => match optname {
             SO_BINDTODEVICE => {
@@ -3192,6 +3238,24 @@ pub fn syscall_getsockopt(
             _ => return err(SyscallError::ENOPROTOOPT),
         },
         SOL_TCP => match optname {
+            TCP_MAXSEG => {
+                if !matches!(
+                    sock.kind(),
+                    crate::fs::NetSocketKind::TcpStream | crate::fs::NetSocketKind::TcpListener
+                ) {
+                    return err(SyscallError::ENOPROTOOPT);
+                }
+                LOOPBACK_TCP_MAXSEG
+            }
+            TCP_INFO => {
+                if !matches!(
+                    sock.kind(),
+                    crate::fs::NetSocketKind::TcpStream | crate::fs::NetSocketKind::TcpListener
+                ) {
+                    return err(SyscallError::ENOPROTOOPT);
+                }
+                return write_tcp_info(optval, optlen, user_len);
+            }
             TCP_NODELAY => match sock.tcp_nodelay() {
                 Ok(v) => v as u32,
                 Err(e) => return e,

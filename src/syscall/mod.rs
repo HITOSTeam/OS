@@ -149,17 +149,14 @@ pub(crate) fn busybox_applet_allowed(name: &str) -> bool {
 }
 
 pub fn last_syscall_snapshot() -> (usize, [usize; 6]) {
-    (
-        LAST_SYSCALL_ID.load(Ordering::Relaxed),
-        [
-            LAST_SYSCALL_A0.load(Ordering::Relaxed),
-            LAST_SYSCALL_A1.load(Ordering::Relaxed),
-            LAST_SYSCALL_A2.load(Ordering::Relaxed),
-            LAST_SYSCALL_A3.load(Ordering::Relaxed),
-            LAST_SYSCALL_A4.load(Ordering::Relaxed),
-            LAST_SYSCALL_A5.load(Ordering::Relaxed),
-        ],
-    )
+    (LAST_SYSCALL_ID.load(Ordering::Relaxed), [
+        LAST_SYSCALL_A0.load(Ordering::Relaxed),
+        LAST_SYSCALL_A1.load(Ordering::Relaxed),
+        LAST_SYSCALL_A2.load(Ordering::Relaxed),
+        LAST_SYSCALL_A3.load(Ordering::Relaxed),
+        LAST_SYSCALL_A4.load(Ordering::Relaxed),
+        LAST_SYSCALL_A5.load(Ordering::Relaxed),
+    ])
 }
 
 const SYSCALL_EVENTFD2: usize = 19;
@@ -182,6 +179,7 @@ const SYSCALL_LREMOVEXATTR: usize = 15;
 const SYSCALL_FREMOVEXATTR: usize = 16;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_FCNTL: usize = 25;
+const SYSCALL_FLOCK: usize = 32;
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_DUP3: usize = 24;
 const SYSCALL_RENAMEAT: usize = 38;
@@ -585,9 +583,12 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
     LAST_SYSCALL_A4.store(args[4], Ordering::Relaxed);
     LAST_SYSCALL_A5.store(args[5], Ordering::Relaxed);
     trace_syscall_entry(id, &args);
+    #[cfg(debug_assertions)]
+    let __perf_start = crate::perf::syscall_begin(id);
     let ret = match id {
         SYSCALL_GETCWD => filesystem::syscall_getcwd(args[0], args[1]),
         SYSCALL_FCNTL => filesystem::syscall_fcntl(args[0], args[1], args[2]),
+        SYSCALL_FLOCK => filesystem::syscall_flock(args[0], args[1]),
         SYSCALL_DUP => filesystem::syscall_dup(args[0]),
         SYSCALL_DUP3 => filesystem::syscall_dup3(args[0], args[1], args[2]),
         SYSCALL_IOCTL => misc::syscall_ioctl(args[0], args[1], args[2]),
@@ -1004,5 +1005,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
             args[5]
         );
     }
+    #[cfg(debug_assertions)]
+    crate::perf::syscall_end(id, __perf_start);
     ret
 }

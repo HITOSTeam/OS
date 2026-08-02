@@ -1,21 +1,27 @@
+#[cfg(target_arch = "riscv64")]
 use crate::{
     config::PAGE_SIZE,
+    fs::UserfaultfdFile,
+    mm::{MapPermission, VirtAddr, try_copy_from_user},
+};
+use crate::{
     fs::{
         LinuxTermio, LinuxTermios, LinuxWinSize, PseudoKindTag, PtyMasterFile, PtySlaveFile,
-        TtyFile, UserfaultfdFile, pseudo_block_is_read_only, pseudo_block_read_ahead,
-        pseudo_block_set_read_ahead, pseudo_block_set_read_only,
+        TtyFile, pseudo_block_is_read_only, pseudo_block_read_ahead, pseudo_block_set_read_ahead,
+        pseudo_block_set_read_only,
     },
-    mm::{
-        MapPermission, VirtAddr, try_copy_from_user, try_copy_to_user, try_read_user_value,
-        try_write_user_value, write_user_value,
+    mm::{try_copy_to_user, try_read_user_value, try_write_user_value, write_user_value},
+    syscall::{
+        error::{SyscallError, err},
+        filesystem::O_NONBLOCK,
     },
-    syscall::error::{SyscallError, err},
     task::processor::{current_files, current_process},
     trap::get_current_token,
 };
 use alloc::{format, string::String};
 use core::mem::size_of;
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UffdioApi {
@@ -24,6 +30,7 @@ struct UffdioApi {
     ioctls: u64,
 }
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UffdioRange {
@@ -31,6 +38,7 @@ struct UffdioRange {
     len: u64,
 }
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UffdioRegister {
@@ -39,6 +47,7 @@ struct UffdioRegister {
     ioctls: u64,
 }
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UffdioCopy {
@@ -76,13 +85,20 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     const TCSBRKP: usize = 0x5425;
     const N_TTY: i32 = 0;
     const N_HDLC: i32 = 13;
+    #[cfg(target_arch = "riscv64")]
     const UFFD_API: u64 = 0xAA;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_API: usize = 0xc018_aa3f;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_REGISTER: usize = 0xc020_aa00;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_COPY: usize = 0xc028_aa03;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
+    #[cfg(target_arch = "riscv64")]
     const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1 << 0;
     const FIONREAD: usize = 0x541B;
+    const FIONBIO: usize = 0x5421;
     const RNDGETENTCNT: usize = 0x8004_5200;
     const BLKROSET: usize = 0x125d;
     const BLKROGET: usize = 0x125e;
@@ -177,6 +193,27 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
     let request = _request & 0xffff_ffffusize;
     let token = get_current_token();
 
+    if request == FIONBIO {
+        if _argp == 0 {
+            return err(SyscallError::EFAULT);
+        }
+        let Some(nonblocking) = try_read_user_value::<i32>(token, _argp as *const i32) else {
+            return err(SyscallError::EFAULT);
+        };
+        let files = current_files();
+        let mut files = files.lock();
+        let Some((_file, mut flags)) = files.get_file_and_flags(fd) else {
+            return EBADF;
+        };
+        if nonblocking != 0 {
+            flags |= O_NONBLOCK as u32;
+        } else {
+            flags &= !(O_NONBLOCK as u32);
+        }
+        return if files.set_flags(fd, flags) { 0 } else { EBADF };
+    }
+
+    #[cfg(target_arch = "riscv64")]
     if let Some(uffd) = file.as_any().downcast_ref::<UserfaultfdFile>() {
         match request {
             UFFDIO_API => {
@@ -253,7 +290,7 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                 }
                 {
                     let process = current_process();
-                    let inner = process.borrow_mut();
+                    let memory_set = process.memory_set();
                     let start = copy.dst as usize & !(PAGE_SIZE - 1);
                     let end = ((copy.dst as usize)
                         .saturating_add(len)
@@ -261,13 +298,12 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
                         & !(PAGE_SIZE - 1);
                     let mut page = start;
                     while page < end {
-                        let mapped = inner
-                            .memory_set
+                        let mapped = memory_set
                             .translate(VirtAddr::from(page).floor())
                             .map(|pte| pte.is_valid())
                             .unwrap_or(false);
                         if !mapped {
-                            match inner.memory_set.resolve_lazy_fault(page, MapPermission::W) {
+                            match memory_set.resolve_lazy_fault(page, MapPermission::W) {
                                 crate::mm::LazyFaultResult::Resolved => {}
                                 crate::mm::LazyFaultResult::Oom => {
                                     return err(SyscallError::ENOMEM);
@@ -1000,6 +1036,8 @@ pub fn syscall_ioctl(fd: usize, _request: usize, _argp: usize) -> isize {
 
     if crate::syscall::net::is_socket_file(file.as_ref()) {
         let net_sock = file.as_any().downcast_ref::<crate::fs::NetSocketFile>();
+
+        //TODO 后期把这些移动到网路库里面
         #[repr(C)]
         #[derive(Clone, Copy)]
         struct Ifconf {

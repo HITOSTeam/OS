@@ -6,7 +6,9 @@ use crate::mm::{
     VirtPageNum, frame_alloc,
 };
 use crate::task::processor::current_task;
-use alloc::string::String;
+// 在 LoongArch 出现需要以 NUL 结尾字符串转换辅助函数的调用者前，下面的
+// `translated_str` 保持禁用。
+// use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -364,9 +366,10 @@ impl PageTable {
         Some(*pte_leaf)
     }
 
-    /// Update an existing leaf PTE's flags, preserving its mapped PPN.
-    ///
-    /// Returns `false` if the vpn is not mapped.
+    /*
+     * 当前 LoongArch 调用者使用 `set_flags_deferred`，并在批处理后显式执行
+     * 一次 ASID 刷新。待单个 PTE 调用者需要时，再启用这个立即刷新的便捷方法。
+     *
     pub fn set_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
         if !self.set_flags_deferred(vpn, flags) {
             return false;
@@ -374,6 +377,7 @@ impl PageTable {
         flush_tlb_vaddr(vpn.0 << 12);
         true
     }
+    */
 
     pub fn set_flags_deferred(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
         // Used by fork/mprotect paths that batch PTE edits and invalidate the
@@ -431,9 +435,10 @@ impl PageTable {
         true
     }
 
-    /// Update an existing leaf PTE's mapped PPN and flags.
-    ///
-    /// Returns `false` if the vpn is not mapped.
+    /*
+     * COW 使用 `remap_deferred`，以保证 PTE 修改和定向 ASID 刷新与帧元数据更新
+     * 的顺序一致。待调用者需要时，再启用这个立即刷新的包装。
+     *
     pub fn remap(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
         if !self.remap_deferred(vpn, ppn, flags) {
             return false;
@@ -441,6 +446,7 @@ impl PageTable {
         flush_tlb_vaddr(vpn.0 << 12);
         true
     }
+    */
 
     pub fn remap_deferred(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
         // Used by COW fault handling to edit the PTE first and flush/drop ASID
@@ -476,6 +482,10 @@ impl PageTable {
         super::asid::write_kernel_asid();
         flush_tlb_all();
     }
+    /*
+     * 这个浅拷贝占位实现不会复制页表帧，且没有调用者。在实现正确的克隆策略前
+     * 保持禁用。
+     *
     pub fn clone(&self) -> Self {
         //todo:alloc new frames...
         return Self {
@@ -483,8 +493,13 @@ impl PageTable {
             frames: Vec::new(),
         };
     }
+    */
 }
 
+/*
+ * 用户地址转换现在通过 `try_resolve_user_page` 一并处理 COW 和懒分配缺页。
+ * 待某个陷阱路径需要再次区分它们时，再启用这个仅处理懒分配的辅助函数。
+ *
 fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool {
     let Some(task) = current_task() else {
         return false;
@@ -492,18 +507,17 @@ fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if token != inner.memory_set.token() {
+    let memory_set = process.memory_set();
+    if token != memory_set.token() {
         return false;
     }
-    match inner.memory_set.resolve_lazy_fault(va, access) {
+    match memory_set.resolve_lazy_fault(va, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => crate::task::processor::exit_group_and_run_next(-9),
         LazyFaultResult::Invalid => false,
     }
 }
+*/
 
 fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool {
     let Some(task) = current_task() else {
@@ -512,16 +526,14 @@ fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if token != inner.memory_set.token() {
+    let memory_set = process.memory_set();
+    if token != memory_set.token() {
         return false;
     }
-    if access.contains(MapPermission::W) && inner.memory_set.resolve_cow_fault(va) {
+    if access.contains(MapPermission::W) && memory_set.resolve_cow_fault(va) {
         return true;
     }
-    match inner.memory_set.resolve_lazy_fault(va, access) {
+    match memory_set.resolve_lazy_fault(va, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => crate::task::processor::exit_group_and_run_next(-9),
         LazyFaultResult::Invalid => false,
@@ -554,11 +566,10 @@ fn resolve_user_pte(token: usize, va: usize, access: MapPermission) -> Result<Pa
             }
         }
     };
-    let mut flags = pte.flags();
+    let flags = pte.flags();
     if access.contains(MapPermission::W) && !pte.writable() {
         if flags.contains(PTEFlags::COW) && try_resolve_user_page(token, va, access) {
             pte = page_table.translate(vpn).ok_or(())?;
-            flags = pte.flags();
         }
     }
     if !pte.is_user() {
@@ -584,7 +595,11 @@ fn translated_address_with(token: usize, ptr: *const u8, access: MapPermission) 
     &mut ppn.get_bytes_array()[page_off]
 }
 
-/// Load a string from other address spaces into kernel space without an end `\0`.
+// 从其他地址空间加载一个不带结尾 `\0` 的字符串。
+/*
+ * LoongArch syscall 路径当前使用字节复制辅助函数。待调用者需要以 NUL 结尾的
+ * 字符串转换辅助函数时，再启用此 API。
+ *
 pub fn translated_str(token: usize, ptr: *const u8) -> String {
     let mut string = String::new();
     let mut va = ptr as usize;
@@ -598,6 +613,7 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
     }
     string
 }
+*/
 pub fn translated_mutref<T>(token: usize, ptr: *mut T) -> &'static mut T {
     let real_addr = translated_address_with(token, ptr as *const u8, MapPermission::W);
     // SAFETY: `translated_address_with` resolved `ptr` to writable mapped memory for this token,

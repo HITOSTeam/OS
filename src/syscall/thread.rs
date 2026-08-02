@@ -48,14 +48,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         let new_task_tid = new_task_res.tid;
 
         // add new thread to current process
-        {
-            let mut process_inner = process.borrow_mut();
-            let tasks = &mut process_inner.tasks;
-            while tasks.len() < new_task_tid + 1 {
-                tasks.push(None);
-            }
-            tasks[new_task_tid] = Some(Arc::clone(&new_task));
-        }
+        process.install_task(new_task_tid, Arc::clone(&new_task));
 
         let new_task_trap_cx = new_task_inner.get_trap_cx();
         *new_task_trap_cx = TrapContext::app_init_context(
@@ -105,18 +98,8 @@ pub fn sys_waittid(tid: usize) -> i32 {
         return err(SyscallError::EPERM) as i32;
     }
 
-    // Clone the waited task Arc while holding the PCB lock, then drop the PCB lock
-    // before borrowing the waited task's TCB. This avoids a deadlock where:
-    // - waiter holds PCB lock and wants waited TCB lock
-    // - waited thread holds its TCB lock and drops TaskUserRes (needs PCB lock)
-    let waited_task = {
-        let process_inner = process.borrow_mut();
-        process_inner
-            .tasks
-            .get(tid)
-            .and_then(|t| t.as_ref())
-            .cloned()
-    };
+    // 线程组锁下只克隆 Arc；检查退出状态时不持有线程组锁。
+    let waited_task = process.task_at(tid);
     let waited_task = match waited_task {
         Some(t) => t,
         None => return -1, // waited thread does not exist
@@ -127,16 +110,8 @@ pub fn sys_waittid(tid: usize) -> i32 {
         {
             let mut waited_inner = waited_task.borrow_mut();
             if let Some(exit_code) = waited_inner.exit_code {
-                // Dealloc the exited thread entry in PCB.
-                let mut process_inner = process.borrow_mut();
-                if let Some(slot) = process_inner.tasks.get_mut(tid) {
-                    // Only clear if it still points to the same TCB.
-                    if let Some(existing) = slot.as_ref() {
-                        if Arc::ptr_eq(existing, &waited_task) {
-                            *slot = None;
-                        }
-                    }
-                }
+                drop(waited_inner);
+                process.remove_task_if(tid, &waited_task);
                 return exit_code;
             }
             waited_inner.join_waiters.push_back(task.clone());

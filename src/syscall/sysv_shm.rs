@@ -317,6 +317,11 @@ fn check_perm(
 }
 
 pub fn fork_inherit(attaches: &[ShmAttach]) {
+    // Starry/Linux 的普通编译进程通常没有 SysV SHM 映射。空快照不应获取
+    // 全局 SHM 管理器锁，否则多线程 fork 会无意义地进入跨子系统锁序。
+    if attaches.is_empty() {
+        return;
+    }
     let mut managers = SHM_MANAGERS.lock();
     for a in attaches {
         if !a.accounted {
@@ -488,13 +493,10 @@ pub fn detach_attaches_overlapping(
             continue;
         }
         if attach.accounted {
-            removed_accounted.push((
-                attach.attach_id,
-                ShmAttachRef {
-                    ipc_ns_id: attach.ipc_ns_id,
-                    shmid: attach.shmid,
-                },
-            ));
+            removed_accounted.push((attach.attach_id, ShmAttachRef {
+                ipc_ns_id: attach.ipc_ns_id,
+                shmid: attach.shmid,
+            }));
         }
         if start > attach.addr {
             next.push(ShmAttach {
@@ -684,10 +686,10 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
 
     let map_len = align_up(seg.size, PAGE_SIZE);
     let process = current_process();
-    let inner = process.borrow_mut();
+    let mm = process.memory_set();
 
     let start = if shmaddr == 0 {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let Some(start) = memory_set.find_free_mmap_range(None, map_len, USER_VA_TOP) else {
             return err(SyscallError::ENOMEM);
         };
@@ -706,7 +708,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     // If the caller asks for a fixed address, follow SHM_REMAP by replacing
     // existing user mappings. Otherwise, reject overlaps.
     if shmaddr != 0 {
-        let memory_set = inner.memory_set.lock();
+        let memory_set = mm.lock();
         let mut cur = start;
         while cur < end {
             let vpn = VirtAddr::from(cur).floor();
@@ -756,7 +758,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     };
     let areas = Vec::from([VmaInsertArea::SharedFrames { start, end, frames }]);
     let detached_shmids = {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let remap_attach_update = if (shmflg & SHM_REMAP) != 0 {
             let mut updated_attaches = memory_set.sysv_shm_attaches_snapshot();
             let Some(release_shmids) =
@@ -788,7 +790,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     seg.atime = now_secs();
     seg.lpid = pid;
     {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         memory_set.note_mmap_end(end);
         memory_set.push_sysv_shm_attach(ShmAttach {
             ipc_ns_id,
@@ -799,7 +801,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
             accounted: true,
         });
     }
-    drop(inner);
+    drop(mm);
     drop(managers);
     release_detached_attach_refs(pid, detached_shmids.as_slice());
     start as isize
@@ -810,9 +812,9 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
     let process = current_process();
-    let inner = process.borrow_mut();
+    let mm = process.memory_set();
     let Some((a, transferred_account)) = ({
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = mm.lock();
         let result = memory_set.remove_sysv_shm_attach(shmaddr);
         if let Some((a, _)) = result {
             let end = a.addr + a.len;
@@ -822,7 +824,7 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
     }) else {
         return err(SyscallError::EINVAL);
     };
-    drop(inner);
+    drop(mm);
 
     let (_, _, pid, _) = current_ids();
     let mut managers = SHM_MANAGERS.lock();

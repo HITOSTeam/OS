@@ -140,16 +140,13 @@ impl EpollFile {
         if interests.contains_key(&fd) {
             return Err(err(SyscallError::EEXIST));
         }
-        interests.insert(
-            fd,
-            EpollInterest {
-                file: Arc::downgrade(file),
-                events,
-                data,
-                last_ready: 0,
-                oneshot_disabled: false,
-            },
-        );
+        interests.insert(fd, EpollInterest {
+            file: Arc::downgrade(file),
+            events,
+            data,
+            last_ready: 0,
+            oneshot_disabled: false,
+        });
         Ok(())
     }
 

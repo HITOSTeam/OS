@@ -1,4 +1,5 @@
 use super::*;
+use crate::fs::{inode_identity_path_in_roots, note_inode_path_hint, note_process_exec_path};
 use alloc::sync::Arc;
 
 struct LoadedExecImage {
@@ -936,9 +937,24 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
         }
     };
     let fanotify_path = resolve_abs_path(AT_FDCWD, &path).ok().flatten();
+    // `/proc/<pid>/exe` 依赖 inode 到路径的提示表。解析辅助函数在并发
+    // exec/目录切换窗口中可能暂时不给出绝对路径，但这不能阻止我们记录
+    // 已成功解析的可执行 inode；否则 Cargo 会偶发认为 procfs 未挂载。
+    let exec_path_hint = fanotify_path.clone().unwrap_or_else(|| {
+        if path.starts_with('/') {
+            normalize_path("/", &path)
+        } else {
+            let cwd = current_process().borrow_mut().cwd.clone();
+            normalize_path(&cwd, &path)
+        }
+    });
     if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
         return e;
     }
+    // 将执行路径与 inode 关联，使 exec 替换 argv/进程状态后 procfs 仍能通过
+    // /proc/<pid>/exe 暴露该路径。
+    note_inode_path_hint(&inode, &exec_path_hint);
+    note_process_exec_path(current_process().getpid(), &exec_path_hint);
     let exec_reservation =
         match crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num()) {
             Ok(reservation) => reservation,
@@ -974,8 +990,22 @@ pub fn syscall_execveat(
         Err(e) => return e,
     };
     let fanotify_path = resolve_abs_path(dirfd, &path).ok().flatten();
+    // execveat 的相对路径需要 dirfd 才能完全规范化；若解析辅助函数暂时
+    // 不可用，绝对路径本身仍可作为稳定的 `/proc/<pid>/exe` 提示。
+    let exec_path_hint = fanotify_path
+        .clone()
+        .or_else(|| path.starts_with('/').then(|| normalize_path("/", &path)));
     if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
         return e;
+    }
+    if let Some(abs) = exec_path_hint.as_deref() {
+        note_inode_path_hint(&inode, abs);
+        note_process_exec_path(current_process().getpid(), abs);
+    } else if let Some(abs) = inode_identity_path_in_roots(inode.device_id(), inode.inode_num()) {
+        // 部分 Rust/Cargo 启动路径使用 `execveat(AT_EMPTY_PATH)`，它没有路径参数。
+        // 按 inode 身份反查真实路径，避免把递归的 `/proc/self/fd/...` 写成 exe 目标。
+        note_inode_path_hint(&inode, &abs);
+        note_process_exec_path(current_process().getpid(), &abs);
     }
     let exec_reservation =
         match crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num()) {

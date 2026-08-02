@@ -7,7 +7,6 @@
 //! Every task or process has a memory_set to control its virtual memory.
 
 mod address;
-mod dtb;
 mod elf_loader;
 mod frame_allocator;
 mod heap_allocator;
@@ -24,8 +23,6 @@ pub use address::StepByOne;
 use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use alloc::vec::Vec;
-#[allow(unused_imports)]
-pub use dtb::init_phys_mem_from_dtb;
 pub(crate) use frame_allocator::frame_refcount;
 pub use frame_allocator::{
     FrameTracker, frame_alloc, frame_alloc_contiguous, frame_available_pages, frame_managed_pages,
@@ -68,6 +65,7 @@ pub fn activate_kernel_space() {
 pub struct KernelPageTableGuard {
     previous_satp: usize,
     switched: bool,
+    preserve_user_tlb: bool,
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -85,12 +83,20 @@ impl KernelPageTableGuard {
             }
         };
         let switched = previous_satp != kernel_satp;
+        // 只有用户页表持有非零 ASID 时，内核页表 ASID 0 与其 TLB 项才可安全
+        // 共存。没有硬件 ASID 或 ASID 耗尽时仍必须沿用保守的全量刷新。
+        let preserve_user_tlb = switched && memory_set::riscv_satp_has_user_asid(previous_satp);
         if switched {
-            memory_set::activate_token(kernel_satp);
+            if preserve_user_tlb {
+                memory_set::riscv_write_satp_without_flush(kernel_satp);
+            } else {
+                memory_set::activate_token(kernel_satp);
+            }
         }
         Self {
             previous_satp,
             switched,
+            preserve_user_tlb,
         }
     }
 }
@@ -99,7 +105,11 @@ impl KernelPageTableGuard {
 impl Drop for KernelPageTableGuard {
     fn drop(&mut self) {
         if self.switched {
-            memory_set::activate_token(self.previous_satp);
+            if self.preserve_user_tlb {
+                memory_set::riscv_write_satp_without_flush(self.previous_satp);
+            } else {
+                memory_set::activate_token(self.previous_satp);
+            }
         }
     }
 }

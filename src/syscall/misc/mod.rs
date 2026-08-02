@@ -69,13 +69,17 @@ pub(crate) fn decode_linux_tid_strict(tgid: usize, tid: usize) -> Option<usize> 
 }
 
 pub(super) fn current_tid_index() -> usize {
-    current_task()
-        .unwrap()
-        .borrow_mut()
+    let Some(task) = current_task() else {
+        return 0;
+    };
+    // exit_group 可能在另一个核心撤销本线程的用户资源；当前系统调用仍需
+    // 走到 trap_return，后者发现 res 为空后会完成线程退出。此窗口内把它
+    // 视为线程组主线程，不能因线程号已解绑而 panic。
+    task.borrow_mut()
         .res
         .as_ref()
-        .unwrap()
-        .tid
+        .map(|res| res.tid)
+        .unwrap_or(0)
 }
 
 pub(super) fn current_linux_tid() -> usize {

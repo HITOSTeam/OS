@@ -194,11 +194,7 @@ fn proc_pid_fdinfo(pid: u32, fd: usize) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        return String::new();
-    };
-    let files = Arc::clone(&inner.files);
-    drop(inner);
+    let files = proc.files();
     let Some((file, descriptor_flags)) = files.lock().get_file_and_flags(fd) else {
         return String::new();
     };
@@ -477,10 +473,12 @@ pub fn vm_committed_as_bytes() -> usize {
         map.values().cloned().collect::<Vec<_>>()
     };
     processes.iter().fold(0usize, |acc, process| {
-        let Some(inner) = process.try_borrow_mut() else {
+        let mm = process.memory_set();
+        // /proc/meminfo 是统计快照，不能为了精确读取一个正在修改的 mm
+        // 阻塞所有并发 brk/mmap。忙碌地址空间留到下一次采样统计。
+        let Some(memory_set) = mm.try_lock() else {
             return acc;
         };
-        let memory_set = inner.memory_set.lock();
         let heap = memory_set.heap_size();
         let anon_private = memory_set.anon_private_writable_vm_bytes();
         acc.saturating_add(heap).saturating_add(anon_private)
@@ -504,9 +502,23 @@ fn proc_meminfo() -> String {
 }
 
 fn proc_cpuinfo() -> String {
-    String::from(
-        "processor\t: 0\nvendor_id\t: QEMU\nmodel name\t: QEMU Virtual CPU\ncpu MHz\t\t: 1000.000\n",
-    )
+    let mut out = String::new();
+    let online = crate::task::manager::online_hart_mask();
+    for hart_id in 0..config::MAX_HARTS {
+        if online & (1usize << hart_id) == 0 {
+            continue;
+        }
+        let _ = write!(
+            out,
+            "processor\t: {hart_id}\nvendor_id\t: QEMU\nmodel name\t: QEMU Virtual CPU\ncpu MHz\t\t: 1000.000\n\n"
+        );
+    }
+    if out.is_empty() {
+        out.push_str(
+            "processor\t: 0\nvendor_id\t: QEMU\nmodel name\t: QEMU Virtual CPU\ncpu MHz\t\t: 1000.000\n",
+        );
+    }
+    out
 }
 
 fn proc_cmdline() -> String {
@@ -521,9 +533,15 @@ fn proc_uptime() -> String {
 }
 
 fn proc_stat() -> String {
-    String::from(
-        "cpu  0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n",
-    )
+    let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
+    let online = crate::task::manager::online_hart_mask();
+    for hart_id in 0..config::MAX_HARTS {
+        if online & (1usize << hart_id) != 0 {
+            let _ = writeln!(out, "cpu{hart_id} 0 0 0 0 0 0 0 0 0 0");
+        }
+    }
+    out.push_str("intr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n");
+    out
 }
 
 fn proc_perf() -> String {
@@ -577,6 +595,24 @@ fn proc_pid_status(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
+    let num_threads = proc.thread_count();
+    let (main_state, cgroup_frozen) = proc
+        .tasks_snapshot()
+        .first()
+        .and_then(|task| {
+            task.try_borrow_mut()
+                .map(|inner| (inner.task_status, inner.cgroup_frozen))
+        })
+        .unwrap_or((TaskStatus::Ready, false));
+    let (heap_bytes, mmap_bytes, vmlck_bytes) = {
+        let mm = proc.memory_set();
+        let memory_set = mm.lock();
+        (
+            memory_set.heap_size(),
+            memory_set.vm_regions_total_len(),
+            memory_set.locked_bytes(),
+        )
+    };
     let Some(inner) = proc.try_borrow_mut() else {
         if crate::debug_config::DEBUG_PROCFS {
             crate::println!("[procfs] status pid={} lock busy", pid);
@@ -589,25 +625,6 @@ fn proc_pid_status(pid: u32) -> String {
         .and_then(|w| w.upgrade())
         .map(|p| p.getpid())
         .unwrap_or(0);
-    let num_threads = inner.thread_count();
-    let (main_state, cgroup_frozen) = inner
-        .tasks
-        .iter()
-        .flatten()
-        .next()
-        .and_then(|t| {
-            t.try_borrow_mut()
-                .map(|ti| (ti.task_status, ti.cgroup_frozen))
-        })
-        .unwrap_or((TaskStatus::Ready, false));
-    let (heap_bytes, mmap_bytes, vmlck_bytes) = {
-        let memory_set = inner.memory_set.lock();
-        (
-            memory_set.heap_size(),
-            memory_set.vm_regions_total_len(),
-            memory_set.locked_bytes(),
-        )
-    };
     let vmdata_kb: usize = (heap_bytes + 1023) / 1024;
     let vsize_kb: usize = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) / 1024;
     let vmlck_kb: usize = (vmlck_bytes + 1023) / 1024;
@@ -667,6 +684,20 @@ fn proc_pid_stat(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
+    let num_threads = proc.thread_count();
+    let (main_state, cgroup_frozen) = proc
+        .tasks_snapshot()
+        .first()
+        .and_then(|task| {
+            task.try_borrow_mut()
+                .map(|inner| (inner.task_status, inner.cgroup_frozen))
+        })
+        .unwrap_or((TaskStatus::Ready, false));
+    let (heap_bytes, mmap_bytes) = {
+        let mm = proc.memory_set();
+        let memory_set = mm.lock();
+        (memory_set.heap_size(), memory_set.vm_regions_total_len())
+    };
     let Some(inner) = proc.try_borrow_mut() else {
         let elapsed = if crate::debug_config::DEBUG_FUTEX {
             crate::arch::read_time().wrapping_sub(start_cycles)
@@ -686,21 +717,6 @@ fn proc_pid_stat(pid: u32) -> String {
         .map(|p| p.getpid())
         .unwrap_or(0);
     let start_time_ms = inner.start_time_ms;
-    let num_threads = inner.thread_count();
-    let (main_state, cgroup_frozen) = inner
-        .tasks
-        .iter()
-        .flatten()
-        .next()
-        .and_then(|t| {
-            t.try_borrow_mut()
-                .map(|ti| (ti.task_status, ti.cgroup_frozen))
-        })
-        .unwrap_or((TaskStatus::Ready, false));
-    let (heap_bytes, mmap_bytes) = {
-        let memory_set = inner.memory_set.lock();
-        (memory_set.heap_size(), memory_set.vm_regions_total_len())
-    };
     let vsize: u64 = (config::USER_STACK_SIZE + heap_bytes + mmap_bytes) as u64;
 
     let comm = if inner.comm.is_empty() {
@@ -812,29 +828,24 @@ fn proc_pid_task_stat(pid: u32, tid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
+    let Some(tid_index) = decode_proc_linux_tid(pid, tid) else {
+        return String::new();
+    };
+    let Some((task_state, cgroup_frozen)) = proc.task_at(tid_index).and_then(|t| {
+        t.try_borrow_mut().and_then(|ti| {
+            if ti.res.is_none() || ti.exit_code.is_some() {
+                None
+            } else {
+                Some((ti.task_status, ti.cgroup_frozen))
+            }
+        })
+    }) else {
+        return String::new();
+    };
     let Some(inner) = proc.try_borrow_mut() else {
         if crate::debug_config::DEBUG_PROCFS {
             crate::println!("[procfs] task stat pid={} tid={} lock busy", pid, tid);
         }
-        return String::new();
-    };
-    let Some(tid_index) = decode_proc_linux_tid(pid, tid) else {
-        return String::new();
-    };
-    let Some((task_state, cgroup_frozen)) = inner
-        .tasks
-        .get(tid_index)
-        .and_then(|t| t.as_ref())
-        .and_then(|t| {
-            t.try_borrow_mut().and_then(|ti| {
-                if ti.res.is_none() || ti.exit_code.is_some() {
-                    None
-                } else {
-                    Some((ti.task_status, ti.cgroup_frozen))
-                }
-            })
-        })
-    else {
         return String::new();
     };
 
@@ -886,12 +897,11 @@ fn proc_pid_maps(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let inner = proc.borrow_mut();
     let regions = {
-        let memory_set = inner.memory_set.lock();
+        let mm = proc.memory_set();
+        let memory_set = mm.lock();
         memory_set.vm_regions_snapshot()
     };
-    drop(inner);
 
     let mut out = String::with_capacity(regions.len().saturating_mul(48));
     for region in regions {
@@ -935,14 +945,12 @@ fn proc_pid_pagemap_entry(pid: u32, entry: usize) -> u64 {
     let Some(proc) = pid2process(pid as usize) else {
         return 0;
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        return 0;
-    };
     let Some(vaddr) = entry.checked_mul(config::PAGE_SIZE) else {
         return 0;
     };
     let vpn = VirtAddr::from(vaddr).floor();
-    let memory_set = inner.memory_set.lock();
+    let mm = proc.memory_set();
+    let memory_set = mm.lock();
     if let Some(pte) = memory_set.translate(vpn) {
         if pte.is_valid() {
             return (1u64 << 63) | (pte.ppn().0 as u64 & ((1u64 << 55) - 1));
@@ -957,10 +965,8 @@ fn proc_kpageflags_entry(pfn: usize) -> u64 {
         map.values().cloned().collect::<Vec<_>>()
     };
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let memory_set = inner.memory_set.lock();
+        let mm = process.memory_set();
+        let memory_set = mm.lock();
         for (start, end) in memory_set.user_mapped_ranges() {
             let mut cur = start;
             while cur < end {
@@ -993,11 +999,9 @@ pub(super) fn proc_pid_pagemap_len(pid: u32) -> usize {
     let Some(proc) = pid2process(pid as usize) else {
         return 0;
     };
-    let Some(inner) = proc.try_borrow_mut() else {
-        return 0;
-    };
     let max_end = {
-        let memory_set = inner.memory_set.lock();
+        let mm = proc.memory_set();
+        let memory_set = mm.lock();
         memory_set.max_user_mapped_end()
     };
     let page_count = max_end.saturating_add(config::PAGE_SIZE - 1) / config::PAGE_SIZE;
@@ -1054,9 +1058,9 @@ fn proc_pid_smaps(pid: u32) -> String {
     let Some(proc) = pid2process(pid as usize) else {
         return String::new();
     };
-    let inner = proc.borrow_mut();
     let regions = {
-        let memory_set = inner.memory_set.lock();
+        let mm = proc.memory_set();
+        let memory_set = mm.lock();
         let mut regions = memory_set.vm_regions_snapshot();
         regions.sort_by_key(|r| r.start);
         regions
@@ -1067,7 +1071,6 @@ fn proc_pid_smaps(pid: u32) -> String {
             })
             .collect::<Vec<_>>()
     };
-    drop(inner);
 
     let mut out = String::new();
     for (region, locked_bytes) in regions {

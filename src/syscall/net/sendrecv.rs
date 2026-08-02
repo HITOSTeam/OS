@@ -131,18 +131,15 @@ fn flush_tcp_msg_more_pending_for_addr_inner(addr: usize, sock: &NetSocketFile, 
         if !pending.data.is_empty() {
             let sent = sock.tcp_try_flush_send_buffer(&pending.data);
             if keep_unsent && sent < pending.data.len() {
-                put_pending_more(
-                    addr,
-                    PendingMoreState {
-                        data: pending.data[sent..].to_vec(),
-                        udp_target: pending.udp_target,
-                        udp_pktinfo: pending.udp_pktinfo,
-                        udp_ttl_override: pending.udp_ttl_override,
-                        udp_tos_override: pending.udp_tos_override,
-                        udp_dontroute: pending.udp_dontroute,
-                        udp_confirm: pending.udp_confirm,
-                    },
-                );
+                put_pending_more(addr, PendingMoreState {
+                    data: pending.data[sent..].to_vec(),
+                    udp_target: pending.udp_target,
+                    udp_pktinfo: pending.udp_pktinfo,
+                    udp_ttl_override: pending.udp_ttl_override,
+                    udp_tos_override: pending.udp_tos_override,
+                    udp_dontroute: pending.udp_dontroute,
+                    udp_confirm: pending.udp_confirm,
+                });
             }
         }
     }
@@ -292,18 +289,15 @@ fn flush_tcp_pending_before_current(
     match sock.tcp_send(&pending.data, nonblock) {
         Ok(sent) if sent >= pending.data.len() => Ok(()),
         Ok(sent) => {
-            put_pending_more(
-                key,
-                PendingMoreState {
-                    data: pending.data[sent..].to_vec(),
-                    udp_target: pending.udp_target,
-                    udp_pktinfo: pending.udp_pktinfo,
-                    udp_ttl_override: pending.udp_ttl_override,
-                    udp_tos_override: pending.udp_tos_override,
-                    udp_dontroute: pending.udp_dontroute,
-                    udp_confirm: pending.udp_confirm,
-                },
-            );
+            put_pending_more(key, PendingMoreState {
+                data: pending.data[sent..].to_vec(),
+                udp_target: pending.udp_target,
+                udp_pktinfo: pending.udp_pktinfo,
+                udp_ttl_override: pending.udp_ttl_override,
+                udp_tos_override: pending.udp_tos_override,
+                udp_dontroute: pending.udp_dontroute,
+                udp_confirm: pending.udp_confirm,
+            });
             Err(err(SyscallError::EAGAIN))
         }
         Err(e) => {

@@ -7,8 +7,9 @@ use alloc::vec::Vec;
 
 use crate::fs::{
     File, NamespaceFile, NamespaceKind, NetSocketFile, OSInode, Pipe, PseudoDir, PseudoFile,
-    PseudoKindTag, PseudoShmFile, RtcFile, inode_logical_path, inode_path_hint,
-    inode_path_in_roots, path_resolves_to_inode,
+    PseudoKindTag, PseudoShmFile, RtcFile, inode_identity_path_in_roots, inode_logical_path,
+    inode_path_hint, inode_path_hint_by_identity, inode_path_in_roots, path_resolves_to_inode,
+    process_exec_path,
 };
 use crate::task::manager::pid2process;
 use crate::task::processor::{current_process, current_task};
@@ -257,10 +258,11 @@ pub fn normalize_proc_magic_path(path: &str) -> Cow<'_, str> {
 /// 无法识别的类型返回 `None`。
 fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     let proc = pid2process(pid as usize)?;
-    let (files, cwd) = {
+    let cwd = {
         let inner = proc.try_borrow_mut()?;
-        (Arc::clone(&inner.files), inner.cwd.clone())
+        inner.cwd.clone()
     };
+    let files = proc.files();
     let file = files.lock().get_file(fd)?;
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
@@ -309,13 +311,34 @@ fn proc_pid_cwd(pid: u32) -> Option<String> {
     Some(inner.cwd.clone())
 }
 
+/// 返回进程实际执行文件的路径。
+///
+/// 进程表为 ETXTBSY 记账仅保存可执行文件的 inode 身份；路径解析会在替换进程映像前
+/// 记录 inode 到路径的提示信息。这足以实现兼容 Linux 的 `/proc/<pid>/exe`，并避免
+/// 在这里扫描大型测试根文件系统。
+fn proc_pid_exe(pid: u32) -> Option<String> {
+    // 不让 procfs 可用性依赖短暂的 PCB 锁竞争：多 hart 并发时 Cargo 启动会读取
+    // `/proc/self/exe`，此处必须避免因 try_lock 失败误判链接不存在。
+    if let Some(path) = process_exec_path(pid as usize) {
+        return Some(path);
+    }
+    let proc = pid2process(pid as usize)?;
+    let (device_id, inode_num) = {
+        let inner = proc.try_borrow_mut()?;
+        (inner.exec_inode_dev, inner.exec_inode_num)
+    };
+    // 设备号 0 是第一块 ext4 磁盘的合法身份，不能将其视为无效值。
+    if inode_num == 0 {
+        return None;
+    }
+    inode_path_hint_by_identity(device_id, inode_num)
+        .or_else(|| inode_identity_path_in_roots(device_id, inode_num))
+}
+
 /// 取目标进程 fd 表中指定 fd 的文件对象（克隆 `Arc`）。进程不存在或 fd 无效时返回 `None`。
 fn proc_pid_fd_file(pid: u32, fd: usize) -> Option<Arc<dyn File + Send + Sync>> {
     let proc = pid2process(pid as usize)?;
-    let files = {
-        let inner = proc.try_borrow_mut()?;
-        Arc::clone(&inner.files)
-    };
+    let files = proc.files();
     files.lock().get_file(fd)
 }
 
@@ -377,7 +400,7 @@ enum ProcMagicLinkFollowTarget {
 
 /// 判断某个 procfs 路径是否本身是一个 magic link，并解析出它的跟随目标。
 ///
-/// 覆盖 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下的 `cwd`、`ns/ipc`、
+/// 覆盖 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下的 `cwd`、`exe`、`ns/ipc`、
 /// `ns/mnt`、`fd/<n>` 和对应的 `task/<tid>/…` 变体。非 magic link 返回 `None`。
 fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget> {
     let trimmed = trim_proc_path(path);
@@ -399,6 +422,9 @@ fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget
     }
     if rest == "cwd" {
         return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
+    }
+    if rest == "exe" {
+        return proc_pid_exe(pid).map(ProcMagicLinkFollowTarget::Path);
     }
     if rest == "ns/ipc" {
         return proc_pid_namespace_file(pid, NamespaceKind::Ipc)
@@ -423,6 +449,9 @@ fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget
     }
     if tail == "cwd" {
         return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
+    }
+    if tail == "exe" {
+        return proc_pid_exe(pid).map(ProcMagicLinkFollowTarget::Path);
     }
     if tail == "ns/ipc" {
         return proc_pid_namespace_file(pid, NamespaceKind::Ipc)
@@ -465,6 +494,9 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if rest == "cwd" || rest == "ns/ipc" || rest == "ns/mnt" || rest == "ns/net" {
         return true;
     }
+    if rest == "exe" {
+        return proc_pid_exe(pid).is_some();
+    }
     if let Some(fd_name) = rest.strip_prefix("fd/") {
         return parse_proc_fd_component(fd_name)
             .and_then(|fd| proc_pid_fd_file(pid, fd))
@@ -479,6 +511,9 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     }
     if tail == "cwd" || tail == "ns/ipc" || tail == "ns/mnt" || tail == "ns/net" {
         return true;
+    }
+    if tail == "exe" {
+        return proc_pid_exe(pid).is_some();
     }
     tail.strip_prefix("fd/")
         .and_then(parse_proc_fd_component)
@@ -512,7 +547,7 @@ pub fn proc_fd_link_file(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
 
 /// 实现对 procfs magic link 的 `readlink`：返回链接指向的目标字符串。
 ///
-/// 处理 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下 `cwd`、`ns/ipc`、`ns/mnt`、
+/// 处理 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下 `cwd`、`exe`、`ns/ipc`、`ns/mnt`、
 /// `fd/<n>`（及 `task/<tid>/…` 变体）。非链接路径返回 `None`。
 pub fn proc_readlink(path: &str) -> Option<String> {
     let trimmed = trim_proc_path(path);
@@ -538,6 +573,9 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     if rest == "cwd" {
         return proc_pid_cwd(pid);
     }
+    if rest == "exe" {
+        return proc_pid_exe(pid);
+    }
     if rest == "ns/ipc" {
         return proc_pid_namespace_target(pid, NamespaceKind::Ipc);
     }
@@ -559,6 +597,9 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     }
     if tail == "cwd" {
         return proc_pid_cwd(pid);
+    }
+    if tail == "exe" {
+        return proc_pid_exe(pid);
     }
     if tail == "ns/ipc" {
         return proc_pid_namespace_target(pid, NamespaceKind::Ipc);

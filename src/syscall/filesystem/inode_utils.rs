@@ -1,5 +1,5 @@
 use super::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, BTreeSet, FS_APPEND_FL,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, FS_APPEND_FL,
     FS_IMMUTABLE_FL, Mutex, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOATIME, O_NONBLOCK, O_RDONLY,
     O_TMPFILE, O_TRUNC, O_WRONLY, OSInode, Ordering, PID2PCB, S_IFBLK, S_IFCHR, S_IFMT,
     SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec, cgroup_rename, clear_ext4_path_cache,
@@ -13,6 +13,7 @@ use super::{
     register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
     rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
 };
+use crate::fs::has_open_inode_description;
 use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
 use alloc::vec;
 use lazy_static::lazy_static;
@@ -74,17 +75,14 @@ pub(crate) fn set_inode_times(ino: u64, times: InodeTimes) {
 
 pub(crate) fn set_inode_all_times_now(inode: &Arc<ext4_fs::Inode>) {
     let (sec, nsec) = current_timespec();
-    set_inode_times(
-        inode.inode_num() as u64,
-        InodeTimes {
-            atime_sec: sec,
-            atime_nsec: nsec,
-            mtime_sec: sec,
-            mtime_nsec: nsec,
-            ctime_sec: sec,
-            ctime_nsec: nsec,
-        },
-    );
+    set_inode_times(inode.inode_num() as u64, InodeTimes {
+        atime_sec: sec,
+        atime_nsec: nsec,
+        mtime_sec: sec,
+        mtime_nsec: nsec,
+        ctime_sec: sec,
+        ctime_nsec: nsec,
+    });
 }
 
 pub(crate) fn touch_inode_mtime_ctime_now(inode: &Arc<ext4_fs::Inode>) {
@@ -684,11 +682,9 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
     // 当前进程的 user-buffer write 可以直接按用户地址做旧路径镜像。
     let copies: Vec<(usize, usize, usize)> = {
         let process = current_process();
-        let inner = process.borrow_mut();
-        inner.memory_set.update_file_vm_size(dev, ino, file_size);
-        inner
-            .memory_set
-            .file_vm_copy_targets(dev, ino, write_off, len)
+        let memory_set = process.memory_set();
+        memory_set.update_file_vm_size(dev, ino, file_size);
+        memory_set.file_vm_copy_targets(dev, ino, write_off, len)
     };
     if !copies.is_empty() {
         let token = get_current_token();
@@ -745,15 +741,14 @@ fn mirror_inode_write_to_shared_mmaps_all_processes(
         // 同步全局 cache 和所有已 resident 的 MAP_SHARED 页。
         update_shared_file_page_cache(dev, ino, write_off + done, &tmp[..chunk]);
         for process in processes.iter() {
-            let Some(inner) = process.try_borrow_mut() else {
-                continue;
-            };
-            inner.memory_set.mirror_shared_file_write_to_resident_mmaps(
-                dev,
-                ino,
-                write_off + done,
-                &tmp[..chunk],
-            );
+            let _ = process
+                .memory_set()
+                .try_mirror_shared_file_write_to_resident_mmaps(
+                    dev,
+                    ino,
+                    write_off + done,
+                    &tmp[..chunk],
+                );
         }
         done += chunk;
     }
@@ -783,12 +778,9 @@ pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
         map.values().cloned().collect::<Vec<_>>()
     };
     for process in processes.iter() {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        inner
-            .memory_set
-            .mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
+        let _ = process
+            .memory_set()
+            .try_mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
     }
 }
 
@@ -800,10 +792,9 @@ fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize)
         map.values().cloned().collect::<Vec<_>>()
     };
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        inner.memory_set.update_file_vm_size(dev, ino, file_size);
+        let _ = process
+            .memory_set()
+            .try_update_file_vm_size(dev, ino, file_size);
     }
 }
 
@@ -815,8 +806,9 @@ pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
     let file_size = inode_visible_size_with_disk_size(inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     let process = current_process();
-    let inner = process.borrow_mut();
-    inner.memory_set.update_file_vm_size(dev, ino, file_size);
+    process
+        .memory_set()
+        .update_file_vm_size(dev, ino, file_size);
 }
 
 pub(crate) fn update_current_os_inode_mmaps_size(os_inode: &OSInode) {
@@ -828,8 +820,9 @@ pub(crate) fn update_current_os_inode_mmaps_size(os_inode: &OSInode) {
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
     update_inode_mmaps_size_all_processes(dev, ino, file_size);
     let process = current_process();
-    let inner = process.borrow_mut();
-    inner.memory_set.update_file_vm_size(dev, ino, file_size);
+    process
+        .memory_set()
+        .update_file_vm_size(dev, ino, file_size);
 }
 
 /// Linux `pread64(2)` (syscall 67 on riscv64).
@@ -874,43 +867,7 @@ pub(crate) fn flush_open_inode_views(target: &Arc<ext4_fs::Inode>) {
 }
 
 pub(crate) fn has_open_inode_view(target: &Arc<ext4_fs::Inode>) -> bool {
-    let target_ino = target.inode_num();
-    let target_dev = target.device_id();
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    let mut seen_tables = BTreeSet::new();
-    for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            // Cannot inspect this process — conservatively report the inode
-            // as open so the caller defers the unlink rather than deleting
-            // a file that may still be in use.
-            return true;
-        };
-        let table = Arc::clone(&inner.files);
-        drop(inner);
-        if !seen_tables.insert(Arc::as_ptr(&table) as usize) {
-            continue;
-        }
-        if table
-            .lock()
-            .iter_files_snapshot()
-            .into_iter()
-            .any(|(_fd, file)| {
-                file.as_any()
-                    .downcast_ref::<OSInode>()
-                    .map(|o| {
-                        let inode = o.ext4_inode();
-                        inode.inode_num() == target_ino && inode.device_id() == target_dev
-                    })
-                    .unwrap_or(false)
-            })
-        {
-            return true;
-        }
-    }
-    false
+    has_open_inode_description(target.device_id(), target.inode_num())
 }
 
 pub(crate) fn defer_unlink_open_file(
@@ -921,6 +878,9 @@ pub(crate) fn defer_unlink_open_file(
     if !child.is_file() || !has_open_inode_view(child) {
         return Ok(false);
     }
+    // has_open_inode_view 必须在全局 ext4 锁外完成；确认需要延迟删除后，
+    // 再串行化目录查找和重命名。
+    let _ext4_guard = ext4_lock();
     let pid = current_process().getpid();
     for _ in 0..64 {
         let seq = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);

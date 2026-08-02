@@ -131,7 +131,7 @@ pub(super) fn count_blocked_waiters(queue: &mut VecDeque<Weak<TaskControlBlock>>
 ///
 /// 不按 `TaskStatus::Blocked` 过滤：SMP 下等待者会先登记到对象等待队列，
 /// 随后才在 `block_current_and_run_next()` 中切为 Blocked。若唤醒方在这个窗口
-/// 按状态过滤，会绕过 `wakeup_task()` 的 wakeup_pending 机制并丢失唤醒。
+/// 按状态过滤，会绕过 `wakeup_task()` 的原子延迟唤醒机制并丢失唤醒。
 /// 这里会唤醒所有存活等待者，依赖阻塞 syscall 被唤醒后循环重查对象条件。
 pub(super) fn drain_live_waiters(
     queue: &mut VecDeque<Weak<TaskControlBlock>>,

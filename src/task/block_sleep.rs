@@ -753,7 +753,7 @@ fn process_delayed_tid_clears(current_ms: usize) {
         let Some(proc) = pid2process(entry.pid) else {
             continue;
         };
-        let token = proc.borrow_mut().get_user_token();
+        let token = proc.get_user_token();
         let _ = crate::mm::try_write_user_value(token, entry.ctid as *mut i32, &0);
         let _ = futex_wake_private_and_shared(entry.pid, token, entry.ctid, 1);
     }
@@ -1007,15 +1007,7 @@ fn deliver_alarm(pid: usize) {
         );
         return;
     };
-    let task = {
-        let inner = proc.borrow_mut();
-        let tasks = inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<Vec<_>>();
-        pick_task_for_signal(&tasks, bit)
-    };
+    let task = pick_task_for_signal(&proc.tasks_snapshot(), bit);
     let Some(task) = task else {
         crate::log_if!(DEBUG_UNIXBENCH, info, "[alarm] drop pid={} (no task)", pid);
         return;
@@ -1026,7 +1018,7 @@ fn deliver_alarm(pid: usize) {
         let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
         (
             tid,
-            task.on_cpu.load(AtomicOrdering::Acquire),
+            task.running_hart().unwrap_or(TaskControlBlock::OFF_CPU),
             inner.signal_mask,
             inner.pending_signals,
         )

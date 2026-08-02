@@ -6,7 +6,7 @@ use lazy_static::*;
 use spin::Mutex;
 
 use crate::arch;
-use crate::config::MAX_HARTS;
+use crate::config::{MAX_HARTS, active_hart_mask};
 use crate::task::process_block::ProcessControlBlock;
 use crate::task::task_block::{TaskControlBlock, TaskStatus};
 
@@ -48,16 +48,24 @@ pub(super) fn current_time_ns_usize() -> usize {
 
 /// 让 hart 上线
 pub fn mark_hart_online(hart_id: usize) {
-    if hart_id < usize::BITS as usize {
+    if hart_id < MAX_HARTS && (active_hart_mask() & (1usize << hart_id)) != 0 {
         ONLINE_HART_MASK.fetch_or(1usize << hart_id, Ordering::SeqCst);
     }
 }
 
 /// hart_mask 的全局包装
 pub fn online_hart_mask() -> usize {
-    let mask = ONLINE_HART_MASK.load(Ordering::Acquire);
-    // 兜底：至少 hart0 存在。
-    if mask == 0 { 1 } else { mask }
+    let active = active_hart_mask();
+    let mask = ONLINE_HART_MASK.load(Ordering::Acquire) & active;
+    if mask != 0 {
+        return mask;
+    }
+    // 早期启动阶段还没有发布 online bit；兜底到 DTB 中的第一个 hart。
+    if active == 0 {
+        1
+    } else {
+        1usize << active.trailing_zeros()
+    }
 }
 
 /// 从 start hart 开始轮询，返回第一个在线（已上线）的 hart ID
@@ -255,23 +263,11 @@ fn wakeup_task_with_batch_inner(
         if task_inner.task_status == TaskStatus::Blocked {
             if task_inner.cgroup_frozen {
                 task_inner.wake_on_cgroup_thaw = true;
-                task.wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
-                task.wakeup_sync_hart.store(
-                    TaskControlBlock::OFF_CPU,
-                    core::sync::atomic::Ordering::Release,
-                );
                 return;
             }
             task_inner.task_status = TaskStatus::Ready;
             task_inner.parked_by_cgroup = false;
             task_inner.wake_on_cgroup_thaw = false;
-            task.wakeup_pending
-                .store(false, core::sync::atomic::Ordering::Release);
-            task.wakeup_sync_hart.store(
-                TaskControlBlock::OFF_CPU,
-                core::sync::atomic::Ordering::Release,
-            );
             drop(task_inner);
             if let Some((hart_id, was_empty)) = enqueue_task_with_wakeup_flags(
                 Arc::clone(&task),
@@ -295,37 +291,22 @@ fn wakeup_task_with_batch_inner(
         (hart < MAX_HARTS).then_some(hart)
     }
 
-    // SMP 安全性：如果任务确实仍在某个 hart 上执行，不要直接入队
-    // （否则会在同一个内核栈上竞争）。改为标记待处理唤醒，让该 hart
-    // 切回 idle 后再把任务入队。
-    if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
-        if let Some(source_hart) = sync_source_hart.filter(|hart| *hart < MAX_HARTS) {
-            task.wakeup_sync_hart
-                .store(source_hart, core::sync::atomic::Ordering::Release);
-        }
-        task.wakeup_pending
-            .store(true, core::sync::atomic::Ordering::Release);
-        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) == TaskControlBlock::OFF_CPU {
-            let effective_sync_source = sync_source_hart.or_else(|| take_pending_sync_hart(&task));
-            wake_if_blocked_inner(task, batch, allow_fair_preempt, effective_sync_source);
-        }
+    // 与 Linux try_to_wake_up()/finish_task() 相同，任务仍在旧内核栈上时不能
+    // 直接入队。on_cpu 的 pending 位与切出方的 swap 在同一个原子字上排序，
+    // 因而不需要用两次独立 load 猜测切出是否已经完成。
+    let sync_source_hart = sync_source_hart.filter(|hart| *hart < MAX_HARTS);
+    if task.defer_wakeup_if_on_cpu(sync_source_hart) {
         return;
     }
 
-    let effective_sync_source = sync_source_hart.or_else(|| take_pending_sync_hart(&task));
+    let pending_sync_source = take_pending_sync_hart(&task);
+    let effective_sync_source = sync_source_hart.or(pending_sync_source);
     wake_if_blocked_inner(task, batch, allow_fair_preempt, effective_sync_source);
 }
 
 /// 在进程调度策略/优先级/nice 值变更后，重新将其所有可运行线程入队到正确的位置
 pub fn refresh_process_runqueues(process: &Arc<ProcessControlBlock>) {
-    let tasks = {
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .iter()
-            .filter_map(|t| t.as_ref().cloned())
-            .collect::<alloc::vec::Vec<_>>()
-    };
+    let tasks = process.tasks_snapshot();
     if tasks.is_empty() {
         return;
     }
@@ -386,7 +367,7 @@ pub fn refresh_task_runqueue(task: &Arc<TaskControlBlock>) {
     }
 }
 
-/// 唤醒一个阻塞中的任务。SMP 安全：如果任务还在其他 hart 上执行，则标记 wakeup_pending 让其自行处理。
+/// 唤醒一个阻塞中的任务。SMP 安全：任务仍在其他 hart 上时登记原子延迟唤醒。
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     let mut batch = WakeupBatch::default();
     wakeup_task_with_batch(task, &mut batch);

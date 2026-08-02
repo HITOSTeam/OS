@@ -8,7 +8,7 @@
 /// You can override it by building with `LOG=error|warn|info|debug|trace`.
 pub const DEFAULT_LOG_LEVEL: log::LevelFilter = if DEBUG_UNIXBENCH {
     log::LevelFilter::Info
-} else if DEBUG_CYCLICTEST {
+} else if DEBUG_CYCLICTEST || DEBUG_WATCHDOG {
     log::LevelFilter::Warn
 } else {
     log::LevelFilter::Off
@@ -69,6 +69,11 @@ pub const DEBUG_WATCHDOG: bool = false;
 pub const DEBUG_LOG_TEST: bool = false;
 
 /// Lightweight performance counters for diagnosing bottlenecks.
+///
+/// 临时打开用于诊断 CAgent 云端慢速现象，仅在 Debug 构建中启用。
+#[cfg(debug_assertions)]
+pub const DEBUG_PERF: bool = true;
+#[cfg(not(debug_assertions))]
 pub const DEBUG_PERF: bool = false;
 
 /// Use full-copy fork on LoongArch instead of COW (slower but safer).

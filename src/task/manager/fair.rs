@@ -98,15 +98,12 @@ impl FairGroupQueue {
         deadline: u128,
         weight: u128,
     ) {
-        if let Some(old) = self.tasks.insert(
-            task_id,
-            FairTaskEntity {
-                vruntime,
-                deadline,
-                weight,
-                task,
-            },
-        ) {
+        if let Some(old) = self.tasks.insert(task_id, FairTaskEntity {
+            vruntime,
+            deadline,
+            weight,
+            task,
+        }) {
             self.task_order
                 .remove(&(old.deadline, old.vruntime, task_id));
             self.vruntime_weighted_sum = self
@@ -415,14 +412,13 @@ pub(super) fn place_fair_task_entity(
 fn fair_task_vruntime_deadline_at(task: &Arc<TaskControlBlock>, now_ns: u64) -> (u128, u128) {
     let inner = task.borrow_mut();
     // 若任务正在运行，补上从 runtime_start_ns 到 now 的未记账片段。
-    let current_runtime_ns =
-        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
-            inner
-                .cpu_time_ns
-                .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
-        } else {
-            inner.cpu_time_ns
-        };
+    let current_runtime_ns = if task.is_on_cpu() {
+        inner
+            .cpu_time_ns
+            .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
+    } else {
+        inner.cpu_time_ns
+    };
     // delta = 本次估算的运行时间 - 上次入队时的快照。
     let delta_ns = current_runtime_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
     // 按权重缩放后累加，得到实时 vruntime。
@@ -450,7 +446,7 @@ pub(super) fn current_fair_entity_for_group(
     now_ns: u64,
 ) -> Option<(u128, u128)> {
     let current = crate::task::processor::current_task_on_hart(hart_id)?;
-    if current.on_cpu.load(core::sync::atomic::Ordering::Acquire) == TaskControlBlock::OFF_CPU {
+    if !current.is_on_cpu() {
         return None;
     }
     let weight = {
@@ -739,14 +735,13 @@ pub fn protect_fair_fork_parent(task: &Arc<TaskControlBlock>) {
     ) {
         return;
     }
-    let current_runtime_ns =
-        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
-            inner
-                .cpu_time_ns
-                .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
-        } else {
-            inner.cpu_time_ns
-        };
+    let current_runtime_ns = if task.is_on_cpu() {
+        inner
+            .cpu_time_ns
+            .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
+    } else {
+        inner.cpu_time_ns
+    };
     let delta_ns = current_runtime_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
     let vruntime = inner
         .fair_vruntime_ns
@@ -766,14 +761,13 @@ fn prime_fair_startup_credit(task: &Arc<TaskControlBlock>, credit_ns: u128) {
     ) {
         return;
     }
-    let current_runtime_ns =
-        if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
-            inner
-                .cpu_time_ns
-                .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
-        } else {
-            inner.cpu_time_ns
-        };
+    let current_runtime_ns = if task.is_on_cpu() {
+        inner
+            .cpu_time_ns
+            .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))
+    } else {
+        inner.cpu_time_ns
+    };
     let delta_ns = current_runtime_ns.saturating_sub(inner.fair_runtime_checkpoint_ns);
     let vruntime = inner
         .fair_vruntime_ns

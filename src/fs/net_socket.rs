@@ -36,8 +36,8 @@ use smoltcp::wire::{
 // TCP 默认收发缓冲区刻意配得较大，主要是为了让 iperf 一类大吞吐测试
 // 不会过早被 smoltcp 的用户态缓冲区限制住。
 //
-const TCP_RX_BUF_LEN_IPERF: usize = 128 * 1024;
-const TCP_TX_BUF_LEN_IPERF: usize = 128 * 1024;
+const TCP_RX_BUF_LEN_IPERF: usize = 1024 * 1024;
+const TCP_TX_BUF_LEN_IPERF: usize = 1024 * 1024;
 // Linux 的 UDP rmem/wmem 是按需消耗的；smoltcp 需要建 socket 时就给定容量。
 // 这里保持较小的初始缓冲，避免 LTP multicast 一次创建数千个 UDP socket 时
 // 因每个 socket 预分配大块内核堆而 OOM。
@@ -69,6 +69,10 @@ static CREATED_UDP_HANDLES: AtomicUsize = AtomicUsize::new(0);
 static FREED_UDP_HANDLES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_UDP_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+// 下面这些计数器只用于 OOM/泄漏排查，不参与协议语义。
+// 因为 TCP backlog 会为一个用户态 listener 创建多个 smoltcp handle，
+// 如果只看文件 fd 数，很难判断内核堆到底被多少底层 socket 缓冲占住；
+// 所以这里分别统计 NetSocketFile、TCP handle、UDP handle 以及预估缓冲字节数。
 fn note_net_socket_file_created() {
     CREATED_NET_SOCKET_FILES.fetch_add(1, Ordering::Relaxed);
     LIVE_NET_SOCKET_FILES.fetch_add(1, Ordering::Relaxed);
@@ -320,39 +324,75 @@ fn inet_bind_addr_conflicts(left: Option<IpAddress>, right: Option<IpAddress>) -
     left.is_none() || right.is_none() || left == right
 }
 
-fn tcp_bound_endpoint_conflicts(
-    endpoint: IpListenEndpoint,
-    requested_addr: Option<IpAddress>,
-    requested_port: u16,
+// 判断两个 INET/INET6 bind 请求在 Linux 语义下是否冲突。
+//
+// smoltcp 只认识具体的 `IpListenEndpoint`，但 Linux 的 bind 冲突还要考虑
+// socket 创建时的地址族以及 IPV6_V6ONLY：
+//
+// - `addr = None` 表示 wildcard bind，例如 0.0.0.0 或 dual-stack 的 ::
+// - AF_INET6 且 `IPV6_V6ONLY=0` 时，IPv6 wildcard 会同时占用 IPv4 端口
+// - AF_INET6 且 `IPV6_V6ONLY=1` 时，IPv6 与 IPv4 端口空间互不冲突
+// - IPv4-mapped 地址按 IPv4 地址比较，普通 IPv6 地址不与 IPv4 地址冲突
+//
+// 这个函数把这些 Linux 层面的规则补在 smoltcp 之外，避免 iperf/netperf
+// 一类程序在 AF_INET/AF_INET6 混用时错误地允许或拒绝 bind。
+fn inet_bind_domains_conflict(
+    left_addr: Option<IpAddress>,
+    left_domain: u16,
+    left_v6only: bool,
+    right_addr: Option<IpAddress>,
+    right_domain: u16,
+    right_v6only: bool,
 ) -> bool {
-    endpoint.port == requested_port
-        && requested_port != 0
-        && inet_bind_addr_conflicts(endpoint.addr, requested_addr)
-}
-
-fn tcp_local_endpoint_conflicts(
-    endpoint: Option<IpEndpoint>,
-    requested_addr: Option<IpAddress>,
-    requested_port: u16,
-) -> bool {
-    let Some(endpoint) = endpoint else {
-        return false;
+    if left_domain == right_domain {
+        return inet_bind_addr_conflicts(left_addr, right_addr);
+    }
+    let (v6_addr, v6only, v4_addr) = if left_domain == AF_INET6 {
+        (left_addr, left_v6only, right_addr)
+    } else {
+        (right_addr, right_v6only, left_addr)
     };
-    endpoint.port == requested_port
-        && requested_port != 0
-        && inet_bind_addr_conflicts(Some(endpoint.addr), requested_addr)
+    if v6only {
+        return false;
+    }
+    match v6_addr {
+        None => true,
+        Some(IpAddress::Ipv4(v6_v4)) => match v4_addr {
+            None => true,
+            Some(IpAddress::Ipv4(v4)) => v6_v4 == v4,
+            Some(IpAddress::Ipv6(_)) => false,
+        },
+        Some(IpAddress::Ipv6(_)) => false,
+    }
 }
 
 #[derive(Clone, Copy)]
 struct TcpSocketMeta {
+    // smoltcp 的 tcp::Socket 不保存 SO_REUSEADDR / 地址族 / IPV6_V6ONLY。
+    // bind 冲突判断、listen 后补槽、accept 后继承选项都需要这些 Linux 元数据。
     reuseaddr: bool,
+    domain: u16,
+    ipv6_v6only: bool,
 }
 
 #[derive(Clone, Copy)]
 struct UdpSocketMeta {
+    // UDP 也需要同样的 fd 层元数据；另外 UDP-Lite 复用同一个 smoltcp UDP 类型，
+    // 端口冲突判断还会额外比较 transport protocol。
     reuseaddr: bool,
+    domain: u16,
+    ipv6_v6only: bool,
 }
 
+// 检查 TCP 端口是否已被占用。
+//
+// 这里同时检查两种位置：
+// - get_bound_endpoint(): bind() 后但尚未 connect/listen 的端点
+// - local_endpoint(): connect/listen 建立后 smoltcp 记录的本地端点
+//
+// SO_REUSEADDR 的处理刻意接近 Linux：只有新旧 socket 都打开 reuseaddr，
+// 且已有 socket 不是 listen socket 时，才允许重复绑定。监听端口仍然要阻止
+// 另一个监听者抢占同一地址/端口，否则服务器测试会出现随机连接到错误 listener 的问题。
 fn tcp_port_in_use(
     net_ns_id: usize,
     sockets: &SocketSet<'_>,
@@ -360,6 +400,8 @@ fn tcp_port_in_use(
     requested_addr: Option<IpAddress>,
     requested_port: u16,
     requested_reuseaddr: bool,
+    requested_domain: u16,
+    requested_v6only: bool,
 ) -> bool {
     let tcp_meta = TCP_SOCKET_META.lock();
     sockets.iter().any(|(handle, socket)| {
@@ -369,19 +411,52 @@ fn tcp_port_in_use(
         let SmolSocket::Tcp(sock) = socket else {
             return false;
         };
-        if !tcp_bound_endpoint_conflicts(sock.get_bound_endpoint(), requested_addr, requested_port)
-            && !tcp_local_endpoint_conflicts(sock.local_endpoint(), requested_addr, requested_port)
-        {
+        let peer = tcp_meta
+            .get(&(net_ns_id, handle))
+            .copied()
+            .unwrap_or(TcpSocketMeta {
+                // 旧对象或异常路径缺少 meta 时按最保守的 IPv4 非复用处理，
+                // 这样不会错误放宽 bind 限制。
+                reuseaddr: false,
+                domain: AF_INET,
+                ipv6_v6only: false,
+            });
+        let bound = sock.get_bound_endpoint();
+        let bound_conflicts = bound.port == requested_port
+            && requested_port != 0
+            && inet_bind_domains_conflict(
+                bound.addr,
+                peer.domain,
+                peer.ipv6_v6only,
+                requested_addr,
+                requested_domain,
+                requested_v6only,
+            );
+        let local_conflicts = sock.local_endpoint().is_some_and(|endpoint| {
+            endpoint.port == requested_port
+                && requested_port != 0
+                && inet_bind_domains_conflict(
+                    Some(endpoint.addr),
+                    peer.domain,
+                    peer.ipv6_v6only,
+                    requested_addr,
+                    requested_domain,
+                    requested_v6only,
+                )
+        });
+        if !bound_conflicts && !local_conflicts {
             return false;
         }
 
-        let peer_reuseaddr = tcp_meta
-            .get(&(net_ns_id, handle))
-            .is_some_and(|meta| meta.reuseaddr);
+        let peer_reuseaddr = peer.reuseaddr;
         !(requested_reuseaddr && peer_reuseaddr && sock.state() != tcp::State::Listen)
     })
 }
 
+// 检查 UDP/UDP-Lite 端口是否已被占用。
+//
+// UDP 没有连接状态队列，但 Linux 仍按地址、端口、协议、SO_REUSEADDR 组合决定
+// bind 是否成功。这里把 UDP 和 UDP-Lite 区分开，避免两种协议互相误判冲突。
 fn udp_port_in_use(
     net_ns_id: usize,
     sockets: &SocketSet<'_>,
@@ -390,6 +465,8 @@ fn udp_port_in_use(
     requested_port: u16,
     requested_reuseaddr: bool,
     requested_protocol: IpProtocol,
+    requested_domain: u16,
+    requested_v6only: bool,
 ) -> bool {
     let udp_meta = UDP_SOCKET_META.lock();
     sockets.iter().any(|(handle, socket)| {
@@ -402,17 +479,31 @@ fn udp_port_in_use(
         if sock.transport_protocol() != requested_protocol {
             return false;
         }
+        let peer = udp_meta
+            .get(&(net_ns_id, handle))
+            .copied()
+            .unwrap_or(UdpSocketMeta {
+                // 缺少 meta 时同样走保守路径：IPv4、非 reuseaddr、非 v6only。
+                reuseaddr: false,
+                domain: AF_INET,
+                ipv6_v6only: false,
+            });
         let endpoint = sock.endpoint();
         if endpoint.port != requested_port
             || requested_port == 0
-            || !inet_bind_addr_conflicts(endpoint.addr, requested_addr)
+            || !inet_bind_domains_conflict(
+                endpoint.addr,
+                peer.domain,
+                peer.ipv6_v6only,
+                requested_addr,
+                requested_domain,
+                requested_v6only,
+            )
         {
             return false;
         }
 
-        let peer_reuseaddr = udp_meta
-            .get(&(net_ns_id, handle))
-            .is_some_and(|meta| meta.reuseaddr);
+        let peer_reuseaddr = peer.reuseaddr;
         !(requested_reuseaddr && peer_reuseaddr)
     })
 }
@@ -491,6 +582,8 @@ pub struct NetSocketFile {
 pub struct SocketOptions {
     /// `SO_REUSEADDR`，TCP/UDP bind 冲突判定会按 Linux 复用规则消费。
     reuseaddr: bool,
+    /// `IPV6_V6ONLY`，AF_INET6 默认关闭，保持 Linux dual-stack 默认值。
+    ipv6_v6only: bool,
     /// `SO_DONTROUTE`，UDP 发送路径会按本链路直连语义约束选路。
     dontroute: bool,
     /// `SO_BROADCAST`，UDP 发往 IPv4 broadcast 时必须开启，否则返回 `EACCES`。
@@ -650,10 +743,23 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
 }
 
-fn set_tcp_socket_reuseaddr_meta(ns_id: usize, handles: &[SocketHandle], reuseaddr: bool) {
+fn set_tcp_socket_meta(
+    ns_id: usize,
+    handles: &[SocketHandle],
+    reuseaddr: bool,
+    domain: u16,
+    ipv6_v6only: bool,
+) {
     let mut meta = TCP_SOCKET_META.lock();
     for handle in handles {
-        meta.insert((ns_id, *handle), TcpSocketMeta { reuseaddr });
+        // 一个 NetSocketFile 可能对应多个 TCP handle：
+        // listener 会用多个 smoltcp listening socket 近似 backlog，
+        // 因此必须给每个槽位都登记同样的 Linux socket 元数据。
+        meta.insert((ns_id, *handle), TcpSocketMeta {
+            reuseaddr,
+            domain,
+            ipv6_v6only,
+        });
     }
 }
 
@@ -664,10 +770,21 @@ fn unregister_tcp_socket_meta(ns_id: usize, handles: &[SocketHandle]) {
     }
 }
 
-fn set_udp_socket_reuseaddr_meta(ns_id: usize, handles: &[SocketHandle], reuseaddr: bool) {
+fn set_udp_socket_meta(
+    ns_id: usize,
+    handles: &[SocketHandle],
+    reuseaddr: bool,
+    domain: u16,
+    ipv6_v6only: bool,
+) {
     let mut meta = UDP_SOCKET_META.lock();
     for handle in handles {
-        meta.insert((ns_id, *handle), UdpSocketMeta { reuseaddr });
+        // 当前 UDP 通常只有一个 handle；这里仍保留切片接口，和 TCP 元数据维护路径一致。
+        meta.insert((ns_id, *handle), UdpSocketMeta {
+            reuseaddr,
+            domain,
+            ipv6_v6only,
+        });
     }
 }
 
@@ -680,6 +797,8 @@ fn unregister_udp_socket_meta(ns_id: usize, handles: &[SocketHandle]) {
 
 /// Remove fd-layer socket metadata that belongs to a destroyed network namespace.
 pub(crate) fn cleanup_net_namespace(ns_id: usize) {
+    // network namespace 被销毁后，SocketSet 会整体释放；fd 层维护的 poll/meta 表
+    // 也必须按 namespace 清理，否则新的 namespace 复用相同 handle 数值时会命中旧状态。
     NET_POLL_WAITERS
         .lock()
         .retain(|(entry_ns, _), _| *entry_ns != ns_id);
@@ -828,7 +947,7 @@ impl NetSocketFile {
             sockets.add(tcp::Socket::new(rx, tx))
         });
         note_tcp_handle_created();
-        set_tcp_socket_reuseaddr_meta(net_ns_id, &[handle], false);
+        set_tcp_socket_meta(net_ns_id, &[handle], false, domain, false);
         let file = Arc::new(Self {
             net_ns_id,
             domain,
@@ -838,6 +957,7 @@ impl NetSocketFile {
             inner: Mutex::new(Inner::TcpStream { handle }),
             opts: Mutex::new(SocketOptions {
                 reuseaddr: false,
+                ipv6_v6only: false,
                 dontroute: false,
                 broadcast: false,
                 keepalive: false,
@@ -921,7 +1041,7 @@ impl NetSocketFile {
             sockets.add(socket)
         });
         note_udp_handle_created(UDP_RX_BUF_LEN, UDP_TX_BUF_LEN);
-        set_udp_socket_reuseaddr_meta(net_ns_id, &[handle], false);
+        set_udp_socket_meta(net_ns_id, &[handle], false, domain, false);
         let file = Arc::new(Self {
             net_ns_id,
             domain,
@@ -934,6 +1054,7 @@ impl NetSocketFile {
             }),
             opts: Mutex::new(SocketOptions {
                 reuseaddr: false,
+                ipv6_v6only: false,
                 dontroute: false,
                 broadcast: false,
                 keepalive: false,
@@ -1090,6 +1211,55 @@ impl NetSocketFile {
         self.protocol
     }
 
+    pub fn ipv6_v6only(&self) -> bool {
+        self.opts.lock().ipv6_v6only
+    }
+
+    pub fn set_ipv6_v6only(&self, enabled: bool) -> Result<(), isize> {
+        const EINVAL: isize = -22;
+        // Linux 只允许在 AF_INET6 socket 且尚未 bind/connect/listen 前修改 IPV6_V6ONLY。
+        // 一旦端口占用关系已经进入全局表，继续切换 v6only 会改变 bind 冲突语义，
+        // 所以这里直接返回 EINVAL。
+        if self.domain != AF_INET6 || self.is_bound_or_connected() {
+            return Err(EINVAL);
+        }
+        self.opts.lock().ipv6_v6only = enabled;
+        let (kind, handles) = match &*self.inner.lock() {
+            Inner::TcpStream { handle } => (NetSocketKind::TcpStream, vec![*handle]),
+            Inner::TcpListener { listen, .. } => (NetSocketKind::TcpListener, listen.clone()),
+            Inner::Udp { handle, .. } => (NetSocketKind::Udp, vec![*handle]),
+        };
+        let reuseaddr = self.reuseaddr();
+        if kind == NetSocketKind::Udp {
+            // v6only 不存在于 smoltcp socket 本体，必须同步更新到 UDP meta 表，
+            // 后续 bind 同端口时才知道这个 AF_INET6 socket 是否占用了 IPv4 端口空间。
+            set_udp_socket_meta(self.net_ns_id, &handles, reuseaddr, self.domain, enabled);
+        } else {
+            // TCP stream 和 listener 都走同一份 TCP meta。listener 可能有多个 backlog
+            // handle，所以这里一次性更新所有底层 handle。
+            set_tcp_socket_meta(self.net_ns_id, &handles, reuseaddr, self.domain, enabled);
+        }
+        Ok(())
+    }
+
+    fn is_bound_or_connected(&self) -> bool {
+        // 用于限制 IPV6_V6ONLY 的修改时机。这里不能只看 NetSocketFile 的 kind，
+        // 还要进入 smoltcp socket 检查端口是否已经 bind，以及 TCP 是否已经 connect。
+        match &*self.inner.lock() {
+            Inner::TcpStream { handle } => self.with_sockets_mut(|_iface, _dev, sockets| {
+                let socket = sockets.get::<tcp::Socket>(*handle);
+                socket.get_bound_endpoint().port != 0 || socket.local_endpoint().is_some()
+            }),
+            Inner::TcpListener { .. } => true,
+            Inner::Udp { handle, connected } => {
+                connected.is_some()
+                    || self.with_sockets_mut(|_iface, _dev, sockets| {
+                        sockets.get::<udp::Socket>(*handle).endpoint().port != 0
+                    })
+            }
+        }
+    }
+
     fn ensure_udp_buffer_capacity(&self, min_rx_payload: usize, min_tx_payload: usize) {
         let handle = match &*self.inner.lock() {
             Inner::Udp { handle, .. } => *handle,
@@ -1165,10 +1335,14 @@ impl NetSocketFile {
             Inner::TcpListener { listen, .. } => (NetSocketKind::TcpListener, listen.clone()),
             Inner::Udp { handle, .. } => (NetSocketKind::Udp, vec![*handle]),
         };
+        let v6only = self.ipv6_v6only();
         if kind == NetSocketKind::Udp {
-            set_udp_socket_reuseaddr_meta(self.net_ns_id, &handles, enabled);
+            // SO_REUSEADDR 会影响后续其它 UDP socket 的 bind 决策，不能只存在 opts 里。
+            set_udp_socket_meta(self.net_ns_id, &handles, enabled, self.domain, v6only);
         } else {
-            set_tcp_socket_reuseaddr_meta(self.net_ns_id, &handles, enabled);
+            // TCP listener 的 backlog 槽位同样需要同步 reuseaddr，否则 accept 补槽后
+            // 端口冲突检查会把同一个 listener 的不同 handle 当成普通占用者。
+            set_tcp_socket_meta(self.net_ns_id, &handles, enabled, self.domain, v6only);
         }
     }
 
@@ -2771,12 +2945,9 @@ impl NetSocketFile {
     // 对 listener 而言，真正可能变成“可 accept”的是每一个 backlog 槽位，因此必须全部注册。
     fn poll_registration_handles(&self) -> Vec<(SocketHandle, PollRegistrationKind)> {
         match &*self.inner.lock() {
-            Inner::TcpStream { handle } => vec![(
-                *handle,
-                PollRegistrationKind::TcpStream {
-                    rcvlowat: self.opts.lock().rcvlowat.max(1) as usize,
-                },
-            )],
+            Inner::TcpStream { handle } => vec![(*handle, PollRegistrationKind::TcpStream {
+                rcvlowat: self.opts.lock().rcvlowat.max(1) as usize,
+            })],
             Inner::TcpListener { listen, .. } => listen
                 .iter()
                 .copied()
@@ -2882,7 +3053,17 @@ impl NetSocketFile {
                 } else {
                     port
                 };
-                let requested_addr = (!ip_is_unspecified(ip)).then_some(ip);
+                let v6only = self.ipv6_v6only();
+                // smoltcp 用 `addr=None` 表示 wildcard。对 AF_INET6 而言：
+                // - v6only=false: :: 应作为 dual-stack wildcard，必须用 None 表示，
+                //   这样端口冲突检查也会覆盖 IPv4。
+                // - v6only=true: :: 只占用 IPv6 wildcard，因此保留 Some(::)，
+                //   避免错误阻塞同端口的 IPv4 bind。
+                let requested_addr = if ip_is_unspecified(ip) {
+                    (self.domain == AF_INET6 && v6only).then_some(ip)
+                } else {
+                    Some(ip)
+                };
                 let requested_reuseaddr = self.reuseaddr();
                 if tcp_port_in_use(
                     self.net_ns_id,
@@ -2891,6 +3072,8 @@ impl NetSocketFile {
                     requested_addr,
                     port,
                     requested_reuseaddr,
+                    self.domain,
+                    v6only,
                 ) {
                     return Err(EADDRINUSE);
                 }
@@ -2911,7 +3094,14 @@ impl NetSocketFile {
                         } else {
                             port
                         };
-                        let requested_addr = (!ip_is_unspecified(ip)).then_some(ip);
+                        let v6only = self.ipv6_v6only();
+                        // 和 TCP 一样，UDP wildcard bind 也要区分 dual-stack 与 v6only。
+                        // 这个地址会同时写入 smoltcp endpoint，并参与 fd 层端口冲突检查。
+                        let requested_addr = if ip_is_unspecified(ip) {
+                            (self.domain == AF_INET6 && v6only).then_some(ip)
+                        } else {
+                            Some(ip)
+                        };
                         let requested_reuseaddr = self.reuseaddr();
                         if udp_port_in_use(
                             self.net_ns_id,
@@ -2925,6 +3115,8 @@ impl NetSocketFile {
                             } else {
                                 IpProtocol::Udp
                             },
+                            self.domain,
+                            v6only,
                         ) {
                             return Err(EADDRINUSE);
                         }
@@ -2939,6 +3131,8 @@ impl NetSocketFile {
                         Ok(()) => return Ok(()),
                         Err(e) => {
                             last_err = e;
+                            // 如果用户指定了固定端口，失败就是真失败；如果是临时端口，
+                            // 只有“端口已占用”值得重新分配再试，其它错误继续返回给用户。
                             if !ephemeral || e == EADDRINUSE {
                                 break;
                             }
@@ -2957,6 +3151,10 @@ impl NetSocketFile {
         // smoltcp 没有 Linux 那样的半连接/全连接队列。本实现用多个
         // listening socket 近似 backlog，但每个槽都会预分配 TCP 数据缓冲；
         // 因此只预建一个小的内部窗口，避免长时间 LTP 批次把内核堆耗尽。
+        //
+        // 注意：这里的 `backlog` 是“内部预分配的监听槽位数量”，不是完整 Linux
+        // listen queue。只要能让并发连接测试不会因为单槽监听而立刻 ECONNREFUSED，
+        // 就已经能覆盖 iperf/netperf 这类评测需求。
         let backlog = backlog.max(1).min(TCP_LISTEN_BACKLOG_PREALLOC_LIMIT);
         self.poll_net();
         let mut inner = self.inner.lock();
@@ -3004,6 +3202,8 @@ impl NetSocketFile {
         let mut listen_handles = Vec::new();
         // smoltcp 没有现成的 backlog 队列，这里用“多个同时 listen 的 socket”近似模拟 backlog 槽位。
         // 现有 handle 直接复用成第一个槽位，避免无意义地销毁再重建。
+        // 所有槽位都 listen 在同一个 endpoint 上，由端口冲突逻辑中的 meta 表把它们识别为
+        // 同一个 NetSocketFile 的内部资源，而不是外部的重复 bind。
         self.with_sockets_mut(|_iface, _dev, sockets| {
             let s = sockets.get_mut::<tcp::Socket>(handle);
             s.set_hop_limit(hop_limit);
@@ -3019,6 +3219,8 @@ impl NetSocketFile {
         //
         for _ in 1..backlog {
             let h = self.with_sockets_mut(|_iface, _dev, sockets| {
+                // 每个 backlog 槽位都是完整的 smoltcp TCP socket，因此也要继承
+                // IP_TTL/IP_TOS/keepalive/TCP_NODELAY 等已设置选项。
                 let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF_LEN_IPERF]);
                 let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUF_LEN_IPERF]);
                 let mut s = tcp::Socket::new(rx, tx);
@@ -3034,7 +3236,16 @@ impl NetSocketFile {
             note_tcp_handle_created();
             listen_handles.push(h);
         }
-        set_tcp_socket_reuseaddr_meta(self.net_ns_id, &listen_handles, reuseaddr);
+        // listen_handles 里的所有底层 handle 都代表同一个用户态 listener。
+        // 统一登记 meta 后，后续 SO_REUSEADDR/IPV6_V6ONLY 更新和端口冲突检查
+        // 才能按“一个 listener”理解这些槽位。
+        set_tcp_socket_meta(
+            self.net_ns_id,
+            &listen_handles,
+            reuseaddr,
+            self.domain,
+            self.ipv6_v6only(),
+        );
         *inner = Inner::TcpListener {
             endpoint,
             backlog,
@@ -3074,6 +3285,8 @@ impl NetSocketFile {
             if let Some(i) = idx {
                 let h = listen.remove(i);
                 let mut accepted_opts = self.opts.lock().clone();
+                // accept 得到的是全新的连接 fd；不能继承 listener 上的半关闭状态或
+                // 非阻塞 connect 中间状态，但应继承 keepalive/nodelay/buffer 等常规选项。
                 accepted_opts.rd_shutdown = false;
                 accepted_opts.wr_shutdown = false;
                 accepted_opts.connect_in_progress = false;
@@ -3089,6 +3302,8 @@ impl NetSocketFile {
                     );
                     let tcp_nodelay = accepted_opts.tcp_nodelay;
                     let new_h = self.with_sockets_mut(|_iface, _dev, sockets| {
+                        // 补槽 socket 必须继续 listen 在同一个 endpoint 上，否则 accept 一次后
+                        // listener 容量会下降，parallel TCP 测试容易在后续连接阶段被拒绝。
                         let rx = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF_LEN_IPERF]);
                         let tx = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUF_LEN_IPERF]);
                         let mut s = tcp::Socket::new(rx, tx);
@@ -3101,14 +3316,26 @@ impl NetSocketFile {
                         sockets.add(s)
                     });
                     note_tcp_handle_created();
-                    set_tcp_socket_reuseaddr_meta(
+                    // 新补出的监听槽位也要加入 meta 表，否则之后 bind 同端口时会缺失
+                    // reuseaddr/domain/v6only 信息。
+                    set_tcp_socket_meta(
                         self.net_ns_id,
                         &[new_h],
                         accepted_opts.reuseaddr,
+                        self.domain,
+                        accepted_opts.ipv6_v6only,
                     );
                     listen.push(new_h);
                 }
-                set_tcp_socket_reuseaddr_meta(self.net_ns_id, &[h], accepted_opts.reuseaddr);
+                // 被取走的 handle 从此不再是 listener 槽位，而是 accepted TCP stream。
+                // 仍然保留同样的 fd 层 meta，方便 Drop、/proc 和后续选项同步路径统一处理。
+                set_tcp_socket_meta(
+                    self.net_ns_id,
+                    &[h],
+                    accepted_opts.reuseaddr,
+                    self.domain,
+                    accepted_opts.ipv6_v6only,
+                );
                 drop(inner);
                 self.notify_poll_waiters();
                 let accepted = Arc::new(NetSocketFile {
@@ -4452,8 +4679,11 @@ impl Drop for NetSocketFile {
             Inner::Udp { handle, .. } => vec![*handle],
             Inner::TcpListener { listen, .. } => listen.clone(),
         };
+        // 先移除 fd 层注册，再从 smoltcp SocketSet 删除实际 socket。
+        // 这样即使删除过程中触发网络 poll，也不会再把等待任务挂到即将失效的 handle 上。
         unregister_poll_waiters(self.net_ns_id, handles.as_slice());
         if kind == NetSocketKind::TcpStream || kind == NetSocketKind::TcpListener {
+            // listener 可能含多个 backlog handle，全部都要从 meta 表清理。
             unregister_tcp_socket_meta(self.net_ns_id, handles.as_slice());
         } else if kind == NetSocketKind::Udp {
             unregister_udp_socket_meta(self.net_ns_id, handles.as_slice());
@@ -4464,10 +4694,13 @@ impl Drop for NetSocketFile {
                 for h in handles {
                     sockets.remove(h);
                 }
+                // TCP 每个 handle 的缓冲大小固定，因此可以按数量扣减调试计数。
                 note_tcp_handles_freed(handle_count);
             }
             NetSocketKind::Udp => {
                 for h in handles {
+                    // UDP buffer 可能因 SO_RCVBUF/SO_SNDBUF 动态扩容，释放前必须读取
+                    // 当前容量，才能把调试计数扣准确。
                     let (rx_bytes, tx_bytes) = {
                         let s = sockets.get::<udp::Socket>(h);
                         (s.payload_recv_capacity(), s.payload_send_capacity())

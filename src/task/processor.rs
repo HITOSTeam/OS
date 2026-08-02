@@ -20,13 +20,14 @@ use crate::{
         runtime::{monotonic_time_ns, start_task_runtime_slice},
         sched::{RT_PRIO_MIN, SchedClass, rr_timeslice_ticks, sched_class},
         switch,
-        task_block::{TaskControlBlock, TaskStatus},
+        task_block::{PendingWakeup, TaskControlBlock, TaskStatus},
         task_context::{self, TaskContext},
     },
     trap::init_trap,
 };
 use alloc::{collections::VecDeque, sync::Arc, task, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use log;
 use spin::Mutex;
@@ -39,6 +40,31 @@ static TASK_DROP_REF_DIAG_SEQ: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static TASK_FETCH_REF_DIAG_SEQ: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+const SCHED_TRACE_LEN: usize = 64;
+
+struct SchedTraceEntry {
+    seq: AtomicUsize,
+    task: AtomicUsize,
+    hart: AtomicUsize,
+    phase: AtomicUsize,
+    aux: AtomicUsize,
+}
+
+impl SchedTraceEntry {
+    const fn new() -> Self {
+        Self {
+            seq: AtomicUsize::new(0),
+            task: AtomicUsize::new(0),
+            hart: AtomicUsize::new(0),
+            phase: AtomicUsize::new(0),
+            aux: AtomicUsize::new(0),
+        }
+    }
+}
+
+static SCHED_TRACE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static SCHED_TRACE: [SchedTraceEntry; SCHED_TRACE_LEN] =
+    [const { SchedTraceEntry::new() }; SCHED_TRACE_LEN];
 const IDLE_CLEANUP_BUDGET: usize = 4;
 const IDLE_FILES_STRUCT_DROP_BUDGET: usize = 2;
 const IDLE_FILES_STRUCT_CLOSE_BATCH: usize = 2;
@@ -63,6 +89,57 @@ fn maybe_log_task_drop(event: &str) {
             inflight,
             queued,
             done
+        );
+    }
+}
+
+#[inline]
+fn trace_scheduler_transition(phase: usize, task: &Arc<TaskControlBlock>, aux: usize) {
+    if !crate::debug_config::DEBUG_WATCHDOG {
+        return;
+    }
+    let seq = SCHED_TRACE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let entry = &SCHED_TRACE[seq % SCHED_TRACE_LEN];
+    entry
+        .task
+        .store(Arc::as_ptr(task) as usize, Ordering::Relaxed);
+    entry.hart.store(hart_id(), Ordering::Relaxed);
+    entry.phase.store(phase, Ordering::Relaxed);
+    entry.aux.store(aux, Ordering::Relaxed);
+    entry.seq.store(seq, Ordering::Release);
+}
+
+pub fn debug_dump_scheduler_trace() {
+    if !crate::debug_config::DEBUG_WATCHDOG {
+        return;
+    }
+    let end = SCHED_TRACE_SEQ.load(Ordering::Acquire);
+    let start = end.saturating_sub(SCHED_TRACE_LEN - 1).max(1);
+    for seq in start..=end {
+        let entry = &SCHED_TRACE[seq % SCHED_TRACE_LEN];
+        if entry.seq.load(Ordering::Acquire) != seq {
+            continue;
+        }
+        let phase = match entry.phase.load(Ordering::Relaxed) {
+            1 => "fetch",
+            2 => "set_current",
+            3 => "take_current",
+            4 => "set_pending_ready",
+            5 => "set_pending_blocked",
+            6 => "idle_take_blocked",
+            7 => "idle_finish_blocked",
+            8 => "idle_take_ready",
+            9 => "idle_requeue_ready",
+            10 => "queue_exit_drop",
+            _ => "unknown",
+        };
+        log::warn!(
+            "[sched-trace] seq={} hart={} task={:#x} phase={} aux={}",
+            seq,
+            entry.hart.load(Ordering::Relaxed),
+            entry.task.load(Ordering::Relaxed),
+            phase,
+            entry.aux.load(Ordering::Relaxed),
         );
     }
 }
@@ -223,6 +300,7 @@ fn reparent_orphaned_children(process: &Arc<ProcessControlBlock>) {
 }
 
 fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
+    trace_scheduler_transition(10, &task, 0);
     if crate::debug_config::DEBUG_TASK_LIFECYCLE {
         let seq = TASK_DROP_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if seq <= 16 || (seq & (seq - 1)) == 0 {
@@ -256,18 +334,28 @@ fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
             let mut condvar_waiters = 0usize;
             let mut mutex_waiters = 0usize;
             for process in processes {
+                let tasks = process.tasks_snapshot();
+                task_slots = task_slots.saturating_add(
+                    tasks
+                        .iter()
+                        .filter(|holder| Arc::ptr_eq(holder, &task))
+                        .count(),
+                );
+                for holder in &tasks {
+                    if Arc::ptr_eq(holder, &task) {
+                        continue;
+                    }
+                    if let Some(holder_inner) = holder.try_borrow_mut() {
+                        join_waiters = join_waiters.saturating_add(
+                            holder_inner
+                                .join_waiters
+                                .iter()
+                                .filter(|w| Arc::ptr_eq(w, &task))
+                                .count(),
+                        );
+                    }
+                }
                 if let Some(inner) = process.try_borrow_mut() {
-                    task_slots = task_slots.saturating_add(
-                        inner
-                            .tasks
-                            .iter()
-                            .filter(|slot| {
-                                slot.as_ref()
-                                    .map(|holder| Arc::ptr_eq(holder, &task))
-                                    .unwrap_or(false)
-                            })
-                            .count(),
-                    );
                     wait_queues = wait_queues.saturating_add(
                         inner
                             .wait_queue
@@ -282,20 +370,6 @@ fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
                             .filter(|holder| Arc::ptr_eq(holder, &task))
                             .count(),
                     );
-                    for holder in inner.tasks.iter().filter_map(|slot| slot.as_ref()) {
-                        if Arc::ptr_eq(holder, &task) {
-                            continue;
-                        }
-                        if let Some(holder_inner) = holder.try_borrow_mut() {
-                            join_waiters = join_waiters.saturating_add(
-                                holder_inner
-                                    .join_waiters
-                                    .iter()
-                                    .filter(|w| Arc::ptr_eq(w, &task))
-                                    .count(),
-                            );
-                        }
-                    }
                     for sem in inner.semaphore_list.iter().filter_map(|s| s.as_ref()) {
                         sem_waiters = sem_waiters.saturating_add(
                             sem.inner
@@ -346,8 +420,7 @@ fn queue_exiting_task_drop(task: Arc<TaskControlBlock>) {
             );
         }
     }
-    // Detach the kernel stack now, but free it only after switching to idle.
-    // This keeps stack reclamation independent from lingering task Arc refs.
+    // 先从任务取出内核栈，切换到 idle 栈后再释放，避免残留任务引用阻碍栈回收。
     let kstack = task.take_kstack();
     let mut processor = local_processor().lock();
     if let Some(kstack) = kstack {
@@ -435,10 +508,7 @@ fn finish_thread_exit_cleanup(
     drop_user_res: bool,
 ) -> (usize, bool, Option<usize>) {
     let pid = process.getpid();
-    let token = {
-        let inner = process.borrow_mut();
-        inner.memory_set.token()
-    };
+    let token = process.memory_set().token();
 
     if cleanup.robust_list_head != 0 {
         let linux_tid = crate::syscall::misc::encode_linux_tid(pid, cleanup.tid) as u32;
@@ -526,14 +596,7 @@ fn cleanup_process_threads_for_group_exit(
     current_task: &Arc<TaskControlBlock>,
     exit_code: i32,
 ) -> Vec<TaskUserRes> {
-    let members = {
-        let process_inner = process.borrow_mut();
-        process_inner
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().cloned())
-            .collect::<Vec<_>>()
-    };
+    let members = process.tasks_snapshot();
 
     let mut recycle_res = Vec::<TaskUserRes>::new();
     for member in &members {
@@ -545,6 +608,33 @@ fn cleanup_process_threads_for_group_exit(
         let cleanup = take_thread_exit_cleanup(member, exit_code);
         let drop_user_res = cleanup.is_linux_thread;
         let _ = finish_thread_exit_cleanup(process, cleanup, drop_user_res);
+    }
+    // 其他核心可能仍在该线程的系统调用路径中。上面清空 res 后，它会在
+    // trap_return 的统一检查点调用 exit_current_and_run_next。必须等它真正
+    // 离开 CPU，才能由调用方释放整个 mm；否则远端核心可能继续访问已经
+    // 替换的页表。这个等待对应 Linux de_thread/线程组退出的停机同步。
+    let mut kicked_mask = 0usize;
+    loop {
+        let mut running_mask = 0usize;
+        for member in &members {
+            if Arc::ptr_eq(member, current_task) {
+                continue;
+            }
+            if let Some(running_hart) = member.running_hart().filter(|hart| *hart < MAX_HARTS) {
+                running_mask |= 1usize << running_hart;
+            }
+        }
+        if running_mask == 0 {
+            break;
+        }
+        let new_kicks = running_mask & !kicked_mask;
+        for hart in 0..MAX_HARTS {
+            if (new_kicks & (1usize << hart)) != 0 {
+                arch::send_ipi(hart);
+            }
+        }
+        kicked_mask |= new_kicks;
+        core::hint::spin_loop();
     }
     for member in members {
         let mut member_inner = member.borrow_mut();
@@ -706,9 +796,12 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
     task
 }
 
-/// 唤醒路径专用：用 `try_lock` 获取当前任务，拿不到锁就放弃抢占判断，
-/// 避免在持有就绪队列锁时再去抢 processor 锁而死锁。
-fn current_task_for_wakeup_preempt() -> Option<Arc<TaskControlBlock>> {
+/// 非阻塞获取本 hart 当前任务。
+///
+/// 调度探测和唤醒抢占路径可能已经位于其他锁的临界区，拿不到 processor 锁时
+/// 应直接放弃本次优化机会，不能为了读取当前任务再形成一条自旋锁等待链。
+#[inline]
+fn try_current_task() -> Option<Arc<TaskControlBlock>> {
     let processor = local_processor().try_lock()?;
     processor.current()
 }
@@ -782,7 +875,7 @@ fn wakeup_should_preempt_task(
 /// 判断被唤醒的任务是否应抢占本 hart（调用方所在 hart）当前运行的任务。
 /// 取不到当前任务则视为应抢占（idle 状态，谁来都行）。
 fn wakeup_should_preempt_current(woken: &Arc<TaskControlBlock>) -> bool {
-    let Some(current) = current_task_for_wakeup_preempt() else {
+    let Some(current) = try_current_task() else {
         return true;
     };
     wakeup_should_preempt_task(&current, woken, hart_id() % MAX_HARTS)
@@ -831,7 +924,9 @@ pub fn wakeup_should_preempt_target_hart(
 /// `NEED_RESCHED`，远端 hart 通过 IPI 尽快走到返回用户态前的调度点。
 pub fn request_reschedule_for_wakeup(woken: &Arc<TaskControlBlock>, target_hart: usize) {
     let local_hart = hart_id() % MAX_HARTS;
-    if target_hart >= MAX_HARTS {
+    if target_hart >= MAX_HARTS
+        || crate::task::manager::online_hart_mask() & (1usize << target_hart) == 0
+    {
         return;
     }
     if !wakeup_should_preempt_target_hart(woken, target_hart) {
@@ -850,6 +945,7 @@ pub fn request_reschedule_for_wakeup(woken: &Arc<TaskControlBlock>, target_hart:
 /// 逐个发 IPI 的开销。
 pub fn request_reschedule_harts(target_mask: usize) {
     let local_hart = hart_id() % MAX_HARTS;
+    let target_mask = target_mask & crate::task::manager::online_hart_mask();
     for target_hart in 0..MAX_HARTS {
         if (target_mask & (1usize << target_hart)) != 0 {
             NEED_RESCHED[target_hart].store(true, Ordering::Release);
@@ -892,11 +988,9 @@ pub(crate) fn current_files() -> Arc<spin::Mutex<FilesStruct>> {
 
 pub(crate) fn current_files_and_nofile_limit() -> (Arc<spin::Mutex<FilesStruct>>, usize) {
     let process = current_process();
-    let inner = process.borrow_mut();
-    (
-        Arc::clone(&inner.files),
-        inner.rlimits.rlimit_nofile_cur as usize,
-    )
+    let files = process.files();
+    let limit = process.borrow_mut().rlimits.rlimit_nofile_cur as usize;
+    (files, limit)
 }
 
 // todo
@@ -982,11 +1076,15 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
     let mut processor = local_processor().lock();
     let task = processor.take_current_task();
     drop(processor);
+    if let Some(task) = task.as_ref() {
+        trace_scheduler_transition(3, task, 0);
+    }
     task
 }
 /// 调度核心函数,直接完成任务的切换，传入参数为我们需要切换的任务的上下文
 /// 完毕之后，该hart 进入idle_task,idle-Task会进入调度循环idle_task()
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+    assert_current_scheduling_enabled("schedule");
     #[cfg(target_arch = "riscv64")]
     // The RISC-V trap path runs part of the kernel on the current user SATP
     // with shared kernel roots. Switch to the full kernel SATP before the idle
@@ -994,6 +1092,15 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     crate::mm::activate_kernel_space();
     let mut processor = local_processor().lock();
     let idle_task_cx_ptr = processor.get_idle_task_ptr();
+    let idle_ra = unsafe { (*idle_task_cx_ptr).ra };
+    let idle_sp = unsafe { (*idle_task_cx_ptr).sp };
+    assert!(
+        idle_ra != 0 && idle_sp != 0,
+        "hart {} attempted to return to an uninitialized idle context: ra={:#x} sp={:#x}",
+        hart_id(),
+        idle_ra,
+        idle_sp
+    );
     drop(processor);
     // SAFETY: both task contexts are valid kernel stack pointers owned by their respective tasks;
     // switched_task_cx_ptr is the current task's context, idle_task_cx_ptr is the idle context.
@@ -1164,23 +1271,24 @@ pub fn idle_task() {
         // 此时任务已不在 CPU 上（已切到 idle 上下文），可以安全清理 on_cpu。
         // NOTE: 如果在这之前就将task 入队，那么另一个hart 可能进入 从而导致问题
         if let Some(task) = local_processor().lock().take_pending_blocked() {
-            task.clear_on_cpu();
-            // 切走期间有人尝试唤醒它（wakeup_pending）→ 补唤醒。
+            // 切走期间有人尝试唤醒它时，由 on_cpu 原子字携带 pending 位。
             // 对应 Linux try_to_wake_up() 等 prev 离开 CPU 后再走正常唤醒路径，
             // 使 wakeup_preempt() 能正确设 NEED_RESCHED。
-            if task
-                .wakeup_pending
-                .swap(false, core::sync::atomic::Ordering::AcqRel)
-            {
-                let sync_hart = task.wakeup_sync_hart.swap(
-                    TaskControlBlock::OFF_CPU,
-                    core::sync::atomic::Ordering::AcqRel,
-                );
-                if sync_hart < MAX_HARTS {
+            trace_scheduler_transition(6, &task, 0);
+            let pending_wakeup = task.finish_running();
+            let pending_wakeup_code = match pending_wakeup {
+                PendingWakeup::None => 0,
+                PendingWakeup::Normal => 1,
+                PendingWakeup::Sync(hart) => hart.saturating_add(2),
+            };
+            trace_scheduler_transition(7, &task, pending_wakeup_code);
+            match pending_wakeup {
+                PendingWakeup::None => {}
+                PendingWakeup::Normal => wakeup_task(task),
+                PendingWakeup::Sync(sync_hart) if sync_hart < MAX_HARTS => {
                     wakeup_sync_task_on_hart(task, sync_hart);
-                } else {
-                    wakeup_task(task);
                 }
+                PendingWakeup::Sync(_) => wakeup_task(task),
             }
         }
 
@@ -1188,14 +1296,13 @@ pub fn idle_task() {
         // 延迟到 idle 上下文才入队，保证任务不再使用自己的内核栈时才
         // 对其他 hart 可见，避免 SMP 下同一任务被两个 hart 同时调度。
         if let Some(task) = local_processor().lock().take_pending_ready() {
-            task.clear_on_cpu();
-            task.wakeup_pending
-                .store(false, core::sync::atomic::Ordering::Release);
-            task.wakeup_sync_hart.store(
-                TaskControlBlock::OFF_CPU,
-                core::sync::atomic::Ordering::Release,
-            );
-            requeue_task(task);
+            trace_scheduler_transition(8, &task, 0);
+            let _ = task.finish_running();
+            let task_for_trace = Arc::clone(&task);
+            let target = requeue_task(task)
+                .map(|hart| hart.saturating_add(1))
+                .unwrap_or(0);
+            trace_scheduler_transition(9, &task_for_trace, target);
         }
 
         // 处理内核态定时器中断延迟的工作（只置位、不立即处理的那部分）。
@@ -1288,23 +1395,15 @@ pub fn idle_task() {
                     );
                 }
             }
-            task.clear_on_cpu();
+            let _ = task.finish_running();
             // 尝试从进程的线程列表中清掉这个 task 的 slot。
             // 僵尸进程且有额外引用时保留 slot，让 wait4 能 reap。
             if let Some(process) = task.process.upgrade() {
                 if let Some(mut inner) = process.try_borrow_mut() {
                     let keep_for_reap = inner.is_zombie && Arc::strong_count(&task) > 2;
+                    drop(inner);
                     if !keep_for_reap {
-                        for slot in inner.tasks.iter_mut() {
-                            if slot
-                                .as_ref()
-                                .map(|t| Arc::ptr_eq(t, &task))
-                                .unwrap_or(false)
-                            {
-                                *slot = None;
-                                break;
-                            }
-                        }
+                        process.remove_task_ref(&task);
                     }
                 }
             }
@@ -1332,6 +1431,7 @@ pub fn idle_task() {
         let _ = arch::disable_interrupts();
         drain_deferred_kernel_timer_work();
         if let Some(task) = fetch_task() {
+            trace_scheduler_transition(1, &task, 0);
             // 恢复目标任务的浮点寄存器状态。
             arch::restore_user_fp_state(&task);
             if crate::debug_config::DEBUG_TASK_LIFECYCLE {
@@ -1369,6 +1469,14 @@ pub fn idle_task() {
             start_task_runtime_slice(&task, now_ns);
             let mut task_inner = task.borrow_mut();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
+            assert!(
+                task_inner.task_cx.ra != 0 && task_inner.task_cx.sp != 0,
+                "hart {} fetched an invalid task context: ra={:#x} sp={:#x} status={:?}",
+                hart_id(),
+                task_inner.task_cx.ra,
+                task_inner.task_cx.sp,
+                task_inner.task_status
+            );
             // 首次调度日志。
             if IDLE_FIRST_SWITCH_LOG.swap(false, Ordering::SeqCst) {
                 let tid = task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
@@ -1399,11 +1507,11 @@ pub fn idle_task() {
             }
             // 同步 trap context 中的 kernel_tp（hart id），适配跨核迁移。
             task_inner.get_trap_cx().kernel_tp = hart_id();
-            task.mark_on_cpu(hart_id());
             task_inner.task_status = TaskStatus::Running;
 
             drop(task_inner);
             // 把目标任务设为当前任务。
+            trace_scheduler_transition(2, &task, 0);
             processor.now_task_block = Some(task);
             drop(processor);
 
@@ -1431,7 +1539,7 @@ pub fn idle_task() {
             // 4b：watchdog 诊断——空转太久则 dump 系统状态。
             if crate::debug_config::DEBUG_WATCHDOG {
                 let c = EMPTY_SPINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if c == 1_000 {
+                if c == 1_000 || (c > 1_000 && c % 10_000 == 0) {
                     crate::task::manager::dump_system_state();
                 }
             }
@@ -1489,23 +1597,46 @@ lazy_static! {
 /// `reschedule_before_user_return_if_needed` 消费。
 static NEED_RESCHED: [AtomicBool; MAX_HARTS] = [const { AtomicBool::new(false) }; MAX_HARTS];
 
+/// 每 hart 的不可调度嵌套深度，对应 Linux `preempt_count`。
+///
+/// 计数属于执行上下文而不是某个 TCB，持有任意 TCB 内锁或跨子系统临界区时
+/// 都能用一次本地原子读取阻止主动调度，不需要争用 processor/TCB 锁。
+#[repr(align(64))]
+struct HartSchedulingState {
+    disabled: AtomicUsize,
+}
+
+impl HartSchedulingState {
+    const fn new() -> Self {
+        Self {
+            disabled: AtomicUsize::new(0),
+        }
+    }
+}
+
+static SCHEDULING_STATE: [HartSchedulingState; MAX_HARTS] =
+    [const { HartSchedulingState::new() }; MAX_HARTS];
+
 pub fn go_to_first_task() -> ! {
     idle_task();
     panic!("Unreachable in go_to_first_task!");
 }
-pub fn suspend_current_and_run_next() {
-    // If the current process has a fatal pending signal, terminate it even if we are
-    // inside a long-running/blocking syscall loop (where we may never return to the
-    // trap handler's "check signal then return to user" path).
-    //
-    // Use `try_borrow_mut` to avoid deadlocking if the caller already holds the PCB lock.
-    if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
+fn suspend_current_and_run_next_unchecked(task_snapshot: Arc<TaskControlBlock>) {
+    // 长时间运行或循环阻塞的系统调用可能一直到不了返回用户态前的信号检查点，
+    // 因此主动让出时也处理致命信号。进入这里前已经非阻塞探测过 TCB/PCB 锁。
+    if let Some((errno, msg)) = crate::task::signal::check_task_signals_error(&task_snapshot) {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
     let Some(task) = take_current_task() else {
         return;
     };
+    debug_assert!(
+        Arc::ptr_eq(&task, &task_snapshot),
+        "hart {} 调度探测期间当前任务发生变化",
+        hart_id()
+    );
+    drop(task_snapshot);
     charge_task_runtime_for_scheduler(&task);
 
     // ---- access current TCB exclusively
@@ -1523,12 +1654,105 @@ pub fn suspend_current_and_run_next() {
     // Instead, stash it on this hart and let `idle_task()` enqueue it after the
     // context switch completes.
     arch::save_user_fp_state(&task);
+    trace_scheduler_transition(4, &task, 0);
     local_processor().lock().set_pending_ready(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
 }
 
+/// 当前 hart 的不可调度临界区守卫。
+///
+/// 守卫不持有 TCB/PCB 锁，可以安全嵌套并跨越 mm 与文件系统调用。
+pub struct SchedulingDisableGuard {
+    hart: usize,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for SchedulingDisableGuard {
+    fn drop(&mut self) {
+        let previous = SCHEDULING_STATE[self.hart]
+            .disabled
+            .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "hart 不可调度计数下溢");
+    }
+}
+
+/// 标记当前 hart 暂时不能主动进入调度器。
+#[inline]
+pub fn disable_current_scheduling() -> SchedulingDisableGuard {
+    let hart = hart_id();
+    debug_assert!(hart < MAX_HARTS, "hart id 超出不可调度计数范围");
+    SCHEDULING_STATE[hart]
+        .disabled
+        .fetch_add(1, Ordering::Relaxed);
+    SchedulingDisableGuard {
+        hart,
+        _not_send: PhantomData,
+    }
+}
+
+#[inline]
+fn current_scheduling_disable_depth() -> usize {
+    let hart = hart_id();
+    if hart >= MAX_HARTS {
+        return usize::MAX;
+    }
+    SCHEDULING_STATE[hart].disabled.load(Ordering::Relaxed)
+}
+
+/// 当前执行上下文是否允许主动调度。
+#[inline]
+fn current_scheduling_enabled() -> bool {
+    current_scheduling_disable_depth() == 0
+}
+
+#[inline]
+fn assert_current_scheduling_enabled(operation: &str) {
+    assert_eq!(
+        current_scheduling_disable_depth(),
+        0,
+        "hart {} 在不可调度临界区内进入 {}",
+        hart_id(),
+        operation
+    );
+}
+
+/// 尝试在允许调度的上下文中主动让出当前 CPU。
+///
+/// 缺页、用户内存复制等路径可能已经持有当前任务的 TCB 内锁。此时直接调用
+/// `suspend_current_and_run_next()` 会在运行时间记账或任务状态切换时再次获取
+/// 同一把锁，形成当前 hart 自锁。这里把可调度性判断收敛到调度器：只有当前
+/// processor、当前 TCB 和 PCB 内锁都能够立即取得时才进入完整的让出流程，
+/// 否则由调用者继续短暂自旋。
+pub fn try_suspend_current_and_run_next() -> bool {
+    // 热路径先读每 hart 计数。持有 TCB/mm 锁时无需再争用 processor 锁。
+    if !current_scheduling_enabled() {
+        return false;
+    }
+    let Some(task) = try_current_task() else {
+        return false;
+    };
+    if !task.inner_lock_available_for_scheduling() {
+        return false;
+    }
+    let Some(process) = task.process.upgrade() else {
+        return false;
+    };
+    if !process.inner_lock_available_for_scheduling() {
+        return false;
+    }
+    drop(process);
+    suspend_current_and_run_next_unchecked(task);
+    true
+}
+
+/// 主动让出当前 CPU；不可调度上下文中保持运行并由调用者继续重试。
+pub fn suspend_current_and_run_next() {
+    let _ = try_suspend_current_and_run_next();
+}
+
 pub fn block_current_and_run_next() {
+    assert_current_scheduling_enabled("block_current_and_run_next");
     // Same rationale as in `suspend_current_and_run_next()`: a task can be stuck
     // yielding within a syscall (interrupts disabled), so handle fatal signals here.
     if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
@@ -1565,11 +1789,13 @@ pub fn block_current_and_run_next() {
     if should_block {
         record_fair_sleep_lag(&task);
         arch::save_user_fp_state(&task);
+        trace_scheduler_transition(5, &task, 1);
         local_processor().lock().set_pending_blocked(task);
     } else {
         // Behave like a yield: enqueue after we have switched back to idle
         // to avoid "run on two harts".
         arch::save_user_fp_state(&task);
+        trace_scheduler_transition(4, &task, 1);
         local_processor().lock().set_pending_ready(task);
     }
     // jump to scheduling cycle
@@ -1581,11 +1807,12 @@ pub const IDLE_PID: usize = 0;
 
 // 线程(task)  单位的推出
 pub fn exit_current_and_run_next(exit_code: i32) -> ! {
+    assert_current_scheduling_enabled("exit_current_and_run_next");
     // 标记线程状态,
     let task = take_current_task().unwrap();
     charge_task_runtime_for_scheduler(&task);
-    // This task will never be scheduled again; ensure it is considered off CPU.
-    task.clear_on_cpu();
+    // 上下文切换到本 hart 的 idle 栈之前保持 `on_cpu`。如果在这里提前清除，
+    // 并发唤醒可能在退出路径仍使用该任务内核栈时重新入队并运行它。
     let Some(process) = task.process.upgrade() else {
         if DEBUG_SCHED {
             log::warn!("[exit] task lost process; dropping task and scheduling idle");
@@ -1619,16 +1846,9 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             // For Linux threads, remove from the process task table immediately.
             // Joiners use futexes instead of waittid, so we don't need the slot.
             let thread_cpu_ns = crate::task::runtime::task_cpu_time_ns(&task);
-            let mut process_inner = process.borrow_mut();
-            let remove_slot = process_inner
-                .tasks
-                .get(tid)
-                .and_then(|slot| slot.as_ref())
-                .map(|t| Arc::ptr_eq(t, &task))
-                .unwrap_or(false);
-            if remove_slot {
+            if process.remove_task_if(tid, &task) {
+                let mut process_inner = process.borrow_mut();
                 process_inner.cpu_time_ns = process_inner.cpu_time_ns.saturating_add(thread_cpu_ns);
-                process_inner.tasks[tid] = None;
             }
         }
     }
@@ -1672,17 +1892,14 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // Detach and semantically close this process' fd table before the
         // zombie becomes visible to waiters.  Heavy file object drops remain
         // deferred below.
-        let (parent, exit_signal, old_files) = {
+        let old_files = process.replace_files(Arc::new(spin::Mutex::new(FilesStruct::new())));
+        close_files_struct_fd_refs_if_unshared(&old_files);
+        let (parent, exit_signal) = {
             let mut process_inner = process.borrow_mut();
             crate::syscall::process::unregister_executing_inode(
                 process_inner.exec_inode_dev,
                 process_inner.exec_inode_num,
             );
-            let old_files = core::mem::replace(
-                &mut process_inner.files,
-                Arc::new(spin::Mutex::new(FilesStruct::new())),
-            );
-            close_files_struct_fd_refs_if_unshared(&old_files);
             process_inner.is_zombie = true;
             process_inner.dumped_core = dumped_core;
             process_inner.exit_code = exit_code;
@@ -1690,7 +1907,6 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             (
                 process_inner.parent.as_ref().and_then(|p| p.upgrade()),
                 process_inner.exit_signal,
-                old_files,
             )
         }; // drop child PCB lock before touching parent to avoid lock inversion
         crate::syscall::process::release_ptrace_tracer(&process);
@@ -1717,25 +1933,18 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // same exit-side futex/join cleanup as the current thread.
         let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
         recycle_res.clear();
-        let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
+        // Linux 在退出时先把 mm 从进程上摘下，zombie 只保留元数据。
+        let mut old_mm = process.replace_memory_set(MmRef::new(MemorySet::new_bare()));
+        let old_mm_token = old_mm.token();
+        let old_shm_cleanup = old_mm.take_sysv_shm_attaches_for_cleanup();
+        let old_net_ns_id = {
             let mut process_inner = process.borrow_mut();
             process_inner.clear_children();
             process_inner.exited_children.clear();
-            let old_mm_token = process_inner.memory_set.token();
             let old_net_ns_id = process_inner.net_ns_id;
-            let old_shm_cleanup = process_inner
-                .memory_set
-                .take_sysv_shm_attaches_for_cleanup();
-            // Linux releases `mm_struct` at exit and keeps only zombie metadata.
-            // Drop the full user address space here so unreaped zombies do not pin
-            // page-table pages (and COW refs) during fork-heavy workloads.
-            let old_mm = core::mem::replace(
-                &mut process_inner.memory_set,
-                MmRef::new(MemorySet::new_bare()),
-            );
             crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
             crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-            (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
+            old_net_ns_id
         };
         if !release_process_mm_owner(old_mm_token) {
             crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
@@ -1769,9 +1978,10 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
 
 /// Terminate the entire process, even when called from a non-main thread.
 pub fn exit_group_and_run_next(exit_code: i32) -> ! {
+    assert_current_scheduling_enabled("exit_group_and_run_next");
     let task = take_current_task().unwrap();
     charge_task_runtime_for_scheduler(&task);
-    task.clear_on_cpu();
+    // 与普通退出路径相同，switch() 不再使用任务内核栈后，由 idle 设置 OFF_CPU。
     let Some(process) = task.process.upgrade() else {
         if DEBUG_SCHED {
             log::warn!("[exit_group] task lost process; dropping task and scheduling idle");
@@ -1811,17 +2021,14 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         }
     }
 
-    let (parent, exit_signal, old_files) = {
+    let old_files = process.replace_files(Arc::new(spin::Mutex::new(FilesStruct::new())));
+    close_files_struct_fd_refs_if_unshared(&old_files);
+    let (parent, exit_signal) = {
         let mut process_inner = process.borrow_mut();
         crate::syscall::process::unregister_executing_inode(
             process_inner.exec_inode_dev,
             process_inner.exec_inode_num,
         );
-        let old_files = core::mem::replace(
-            &mut process_inner.files,
-            Arc::new(spin::Mutex::new(FilesStruct::new())),
-        );
-        close_files_struct_fd_refs_if_unshared(&old_files);
         process_inner.is_zombie = true;
         process_inner.dumped_core = dumped_core;
         process_inner.exit_code = exit_code;
@@ -1829,7 +2036,6 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         (
             process_inner.parent.as_ref().and_then(|p| p.upgrade()),
             process_inner.exit_signal,
-            old_files,
         )
     };
     crate::syscall::process::release_ptrace_tracer(&process);
@@ -1853,24 +2059,17 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
 
     let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
     recycle_res.clear();
-    let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
+    let mut old_mm = process.replace_memory_set(MmRef::new(MemorySet::new_bare()));
+    let old_mm_token = old_mm.token();
+    let old_shm_cleanup = old_mm.take_sysv_shm_attaches_for_cleanup();
+    let old_net_ns_id = {
         let mut process_inner = process.borrow_mut();
         process_inner.clear_children();
         process_inner.exited_children.clear();
-        let old_mm_token = process_inner.memory_set.token();
         let old_net_ns_id = process_inner.net_ns_id;
-        let old_shm_cleanup = process_inner
-            .memory_set
-            .take_sysv_shm_attaches_for_cleanup();
-        // Same as exit_current_and_run_next(): release the whole user address
-        // space eagerly and keep only zombie bookkeeping in the PCB.
-        let old_mm = core::mem::replace(
-            &mut process_inner.memory_set,
-            MmRef::new(MemorySet::new_bare()),
-        );
         crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
         crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-        (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
+        old_net_ns_id
     };
     if !release_process_mm_owner(old_mm_token) {
         crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);

@@ -11,6 +11,60 @@ use crate::mm::{PTEFlags, VirtAddr, VirtPageNum, frame_alloc};
 use crate::task::processor::current_process;
 
 impl MemorySet {
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn debug_fault_state(&self, fault_va: usize, access: MapPermission) {
+        let vpn: VirtPageNum = VirtAddr::from(fault_va).floor();
+        let pte_bits = self.translate(vpn).map(|pte| pte.bits).unwrap_or(0);
+        crate::println!(
+            "[fault_state] va={:#x} vpn={:#x} access={:#x} pte={:#x}",
+            fault_va,
+            vpn.0,
+            access.bits(),
+            pte_bits
+        );
+
+        let mut previous = None;
+        let mut next = None;
+        let mut containing = None;
+        for region in self.vm_regions.iter().copied() {
+            if region.start <= fault_va && fault_va < region.end() {
+                containing = Some(region);
+                break;
+            }
+            if region.end() <= fault_va {
+                previous = Some(region);
+            } else if region.start > fault_va {
+                next = Some(region);
+                break;
+            }
+        }
+        crate::println!(
+            "[fault_state] region_hit={:?} region_prev={:?} region_next={:?}",
+            containing,
+            previous,
+            next
+        );
+
+        let mut area_hit = false;
+        for area in self.areas.iter() {
+            if !area.contains_vpn(vpn) {
+                continue;
+            }
+            area_hit = true;
+            crate::println!(
+                "[fault_state] area={:#x}-{:#x} type={:?} perm={:#x} frames={}",
+                area.start_vpn().0 * PAGE_SIZE,
+                area.end_vpn().0 * PAGE_SIZE,
+                area.map_type(),
+                area.map_perm().bits(),
+                area.tracked_frame_count()
+            );
+        }
+        if !area_hit {
+            crate::println!("[fault_state] area_hit=false");
+        }
+    }
+
     /// 检查 addr 是否落在文件映射的 SIGBUS tail 区（EOF 之后的不可访问段）。
     #[allow(dead_code)]
     pub fn fault_hits_mmap_sigbus_tail(&self, addr: usize) -> bool {
@@ -153,7 +207,8 @@ impl MemorySet {
             break;
         }
 
-        // 刷新 TLB，使新 PTE 立即生效。
+        // 刷新 TLB，使新 PTE 立即生效。ASID 层会对曾运行过该地址空间的 hart
+        // 发起定向失效；不能再额外广播到所有在线 hart，否则会破坏 COW 热路径。
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         self.flush_user_page(fault_va);
         true
@@ -231,6 +286,20 @@ impl MemorySet {
             );
             if let Some(pte) = self.page_table.translate(vpn) {
                 if pte.is_valid() {
+                    #[cfg(target_arch = "loongarch64")]
+                    {
+                        let access_allowed = (!access.contains(MapPermission::R) || pte.readable())
+                            && (!access.contains(MapPermission::W) || pte.writable())
+                            && (!access.contains(MapPermission::X) || pte.executable())
+                            && pte.is_user();
+                        if access_allowed {
+                            // LoongArch refill 会缓存无效项；并发 ASID 切换后，按地址
+                            // 刷新偶尔无法命中旧项。PTE 已允许本次访问时，这是一次
+                            // spurious fault，全刷本 hart 的非全局项后重试即可。
+                            crate::arch::loongarch64::mm::flush_local_user_tlb();
+                            return LazyFaultResult::Resolved;
+                        }
+                    }
                     return LazyFaultResult::Invalid;
                 }
             }
@@ -322,9 +391,9 @@ impl MemorySet {
                 }
             }
             #[cfg(target_arch = "loongarch64")]
-            self.flush_user_page(fault_va);
+            self.flush_local_user_page(fault_va);
             #[cfg(target_arch = "riscv64")]
-            self.flush_user_page(fault_va);
+            self.flush_local_user_page(fault_va);
             return LazyFaultResult::Resolved;
         }
         LazyFaultResult::Invalid

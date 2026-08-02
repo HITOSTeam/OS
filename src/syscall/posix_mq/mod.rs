@@ -442,13 +442,10 @@ pub fn syscall_mq_timedsend(
                 .iter()
                 .position(|m| m.prio < msg_prio as u32)
                 .unwrap_or(state.messages.len());
-            state.messages.insert(
-                insert_at,
-                MqMessage {
-                    prio: msg_prio as u32,
-                    data: payload.clone(),
-                },
-            );
+            state.messages.insert(insert_at, MqMessage {
+                prio: msg_prio as u32,
+                data: payload.clone(),
+            });
             wake_all_waiters(&mut state.recv_waiters);
             wake_poll_waiters(&mut state);
             // 仅在队列从空变非空时触发通知，且通知只触发一次（取走后清空注册）

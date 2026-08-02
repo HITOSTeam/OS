@@ -183,13 +183,7 @@ fn set_thread_freezer_state(thread_id: CgroupThreadId, frozen: bool) -> bool {
     let Some(process) = pid2process(thread_id.tgid) else {
         return false;
     };
-    let task = {
-        let inner = process.borrow_mut();
-        inner
-            .tasks
-            .get(thread_id.tid_index)
-            .and_then(|task| task.as_ref().cloned())
-    };
+    let task = process.task_at(thread_id.tid_index);
     let Some(task) = task else {
         return false;
     };

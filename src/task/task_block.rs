@@ -1,5 +1,6 @@
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 
@@ -28,11 +29,14 @@ pub struct TaskControlBlock {
     ///
     /// 调度器在任务变为可运行时，用它决定应放入哪个每 hart 运行队列。
     pub cpu_id: AtomicUsize,
-    /// 当前正在运行该任务的 hart id；如果没有运行在任何 hart 上，则为 OFF_CPU。
-    pub on_cpu: AtomicUsize,
-    /// 当唤醒方尝试唤醒仍处于 `on_cpu` 状态的任务时置位。
-    pub wakeup_pending: AtomicBool,
-    /// `wakeup_pending` 对应的同步唤醒来源 hart。
+    /// 当前任务的运行状态原子字。
+    ///
+    /// 低位保存 hart id，最高位表示任务切出期间收到了唤醒；如果没有运行在
+    /// 任何 hart 上，则为 `OFF_CPU`。把两种状态合并到同一个原子字后，唤醒方
+    /// 的 `fetch_or` 与切出方的 `swap` 具有唯一顺序，不再存在两个独立原子间
+    /// 的丢唤醒窗口。
+    on_cpu: AtomicUsize,
+    /// 延迟唤醒对应的同步唤醒来源 hart。
     ///
     /// Linux `WF_SYNC` 风格 handoff 可能发生在目标任务还位于自己的内核栈上时。
     /// 此时只能延迟到目标切回 idle 后入队；这里保留原始 waker hart，避免
@@ -61,6 +65,38 @@ pub struct FutexWaitHandle {
     pub in_queue: Arc<AtomicBool>,
 }
 
+/// 任务完成切出后需要处理的延迟唤醒。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingWakeup {
+    None,
+    Normal,
+    Sync(usize),
+}
+
+/// 持有 TCB 内锁期间同时禁止当前 hart 主动调度。
+///
+/// TCB 使用自旋锁保护；若锁持有者在临界区内主动让出 CPU，新任务可能再次
+/// 获取同一把锁而自锁。该守卫把 StarryOS `SpinNoPreempt` 和 Linux
+/// `spin_lock()` 的约束固化到类型中，先释放内锁，再恢复可调度状态。
+pub struct TaskControlBlockGuard<'a> {
+    inner: MutexGuard<'a, TaskControlBlockInner>,
+    _scheduling_guard: crate::task::processor::SchedulingDisableGuard,
+}
+
+impl Deref for TaskControlBlockGuard<'_> {
+    type Target = TaskControlBlockInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for TaskControlBlockGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 static TASK_TCB_ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TASK_TCB_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -84,6 +120,7 @@ fn maybe_log_tcb_inflight(event: &str) {
 
 impl TaskControlBlock {
     pub const OFF_CPU: usize = usize::MAX;
+    const WAKE_PENDING_BIT: usize = 1usize << (usize::BITS as usize - 1);
 
     pub fn set_cpu_id(&self, cpu_id: usize) {
         self.cpu_id.store(cpu_id, Ordering::Release);
@@ -93,17 +130,83 @@ impl TaskControlBlock {
         self.cpu_id.load(Ordering::Acquire)
     }
 
-    pub fn mark_on_cpu(&self, hart_id: usize) {
+    /// 返回当前运行该任务的 hart；延迟唤醒位不会泄漏给调用者。
+    #[inline]
+    pub fn running_hart(&self) -> Option<usize> {
+        let state = self.on_cpu.load(Ordering::Acquire);
+        (state != Self::OFF_CPU).then_some(state & !Self::WAKE_PENDING_BIT)
+    }
+
+    #[inline]
+    pub fn is_on_cpu(&self) -> bool {
+        self.running_hart().is_some()
+    }
+
+    /// 任务仍在 CPU 上时原子登记一次延迟唤醒。
+    ///
+    /// `fetch_or` 与 [`finish_running`](Self::finish_running) 的 `swap` 在同一
+    /// 原子字上排序：返回 `true` 时由切出方负责补唤醒；返回 `false` 时任务
+    /// 已经离开 CPU，调用方必须直接走普通唤醒路径。
+    pub(crate) fn defer_wakeup_if_on_cpu(&self, sync_source_hart: Option<usize>) -> bool {
+        if let Some(source_hart) = sync_source_hart {
+            self.wakeup_sync_hart.store(source_hart, Ordering::Release);
+        }
+        let previous = self
+            .on_cpu
+            .fetch_or(Self::WAKE_PENDING_BIT, Ordering::AcqRel);
+        previous != Self::OFF_CPU
+    }
+
+    /// 在任务离开运行队列时原子声明 CPU 所有权。
+    ///
+    /// 必须在任务仍受运行队列锁保护时完成；否则另一核可能在“已经出队、
+    /// 尚未标记运行”的窗口中再次入队同一任务，最终并发使用同一内核栈。
+    pub fn try_mark_on_cpu(&self, hart_id: usize) -> bool {
+        debug_assert!(
+            hart_id < Self::WAKE_PENDING_BIT,
+            "hart id 占用了 TCB 唤醒状态位"
+        );
         self.cpu_id.store(hart_id, Ordering::Release);
-        self.on_cpu.store(hart_id, Ordering::Release);
-        // 一旦已经运行，就不应再保留待处理唤醒。
-        self.wakeup_pending.store(false, Ordering::Release);
+        self.on_cpu
+            .compare_exchange(Self::OFF_CPU, hart_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// 在任务已经切到 idle 栈后发布 `OFF_CPU`，并一次性取走切出期间的唤醒。
+    pub(crate) fn finish_running(&self) -> PendingWakeup {
+        let previous = self.on_cpu.swap(Self::OFF_CPU, Ordering::AcqRel);
+        let sync_hart = self.wakeup_sync_hart.swap(Self::OFF_CPU, Ordering::AcqRel);
+        if previous == Self::OFF_CPU || (previous & Self::WAKE_PENDING_BIT) == 0 {
+            PendingWakeup::None
+        } else if sync_hart == Self::OFF_CPU {
+            PendingWakeup::Normal
+        } else {
+            PendingWakeup::Sync(sync_hart)
+        }
+    }
+
+    /// 当前等待条件已经满足、不再准备阻塞时，丢弃此前登记的冗余唤醒。
+    pub(crate) fn discard_deferred_wakeup(&self) {
+        let mut current = self.on_cpu.load(Ordering::Acquire);
+        while current != Self::OFF_CPU && (current & Self::WAKE_PENDING_BIT) != 0 {
+            match self.on_cpu.compare_exchange_weak(
+                current,
+                current & !Self::WAKE_PENDING_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         self.wakeup_sync_hart
             .store(Self::OFF_CPU, Ordering::Release);
     }
 
-    pub fn clear_on_cpu(&self) {
-        self.on_cpu.store(Self::OFF_CPU, Ordering::Release);
+    /// 仅供诊断输出读取，不参与唤醒协议。
+    pub(crate) fn has_deferred_wakeup(&self) -> bool {
+        let state = self.on_cpu.load(Ordering::Acquire);
+        state != Self::OFF_CPU && (state & Self::WAKE_PENDING_BIT) != 0
     }
 
     pub fn mark_signal_pending(&self) {
@@ -118,8 +221,13 @@ impl TaskControlBlock {
         self.signal_pending.load(Ordering::Acquire)
     }
 
-    pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
-        self.inner.lock()
+    pub fn borrow_mut(&self) -> TaskControlBlockGuard<'_> {
+        let scheduling_guard = crate::task::processor::disable_current_scheduling();
+        let inner = self.inner.lock();
+        TaskControlBlockGuard {
+            inner,
+            _scheduling_guard: scheduling_guard,
+        }
     }
 
     pub fn kstack_top(&self) -> usize {
@@ -134,8 +242,19 @@ impl TaskControlBlock {
         self.kstack.lock().take()
     }
 
-    pub fn try_borrow_mut(&self) -> Option<MutexGuard<'_, TaskControlBlockInner>> {
-        self.inner.try_lock()
+    pub fn try_borrow_mut(&self) -> Option<TaskControlBlockGuard<'_>> {
+        let scheduling_guard = crate::task::processor::disable_current_scheduling();
+        let inner = self.inner.try_lock()?;
+        Some(TaskControlBlockGuard {
+            inner,
+            _scheduling_guard: scheduling_guard,
+        })
+    }
+
+    /// 调度器让出 CPU 前只探测一次 TCB 内锁，不把原始 guard 暴露给调用者。
+    #[inline]
+    pub(crate) fn inner_lock_available_for_scheduling(&self) -> bool {
+        self.inner.try_lock().is_some()
     }
 
     pub fn get_user_token(&self) -> usize {
@@ -248,6 +367,14 @@ impl TaskControlBlock {
 
     pub fn take_futex_wait(&self) -> Option<FutexWaitHandle> {
         self.futex_wait.lock().take()
+    }
+
+    /// 仅供 watchdog 读取当前 futex 等待键，不改变等待队列所有权。
+    pub(crate) fn futex_wait_snapshot(&self) -> Option<((usize, usize), bool)> {
+        self.futex_wait
+            .lock()
+            .as_ref()
+            .map(|handle| (handle.key, handle.in_queue.load(Ordering::Acquire)))
     }
 }
 
@@ -396,17 +523,17 @@ impl TaskControlBlock {
         let trap_cx_ppn = res.trap_cx_ppn();
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
-        let (process_scheduling, memory_set) = {
+        let process_scheduling = {
             let inner = process.borrow_mut();
-            (inner.scheduling.clone(), inner.memory_set.clone())
+            inner.scheduling.clone()
         };
+        let memory_set = process.memory_set();
         let tcb = Self {
             process: Arc::downgrade(&process),
             memory_set: Mutex::new(memory_set),
             kstack: Mutex::new(Some(kstack)),
             cpu_id: AtomicUsize::new(0),
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
-            wakeup_pending: AtomicBool::new(false),
             wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
@@ -496,10 +623,11 @@ impl TaskControlBlock {
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
         // 继承进程当前的 nice 值，避免新线程上调度器后 nice 不一致
-        let (process_scheduling, memory_set) = {
+        let process_scheduling = {
             let inner = process.borrow_mut();
-            (inner.scheduling.clone(), inner.memory_set.clone())
+            inner.scheduling.clone()
         };
+        let memory_set = process.memory_set();
         let tcb = Self {
             // 用 Weak 反指回所属进程，避免线程 TCB 与进程 PCB 之间形成 Arc 循环引用
             process: Arc::downgrade(&process),
@@ -511,7 +639,6 @@ impl TaskControlBlock {
             // 当前未上 CPU；运行时由调度器把它切到 ON_CPU 状态
             on_cpu: AtomicUsize::new(Self::OFF_CPU),
             // 唤醒标记/就绪队列标记的初值均为 false：刚创建还未排队
-            wakeup_pending: AtomicBool::new(false),
             wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
             in_ready_queue: AtomicBool::new(false),
@@ -622,7 +749,7 @@ impl TaskControlBlock {
         let inner = self.borrow_mut();
         // 当前 CPU 仍在调度。
         // 当前时间 + 累计时间。
-        if self.on_cpu.load(Ordering::Acquire) != Self::OFF_CPU {
+        if self.is_on_cpu() {
             inner
                 .cpu_time_ns
                 .saturating_add(now_ns.saturating_sub(inner.runtime_start_ns))

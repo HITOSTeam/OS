@@ -3,8 +3,7 @@
 //! 与 smoltcp 自带的 [`smoltcp::phy::Loopback`] 相比，本设备在收发路径上插入了
 //! 观测钩子 [`crate::syscall::net::observe_loopback_ip_packet_in`]，使流经 `lo`
 //! 的每个 IP 报文都能被 AF_PACKET 抓包、网卡/协议流量统计等机制看到，并按
-//! network namespace 归属。同时它使用真实的校验和能力（而非 `ignored`），
-//! 以保证抓到的报文校验和正确、支持 `IP_TOS`、UDP 零校验和等选项。
+//! network namespace 归属。
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -61,13 +60,10 @@ impl PacketTapLoopback {
     /// 从外部（非 smoltcp 发送路径）直接向回环队列注入一个 IP 报文，
     /// 下次 `receive` 时即可被协议栈取走。供 `inject_loopback_ip_packet_in` 使用。
     pub(super) fn inject_ip_packet(&mut self, packet: &[u8], observe_rx: bool) {
-        push_back_bounded(
-            &mut self.queue,
-            QueuedLoopbackPacket {
-                data: packet.to_vec(),
-                observe_rx,
-            },
-        );
+        push_back_bounded(&mut self.queue, QueuedLoopbackPacket {
+            data: packet.to_vec(),
+            observe_rx,
+        });
     }
 }
 
@@ -163,13 +159,10 @@ impl<'a> SmolTxToken for PacketTapTxToken<'a> {
             *self.suppress_multicast_loopback -= 1;
         } else {
             // loopback 的发送结果就是稍后被同一个 namespace 的 RX 路径取走。
-            push_back_bounded(
-                self.queue,
-                QueuedLoopbackPacket {
-                    data: buffer,
-                    observe_rx: true,
-                },
-            );
+            push_back_bounded(self.queue, QueuedLoopbackPacket {
+                data: buffer,
+                observe_rx: true,
+            });
         }
         result
     }
@@ -192,13 +185,10 @@ impl Device for PacketTapLoopback {
                 crate::syscall::net::wireguard::handle_inbound_ipv4_packet(self.ns_id, &packet.data)
             {
                 for inner in inner_packets.into_iter().rev() {
-                    push_front_bounded(
-                        &mut self.queue,
-                        QueuedLoopbackPacket {
-                            data: inner,
-                            observe_rx: true,
-                        },
-                    );
+                    push_front_bounded(&mut self.queue, QueuedLoopbackPacket {
+                        data: inner,
+                        observe_rx: true,
+                    });
                 }
                 continue;
             }
@@ -226,13 +216,14 @@ impl Device for PacketTapLoopback {
         })
     }
 
-    /// 上报设备能力：MTU 取 IP 包最大值 65535，介质沿用创建时的设置，
-    /// 校验和能力用默认值（由软件计算 IP/TCP/UDP 校验和）。
+    /// 上报设备能力：MTU 取 IP 包最大值 65535，介质沿用创建时的设置。
+    /// Linux loopback 会把本机包当作无需校验和处理；这里也声明 checksum ignored，
+    /// 避免 iperf 大 TCP 包在同一个内核里反复计算和验证校验和。
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 65535;
         caps.medium = self.medium;
-        caps.checksum = ChecksumCapabilities::default();
+        caps.checksum = ChecksumCapabilities::ignored();
         caps
     }
 }

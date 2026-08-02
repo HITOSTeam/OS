@@ -13,6 +13,7 @@ const AF_INET: usize = 2;
 const SOCK_STREAM: usize = 1;
 const SOCK_DGRAM: usize = 2;
 const SOCK_RAW: usize = 3;
+const SOCK_SEQPACKET: usize = 5;
 const SOCK_TYPE_MASK: usize = 0xf;
 const SOCK_NONBLOCK: usize = 0x800;
 const SOCK_CLOEXEC: usize = 0x80000;
@@ -21,7 +22,8 @@ const FD_CLOEXEC: u32 = 1;
 
 /// Linux `socketpair(2)` (syscall 199 on riscv64).
 ///
-/// Minimal support for `AF_UNIX` + `SOCK_STREAM`, sufficient for rt-tests `hackbench`.
+/// 支持 hackbench 以及 glibc/Rust 创建子进程错误通道所需的本地
+/// stream/datagram/seqpacket 形式。
 pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: usize) -> isize {
     let flags = type_ & !SOCK_TYPE_MASK;
     if (flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK)) != 0 {
@@ -31,7 +33,10 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
         return err(SyscallError::EFAULT);
     }
     let sock_type = type_ & SOCK_TYPE_MASK;
-    if !matches!(sock_type, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) {
+    if !matches!(
+        sock_type,
+        SOCK_STREAM | SOCK_DGRAM | SOCK_RAW | SOCK_SEQPACKET
+    ) {
         return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
@@ -45,7 +50,7 @@ pub fn syscall_socketpair(domain: usize, type_: usize, protocol: usize, sv_ptr: 
             if protocol != 0 {
                 return err(SyscallError::EPROTONOSUPPORT);
             }
-            if !matches!(sock_type, SOCK_STREAM | SOCK_DGRAM) {
+            if !matches!(sock_type, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) {
                 return err(SyscallError::EPROTONOSUPPORT);
             }
         }

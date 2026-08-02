@@ -540,9 +540,12 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 /// Closes a single file descriptor and releases any lock or lease state tied to it.
 pub fn syscall_close(fd: usize) -> isize {
     let files = current_files();
-    let mut files = files.lock();
-    let Some(file) = files.get_file(fd) else {
-        return err(SyscallError::EBADF);
+    let file = {
+        let mut files = files.lock();
+        let Some(file) = files.clear_fd(fd) else {
+            return err(SyscallError::EBADF);
+        };
+        file
     };
     let lock_key = file_lock_key(&file);
     let fanotify_close = file
@@ -558,8 +561,6 @@ pub fn syscall_close(fd: usize) -> isize {
             };
             (inode, file.writable(), is_dir, path)
         });
-    let _ = files.clear_fd(fd);
-    drop(files);
     if let Some((inode, writable, is_dir, path)) = fanotify_close {
         fanotify_notify_close(&inode, writable, is_dir, path.as_deref());
     }
@@ -573,6 +574,7 @@ pub fn syscall_close(fd: usize) -> isize {
             crate::println!("[fs] close(pid={}) fd={}", pid, fd);
         }
     }
+    drop(file);
     0
 }
 

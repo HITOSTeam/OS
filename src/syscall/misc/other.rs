@@ -106,8 +106,7 @@ pub fn syscall_get_robust_list(pid: usize, head_ptr: usize, len_ptr: usize) -> i
         let Some(target_proc) = pid2process(pid) else {
             return err(SyscallError::ESRCH);
         };
-        let inner = target_proc.borrow_mut();
-        let Some(task) = inner.tasks.first().and_then(|t| t.as_ref()).cloned() else {
+        let Some(task) = target_proc.task_at(0) else {
             return err(SyscallError::ESRCH);
         };
         task

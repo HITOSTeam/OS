@@ -71,19 +71,55 @@ pub(super) fn user_range_valid(start: usize, end: usize) -> bool {
     start < end && end <= USER_VA_TOP
 }
 
-pub(super) fn overcommit_limit_bytes() -> Option<usize> {
-    match vm_overcommit_memory() {
-        // 模式 0 是 Linux 的启发式 overcommit。当前内核还没有 swap/reclaim，
-        // 因此给匿名私有可写 commit 留出有限裕量，但仍拒绝明显超过
-        // 物理内存两倍的大额请求。
-        0 => {
-            let total = crate::mm::frame_managed_pages().saturating_mul(PAGE_SIZE);
-            Some(total.saturating_add(total / 2))
+#[derive(Clone, Copy)]
+pub(super) struct OvercommitSnapshot {
+    limit: Option<usize>,
+    committed: usize,
+    cumulative: bool,
+}
+
+impl OvercommitSnapshot {
+    /// 在获取当前进程 mm 锁之前拍摄 overcommit 状态。Linux 模式 0 是
+    /// 启发式检查，只拒绝单次明显超过可用内存的请求；模式 2 才使用全局
+    /// committed 快照。这样常见的 brk/mmap 不再扫描并锁住所有 PCB。
+    pub fn capture() -> Self {
+        match vm_overcommit_memory() {
+            0 => {
+                let total = crate::mm::frame_managed_pages().saturating_mul(PAGE_SIZE);
+                Self {
+                    limit: Some(total.saturating_add(total / 2)),
+                    committed: 0,
+                    cumulative: false,
+                }
+            }
+            1 => Self {
+                limit: None,
+                committed: 0,
+                cumulative: false,
+            },
+            2 => Self {
+                limit: Some(vm_commit_limit_bytes()),
+                committed: vm_committed_as_bytes(),
+                cumulative: true,
+            },
+            _ => Self {
+                limit: None,
+                committed: 0,
+                cumulative: false,
+            },
         }
-        // 不设限
-        1 => None,
-        2 => Some(vm_commit_limit_bytes()),
-        _ => None,
+    }
+
+    pub fn rejects(self, additional_bytes: usize) -> bool {
+        let Some(limit) = self.limit else {
+            return false;
+        };
+        let requested = if self.cumulative {
+            self.committed.saturating_add(additional_bytes)
+        } else {
+            additional_bytes
+        };
+        requested > limit
     }
 }
 
@@ -91,10 +127,7 @@ pub(super) fn exceeds_overcommit_limit(additional_bytes: usize) -> bool {
     if additional_bytes == 0 {
         return false;
     }
-    let Some(limit) = overcommit_limit_bytes() else {
-        return false;
-    };
-    vm_committed_as_bytes().saturating_add(additional_bytes) > limit
+    OvercommitSnapshot::capture().rejects(additional_bytes)
 }
 
 pub(super) fn find_inode_file_in_snapshot(
@@ -124,11 +157,7 @@ pub(super) fn find_open_inode_file(
     };
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }
@@ -168,11 +197,7 @@ pub(super) fn find_open_shm_file(memfd_id: u64) -> Option<Arc<dyn File + Send + 
     };
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            continue;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
+        let files = process.files();
         if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
             continue;
         }

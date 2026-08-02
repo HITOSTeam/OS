@@ -456,16 +456,14 @@ fn try_resolve_lazy_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if token != inner.memory_set.token() {
+    let memory_set = process.memory_set();
+    if token != memory_set.token() {
         return false;
     }
-    match inner.memory_set.resolve_lazy_fault(va, access) {
+    match memory_set.resolve_lazy_fault(va, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => {
-            drop(inner);
+            drop(memory_set);
             crate::task::processor::exit_group_and_run_next(-9)
         }
         LazyFaultResult::Invalid => false,
@@ -479,19 +477,17 @@ fn try_resolve_user_page(token: usize, va: usize, access: MapPermission) -> bool
     let Some(process) = task.process.upgrade() else {
         return false;
     };
-    let Some(inner) = process.try_borrow_mut() else {
-        return false;
-    };
-    if token != inner.memory_set.token() {
+    let memory_set = process.memory_set();
+    if token != memory_set.token() {
         return false;
     }
-    if access.contains(MapPermission::W) && inner.memory_set.resolve_cow_fault(va) {
+    if access.contains(MapPermission::W) && memory_set.resolve_cow_fault(va) {
         return true;
     }
-    match inner.memory_set.resolve_lazy_fault(va, access) {
+    match memory_set.resolve_lazy_fault(va, access) {
         LazyFaultResult::Resolved => true,
         LazyFaultResult::Oom => {
-            drop(inner);
+            drop(memory_set);
             crate::task::processor::exit_group_and_run_next(-9)
         }
         LazyFaultResult::Invalid => false,
