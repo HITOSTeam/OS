@@ -1,18 +1,14 @@
 use super::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, BTreeSet, FS_APPEND_FL,
-    FS_IMMUTABLE_FL, Mutex, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOATIME, O_NONBLOCK, O_RDONLY,
-    O_TRUNC, O_WRONLY, OSInode, Ordering, PID2PCB, S_IFBLK, S_IFCHR, S_IFMT, SIGXFSZ_NUM, String,
-    SyscallError, TMPFILE_SEQ, Vec, apply_chmod_to_vfs_path, clear_ext4_path_cache,
-    current_effective_uid_gid, current_files, current_fsuid_gid, current_in_group, current_process,
-    current_timespec, empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_inode_lock,
-    ext4_topology_lock, fchmod_fd_for_at_empty_path, fifo_pipe_state_for_inode,
-    file_lock_key_from_inode, get_current_token, inode_mode_allows, inode_mode_allows_uid_gid,
-    inode_visible_size_with_disk_size, install_open_file_fd, map_vfs_error,
-    maybe_signal_lease_break, note_inode_path_hint, pin_legacy_file_path, queue_process_signal,
-    read_user_cstring, register_deferred_unlink_cleanup, resolve_at_inode,
-    resolve_at_inode_with_vfs_path, resolve_at_path, resolve_at_vfs_path, resolve_parent_and_name,
-    resolve_parent_vfs_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
-    with_ext4_inode_write, with_ext4_inode_write_set,
+    AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, BTreeSet, FS_APPEND_FL,
+    FS_IMMUTABLE_FL, Mutex, OSInode, Ordering, PID2PCB, SIGXFSZ_NUM, String, SyscallError,
+    TMPFILE_SEQ, Vec, apply_chmod_to_vfs_path, clear_ext4_path_cache, current_effective_uid_gid,
+    current_files, current_fsuid_gid, current_in_group, current_process, current_timespec,
+    empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_topology_lock,
+    fchmod_fd_for_at_empty_path, get_current_token, inode_mode_allows_uid_gid,
+    inode_visible_size_with_disk_size, map_vfs_error, queue_process_signal, read_user_cstring,
+    register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_at_vfs_path,
+    resolve_parent_and_name, resolve_parent_vfs_path, syscall_fchmod, try_copy_from_user,
+    try_copy_to_user_unchecked, with_ext4_inode_write, with_ext4_inode_write_set,
 };
 use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{VfsMetadata, VfsNodeKind, VfsPath, VfsRenameFlags};
@@ -115,147 +111,6 @@ pub(crate) fn set_inode_fs_flags(ino: u64, flags: u32) {
 
 pub(crate) fn inode_is_immutable_or_append(inode: &Arc<ext4_fs::Inode>) -> bool {
     (inode_fs_flags(inode.inode_num() as u64) & (FS_IMMUTABLE_FL | FS_APPEND_FL)) != 0
-}
-
-pub(crate) fn open_existing_ext4_inode(
-    path: &str,
-    raw_abs: Option<&str>,
-    inode: alloc::sync::Arc<ext4_fs::Inode>,
-    vfs_path: Option<VfsPath>,
-    flags: usize,
-    readable: bool,
-    writable: bool,
-    append: bool,
-    o_path: bool,
-) -> Result<usize, isize> {
-    let readonly_fs = vfs_path
-        .as_ref()
-        .is_some_and(|path| path.mount().flags().is_read_only());
-    let inode_lock = ext4_inode_lock(&inode);
-    let inode_guard = inode_lock.read();
-
-    if let Some(abs) = raw_abs {
-        note_inode_path_hint(&inode, abs);
-    }
-    let mode = inode.mode() & S_IFMT;
-    if vfs_path
-        .as_ref()
-        .is_some_and(|path| path.mount().flags().is_nodev())
-        && matches!(mode, S_IFCHR | S_IFBLK)
-    {
-        return Err(err(SyscallError::EACCES));
-    }
-    if readonly_fs && !o_path && (writable || (flags & O_TRUNC) != 0) {
-        return Err(err(SyscallError::EROFS));
-    }
-
-    if !o_path && inode.is_dir() && ((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) != 0) {
-        return Err(err(SyscallError::EISDIR));
-    }
-
-    if (flags & O_NOATIME) != 0 {
-        let (euid, _egid) = current_effective_uid_gid();
-        if euid != 0 && euid != inode.uid() {
-            return Err(err(SyscallError::EPERM));
-        }
-    }
-
-    let mut mask = 0usize;
-    if readable {
-        mask |= 4;
-    }
-    if writable {
-        mask |= 2;
-    }
-    if !inode_mode_allows(&inode, mask) {
-        return Err(err(SyscallError::EACCES));
-    }
-
-    if (flags & O_DIRECTORY) != 0 && !inode.is_dir() {
-        return Err(err(SyscallError::ENOTDIR));
-    }
-
-    if !o_path && inode.is_fifo() {
-        let state = fifo_pipe_state_for_inode(inode.device_id() as u64, inode.inode_num() as u64);
-        let accmode = flags & O_ACCMODE;
-        if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
-            drop(inode_guard);
-            return Err(err(SyscallError::ENXIO));
-        }
-        let Some(mut file) = state.open_file(accmode) else {
-            drop(inode_guard);
-            return Err(err(SyscallError::EINVAL));
-        };
-        drop(inode_guard);
-        if let Some(object_path) = vfs_path.as_ref() {
-            file = pin_legacy_file_path(file, object_path.clone(), raw_abs.unwrap_or("/"));
-        }
-        return install_open_file_fd(file, flags, o_path);
-    }
-
-    let inode_num = inode.inode_num();
-    let os_inode = match OSInode::new_with_append_rofs_tmp_cleanup(
-        readable,
-        writable,
-        append,
-        alloc::sync::Arc::clone(&inode),
-        readonly_fs,
-        false,
-        None,
-    ) {
-        Ok(file) => alloc::sync::Arc::new(
-            file.with_fanotify_path(raw_abs.map(alloc::string::String::from))
-                .with_vfs_path(vfs_path),
-        ),
-        Err(e) => return Err(e),
-    };
-
-    if !o_path && inode.is_file() {
-        maybe_signal_lease_break(
-            file_lock_key_from_inode(&inode),
-            writable,
-            false,
-            current_process().getpid(),
-        );
-    }
-
-    let needs_trunc = !o_path && (flags & O_TRUNC) != 0 && writable && inode.is_file();
-    drop(inode_guard);
-    if needs_trunc {
-        let ret = truncate_regular_inode(&inode, 0);
-        if ret != 0 {
-            return Err(ret);
-        }
-        touch_inode_mtime_ctime_now(&inode);
-    }
-
-    crate::fs::debug_track_iozone_inode(path, inode_num);
-    install_open_file_fd(os_inode, flags, o_path)
-}
-
-pub(crate) fn open_existing_target_path(
-    abs: &str,
-    flags: usize,
-    readable: bool,
-    writable: bool,
-    append: bool,
-    o_path: bool,
-) -> Result<usize, isize> {
-    let at = resolve_at_path(AT_FDCWD, abs)?;
-
-    let (fsuid, fsgid) = current_fsuid_gid();
-    let (inode, vfs_path) = resolve_at_inode_with_vfs_path(&at, fsuid, fsgid, true)?;
-    open_existing_ext4_inode(
-        abs,
-        Some(abs),
-        inode,
-        vfs_path,
-        flags,
-        readable,
-        writable,
-        append,
-        o_path,
-    )
 }
 
 /// Linux `faccessat(2)` (syscall 48 on riscv64).

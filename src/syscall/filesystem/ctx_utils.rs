@@ -3,8 +3,6 @@ use super::{
     MOUNT_ATTR_NOSUID, MOUNT_ATTR_NOSYMFOLLOW, MOUNT_ATTR_RDONLY, MOUNT_ATTR_STRICTATIME,
     MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_RDONLY,
     MS_STRICTATIME, Mutex, String, SyscallError, UserBuffer, current_files_and_nofile_limit, err,
-    find_path_in_roots, get_current_token, mount_lookup_for_abs, read_user_cstring,
-    register_rofs_mount, resolve_abs_path, unregister_rofs_mount, with_ext4_inode_read,
 };
 use crate::fs::vfs::{PinnedPath, VfsFileSystem, VfsMountNamespace, VfsPath};
 
@@ -296,48 +294,4 @@ pub(crate) fn mount_attr_bits_to_legacy_flags(attrs: usize) -> usize {
         flags |= MS_NOSYMFOLLOW;
     }
     flags
-}
-
-/// Mirrors the effective read-only mount flag into the path-based rofs registry.
-pub(crate) fn sync_rofs_state(target: &str, flags: usize) {
-    if (flags & MS_RDONLY) != 0 {
-        register_rofs_mount(target);
-    } else {
-        unregister_rofs_mount(target);
-    }
-}
-
-/// Reads a userspace path and resolves it to an absolute path string.
-pub(crate) fn read_user_path_abs(dirfd: isize, ptr: usize) -> Result<String, isize> {
-    let token = get_current_token();
-    let path = read_user_cstring(token, ptr)?;
-    if path.is_empty() {
-        return Err(err(SyscallError::ENOENT));
-    }
-    resolve_abs_path(dirfd, &path)?.ok_or_else(|| err(SyscallError::EBADF))
-}
-
-/// Ensures that a mount target exists and names a directory.
-pub(crate) fn ensure_mount_target_dir(abs: &str) -> Result<(), isize> {
-    let Some(inode) = find_path_in_roots(abs) else {
-        return Err(err(SyscallError::ENOENT));
-    };
-    if !with_ext4_inode_read(&inode, || inode.is_dir()) {
-        return Err(err(SyscallError::ENOTDIR));
-    }
-    Ok(())
-}
-
-/// Returns the filesystem type currently associated with an absolute mount path.
-pub(crate) fn mount_fs_type_for_abs(abs: &str) -> String {
-    mount_lookup_for_abs(abs)
-        .map(|m| m.fs_type)
-        .unwrap_or_else(|| String::from("ext4"))
-}
-
-/// Returns the source string that should be shown for an existing mount.
-pub(crate) fn mount_source_display_for_abs(abs: &str) -> String {
-    mount_lookup_for_abs(abs)
-        .map(|m| m.source_display)
-        .unwrap_or_else(|| String::from("/dev/root"))
 }

@@ -2486,29 +2486,6 @@ pub(crate) fn statfs_mount_backend_for_abs(abs: &str) -> MountBackend {
         .unwrap_or(MountBackend::Storage)
 }
 
-pub(crate) fn register_rofs_mount(abs: &str) {
-    let ns = current_mount_namespace();
-    with_mount_namespace_mut(&ns, |state| {
-        let mounts = state.rofs_mounts_mut();
-        if !mounts.iter().any(|m| m == abs) {
-            mounts.push(String::from(abs));
-        }
-    });
-    let _ = update_mount_record_flags(abs, mount_flags_for_abs(abs) | MS_RDONLY);
-}
-
-pub(crate) fn unregister_rofs_mount(abs: &str) {
-    with_mount_namespace_mut(&current_mount_namespace(), |state| {
-        state.rofs_mounts_mut().retain(|m| m != abs);
-    });
-    if let Some(mut record) = mount_lookup_for_abs(abs) {
-        if record.target == abs {
-            record.flags &= !MS_RDONLY;
-            let _ = update_mount_record_flags(abs, record.flags);
-        }
-    }
-}
-
 pub(crate) fn path_under_mount(abs: &str, mnt: &str) -> bool {
     if mnt == "/" {
         return true;
