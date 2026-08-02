@@ -18,15 +18,20 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::bpf::BpfProgFile;
+use crate::fs::vfs::{PinnedPath, VfsError, VfsNodeKind, VfsParentPath, VfsPath};
 use crate::fs::{
-    File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, clear_ext4_path_cache,
-    ext4_inode_lock, find_path_in_roots, make_socketpair, wake_tasks,
+    File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollWaitQueue, SocketPairEnd, make_socketpair,
+    wake_tasks,
 };
 use crate::mm::{
     UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
 };
+use crate::sync::KernelMutex;
 use crate::syscall::error::{SyscallError, err};
-use crate::syscall::filesystem::normalize_path;
+use crate::syscall::filesystem::{
+    AT_FDCWD, apply_umask, current_fsuid_gid, invalidate_vfs_parent_entry, map_vfs_error,
+    resolve_at_path, resolve_at_vfs_path, resolve_parent_vfs_path, vfs_mode_allows_uid_gid,
+};
 use crate::task::processor::{current_process, current_task, suspend_current_and_run_next};
 use crate::task::signal::has_wait_interrupting_pending;
 use crate::task::task_block::TaskControlBlock;
@@ -37,6 +42,48 @@ use super::*;
 
 /// 指向 `File` trait 对象的弱引用别名，用于注册表中持有 socket 而不阻止其释放。
 type FileWeak = Weak<dyn File + Send + Sync>;
+
+/// Linux pathname AF_UNIX lookup finds the bound socket by inode, not by the
+/// spelling used to reach it.  A filesystem ID is needed because node IDs are
+/// only stable within one superblock.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct UnixSocketNodeKey {
+    filesystem_id: u64,
+    node_id: u64,
+}
+
+impl UnixSocketNodeKey {
+    fn from_path(path: &VfsPath) -> Self {
+        Self {
+            filesystem_id: path.node().filesystem_id(),
+            node_id: path.node().node_id(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UnixSocketRoute {
+    Path(UnixSocketNodeKey),
+    Abstract(Vec<u8>),
+}
+
+#[derive(Clone)]
+struct UnixConnectedDgramPeer {
+    /// Retain the identity selected by connect for diagnostics and to make it
+    /// explicit that a later pathname rebind must not retarget this socket.
+    _route: UnixSocketRoute,
+    file: FileWeak,
+}
+
+struct UnixPathBinding {
+    key: UnixSocketNodeKey,
+    _path: PinnedPath,
+}
+
+struct UnixSocketRegistration {
+    socket_id: u64,
+    file: FileWeak,
+}
 
 /// AF_UNIX socket 的绑定地址，对应 POSIX 定义的两种命名空间。
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -49,16 +96,20 @@ pub(super) enum UnixBoundAddr {
 }
 
 lazy_static! {
-    /// 路径绑定注册表：将文件系统路径映射到对应 socket 的弱引用。
+    /// Pathname sockets are keyed by the resolved socket inode.  This makes
+    /// rename, hard links and bind-mount aliases observe one endpoint while
+    /// allowing a name to be reused after unlink creates a new inode.
     /// 使用 `Weak` 而非 `Arc` 是为了让 socket 在最后一个强引用消失时能自动 drop，
     /// 无需调用方显式注销——`Drop for UnixSocketFile` 会主动清除条目，
     /// 但即便忘记清除，`Weak::upgrade()` 失败后查找函数也会惰性删除过期条目。
-    static ref UNIX_BOUND_PATHS: Mutex<BTreeMap<String, FileWeak>> = Mutex::new(BTreeMap::new());
+    static ref UNIX_BOUND_PATHS: Mutex<BTreeMap<UnixSocketNodeKey, UnixSocketRegistration>> =
+        Mutex::new(BTreeMap::new());
     /// 抽象命名空间注册表：将 `(netns, 抽象名称)` 映射到 socket 的弱引用。
     /// Linux 的 abstract UNIX socket namespace 跟随 network namespace，而不是全局共享。
     /// 设计原因与 `UNIX_BOUND_PATHS` 相同，参见上方注释。
-    static ref UNIX_BOUND_ABSTRACT: Mutex<BTreeMap<(usize, Vec<u8>), FileWeak>> =
-        Mutex::new(BTreeMap::new());
+    static ref UNIX_BOUND_ABSTRACT: Mutex<
+        BTreeMap<(usize, Vec<u8>), UnixSocketRegistration>,
+    > = Mutex::new(BTreeMap::new());
 }
 
 pub(super) fn cleanup_net_namespace(ns_id: usize) {
@@ -89,6 +140,9 @@ struct UnixSocketFilterSnapshot {
 pub(super) struct UnixSocketState {
     /// socket 当前绑定的地址，`None` 表示尚未 bind。
     bound: Option<UnixBoundAddr>,
+    /// Pathname sockets retain the exact mount+dentry selected by bind, just
+    /// like Linux unix_sock.path. Abstract sockets leave this empty.
+    bound_path: Option<UnixPathBinding>,
     /// 是否已进入监听状态（stream 类型调用 `listen` 后置 true）。
     listening: bool,
     /// 监听队列上限，对应 `listen(backlog)`，内部钳位到 [1, 32]。
@@ -103,8 +157,9 @@ pub(super) struct UnixSocketState {
     local_cred: UCred,
     /// 对端进程凭证，连接时由内核填入，供 `SO_PEERCRED` 查询使用。
     peer_cred: Option<UCred>,
-    /// dgram 模式下 `connect` 设定的默认发送目标，省去每次 `sendto` 都指定地址。
-    dgram_peer: Option<UnixBoundAddr>,
+    /// dgram connect stores a resolved route. A pathname is not looked up
+    /// again for every send, so rename/unlink cannot retarget the connection.
+    dgram_peer: Option<UnixConnectedDgramPeer>,
     /// dgram 接收队列，按到达顺序存放，由 `send_dgram` 写入、`recv_dgram` 消费。
     pub(super) dgram_queue: VecDeque<UnixDatagram>,
     reuseaddr: bool,
@@ -137,6 +192,7 @@ impl UnixSocketState {
     fn new_with_cred(local_cred: UCred) -> Self {
         Self {
             bound: None,
+            bound_path: None,
             listening: false,
             backlog: 1,
             pending_accept: VecDeque::new(),
@@ -185,6 +241,9 @@ pub(crate) struct UnixSocketFile {
     /// socket 创建时所在的 network namespace。抽象 UNIX socket 名称空间按此字段隔离；
     /// 路径 socket 仍通过 VFS 路径可见。
     net_ns_id: usize,
+    /// Linux uses unix_sock.bindlock so concurrent bind calls on one socket
+    /// serialize without holding a spin lock across pathname I/O.
+    bind_lock: KernelMutex<()>,
     pub(super) state: Mutex<UnixSocketState>,
 }
 
@@ -195,6 +254,7 @@ impl UnixSocketFile {
             sock_type,
             proc_inode: alloc_socket_inode(),
             net_ns_id: current_process().net_namespace_id(),
+            bind_lock: KernelMutex::new(()),
             state: Mutex::new(UnixSocketState::new()),
         }
     }
@@ -222,6 +282,7 @@ impl UnixSocketFile {
             sock_type,
             proc_inode: alloc_socket_inode(),
             net_ns_id,
+            bind_lock: KernelMutex::new(()),
             state: Mutex::new(state),
         }
     }
@@ -525,14 +586,15 @@ impl UnixSocketFile {
         (self.proc_inode, self.sock_type, socket_state, path)
     }
 
-    fn set_bound_addr(&self, addr: UnixBoundAddr) {
-        self.state.lock().bound = Some(addr);
+    fn set_bound(&self, addr: UnixBoundAddr, path: Option<UnixPathBinding>) {
+        let mut state = self.state.lock();
+        state.bound = Some(addr);
+        state.bound_path = path;
     }
 
     /// 返回对端地址：stream 连接优先，dgram 默认目标次之。
     pub(super) fn peer_addr(&self) -> Option<UnixBoundAddr> {
-        let st = self.state.lock();
-        st.peer_addr.clone().or_else(|| st.dgram_peer.clone())
+        self.state.lock().peer_addr.clone()
     }
 
     /// 返回对端进程凭证，供 `SO_PEERCRED` 使用。
@@ -666,18 +728,19 @@ impl UnixSocketFile {
                     return err(SyscallError::EISCONN);
                 }
             }
-            let peer_file = match lookup_unix_bound_socket(self.net_ns_id, &addr) {
-                Ok(f) => f,
+            let (peer_file, _route) = match lookup_unix_bound_socket(self.net_ns_id, &addr) {
+                Ok(peer) => peer,
                 Err(e) => return e,
             };
             let Some(peer) = peer_file.as_any().downcast_ref::<UnixSocketFile>() else {
                 return err(SyscallError::ECONNREFUSED);
             };
             if !peer.is_stream_like() {
-                return err(SyscallError::EPROTONOSUPPORT);
+                return err(SyscallError::EPROTOTYPE);
             }
             let (client_end, server_end) = make_socketpair();
             let client_bound = self.bound_addr();
+            let peer_bound = peer.bound_addr().unwrap_or_else(|| addr.clone());
             let client_cred = current_unix_ucred();
             let peer_cred = peer.local_cred();
             {
@@ -720,7 +783,7 @@ impl UnixSocketFile {
                     return err(SyscallError::EISCONN);
                 }
                 st.stream_end = Some(client_end.clone());
-                st.peer_addr = Some(addr);
+                st.peer_addr = Some(peer_bound);
                 st.peer_cred = Some(peer_cred);
                 (
                     st.filter_snapshot(),
@@ -739,21 +802,25 @@ impl UnixSocketFile {
         if !self.is_dgram() {
             return err(SyscallError::EPROTONOSUPPORT);
         }
-        let peer_file = match lookup_unix_bound_socket(self.net_ns_id, &addr) {
-            Ok(f) => f,
+        let (peer_file, route) = match lookup_unix_bound_socket(self.net_ns_id, &addr) {
+            Ok(peer) => peer,
             Err(e) => return e,
         };
         let Some(peer) = peer_file.as_any().downcast_ref::<UnixSocketFile>() else {
             return err(SyscallError::ECONNREFUSED);
         };
         if !peer.is_dgram() {
-            return err(SyscallError::EPROTONOSUPPORT);
+            return err(SyscallError::EPROTOTYPE);
         }
         let peer_cred = peer.local_cred();
+        let peer_bound = peer.bound_addr().unwrap_or(addr);
         // dgram connect 仅记录默认目标，不建立真正的连接状态
         let mut st = self.state.lock();
-        st.dgram_peer = Some(addr.clone());
-        st.peer_addr = Some(addr);
+        st.dgram_peer = Some(UnixConnectedDgramPeer {
+            _route: route,
+            file: Arc::downgrade(&peer_file),
+        });
+        st.peer_addr = Some(peer_bound);
         st.peer_cred = Some(peer_cred);
         0
     }
@@ -789,7 +856,7 @@ impl UnixSocketFile {
         if !self.is_dgram() {
             return err(SyscallError::EOPNOTSUPP);
         }
-        let (to, from, sender_passcred) = {
+        let (from, sender_passcred, connected_route) = {
             let st = self.state.lock();
             if st.wr_shutdown {
                 let e = err(SyscallError::EPIPE);
@@ -797,14 +864,20 @@ impl UnixSocketFile {
                 self.set_socket_error(e);
                 return e;
             }
-            // 优先使用调用方传入的显式目标，其次回退到 connect 记录的默认目标
-            let Some(to) = target.or_else(|| st.dgram_peer.clone()) else {
-                return err(SyscallError::ENOTCONN);
-            };
-            (to, st.bound.clone(), st.passcred)
+            (st.bound.clone(), st.passcred, st.dgram_peer.clone())
         };
-        let peer_file = match lookup_unix_bound_socket(self.net_ns_id, &to) {
-            Ok(f) => f,
+        let peer_result = match target {
+            Some(target) => lookup_unix_bound_socket(self.net_ns_id, &target).map(|peer| peer.0),
+            None => match connected_route {
+                Some(peer) => peer
+                    .file
+                    .upgrade()
+                    .ok_or_else(|| err(SyscallError::ECONNREFUSED)),
+                None => return err(SyscallError::ENOTCONN),
+            },
+        };
+        let peer_file = match peer_result {
+            Ok(file) => file,
             Err(e) => {
                 self.record_peer_error(e);
                 return e;
@@ -816,7 +889,7 @@ impl UnixSocketFile {
             return e;
         };
         if !peer.is_dgram() {
-            return err(SyscallError::EPROTONOSUPPORT);
+            return err(SyscallError::EPROTOTYPE);
         }
         let n = payload.len();
         let wake = {
@@ -966,16 +1039,25 @@ impl Drop for UnixSocketFile {
     /// 路径绑定仅清理注册表条目，文件系统中的占位文件不在此处删除。
     fn drop(&mut self) {
         crate::syscall::net::clear_msg_more_pending_for_addr(self as *const Self as usize);
-        if let Some(bound) = self.state.lock().bound.take() {
+        let (bound, path_binding) = {
+            let mut state = self.state.lock();
+            (state.bound.take(), state.bound_path.take())
+        };
+        if let Some(bound) = bound {
             match bound {
-                UnixBoundAddr::Path(path) => {
-                    UNIX_BOUND_PATHS.lock().remove(&path);
+                UnixBoundAddr::Path(_) => {
+                    if let Some(binding) = path_binding.as_ref() {
+                        unregister_path_socket(binding.key, self.proc_inode);
+                    }
                 }
                 UnixBoundAddr::Abstract(name) => {
-                    UNIX_BOUND_ABSTRACT.lock().remove(&(self.net_ns_id, name));
+                    unregister_abstract_socket(self.net_ns_id, &name, self.proc_inode);
                 }
             }
         }
+        // Drop the pinned mount only after the registry no longer exposes the
+        // endpoint. The filesystem socket inode itself remains until unlink.
+        drop(path_binding);
     }
 }
 
@@ -1119,24 +1201,6 @@ pub(super) struct SockAddrUn {
     sun_path: [u8; 108],
 }
 
-/// 将绝对路径拆分为父目录和文件名，用于在父目录下创建 socket 占位文件。
-///
-/// 去除尾部多余 `/` 后再分割，以处理形如 `/tmp/sock/` 的输入。
-/// 根路径 `/` 本身无法再拆分，返回 `None`。
-fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "/" {
-        return None;
-    }
-    let (parent, name) = trimmed.rsplit_once('/')?;
-    // rsplit_once 在路径为 "/foo" 时会产生空的 parent，需要还原为 "/"
-    let parent = if parent.is_empty() { "/" } else { parent };
-    if name.is_empty() {
-        return None;
-    }
-    Some((parent, name))
-}
-
 /// 读取当前进程的有效 UID/GID 并打包为 `UCred`，供 `SO_PEERCRED` 使用。
 fn current_unix_ucred() -> UCred {
     UCred::current()
@@ -1207,7 +1271,9 @@ pub(super) fn read_sockaddr_un_family(addr: usize, addrlen: usize) -> Result<u16
 
 /// 将用户空间的 `sockaddr_un` 转换为内核的 `UnixBoundAddr`。
 ///
-/// 路径类型会相对当前进程工作目录规范化为绝对路径，确保后续注册表查找结果一致。
+/// Pathname spelling is retained for getsockname/proc display. Object identity
+/// is resolved separately at bind/connect time; normalizing through a display
+/// cwd would lose chroot, overmount and old-cwd semantics.
 pub(super) fn parse_unix_bound_addr(addr: usize, addrlen: usize) -> Result<UnixBoundAddr, isize> {
     let (is_abstract, raw_name) = parse_sockaddr_un(addr, addrlen)?;
     if is_abstract {
@@ -1216,77 +1282,224 @@ pub(super) fn parse_unix_bound_addr(addr: usize, addrlen: usize) -> Result<UnixB
     let Ok(path_part) = core::str::from_utf8(&raw_name) else {
         return Err(err(SyscallError::EINVAL));
     };
-    let cwd = current_process().fs_struct().cwd_display();
-    // 相对路径需要结合 cwd 规范化，保证不同进程使用同一路径时能命中同一注册表条目
-    let abs = normalize_path(&cwd, path_part);
-    Ok(UnixBoundAddr::Path(abs))
+    Ok(UnixBoundAddr::Path(String::from(path_part)))
 }
 
-/// 在全局注册表中查找指定地址对应的 socket 强引用。
-///
-/// 若找到条目但 `Weak::upgrade()` 失败，说明 socket 已 drop 但条目未被 `Drop` 清除
-/// （理论上不应发生，但作为防御性措施），此时惰性删除过期条目。
-fn lookup_unix_bound_socket(ns_id: usize, addr: &UnixBoundAddr) -> Result<FileArc, isize> {
+fn lookup_path_registration(key: UnixSocketNodeKey) -> Result<FileArc, isize> {
+    let mut registry = UNIX_BOUND_PATHS.lock();
+    let Some(entry) = registry.get(&key) else {
+        return Err(err(SyscallError::ECONNREFUSED));
+    };
+    if let Some(file) = entry.file.upgrade() {
+        return Ok(file);
+    }
+    registry.remove(&key);
+    Err(err(SyscallError::ECONNREFUSED))
+}
+
+fn lookup_abstract_registration(ns_id: usize, name: &[u8]) -> Result<FileArc, isize> {
+    let key = (ns_id, name.to_vec());
+    let mut registry = UNIX_BOUND_ABSTRACT.lock();
+    let Some(entry) = registry.get(&key) else {
+        return Err(err(SyscallError::ECONNREFUSED));
+    };
+    if let Some(file) = entry.file.upgrade() {
+        return Ok(file);
+    }
+    registry.remove(&key);
+    Err(err(SyscallError::ECONNREFUSED))
+}
+
+fn resolve_unix_path_route(pathname: &str) -> Result<UnixSocketNodeKey, isize> {
+    let at = resolve_at_path(AT_FDCWD, pathname)?;
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let path = resolve_at_vfs_path(&at, fsuid, fsgid, true)?;
+    let metadata = path.node().metadata().map_err(map_vfs_error)?;
+    if metadata.kind != VfsNodeKind::Socket {
+        return Err(err(SyscallError::ECONNREFUSED));
+    }
+    // Linux unix_find_bsd() applies MAY_WRITE to the resolved socket inode.
+    if !vfs_mode_allows_uid_gid(metadata, 2, fsuid, fsgid) {
+        return Err(err(SyscallError::EACCES));
+    }
+    Ok(UnixSocketNodeKey::from_path(&path))
+}
+
+fn resolve_unix_route(addr: &UnixBoundAddr) -> Result<UnixSocketRoute, isize> {
     match addr {
-        UnixBoundAddr::Path(path) => {
-            let mut reg = UNIX_BOUND_PATHS.lock();
-            let Some(weak) = reg.get(path) else {
-                return Err(err(SyscallError::ENOENT));
-            };
-            if let Some(file) = weak.upgrade() {
-                return Ok(file);
-            }
-            // Weak 已失效，惰性清除过期条目
-            reg.remove(path);
-            Err(err(SyscallError::ENOENT))
-        }
-        UnixBoundAddr::Abstract(name) => {
-            let mut reg = UNIX_BOUND_ABSTRACT.lock();
-            let key = (ns_id, name.clone());
-            let Some(weak) = reg.get(&key) else {
-                return Err(err(SyscallError::ENOENT));
-            };
-            if let Some(file) = weak.upgrade() {
-                return Ok(file);
-            }
-            // Weak 已失效，惰性清除过期条目
-            reg.remove(&key);
-            Err(err(SyscallError::ENOENT))
-        }
+        UnixBoundAddr::Path(path) => resolve_unix_path_route(path).map(UnixSocketRoute::Path),
+        UnixBoundAddr::Abstract(name) => Ok(UnixSocketRoute::Abstract(name.clone())),
     }
 }
 
-/// 将 socket 以弱引用形式注册到全局注册表。
-///
-/// 若地址已被存活的 socket 占用则返回 EADDRINUSE；
-/// 若旧条目的 Weak 已失效（对应 socket 已 drop），则替换旧条目以允许复用。
-fn register_unix_bound_socket(ns_id: usize, addr: &UnixBoundAddr, file: &FileArc) -> isize {
-    match addr {
-        UnixBoundAddr::Path(path) => {
-            let mut reg = UNIX_BOUND_PATHS.lock();
-            if let Some(existing) = reg.get(path) {
-                if existing.upgrade().is_some() {
-                    return err(SyscallError::EADDRINUSE);
-                }
-                // 旧 socket 已释放，清除残留条目后允许重新注册
-                reg.remove(path);
-            }
-            reg.insert(path.clone(), Arc::downgrade(file));
-        }
-        UnixBoundAddr::Abstract(name) => {
-            let mut reg = UNIX_BOUND_ABSTRACT.lock();
-            let key = (ns_id, name.clone());
-            if let Some(existing) = reg.get(&key) {
-                if existing.upgrade().is_some() {
-                    return err(SyscallError::EADDRINUSE);
-                }
-                // 旧 socket 已释放，清除残留条目后允许重新注册
-                reg.remove(&key);
-            }
-            reg.insert(key, Arc::downgrade(file));
-        }
+fn lookup_unix_route(ns_id: usize, route: &UnixSocketRoute) -> Result<FileArc, isize> {
+    match route {
+        UnixSocketRoute::Path(key) => lookup_path_registration(*key),
+        UnixSocketRoute::Abstract(name) => lookup_abstract_registration(ns_id, name),
     }
-    0
+}
+
+fn lookup_unix_bound_socket(
+    ns_id: usize,
+    addr: &UnixBoundAddr,
+) -> Result<(FileArc, UnixSocketRoute), isize> {
+    let route = resolve_unix_route(addr)?;
+    let file = lookup_unix_route(ns_id, &route)?;
+    Ok((file, route))
+}
+
+fn register_path_socket(
+    key: UnixSocketNodeKey,
+    socket_id: u64,
+    file: &FileArc,
+    sock: &UnixSocketFile,
+    bound: UnixBoundAddr,
+    binding: UnixPathBinding,
+) -> Result<(), isize> {
+    let mut registry = UNIX_BOUND_PATHS.lock();
+    if let Some(existing) = registry.get(&key)
+        && existing.file.upgrade().is_some()
+    {
+        return Err(err(SyscallError::EADDRINUSE));
+    }
+    // Publish the socket state before making the registry entry visible.
+    // Readers release the registry lock before inspecting the socket, so they
+    // can never observe a registered endpoint with an uncommitted address.
+    sock.set_bound(bound, Some(binding));
+    registry.insert(
+        key,
+        UnixSocketRegistration {
+            socket_id,
+            file: Arc::downgrade(file),
+        },
+    );
+    Ok(())
+}
+
+fn register_abstract_socket(
+    ns_id: usize,
+    name: &[u8],
+    socket_id: u64,
+    file: &FileArc,
+    sock: &UnixSocketFile,
+    bound: UnixBoundAddr,
+) -> Result<(), isize> {
+    let key = (ns_id, name.to_vec());
+    let mut registry = UNIX_BOUND_ABSTRACT.lock();
+    if let Some(existing) = registry.get(&key)
+        && existing.file.upgrade().is_some()
+    {
+        return Err(err(SyscallError::EADDRINUSE));
+    }
+    sock.set_bound(bound, None);
+    registry.insert(
+        key,
+        UnixSocketRegistration {
+            socket_id,
+            file: Arc::downgrade(file),
+        },
+    );
+    Ok(())
+}
+
+fn unregister_path_socket(key: UnixSocketNodeKey, socket_id: u64) {
+    let mut registry = UNIX_BOUND_PATHS.lock();
+    if registry
+        .get(&key)
+        .is_some_and(|entry| entry.socket_id == socket_id)
+    {
+        registry.remove(&key);
+    }
+}
+
+fn unregister_abstract_socket(ns_id: usize, name: &[u8], socket_id: u64) {
+    let key = (ns_id, name.to_vec());
+    let mut registry = UNIX_BOUND_ABSTRACT.lock();
+    if registry
+        .get(&key)
+        .is_some_and(|entry| entry.socket_id == socket_id)
+    {
+        registry.remove(&key);
+    }
+}
+
+fn rollback_unix_path_node(parent: &VfsParentPath, expected: UnixSocketNodeKey) {
+    // Never unlink a replacement installed by a racing rename/create. Linux
+    // keeps the parent inode locked across this transaction; our backends own
+    // their directory locks internally, so object-identity validation is the
+    // corresponding minimal safety rule.
+    let still_created_object = parent
+        .parent
+        .node()
+        .lookup(&parent.name)
+        .ok()
+        .is_some_and(|node| {
+            node.filesystem_id() == expected.filesystem_id && node.node_id() == expected.node_id
+        });
+    if still_created_object {
+        let _ = parent.parent.node().unlink(&parent.name, false);
+    }
+    invalidate_vfs_parent_entry(parent);
+}
+
+fn bind_unix_path(file: &FileArc, sock: &UnixSocketFile, pathname: &str) -> Result<(), isize> {
+    let at = resolve_at_path(AT_FDCWD, pathname)?;
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let parent = resolve_parent_vfs_path(&at, fsuid, fsgid)?;
+    if parent.trailing_slash {
+        return Err(err(SyscallError::ENOENT));
+    }
+    if parent.parent.mount().flags().is_read_only() {
+        return Err(err(SyscallError::EROFS));
+    }
+    let parent_metadata = parent.parent.node().metadata().map_err(map_vfs_error)?;
+    if parent_metadata.kind != VfsNodeKind::Directory {
+        return Err(err(SyscallError::ENOTDIR));
+    }
+    if !vfs_mode_allows_uid_gid(parent_metadata, 3, fsuid, fsgid) {
+        return Err(err(SyscallError::EACCES));
+    }
+    let gid = if parent_metadata.mode & 0o2000 != 0 {
+        parent_metadata.gid
+    } else {
+        fsgid
+    };
+    let mode = apply_umask(0o777);
+    let node = match parent
+        .parent
+        .node()
+        .mknod(&parent.name, VfsNodeKind::Socket, mode, 0)
+    {
+        Ok(node) => node,
+        Err(VfsError::Exists) => return Err(err(SyscallError::EADDRINUSE)),
+        Err(error) => return Err(map_vfs_error(error)),
+    };
+    let key = UnixSocketNodeKey {
+        filesystem_id: node.filesystem_id(),
+        node_id: node.node_id(),
+    };
+    if let Err(error) = node.set_owner(fsuid, gid) {
+        rollback_unix_path_node(&parent, key);
+        return Err(map_vfs_error(error));
+    }
+    invalidate_vfs_parent_entry(&parent);
+    let path = VfsPath::created_child(&parent.parent, &parent.name, node);
+    let binding = UnixPathBinding {
+        key,
+        _path: PinnedPath::new(path),
+    };
+    if let Err(error) = register_path_socket(
+        key,
+        sock.proc_inode,
+        file,
+        sock,
+        UnixBoundAddr::Path(String::from(pathname)),
+        binding,
+    ) {
+        rollback_unix_path_node(&parent, key);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// 将 socket 绑定到指定地址，区分文件系统路径和抽象命名空间两种情况。
@@ -1302,6 +1515,7 @@ pub(super) fn bind_unix_socket(
     addr: usize,
     addrlen: usize,
 ) -> isize {
+    let _bind_guard = sock.bind_lock.lock();
     if sock.bound_addr().is_some() {
         return err(SyscallError::EINVAL);
     }
@@ -1309,45 +1523,24 @@ pub(super) fn bind_unix_socket(
         Ok(v) => v,
         Err(e) => return e,
     };
-    if let UnixBoundAddr::Path(abs) = &bound {
-        let Some((parent_path, name)) = split_parent_and_name(abs) else {
-            return err(SyscallError::EINVAL);
-        };
-        let Some(parent) = find_path_in_roots(parent_path) else {
-            return err(SyscallError::ENOENT);
-        };
-        let parent_lock = ext4_inode_lock(&parent);
-        let _parent_guard = parent_lock.write();
-        if !parent.is_dir() {
-            return err(SyscallError::ENOTDIR);
-        }
-        // 提前检查文件是否已存在，避免 create_file 返回模糊错误
-        if parent.find(name).is_some() {
-            return err(SyscallError::EADDRINUSE);
-        }
-        if parent.create_file(name).is_err() {
-            // create_file 失败后再次检查：可能是并发 bind 抢先创建了同名文件
-            if parent.find(name).is_some() {
-                return err(SyscallError::EADDRINUSE);
+    match &bound {
+        UnixBoundAddr::Path(pathname) => match bind_unix_path(file, sock, pathname) {
+            Ok(()) => {}
+            Err(error) => return error,
+        },
+        UnixBoundAddr::Abstract(name) => {
+            if let Err(error) = register_abstract_socket(
+                sock.net_ns_id,
+                name,
+                sock.proc_inode,
+                file,
+                sock,
+                bound.clone(),
+            ) {
+                return error;
             }
-            return err(SyscallError::EINVAL);
-        }
-        clear_ext4_path_cache();
-        let reg_result = register_unix_bound_socket(sock.net_ns_id, &bound, file);
-        if reg_result != 0 {
-            // 注册失败（如另一个 socket 已占用此路径），回滚删除刚创建的占位文件
-            if parent.unlink(name).is_ok() {
-                clear_ext4_path_cache();
-            }
-            return reg_result;
-        }
-    } else {
-        let reg_result = register_unix_bound_socket(sock.net_ns_id, &bound, file);
-        if reg_result != 0 {
-            return reg_result;
         }
     }
-    sock.set_bound_addr(bound);
     0
 }
 

@@ -105,6 +105,8 @@ pub enum SyscallError {
     EDESTADDRREQ = 89,
     /// A message, datagram, or packet is too large for the protocol or buffer.
     EMSGSIZE = 90,
+    /// The peer socket uses an incompatible protocol type for this operation.
+    EPROTOTYPE = 91,
     /// The protocol option is unknown, unsupported, or invalid at this level.
     ENOPROTOOPT = 92,
     /// The requested protocol is not supported by the socket family or stack.
