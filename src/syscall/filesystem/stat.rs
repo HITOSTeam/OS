@@ -3,16 +3,15 @@ use super::{
     BTreeSet, CgroupFile, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_SUPPORTED_MASK,
     FS_APPEND_FL, FS_IMMUTABLE_FL, FifoDuplexFile, File, KStat, MemfdFile, NetSocketFile, OSInode,
     PID2PCB, Pipe, ProcPseudoFile, ProcessControlBlock, PseudoBlock, PseudoDir, PseudoFile,
-    RtcFile, Statx, String, SyscallError, TimeSpec, Vec, VfsOpenedFile, current_effective_uid_gid,
+    RtcFile, Statx, SyscallError, TimeSpec, Vec, VfsOpenedFile, current_effective_uid_gid,
     current_fsuid_gid, current_process, current_timespec, err, fd_has_o_path,
-    file_lock_key_from_inode, fill_statfs, fill_statfs_for_backend, fill_statfs_from_vfs,
-    find_path_in_roots, flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file,
-    get_inode_times, inode_fs_flags, inode_mode_allows_uid_gid, inode_visible_size_with_disk_size,
+    file_lock_key_from_inode, fill_statfs, fill_statfs_from_vfs, find_path_in_roots,
+    flush_open_inode_views, fsize_limit_allows, get_current_token, get_fd_file, get_inode_times,
+    inode_fs_flags, inode_mode_allows_uid_gid, inode_visible_size_with_disk_size,
     is_privileged_or_owner, kstat_from_ext4_snapshot, kstat_from_fd, kstat_from_vfs_path,
     map_vfs_error, maybe_signal_lease_break, mount_flags_to_statfs, pseudo_block_note_sync,
-    punch_hole_keep_size, read_user_cstring, require_fd_file, resolve_abs_path, resolve_at_inode,
-    resolve_at_path, resolve_at_vfs_path, resolve_utime, set_inode_times,
-    statfs_mount_backend_for_abs, statfs_mount_flags_for_abs, statx_from_kstat, sync_all,
+    punch_hole_keep_size, read_user_cstring, require_fd_file, resolve_at_inode, resolve_at_path,
+    resolve_at_vfs_path, resolve_utime, set_inode_times, statx_from_kstat, sync_all,
     touch_inode_mtime_ctime_now, truncate_regular_inode, try_copy_to_user, try_read_user_value,
     try_write_user_value, update_current_inode_mmaps_size, update_current_os_inode_mmaps_size,
     vfs_mode_allows_uid_gid, with_ext4_inode_read, with_ext4_inode_write, write_zeros_range,
@@ -228,7 +227,7 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
     };
     let (fsuid, fsgid) = current_fsuid_gid();
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, true) {
-        Ok(Some(path)) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
             if path.mount().flags().is_read_only() {
                 return err(SyscallError::EROFS);
             }
@@ -253,10 +252,7 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
         Ok(path) => path,
         Err(error) => return error,
     };
-    if vfs_path
-        .as_ref()
-        .is_some_and(|path| path.mount().flags().is_read_only())
-    {
+    if vfs_path.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
     let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
@@ -341,35 +337,20 @@ pub fn syscall_statfs(pathname: usize, st_ptr: usize) -> isize {
     };
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    match resolve_at_vfs_path(&at, fsuid, fsgid, true) {
-        Ok(Some(path)) => {
-            let filesystem = path.mount().filesystem();
-            let stat = match filesystem.statfs() {
-                Ok(stat) => stat,
-                Err(error) => return map_vfs_error(error),
-            };
-            return fill_statfs_from_vfs(
-                st_ptr,
-                stat,
-                filesystem.filesystem_id(),
-                mount_flags_to_statfs(path.mount().flags().0),
-            );
-        }
-        Ok(None) => {}
+    let path = match resolve_at_vfs_path(&at, fsuid, fsgid, true) {
+        Ok(path) => path,
         Err(error) => return error,
-    }
-
-    if let Err(e) = resolve_at_inode(&at, fsuid, fsgid, true) {
-        return e;
-    }
-    let abs = resolve_abs_path(AT_FDCWD, path.as_str())
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| String::from("/"));
-    fill_statfs_for_backend(
+    };
+    let filesystem = path.mount().filesystem();
+    let stat = match filesystem.statfs() {
+        Ok(stat) => stat,
+        Err(error) => return map_vfs_error(error),
+    };
+    fill_statfs_from_vfs(
         st_ptr,
-        statfs_mount_backend_for_abs(&abs),
-        statfs_mount_flags_for_abs(&abs),
+        stat,
+        filesystem.filesystem_id(),
+        mount_flags_to_statfs(path.mount().flags().0),
     )
 }
 
@@ -615,7 +596,7 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
     let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
-        Ok(Some(path)) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
             return apply_utimens_to_vfs_path(&path, spec);
         }
         Ok(path) => path,
@@ -630,10 +611,7 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
         Ok(v) => v,
         Err(e) => return e,
     };
-    if vfs_path
-        .as_ref()
-        .is_some_and(|path| path.mount().flags().is_read_only())
-    {
+    if vfs_path.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
     with_ext4_inode_write(&inode, || {
@@ -946,24 +924,9 @@ fn resolve_vfs_stat_kstat(
     fsuid: u32,
     fsgid: u32,
     follow_final: bool,
-) -> Result<Option<KStat>, isize> {
-    let Some(path) = resolve_at_vfs_path(at, fsuid, fsgid, follow_final)? else {
-        return Ok(None);
-    };
-    kstat_from_vfs_path(&path).map(Some)
-}
-
-fn resolve_ext4_stat_kstat(
-    at: &AtPath,
-    fsuid: u32,
-    fsgid: u32,
-    follow_final: bool,
 ) -> Result<KStat, isize> {
-    // Object-VFS paths, including proc magic links, are resolved before this
-    // transitional ext4 fallback. Never reopen a pseudo backend from an inode
-    // path string: an old dirfd must continue to name its original tree.
-    let inode = resolve_at_inode(at, fsuid, fsgid, follow_final)?;
-    Ok(kstat_from_ext4_inode(&inode))
+    let path = resolve_at_vfs_path(at, fsuid, fsgid, follow_final)?;
+    kstat_from_vfs_path(&path)
 }
 
 fn busybox_fallback_kstat() -> Option<KStat> {
@@ -1013,26 +976,18 @@ pub fn syscall_newfstatat(dirfd: isize, pathname: usize, st_ptr: usize, _flags: 
 
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let object_stat = match resolve_vfs_stat_kstat(&at, fsuid, fsgid, follow_final) {
+    let st = match resolve_vfs_stat_kstat(&at, fsuid, fsgid, follow_final) {
         Ok(stat) => stat,
-        Err(error) => return error,
-    };
-    let st = if let Some(stat) = object_stat {
-        stat
-    } else {
-        match resolve_ext4_stat_kstat(&at, fsuid, fsgid, follow_final) {
-            Ok(v) => v,
-            Err(e)
-                if e == err(SyscallError::ENOENT)
-                    && matches!(path.as_str(), "busybox" | "./busybox") =>
-            {
-                match busybox_fallback_kstat() {
-                    Some(v) => v,
-                    None => return err(SyscallError::ENOENT),
-                }
+        Err(e)
+            if e == err(SyscallError::ENOENT)
+                && matches!(path.as_str(), "busybox" | "./busybox") =>
+        {
+            match busybox_fallback_kstat() {
+                Some(v) => v,
+                None => return err(SyscallError::ENOENT),
             }
-            Err(e) => return e,
         }
+        Err(error) => return error,
     };
 
     if try_write_user_value(token, st_ptr as *mut KStat, &st).is_err() {
@@ -1093,26 +1048,18 @@ pub fn syscall_statx(
 
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let (fsuid, fsgid) = current_fsuid_gid();
-    let object_stat = match resolve_vfs_stat_kstat(&at, fsuid, fsgid, follow_final) {
+    let st = match resolve_vfs_stat_kstat(&at, fsuid, fsgid, follow_final) {
         Ok(stat) => stat,
-        Err(error) => return error,
-    };
-    let st = if let Some(stat) = object_stat {
-        stat
-    } else {
-        match resolve_ext4_stat_kstat(&at, fsuid, fsgid, follow_final) {
-            Ok(v) => v,
-            Err(e)
-                if e == err(SyscallError::ENOENT)
-                    && matches!(path.as_str(), "busybox" | "./busybox") =>
-            {
-                match busybox_fallback_kstat() {
-                    Some(v) => v,
-                    None => return err(SyscallError::ENOENT),
-                }
+        Err(e)
+            if e == err(SyscallError::ENOENT)
+                && matches!(path.as_str(), "busybox" | "./busybox") =>
+        {
+            match busybox_fallback_kstat() {
+                Some(v) => v,
+                None => return err(SyscallError::ENOENT),
             }
-            Err(e) => return e,
         }
+        Err(error) => return error,
     };
 
     let stx = statx_from_kstat(&st);

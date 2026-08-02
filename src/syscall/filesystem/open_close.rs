@@ -10,15 +10,14 @@ use super::{
     current_process, err, ext4_err_to_errno, ext4_inode_lock, fanotify_notify_close,
     fanotify_notify_open, fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key,
     file_lock_key_from_inode, get_current_token, gid_for_created_inode, inode_mode_allows,
-    inode_mode_allows_uid_gid, install_open_file_fd, invalidate_ext4_path_cache_for_at,
-    invalidate_vfs_parent_entry, is_privileged_or_owner, make_pipe, map_vfs_error,
-    maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint, pin_legacy_file_path,
-    read_user_cstring, remove_owner_file_lease_for_key, remove_process_record_locks_for_key,
-    resolve_abs_path, resolve_at_inode_with_vfs_path_flags, resolve_at_path,
-    resolve_at_vfs_path_with_flags, resolve_openat2_path, resolve_parent_and_name_with_flags,
-    resolve_parent_vfs_path_with_flags, root_inode_for_device, set_inode_all_times_now,
-    touch_inode_mtime_ctime_now, truncate_regular_inode, try_copy_from_user, try_write_user_value,
-    with_ext4_inode_read,
+    inode_mode_allows_uid_gid, install_open_file_fd, invalidate_vfs_parent_entry,
+    is_privileged_or_owner, make_pipe, map_vfs_error, maybe_signal_lease_break,
+    mode_for_created_file, note_inode_path_hint, pin_legacy_file_path, read_user_cstring,
+    remove_owner_file_lease_for_key, remove_process_record_locks_for_key, resolve_abs_path,
+    resolve_at_inode_with_vfs_path_flags, resolve_at_path, resolve_at_vfs_path_with_flags,
+    resolve_openat2_path, resolve_parent_and_name_with_flags, resolve_parent_vfs_path_with_flags,
+    root_inode_for_device, set_inode_all_times_now, touch_inode_mtime_ctime_now,
+    truncate_regular_inode, try_copy_from_user, try_write_user_value, with_ext4_inode_read,
 };
 use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{LookupFlags, VfsMetadata, VfsNodeKind, VfsOpenOptions, VfsPath};
@@ -58,13 +57,8 @@ fn try_open_non_ext4_vfs(
     tmpfile_requested: bool,
     lookup_flags: LookupFlags,
 ) -> Option<isize> {
-    if !matches!(at, AtPath::Vfs(_)) {
-        return None;
-    }
-
     let mut path = match resolve_at_vfs_path_with_flags(at, fsuid, fsgid, lookup_flags) {
-        Ok(Some(path)) => Some(path),
-        Ok(None) => unreachable!("Vfs AtPath did not use the object walker"),
+        Ok(path) => Some(path),
         Err(error) if error == err(SyscallError::ENOENT) => None,
         Err(error) => return Some(error),
     };
@@ -77,8 +71,7 @@ fn try_open_non_ext4_vfs(
 
     if path.is_none() {
         let parent = match resolve_parent_vfs_path_with_flags(at, fsuid, fsgid, lookup_flags) {
-            Ok(Some(parent)) => parent,
-            Ok(None) => unreachable!("Vfs AtPath did not provide an object parent"),
+            Ok(parent) => parent,
             Err(error) => return Some(error),
         };
         if parent.parent.node().as_any().is::<Ext4VfsNode>() {
@@ -115,8 +108,7 @@ fn try_open_non_ext4_vfs(
         }
         invalidate_vfs_parent_entry(&parent);
         path = match resolve_at_vfs_path_with_flags(at, fsuid, fsgid, lookup_flags) {
-            Ok(Some(path)) => Some(path),
-            Ok(None) => unreachable!("created VFS node did not resolve through its mount"),
+            Ok(path) => Some(path),
             Err(error) => return Some(error),
         };
     } else if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 && !tmpfile_requested {
@@ -507,9 +499,6 @@ fn do_openat(
             return e;
         }
     };
-    if strict_object_lookup && !matches!(at, AtPath::Vfs(_)) {
-        return err(SyscallError::EOPNOTSUPP);
-    }
     let create_mode = apply_umask(mode);
     let mut created = false;
     let mut tmpfile_cleanup_parent: Option<alloc::sync::Arc<ext4_fs::Inode>> = None;
@@ -538,7 +527,7 @@ fn do_openat(
     let mut opened_vfs_path = None;
     let mut inode = match resolve_at_inode_with_vfs_path_flags(&at, fsuid, fsgid, lookup_flags) {
         Ok((inode, vfs_path)) => {
-            opened_vfs_path = vfs_path;
+            opened_vfs_path = Some(vfs_path);
             Some(inode)
         }
         Err(e) if e == err(SyscallError::ENOENT) => None,
@@ -652,55 +641,47 @@ fn do_openat(
                 Ok(parent) => parent,
                 Err(error) => return error,
             };
-        if creation_parent
-            .as_ref()
-            .is_some_and(|parent| parent.parent.mount().flags().is_read_only())
-        {
+        if creation_parent.parent.mount().flags().is_read_only() {
             return err(SyscallError::EROFS);
         }
-        match &at {
-            AtPath::Vfs(_) | AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
-                let (parent, name) =
-                    match resolve_parent_and_name_with_flags(&at, fsuid, fsgid, lookup_flags) {
-                        Ok(v) => v,
-                        Err(e) => return e,
-                    };
-                let parent_lock = ext4_inode_lock(&parent);
-                let _parent_guard = parent_lock.write();
-                if !parent.is_dir() {
-                    if debug_close {
-                        crate::println!("[fs] openat close-test parent not dir");
-                    }
-                    return err(SyscallError::ENOTDIR);
-                }
-                if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
-                    if debug_close {
-                        crate::println!("[fs] openat close-test parent no search perm");
-                    }
-                    return err(SyscallError::EACCES);
-                }
-                inode = match parent.create_file(&name) {
-                    Ok(i) => {
-                        let created_gid = gid_for_created_inode(Some(&parent), fsgid);
-                        let created_mode = mode_for_created_file(create_mode, created_gid);
-                        let child_lock = ext4_inode_lock(&i);
-                        let _child_guard = child_lock.write();
-                        i.set_uid_gid(fsuid, created_gid);
-                        i.set_mode(created_mode);
-                        set_inode_all_times_now(&i);
-                        invalidate_ext4_path_cache_for_at(&at, false);
-                        created = true;
-                        Some(i)
-                    }
-                    Err(e) => {
-                        if debug_close {
-                            crate::println!("[fs] openat close-test create_file err={:?}", e);
-                        }
-                        return ext4_err_to_errno(e);
-                    }
-                };
+        let (parent, name) =
+            match resolve_parent_and_name_with_flags(&at, fsuid, fsgid, lookup_flags) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+        let parent_lock = ext4_inode_lock(&parent);
+        let _parent_guard = parent_lock.write();
+        if !parent.is_dir() {
+            if debug_close {
+                crate::println!("[fs] openat close-test parent not dir");
             }
+            return err(SyscallError::ENOTDIR);
         }
+        if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
+            if debug_close {
+                crate::println!("[fs] openat close-test parent no search perm");
+            }
+            return err(SyscallError::EACCES);
+        }
+        inode = match parent.create_file(&name) {
+            Ok(i) => {
+                let created_gid = gid_for_created_inode(Some(&parent), fsgid);
+                let created_mode = mode_for_created_file(create_mode, created_gid);
+                let child_lock = ext4_inode_lock(&i);
+                let _child_guard = child_lock.write();
+                i.set_uid_gid(fsuid, created_gid);
+                i.set_mode(created_mode);
+                set_inode_all_times_now(&i);
+                created = true;
+                Some(i)
+            }
+            Err(e) => {
+                if debug_close {
+                    crate::println!("[fs] openat close-test create_file err={:?}", e);
+                }
+                return ext4_err_to_errno(e);
+            }
+        };
     }
 
     let inode = match inode {
@@ -710,7 +691,7 @@ fn do_openat(
 
     if opened_vfs_path.is_none() && !tmpfile_requested {
         opened_vfs_path = match resolve_at_vfs_path_with_flags(&at, fsuid, fsgid, lookup_flags) {
-            Ok(path) => path,
+            Ok(path) => Some(path),
             Err(e) => return e,
         };
     }

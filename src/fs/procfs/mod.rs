@@ -27,7 +27,7 @@ pub(crate) mod vfs;
 
 pub use content::{vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory};
 pub(crate) use entries::{net_core_busy_poll_usecs, net_core_busy_read_usecs, vm_max_map_count};
-pub use magic_link::{normalize_proc_magic_path, proc_magic_link_exists, proc_readlink};
+pub use magic_link::{proc_magic_link_exists, proc_readlink};
 pub(crate) use open::{open_proc_pseudo_in, proc_provider_path_for_namespace};
 
 #[derive(Clone, Copy, Debug)]

@@ -34,7 +34,7 @@ fn exec_event_vfs_path(dirfd: isize, path: &str) -> Option<VfsPath> {
     }
     let at = resolve_at_path(dirfd, path).ok()?;
     let (fsuid, fsgid) = current_fsuid_gid();
-    resolve_at_vfs_path(&at, fsuid, fsgid, true).ok().flatten()
+    resolve_at_vfs_path(&at, fsuid, fsgid, true).ok()
 }
 
 fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>, path: &str) -> Result<LoadedExecImage, isize> {

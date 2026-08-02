@@ -337,8 +337,7 @@ pub fn syscall_fspick(dirfd: isize, path: usize, flags: usize) -> isize {
         let (uid, gid) = current_fsuid_gid();
         let follow_final = (flags & FSPICK_SYMLINK_NOFOLLOW) == 0;
         let picked = match resolve_at_vfs_path(&at, uid, gid, follow_final) {
-            Ok(Some(path)) => path,
-            Ok(None) => return err(SyscallError::EOPNOTSUPP),
+            Ok(path) => path,
             Err(e) => return e,
         };
         (abs, picked)
@@ -403,8 +402,7 @@ pub fn syscall_open_tree(dirfd: isize, path: usize, flags: usize) -> isize {
     let (uid, gid) = current_fsuid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let source = match resolve_at_vfs_path(&at, uid, gid, follow_final) {
-        Ok(Some(path)) => path,
-        Ok(None) => return err(SyscallError::EOPNOTSUPP),
+        Ok(path) => path,
         Err(e) => return e,
     };
     let Some(source_namespace) = source.mount().owner_namespace() else {
@@ -493,8 +491,7 @@ pub fn syscall_move_mount(
     let (uid, gid) = current_fsuid_gid();
     let follow_final = (flags & MOVE_MOUNT_T_SYMLINKS) != 0;
     let target = match resolve_at_vfs_path(&at, uid, gid, follow_final) {
-        Ok(Some(path)) => path,
-        Ok(None) => return err(SyscallError::EOPNOTSUPP),
+        Ok(path) => path,
         Err(e) => return e,
     };
     match attach_or_move_mount_handle(&target, &to_abs, &mut state) {

@@ -1,17 +1,16 @@
 use super::{
     ACCT_COMM, ACCT_STATE, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Acct,
-    AcctState, Arc, AtPath, FILE_LEASES, FileLockKey, OSInode, ProcessControlBlock, PseudoDir,
-    RECORD_LOCK_WAITERS, RECORD_LOCKS, String, SyscallError, TaskControlBlock, Vec, VfsOpenedFile,
+    AcctState, Arc, FILE_LEASES, FileLockKey, OSInode, ProcessControlBlock, RECORD_LOCK_WAITERS,
+    RECORD_LOCKS, String, SyscallError, TaskControlBlock, Vec, VfsOpenedFile,
     apply_chmod_to_vfs_path, apply_chown_to_inode, apply_chown_to_vfs_path, apply_process_root,
     busybox_exists, clear_ext4_path_cache, clear_record_lock_waiting, current_cwd_path,
     current_effective_uid_gid, current_fsuid_gid, current_in_group, current_process,
     current_real_uid_gid, do_fchmodat, empty_path_fd_for_at_op, err, fd_has_o_path,
-    find_path_in_roots, get_current_token, get_fd_file, get_time_ms, inode_mode_allows,
-    inode_mode_allows_uid_gid, is_privileged_or_owner, logical_path_for_open_fd,
-    mount_note_path_access, normalize_path, read_user_cstring, resolve_abs_path, resolve_at_inode,
-    resolve_at_path, resolve_at_vfs_path, resolve_final_symlink_abs_path,
-    resolve_final_symlink_abs_path_locked, should_try_busybox_applet_path, vfs_mode_allows_uid_gid,
-    wake_record_lock_waiters, with_ext4_inode_read, with_ext4_inode_write,
+    find_path_in_roots, get_current_token, get_fd_file, get_time_ms, inode_mode_allows_uid_gid,
+    is_privileged_or_owner, mount_note_path_access, normalize_path, read_user_cstring,
+    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_at_vfs_path,
+    should_try_busybox_applet_path, vfs_mode_allows_uid_gid, wake_record_lock_waiters,
+    with_ext4_inode_read, with_ext4_inode_write,
 };
 use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{VfsNodeKind, VfsPath};
@@ -59,10 +58,7 @@ pub fn syscall_acct(pathname: usize) -> isize {
         Ok(path) => path,
         Err(error) => return error,
     };
-    if vfs_path
-        .as_ref()
-        .is_some_and(|path| path.mount().flags().is_read_only())
-    {
+    if vfs_path.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
     let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
@@ -294,7 +290,7 @@ fn do_faccessat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isi
     };
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let vfs_path = match resolve_at_vfs_path(&at, uid, gid, follow_final) {
-        Ok(Some(path)) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
             if mode & 2 != 0 && path.mount().flags().is_read_only() {
                 return err(SyscallError::EROFS);
             }
@@ -339,11 +335,7 @@ fn do_faccessat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isi
             Err(e) => return e,
         };
 
-        if mode & 2 != 0
-            && vfs_path
-                .as_ref()
-                .is_some_and(|path| path.mount().flags().is_read_only())
-        {
+        if mode & 2 != 0 && vfs_path.mount().flags().is_read_only() {
             return err(SyscallError::EROFS);
         }
         if !with_ext4_inode_read(&inode, || inode_mode_allows_uid_gid(&inode, mode, uid, gid)) {
@@ -494,7 +486,7 @@ pub fn syscall_fchownat(
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
-        Ok(Some(path)) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
             return apply_chown_to_vfs_path(&path, uid, gid);
         }
         Ok(path) => path,
@@ -504,10 +496,7 @@ pub fn syscall_fchownat(
         Ok(v) => v,
         Err(e) => return e,
     };
-    if vfs_path
-        .as_ref()
-        .is_some_and(|path| path.mount().flags().is_read_only())
-    {
+    if vfs_path.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
     let ret = apply_chown_to_inode(&inode, uid, gid);
@@ -534,10 +523,10 @@ pub fn syscall_chroot(pathname: usize) -> isize {
     };
     let process = current_process();
     let cwd = process.fs_struct().cwd_display();
-    let candidate_abs = match &at {
-        AtPath::Vfs(_) => normalize_path(&cwd, &path),
-        AtPath::Ext4Abs(abs) => abs.clone(),
-        AtPath::Ext4Rel { .. } => normalize_path(&cwd, &path),
+    let candidate_abs = if path.starts_with('/') {
+        apply_process_root(&normalize_path("/", &path))
+    } else {
+        normalize_path(&cwd, &path)
     };
 
     let (fsuid, fsgid) = current_fsuid_gid();
@@ -545,29 +534,14 @@ pub fn syscall_chroot(pathname: usize) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
-    let final_root = if let Some(path) = vfs_path.as_ref() {
-        if let Err(e) = validate_vfs_directory(path, fsuid, fsgid) {
-            return e;
-        }
-        path.mount()
-            .owner_namespace()
-            .and_then(|namespace| namespace.path_string(path).ok())
-            .unwrap_or(candidate_abs.clone())
-    } else {
-        let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let inode_lock = crate::fs::ext4_inode_lock(&inode);
-        let _inode_guard = inode_lock.read();
-        if !inode.is_dir() {
-            return err(SyscallError::ENOTDIR);
-        }
-        if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
-            return err(SyscallError::EACCES);
-        }
-        resolve_final_symlink_abs_path_locked(&candidate_abs)
-    };
+    if let Err(e) = validate_vfs_directory(&vfs_path, fsuid, fsgid) {
+        return e;
+    }
+    let final_root = vfs_path
+        .mount()
+        .owner_namespace()
+        .and_then(|namespace| namespace.path_string(&vfs_path).ok())
+        .unwrap_or(candidate_abs);
 
     // Capability check after pathname validation so permission errors surface
     // first, matching Linux/LTP expectations.
@@ -581,11 +555,9 @@ pub fn syscall_chroot(pathname: usize) -> isize {
 
     // Linux chroot() updates "/" for this process but does not implicitly
     // retarget "."; callers that want both semantics must chdir("/") too.
-    if let Some(path) = vfs_path {
-        process.fs_struct().set_root_with_display(path, &final_root);
-    } else {
-        process.fs_struct().set_root_display(&final_root);
-    }
+    process
+        .fs_struct()
+        .set_root_with_display(vfs_path, &final_root);
     0
 }
 
@@ -627,57 +599,18 @@ pub fn syscall_chdir(pathname: usize) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
-    let final_cwd = if let Some(path) = vfs_path.as_ref() {
-        if let Err(e) = validate_vfs_directory(path, fsuid, fsgid) {
-            return e;
-        }
-        path.mount()
-            .owner_namespace()
-            .and_then(|namespace| namespace.path_string(path).ok())
-            .unwrap_or(new_cwd.clone())
-    } else {
-        let inode = match resolve_at_inode(&at, fsuid, fsgid, true) {
-            Ok(v) => v,
-            Err(e) => {
-                if crate::debug_config::DEBUG_SYSCALL {
-                    let pid = process.getpid();
-                    crate::println!(
-                        "[chdir] pid={} resolve_at_inode err={} new_cwd='{}'",
-                        pid,
-                        e,
-                        new_cwd
-                    );
-                }
-                return e;
-            }
-        };
-        let inode_lock = crate::fs::ext4_inode_lock(&inode);
-        let _inode_guard = inode_lock.read();
-        if crate::debug_config::DEBUG_SYSCALL {
-            let pid = process.getpid();
-            crate::println!(
-                "[chdir] pid={} inode={} mode=0o{:o} is_dir={} is_file={}",
-                pid,
-                inode.inode_num(),
-                inode.mode(),
-                inode.is_dir(),
-                inode.is_file()
-            );
-        }
-        if !inode.is_dir() {
-            return err(SyscallError::ENOTDIR);
-        }
-        if !inode_mode_allows_uid_gid(&inode, 1, fsuid, fsgid) {
-            return err(SyscallError::EACCES);
-        }
-        resolve_final_symlink_abs_path_locked(&new_cwd)
-    };
-
-    if let Some(path) = vfs_path {
-        process.fs_struct().set_cwd_with_display(path, &final_cwd);
-    } else {
-        process.fs_struct().set_cwd_display(&final_cwd);
+    if let Err(e) = validate_vfs_directory(&vfs_path, fsuid, fsgid) {
+        return e;
     }
+    let final_cwd = vfs_path
+        .mount()
+        .owner_namespace()
+        .and_then(|namespace| namespace.path_string(&vfs_path).ok())
+        .unwrap_or(new_cwd);
+
+    process
+        .fs_struct()
+        .set_cwd_with_display(vfs_path, &final_cwd);
     0
 }
 
@@ -687,52 +620,21 @@ pub fn syscall_fchdir(fd: usize) -> isize {
         return err(SyscallError::EBADF);
     };
 
-    if let Some(path) = file.object_path() {
-        let (fsuid, fsgid) = current_fsuid_gid();
-        if let Err(e) = validate_vfs_directory(path, fsuid, fsgid) {
-            return e;
-        }
-        let display = path
-            .mount()
-            .owner_namespace()
-            .and_then(|namespace| namespace.path_string(path).ok())
-            .or_else(|| file.logical_path_hint().map(String::from))
-            .unwrap_or_else(current_cwd_path);
-        current_process()
-            .fs_struct()
-            .set_cwd_with_display(path.clone(), &display);
-        return 0;
-    }
-
-    // Transitional descriptors created without an f_path retain their old
-    // backend-specific fallback. New pathname opens always take the object
-    // branch above, matching Linux fchdir(fd_file(f)->f_path).
-    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
-        let new_cwd = String::from(pdir.path());
-        current_process().fs_struct().set_cwd_display(&new_cwd);
-        return 0;
-    }
-
-    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+    let Some(path) = file.object_path() else {
         return err(SyscallError::ENOTDIR);
     };
-    let inode = os_inode.ext4_inode();
-    let access_error = with_ext4_inode_read(&inode, || {
-        if !inode.is_dir() {
-            return Some(err(SyscallError::ENOTDIR));
-        }
-        if !inode_mode_allows(&inode, 1) {
-            return Some(err(SyscallError::EACCES));
-        }
-        None
-    });
-    if let Some(error) = access_error {
-        return error;
+    let (fsuid, fsgid) = current_fsuid_gid();
+    if let Err(e) = validate_vfs_directory(path, fsuid, fsgid) {
+        return e;
     }
-
-    let fallback_cwd = current_cwd_path();
-    let target_path = logical_path_for_open_fd(fd, &file, &fallback_cwd);
-    let final_cwd = resolve_final_symlink_abs_path(&target_path);
-    current_process().fs_struct().set_cwd_display(&final_cwd);
+    let display = path
+        .mount()
+        .owner_namespace()
+        .and_then(|namespace| namespace.path_string(path).ok())
+        .or_else(|| file.logical_path_hint().map(String::from))
+        .unwrap_or_else(current_cwd_path);
+    current_process()
+        .fs_struct()
+        .set_cwd_with_display(path.clone(), &display);
     0
 }

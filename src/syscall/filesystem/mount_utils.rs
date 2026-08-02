@@ -511,10 +511,6 @@ pub(crate) fn current_cwd_path() -> String {
     current_process().fs_struct().cwd_display()
 }
 
-pub(crate) fn logical_path_for_inode(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
-    inode_logical_path(inode)
-}
-
 pub(crate) fn proc_self_fd_path(fd: usize) -> String {
     alloc::format!("/proc/self/fd/{}", fd)
 }
@@ -642,7 +638,7 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
     false
 }
 
-fn resolve_object_vfs_user_path(path: &str) -> Result<Option<VfsPath>, isize> {
+fn resolve_object_vfs_user_path(path: &str) -> Result<VfsPath, isize> {
     let at = resolve_at_path(AT_FDCWD, path)?;
     let (uid, gid) = current_fsuid_gid();
     resolve_at_vfs_path(&at, uid, gid, true)
@@ -662,12 +658,9 @@ fn resolve_object_vfs_absolute(path: &str) -> Result<VfsPath, isize> {
         .map_err(map_vfs_error)
 }
 
-/// Attach a non-recursive bind directly to the mount graph.
-///
-/// `Ok(false)` means one side still belongs to a transitional backend and the
-/// caller must use the legacy record implementation.  A graph mutation is
-/// always completed before its presentation record opts into object lookup.
-fn try_object_vfs_bind_mount(
+/// Attach a bind directly to the authoritative mount graph.  The presentation
+/// record is updated only after the graph mutation succeeds.
+fn object_vfs_bind_mount(
     target_user: &str,
     target_abs: &str,
     source_user: &str,
@@ -675,13 +668,9 @@ fn try_object_vfs_bind_mount(
     fs_type: &str,
     flags: usize,
     recursive: bool,
-) -> Result<bool, isize> {
-    let Some(source) = resolve_object_vfs_user_path(source_user)? else {
-        return Ok(false);
-    };
-    let Some(target) = resolve_object_vfs_user_path(target_user)? else {
-        return Ok(false);
-    };
+) -> Result<(), isize> {
+    let source = resolve_object_vfs_user_path(source_user)?;
+    let target = resolve_object_vfs_user_path(target_user)?;
     let source_is_dir =
         source.node().metadata().map_err(map_vfs_error)?.kind == VfsNodeKind::Directory;
     let target_is_dir =
@@ -707,7 +696,7 @@ fn try_object_vfs_bind_mount(
     create_object_bind_mount_record_with_propagation(
         target_abs, source_abs, source_abs, fs_type, flags, recursive,
     );
-    Ok(true)
+    Ok(())
 }
 
 /// Instantiate a registered filesystem and attach it directly to the mount
@@ -719,7 +708,7 @@ fn try_object_vfs_bind_mount(
 /// resulting mount (`do_new_mount()` in `fs/namespace.c`).  Keep that same
 /// ordering here so filesystem-specific options never select a hidden ext4
 /// backing directory.
-fn try_object_vfs_registered_mount(
+fn object_vfs_registered_mount(
     target_user: &str,
     target_abs: &str,
     fs_type: &str,
@@ -727,10 +716,8 @@ fn try_object_vfs_registered_mount(
     record_source: &str,
     data: &str,
     flags: usize,
-) -> Result<bool, isize> {
-    let Some(target) = resolve_object_vfs_user_path(target_user)? else {
-        return Ok(false);
-    };
+) -> Result<(), isize> {
+    let target = resolve_object_vfs_user_path(target_user)?;
     if target.node().metadata().map_err(map_vfs_error)?.kind != VfsNodeKind::Directory {
         return Err(err(SyscallError::ENOTDIR));
     }
@@ -759,17 +746,17 @@ fn try_object_vfs_registered_mount(
         fs_type,
         flags,
     );
-    Ok(true)
+    Ok(())
 }
 
-fn try_object_vfs_ext4_mount(
+fn object_vfs_ext4_mount(
     target_user: &str,
     target_abs: &str,
     source_display: &str,
     legacy_source: &str,
     flags: usize,
-) -> Result<bool, isize> {
-    try_object_vfs_registered_mount(
+) -> Result<(), isize> {
+    object_vfs_registered_mount(
         target_user,
         target_abs,
         "ext4",
@@ -1969,7 +1956,7 @@ pub(crate) fn syscall_mount_impl(
         }
 
         let fsname = fstype.as_deref().unwrap_or("none");
-        match try_object_vfs_bind_mount(
+        match object_vfs_bind_mount(
             &dir,
             &target,
             source_display,
@@ -1978,7 +1965,7 @@ pub(crate) fn syscall_mount_impl(
             flags,
             (flags & MS_REC) != 0,
         ) {
-            Ok(true) => {
+            Ok(()) => {
                 if (flags & propagation_flags) != 0 {
                     return match apply_mount_propagation_change(
                         &target,
@@ -1990,7 +1977,6 @@ pub(crate) fn syscall_mount_impl(
                 }
                 return 0;
             }
-            Ok(false) => return err(SyscallError::EOPNOTSUPP),
             Err(e) => return e,
         }
     }
@@ -2040,8 +2026,7 @@ pub(crate) fn syscall_mount_impl(
             Err(e) => return e,
         };
         let to = match resolve_object_vfs_user_path(&dir) {
-            Ok(Some(path)) => path,
-            Ok(None) => return err(SyscallError::EINVAL),
+            Ok(path) => path,
             Err(e) => return e,
         };
         let namespace = current_mount_namespace().lock().vfs_namespace();
@@ -2084,7 +2069,7 @@ pub(crate) fn syscall_mount_impl(
     }
     if fsname == "tmpfs" {
         let mount_flags = flags & mount_flag_mask();
-        match try_object_vfs_registered_mount(
+        match object_vfs_registered_mount(
             &dir,
             &target,
             fsname,
@@ -2093,14 +2078,13 @@ pub(crate) fn syscall_mount_impl(
             data.as_deref().unwrap_or(""),
             mount_flags,
         ) {
-            Ok(true) => return 0,
-            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Ok(()) => return 0,
             Err(e) => return e,
         }
     }
     if matches!(fsname, "proc" | "sysfs" | "devtmpfs") {
         let mount_flags = flags & mount_flag_mask();
-        match try_object_vfs_registered_mount(
+        match object_vfs_registered_mount(
             &dir,
             &target,
             fsname,
@@ -2114,15 +2098,14 @@ pub(crate) fn syscall_mount_impl(
             data.as_deref().unwrap_or(""),
             mount_flags,
         ) {
-            Ok(true) => return 0,
-            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Ok(()) => return 0,
             Err(e) => return e,
         }
     }
     if fsname == "cgroup2" {
         let spec = CgroupMountSpec::unified();
         let mount_flags = flags & mount_flag_mask();
-        match try_object_vfs_registered_mount(
+        match object_vfs_registered_mount(
             &dir,
             &target,
             fsname,
@@ -2131,8 +2114,7 @@ pub(crate) fn syscall_mount_impl(
             data.as_deref().unwrap_or(""),
             mount_flags,
         ) {
-            Ok(true) => return 0,
-            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Ok(()) => return 0,
             Err(e) => return e,
         }
     }
@@ -2143,7 +2125,7 @@ pub(crate) fn syscall_mount_impl(
             Err(e) => return e,
         };
         let mount_flags = flags & mount_flag_mask();
-        match try_object_vfs_registered_mount(
+        match object_vfs_registered_mount(
             &dir,
             &target,
             fsname,
@@ -2152,8 +2134,7 @@ pub(crate) fn syscall_mount_impl(
             options,
             mount_flags,
         ) {
-            Ok(true) => return 0,
-            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Ok(()) => return 0,
             Err(e) => return e,
         }
     }
@@ -2181,14 +2162,10 @@ pub(crate) fn syscall_mount_impl(
         source
     };
     let mount_flags = flags & mount_flag_mask();
-    if fsname == "ext4" {
-        match try_object_vfs_ext4_mount(&dir, &target, source_display, &source, mount_flags) {
-            Ok(true) => return 0,
-            Ok(false) => return err(SyscallError::EOPNOTSUPP),
-            Err(e) => return e,
-        }
+    match object_vfs_ext4_mount(&dir, &target, source_display, &source, mount_flags) {
+        Ok(()) => 0,
+        Err(e) => e,
     }
-    err(SyscallError::EOPNOTSUPP)
 }
 
 pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
@@ -2474,16 +2451,6 @@ pub(crate) fn proc_mountinfo_snapshot() -> String {
 
 pub(crate) fn proc_mountinfo_snapshot_for_process(process: &Arc<ProcessControlBlock>) -> String {
     proc_mountinfo_snapshot_for_namespace(&process.mount_namespace())
-}
-
-pub(crate) fn statfs_mount_flags_for_abs(abs: &str) -> i64 {
-    mount_flags_to_statfs(mount_flags_for_abs(abs))
-}
-
-pub(crate) fn statfs_mount_backend_for_abs(abs: &str) -> MountBackend {
-    mount_lookup_for_abs(abs)
-        .map(|mount| mount.backend)
-        .unwrap_or(MountBackend::Storage)
 }
 
 pub(crate) fn path_under_mount(abs: &str, mnt: &str) -> bool {

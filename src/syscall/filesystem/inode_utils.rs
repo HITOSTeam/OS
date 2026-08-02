@@ -157,7 +157,7 @@ pub(crate) fn do_fchmodat(
     let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
-        Ok(Some(path)) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
             return apply_chmod_to_vfs_path(&path, mode);
         }
         Ok(path) => path,
@@ -167,10 +167,7 @@ pub(crate) fn do_fchmodat(
         Ok(v) => v,
         Err(e) => return e,
     };
-    if vfs_path
-        .as_ref()
-        .is_some_and(|path| path.mount().flags().is_read_only())
-    {
+    if vfs_path.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
     with_ext4_inode_write(&inode, || {
@@ -329,24 +326,17 @@ fn try_do_non_ext4_vfs_rename(
     let exchange = flags.contains(VfsRenameFlags::EXCHANGE);
     let old_parent = match resolve_parent_vfs_path(old_at, fsuid, fsgid) {
         Ok(parent) => parent,
-        Err(error) => return matches!(old_at, AtPath::Vfs(_)).then_some(error),
+        Err(error) => return Some(error),
     };
     let new_parent = match resolve_parent_vfs_path(new_at, fsuid, fsgid) {
         Ok(parent) => parent,
-        Err(error) => return matches!(new_at, AtPath::Vfs(_)).then_some(error),
+        Err(error) => return Some(error),
     };
-    let has_non_ext4_parent = old_parent
-        .as_ref()
-        .is_some_and(|parent| !parent.parent.node().as_any().is::<Ext4VfsNode>())
-        || new_parent
-            .as_ref()
-            .is_some_and(|parent| !parent.parent.node().as_any().is::<Ext4VfsNode>());
+    let has_non_ext4_parent = !old_parent.parent.node().as_any().is::<Ext4VfsNode>()
+        || !new_parent.parent.node().as_any().is::<Ext4VfsNode>();
     if !has_non_ext4_parent {
         return None;
     }
-    let (Some(old_parent), Some(new_parent)) = (old_parent, new_parent) else {
-        return Some(err(SyscallError::EXDEV));
-    };
     if old_parent.parent.node().as_any().is::<Ext4VfsNode>()
         || new_parent.parent.node().as_any().is::<Ext4VfsNode>()
         || old_parent.parent.mount().id() != new_parent.parent.mount().id()
@@ -362,8 +352,7 @@ fn try_do_non_ext4_vfs_rename(
     }
 
     let source = match resolve_at_vfs_path(old_at, fsuid, fsgid, false) {
-        Ok(Some(path)) => path,
-        Ok(None) => unreachable!("object rename source did not use the VFS walker"),
+        Ok(path) => path,
         Err(error) => return Some(error),
     };
     if source.mount().id() != old_parent.parent.mount().id() {
@@ -378,8 +367,7 @@ fn try_do_non_ext4_vfs_rename(
     }
 
     let target = match resolve_at_vfs_path(new_at, fsuid, fsgid, false) {
-        Ok(Some(path)) => Some(path),
-        Ok(None) => unreachable!("object rename target did not use the VFS walker"),
+        Ok(path) => Some(path),
         Err(error) if error == err(SyscallError::ENOENT) => None,
         Err(error) => return Some(error),
     };
@@ -496,11 +484,6 @@ fn validate_ext4_rename_mounts(
 ) -> Result<(), isize> {
     let old_parent = resolve_parent_vfs_path(old_at, fsuid, fsgid)?;
     let new_parent = resolve_parent_vfs_path(new_at, fsuid, fsgid)?;
-    let (old_parent, new_parent) = match (old_parent, new_parent) {
-        (Some(old_parent), Some(new_parent)) => (old_parent, new_parent),
-        (None, None) => return Ok(()),
-        _ => return Err(err(SyscallError::EXDEV)),
-    };
     if old_parent.parent.mount().id() != new_parent.parent.mount().id() {
         return Err(err(SyscallError::EXDEV));
     }
@@ -510,20 +493,18 @@ fn validate_ext4_rename_mounts(
         return Err(err(SyscallError::EROFS));
     }
 
-    let source = resolve_at_vfs_path(old_at, fsuid, fsgid, false)?
-        .expect("object rename parent must produce an object source");
+    let source = resolve_at_vfs_path(old_at, fsuid, fsgid, false)?;
     if source.mount().id() != old_parent.parent.mount().id() {
         return Err(err(SyscallError::EBUSY));
     }
     match resolve_at_vfs_path(new_at, fsuid, fsgid, false) {
-        Ok(Some(target)) => {
+        Ok(target) => {
             if target.mount().id() != new_parent.parent.mount().id() {
                 return Err(err(SyscallError::EBUSY));
             }
         }
         Err(error) if !target_required && error == err(SyscallError::ENOENT) => {}
         Err(error) => return Err(error),
-        Ok(None) => unreachable!("object rename parent must use the object walker"),
     }
     Ok(())
 }

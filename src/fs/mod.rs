@@ -242,12 +242,9 @@ pub(crate) use inode::{
     ExecInodeReservation, block_device_source_path, block_root, block_root_for_source,
     clear_ext4_path_cache, debug_track_iozone_inode, ensure_root_mount_directory, ext4_inode_lock,
     ext4_topology_lock, find_path_in_roots, inode_path_hint, inode_path_in_roots,
-    invalidate_ext4_path_cache, invalidate_ext4_path_cache_inode,
-    invalidate_ext4_path_cache_subtree, is_inode_currently_executed, note_ext4_path_cache,
-    note_inode_path_hint, path_resolves_to_inode, path_within_filesystem,
-    register_deferred_unlink_cleanup, register_executing_inode, resolve_final_symlink_abs_path,
-    resolve_final_symlink_abs_path_locked, root_inode_for_device, root_inode_for_path,
-    unregister_executing_inode, with_ext4_inode_read, with_ext4_inode_write,
+    invalidate_ext4_path_cache_inode, is_inode_currently_executed, note_inode_path_hint,
+    path_resolves_to_inode, register_deferred_unlink_cleanup, register_executing_inode,
+    root_inode_for_device, unregister_executing_inode, with_ext4_inode_read, with_ext4_inode_write,
     with_ext4_inode_write_set,
 };
 pub(crate) use inode::{
@@ -278,8 +275,8 @@ pub(crate) use procfs::parse_proc_sys_usize;
 pub(crate) use procfs::vfs::ProcFsFactory;
 pub(crate) use procfs::vm_max_map_count;
 pub use procfs::{
-    ProcMagicLinkFile, ProcPseudoFile, normalize_proc_magic_path, proc_readlink,
-    vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory,
+    ProcMagicLinkFile, ProcPseudoFile, proc_readlink, vm_commit_limit_bytes, vm_committed_as_bytes,
+    vm_overcommit_memory,
 };
 pub use pseudo::PseudoBlock;
 pub use pseudo::TunTapFile;

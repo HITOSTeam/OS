@@ -24,14 +24,14 @@ fn resolve_xattr_path_target(path_ptr: usize, follow_final: bool) -> Result<Xatt
     let at = resolve_at_path(super::AT_FDCWD, &path)?;
     let (fsuid, fsgid) = current_fsuid_gid();
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
-        Ok(Some(path)) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
             return Ok(XattrTarget::Vfs(path));
         }
         Ok(path) => path,
         Err(error) => return Err(error),
     };
     resolve_at_inode(&at, fsuid, fsgid, follow_final)
-        .map(|inode| XattrTarget::Ext4(inode, vfs_path))
+        .map(|inode| XattrTarget::Ext4(inode, Some(vfs_path)))
 }
 
 fn resolve_xattr_fd_target(fd: usize) -> Result<XattrTarget, isize> {

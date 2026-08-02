@@ -18,11 +18,9 @@ use crate::{
         ext4_inode_lock, ext4_topology_lock, fanotify_notify_access, fanotify_notify_close,
         fanotify_notify_modify, fanotify_notify_open, fanotify_permission_access,
         fanotify_permission_open, find_path_in_roots, inode_logical_path, inode_raw_logical_path,
-        invalidate_ext4_path_cache, invalidate_ext4_path_cache_inode,
-        invalidate_ext4_path_cache_subtree, make_pipe, mount_namespace_id, note_ext4_path_cache,
-        note_inode_path_hint, pin_legacy_file_path, pseudo_block_is_read_only,
-        pseudo_block_note_sync, register_deferred_unlink_cleanup, resolve_final_symlink_abs_path,
-        resolve_final_symlink_abs_path_locked, root_inode_for_device, with_ext4_inode_read,
+        invalidate_ext4_path_cache_inode, make_pipe, mount_namespace_id, note_inode_path_hint,
+        pin_legacy_file_path, pseudo_block_is_read_only, pseudo_block_note_sync,
+        register_deferred_unlink_cleanup, root_inode_for_device, with_ext4_inode_read,
         with_ext4_inode_write, with_ext4_inode_write_set,
     },
     mm::{
@@ -257,7 +255,6 @@ pub(crate) const PATH_MAX: usize = 4096;
 /// Maximum single path component length.
 pub(crate) const NAME_MAX: usize = 255;
 /// Symlink resolution cap used to break loops.
-pub(crate) const MAX_SYMLINKS: usize = 40;
 
 /// File type bitmask within `st_mode`.
 pub(crate) const S_IFMT: u16 = 0o170000;

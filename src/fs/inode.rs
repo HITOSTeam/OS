@@ -116,10 +116,6 @@ pub(crate) fn with_ext4_inode_write_set<R>(inodes: &[&Inode], operation: impl Fn
 // populating an unused global BTreeMap only reintroduces path-walk contention.
 pub(crate) fn clear_ext4_path_cache() {}
 
-pub(crate) fn invalidate_ext4_path_cache(_path: &str) {}
-
-pub(crate) fn invalidate_ext4_path_cache_subtree(_path: &str) {}
-
 pub(crate) fn invalidate_ext4_path_cache_inode(_inode: &Inode) {}
 
 #[derive(Clone, Copy, Default)]
@@ -278,15 +274,6 @@ impl WriteOpenState {
     }
 }
 
-pub(crate) fn note_ext4_path_cache(
-    _path: &str,
-    _uid: u32,
-    _gid: u32,
-    _follow_final: bool,
-    _inode: &Arc<Inode>,
-) {
-}
-
 pub(crate) fn debug_track_iozone_inode(path: &str, inode_num: u32) {
     if !crate::debug_config::DEBUG_IOZONE_FS {
         return;
@@ -313,53 +300,6 @@ pub(crate) fn inode_path_hint(inode: &Arc<Inode>) -> Option<String> {
         .lock()
         .get(&(inode.device_id(), inode.inode_num()))
         .cloned()
-}
-
-fn normalize_inode_abs_path(cwd: &str, path: &str) -> String {
-    let mut parts = Vec::new();
-    let absolute = path.starts_with('/');
-    if !absolute {
-        for seg in cwd.split('/') {
-            if seg.is_empty() || seg == "." {
-                continue;
-            }
-            if seg == ".." {
-                parts.pop();
-                continue;
-            }
-            parts.push(seg);
-        }
-    }
-    for seg in path.split('/') {
-        if seg.is_empty() || seg == "." {
-            continue;
-        }
-        if seg == ".." {
-            parts.pop();
-            continue;
-        }
-        parts.push(seg);
-    }
-    let mut out = String::from("/");
-    out.push_str(&parts.join("/"));
-    if out.len() > 1 && out.ends_with('/') {
-        out.pop();
-    }
-    out
-}
-
-fn split_inode_parent_and_name(path: &str) -> Option<(&str, &str)> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.rfind('/') {
-        Some(pos) => {
-            let (parent, name) = trimmed.split_at(pos);
-            Some((parent, &name[1..]))
-        }
-        None => Some(("", trimmed)),
-    }
 }
 
 fn join_inode_path(base: &str, name: &str) -> String {
@@ -436,49 +376,6 @@ pub(crate) fn path_resolves_to_inode(path: &str, target: &Arc<Inode>) -> bool {
         return false;
     };
     found.device_id() == target.device_id() && found.inode_num() == target.inode_num()
-}
-
-pub(crate) fn resolve_final_symlink_abs_path_locked(abs: &str) -> String {
-    let mut current = String::from(abs);
-    for _ in 0..40 {
-        if current == "/" {
-            break;
-        }
-        let Some((parent, name)) = split_inode_parent_and_name(&current) else {
-            break;
-        };
-        let parent_abs = if parent.is_empty() { "/" } else { parent };
-        let Some(parent_inode) = find_path_in_roots(parent_abs) else {
-            break;
-        };
-        let child = {
-            let parent_lock = ext4_inode_lock(&parent_inode);
-            let _parent_guard = parent_lock.read();
-            let Some(child) = parent_inode.find(name) else {
-                break;
-            };
-            child
-        };
-        let child_lock = ext4_inode_lock(&child);
-        let _child_guard = child_lock.read();
-        if !child.is_symlink() {
-            break;
-        }
-        let target = String::from_utf8_lossy(&child.read_all()).into_owned();
-        if target.is_empty() {
-            break;
-        }
-        current = if target.starts_with('/') {
-            normalize_inode_abs_path("/", &target)
-        } else {
-            normalize_inode_abs_path(parent_abs, &target)
-        };
-    }
-    current
-}
-
-pub(crate) fn resolve_final_symlink_abs_path(abs: &str) -> String {
-    resolve_final_symlink_abs_path_locked(abs)
 }
 
 fn debug_iozone_tracked(inode_num: u32) -> bool {
@@ -1293,18 +1190,10 @@ lazy_static! {
         .expect("[ext4] /dev/vdb has no user ext4 root inode");
 }
 
-pub(crate) fn root_inode_for_path(path: &str) -> Arc<Inode> {
+fn root_inode_for_path(path: &str) -> Arc<Inode> {
     device_path_parts(path)
         .and_then(|(index, _)| block_root(index))
         .unwrap_or_else(|| ROOT_INODE.clone())
-}
-
-pub(crate) fn path_within_filesystem(path: &str) -> &str {
-    match device_path_parts(path) {
-        Some((_, "")) => "/",
-        Some((_, suffix)) => suffix,
-        None => path,
-    }
 }
 
 pub(crate) fn root_inode_for_device(device_id: usize) -> Option<Arc<Inode>> {

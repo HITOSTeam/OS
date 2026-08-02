@@ -79,7 +79,7 @@ pub fn syscall_fanotify_mark(
     let Some(fanotify_file) = fanotify_file.as_any().downcast_ref::<FanotifyFile>() else {
         return err(SyscallError::EINVAL);
     };
-    match fanotify_file.modify_mark(flags, mask, inode, is_dir, mark_path) {
+    match fanotify_file.modify_mark(flags, mask, inode, is_dir, Some(mark_path)) {
         Ok(()) => 0,
         Err(e) => e,
     }

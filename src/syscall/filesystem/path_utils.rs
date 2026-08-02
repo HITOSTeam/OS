@@ -1,12 +1,10 @@
 use super::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, INODE_XATTRS, MAX_SYMLINKS, NAME_MAX,
-    OSInode, PATH_MAX, PseudoDir, String, SyscallError, Vec, VfsOpenedFile, XATTR_CREATE,
-    XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX, clear_ext4_path_cache, current_cwd_path,
-    current_fsuid_gid, current_process, err, ext4_inode_lock, fd_has_o_path, find_path_in_roots,
-    get_fd_file, inode_is_immutable_or_append, inode_mode_allows_uid_gid,
-    invalidate_ext4_path_cache, invalidate_ext4_path_cache_subtree, logical_path_for_inode,
-    logical_path_for_open_fd, note_ext4_path_cache, touch_inode_mtime_ctime_now,
-    try_copy_from_user, try_copy_to_user, try_read_user_value,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, INODE_XATTRS, NAME_MAX, OSInode, PATH_MAX,
+    String, SyscallError, Vec, XATTR_CREATE, XATTR_NAME_MAX, XATTR_REPLACE, XATTR_SIZE_MAX,
+    current_cwd_path, current_fsuid_gid, current_process, err, ext4_inode_lock, fd_has_o_path,
+    find_path_in_roots, get_fd_file, inode_is_immutable_or_append, inode_mode_allows_uid_gid,
+    logical_path_for_open_fd, touch_inode_mtime_ctime_now, try_copy_from_user, try_copy_to_user,
+    try_read_user_value,
 };
 use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{
@@ -87,28 +85,6 @@ pub(crate) fn apply_process_root(abs: &str) -> String {
     normalize_path("/", &out)
 }
 
-/// 规范化一个相对路径：去掉 `.`、解析 `..`、合并多余斜杠，返回不含前导 `/` 的字符串。
-/// remove aubndant .. for example ../../.. we get .. finally
-/// and . will be removed directly
-pub(crate) fn normalize_relative_path(path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        if seg.is_empty() || seg == "." {
-            continue;
-        }
-        if seg == ".." {
-            if parts.last().is_some_and(|last| *last != "..") {
-                parts.pop();
-            } else {
-                parts.push(seg);
-            }
-            continue;
-        }
-        parts.push(seg);
-    }
-    parts.join("/")
-}
-
 /// 检查路径中每个分量的长度是否超过 `NAME_MAX`，超过则返回 `ENAMETOOLONG`。
 pub(crate) fn validate_path_components(path: &str) -> Result<(), isize> {
     for seg in path.split('/').filter(|s| !s.is_empty()) {
@@ -171,130 +147,23 @@ pub(crate) fn should_try_busybox_applet_path(path: &str, allow_relative: bool) -
         || path.starts_with("/usr/sbin/")
 }
 
-/// 将路径拆分为 `(父目录, 末尾名称)`。
-/// 路径为空或仅由斜杠组成时返回 `None`。
-pub(crate) fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.rfind('/') {
-        Some(pos) => {
-            let (parent, name) = trimmed.split_at(pos);
-            Some((parent, &name[1..]))
-        }
-        None => Some(("", trimmed)),
-    }
-}
-
-pub(crate) enum RelativeAtPathBase {
-    // real path,but not real file(psudo),so no inode
-    LogicalAbs(String),
-    // path based on an inode
-    Ext4Dir {
-        base: alloc::sync::Arc<ext4_fs::Inode>,
-        logical_base: Option<String>,
-        vfs_base: Option<VfsPath>,
-    },
-    /// Directory descriptor backed directly by an object-VFS path.
-    VfsDir {
-        base: VfsPath,
-    },
-}
-
 #[derive(Clone)]
-pub(crate) struct VfsAtPath {
+pub(crate) struct AtPath {
     namespace: Arc<VfsMountNamespace>,
     root: VfsPath,
     start: VfsPath,
     path: String,
 }
 
-pub(crate) enum AtPath {
-    /// Object VFS lookup.  The path remains unresolved until the caller chooses
-    /// whether to follow the final symlink, matching Linux namei lookup flags.
-    Vfs(VfsAtPath),
-    /// An ext4 lookup rooted at `/`.
-    Ext4Abs(String),
-    /// An ext4 lookup rooted at an open directory fd.
-    Ext4Rel {
-        base: alloc::sync::Arc<ext4_fs::Inode>,
-        rel: String,
-        /// Translated absolute path used only for path-cache invalidation.
-        cache_abs: Option<String>,
-    },
-}
-
-pub(crate) fn invalidate_ext4_path_cache_for_at(at: &AtPath, subtree: bool) {
-    let Some(path) = (match at {
-        AtPath::Vfs(_) => return,
-        AtPath::Ext4Abs(abs) => Some(abs.as_str()),
-        AtPath::Ext4Rel {
-            cache_abs: Some(abs),
-            ..
-        } => Some(abs.as_str()),
-        AtPath::Ext4Rel { .. } => None,
-    }) else {
-        clear_ext4_path_cache();
-        return;
-    };
-    if subtree {
-        invalidate_ext4_path_cache_subtree(path);
-    } else {
-        invalidate_ext4_path_cache(path);
-    }
-}
-
-/// 将绝对路径字符串转换为 `AtPath` 枚举，区分 ext4 路径与伪文件系统路径。
-pub(crate) fn classify_abs_at_path(abs: String) -> AtPath {
-    // Linux starts absolute lookup from the process's pinned root path.  The
-    // mount graph, not a presentation record or translated provider string,
-    // selects the filesystem for every component.
-    if let Some(at) = vfs_at_from_logical_abs(&abs) {
-        return at;
-    }
-    // Only legacy internal callers can supply a spelling outside the current
-    // chroot.  Do not reinterpret it through a mount-record source string.
-    AtPath::Ext4Abs(abs)
-}
-
-fn logical_path_below_process_root(abs: &str, root: &str) -> Option<String> {
-    if root == "/" {
-        return Some(String::from(abs));
-    }
-    if abs == root {
-        return Some(String::from("/"));
-    }
-    let suffix = abs.strip_prefix(root)?;
-    if !suffix.starts_with('/') {
-        return None;
-    }
-    Some(String::from(suffix))
-}
-
-fn vfs_at_from_logical_abs(abs: &str) -> Option<AtPath> {
-    let process = current_process();
-    let fs = process.fs_struct();
-    let path = logical_path_below_process_root(abs, &fs.root_display())?;
-    let root = fs.root().path().clone();
-    let namespace = process.mount_namespace().lock().vfs_namespace();
-    Some(AtPath::Vfs(VfsAtPath {
-        namespace,
-        root: root.clone(),
-        start: root,
-        path,
-    }))
-}
-
 fn vfs_at_from_start(start: VfsPath, path: &str) -> AtPath {
     let process = current_process();
     let fs = process.fs_struct();
-    AtPath::Vfs(VfsAtPath {
+    AtPath {
         namespace: process.mount_namespace().lock().vfs_namespace(),
         root: fs.root().path().clone(),
         start,
         path: String::from(path),
-    })
+    }
 }
 
 pub(crate) fn map_vfs_error(error: VfsError) -> isize {
@@ -325,7 +194,7 @@ pub(crate) fn resolve_at_vfs_path(
     uid: u32,
     gid: u32,
     follow_final: bool,
-) -> Result<Option<VfsPath>, isize> {
+) -> Result<VfsPath, isize> {
     resolve_at_vfs_path_with_flags(
         at,
         uid,
@@ -346,19 +215,15 @@ pub(crate) fn resolve_at_vfs_path_with_flags(
     uid: u32,
     gid: u32,
     flags: LookupFlags,
-) -> Result<Option<VfsPath>, isize> {
-    let AtPath::Vfs(vfs) = at else {
-        return Ok(None);
-    };
-    PathWalker::new(Arc::clone(&vfs.namespace))
+) -> Result<VfsPath, isize> {
+    PathWalker::new(Arc::clone(&at.namespace))
         .walk(
-            &vfs.root,
-            &vfs.start,
-            &vfs.path,
+            &at.root,
+            &at.start,
+            &at.path,
             flags,
             VfsCredentials { uid, gid },
         )
-        .map(Some)
         .map_err(map_vfs_error)
 }
 
@@ -366,24 +231,16 @@ pub(crate) fn resolve_at_vfs_path_with_flags(
 /// following its final symlink.  Linux namei treats that root as a real pinned
 /// `struct path`; callers must not infer it from a spelling such as `"/"`.
 pub(crate) fn vfs_at_path_is_process_root(at: &AtPath, uid: u32, gid: u32) -> Result<bool, isize> {
-    let AtPath::Vfs(vfs) = at else {
-        return Ok(false);
-    };
-    let path = resolve_at_vfs_path(at, uid, gid, false)?
-        .expect("Vfs AtPath must resolve to an object path");
-    Ok(path.same_object(&vfs.root))
+    let path = resolve_at_vfs_path(at, uid, gid, false)?;
+    Ok(path.same_object(&at.root))
 }
 
-/// 根据 `dirfd` 确定相对路径的基准：
-/// - `AT_FDCWD`：返回当前工作目录的逻辑绝对路径；
-/// - 伪目录 fd：返回其逻辑绝对路径；
-/// - ext4 目录 fd：返回对应的 inode 及其逻辑路径（如可知）。
-/// tldr:
-/// 简单来说 就是判断dirfd是什么类型的地址，如果是 psudo file 那么会返回 logical addr  反之，返回
-/// 真实node 节点 + 对因地址
-pub(crate) fn resolve_relative_at_path_base(dirfd: isize) -> Result<RelativeAtPathBase, isize> {
+/// Return the pinned directory object used as the start of a relative lookup.
+/// Linux takes this from `fs->pwd` or `fd_file(dirfd)->f_path`; a pathname
+/// string is never reconstructed from the descriptor's display name.
+fn relative_at_path_start(dirfd: isize) -> Result<VfsPath, isize> {
     if dirfd == AT_FDCWD {
-        return Ok(RelativeAtPathBase::LogicalAbs(current_cwd_path()));
+        return Ok(current_process().fs_struct().cwd().path().clone());
     }
     if dirfd < 0 {
         return Err(err(SyscallError::EBADF));
@@ -391,86 +248,21 @@ pub(crate) fn resolve_relative_at_path_base(dirfd: isize) -> Result<RelativeAtPa
     let Some(file) = get_fd_file(dirfd as usize) else {
         return Err(err(SyscallError::EBADF));
     };
-    if let Some(base) = file.object_path() {
-        let metadata = base.node().metadata().map_err(map_vfs_error)?;
-        if metadata.kind != crate::fs::vfs::VfsNodeKind::Directory {
-            return Err(err(SyscallError::ENOTDIR));
-        }
-        return Ok(RelativeAtPathBase::VfsDir { base: base.clone() });
-    }
-    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
-        return Ok(RelativeAtPathBase::LogicalAbs(String::from(pdir.path())));
-    }
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        if vfs_file.kind() != crate::fs::vfs::VfsNodeKind::Directory {
-            return Err(err(SyscallError::ENOTDIR));
-        }
-        return Ok(RelativeAtPathBase::VfsDir {
-            base: vfs_file.path().clone(),
-        });
-    }
-    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+    let Some(base) = file.object_path() else {
+        // Anonymous files and pre-VFS internal descriptors cannot be dirfds.
+        // Named directory opens always carry an object path.
         return Err(err(SyscallError::ENOTDIR));
     };
-    let base = os_inode.ext4_inode();
-    if !base.is_dir() {
+    if base.node().metadata().map_err(map_vfs_error)?.kind != crate::fs::vfs::VfsNodeKind::Directory
+    {
         return Err(err(SyscallError::ENOTDIR));
     }
-    Ok(RelativeAtPathBase::Ext4Dir {
-        logical_base: logical_path_for_inode(&base),
-        vfs_base: os_inode.vfs_path().map(|path| path.path().clone()),
-        base,
-    })
+    Ok(base.clone())
 }
 
-/// 从逻辑绝对路径基准解析相对路径，处理 `/proc` 魔法路径、挂载点重定向等情况，
-/// 返回最终的 `AtPath`（ext4 绝对、ext4 相对 inode 或伪文件系统）。
-/// tldr:
-/// 对于非真实文件 或者 包含magic link的 at 我们返回 abs
-/// 对于真实文件 返回 inode + relative path 的 相对地址类型
-pub(crate) fn resolve_relative_at_path_from_logical_base(
-    base_path: &str,
-    path: &str,
-) -> Result<AtPath, isize> {
-    let logical_abs = normalize_path(base_path, path);
-    let fs = current_process().fs_struct();
-    if base_path == fs.cwd_display() {
-        return Ok(vfs_at_from_start(fs.cwd().path().clone(), path));
-    }
-    // A legacy directory object without `File::object_path()` can still carry
-    // a logical spelling. Re-enter the authoritative graph from the process
-    // root. The ext4 fallback remains only for such pre-VFS descriptors whose
-    // spelling lies outside the current chroot.
-    if let Some(at) = vfs_at_from_logical_abs(&logical_abs) {
-        return Ok(at);
-    }
-    Ok(AtPath::Ext4Abs(logical_abs))
-}
-
-/// 从已知 ext4 目录 inode 出发解析相对路径。
-/// 若有逻辑路径上下文，优先通过逻辑路径检测伪文件系统或挂载点；
-/// 否则直接返回相对于该 inode 的 `Ext4Rel`。
-pub(crate) fn resolve_relative_at_path_from_ext4_base(
-    base: alloc::sync::Arc<ext4_fs::Inode>,
-    _logical_base: Option<String>,
-    vfs_base: Option<VfsPath>,
-    path: &str,
-) -> Result<AtPath, isize> {
-    if let Some(vfs_base) = vfs_base {
-        return Ok(vfs_at_from_start(vfs_base, path));
-    }
-    let rel = normalize_relative_path(path);
-    Ok(AtPath::Ext4Rel {
-        base,
-        rel,
-        cache_abs: None,
-    })
-}
-
-/// 核心函数
-/// 将 `(dirfd, path)` 解析为 `AtPath`，统一处理绝对路径、相对路径、
-/// `AT_FDCWD`、进程 chroot jail、路径长度/分量校验。
-/// 这是所有文件系统系统调用路径解析的统一入口。 是外部传入的路径 变成 内部数据结构AtPath的器idian
+/// 将用户的 `(dirfd, path)` 转成一次对象化 lookup 的起点和策略上下文。
+/// 绝对路径从进程固定的 root 开始，相对路径从 cwd 或 dirfd 的 `f_path`
+/// 开始；这里不做词法 canonicalization，实际语义由 `PathWalker` 决定。
 pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize> {
     // pre check
     if path.is_empty() {
@@ -481,27 +273,15 @@ pub(crate) fn resolve_at_path(dirfd: isize, path: &str) -> Result<AtPath, isize>
     }
     validate_path_components(path)?;
 
-    // Absolute path: ignore dirfd.
-    // if starts with / then it must be real path or psudo
-    // This is decided in the classify function
+    // Absolute lookup ignores dirfd and starts from the task's pinned root.
+    // Keep the spelling intact so the walker, not lexical normalization,
+    // enforces search permission, symlink and `..` semantics.
     if path.starts_with('/') {
-        let jail_abs = normalize_path("/", path);
-        let abs = apply_process_root(&jail_abs);
-        return Ok(classify_abs_at_path(abs));
+        let root = current_process().fs_struct().root().path().clone();
+        return Ok(vfs_at_from_start(root, path));
     }
 
-    // handle relative address:
-    match resolve_relative_at_path_base(dirfd)? {
-        RelativeAtPathBase::LogicalAbs(base_path) => {
-            resolve_relative_at_path_from_logical_base(&base_path, path)
-        }
-        RelativeAtPathBase::Ext4Dir {
-            base,
-            logical_base,
-            vfs_base,
-        } => resolve_relative_at_path_from_ext4_base(base, logical_base, vfs_base, path),
-        RelativeAtPathBase::VfsDir { base, .. } => Ok(vfs_at_from_start(base, path)),
-    }
+    Ok(vfs_at_from_start(relative_at_path_start(dirfd)?, path))
 }
 
 fn openat2_object_start(dirfd: isize, require_directory: bool) -> Result<VfsPath, isize> {
@@ -555,13 +335,12 @@ pub(crate) fn resolve_openat2_path(
     resolve_at_path(dirfd, path)
 }
 
-/// Resolve the parent object path and final name for an object-VFS pathname.
-/// Non-object transitional paths return `Ok(None)`.
+/// Resolve the parent object path and final name for a VFS pathname.
 pub(crate) fn resolve_parent_vfs_path(
     at: &AtPath,
     uid: u32,
     gid: u32,
-) -> Result<Option<crate::fs::vfs::VfsParentPath>, isize> {
+) -> Result<crate::fs::vfs::VfsParentPath, isize> {
     resolve_parent_vfs_path_with_flags(at, uid, gid, LookupFlags::default())
 }
 
@@ -570,19 +349,15 @@ pub(crate) fn resolve_parent_vfs_path_with_flags(
     uid: u32,
     gid: u32,
     flags: LookupFlags,
-) -> Result<Option<crate::fs::vfs::VfsParentPath>, isize> {
-    let AtPath::Vfs(vfs) = at else {
-        return Ok(None);
-    };
-    PathWalker::new(Arc::clone(&vfs.namespace))
+) -> Result<crate::fs::vfs::VfsParentPath, isize> {
+    PathWalker::new(Arc::clone(&at.namespace))
         .walk_parent(
-            &vfs.root,
-            &vfs.start,
-            &vfs.path,
+            &at.root,
+            &at.start,
+            &at.path,
             flags,
             VfsCredentials { uid, gid },
         )
-        .map(Some)
         .map_err(map_vfs_error)
 }
 
@@ -596,63 +371,6 @@ pub(crate) fn invalidate_vfs_parent_entry(parent: &crate::fs::vfs::VfsParentPath
         .filesystem()
         .dentry_cache()
         .invalidate(parent.parent.dentry(), &parent.name);
-}
-
-/// 从挂载翻译后的 ext4 绝对路径解析 inode。
-///
-/// `root_inode_for_path` selects exactly one backing filesystem.  An ENOENT
-/// therefore stays on that filesystem and never falls through to another disk.
-/// 每个路径分量在查找时获取父目录的共享 inode 锁。
-pub(crate) fn resolve_ext4_abs_path(
-    path: &str,
-    uid: u32,
-    gid: u32,
-    follow_final: bool,
-    depth: &mut usize,
-    seen_symlinks: &mut Vec<u32>,
-) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
-    let abs = crate::fs::normalize_proc_magic_path(path).into_owned();
-
-    let primary = crate::fs::root_inode_for_path(&abs);
-    let lookup_path = crate::fs::path_within_filesystem(&abs);
-    if let Some(result) = resolve_ext4_abs_path_fast_cached(
-        primary.clone(),
-        &abs,
-        lookup_path,
-        uid,
-        gid,
-        follow_final,
-    ) {
-        return result;
-    }
-    let result = resolve_ext4_path(
-        primary,
-        lookup_path,
-        uid,
-        gid,
-        follow_final,
-        depth,
-        seen_symlinks,
-    );
-    if let Ok(inode) = &result {
-        note_ext4_path_cache(&abs, uid, gid, follow_final, inode);
-    }
-    result
-}
-
-fn resolve_ext4_abs_path_fast_cached(
-    start: alloc::sync::Arc<ext4_fs::Inode>,
-    cache_key: &str,
-    lookup_path: &str,
-    uid: u32,
-    gid: u32,
-    follow_final: bool,
-) -> Option<Result<alloc::sync::Arc<ext4_fs::Inode>, isize>> {
-    let result = resolve_ext4_path_fast_no_symlink(start, lookup_path, uid, gid, follow_final)?;
-    if let Ok(inode) = &result {
-        note_ext4_path_cache(cache_key, uid, gid, follow_final, inode);
-    }
-    Some(result)
 }
 
 /// 处理 `*at` 系统调用 `path=""` 的情况：
@@ -884,211 +602,20 @@ pub(crate) fn do_removexattr(inode: &Arc<ext4_fs::Inode>, name: &str) -> isize {
     0
 }
 
-/// 从 ext4 起始 inode 出发，按路径分量逐级查找目标 inode，完整处理：
-/// - `.` / `..` 导航（含跨越起始点的 `..`）；
-/// - 目录执行权限检查（`x` 位）；
-/// - 符号链接解引用（`follow_final` 控制是否解引用最后一个分量），
-///   检测循环（深度 + 已见 inode 集合），绝对符号链接回到根解析。
-/// 每个路径分量在查找时获取父目录的共享 inode 锁。
-pub(crate) fn resolve_ext4_path(
-    start: alloc::sync::Arc<ext4_fs::Inode>,
-    path: &str,
-    uid: u32,
-    gid: u32,
-    follow_final: bool,
-    depth: &mut usize,
-    seen_symlinks: &mut Vec<u32>,
-) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
-    if let Some(result) = resolve_ext4_path_fast_no_symlink(
-        alloc::sync::Arc::clone(&start),
-        path,
-        uid,
-        gid,
-        follow_final,
-    ) {
-        return result;
-    }
-
-    let mut stack: Vec<alloc::sync::Arc<ext4_fs::Inode>> = alloc::vec![start];
-    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let mut idx = 0usize;
-    while idx < components.len() {
-        let seg = components[idx];
-        if seg == "." {
-            idx += 1;
-            continue;
-        }
-        if seg == ".." {
-            let cur = stack.last().unwrap().clone();
-            let cur_lock = ext4_inode_lock(&cur);
-            let _cur_guard = cur_lock.read();
-            if !cur.is_dir() {
-                return Err(err(SyscallError::ENOTDIR));
-            }
-            if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
-                return Err(err(SyscallError::EACCES));
-            }
-            if stack.len() > 1 {
-                stack.pop();
-            } else if let Some(parent) = cur.find("..") {
-                // When walking from a non-root start inode (e.g. resolving a
-                // relative symlink target), ".." must be able to climb above
-                // that start directory.
-                if parent.inode_num() != cur.inode_num() {
-                    stack[0] = parent;
-                }
-            }
-            idx += 1;
-            continue;
-        }
-        let cur = stack.last().unwrap().clone();
-        let next = {
-            let cur_lock = ext4_inode_lock(&cur);
-            let _cur_guard = cur_lock.read();
-            if !cur.is_dir() {
-                return Err(err(SyscallError::ENOTDIR));
-            }
-            if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
-                return Err(err(SyscallError::EACCES));
-            }
-            let Some(next) = cur.find(seg) else {
-                return Err(err(SyscallError::ENOENT));
-            };
-            next
-        };
-        let is_last = idx + 1 == components.len();
-        let next_lock = ext4_inode_lock(&next);
-        let next_guard = next_lock.read();
-        if next.is_symlink() && (follow_final || !is_last) {
-            if *depth >= MAX_SYMLINKS {
-                return Err(err(SyscallError::ELOOP));
-            }
-            let inode_num = next.inode_num();
-            if seen_symlinks.iter().any(|&n| n == inode_num) {
-                return Err(err(SyscallError::ELOOP));
-            }
-            seen_symlinks.push(inode_num);
-            *depth += 1;
-            let target_bytes = next.read_all();
-            drop(next_guard);
-            let target = String::from_utf8_lossy(&target_bytes).into_owned();
-            if target.is_empty() {
-                return Err(err(SyscallError::ENOENT));
-            }
-            let remaining = if is_last {
-                String::new()
-            } else {
-                components[idx + 1..].join("/")
-            };
-            let mut new_path = target;
-            if !remaining.is_empty() {
-                if !new_path.ends_with('/') {
-                    new_path.push('/');
-                }
-                new_path.push_str(&remaining);
-            }
-            if new_path.starts_with('/') {
-                // Linux restarts an absolute symlink at current->fs->root and
-                // then performs ordinary mount-aware namei.  Re-enter the
-                // object walker instead of translating the target to a mount
-                // source pathname.
-                let at = resolve_at_path(AT_FDCWD, &new_path)?;
-                return resolve_at_inode(&at, uid, gid, follow_final);
-            }
-            return resolve_ext4_path(cur, &new_path, uid, gid, follow_final, depth, seen_symlinks);
-        }
-        drop(next_guard);
-        stack.push(next);
-        idx += 1;
-    }
-    Ok(stack.last().unwrap().clone())
-}
-
-fn resolve_ext4_path_fast_no_symlink(
-    start: alloc::sync::Arc<ext4_fs::Inode>,
-    path: &str,
-    uid: u32,
-    gid: u32,
-    follow_final: bool,
-) -> Option<Result<alloc::sync::Arc<ext4_fs::Inode>, isize>> {
-    let mut cur = start;
-    let mut components = path.split('/').filter(|s| !s.is_empty()).peekable();
-    while let Some(seg) = components.next() {
-        if seg == "." || seg == ".." {
-            return None;
-        }
-        let next = {
-            let cur_lock = ext4_inode_lock(&cur);
-            let _cur_guard = cur_lock.read();
-            if !cur.is_dir() {
-                return Some(Err(err(SyscallError::ENOTDIR)));
-            }
-            if !inode_mode_allows_uid_gid(&cur, 1, uid, gid) {
-                return Some(Err(err(SyscallError::EACCES)));
-            }
-            let Some(next) = cur.find(seg) else {
-                return Some(Err(err(SyscallError::ENOENT)));
-            };
-            next
-        };
-        let is_last = components.peek().is_none();
-        let next_is_symlink = {
-            let next_lock = ext4_inode_lock(&next);
-            let _next_guard = next_lock.read();
-            next.is_symlink()
-        };
-        if next_is_symlink && (follow_final || !is_last) {
-            return None;
-        }
-        cur = next;
-    }
-    Some(Ok(cur))
-}
-
-/// 将 `AtPath` 解析为 ext4 inode，统一分发到绝对路径或相对 inode 两条路径。
-/// Object paths are downcast only when the caller specifically requires an
-/// ext4 inode; non-ext4 nodes return `EOPNOTSUPP`.
+/// Resolve one object path and expose its ext4 adapter inode when required by
+/// a legacy inode operation. Non-ext4 nodes return `EOPNOTSUPP`.
 pub(crate) fn resolve_at_inode(
     at: &AtPath,
     uid: u32,
     gid: u32,
     follow_final: bool,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
-    let mut depth = 0usize;
-    let mut seen_symlinks = Vec::new();
-    match at {
-        AtPath::Vfs(_) => {
-            let path = resolve_at_vfs_path(at, uid, gid, follow_final)?
-                .expect("Vfs AtPath must resolve to an object path");
-            path.node()
-                .as_any()
-                .downcast_ref::<Ext4VfsNode>()
-                .map(|node| Arc::clone(node.inode()))
-                .ok_or_else(|| err(SyscallError::EOPNOTSUPP))
-        }
-        AtPath::Ext4Abs(abs) => {
-            resolve_ext4_abs_path(abs, uid, gid, follow_final, &mut depth, &mut seen_symlinks)
-        }
-        AtPath::Ext4Rel {
-            base,
-            rel,
-            cache_abs: _,
-        } => {
-            if rel.is_empty() {
-                Ok(alloc::sync::Arc::clone(base))
-            } else {
-                resolve_ext4_path(
-                    alloc::sync::Arc::clone(base),
-                    rel,
-                    uid,
-                    gid,
-                    follow_final,
-                    &mut depth,
-                    &mut seen_symlinks,
-                )
-            }
-        }
-    }
+    let path = resolve_at_vfs_path(at, uid, gid, follow_final)?;
+    path.node()
+        .as_any()
+        .downcast_ref::<Ext4VfsNode>()
+        .map(|node| Arc::clone(node.inode()))
+        .ok_or_else(|| err(SyscallError::EOPNOTSUPP))
 }
 
 pub(crate) fn resolve_at_inode_with_vfs_path(
@@ -1096,7 +623,7 @@ pub(crate) fn resolve_at_inode_with_vfs_path(
     uid: u32,
     gid: u32,
     follow_final: bool,
-) -> Result<(Arc<ext4_fs::Inode>, Option<VfsPath>), isize> {
+) -> Result<(Arc<ext4_fs::Inode>, VfsPath), isize> {
     resolve_at_inode_with_vfs_path_flags(
         at,
         uid,
@@ -1114,18 +641,15 @@ pub(crate) fn resolve_at_inode_with_vfs_path_flags(
     uid: u32,
     gid: u32,
     flags: LookupFlags,
-) -> Result<(Arc<ext4_fs::Inode>, Option<VfsPath>), isize> {
-    if let Some(path) = resolve_at_vfs_path_with_flags(at, uid, gid, flags)? {
-        let inode = path
-            .node()
-            .as_any()
-            .downcast_ref::<Ext4VfsNode>()
-            .map(|node| Arc::clone(node.inode()))
-            .ok_or_else(|| err(SyscallError::EOPNOTSUPP))?;
-        return Ok((inode, Some(path)));
-    }
-    resolve_at_inode(at, uid, gid, flags.contains(LookupFlags::FOLLOW_FINAL))
-        .map(|inode| (inode, None))
+) -> Result<(Arc<ext4_fs::Inode>, VfsPath), isize> {
+    let path = resolve_at_vfs_path_with_flags(at, uid, gid, flags)?;
+    let inode = path
+        .node()
+        .as_any()
+        .downcast_ref::<Ext4VfsNode>()
+        .map(|node| Arc::clone(node.inode()))
+        .ok_or_else(|| err(SyscallError::EOPNOTSUPP))?;
+    Ok((inode, path))
 }
 
 /// 解析可执行文件路径为 inode，校验：不在 noexec 挂载点、是普通文件、有执行权限。
@@ -1134,10 +658,7 @@ pub(crate) fn resolve_exec_inode(path: &str) -> Result<alloc::sync::Arc<ext4_fs:
     let at = resolve_at_path(AT_FDCWD, path)?;
     let (fsuid, fsgid) = current_fsuid_gid();
     let (inode, vfs_path) = resolve_at_inode_with_vfs_path(&at, fsuid, fsgid, true)?;
-    if vfs_path
-        .as_ref()
-        .is_some_and(|path| path.mount().flags().is_noexec())
-    {
+    if vfs_path.mount().flags().is_noexec() {
         return Err(err(SyscallError::EACCES));
     }
     let inode_lock = ext4_inode_lock(&inode);
@@ -1191,7 +712,7 @@ pub(crate) fn resolve_exec_inode_at(
         if !follow_final && is_symlink {
             return Err(err(SyscallError::ELOOP));
         }
-        (inode, vfs_path)
+        (inode, Some(vfs_path))
     };
     if vfs_path
         .as_ref()
@@ -1248,75 +769,23 @@ pub(crate) fn resolve_parent_and_name_with_flags(
     gid: u32,
     flags: LookupFlags,
 ) -> Result<(alloc::sync::Arc<ext4_fs::Inode>, alloc::string::String), isize> {
-    let mut depth = 0usize;
-    let mut seen_symlinks = Vec::new();
-    match at {
-        AtPath::Vfs(vfs) => {
-            let parent = PathWalker::new(Arc::clone(&vfs.namespace))
-                .walk_parent(
-                    &vfs.root,
-                    &vfs.start,
-                    &vfs.path,
-                    flags,
-                    VfsCredentials { uid, gid },
-                )
-                .map_err(map_vfs_error)?;
-            let inode = parent
-                .parent
-                .node()
-                .as_any()
-                .downcast_ref::<Ext4VfsNode>()
-                .map(|node| Arc::clone(node.inode()))
-                .ok_or_else(|| err(SyscallError::EOPNOTSUPP))?;
-            Ok((inode, parent.name))
-        }
-        AtPath::Ext4Abs(abs) => {
-            if abs == "/" {
-                return Err(err(SyscallError::EINVAL));
-            }
-            let Some((parent_path, name)) = split_parent_and_name(abs) else {
-                return Err(err(SyscallError::EINVAL));
-            };
-            if name.is_empty() {
-                return Err(err(SyscallError::EINVAL));
-            }
-            let parent_abs = if parent_path.is_empty() {
-                alloc::string::String::from("/")
-            } else {
-                let mut p = alloc::string::String::from("/");
-                p.push_str(parent_path);
-                p
-            };
-            let parent =
-                resolve_ext4_abs_path(&parent_abs, uid, gid, true, &mut depth, &mut seen_symlinks)?;
-            Ok((parent, alloc::string::String::from(name)))
-        }
-        AtPath::Ext4Rel { base, rel, .. } => {
-            if rel.is_empty() {
-                return Err(err(SyscallError::EINVAL));
-            }
-            let Some((parent_path, name)) = split_parent_and_name(rel) else {
-                return Err(err(SyscallError::EINVAL));
-            };
-            if name.is_empty() {
-                return Err(err(SyscallError::EINVAL));
-            }
-            let parent = if parent_path.is_empty() {
-                alloc::sync::Arc::clone(base)
-            } else {
-                resolve_ext4_path(
-                    alloc::sync::Arc::clone(base),
-                    parent_path,
-                    uid,
-                    gid,
-                    true,
-                    &mut depth,
-                    &mut seen_symlinks,
-                )?
-            };
-            Ok((parent, alloc::string::String::from(name)))
-        }
-    }
+    let parent = PathWalker::new(Arc::clone(&at.namespace))
+        .walk_parent(
+            &at.root,
+            &at.start,
+            &at.path,
+            flags,
+            VfsCredentials { uid, gid },
+        )
+        .map_err(map_vfs_error)?;
+    let inode = parent
+        .parent
+        .node()
+        .as_any()
+        .downcast_ref::<Ext4VfsNode>()
+        .map(|node| Arc::clone(node.inode()))
+        .ok_or_else(|| err(SyscallError::EOPNOTSUPP))?;
+    Ok((inode, parent.name))
 }
 
 /// 将 `(dirfd, path)` 解析为规范化的逻辑绝对路径字符串（不进入 ext4 查找）。
