@@ -1757,10 +1757,12 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
                 arch::shutdown();
             }
         }
-        // Detach and semantically close this process' fd table before the
-        // zombie becomes visible to waiters.  Heavy file object drops remain
-        // deferred below.
-        let (parent, exit_signal, old_files) = {
+        // Detach files and fs_struct before publishing zombie state, matching
+        // Linux's exit_files()/exit_fs() ordering ahead of exit_notify().
+        // Heavy anonymous file destruction remains deferred below; dropping
+        // our fs_struct Arc immediately releases cwd/root pins unless another
+        // live CLONE_FS owner still shares the same context.
+        let (old_files, old_fs) = {
             let mut process_inner = process.borrow_mut();
             crate::syscall::process::unregister_executing_inode(
                 process_inner.exec_inode_dev,
@@ -1770,7 +1772,13 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
                 &mut process_inner.files,
                 Arc::new(FilesLock::new(FilesStruct::new())),
             );
-            close_files_struct_fd_refs_if_unshared(&old_files);
+            let old_fs = process_inner.fs.take();
+            (old_files, old_fs)
+        };
+        close_files_struct_fd_refs_if_unshared(&old_files);
+        drop(old_fs);
+        let (parent, exit_signal) = {
+            let mut process_inner = process.borrow_mut();
             process_inner.is_zombie = true;
             process_inner.dumped_core = dumped_core;
             process_inner.exit_code = exit_code;
@@ -1778,7 +1786,6 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
             (
                 process_inner.parent.as_ref().and_then(|p| p.upgrade()),
                 process_inner.exit_signal,
-                old_files,
             )
         }; // drop child PCB lock before touching parent to avoid lock inversion
         crate::syscall::process::release_ptrace_tracer(&process);
@@ -1939,7 +1946,11 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         }
     }
 
-    let (parent, exit_signal, old_files) = {
+    // Release cwd/root and descriptor ownership before the zombie can be
+    // observed, just like Linux do_exit() calls exit_files()/exit_fs() before
+    // exit_notify().  Shared CLONE_FS/CLONE_FILES objects remain alive through
+    // their other process owners.
+    let (old_files, old_fs) = {
         let mut process_inner = process.borrow_mut();
         crate::syscall::process::unregister_executing_inode(
             process_inner.exec_inode_dev,
@@ -1949,7 +1960,13 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
             &mut process_inner.files,
             Arc::new(FilesLock::new(FilesStruct::new())),
         );
-        close_files_struct_fd_refs_if_unshared(&old_files);
+        let old_fs = process_inner.fs.take();
+        (old_files, old_fs)
+    };
+    close_files_struct_fd_refs_if_unshared(&old_files);
+    drop(old_fs);
+    let (parent, exit_signal) = {
+        let mut process_inner = process.borrow_mut();
         process_inner.is_zombie = true;
         process_inner.dumped_core = dumped_core;
         process_inner.exit_code = exit_code;
@@ -1957,7 +1974,6 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         (
             process_inner.parent.as_ref().and_then(|p| p.upgrade()),
             process_inner.exit_signal,
-            old_files,
         )
     };
     crate::syscall::process::release_ptrace_tracer(&process);

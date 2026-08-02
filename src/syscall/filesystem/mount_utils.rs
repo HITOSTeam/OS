@@ -578,18 +578,18 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
     };
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let (fs, is_zombie, namespace, files) = match process.try_borrow_mut() {
-            Some(inner) => (
-                Arc::clone(&inner.fs),
-                inner.is_zombie,
-                Arc::clone(&inner.mnt_ns),
-                Arc::clone(&inner.files),
-            ),
+        let (fs, namespace, files) = match process.try_borrow_mut() {
+            Some(inner) => {
+                if inner.is_zombie {
+                    continue;
+                }
+                let Some(fs) = inner.fs.as_ref().map(Arc::clone) else {
+                    continue;
+                };
+                (fs, Arc::clone(&inner.mnt_ns), Arc::clone(&inner.files))
+            }
             None => continue,
         };
-        if is_zombie {
-            continue;
-        }
         if mount_namespace_id(&namespace) != current_ns_id {
             continue;
         }

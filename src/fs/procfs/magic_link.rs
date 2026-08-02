@@ -84,7 +84,10 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     let proc = pid2process(pid as usize)?;
     let (files, fs) = {
         let inner = proc.try_borrow_mut()?;
-        (Arc::clone(&inner.files), Arc::clone(&inner.fs))
+        if inner.is_zombie {
+            return None;
+        }
+        (Arc::clone(&inner.files), Arc::clone(inner.fs.as_ref()?))
     };
     let cwd = fs.cwd_display();
     let file = files.lock().get_file(fd)?;
@@ -159,7 +162,10 @@ fn anonymous_file_name(file: &Arc<dyn File + Send + Sync>) -> Option<&'static st
 fn proc_pid_cwd(pid: u32) -> Option<String> {
     let proc = pid2process(pid as usize)?;
     let inner = proc.try_borrow_mut()?;
-    Some(inner.fs.cwd_display())
+    if inner.is_zombie {
+        return None;
+    }
+    Some(inner.fs.as_ref()?.cwd_display())
 }
 
 /// 读取目标进程当前可执行文件的逻辑绝对路径。
@@ -261,7 +267,7 @@ fn proc_pid_exe_vfs_path(pid: u32) -> Option<VfsPath> {
         let inner = process.try_borrow_mut()?;
         (
             inner.exe_path.clone(),
-            Arc::clone(&inner.fs),
+            inner.fs.as_ref().map(Arc::clone),
             inner.fsuid,
             inner.fsgid,
             inner.is_zombie,
@@ -270,6 +276,7 @@ fn proc_pid_exe_vfs_path(pid: u32) -> Option<VfsPath> {
     if zombie || exe_path.is_empty() {
         return None;
     }
+    let fs = fs?;
     let root = fs.root();
     let cwd = fs.cwd();
     let namespace = process.mount_namespace().lock().vfs_namespace();
@@ -307,7 +314,8 @@ pub(crate) fn proc_magic_vfs_link(path: &str) -> Option<VfsLink> {
     }
     if rest == "cwd" {
         return pid2process(pid as usize)
-            .map(|process| process.fs_struct().cwd().path().clone())
+            .and_then(|process| process.try_fs_struct())
+            .map(|fs| fs.cwd().path().clone())
             .map(VfsLink::Magic);
     }
     if rest == "exe" {
@@ -330,7 +338,8 @@ pub(crate) fn proc_magic_vfs_link(path: &str) -> Option<VfsLink> {
     }
     if tail == "cwd" {
         return pid2process(pid as usize)
-            .map(|process| process.fs_struct().cwd().path().clone())
+            .and_then(|process| process.try_fs_struct())
+            .map(|fs| fs.cwd().path().clone())
             .map(VfsLink::Magic);
     }
     if tail == "exe" {

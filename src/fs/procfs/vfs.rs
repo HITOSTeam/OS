@@ -333,7 +333,11 @@ impl VfsNode for ProcNode {
         let path = self.global_provider_path(&fs).ok_or(VfsError::NoEntry)?;
         // `self` and `thread-self` are ordinary relative links. cwd, exe and
         // pathname-backed fd links use an already resolved object path.
-        proc_magic_vfs_link(&path).ok_or(VfsError::NotSupported)
+        // The proc symlink inode may outlive its dynamic target.  Linux keeps
+        // `/proc/<zombie>/cwd` nameable but `proc_pid_get_link()` returns
+        // ENOENT after exit_fs() clears the task's fs_struct.  `None` here is
+        // therefore a vanished target, not an unsupported readlink operation.
+        proc_magic_vfs_link(&path).ok_or(VfsError::NoEntry)
     }
 
     fn open(self: Arc<Self>, options: VfsOpenOptions) -> VfsResult<Arc<dyn VfsFileOperations>> {

@@ -1131,7 +1131,13 @@ pub struct ProcessControlBlockInner {
     pub ioprio: u16,
     /// Linux-style shared filesystem context.  CLONE_FS shares this Arc;
     /// ordinary fork snapshots root/cwd/umask into a private object.
-    pub(crate) fs: Arc<FsStruct>,
+    /// Filesystem context owned by this live process.
+    ///
+    /// Linux clears `task_struct::fs` in `exit_fs()` before publishing zombie
+    /// state.  Keeping this optional lets an unreaped zombie retain its PCB
+    /// metadata without pinning cwd/root mounts.  A shared `CLONE_FS` context
+    /// remains alive through any other process that still owns an `Arc`.
+    pub(crate) fs: Option<Arc<FsStruct>>,
     /// 文件描述符表。普通 fork 会快照这个对象；CLONE_FILES 共享同一个 Arc，
     /// 让生命周期跟随引用，而不是依赖进程所有者转发模型。
     pub(crate) files: Arc<FilesLock>,
@@ -1638,7 +1644,7 @@ impl ProcessControlBlock {
                 keep_caps: false,
                 personality: 0,
                 ioprio: 0,
-                fs,
+                fs: Some(fs),
                 files: Arc::new(FilesLock::new(FilesStruct::with_stdio())),
                 rlimits: ProcessResourceLimits {
                     rlimit_nofile_cur: 1024,
@@ -2191,10 +2197,14 @@ impl ProcessControlBlock {
         let keep_caps = parent.keep_caps;
         let personality = parent.personality;
         let ioprio = parent.ioprio;
+        let parent_fs = parent
+            .fs
+            .as_ref()
+            .expect("a live fork parent must own an fs_struct");
         let fs = if share_fs {
-            Arc::clone(&parent.fs)
+            Arc::clone(parent_fs)
         } else {
-            parent.fs.clone_private()
+            parent_fs.clone_private()
         };
         let rlimits = parent.rlimits.clone();
         let ipc_ns_id = parent.ipc_ns_id;
@@ -2286,7 +2296,7 @@ impl ProcessControlBlock {
                 keep_caps,
                 personality,
                 ioprio,
-                fs,
+                fs: Some(fs),
                 files: child_files,
                 rlimits,
                 ipc_ns_id,
@@ -2514,12 +2524,32 @@ impl ProcessControlBlock {
     }
 
     pub fn fs_struct(&self) -> Arc<FsStruct> {
-        Arc::clone(&self.borrow_mut().fs)
+        Arc::clone(
+            self.borrow_mut()
+                .fs
+                .as_ref()
+                .expect("a live process must own an fs_struct"),
+        )
+    }
+
+    /// Return the filesystem context only while the process still owns it.
+    /// Procfs uses this for zombie-sensitive magic links such as `cwd`.
+    pub fn try_fs_struct(&self) -> Option<Arc<FsStruct>> {
+        let inner = self.borrow_mut();
+        if inner.is_zombie {
+            return None;
+        }
+        inner.fs.as_ref().map(Arc::clone)
     }
 
     pub fn unshare_fs(&self) {
-        let private = self.borrow_mut().fs.clone_private();
-        self.borrow_mut().fs = private;
+        let mut inner = self.borrow_mut();
+        let private = inner
+            .fs
+            .as_ref()
+            .expect("a live process must own an fs_struct")
+            .clone_private();
+        inner.fs = Some(private);
     }
 
     pub fn mount_namespace_id(&self) -> usize {
@@ -2532,18 +2562,24 @@ impl ProcessControlBlock {
         let fs = FsStruct::new_with_paths(root.clone(), root, "/", "/", umask);
         let mut inner = self.borrow_mut();
         inner.mnt_ns = namespace;
-        inner.fs = fs;
+        inner.fs = Some(fs);
     }
 
     pub fn unshare_mount_namespace(&self) {
         let (namespace, fs) = {
             let inner = self.borrow_mut();
-            clone_mount_namespace_and_fs(&inner.mnt_ns, &inner.fs)
-                .expect("live fs paths must be remappable into a cloned mount namespace")
+            clone_mount_namespace_and_fs(
+                &inner.mnt_ns,
+                inner
+                    .fs
+                    .as_ref()
+                    .expect("a live process must own an fs_struct"),
+            )
+            .expect("live fs paths must be remappable into a cloned mount namespace")
         };
         let mut inner = self.borrow_mut();
         inner.mnt_ns = namespace;
-        inner.fs = fs;
+        inner.fs = Some(fs);
     }
 
     pub fn cgroup_namespace_root(&self) -> String {
