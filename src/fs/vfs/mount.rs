@@ -223,6 +223,19 @@ impl VfsPath {
     pub fn same_object(&self, other: &Self) -> bool {
         self.mount.id() == other.mount.id() && self.dentry.id() == other.dentry.id()
     }
+
+    /// Retain the exact object returned by a successful create operation.
+    ///
+    /// The new dentry is intentionally not inserted into the lookup cache:
+    /// namespace mutation code invalidates that cache separately, while the
+    /// returned path must keep naming the created object even if another task
+    /// immediately renames or unlinks it.
+    pub fn created_child(parent: &VfsPath, name: &str, node: Arc<dyn super::VfsNode>) -> Self {
+        Self::new(
+            Arc::clone(parent.mount()),
+            Dentry::child(parent.dentry(), name, node),
+        )
+    }
 }
 
 /// Persistent paths hold both the mount and its graph owner alive.

@@ -30,7 +30,7 @@ impl Dentry {
     }
 
     // generate child dentry
-    fn child(parent: &Arc<Dentry>, name: &str, node: Arc<dyn VfsNode>) -> Arc<Self> {
+    pub(super) fn child(parent: &Arc<Dentry>, name: &str, node: Arc<dyn VfsNode>) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_DENTRY_ID.fetch_add(1, Ordering::Relaxed) as u64,
             name: name.to_string(),
