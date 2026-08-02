@@ -209,6 +209,7 @@ const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_FCHDIR: usize = 50;
 const SYSCALL_CHROOT: usize = 51;
 const SYSCALL_OPENAT: usize = 56;
+const SYSCALL_OPENAT2: usize = 437;
 const SYSCALL_CLOSE: usize = 57;
 const SYSCALL_CLOSE_RANGE: usize = 436;
 const SYSCALL_VFORK: usize = 58;
@@ -660,6 +661,7 @@ pub fn syscall(id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FCHDIR => filesystem::syscall_fchdir(args[0]),
         SYSCALL_CHROOT => filesystem::syscall_chroot(args[0]),
         SYSCALL_OPENAT => filesystem::syscall_openat(args[0] as isize, args[1], args[2], args[3]),
+        SYSCALL_OPENAT2 => filesystem::syscall_openat2(args[0] as isize, args[1], args[2], args[3]),
         SYSCALL_READ => flow::syscall_read(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_WRITE => flow::syscall_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_READV => flow::syscall_readv(args[0], args[1], args[2]),

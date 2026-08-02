@@ -10,23 +10,20 @@ use spin::Mutex;
 use crate::task::manager::{PID2PCB, wakeup_tasks};
 use crate::{
     fs::{
-        CgroupFile, CgroupMountSpec, ClassifiedAbsPath, EventFdFile, FanotifyFile, File,
-        MountBackend, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
-        NamespaceFile, NetSocketFile, OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile,
-        PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile, PtyMasterFile, PtySlaveFile, RtcFile,
-        SocketPairEnd, TimerFdFile, TtyFile, block_device_source_path, cgroup_charge_file_write,
-        cgroup_logical_path_for_file, cgroup_mkdir, cgroup_mount, cgroup_rename, cgroup_rmdir,
-        cgroup_umount, clear_ext4_path_cache, ext4_inode_lock, ext4_topology_lock,
-        fanotify_notify_access, fanotify_notify_close, fanotify_notify_modify,
-        fanotify_notify_open, fanotify_permission_access, fanotify_permission_open,
-        find_path_in_roots, inode_logical_path, inode_raw_logical_path, invalidate_ext4_path_cache,
-        invalidate_ext4_path_cache_inode, invalidate_ext4_path_cache_subtree, make_pipe,
-        mount_namespace_id, note_ext4_path_cache, note_inode_path_hint, open_pseudo,
-        pseudo_block_is_read_only, pseudo_block_note_sync, register_deferred_unlink_cleanup,
-        resolve_final_symlink_abs_path, resolve_final_symlink_abs_path_locked,
-        resolve_proc_magic_intermediate_abs_path, root_inode_for_device, shm_create, shm_get,
-        shm_object_name, shm_remove, with_ext4_inode_read, with_ext4_inode_write,
-        with_ext4_inode_write_set,
+        CgroupFile, CgroupMountSpec, EventFdFile, FanotifyFile, File, MemfdFile, MountBackend,
+        MountNamespace, MountNamespaceState, MountPropagation, MountRecord, NamespaceFile,
+        NetSocketFile, OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir,
+        PseudoFile, PtyMasterFile, PtySlaveFile, RtcFile, SocketPairEnd, TimerFdFile, TtyFile,
+        VfsOpenedFile, block_device_source_path, cgroup_charge_file_write, clear_ext4_path_cache,
+        ext4_inode_lock, ext4_topology_lock, fanotify_notify_access, fanotify_notify_close,
+        fanotify_notify_modify, fanotify_notify_open, fanotify_permission_access,
+        fanotify_permission_open, find_path_in_roots, inode_logical_path, inode_raw_logical_path,
+        invalidate_ext4_path_cache, invalidate_ext4_path_cache_inode,
+        invalidate_ext4_path_cache_subtree, make_pipe, mount_namespace_id, note_ext4_path_cache,
+        note_inode_path_hint, pin_legacy_file_path, pseudo_block_is_read_only,
+        pseudo_block_note_sync, register_deferred_unlink_cleanup, resolve_final_symlink_abs_path,
+        resolve_final_symlink_abs_path_locked, root_inode_for_device, with_ext4_inode_read,
+        with_ext4_inode_write, with_ext4_inode_write_set,
     },
     mm::{
         MapPermission, UserBuffer, translated_byte_buffer, translated_mutref, try_copy_from_user,
@@ -96,6 +93,8 @@ pub(crate) const AT_SYMLINK_FOLLOW: usize = 0x400;
 pub(crate) const AT_NO_AUTOMOUNT: usize = 0x800;
 /// `*at` flag: permit an empty path and operate directly on `dirfd`.
 pub(crate) const AT_EMPTY_PATH: usize = 0x1000;
+/// Apply a mount attribute change to the complete mount subtree.
+pub(crate) const AT_RECURSIVE: usize = 0x8000;
 /// Mask covering the `statx(2)` sync-behavior selector bits.
 pub(crate) const AT_STATX_SYNC_TYPE: usize = 0x6000;
 
@@ -136,17 +135,17 @@ pub(crate) const O_TMPFILE: usize = 0x410000;
 pub(crate) const FD_CLOEXEC: u32 = 1;
 
 /// Mount is read-only.
-pub(crate) const MS_RDONLY: usize = 0x1;
+pub(crate) const MS_RDONLY: usize = crate::fs::vfs::VfsMountFlags::READ_ONLY;
 /// Ignore set-user-ID and set-group-ID bits.
 pub(crate) const MS_NOSUID: usize = 0x2;
 /// Disallow device special files on this mount.
-pub(crate) const MS_NODEV: usize = 0x4;
+pub(crate) const MS_NODEV: usize = crate::fs::vfs::VfsMountFlags::NODEV;
 /// Disallow program execution on this mount.
-pub(crate) const MS_NOEXEC: usize = 0x8;
+pub(crate) const MS_NOEXEC: usize = crate::fs::vfs::VfsMountFlags::NOEXEC;
 /// Change flags on an existing mount.
 pub(crate) const MS_REMOUNT: usize = 0x20;
 /// Do not follow symlinks during path resolution on this mount.
-pub(crate) const MS_NOSYMFOLLOW: usize = 0x100;
+pub(crate) const MS_NOSYMFOLLOW: usize = crate::fs::vfs::VfsMountFlags::NOSYMFOLLOW;
 /// Suppress atime updates.
 pub(crate) const MS_NOATIME: usize = 0x400;
 /// Suppress atime updates for directories.
@@ -236,6 +235,8 @@ pub(crate) const MOUNT_ATTR_RDONLY: usize = 0x00000001;
 pub(crate) const MOUNT_ATTR_NOSUID: usize = 0x00000002;
 pub(crate) const MOUNT_ATTR_NODEV: usize = 0x00000004;
 pub(crate) const MOUNT_ATTR_NOEXEC: usize = 0x00000008;
+/// Mask for the mutually exclusive mount atime policy values.
+pub(crate) const MOUNT_ATTR__ATIME: usize = 0x00000070;
 pub(crate) const MOUNT_ATTR_NOATIME: usize = 0x00000010;
 pub(crate) const MOUNT_ATTR_STRICTATIME: usize = 0x00000020;
 pub(crate) const MOUNT_ATTR_NODIRATIME: usize = 0x00000080;
@@ -248,8 +249,7 @@ pub(crate) const FSMOUNT_SUPPORTED_ATTRS: usize = MOUNT_ATTR_RDONLY
     | MOUNT_ATTR_NOSUID
     | MOUNT_ATTR_NODEV
     | MOUNT_ATTR_NOEXEC
-    | MOUNT_ATTR_NOATIME
-    | MOUNT_ATTR_STRICTATIME
+    | MOUNT_ATTR__ATIME
     | MOUNT_ATTR_NODIRATIME
     | MOUNT_ATTR_NOSYMFOLLOW;
 /// Maximum normalized path length accepted by pathname syscalls.

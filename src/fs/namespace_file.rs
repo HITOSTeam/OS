@@ -14,6 +14,7 @@ lazy_static! {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NamespaceKind {
+    Cgroup,
     Ipc,
     Mount,
     Net,
@@ -22,9 +23,11 @@ pub enum NamespaceKind {
 impl NamespaceKind {
     pub fn clone_flag(self) -> usize {
         const CLONE_NEWNS: usize = 0x0002_0000;
+        const CLONE_NEWCGROUP: usize = 0x0200_0000;
         const CLONE_NEWIPC: usize = 0x0800_0000;
         const CLONE_NEWNET: usize = 0x4000_0000;
         match self {
+            Self::Cgroup => CLONE_NEWCGROUP,
             Self::Ipc => CLONE_NEWIPC,
             Self::Mount => CLONE_NEWNS,
             Self::Net => CLONE_NEWNET,
@@ -33,6 +36,7 @@ impl NamespaceKind {
 
     pub fn proc_name(self) -> &'static str {
         match self {
+            Self::Cgroup => "cgroup",
             Self::Ipc => "ipc",
             Self::Mount => "mnt",
             Self::Net => "net",
@@ -48,6 +52,7 @@ impl NamespaceKind {
             Self::Ipc => 1u64,
             Self::Mount => 2u64,
             Self::Net => 3u64,
+            Self::Cgroup => 4u64,
         };
         (kind_tag << 56) | (ns_id as u64)
     }
@@ -58,6 +63,7 @@ pub struct NamespaceFile {
     kind: NamespaceKind,
     ns_id: usize,
     mount_ns: Option<MountNamespace>,
+    cgroup_root: Option<String>,
 }
 
 fn inc_net_namespace_file_ref(ns_id: usize) {
@@ -95,6 +101,7 @@ impl NamespaceFile {
             kind,
             ns_id,
             mount_ns: None,
+            cgroup_root: None,
         }
     }
 
@@ -111,6 +118,16 @@ impl NamespaceFile {
             kind: NamespaceKind::Mount,
             ns_id: mount_namespace_id(&namespace),
             mount_ns: Some(namespace),
+            cgroup_root: None,
+        }
+    }
+
+    pub fn new_cgroup(ns_id: usize, root: String) -> Self {
+        Self {
+            kind: NamespaceKind::Cgroup,
+            ns_id,
+            mount_ns: None,
+            cgroup_root: Some(root),
         }
     }
 
@@ -132,6 +149,10 @@ impl NamespaceFile {
 
     pub fn mount_namespace(&self) -> Option<MountNamespace> {
         self.mount_ns.as_ref().map(alloc::sync::Arc::clone)
+    }
+
+    pub fn cgroup_root(&self) -> Option<String> {
+        self.cgroup_root.clone()
     }
 }
 

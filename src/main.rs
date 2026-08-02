@@ -22,8 +22,8 @@ mod net;
 mod perf;
 #[cfg(target_arch = "riscv64")]
 mod sbi;
-mod syscall;
 mod sync;
+mod syscall;
 mod task;
 mod time;
 mod trap;

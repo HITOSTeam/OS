@@ -380,6 +380,7 @@ fn clone_from_parts(
     // 是否与父进程共享文件描述符表 / 地址空间
     let share_files = (flags & CLONE_FILES) != 0;
     let share_vm = (flags & CLONE_VM) != 0;
+    let share_fs = (flags & CLONE_FS) != 0;
 
     // For CLONE_VM + CLONE_PARENT_SETTID, ensure the parent-tid page is
     // materialized before cloning so the child shares the same backing frame.
@@ -401,7 +402,7 @@ fn clone_from_parts(
         return e;
     }
     // 实际复制进程资源：返回 (子进程控制块, 子进程主任务)
-    let (child, task) = match process.fork_with_task(share_files, share_vm) {
+    let (child, task) = match process.fork_with_task(share_files, share_vm, share_fs) {
         Ok(pair) => pair,
         Err(e) => return err(SyscallError::from(e)),
     };
@@ -434,7 +435,7 @@ fn clone_from_parts(
     }
     // CLONE_NEWCGROUP：以当前 cgroup 路径作为子的 cgroup ns 根
     if (flags & CLONE_NEWCGROUP) != 0 {
-        child.set_cgroup_namespace_root(cgroup_current_path(child.getpid()));
+        child.unshare_cgroup_namespace(cgroup_current_path(child.getpid()));
     }
     // CLONE_NEWPID：子进程进入新的 PID 命名空间，自身在新 ns 内成为 init(vpid=1)
     if (flags & CLONE_NEWPID) != 0 {

@@ -622,8 +622,8 @@ impl MemorySet {
                 "VmRegion SIGBUS tail marker outside mapping"
             );
             let has_external_backing =
-                region.file_backed || region.memfd_id != 0 || region.sysv_shmid != 0;
-            if region.file_backed || region.memfd_id != 0 {
+                region.file_backed || region.shmem_id != 0 || region.sysv_shmid != 0;
+            if region.file_backed || region.shmem_id != 0 {
                 debug_assert!(
                     region.backing_id != 0,
                     "file-backed or shared-object VmRegion must keep a backing id"
@@ -667,7 +667,7 @@ impl MemorySet {
         for backing_id in self.mmap_backings.keys().copied() {
             debug_assert!(
                 self.vm_regions.iter().any(|region| {
-                    (region.file_backed || region.memfd_id != 0) && region.backing_id == backing_id
+                    (region.file_backed || region.shmem_id != 0) && region.backing_id == backing_id
                 }),
                 "mmap backing id {} is not referenced by any VmRegion",
                 backing_id
@@ -1101,7 +1101,7 @@ impl MemorySet {
             file_ino: 0,
             file_offset: 0,
             backing_id: 0,
-            memfd_id: 0,
+            shmem_id: 0,
             anon_shared_id: 0,
             sysv_shmid: 0,
             growsdown: false,
@@ -1184,7 +1184,7 @@ impl MemorySet {
         {
             return false;
         }
-        let needs_backing = region.file_backed || region.memfd_id != 0;
+        let needs_backing = region.file_backed || region.shmem_id != 0;
         if needs_backing && backing_file.is_none() {
             return false;
         }
@@ -1274,7 +1274,7 @@ impl MemorySet {
             }
         }
 
-        if region.file_backed || region.memfd_id != 0 {
+        if region.file_backed || region.shmem_id != 0 {
             region.backing_id = self.allocate_mmap_backing(&region, backing_file);
             if region.backing_id == 0 {
                 return false;
@@ -1337,7 +1337,7 @@ impl MemorySet {
         let vm_regions = self.vm_regions.snapshot_range(start, end);
         let mut backing_entries = Vec::new();
         for region in vm_regions.iter() {
-            if !(region.file_backed || region.memfd_id != 0) || region.backing_id == 0 {
+            if !(region.file_backed || region.shmem_id != 0) || region.backing_id == 0 {
                 continue;
             }
             if backing_entries
@@ -1479,7 +1479,7 @@ impl MemorySet {
             file_ino: 0,
             file_offset: start.saturating_sub(self.heap_start),
             backing_id: 0,
-            memfd_id: 0,
+            shmem_id: 0,
             anon_shared_id: 0,
             sysv_shmid: 0,
             growsdown: false,
@@ -1519,7 +1519,7 @@ impl MemorySet {
             file_ino: 0,
             file_offset: 0,
             backing_id: 0,
-            memfd_id: 0,
+            shmem_id: 0,
             anon_shared_id: 0,
             sysv_shmid: 0,
             growsdown: false,

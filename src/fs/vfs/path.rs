@@ -2,10 +2,7 @@ use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 
-use super::{
-    PositiveDentryCache, VfsError, VfsLink, VfsMetadata, VfsMountNamespace, VfsNodeKind, VfsPath,
-    VfsResult,
-};
+use super::{VfsError, VfsLink, VfsMetadata, VfsMountNamespace, VfsNodeKind, VfsPath, VfsResult};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LookupFlags(pub u32);
@@ -25,6 +22,9 @@ impl LookupFlags {
     pub const NO_XDEV: u32 = 1 << 4;
     /// 禁止跟随直接返回 `VfsPath` 的 magic link，例如 procfs 的 fd 链接。
     pub const NO_MAGIC_LINKS: u32 = 1 << 5;
+    /// 禁止跟随任何符号链接。最终分量配合 `O_PATH|O_NOFOLLOW` 时仍可
+    /// 返回链接自身，语义对应 Linux `RESOLVE_NO_SYMLINKS`。
+    pub const NO_SYMLINKS: u32 = 1 << 6;
 
     /// 判断指定的 lookup flag 是否已设置。
     pub fn contains(self, flag: u32) -> bool {
@@ -39,22 +39,32 @@ pub struct VfsCredentials {
     pub gid: u32,
 }
 
+/// Result of resolving every component except the final name.  Create,
+/// unlink, link and rename operate on this parent/name pair so no syscall has
+/// to reconstruct an absolute string.
+pub struct VfsParentPath {
+    pub parent: VfsPath,
+    pub name: String,
+    pub trailing_slash: bool,
+}
+
 /// 路径解析
 pub struct PathWalker {
     namespace: Arc<VfsMountNamespace>,
-    dcache: PositiveDentryCache,
 }
 
 impl PathWalker {
     pub fn new(namespace: Arc<VfsMountNamespace>) -> Self {
-        Self {
-            namespace,
-            dcache: PositiveDentryCache::default(),
-        }
+        Self { namespace }
     }
 
-    pub fn dcache(&self) -> &PositiveDentryCache {
-        &self.dcache
+    /// Select the graph that owns a resolved path.  Relative lookup from an
+    /// old dirfd after `unshare(CLONE_NEWNS)` must continue in the old mount
+    /// tree, not silently switch to the caller's new namespace.
+    fn namespace_for(&self, path: &VfsPath) -> Arc<VfsMountNamespace> {
+        path.mount()
+            .owner_namespace()
+            .unwrap_or_else(|| Arc::clone(&self.namespace))
     }
 
     /// 逐分量解析路径并返回对应的挂载与目录项。
@@ -91,12 +101,21 @@ impl PathWalker {
             return Err(VfsError::CrossDevice);
         }
 
-        // Clone the root path so nodes remain alive throughout the walk.
-        let lookup_root = if flags.contains(LookupFlags::IN_ROOT) {
+        // Clone the root path so nodes remain alive throughout the walk.  A
+        // mount may cover the root dentry itself (for example after mounting
+        // a new root in a private namespace).  Linux starts absolute lookup
+        // from the currently visible `struct path`, so follow that mount stack
+        // before establishing the `..` boundary.  Relative lookup still starts
+        // from the exact cwd/dirfd path and therefore preserves an old covered
+        // directory, just like a pinned Linux file description.
+        let raw_lookup_root = if flags.contains(LookupFlags::IN_ROOT) {
             start.clone()
         } else {
             process_root.clone()
         };
+        let lookup_root = self
+            .namespace_for(&raw_lookup_root)
+            .follow_mounts(raw_lookup_root);
         // Select the starting point for relative or absolute lookup.
         let mut current = if path.starts_with('/') {
             lookup_root.clone()
@@ -111,21 +130,30 @@ impl PathWalker {
         // Handle `.` and `..` components.
         while let Some(component) = components.pop_front() {
             match component.as_str() {
-                "" | "." => continue,
+                "" => continue,
+                "." => {
+                    check_search_permission(current.node().metadata()?, credentials)?;
+                    continue;
+                }
                 ".." => {
+                    // Linux checks MAY_EXEC on the directory being traversed
+                    // before handling the dotdot boundary.
+                    check_search_permission(current.node().metadata()?, credentials)?;
+                    // LOOKUP_BENEATH rejects an attempted escape even when
+                    // the scoped root also happens to be the process root.
+                    // LOOKUP_IN_ROOT, in contrast, clamps dotdot at its root.
+                    if flags.contains(LookupFlags::BENEATH) && current.same_object(&beneath_root) {
+                        return Err(VfsError::CrossDevice);
+                    }
                     // 禁止跳出 root。
                     if current.same_object(&lookup_root) {
                         continue;
                     }
                     // 禁止跨设备。
-                    let parent = self.namespace.ascend(&current);
+                    let parent = self.namespace_for(&current).ascend(&current);
                     if flags.contains(LookupFlags::NO_XDEV)
                         && parent.mount().id() != current.mount().id()
                     {
-                        return Err(VfsError::CrossDevice);
-                    }
-                    // BENEATH 标志禁止跨越。
-                    if flags.contains(LookupFlags::BENEATH) && current.same_object(&beneath_root) {
                         return Err(VfsError::CrossDevice);
                     }
                     current = parent;
@@ -134,13 +162,23 @@ impl PathWalker {
                 _ => {}
             }
 
+            if component.len() > 255 {
+                return Err(VfsError::NameTooLong);
+            }
+
             // 处于目录访问，检查权限。
             check_search_permission(current.node().metadata()?, credentials)?;
             let parent = current.clone();
             // component 是我们下一个要去的地方。
-            let dentry = self.dcache.lookup(parent.dentry(), &component)?;
+            let dentry = parent
+                .mount()
+                .filesystem()
+                .dentry_cache()
+                .lookup(parent.dentry(), &component)?;
             let unmounted = VfsPath::new(Arc::clone(parent.mount()), dentry);
-            let mounted = self.namespace.follow_mounts(unmounted.clone());
+            let mounted = self
+                .namespace_for(&unmounted)
+                .follow_mounts(unmounted.clone());
             if flags.contains(LookupFlags::NO_XDEV)
                 && mounted.mount().id() != unmounted.mount().id()
             {
@@ -155,14 +193,31 @@ impl PathWalker {
             if current.node().metadata()?.kind != VfsNodeKind::Symlink || !follow {
                 continue;
             }
+            if flags.contains(LookupFlags::NO_SYMLINKS) {
+                return Err(VfsError::Loop);
+            }
+            // Linux namei checks MNT_NOSYMFOLLOW on the mount containing the
+            // link immediately before following it.  This applies equally to
+            // textual links and proc-style magic links; operations that do
+            // not follow the final component remain unaffected.
+            if current.mount().flags().is_nosymfollow() {
+                return Err(VfsError::Loop);
+            }
             symlinks += 1;
             if symlinks > 40 {
                 return Err(VfsError::Loop);
             }
             match current.node().readlink()? {
-                VfsLink::Magic(target) => {
+                VfsLink::Magic(target) | VfsLink::MagicDisplay { target, .. } => {
                     if flags.contains(LookupFlags::NO_MAGIC_LINKS) {
                         return Err(VfsError::Loop);
+                    }
+                    // Linux nd_jump_link() rejects direct path jumps for all
+                    // scoped lookups because they cannot safely preserve the
+                    // LOOKUP_BENEATH/LOOKUP_IN_ROOT guarantee.
+                    if flags.contains(LookupFlags::BENEATH) || flags.contains(LookupFlags::IN_ROOT)
+                    {
+                        return Err(VfsError::CrossDevice);
                     }
                     if flags.contains(LookupFlags::NO_XDEV)
                         && target.mount().id() != current.mount().id()
@@ -189,6 +244,61 @@ impl PathWalker {
             return Err(VfsError::NotDirectory);
         }
         Ok(current)
+    }
+
+    /// Resolve the parent of a pathname while leaving the final component as
+    /// a name.  Intermediate symlinks and mount crossings use the same walker
+    /// as ordinary lookup.
+    pub fn walk_parent(
+        &self,
+        process_root: &VfsPath,
+        start: &VfsPath,
+        path: &str,
+        flags: LookupFlags,
+        credentials: VfsCredentials,
+    ) -> VfsResult<VfsParentPath> {
+        if path.is_empty() || path.len() > 4096 {
+            return Err(if path.len() > 4096 {
+                VfsError::NameTooLong
+            } else {
+                VfsError::NoEntry
+            });
+        }
+        let trailing_slash = path.len() > 1 && path.ends_with('/');
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(VfsError::Invalid);
+        }
+        let name = trimmed.rsplit('/').next().ok_or(VfsError::Invalid)?;
+        if name.is_empty() || matches!(name, "." | "..") {
+            return Err(VfsError::Invalid);
+        }
+        if name.len() > 255 {
+            return Err(VfsError::NameTooLong);
+        }
+        let parent_len = trimmed.len().saturating_sub(name.len());
+        let parent_text = trimmed[..parent_len].trim_end_matches('/');
+        let parent = if parent_text.is_empty() {
+            if path.starts_with('/') {
+                self.walk(process_root, start, "/", flags, credentials)?
+            } else {
+                start.clone()
+            }
+        } else {
+            self.walk(
+                process_root,
+                start,
+                parent_text,
+                LookupFlags(flags.0 | LookupFlags::FOLLOW_FINAL),
+                credentials,
+            )?
+        };
+        check_search_permission(parent.node().metadata()?, credentials)?;
+        Ok(VfsParentPath {
+            parent,
+            name: name.to_string(),
+            trailing_slash,
+        })
     }
 }
 

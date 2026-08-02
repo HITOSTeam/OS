@@ -24,17 +24,15 @@ use crate::{
             current_task_cpu_time_ns, process_cpu_time_ns, process_task_by_index, task_cpu_time_ns,
         },
     },
-    time::{get_time, get_time_ns},
+    time::{get_realtime_ns, get_time, get_time_ns, set_realtime_ns},
     trap::get_current_token,
 };
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 const CYCLICTEST_LOG_LIMIT: usize = 32;
 static CLOCK_NS_LOGS: AtomicUsize = AtomicUsize::new(0);
-const DEFAULT_REALTIME_EPOCH_NS: i64 = 1_700_000_000_000_000_000;
-static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(DEFAULT_REALTIME_EPOCH_NS);
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const CLOCK_REALTIME: usize = 0;
 const CLOCK_MONOTONIC: usize = 1;
@@ -122,16 +120,7 @@ fn now_ns() -> u64 {
 }
 
 fn realtime_now_ns() -> u64 {
-    let base = now_ns() as i128;
-    let offset = REALTIME_OFFSET_NS.load(Ordering::Relaxed) as i128;
-    let adjusted = base + offset;
-    if adjusted <= 0 {
-        0
-    } else if adjusted > u64::MAX as i128 {
-        u64::MAX
-    } else {
-        adjusted as u64
-    }
+    get_realtime_ns()
 }
 
 fn posix_timer_process_cpu_time_ns(pid: usize) -> Option<u64> {
@@ -530,11 +519,7 @@ pub fn syscall_settimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
     let target_ns = (tv.sec as u64)
         .saturating_mul(NSEC_PER_SEC)
         .saturating_add((tv.usec as u64).saturating_mul(1_000));
-    let current_mono_ns = now_ns();
-    let offset = (target_ns as i128)
-        .saturating_sub(current_mono_ns as i128)
-        .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-    REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
+    set_realtime_ns(target_ns);
     crate::fs::cancel_realtime_timerfds_on_set();
     0
 }
@@ -714,11 +699,7 @@ pub fn syscall_clock_settime(clk_id: usize, tp_ptr: usize) -> isize {
     if !can_adjust_wallclock() {
         return err(SyscallError::EPERM);
     }
-    let current_mono_ns = now_ns();
-    let offset = (target_ns as i128)
-        .saturating_sub(current_mono_ns as i128)
-        .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-    REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
+    set_realtime_ns(target_ns);
     crate::fs::cancel_realtime_timerfds_on_set();
     0
 }

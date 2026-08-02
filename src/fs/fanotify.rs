@@ -16,13 +16,11 @@ use spin::Mutex;
 
 use crate::{
     fs::{
-        File, OSInode, POLLIN, POLLOUT, PollWaitQueue, find_path_in_roots, inode_raw_logical_path,
-        wake_tasks,
+        File, OSInode, POLLIN, POLLOUT, PollWaitQueue, ext4::Ext4VfsNode, vfs::VfsPath, wake_tasks,
     },
     mm::UserBuffer,
     syscall::{
         error::{SyscallError, err},
-        filesystem::translate_mount_abs,
         misc::encode_linux_tid,
     },
     task::{
@@ -128,12 +126,18 @@ enum FanotifyMarkScope {
     Filesystem,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FanotifyMarkTarget {
+    Inode(FanotifyInodeKey),
+    Mount(u64),
+    Filesystem(u64),
+}
+
 struct FanotifyMark {
     scope: FanotifyMarkScope,
-    target: FanotifyInodeKey,
-    target_dev: usize,
-    target_path: Option<String>,
-    target_source_path: Option<String>,
+    target: FanotifyMarkTarget,
+    /// The inode named by fanotify_mark(), retained for fdinfo output.
+    marked_inode: FanotifyInodeKey,
     mask: u64,
     ignored_mask: u64,
     ignore_survives_modify: bool,
@@ -143,6 +147,7 @@ struct FanotifyEvent {
     mask: u64,
     pid: i32,
     inode: Option<Arc<Inode>>,
+    path: Option<VfsPath>,
     permission: Option<Arc<FanotifyPermission>>,
 }
 
@@ -214,7 +219,7 @@ impl FanotifyFile {
                         break;
                     };
                     let fd = match event.inode.as_ref() {
-                        Some(inode) => install_event_fd(Arc::clone(inode))?,
+                        Some(inode) => install_event_fd(Arc::clone(inode), event.path.clone())?,
                         None => FAN_NOFD,
                     };
                     let meta = FanotifyEventMetadata {
@@ -280,14 +285,29 @@ impl FanotifyFile {
         Ok(size_of::<FanotifyResponse>())
     }
 
+    /// Flush one mark object type without resolving a pathname.  Linux handles
+    /// FAN_MARK_FLUSH before `fanotify_find_path()` and ignores dfd/pathname.
+    pub(crate) fn flush_marks(&self, flags: usize) -> Result<(), isize> {
+        if (flags & !FAN_MARK_TYPE_BITS) != FAN_MARK_FLUSH {
+            return Err(err(SyscallError::EINVAL));
+        }
+        let scope = match flags & FAN_MARK_TYPE_BITS {
+            0 => FanotifyMarkScope::Inode,
+            FAN_MARK_MOUNT => FanotifyMarkScope::Mount,
+            FAN_MARK_FILESYSTEM => FanotifyMarkScope::Filesystem,
+            _ => return Err(err(SyscallError::EINVAL)),
+        };
+        self.inner.lock().marks.retain(|mark| mark.scope != scope);
+        Ok(())
+    }
+
     pub(crate) fn modify_mark(
         &self,
         flags: usize,
         mask: u64,
         inode: Arc<Inode>,
         is_dir: bool,
-        target_path: Option<String>,
-        target_source_path: Option<String>,
+        target_path: Option<VfsPath>,
     ) -> Result<(), isize> {
         if (flags & !FAN_SUPPORTED_MARK_FLAGS) != 0 {
             return Err(err(SyscallError::EINVAL));
@@ -316,22 +336,33 @@ impl FanotifyFile {
             inner.marks.retain(|mark| mark.scope != scope);
             return Ok(());
         }
-        let key = FanotifyInodeKey::from_inode(&inode);
-        let target_dev = inode.device_id();
-        let Some(mark) = inner
-            .marks
-            .iter_mut()
-            .find(|mark| mark.scope == scope && mark.target == key)
-        else {
+        let marked_inode = FanotifyInodeKey::from_inode(&inode);
+        let target = match scope {
+            FanotifyMarkScope::Inode => FanotifyMarkTarget::Inode(marked_inode),
+            FanotifyMarkScope::Mount => FanotifyMarkTarget::Mount(
+                target_path
+                    .as_ref()
+                    .ok_or_else(|| err(SyscallError::EOPNOTSUPP))?
+                    .mount()
+                    .id(),
+            ),
+            FanotifyMarkScope::Filesystem => FanotifyMarkTarget::Filesystem(
+                target_path
+                    .as_ref()
+                    .ok_or_else(|| err(SyscallError::EOPNOTSUPP))?
+                    .mount()
+                    .filesystem()
+                    .filesystem_id(),
+            ),
+        };
+        let Some(mark) = inner.marks.iter_mut().find(|mark| mark.target == target) else {
             if (flags & FAN_MARK_REMOVE) != 0 {
                 return Err(err(SyscallError::ENOENT));
             }
             inner.marks.push(FanotifyMark {
                 scope,
-                target: key,
-                target_dev,
-                target_path,
-                target_source_path,
+                target,
+                marked_inode,
                 mask: if (flags & FAN_MARK_IGNORED_MASK) != 0 {
                     0
                 } else {
@@ -346,12 +377,6 @@ impl FanotifyFile {
             });
             return Ok(());
         };
-        if mark.target_path.is_none() && target_path.is_some() {
-            mark.target_path = target_path;
-        }
-        if mark.target_source_path.is_none() && target_source_path.is_some() {
-            mark.target_source_path = target_source_path;
-        }
         if (flags & FAN_MARK_REMOVE) != 0 {
             if (flags & FAN_MARK_IGNORED_MASK) != 0 {
                 mark.ignored_mask &= !mask;
@@ -380,8 +405,8 @@ impl FanotifyFile {
             let _ = writeln!(
                 out,
                 "fanotify ino:{:x} sdev:{:x} mflags: {:x} mask:{:x} ignored_mask:{:x}",
-                mark.target.ino,
-                mark.target.dev,
+                mark.marked_inode.ino,
+                mark.marked_inode.dev,
                 fdinfo_mark_flags(mark),
                 mark.mask,
                 mark.ignored_mask
@@ -395,7 +420,7 @@ impl FanotifyFile {
         inode: Arc<Inode>,
         inode_key: FanotifyInodeKey,
         parent_key: Option<FanotifyInodeKey>,
-        event_path: Option<&str>,
+        event_path: Option<&VfsPath>,
         event_mask: u64,
         is_dir: bool,
         pid: i32,
@@ -403,14 +428,14 @@ impl FanotifyFile {
         let mut inner = self.inner.lock();
         let mut ignored = 0u64;
         for mark in inner.marks.iter() {
-            if !mark_matches(mark, inode_key, parent_key, event_path, inode.device_id()) {
+            if !mark_matches(mark, inode_key, parent_key, event_path) {
                 continue;
             }
             ignored |= mark_event_bits(mark.ignored_mask, event_mask, is_dir);
         }
         let mut matched = 0u64;
         for mark in inner.marks.iter() {
-            if !mark_matches(mark, inode_key, parent_key, event_path, inode.device_id()) {
+            if !mark_matches(mark, inode_key, parent_key, event_path) {
                 continue;
             }
             matched |= mark_event_bits(mark.mask, event_mask, is_dir) & !ignored;
@@ -418,7 +443,7 @@ impl FanotifyFile {
         if (event_mask & FAN_MODIFY) != 0 {
             for mark in inner.marks.iter_mut() {
                 if mark.ignore_survives_modify
-                    || !mark_matches(mark, inode_key, parent_key, event_path, inode.device_id())
+                    || !mark_matches(mark, inode_key, parent_key, event_path)
                 {
                     continue;
                 }
@@ -436,6 +461,7 @@ impl FanotifyFile {
             mask: matched,
             pid,
             inode: Some(inode),
+            path: event_path.cloned(),
             permission: None,
         });
         wake_readers(&mut inner);
@@ -446,7 +472,7 @@ impl FanotifyFile {
         inode: Arc<Inode>,
         inode_key: FanotifyInodeKey,
         parent_key: Option<FanotifyInodeKey>,
-        event_path: Option<&str>,
+        event_path: Option<&VfsPath>,
         event_candidates: u64,
         is_dir: bool,
         pid: i32,
@@ -454,7 +480,7 @@ impl FanotifyFile {
         let mut inner = self.inner.lock();
         let mut ignored = 0u64;
         for mark in inner.marks.iter() {
-            if !mark_matches(mark, inode_key, parent_key, event_path, inode.device_id()) {
+            if !mark_matches(mark, inode_key, parent_key, event_path) {
                 continue;
             }
             let Some(event_mask) =
@@ -466,7 +492,7 @@ impl FanotifyFile {
         }
         let mut matched = 0u64;
         for mark in inner.marks.iter() {
-            if !mark_matches(mark, inode_key, parent_key, event_path, inode.device_id()) {
+            if !mark_matches(mark, inode_key, parent_key, event_path) {
                 continue;
             }
             let Some(event_mask) = select_permission_event(mark.mask, event_candidates) else {
@@ -491,6 +517,7 @@ impl FanotifyFile {
             mask: matched,
             pid,
             inode: Some(inode),
+            path: event_path.cloned(),
             permission: Some(Arc::clone(&permission)),
         });
         wake_readers(&mut inner);
@@ -512,6 +539,7 @@ impl FanotifyFile {
                 mask: FAN_Q_OVERFLOW,
                 pid: 0,
                 inode: None,
+                path: None,
                 permission: None,
             });
             wake_readers(inner);
@@ -613,23 +641,28 @@ pub(crate) fn max_queued_events_for_procfs() -> usize {
     FANOTIFY_MAX_QUEUED_EVENTS.load(Ordering::Relaxed)
 }
 
-pub(crate) fn notify_open(inode: &Arc<Inode>, is_dir: bool, path: Option<&str>) {
+pub(crate) fn notify_open(inode: &Arc<Inode>, is_dir: bool, path: Option<&VfsPath>) {
     notify_inode_event(inode, FAN_OPEN, is_dir, path);
 }
 
-pub(crate) fn notify_open_exec(inode: &Arc<Inode>, is_dir: bool, path: Option<&str>) {
+pub(crate) fn notify_open_exec(inode: &Arc<Inode>, is_dir: bool, path: Option<&VfsPath>) {
     notify_inode_event(inode, FAN_OPEN | FAN_OPEN_EXEC, is_dir, path);
 }
 
-pub(crate) fn notify_access(inode: &Arc<Inode>, is_dir: bool, path: Option<&str>) {
+pub(crate) fn notify_access(inode: &Arc<Inode>, is_dir: bool, path: Option<&VfsPath>) {
     notify_inode_event(inode, FAN_ACCESS, is_dir, path);
 }
 
-pub(crate) fn notify_modify(inode: &Arc<Inode>, is_dir: bool, path: Option<&str>) {
+pub(crate) fn notify_modify(inode: &Arc<Inode>, is_dir: bool, path: Option<&VfsPath>) {
     notify_inode_event(inode, FAN_MODIFY, is_dir, path);
 }
 
-pub(crate) fn notify_close(inode: &Arc<Inode>, writable: bool, is_dir: bool, path: Option<&str>) {
+pub(crate) fn notify_close(
+    inode: &Arc<Inode>,
+    writable: bool,
+    is_dir: bool,
+    path: Option<&VfsPath>,
+) {
     notify_inode_event(
         inode,
         if writable {
@@ -646,7 +679,7 @@ pub(crate) fn permission_open(
     inode: &Arc<Inode>,
     exec: bool,
     is_dir: bool,
-    path: Option<&str>,
+    path: Option<&VfsPath>,
 ) -> Result<(), isize> {
     notify_permission_event(
         inode,
@@ -663,12 +696,12 @@ pub(crate) fn permission_open(
 pub(crate) fn permission_access(
     inode: &Arc<Inode>,
     is_dir: bool,
-    path: Option<&str>,
+    path: Option<&VfsPath>,
 ) -> Result<(), isize> {
     notify_permission_event(inode, FAN_ACCESS_PERM, is_dir, path)
 }
 
-fn notify_inode_event(inode: &Arc<Inode>, mask: u64, is_dir: bool, path: Option<&str>) {
+fn notify_inode_event(inode: &Arc<Inode>, mask: u64, is_dir: bool, path: Option<&VfsPath>) {
     let groups = {
         let mut groups = FANOTIFY_GROUPS.lock();
         groups.retain(|group| group.upgrade().is_some());
@@ -681,17 +714,14 @@ fn notify_inode_event(inode: &Arc<Inode>, mask: u64, is_dir: bool, path: Option<
         return;
     }
     let inode_key = FanotifyInodeKey::from_inode(inode);
-    let event_path = path
-        .map(String::from)
-        .or_else(|| event_path_for_inode(inode));
-    let parent_key = parent_key_for_event_path(event_path.as_deref());
+    let parent_key = parent_key_for_event_path(path);
     for group in groups {
         let pid = event_pid_for_group(&group);
         group.notify(
             inode.clone(),
             inode_key,
             parent_key,
-            event_path.as_deref(),
+            path,
             mask,
             is_dir,
             pid,
@@ -703,7 +733,7 @@ fn notify_permission_event(
     inode: &Arc<Inode>,
     mask: u64,
     is_dir: bool,
-    path: Option<&str>,
+    path: Option<&VfsPath>,
 ) -> Result<(), isize> {
     let groups = {
         let mut groups = FANOTIFY_GROUPS.lock();
@@ -717,17 +747,14 @@ fn notify_permission_event(
         return Ok(());
     }
     let inode_key = FanotifyInodeKey::from_inode(inode);
-    let event_path = path
-        .map(String::from)
-        .or_else(|| event_path_for_inode(inode));
-    let parent_key = parent_key_for_event_path(event_path.as_deref());
+    let parent_key = parent_key_for_event_path(path);
     for group in groups {
         let pid = event_pid_for_group(&group);
         if let Some(permission) = group.permission_event(
             inode.clone(),
             inode_key,
             parent_key,
-            event_path.as_deref(),
+            path,
             mask,
             is_dir,
             pid,
@@ -753,60 +780,30 @@ fn current_linux_tid_for_event() -> usize {
     encode_linux_tid(current_process().getpid(), tid_index)
 }
 
-fn event_path_for_inode(inode: &Arc<Inode>) -> Option<String> {
-    let path = inode_raw_logical_path(inode)?;
-    Some(translate_mount_abs(&path))
-}
-
-fn parent_key_for_event_path(path: Option<&str>) -> Option<FanotifyInodeKey> {
-    let path = path?;
-    let trimmed = path.trim_end_matches('/');
-    if trimmed == "/" || trimmed.is_empty() {
-        return None;
-    }
-    let parent = match trimmed.rfind('/') {
-        Some(0) => "/",
-        Some(pos) => &trimmed[..pos],
-        None => return None,
-    };
-    find_path_in_roots(&translate_mount_abs(parent))
-        .map(|inode| FanotifyInodeKey::from_inode(&inode))
+fn parent_key_for_event_path(path: Option<&VfsPath>) -> Option<FanotifyInodeKey> {
+    let parent = path?.dentry().parent()?;
+    let node = parent.node().as_any().downcast_ref::<Ext4VfsNode>()?;
+    Some(FanotifyInodeKey::from_inode(node.inode()))
 }
 
 fn mark_matches(
     mark: &FanotifyMark,
     inode_key: FanotifyInodeKey,
     parent_key: Option<FanotifyInodeKey>,
-    event_path: Option<&str>,
-    event_dev: usize,
+    event_path: Option<&VfsPath>,
 ) -> bool {
-    match mark.scope {
-        FanotifyMarkScope::Inode => {
-            mark.target == inode_key
+    match mark.target {
+        FanotifyMarkTarget::Inode(target) => {
+            target == inode_key
                 || ((mark.mask | mark.ignored_mask) & FAN_EVENT_ON_CHILD) != 0
-                    && parent_key.is_some_and(|key| key == mark.target)
+                    && parent_key.is_some_and(|key| key == target)
         }
-        FanotifyMarkScope::Mount => {
-            mark.target_dev == event_dev
-                && mark.target_path.as_ref().is_none_or(|target_path| {
-                    event_path.is_some_and(|path| path_under_or_at(path, target_path))
-                })
+        FanotifyMarkTarget::Mount(target_mount) => {
+            event_path.is_some_and(|path| path.mount().id() == target_mount)
         }
-        FanotifyMarkScope::Filesystem => {
-            mark.target_dev == event_dev
-                && mark.target_source_path.as_ref().is_none_or(|target_path| {
-                    event_path.is_some_and(|path| {
-                        path_under_or_at(&translate_mount_abs(path), target_path)
-                    })
-                })
-        }
+        FanotifyMarkTarget::Filesystem(target_filesystem) => event_path
+            .is_some_and(|path| path.mount().filesystem().filesystem_id() == target_filesystem),
     }
-}
-
-fn path_under_or_at(path: &str, root: &str) -> bool {
-    root == "/"
-        || path == root
-        || (path.starts_with(root) && path.as_bytes().get(root.len()) == Some(&b'/'))
 }
 
 fn fdinfo_mark_flags(mark: &FanotifyMark) -> usize {
@@ -844,8 +841,9 @@ fn select_permission_event(mark_mask: u64, candidates: u64) -> Option<u64> {
     None
 }
 
-fn install_event_fd(inode: Arc<Inode>) -> Result<i32, isize> {
-    let file: Arc<dyn File + Send + Sync> = Arc::new(OSInode::new_fanotify_event(inode));
+fn install_event_fd(inode: Arc<Inode>, path: Option<VfsPath>) -> Result<i32, isize> {
+    let file: Arc<dyn File + Send + Sync> =
+        Arc::new(OSInode::new_fanotify_event(inode).with_vfs_path(path));
     let (files, limit) = current_files_and_nofile_limit();
     let installed = files.lock().install_fd(file, 0, limit);
     installed.map(|fd| fd as i32).map_err(|rejected| {

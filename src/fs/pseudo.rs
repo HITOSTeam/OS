@@ -664,15 +664,16 @@ impl File for TunTapFile {
     }
 }
 
-/// 共享内存对象的实际数据，由 [`PseudoShmFile`] 通过 `Arc<Mutex<_>>` 共享。
+/// 匿名 memfd 的实际数据，由 [`MemfdFile`] 通过 `Arc<Mutex<_>>` 共享。
 ///
-/// 支持 POSIX shm（`shm_open`）和匿名 memfd（`memfd_create`）两种模式。
+/// POSIX `shm_open` 对象是挂载在 `/dev/shm` 的普通 TmpFs inode，不再进入
+/// 这个匿名对象实现。
 /// 物理页通过 [`FrameTracker`] 按需分配，`ensure_len` 负责扩缩容。
-pub(crate) struct ShmDataInner {
+pub(crate) struct MemfdDataInner {
     /// 全局唯一 ID，供 `/proc/self/maps` 等显示 memfd 身份。
     id: u64,
-    /// true 时为 memfd，否则为 POSIX shm。
-    is_memfd: bool,
+    /// Linux dentry name, including the `memfd:` prefix.
+    name: String,
     /// memfd 的密封标志位（`F_SEAL_*`）；POSIX shm 固定为 0。
     seals: u32,
     /// 当前有效长度（字节），可能小于已分配页的总大小。
@@ -681,25 +682,15 @@ pub(crate) struct ShmDataInner {
     frames: Vec<FrameTracker>,
 }
 
-impl ShmDataInner {
-    fn new_posix_shm() -> Self {
-        Self {
-            id: SHM_NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            is_memfd: false,
-            seals: 0,
-            len: 0,
-            frames: Vec::new(),
-        }
-    }
-
-    fn new_memfd(allow_sealing: bool) -> Self {
+impl MemfdDataInner {
+    fn new_memfd(name: &str, allow_sealing: bool) -> Self {
         let mut seals = 0;
         if !allow_sealing {
-            seals |= PseudoShmFile::F_SEAL_SEAL;
+            seals |= MemfdFile::F_SEAL_SEAL;
         }
         Self {
-            id: SHM_NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            is_memfd: true,
+            id: MEMFD_NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            name: alloc::format!("memfd:{name}"),
             seals,
             len: 0,
             frames: Vec::new(),
@@ -728,11 +719,9 @@ impl ShmDataInner {
     }
 }
 
-pub(crate) type ShmData = Arc<Mutex<ShmDataInner>>;
+pub(crate) type MemfdData = Arc<Mutex<MemfdDataInner>>;
 
 lazy_static! {
-    /// 全局 POSIX 共享内存对象表，键为 `/dev/shm/<name>` 的 `<name>` 部分。
-    static ref SHM_OBJECTS: Mutex<BTreeMap<String, ShmData>> = Mutex::new(BTreeMap::new());
     /// 通过 `mkdir /dev/<name>` 动态创建的伪目录，键为目录名，值为分配的 inode 号。
     static ref PSEUDO_DEV_DIRS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 }
@@ -743,7 +732,7 @@ static PSEUDO_BLOCK_IO_TICKS: AtomicU64 = AtomicU64::new(1);
 static PSEUDO_BLOCK_READ_ONLY: AtomicBool = AtomicBool::new(false);
 static PSEUDO_BLOCK_READ_AHEAD: AtomicU64 = AtomicU64::new(256);
 static PSEUDO_DEV_DIR_NEXT_INO: AtomicU64 = AtomicU64::new(0x52_0000);
-static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static MEMFD_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 const EEXIST: isize = -17;
 const ENOENT: isize = -2;
@@ -877,27 +866,8 @@ pub(crate) fn pseudo_block_set_read_ahead(value: u64) {
     PSEUDO_BLOCK_READ_AHEAD.store(value, Ordering::Relaxed);
 }
 
-pub(crate) fn shm_list() -> Vec<String> {
-    SHM_OBJECTS.lock().keys().cloned().collect()
-}
-
-pub(crate) fn shm_get(name: &str) -> Option<ShmData> {
-    SHM_OBJECTS.lock().get(name).cloned()
-}
-
-pub(crate) fn shm_create(name: &str) -> ShmData {
-    let mut map = SHM_OBJECTS.lock();
-    map.entry(String::from(name))
-        .or_insert_with(|| Arc::new(Mutex::new(ShmDataInner::new_posix_shm())))
-        .clone()
-}
-
-pub(crate) fn shm_create_anonymous(allow_sealing: bool) -> ShmData {
-    Arc::new(Mutex::new(ShmDataInner::new_memfd(allow_sealing)))
-}
-
-pub(crate) fn shm_remove(name: &str) -> bool {
-    SHM_OBJECTS.lock().remove(name).is_some()
+pub(crate) fn memfd_create_backing(name: &str, allow_sealing: bool) -> MemfdData {
+    Arc::new(Mutex::new(MemfdDataInner::new_memfd(name, allow_sealing)))
 }
 
 /// A minimal block device node for `/dev/root` so tools like busybox `df`
@@ -947,18 +917,15 @@ impl File for PseudoBlock {
     }
 }
 
-/// A minimal shared-memory file for `/dev/shm/<name>`.
-///
-/// This is a very small in-memory backing store to satisfy musl's `shm_open`/`shm_unlink`
-/// users (e.g., `cyclictest`). It provides per-fd offsets and a shared data buffer.
-pub struct PseudoShmFile {
-    data: ShmData,
+/// Anonymous shmem file used by `memfd_create(2)`.
+pub struct MemfdFile {
+    data: MemfdData,
     offset: Mutex<usize>,
     readable: bool,
     writable: bool,
 }
 
-impl PseudoShmFile {
+impl MemfdFile {
     pub const F_SEAL_SEAL: u32 = 0x0001;
     pub const F_SEAL_SHRINK: u32 = 0x0002;
     pub const F_SEAL_GROW: u32 = 0x0004;
@@ -966,21 +933,12 @@ impl PseudoShmFile {
     pub const F_SEAL_ALL: u32 =
         Self::F_SEAL_SEAL | Self::F_SEAL_SHRINK | Self::F_SEAL_GROW | Self::F_SEAL_WRITE;
 
-    pub fn new(data: ShmData) -> Self {
+    pub fn new(data: MemfdData) -> Self {
         Self {
             data,
             offset: Mutex::new(0),
             readable: true,
             writable: true,
-        }
-    }
-
-    pub fn new_with_mode(data: ShmData, readable: bool, writable: bool) -> Self {
-        Self {
-            data,
-            offset: Mutex::new(0),
-            readable,
-            writable,
         }
     }
 
@@ -1037,23 +995,23 @@ impl PseudoShmFile {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn is_memfd(&self) -> bool {
-        self.data.lock().is_memfd
-    }
-
     pub fn memfd_id(&self) -> u64 {
         self.data.lock().id
     }
 
+    /// User-visible `/proc/<pid>/fd/<n>` target for this unlinked shmem file.
+    pub fn proc_link_target(&self) -> String {
+        alloc::format!("/{} (deleted)", self.data.lock().name)
+    }
+
     pub fn memfd_seals(&self) -> Option<u32> {
         let data = self.data.lock();
-        data.is_memfd.then_some(data.seals)
+        Some(data.seals)
     }
 
     pub fn has_memfd_seal(&self, seal: u32) -> bool {
         let data = self.data.lock();
-        data.is_memfd && (data.seals & seal) != 0
+        (data.seals & seal) != 0
     }
 
     pub fn add_memfd_seals(&self, add: u32) -> Result<u32, isize> {
@@ -1063,9 +1021,6 @@ impl PseudoShmFile {
             return Err(EINVAL);
         }
         let mut data = self.data.lock();
-        if !data.is_memfd {
-            return Err(EINVAL);
-        }
         if (data.seals & Self::F_SEAL_SEAL) != 0 {
             return Err(EPERM);
         }
@@ -1086,9 +1041,32 @@ impl PseudoShmFile {
         }
         Some(data.frames[start_page..end_page].iter().cloned().collect())
     }
+
+    /// Read without changing the shared open-file position.
+    pub fn read_at(&self, offset: usize, output: &mut [u8]) -> usize {
+        let data = self.data.lock();
+        if offset >= data.len() {
+            return 0;
+        }
+        let length = output.len().min(data.len() - offset);
+        let mut done = 0usize;
+        while done < length {
+            let position = offset + done;
+            let page = position / PAGE_SIZE;
+            let in_page = position % PAGE_SIZE;
+            if page >= data.frames.len() {
+                break;
+            }
+            let chunk = (PAGE_SIZE - in_page).min(length - done);
+            let bytes = data.frames[page].ppn.get_bytes_array();
+            output[done..done + chunk].copy_from_slice(&bytes[in_page..in_page + chunk]);
+            done += chunk;
+        }
+        done
+    }
 }
 
-impl File for PseudoShmFile {
+impl File for MemfdFile {
     fn readable(&self) -> bool {
         self.readable
     }
@@ -1215,7 +1193,7 @@ impl PseudoFile {
     pub fn new_urandom(seed: u64) -> Self {
         Self {
             readable: true,
-            writable: false,
+            writable: true,
             kind_tag: PseudoKindTag::Urandom,
             inner: Mutex::new(PseudoInner {
                 offset: 0,
@@ -1239,7 +1217,7 @@ impl PseudoFile {
     pub fn new_zero() -> Self {
         Self {
             readable: true,
-            writable: false,
+            writable: true,
             kind_tag: PseudoKindTag::Zero,
             inner: Mutex::new(PseudoInner {
                 offset: 0,
@@ -1267,6 +1245,35 @@ impl PseudoFile {
 
     pub fn kind_tag(&self) -> PseudoKindTag {
         self.kind_tag
+    }
+
+    /// Read a stateless byte range from a static pseudo file.
+    ///
+    /// Object-VFS file descriptions own their position, so adapters must not
+    /// reuse the cursor embedded in the transitional [`File`] implementation.
+    /// Device-like pseudo kinds intentionally remain unsupported here.
+    pub(crate) fn read_at_bytes(&self, offset: usize, output: &mut [u8]) -> Option<usize> {
+        let inner = self.inner.lock();
+        let PseudoKind::Static(data) = &inner.kind else {
+            return None;
+        };
+        if offset >= data.len() {
+            return Some(0);
+        }
+        let read = core::cmp::min(output.len(), data.len() - offset);
+        output[..read].copy_from_slice(&data[offset..offset + read]);
+        Some(read)
+    }
+
+    /// Apply the legacy write semantics without consuming its embedded
+    /// cursor.  Writable static proc knobs either handle writes in their own
+    /// backend or deliberately discard the supplied bytes.
+    pub(crate) fn write_at_bytes(&self, _offset: usize, input: &[u8]) -> Option<usize> {
+        let inner = self.inner.lock();
+        match &inner.kind {
+            PseudoKind::Static(_) if self.writable => Some(input.len()),
+            _ => None,
+        }
     }
 }
 
@@ -1334,7 +1341,7 @@ impl File for PseudoFile {
     fn write(&self, buf: UserBuffer) -> usize {
         let inner = self.inner.lock();
         match inner.kind {
-            PseudoKind::Null => buf.len(),
+            PseudoKind::Null | PseudoKind::Zero | PseudoKind::Urandom(_) => buf.len(),
             PseudoKind::Static(_) if self.writable => buf.len(),
             _ => 0,
         }

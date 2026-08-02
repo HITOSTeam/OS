@@ -1,32 +1,443 @@
+use alloc::vec;
 use alloc::vec::Vec;
 
 use super::{
-    AtPath, BTreeSet, FD_CLOEXEC, File, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY,
-    O_EXCL, O_NOATIME, O_NOFOLLOW, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_TMPFILE, O_TRUNC,
-    O_WRONLY, OSInode, Ordering, ProcMagicLinkFile, PseudoShmFile, S_IFBLK, S_IFCHR, S_IFMT,
-    SyscallError, TMPFILE_SEQ, apply_umask, clear_ext4_path_cache, current_effective_uid_gid,
-    current_files, current_files_and_nofile_limit, current_fsuid_gid, current_process, err,
-    ext4_err_to_errno, ext4_inode_lock, fanotify_notify_close, fanotify_notify_open,
-    fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key, file_lock_key_from_inode,
-    get_current_token, gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid,
-    install_open_file_fd_for_path, invalidate_ext4_path_cache_for_at, is_privileged_or_owner,
-    make_pipe, maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint,
-    open_existing_target_path, open_pseudo, path_is_nodev, path_is_nosymfollow, path_is_rofs,
-    proc_path_for_at, read_user_cstring, remove_owner_file_lease_for_key,
-    remove_process_record_locks_for_key, reopen_proc_link_file, resolve_abs_path, resolve_at_inode,
-    resolve_at_path, resolve_parent_and_name, root_inode_for_device, set_inode_all_times_now,
-    shm_create, shm_get, shm_object_name, touch_inode_mtime_ctime_now, truncate_regular_inode,
-    try_write_user_value, with_ext4_inode_read,
+    Arc, AtPath, BTreeSet, FD_CLOEXEC, File, MemfdFile, O_ACCMODE, O_APPEND, O_ASYNC, O_CLOEXEC,
+    O_CREAT, O_DIRECT, O_DIRECTORY, O_EXCL, O_NOATIME, O_NOFOLLOW, O_NONBLOCK, O_PATH, O_RDONLY,
+    O_RDWR, O_TMPFILE, O_TRUNC, O_WRONLY, OSInode, Ordering, S_IFBLK, S_IFCHR, S_IFMT,
+    SyscallError, TMPFILE_SEQ, VfsOpenedFile, apply_umask, clear_ext4_path_cache,
+    current_effective_uid_gid, current_files, current_files_and_nofile_limit, current_fsuid_gid,
+    current_process, err, ext4_err_to_errno, ext4_inode_lock, fanotify_notify_close,
+    fanotify_notify_open, fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key,
+    file_lock_key_from_inode, get_current_token, gid_for_created_inode, inode_mode_allows,
+    inode_mode_allows_uid_gid, install_open_file_fd, invalidate_ext4_path_cache_for_at,
+    invalidate_vfs_parent_entry, is_privileged_or_owner, make_pipe, map_vfs_error,
+    maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint, pin_legacy_file_path,
+    read_user_cstring, remove_owner_file_lease_for_key, remove_process_record_locks_for_key,
+    resolve_abs_path, resolve_at_inode_with_vfs_path_flags, resolve_at_path,
+    resolve_at_vfs_path_with_flags, resolve_openat2_path, resolve_parent_and_name_with_flags,
+    resolve_parent_vfs_path_with_flags, root_inode_for_device, set_inode_all_times_now,
+    touch_inode_mtime_ctime_now, truncate_regular_inode, try_copy_from_user, try_write_user_value,
+    with_ext4_inode_read,
 };
+use crate::fs::ext4::Ext4VfsNode;
+use crate::fs::vfs::{LookupFlags, VfsMetadata, VfsNodeKind, VfsOpenOptions, VfsPath};
 
-/// Opens or creates a filesystem object across ext4, proc, pseudo-fs, and tmpfile paths.
+fn vfs_metadata_allows(metadata: VfsMetadata, mask: u16, uid: u32, gid: u32) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    let shift = if uid == metadata.uid {
+        6
+    } else if gid == metadata.gid {
+        3
+    } else {
+        0
+    };
+    ((metadata.mode >> shift) & mask) == mask
+}
+
+/// Open a pathname when it belongs to a non-ext4 object filesystem.
+///
+/// Returning `None` means the object path is ext4 and the existing optimized
+/// inode adapter should continue handling it. Every non-ext4 outcome,
+/// including errors, is returned as `Some` so it cannot fall back to a hidden
+/// ext4 directory or pathname translation.
+fn try_open_non_ext4_vfs(
+    at: &AtPath,
+    logical_path: &str,
+    flags: usize,
+    create_mode: u16,
+    fsuid: u32,
+    fsgid: u32,
+    readable: bool,
+    writable: bool,
+    append: bool,
+    o_path: bool,
+    nofollow: bool,
+    tmpfile_requested: bool,
+    lookup_flags: LookupFlags,
+) -> Option<isize> {
+    if !matches!(at, AtPath::Vfs(_)) {
+        return None;
+    }
+
+    let mut path = match resolve_at_vfs_path_with_flags(at, fsuid, fsgid, lookup_flags) {
+        Ok(Some(path)) => Some(path),
+        Ok(None) => unreachable!("Vfs AtPath did not use the object walker"),
+        Err(error) if error == err(SyscallError::ENOENT) => None,
+        Err(error) => return Some(error),
+    };
+    if path
+        .as_ref()
+        .is_some_and(|path| path.node().as_any().is::<Ext4VfsNode>())
+    {
+        return None;
+    }
+
+    if path.is_none() {
+        let parent = match resolve_parent_vfs_path_with_flags(at, fsuid, fsgid, lookup_flags) {
+            Ok(Some(parent)) => parent,
+            Ok(None) => unreachable!("Vfs AtPath did not provide an object parent"),
+            Err(error) => return Some(error),
+        };
+        if parent.parent.node().as_any().is::<Ext4VfsNode>() {
+            return None;
+        }
+        if (flags & O_CREAT) == 0 || tmpfile_requested || parent.trailing_slash {
+            return Some(err(SyscallError::ENOENT));
+        }
+        let parent_metadata = match parent.parent.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return Some(map_vfs_error(error)),
+        };
+        if parent_metadata.kind != VfsNodeKind::Directory {
+            return Some(err(SyscallError::ENOTDIR));
+        }
+        if !vfs_metadata_allows(parent_metadata, 3, fsuid, fsgid) {
+            return Some(err(SyscallError::EACCES));
+        }
+        if parent.parent.mount().flags().is_read_only() {
+            return Some(err(SyscallError::EROFS));
+        }
+        let gid = if parent_metadata.mode & 0o2000 != 0 {
+            parent_metadata.gid
+        } else {
+            fsgid
+        };
+        let created_mode = mode_for_created_file(create_mode, gid);
+        let node = match parent.parent.node().create(&parent.name, created_mode) {
+            Ok(node) => node,
+            Err(error) => return Some(map_vfs_error(error)),
+        };
+        if let Err(error) = node.set_owner(fsuid, gid) {
+            return Some(map_vfs_error(error));
+        }
+        invalidate_vfs_parent_entry(&parent);
+        path = match resolve_at_vfs_path_with_flags(at, fsuid, fsgid, lookup_flags) {
+            Ok(Some(path)) => Some(path),
+            Ok(None) => unreachable!("created VFS node did not resolve through its mount"),
+            Err(error) => return Some(error),
+        };
+    } else if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 && !tmpfile_requested {
+        return Some(err(SyscallError::EEXIST));
+    }
+
+    if tmpfile_requested {
+        return Some(err(SyscallError::EOPNOTSUPP));
+    }
+    let path: VfsPath = path.expect("non-ext4 path checked above");
+    let metadata = match path.node().metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(map_vfs_error(error)),
+    };
+    if !o_path && nofollow && metadata.kind == VfsNodeKind::Symlink {
+        return Some(err(SyscallError::ELOOP));
+    }
+    if (flags & O_DIRECTORY) != 0 && metadata.kind != VfsNodeKind::Directory {
+        return Some(err(SyscallError::ENOTDIR));
+    }
+    if !o_path
+        && metadata.kind == VfsNodeKind::Directory
+        && ((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) != 0)
+    {
+        return Some(err(SyscallError::EISDIR));
+    }
+    let mut access_mask = 0u16;
+    if readable {
+        access_mask |= 4;
+    }
+    if writable {
+        access_mask |= 2;
+    }
+    if !o_path && !vfs_metadata_allows(metadata, access_mask, fsuid, fsgid) {
+        return Some(err(SyscallError::EACCES));
+    }
+    if (flags & O_NOATIME) != 0 {
+        let (euid, _) = current_effective_uid_gid();
+        if euid != 0 && euid != metadata.uid {
+            return Some(err(SyscallError::EPERM));
+        }
+    }
+    let readonly = path.mount().flags().is_read_only();
+    if readonly && (writable || (flags & O_TRUNC) != 0) {
+        return Some(err(SyscallError::EROFS));
+    }
+    if !o_path && metadata.kind == VfsNodeKind::Fifo {
+        let state = fifo_pipe_state_for_inode(path.node().filesystem_id(), path.node().node_id());
+        let accmode = flags & O_ACCMODE;
+        if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
+            return Some(err(SyscallError::ENXIO));
+        }
+        let Some(file) = state.open_file(accmode) else {
+            return Some(err(SyscallError::EINVAL));
+        };
+        let file = pin_legacy_file_path(file, path, logical_path);
+        return Some(match install_open_file_fd(file, flags, false) {
+            Ok(fd) => fd as isize,
+            Err(error) => error,
+        });
+    }
+    if !o_path && (flags & O_TRUNC) != 0 && writable && metadata.kind == VfsNodeKind::Regular {
+        if let Err(error) = path.node().truncate(0) {
+            return Some(map_vfs_error(error));
+        }
+    }
+    if !o_path
+        && path.mount().flags().is_nodev()
+        && matches!(
+            metadata.kind,
+            VfsNodeKind::CharacterDevice | VfsNodeKind::BlockDevice
+        )
+    {
+        return Some(err(SyscallError::EACCES));
+    }
+    if !o_path && let Some((filesystem_kind, file)) = crate::fs::kernel_file_from_path(&path) {
+        // Linux pipefs installs `pipeanon_fops.open`, so reopening a proc-fd
+        // pipe link creates another endpoint reference.  An internal shmem
+        // path reopens the same memfd inode with an independent file offset.
+        // sockfs and anon_inodefs retain their no-open inode operations.
+        let reopened: Arc<dyn File + Send + Sync> = match filesystem_kind {
+            crate::fs::KernelFileSystemKind::Pipe => file,
+            crate::fs::KernelFileSystemKind::Shmem => {
+                let Some(memfd) = file.as_any().downcast_ref::<MemfdFile>() else {
+                    return Some(err(SyscallError::ENXIO));
+                };
+                Arc::new(memfd.reopen_with_mode(readable, writable))
+            }
+            crate::fs::KernelFileSystemKind::Socket
+            | crate::fs::KernelFileSystemKind::Anonymous => {
+                return Some(err(SyscallError::ENXIO));
+            }
+        };
+        return Some(match install_open_file_fd(reopened, flags, false) {
+            Ok(fd) => fd as isize,
+            Err(error) => error,
+        });
+    }
+    if !o_path
+        && let Some(result) = crate::fs::open_devtmpfs_path(&path, logical_path, readable, writable)
+    {
+        let file = match result {
+            Ok(file) => file,
+            Err(error) => return Some(map_vfs_error(error)),
+        };
+        return Some(match install_open_file_fd(file, flags, false) {
+            Ok(fd) => fd as isize,
+            Err(error) => error,
+        });
+    }
+    if !o_path
+        && !matches!(
+            metadata.kind,
+            VfsNodeKind::Regular | VfsNodeKind::Directory | VfsNodeKind::Symlink
+        )
+    {
+        return Some(err(SyscallError::EOPNOTSUPP));
+    }
+    let opened = match VfsOpenedFile::open(
+        path,
+        alloc::string::String::from(logical_path),
+        VfsOpenOptions {
+            readable,
+            writable,
+            append,
+        },
+        o_path,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => return Some(map_vfs_error(error)),
+    };
+    let file: alloc::sync::Arc<dyn File + Send + Sync> = opened;
+    Some(match install_open_file_fd(file, flags, o_path) {
+        Ok(fd) => fd as isize,
+        Err(error) => error,
+    })
+}
+
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_CACHED: u64 = 0x20;
+const VALID_RESOLVE_FLAGS: u64 = RESOLVE_NO_XDEV
+    | RESOLVE_NO_MAGICLINKS
+    | RESOLVE_NO_SYMLINKS
+    | RESOLVE_BENEATH
+    | RESOLVE_IN_ROOT
+    | RESOLVE_CACHED;
+
+const O_NOCTTY: usize = 0x100;
+const O_DSYNC: usize = 0x1000;
+const O_LARGEFILE: usize = 0x8000;
+const O_SYNC_INTERNAL: usize = 0x100000;
+const O_TMPFILE_INTERNAL: usize = 0x400000;
+const O_EMPTYPATH: usize = 1 << 26;
+const VALID_OPENAT2_FLAGS: usize = O_ACCMODE
+    | O_CREAT
+    | O_EXCL
+    | O_NOCTTY
+    | O_TRUNC
+    | O_APPEND
+    | O_NONBLOCK
+    | O_DSYNC
+    | O_ASYNC
+    | O_DIRECT
+    | O_LARGEFILE
+    | O_DIRECTORY
+    | O_NOFOLLOW
+    | O_NOATIME
+    | O_CLOEXEC
+    | O_SYNC_INTERNAL
+    | O_PATH
+    | O_TMPFILE_INTERNAL
+    | O_EMPTYPATH;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+fn read_open_how(how_ptr: usize, size: usize) -> Result<OpenHow, isize> {
+    const OPEN_HOW_SIZE_VER0: usize = core::mem::size_of::<OpenHow>();
+    const OPEN_HOW_MAX_COPY: usize = 4096;
+
+    if size < OPEN_HOW_SIZE_VER0 {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if size > OPEN_HOW_MAX_COPY {
+        return Err(err(SyscallError::E2BIG));
+    }
+    if how_ptr == 0 {
+        return Err(err(SyscallError::EFAULT));
+    }
+    let mut raw = vec![0u8; size];
+    if try_copy_from_user(
+        get_current_token(),
+        how_ptr as *const u8,
+        raw.as_mut_slice(),
+    )
+    .is_err()
+    {
+        return Err(err(SyscallError::EFAULT));
+    }
+    if raw[OPEN_HOW_SIZE_VER0..].iter().any(|byte| *byte != 0) {
+        return Err(err(SyscallError::E2BIG));
+    }
+    let mut how = OpenHow::default();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            raw.as_ptr(),
+            &mut how as *mut OpenHow as *mut u8,
+            OPEN_HOW_SIZE_VER0,
+        );
+    }
+    Ok(how)
+}
+
+fn validate_open_how(how: OpenHow) -> Result<(usize, usize, LookupFlags), isize> {
+    let flags = usize::try_from(how.flags).map_err(|_| err(SyscallError::EINVAL))?;
+    let mode = usize::try_from(how.mode).map_err(|_| err(SyscallError::EINVAL))?;
+    if flags & !VALID_OPENAT2_FLAGS != 0 || how.resolve & !VALID_RESOLVE_FLAGS != 0 {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if how.resolve & RESOLVE_BENEATH != 0 && how.resolve & RESOLVE_IN_ROOT != 0 {
+        return Err(err(SyscallError::EINVAL));
+    }
+
+    let creates = flags & (O_CREAT | O_TMPFILE_INTERNAL) != 0;
+    if creates {
+        if mode & !0o7777 != 0 {
+            return Err(err(SyscallError::EINVAL));
+        }
+    } else if mode != 0 {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if flags & (O_DIRECTORY | O_CREAT) == (O_DIRECTORY | O_CREAT) {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if flags & O_TMPFILE_INTERNAL != 0
+        && (flags & O_DIRECTORY == 0 || matches!(flags & O_ACCMODE, O_RDONLY))
+    {
+        return Err(err(SyscallError::EINVAL));
+    }
+    if flags & O_PATH != 0 {
+        let valid_path_flags = O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_EMPTYPATH;
+        if flags & !valid_path_flags != 0 {
+            return Err(err(SyscallError::EINVAL));
+        }
+    }
+
+    // This VFS has no RCU/dcache-only proof. Linux permits returning EAGAIN
+    // whenever RESOLVE_CACHED cannot complete without a slow lookup, so use
+    // that conservative result instead of claiming a false cache hit.
+    if how.resolve & RESOLVE_CACHED != 0 {
+        return Err(err(SyscallError::EAGAIN));
+    }
+
+    let mut lookup = 0;
+    if how.resolve & RESOLVE_NO_XDEV != 0 {
+        lookup |= LookupFlags::NO_XDEV;
+    }
+    if how.resolve & RESOLVE_NO_MAGICLINKS != 0 {
+        lookup |= LookupFlags::NO_MAGIC_LINKS;
+    }
+    if how.resolve & RESOLVE_NO_SYMLINKS != 0 {
+        lookup |= LookupFlags::NO_SYMLINKS;
+    }
+    if how.resolve & RESOLVE_BENEATH != 0 {
+        lookup |= LookupFlags::BENEATH;
+    }
+    if how.resolve & RESOLVE_IN_ROOT != 0 {
+        lookup |= LookupFlags::IN_ROOT;
+    }
+    if flags & O_EMPTYPATH != 0 {
+        lookup |= LookupFlags::ALLOW_EMPTY;
+    }
+    Ok((flags, mode, LookupFlags(lookup)))
+}
+
+/// Opens or creates a filesystem object across ext4 and all object filesystems.
 pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) -> isize {
     let token = get_current_token();
     let path = match read_user_cstring(token, pathname) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    if path.is_empty() {
+    do_openat(dirfd, path, flags, mode, LookupFlags::default(), false)
+}
+
+/// Linux `openat2(2)`: validate the extensible `open_how` ABI before carrying
+/// its resolve policy into the same open implementation used by `openat(2)`.
+pub fn syscall_openat2(dirfd: isize, pathname: usize, how_ptr: usize, size: usize) -> isize {
+    let how = match read_open_how(how_ptr, size) {
+        Ok(how) => how,
+        Err(error) => return error,
+    };
+    let (flags, mode, lookup_flags) = match validate_open_how(how) {
+        Ok(validated) => validated,
+        Err(error) => return error,
+    };
+    let path = match read_user_cstring(get_current_token(), pathname) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    do_openat(dirfd, path, flags, mode, lookup_flags, true)
+}
+
+fn do_openat(
+    dirfd: isize,
+    path: alloc::string::String,
+    flags: usize,
+    mode: usize,
+    mut lookup_flags: LookupFlags,
+    strict_object_lookup: bool,
+) -> isize {
+    if path.is_empty() && !lookup_flags.contains(LookupFlags::ALLOW_EMPTY) {
         return err(SyscallError::ENOENT);
     }
     let debug_close = crate::debug_config::DEBUG_FS && path.contains("test_close");
@@ -43,7 +454,12 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     let o_path = (flags & O_PATH) != 0;
-    let nofollow = (flags & O_NOFOLLOW) != 0;
+    // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW so a final symlink is
+    // tested for existence rather than followed before returning EEXIST.
+    let nofollow = (flags & O_NOFOLLOW) != 0 || ((flags & O_CREAT) != 0 && (flags & O_EXCL) != 0);
+    if !nofollow {
+        lookup_flags.0 |= LookupFlags::FOLLOW_FINAL;
+    }
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
         if path == "." || path == "/proc" || path == "/proc/" || path == "/sys" || path == "/dev" {
@@ -68,18 +484,21 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         }
     };
     let tmpfile_requested = (flags & O_TMPFILE) == O_TMPFILE;
-    let write_intent = writable || (flags & (O_CREAT | O_TRUNC)) != 0 || tmpfile_requested;
-    let raw_abs = match resolve_abs_path(dirfd, &path) {
-        Ok(v) => v,
-        Err(e) => return e,
+    let raw_abs = if path.is_empty() {
+        None
+    } else {
+        match resolve_abs_path(dirfd, &path) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
     };
-    let readonly_fs = raw_abs.as_deref().map(path_is_rofs).unwrap_or(false);
-    if write_intent && readonly_fs {
-        return err(SyscallError::EROFS);
-    }
     let append = !o_path && (flags & O_APPEND) != 0;
 
-    let at = match resolve_at_path(dirfd, &path) {
+    let at = match if strict_object_lookup {
+        resolve_openat2_path(dirfd, &path, lookup_flags)
+    } else {
+        resolve_at_path(dirfd, &path)
+    } {
         Ok(v) => v,
         Err(e) => {
             if debug_close {
@@ -88,117 +507,40 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             return e;
         }
     };
+    if strict_object_lookup && !matches!(at, AtPath::Vfs(_)) {
+        return err(SyscallError::EOPNOTSUPP);
+    }
     let create_mode = apply_umask(mode);
     let mut created = false;
     let mut tmpfile_cleanup_parent: Option<alloc::sync::Arc<ext4_fs::Inode>> = None;
     let mut tmpfile_cleanup_name: Option<alloc::string::String> = None;
     let (fsuid, fsgid) = current_fsuid_gid();
-    if let Some(abs) = raw_abs.as_deref() {
-        if path_is_nosymfollow(abs) {
-            if let Ok(inode) = resolve_at_inode(&at, fsuid, fsgid, false) {
-                let inode_lock = ext4_inode_lock(&inode);
-                let _inode_guard = inode_lock.read();
-                if inode.is_symlink() {
-                    return err(SyscallError::ELOOP);
-                }
-            }
-        }
-    }
-
-    // Pseudo fs: `/sys`, `/dev`.
-    if let AtPath::PseudoAbs(abs) = &at {
-        if tmpfile_requested {
-            return err(SyscallError::EOPNOTSUPP);
-        }
-        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
-            if !nofollow {
-                if let Some(src_file) = crate::fs::mounted_proc_fd_link_file(&proc_path) {
-                    let fd =
-                        match reopen_proc_link_file(src_file, flags, readable, writable, o_path) {
-                            Ok(fd) => fd,
-                            Err(e) => return e,
-                        };
-                    return fd as isize;
-                }
-            }
-            if crate::fs::mounted_proc_magic_link_exists(&proc_path) {
-                if nofollow {
-                    if !o_path {
-                        return err(SyscallError::ELOOP);
-                    }
-                    if (flags & O_DIRECTORY) != 0 {
-                        return err(SyscallError::ENOTDIR);
-                    }
-                    let fd = match install_open_file_fd_for_path(
-                        ProcMagicLinkFile::new(&proc_path),
-                        flags,
-                        true,
-                        abs,
-                    ) {
-                        Ok(fd) => fd,
-                        Err(e) => return e,
-                    };
-                    return fd as isize;
-                }
-                if let Some(target) = crate::fs::mounted_proc_readlink(&proc_path) {
-                    if target.starts_with('/') {
-                        let fd = match open_existing_target_path(
-                            &target, flags, readable, writable, append, o_path,
-                        ) {
-                            Ok(fd) => fd,
-                            Err(e) => return e,
-                        };
-                        return fd as isize;
-                    }
-                }
-                let file = match open_pseudo(abs) {
-                    Some(f) => f,
-                    None => return err(SyscallError::ENOENT),
-                };
-                let fd = match install_open_file_fd_for_path(file, flags, o_path, abs) {
-                    Ok(fd) => fd,
-                    Err(e) => return e,
-                };
-                return fd as isize;
-            }
-        }
-        // Minimal `/dev/shm` support for POSIX `shm_open` users (e.g., cyclictest).
-        // Must handle `O_CREAT|O_EXCL` even when the object already exists.
-        let file: alloc::sync::Arc<dyn File + Send + Sync> =
-            if let Some(name) = shm_object_name(abs) {
-                if (flags & O_CREAT) != 0 {
-                    if (flags & O_EXCL) != 0 && shm_get(name).is_some() {
-                        return err(SyscallError::EEXIST);
-                    }
-                    let data = shm_create(name);
-                    alloc::sync::Arc::new(PseudoShmFile::new_with_mode(data, readable, writable))
-                } else {
-                    let Some(data) = shm_get(name) else {
-                        return err(SyscallError::ENOENT);
-                    };
-                    alloc::sync::Arc::new(PseudoShmFile::new_with_mode(data, readable, writable))
-                }
-            } else if let Some(f) = open_pseudo(abs) {
-                f
-            } else {
-                return err(SyscallError::ENOENT);
-            };
-        let fd = match install_open_file_fd_for_path(file, flags, o_path, abs) {
-            Ok(fd) => fd,
-            Err(e) => return e,
-        };
-        if crate::debug_config::DEBUG_FS {
-            let pid = current_process().getpid();
-            if abs == "/proc" || abs == "/sys" || abs == "/dev" {
-                crate::println!("[fs] openat(pid={}) pseudo '{}' -> fd={}", pid, abs, fd);
-            }
-        }
-        return fd as isize;
+    let logical_abs = raw_abs.as_deref().unwrap_or(path.as_str());
+    if let Some(result) = try_open_non_ext4_vfs(
+        &at,
+        logical_abs,
+        flags,
+        create_mode,
+        fsuid,
+        fsgid,
+        readable,
+        writable,
+        append,
+        o_path,
+        nofollow,
+        tmpfile_requested,
+        lookup_flags,
+    ) {
+        return result;
     }
 
     // ext4 lookup with search permission checks and symlink resolution.
-    let mut inode = match resolve_at_inode(&at, fsuid, fsgid, !nofollow) {
-        Ok(v) => Some(v),
+    let mut opened_vfs_path = None;
+    let mut inode = match resolve_at_inode_with_vfs_path_flags(&at, fsuid, fsgid, lookup_flags) {
+        Ok((inode, vfs_path)) => {
+            opened_vfs_path = vfs_path;
+            Some(inode)
+        }
         Err(e) if e == err(SyscallError::ENOENT) => None,
         Err(e) => {
             if debug_close {
@@ -222,6 +564,12 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     if tmpfile_requested {
+        if opened_vfs_path
+            .as_ref()
+            .is_some_and(|path| path.mount().flags().is_read_only())
+        {
+            return err(SyscallError::EROFS);
+        }
         let dir_inode = match inode {
             Some(ref i) => alloc::sync::Arc::clone(i),
             None => return err(SyscallError::ENOENT),
@@ -299,12 +647,24 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
 
     // CREATE: create file if missing (Linux: only affects the final component).
     if inode.is_none() && (flags & O_CREAT != 0) {
+        let creation_parent =
+            match resolve_parent_vfs_path_with_flags(&at, fsuid, fsgid, lookup_flags) {
+                Ok(parent) => parent,
+                Err(error) => return error,
+            };
+        if creation_parent
+            .as_ref()
+            .is_some_and(|parent| parent.parent.mount().flags().is_read_only())
+        {
+            return err(SyscallError::EROFS);
+        }
         match &at {
-            AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
-                let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
-                    Ok(v) => v,
-                    Err(e) => return e,
-                };
+            AtPath::Vfs(_) | AtPath::Ext4Abs(_) | AtPath::Ext4Rel { .. } => {
+                let (parent, name) =
+                    match resolve_parent_and_name_with_flags(&at, fsuid, fsgid, lookup_flags) {
+                        Ok(v) => v,
+                        Err(e) => return e,
+                    };
                 let parent_lock = ext4_inode_lock(&parent);
                 let _parent_guard = parent_lock.write();
                 if !parent.is_dir() {
@@ -340,7 +700,6 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
                     }
                 };
             }
-            AtPath::PseudoAbs(_) => unreachable!(),
         }
     }
 
@@ -349,15 +708,31 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         None => return err(SyscallError::ENOENT),
     };
 
+    if opened_vfs_path.is_none() && !tmpfile_requested {
+        opened_vfs_path = match resolve_at_vfs_path_with_flags(&at, fsuid, fsgid, lookup_flags) {
+            Ok(path) => path,
+            Err(e) => return e,
+        };
+    }
+
     if !tmpfile_requested {
         if let Some(abs) = raw_abs.as_deref() {
             note_inode_path_hint(&inode, abs);
         }
     }
 
-    if let Some(abs) = raw_abs.as_deref() {
+    let readonly_fs = opened_vfs_path
+        .as_ref()
+        .is_some_and(|path| path.mount().flags().is_read_only());
+    if readonly_fs && !created && !o_path && (writable || (flags & O_TRUNC) != 0) {
+        return err(SyscallError::EROFS);
+    }
+    if opened_vfs_path
+        .as_ref()
+        .is_some_and(|path| path.mount().flags().is_nodev())
+    {
         let mode = with_ext4_inode_read(&inode, || inode.mode() & S_IFMT);
-        if path_is_nodev(abs) && matches!(mode, S_IFCHR | S_IFBLK) {
+        if matches!(mode, S_IFCHR | S_IFBLK) {
             return err(SyscallError::EACCES);
         }
     }
@@ -428,19 +803,22 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
     }
 
     if !o_path && inode.is_fifo() {
-        let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
+        let state = fifo_pipe_state_for_inode(inode.device_id() as u64, inode.inode_num() as u64);
         let accmode = flags & O_ACCMODE;
         if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
             drop(inode_guard);
             return err(SyscallError::ENXIO);
         }
-        let Some(file) = state.open_file(accmode) else {
+        let Some(mut file) = state.open_file(accmode) else {
             drop(inode_guard);
             return err(SyscallError::EINVAL);
         };
         drop(inode_guard);
         let logical_abs = raw_abs.as_deref().unwrap_or("/");
-        let fd = match install_open_file_fd_for_path(file, flags, o_path, logical_abs) {
+        if let Some(path) = opened_vfs_path.as_ref() {
+            file = pin_legacy_file_path(file, path.clone(), logical_abs);
+        }
+        let fd = match install_open_file_fd(file, flags, o_path) {
             Ok(fd) => fd,
             Err(e) => return e,
         };
@@ -468,12 +846,15 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
         false,
         tmpfile_cleanup,
     ) {
-        Ok(file) => alloc::sync::Arc::new(file.with_fanotify_path(raw_abs.clone())),
+        Ok(file) => alloc::sync::Arc::new(
+            file.with_fanotify_path(raw_abs.clone())
+                .with_vfs_path(opened_vfs_path),
+        ),
         Err(e) => return e,
     };
     let fanotify_inode = os_inode.ext4_inode();
     let fanotify_is_dir = fanotify_inode.is_dir();
-    let fanotify_path = os_inode.fanotify_path();
+    let fanotify_path = os_inode.vfs_path().map(|path| path.path().clone());
 
     if !o_path && inode.is_file() {
         maybe_signal_lease_break(
@@ -500,18 +881,17 @@ pub fn syscall_openat(dirfd: isize, pathname: usize, flags: usize, mode: usize) 
             &fanotify_inode,
             false,
             fanotify_is_dir,
-            fanotify_path.as_deref(),
+            fanotify_path.as_ref(),
         )
     {
         return e;
     }
-    let logical_abs = raw_abs.as_deref().unwrap_or("/");
-    let fd = match install_open_file_fd_for_path(os_inode, flags, o_path, logical_abs) {
+    let fd = match install_open_file_fd(os_inode, flags, o_path) {
         Ok(fd) => fd,
         Err(e) => return e,
     };
     if !o_path {
-        fanotify_notify_open(&fanotify_inode, fanotify_is_dir, fanotify_path.as_deref());
+        fanotify_notify_open(&fanotify_inode, fanotify_is_dir, fanotify_path.as_ref());
     }
     if crate::debug_config::DEBUG_FS {
         let pid = current_process().getpid();
@@ -548,12 +928,12 @@ pub fn syscall_close(fd: usize) -> isize {
         .filter(|os_inode| !os_inode.fanotify_silent())
         .map(|os_inode| {
             let inode = os_inode.ext4_inode();
-            let path = os_inode.fanotify_path();
+            let path = os_inode.vfs_path().map(|path| path.path().clone());
             let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
             (inode, file.writable(), is_dir, path)
         });
     if let Some((inode, writable, is_dir, path)) = fanotify_close {
-        fanotify_notify_close(&inode, writable, is_dir, path.as_deref());
+        fanotify_notify_close(&inode, writable, is_dir, path.as_ref());
     }
     if let Some(key) = lock_key {
         remove_process_record_locks_for_key(current_process().getpid(), key);
@@ -697,8 +1077,7 @@ pub fn syscall_dup(oldfd: usize) -> isize {
     let Some((file, old_flags)) = files.get_file_and_flags(oldfd) else {
         return err(SyscallError::EBADF);
     };
-    let mount = files.get_mount_ref(oldfd);
-    let installed = files.install_fd_with_mount(file, old_flags & !FD_CLOEXEC, mount, limit);
+    let installed = files.install_fd(file, old_flags & !FD_CLOEXEC, limit);
     drop(files);
     let newfd = match installed {
         Ok(fd) => fd,
@@ -727,14 +1106,13 @@ pub fn syscall_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let Some((file, old_flags)) = files.get_file_and_flags(oldfd) else {
         return err(SyscallError::EBADF);
     };
-    let mount = files.get_mount_ref(oldfd);
     let mut new_flags = old_flags;
     if (flags & O_CLOEXEC) != 0 {
         new_flags |= FD_CLOEXEC;
     } else {
         new_flags &= !FD_CLOEXEC;
     }
-    let replaced = files.replace_fd_at_with_mount(newfd, file, new_flags, mount, limit);
+    let replaced = files.replace_fd_at(newfd, file, new_flags, limit);
     drop(files);
     let replaced_file = match replaced {
         Ok(replaced) => replaced,

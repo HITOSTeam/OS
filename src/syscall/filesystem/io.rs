@@ -1,12 +1,13 @@
 use super::{
-    CgroupFile, EventFdFile, FifoDuplexFile, IOV_MAX, MapPermission, O_NOATIME, O_NONBLOCK, O_PATH,
-    OSInode, PIPE_BUF, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile, PseudoShmFile,
-    SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK, SocketPairEnd,
-    SyscallError, TimerFdFile, UserBuffer, Vec, cgroup_charge_file_write, current_process, err,
-    ext4_err_to_errno, fanotify_notify_access, fanotify_notify_modify, fanotify_permission_access,
-    fanotify_read_result, fanotify_write_result, fd_has_append, fd_has_noatime, fd_has_nonblock,
-    fd_has_o_path, file_is_pipe, file_is_seekable_for_preadwrite, get_current_token,
-    get_fd_file_and_flags, inode_visible_size_with_disk_size, maybe_update_inode_atime,
+    CgroupFile, EventFdFile, FifoDuplexFile, IOV_MAX, MapPermission, MemfdFile, O_NOATIME,
+    O_NONBLOCK, O_PATH, OSInode, PIPE_BUF, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir,
+    PseudoFile, SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK,
+    SocketPairEnd, SyscallError, TimerFdFile, UserBuffer, Vec, VfsOpenedFile,
+    cgroup_charge_file_write, current_process, err, ext4_err_to_errno, fanotify_notify_access,
+    fanotify_notify_modify, fanotify_permission_access, fanotify_read_result,
+    fanotify_write_result, fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path,
+    file_is_pipe, file_is_seekable_for_preadwrite, get_current_token, get_fd_file_and_flags,
+    inode_visible_size_with_disk_size, map_vfs_error, maybe_update_inode_atime,
     mirror_inode_kernel_write_to_shared_mmaps, mirror_inode_write_to_current_mmaps,
     pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal, read_optional_offset,
     read_vm_iovec, require_fd_file, socketpair_write_from_kernel, touch_inode_mtime_ctime_now,
@@ -32,6 +33,20 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if len == 0 {
         return 0;
+    }
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        return match vfs_file.read_user_result(UserBuffer::new(user_bufs)) {
+            Ok(read) => read as isize,
+            Err(error) => map_vfs_error(error),
+        };
     }
     if crate::syscall::net::socket_read_uses_recvfrom(file.as_ref()) {
         return crate::syscall::net::syscall_recvfrom(fd, buffer, len, 0, 0, 0);
@@ -181,9 +196,9 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         .filter(|os_inode| !os_inode.fanotify_silent())
     {
         let inode = os_inode.ext4_inode();
-        let fanotify_path = os_inode.fanotify_path();
+        let fanotify_path = os_inode.vfs_path().map(|path| path.path().clone());
         let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
-        if let Err(e) = fanotify_permission_access(&inode, is_dir, fanotify_path.as_deref()) {
+        if let Err(e) = fanotify_permission_access(&inode, is_dir, fanotify_path.as_ref()) {
             return e;
         }
     }
@@ -206,9 +221,9 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             let inode = os_inode.ext4_inode();
             maybe_update_inode_atime(&inode, false);
             if read_len > 0 {
-                let fanotify_path = os_inode.fanotify_path();
+                let fanotify_path = os_inode.vfs_path().map(|path| path.path().clone());
                 let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
-                fanotify_notify_access(&inode, is_dir, fanotify_path.as_deref());
+                fanotify_notify_access(&inode, is_dir, fanotify_path.as_ref());
             }
         }
     }
@@ -322,6 +337,60 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
     }
     if len == 0 {
         return 0;
+    }
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        if vfs_file.path().mount().flags().is_read_only() {
+            return err(SyscallError::EROFS);
+        }
+        let accounts_storage_write = !matches!(
+            vfs_file.path().mount().filesystem().filesystem_type(),
+            "cgroup" | "cgroup2"
+        );
+        let start = if vfs_file.is_append() {
+            match vfs_file.size() {
+                Ok(size) => size,
+                Err(error) => return map_vfs_error(error),
+            }
+        } else {
+            vfs_file.offset()
+        };
+        let fsize_limit = {
+            let process = current_process();
+            let inner = process.borrow_mut();
+            inner.rlimits.rlimit_fsize_cur
+        };
+        let mut write_len = len;
+        let mut hit_fsize_limit = false;
+        if accounts_storage_write && fsize_limit != u64::MAX {
+            if start >= fsize_limit {
+                queue_process_signal(current_process().getpid(), SIGXFSZ_NUM);
+                return err(SyscallError::EFBIG);
+            }
+            let remain = fsize_limit.saturating_sub(start).min(usize::MAX as u64) as usize;
+            if write_len > remain {
+                write_len = remain;
+                hit_fsize_limit = true;
+            }
+        }
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            write_len,
+            MapPermission::R,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        let written = match vfs_file.write_user_result(UserBuffer::new(user_bufs)) {
+            Ok(written) => written,
+            Err(error) => return map_vfs_error(error),
+        };
+        if written > 0 && accounts_storage_write {
+            cgroup_charge_file_write(current_process().getpid(), written);
+        }
+        if hit_fsize_limit {
+            queue_process_signal(current_process().getpid(), SIGXFSZ_NUM);
+        }
+        return written as isize;
     }
     // Match Linux tty_write_lock(): serialize one userspace terminal write as
     // a unit, and acquire the sleepable lock before translating unpinned user
@@ -488,13 +557,13 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             }
         }
     }
-    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+    if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
+        if shm.has_memfd_seal(MemfdFile::F_SEAL_WRITE) {
             return err(SyscallError::EPERM);
         }
         let start = shm.offset();
         let end = start.saturating_add(write_len);
-        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && end > shm.len() {
+        if shm.has_memfd_seal(MemfdFile::F_SEAL_GROW) && end > shm.len() {
             return err(SyscallError::EPERM);
         }
     }
@@ -537,9 +606,9 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
                 return ext4_err_to_errno(e);
             }
             let inode = os_inode.ext4_inode();
-            let fanotify_path = os_inode.fanotify_path();
+            let fanotify_path = os_inode.vfs_path().map(|path| path.path().clone());
             let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
-            fanotify_notify_modify(&inode, is_dir, fanotify_path.as_deref());
+            fanotify_notify_modify(&inode, is_dir, fanotify_path.as_ref());
         }
     }
     if hit_fsize_limit {
@@ -569,6 +638,21 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     }
     if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, pos as usize) {
         return e;
+    }
+
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            len,
+            MapPermission::W,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        return match vfs_file.pread_user_result(pos as u64, UserBuffer::new(user_bufs)) {
+            Ok(read) => read as isize,
+            Err(error) => map_vfs_error(error),
+        };
     }
 
     // ext4 regular files
@@ -612,7 +696,7 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
         return total as isize;
     }
 
-    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+    if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
         let old = shm.offset();
         shm.set_offset(pos as usize);
         let Ok(user_bufs) = try_translated_byte_buffer(
@@ -693,6 +777,63 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     }
     if let Err(e) = validate_direct_io_request(fd, &file, buffer, len, pos as usize) {
         return e;
+    }
+
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        if vfs_file.path().mount().flags().is_read_only() {
+            return err(SyscallError::EROFS);
+        }
+        let accounts_storage_write = !matches!(
+            vfs_file.path().mount().filesystem().filesystem_type(),
+            "cgroup" | "cgroup2"
+        );
+        let effective_pos = if vfs_file.is_append() {
+            match vfs_file.size() {
+                Ok(size) => size,
+                Err(error) => return map_vfs_error(error),
+            }
+        } else {
+            pos as u64
+        };
+        let fsize_limit = {
+            let process = current_process();
+            let inner = process.borrow_mut();
+            inner.rlimits.rlimit_fsize_cur
+        };
+        let mut write_len = len;
+        let mut hit_fsize_limit = false;
+        if accounts_storage_write && fsize_limit != u64::MAX {
+            if effective_pos >= fsize_limit {
+                queue_process_signal(current_process().getpid(), SIGXFSZ_NUM);
+                return err(SyscallError::EFBIG);
+            }
+            let remain = fsize_limit
+                .saturating_sub(effective_pos)
+                .min(usize::MAX as u64) as usize;
+            if write_len > remain {
+                write_len = remain;
+                hit_fsize_limit = true;
+            }
+        }
+        let Ok(user_bufs) = try_translated_byte_buffer(
+            get_current_token(),
+            buffer as *mut u8,
+            write_len,
+            MapPermission::R,
+        ) else {
+            return err(SyscallError::EFAULT);
+        };
+        let written = match vfs_file.pwrite_user_result(effective_pos, UserBuffer::new(user_bufs)) {
+            Ok(written) => written,
+            Err(error) => return map_vfs_error(error),
+        };
+        if written > 0 && accounts_storage_write {
+            cgroup_charge_file_write(current_process().getpid(), written);
+        }
+        if hit_fsize_limit {
+            queue_process_signal(current_process().getpid(), SIGXFSZ_NUM);
+        }
+        return written as isize;
     }
 
     // ext4 regular files
@@ -799,13 +940,13 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         }
     }
 
-    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
-        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE) {
+    if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
+        if shm.has_memfd_seal(MemfdFile::F_SEAL_WRITE) {
             return err(SyscallError::EPERM);
         }
         let start = pos as usize;
         let end = start.saturating_add(len);
-        if shm.has_memfd_seal(PseudoShmFile::F_SEAL_GROW) && end > shm.len() {
+        if shm.has_memfd_seal(MemfdFile::F_SEAL_GROW) && end > shm.len() {
             return err(SyscallError::EPERM);
         }
         let old = shm.offset();
@@ -1562,6 +1703,45 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         return new;
     }
 
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        let (cur, end, directory) = match vfs_file.kind() {
+            crate::fs::vfs::VfsNodeKind::Directory => {
+                let end = match vfs_file.path().node().readdir() {
+                    Ok(entries) => entries.len().saturating_add(2) as isize,
+                    Err(error) => return map_vfs_error(error),
+                };
+                (vfs_file.directory_cookie() as isize, end, true)
+            }
+            crate::fs::vfs::VfsNodeKind::Regular => {
+                let end = match vfs_file.size() {
+                    Ok(size) => size.min(isize::MAX as u64) as isize,
+                    Err(error) => return map_vfs_error(error),
+                };
+                (
+                    vfs_file.offset().min(isize::MAX as u64) as isize,
+                    end,
+                    false,
+                )
+            }
+            _ => return err(SyscallError::ESPIPE),
+        };
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => cur.saturating_add(offset),
+            SEEK_END => end.saturating_add(offset),
+            _ => return err(SyscallError::EINVAL),
+        };
+        if new < 0 {
+            return err(SyscallError::EINVAL);
+        }
+        if directory {
+            vfs_file.set_directory_cookie(new as u64);
+        } else {
+            vfs_file.set_offset(new as u64);
+        }
+        return new;
+    }
+
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = os_inode.ext4_inode();
         let (is_dir, is_fifo, disk_end) = with_ext4_inode_read(&inode, || {
@@ -1638,7 +1818,7 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         return new;
     }
 
-    if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+    if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
         let end = shm.len() as isize;
         let cur = shm.offset() as isize;
         let new = match whence {

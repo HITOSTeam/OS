@@ -1,30 +1,53 @@
 //! ext4 adapter for the object-based VFS.
 
-use crate::fs::inode::{Ext4InodeLock, OSInode, ext4_inode_lock};
+use crate::fs::inode::{Ext4InodeLock, ext4_inode_lock};
 use crate::fs::vfs::{
-    DentryCachePolicy, VfsDirEntry, VfsError, VfsFileSystem, VfsLink, VfsMetadata, VfsNode,
-    VfsNodeKind, VfsOpenOptions, VfsResult, VfsStatFs, VfsTimes,
+    DentryCachePolicy, VfsDirEntry, VfsError, VfsFileOperations, VfsFileSystem, VfsFileSystemState,
+    VfsLink, VfsMetadata, VfsNode, VfsNodeKind, VfsOpenOptions, VfsResult, VfsStatFs, VfsTimes,
 };
+use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use ext4_fs::{Ext4Error, Inode};
+use lazy_static::lazy_static;
+use spin::Mutex;
 
 const EXT4_SUPER_MAGIC: u64 = 0xef53;
+
+lazy_static! {
+    /// One VFS superblock object per ext4 block device.  Repeated mounts and
+    /// mount-namespace clones share its stable root dentry and dcache, like
+    /// Linux reusing a `super_block` for the same mounted block device.
+    static ref EXT4_VFS_INSTANCES: Mutex<BTreeMap<usize, Weak<Ext4Vfs>>> =
+        Mutex::new(BTreeMap::new());
+}
 
 pub struct Ext4Vfs {
     filesystem_id: u64,
     root: Arc<Inode>,
+    vfs_state: VfsFileSystemState,
 }
 
 impl Ext4Vfs {
     pub fn new(root: Arc<Inode>) -> Arc<Self> {
-        Arc::new(Self {
-            filesystem_id: root.device_id() as u64 + 1,
+        let device_id = root.device_id();
+        let mut instances = EXT4_VFS_INSTANCES.lock();
+        if let Some(filesystem) = instances.get(&device_id).and_then(Weak::upgrade) {
+            return filesystem;
+        }
+        let filesystem_id = root.device_id() as u64 + 1;
+        let root_node = Arc::new(Ext4VfsNode::new(filesystem_id, Arc::clone(&root)));
+        let filesystem = Arc::new(Self {
+            filesystem_id,
             root,
-        })
+            vfs_state: VfsFileSystemState::new(root_node as Arc<dyn VfsNode>),
+        });
+        instances.retain(|_, filesystem| filesystem.strong_count() != 0);
+        instances.insert(device_id, Arc::downgrade(&filesystem));
+        filesystem
     }
 }
 
@@ -37,16 +60,21 @@ impl VfsFileSystem for Ext4Vfs {
         "ext4"
     }
 
-    fn root_node(&self) -> Arc<dyn VfsNode> {
-        Arc::new(Ext4VfsNode::new(self.filesystem_id, Arc::clone(&self.root)))
+    fn vfs_state(&self) -> &VfsFileSystemState {
+        &self.vfs_state
     }
 
     fn statfs(&self) -> VfsResult<VfsStatFs> {
+        let stat = self.root.filesystem_stat_snapshot();
         Ok(VfsStatFs {
             magic: EXT4_SUPER_MAGIC,
-            block_size: self.root.block_size() as u64,
+            block_size: stat.block_size,
+            blocks: stat.blocks,
+            blocks_free: stat.blocks_free,
+            blocks_available: stat.blocks_available,
+            files: stat.files,
+            files_free: stat.files_free,
             name_len: 255,
-            ..VfsStatFs::default()
         })
     }
 
@@ -177,18 +205,13 @@ impl VfsNode for Ext4VfsNode {
         Ok(VfsLink::Text(String::from(target)))
     }
 
-    fn open(
-        self: Arc<Self>,
-        options: VfsOpenOptions,
-    ) -> VfsResult<Arc<dyn crate::fs::File + Send + Sync>> {
-        OSInode::new_with_append(
-            options.readable,
-            options.writable,
-            options.append,
-            Arc::clone(&self.inode),
-        )
-        .map(|file| Arc::new(file) as Arc<dyn crate::fs::File + Send + Sync>)
-        .map_err(|_| VfsError::Invalid)
+    fn open(self: Arc<Self>, options: VfsOpenOptions) -> VfsResult<Arc<dyn VfsFileOperations>> {
+        Ok(Arc::new(Ext4VfsFile {
+            inode: Arc::clone(&self.inode),
+            inode_lock: Arc::clone(&self.inode_lock),
+            readable: options.readable,
+            writable: options.writable,
+        }))
     }
 
     fn create(&self, name: &str, mode: u16) -> VfsResult<Arc<dyn VfsNode>> {
@@ -331,6 +354,91 @@ impl VfsNode for Ext4VfsNode {
         let _inode_guard = self.inode_lock.write();
         self.inode.set_uid_gid(uid, gid);
         Ok(())
+    }
+
+    fn set_mode_owner(&self, mode: u16, uid: u32, gid: u32) -> VfsResult<()> {
+        let _inode_guard = self.inode_lock.write();
+        self.inode.set_uid_gid(uid, gid);
+        self.inode.set_mode(mode & 0o7777);
+        Ok(())
+    }
+}
+
+/// Stateless opened ext4 operations.  The legacy `OSInode` keeps its cursor
+/// for online syscalls during migration; the object VFS does not wrap it and
+/// therefore cannot acquire a second authoritative position.
+struct Ext4VfsFile {
+    inode: Arc<Inode>,
+    inode_lock: Arc<Ext4InodeLock>,
+    readable: bool,
+    writable: bool,
+}
+
+impl VfsFileOperations for Ext4VfsFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn readable(&self) -> bool {
+        self.readable
+    }
+
+    fn writable(&self) -> bool {
+        self.writable
+    }
+
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> VfsResult<usize> {
+        if !self.readable {
+            return Err(VfsError::Access);
+        }
+        let offset = usize::try_from(offset).map_err(|_| VfsError::Invalid)?;
+        let _guard = self.inode_lock.read();
+        Ok(self.inode.read_at(offset, output))
+    }
+
+    fn write_at(&self, offset: u64, input: &[u8]) -> VfsResult<usize> {
+        if !self.writable {
+            return Err(VfsError::Access);
+        }
+        let offset = usize::try_from(offset).map_err(|_| VfsError::Invalid)?;
+        let _guard = self.inode_lock.write();
+        self.inode.write_at(offset, input).map_err(map_ext4_error)
+    }
+
+    fn size(&self) -> VfsResult<u64> {
+        let _guard = self.inode_lock.read();
+        Ok(self.inode.size() as u64)
+    }
+
+    fn append(&self, input: &[u8]) -> VfsResult<(u64, usize)> {
+        if !self.writable {
+            return Err(VfsError::Access);
+        }
+        let _guard = self.inode_lock.write();
+        let offset = self.inode.size() as u64;
+        let written = self
+            .inode
+            .write_at(offset as usize, input)
+            .map_err(map_ext4_error)?;
+        Ok((offset, written))
+    }
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        ext4_fs::sync_all();
+        Ok(())
+    }
+
+    fn sync_range(&self, _offset: u64, _length: u64, _flags: u32) -> VfsResult<()> {
+        ext4_fs::sync_all();
+        Ok(())
+    }
+
+    fn advise(&self, _offset: u64, _length: u64, _advice: u32) -> VfsResult<()> {
+        if self.inode.is_file() {
+            Ok(())
+        } else {
+            Err(VfsError::Invalid)
+        }
     }
 }
 

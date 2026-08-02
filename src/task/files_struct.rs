@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::fs::{FdMountRef, File, Stdin, Stdout};
+use crate::fs::{File, Stdin, Stdout};
 use spin::mutex::SpinMutex;
 
 const FD_CLOEXEC: u32 = 1;
@@ -16,7 +16,6 @@ const FD_CLOEXEC: u32 = 1;
 pub struct FilesStruct {
     fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     fd_flags: Vec<u32>,
-    fd_mounts: Vec<Option<FdMountRef>>,
     next_fd_hint: usize,
     close_cursor: Option<usize>,
     fd_refs_closed: bool,
@@ -41,17 +40,15 @@ pub type FilesLock = SpinMutex<FilesStruct>;
 ///
 /// Linux's `file_close_fd_locked()` returns the `struct file *` and performs
 /// `filp_close()` only after dropping `files->file_lock`. This object carries
-/// the equivalent deferred notification (and mount reference) so pipe wakeups,
-/// inode cleanup, and final `Arc` destruction cannot run in the table's spin
-/// critical section.
+/// the equivalent deferred notification so pipe wakeups, inode cleanup, and
+/// final `Arc` destruction cannot run in the table's spin critical section.
 #[must_use = "detached descriptors must be completed after releasing FilesLock"]
 pub struct DetachedFd {
     file: Arc<dyn File + Send + Sync>,
-    mount: Option<FdMountRef>,
     notify_close: bool,
 }
 
-/// File and mount references rejected before they were installed.
+/// File reference rejected before it was installed.
 ///
 /// This is returned rather than dropped by `FilesStruct` so allocation-limit
 /// and fixed-fd validation failures cannot run file destructors while
@@ -59,47 +56,31 @@ pub struct DetachedFd {
 #[must_use = "rejected descriptors must be dropped after releasing FilesLock"]
 pub struct RejectedFd {
     file: Arc<dyn File + Send + Sync>,
-    mount: Option<FdMountRef>,
 }
 
 impl RejectedFd {
-    fn new(file: Arc<dyn File + Send + Sync>, mount: Option<FdMountRef>) -> Self {
-        Self { file, mount }
+    fn new(file: Arc<dyn File + Send + Sync>) -> Self {
+        Self { file }
     }
 
     /// Release an uninstalled object after the caller has dropped FilesLock.
     pub fn discard(self) {
-        let Self { file, mount } = self;
-        drop(mount);
-        drop(file);
+        drop(self.file);
     }
 }
 
 impl DetachedFd {
-    fn new(
-        file: Arc<dyn File + Send + Sync>,
-        mount: Option<FdMountRef>,
-        notify_close: bool,
-    ) -> Self {
-        Self {
-            file,
-            mount,
-            notify_close,
-        }
+    fn new(file: Arc<dyn File + Send + Sync>, notify_close: bool) -> Self {
+        Self { file, notify_close }
     }
 
     /// Complete semantic close outside `FilesLock` and return the detached file
     /// when the syscall still needs it for POSIX-lock or fanotify cleanup.
     pub fn complete_close(self) -> Arc<dyn File + Send + Sync> {
-        let Self {
-            file,
-            mount,
-            notify_close,
-        } = self;
+        let Self { file, notify_close } = self;
         if notify_close {
             file.on_fd_close();
         }
-        drop(mount);
         file
     }
 }
@@ -126,7 +107,6 @@ impl FilesStruct {
                 Some(Arc::new(Stdout)),
             ],
             fd_flags: vec![0; 3],
-            fd_mounts: vec![None; 3],
             next_fd_hint: 3,
             close_cursor: None,
             fd_refs_closed: false,
@@ -139,7 +119,7 @@ impl FilesStruct {
     /// 子进程关闭/重定向 fd 不会影响父进程。
     /// 也就是 表独立，而不是底层资源独立
     pub fn clone_private(&self) -> Self {
-        let (fd_table, fd_flags, fd_mounts) = self.snapshot_fd_state();
+        let (fd_table, fd_flags) = self.snapshot_fd_state();
         for file in fd_table.iter().flatten() {
             file.on_fd_install();
         }
@@ -147,7 +127,6 @@ impl FilesStruct {
         Self {
             fd_table,
             fd_flags,
-            fd_mounts,
             next_fd_hint,
             close_cursor: None,
             fd_refs_closed: false,
@@ -187,8 +166,7 @@ impl FilesStruct {
             let idx = len - 1;
             let has_file = self.fd_table[idx].is_some();
             let has_flag = self.fd_flags.get(idx).copied().unwrap_or(0) != 0;
-            let has_mount = self.fd_mounts.get(idx).is_some_and(Option::is_some);
-            if has_file || has_flag || has_mount {
+            if has_file || has_flag {
                 break;
             }
             len -= 1;
@@ -201,7 +179,6 @@ impl FilesStruct {
         let len = self.effective_len();
         self.fd_table.truncate(len);
         self.fd_flags.truncate(len);
-        self.fd_mounts.truncate(len);
         if self.next_fd_hint > len {
             self.next_fd_hint = len;
         }
@@ -213,21 +190,12 @@ impl FilesStruct {
         if self.fd_flags.len() < self.fd_table.len() {
             self.fd_flags.resize(self.fd_table.len(), 0);
         }
-        if self.fd_mounts.len() < self.fd_table.len() {
-            self.fd_mounts.resize(self.fd_table.len(), None);
-        }
     }
 
     /// 快照当前 fd 表状态，返回 (fd_table 副本, fd_flags 副本)。
     /// 用于 fork（clone_private）以及需要在持锁外遍历 fd 的场景。
     /// Arc::clone 只增加引用计数，不复制底层 File 数据。
-    pub fn snapshot_fd_state(
-        &self,
-    ) -> (
-        Vec<Option<Arc<dyn File + Send + Sync>>>,
-        Vec<u32>,
-        Vec<Option<FdMountRef>>,
-    ) {
+    pub fn snapshot_fd_state(&self) -> (Vec<Option<Arc<dyn File + Send + Sync>>>, Vec<u32>) {
         let len = self.effective_len();
         let fd_table = self
             .fd_table
@@ -239,11 +207,7 @@ impl FilesStruct {
         if fd_flags.len() < fd_table.len() {
             fd_flags.resize(fd_table.len(), 0);
         }
-        let mut fd_mounts = self.fd_mounts.iter().take(len).cloned().collect::<Vec<_>>();
-        if fd_mounts.len() < fd_table.len() {
-            fd_mounts.resize(fd_table.len(), None);
-        }
-        (fd_table, fd_flags, fd_mounts)
+        (fd_table, fd_flags)
     }
 
     /// 返回所有已打开 fd 的 (fd编号, File引用) 列表（快照，不持锁）。
@@ -271,8 +235,7 @@ impl FilesStruct {
         let mut cursor = self.close_cursor.unwrap_or(0);
         while cursor < self.fd_table.len() && files.len() < limit {
             if let Some(file) = self.fd_table[cursor].take() {
-                let mount = self.fd_mounts.get_mut(cursor).and_then(Option::take);
-                files.push(DetachedFd::new(file, mount, !self.fd_refs_closed));
+                files.push(DetachedFd::new(file, !self.fd_refs_closed));
             }
             if let Some(flag) = self.fd_flags.get_mut(cursor) {
                 *flag = 0;
@@ -283,7 +246,6 @@ impl FilesStruct {
         if cursor >= self.fd_table.len() {
             self.fd_table.clear();
             self.fd_flags.clear();
-            self.fd_mounts.clear();
             self.next_fd_hint = 0;
             self.close_cursor = None;
         } else {
@@ -293,21 +255,40 @@ impl FilesStruct {
         files
     }
 
-    /// Mark all descriptor references as semantically closed without dropping
-    /// the underlying file objects yet.  Exit uses this before deferring heavy
-    /// object destruction, matching Linux's "close fd table before wait is
-    /// visible" semantics for lightweight per-file accounting.
+    /// Mark every descriptor semantically closed and detach pathname-backed
+    /// references from the table.
+    ///
+    /// Linux's `exit_files()` releases each `struct file` (and therefore its
+    /// `f_path`) before the process is observable as a zombie.  Anonymous
+    /// objects may stay in this kernel's bounded idle-side destruction queue,
+    /// but a stale implementation reference must not keep a mount busy after
+    /// `waitpid()` has observed process exit.  Taking path-backed entries here
+    /// releases their mount pins as soon as the returned batch is completed;
+    /// shared descriptions remain alive naturally through the other fd table,
+    /// epoll item, or SCM_RIGHTS reference that owns their `Arc`.
     fn take_all_fd_close_notifications(&mut self) -> Vec<DetachedFd> {
         if self.fd_refs_closed {
             return Vec::new();
         }
         self.fd_refs_closed = true;
-        self.fd_table
-            .iter()
-            .flatten()
-            .cloned()
-            .map(|file| DetachedFd::new(file, None, true))
-            .collect()
+        let mut detached = Vec::new();
+        for index in 0..self.fd_table.len() {
+            let path_backed = self.fd_table[index]
+                .as_ref()
+                .is_some_and(|file| file.object_path().is_some());
+            if path_backed {
+                if let Some(file) = self.fd_table[index].take() {
+                    detached.push(DetachedFd::new(file, true));
+                }
+                if let Some(flags) = self.fd_flags.get_mut(index) {
+                    *flags = 0;
+                }
+            } else if let Some(file) = self.fd_table[index].as_ref() {
+                detached.push(DetachedFd::new(Arc::clone(file), true));
+            }
+        }
+        self.trim();
+        detached
     }
 
     /// 按 fd 编号取出 File 引用；fd 不存在或已关闭返回 None。
@@ -322,18 +303,6 @@ impl FilesStruct {
     pub fn get_file_and_flags(&self, fd: usize) -> Option<(Arc<dyn File + Send + Sync>, u32)> {
         let file = self.get_file(fd)?;
         Some((file, self.get_flags(fd)))
-    }
-
-    pub fn get_mount_ref(&self, fd: usize) -> Option<FdMountRef> {
-        self.fd_mounts.get(fd).and_then(Clone::clone)
-    }
-
-    pub fn iter_mount_refs_snapshot(&self) -> Vec<(usize, FdMountRef)> {
-        self.fd_mounts
-            .iter()
-            .enumerate()
-            .filter_map(|(fd, mount)| mount.clone().map(|mount| (fd, mount)))
-            .collect()
     }
 
     /// Return the descriptor state needed by select/poll style syscalls.
@@ -381,7 +350,6 @@ impl FilesStruct {
             }
             self.ensure_flags_len();
             self.fd_flags[fd] = 0;
-            self.fd_mounts[fd] = None;
             self.next_fd_hint = fd + 1;
             Some(fd)
         } else {
@@ -390,7 +358,6 @@ impl FilesStruct {
             }
             self.fd_table.push(None);
             self.fd_flags.push(0);
-            self.fd_mounts.push(None);
             let fd = self.fd_table.len() - 1;
             self.next_fd_hint = fd + 1;
             Some(fd)
@@ -405,24 +372,13 @@ impl FilesStruct {
         flags: u32,
         limit: usize,
     ) -> Result<usize, RejectedFd> {
-        self.install_fd_with_mount(file, flags, None, limit)
-    }
-
-    pub fn install_fd_with_mount(
-        &mut self,
-        file: Arc<dyn File + Send + Sync>,
-        flags: u32,
-        mount: Option<FdMountRef>,
-        limit: usize,
-    ) -> Result<usize, RejectedFd> {
         self.close_cursor = None;
         let Some(fd) = self.alloc_fd(limit) else {
-            return Err(RejectedFd::new(file, mount));
+            return Err(RejectedFd::new(file));
         };
         file.on_fd_install();
         self.fd_table[fd] = Some(file);
         self.fd_flags[fd] = flags;
-        self.fd_mounts[fd] = mount;
         Ok(fd)
     }
 
@@ -438,36 +394,21 @@ impl FilesStruct {
         flags: u32,
         limit: usize,
     ) -> Result<Option<DetachedFd>, RejectedFd> {
-        self.replace_fd_at_with_mount(fd, file, flags, None, limit)
-    }
-
-    pub fn replace_fd_at_with_mount(
-        &mut self,
-        fd: usize,
-        file: Arc<dyn File + Send + Sync>,
-        flags: u32,
-        mount: Option<FdMountRef>,
-        limit: usize,
-    ) -> Result<Option<DetachedFd>, RejectedFd> {
         if fd >= limit {
-            return Err(RejectedFd::new(file, mount));
+            return Err(RejectedFd::new(file));
         }
         self.close_cursor = None;
         if self.fd_table.len() <= fd {
             self.fd_table.resize(fd + 1, None);
             self.fd_flags.resize(fd + 1, 0);
-            self.fd_mounts.resize(fd + 1, None);
         } else {
             self.ensure_flags_len();
         }
         let old_file = self.fd_table[fd].take();
-        let old_mount = self.fd_mounts[fd].take();
-        let detached =
-            old_file.map(|old_file| DetachedFd::new(old_file, old_mount, !self.fd_refs_closed));
+        let detached = old_file.map(|old_file| DetachedFd::new(old_file, !self.fd_refs_closed));
         file.on_fd_install();
         self.fd_table[fd] = Some(file);
         self.fd_flags[fd] = flags;
-        self.fd_mounts[fd] = mount;
         if fd == self.next_fd_hint {
             while self
                 .fd_table
@@ -488,14 +429,13 @@ impl FilesStruct {
         }
         let file = self.fd_table[fd].take();
         self.ensure_flags_len();
-        let mount = self.fd_mounts[fd].take();
         self.fd_flags[fd] = 0;
         self.close_cursor = None;
         if file.is_some() {
             self.next_fd_hint = self.next_fd_hint.min(fd);
         }
         self.trim();
-        file.map(|file| DetachedFd::new(file, mount, !self.fd_refs_closed))
+        file.map(|file| DetachedFd::new(file, !self.fd_refs_closed))
     }
 
     /// 读取 fd 的描述符 flags（FD_CLOEXEC / O_NONBLOCK 等）；fd 不存在返回 0。
@@ -521,8 +461,7 @@ impl FilesStruct {
         for (idx, flags) in self.fd_flags.iter_mut().enumerate() {
             if (*flags & FD_CLOEXEC) != 0 {
                 if let Some(file) = self.fd_table[idx].take() {
-                    let mount = self.fd_mounts[idx].take();
-                    detached.push(DetachedFd::new(file, mount, !self.fd_refs_closed));
+                    detached.push(DetachedFd::new(file, !self.fd_refs_closed));
                 }
                 *flags = 0;
                 self.next_fd_hint = self.next_fd_hint.min(idx);
@@ -538,7 +477,6 @@ impl Default for FilesStruct {
         Self {
             fd_table: Vec::new(),
             fd_flags: Vec::new(),
-            fd_mounts: Vec::new(),
             next_fd_hint: 0,
             close_cursor: None,
             fd_refs_closed: false,

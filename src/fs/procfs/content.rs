@@ -87,6 +87,7 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
     match kind {
         ProcFileKind::Mounts => proc_mounts_current(),
         ProcFileKind::Mountinfo => proc_mountinfo_current(),
+        ProcFileKind::Filesystems => crate::syscall::filesystem::proc_filesystems_snapshot(),
         ProcFileKind::PidMounts(pid) => proc_mounts_for_pid(*pid),
         ProcFileKind::PidMountinfo(pid) => proc_mountinfo_for_pid(*pid),
         ProcFileKind::Cgroups => crate::fs::cgroup_proc_cgroups_content(),
@@ -226,7 +227,7 @@ fn proc_fdinfo_pos(file: &Arc<dyn crate::fs::File + Send + Sync>) -> usize {
     if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
         return proc_file.offset();
     }
-    if let Some(shm) = file.as_any().downcast_ref::<crate::fs::PseudoShmFile>() {
+    if let Some(shm) = file.as_any().downcast_ref::<crate::fs::MemfdFile>() {
         return shm.offset();
     }
     if let Some(block) = file.as_any().downcast_ref::<crate::fs::PseudoBlock>() {
@@ -1008,16 +1009,9 @@ pub(super) fn proc_kpageflags_read(offset: &mut usize, buf: &mut UserBuffer) -> 
     }
     let mut total = 0usize;
     for slice in buf.buffers.iter_mut() {
-        let mut i = 0usize;
-        while i < slice.len() && *offset < limit {
-            let entry = (*offset) / 8;
-            let byte_in_entry = (*offset) % 8;
-            let val = proc_kpageflags_entry(entry);
-            slice[i] = ((val >> (byte_in_entry * 8)) & 0xff) as u8;
-            *offset += 1;
-            i += 1;
-            total += 1;
-        }
+        let read = proc_kpageflags_read_at(*offset, slice);
+        *offset += read;
+        total += read;
     }
     total
 }
@@ -1029,18 +1023,44 @@ pub(super) fn proc_pid_pagemap_read(pid: u32, offset: &mut usize, buf: &mut User
     }
     let mut total = 0usize;
     for slice in buf.buffers.iter_mut() {
-        let mut i = 0usize;
-        while i < slice.len() && *offset < limit {
-            let entry = (*offset) / 8;
-            let byte_in_entry = (*offset) % 8;
-            let val = proc_pid_pagemap_entry(pid, entry);
-            slice[i] = ((val >> (byte_in_entry * 8)) & 0xff) as u8;
-            *offset += 1;
-            i += 1;
-            total += 1;
-        }
+        let read = proc_pid_pagemap_read_at(pid, *offset, slice);
+        *offset += read;
+        total += read;
     }
     total
+}
+
+/// Read `/proc/kpageflags` at an explicit byte offset.  This is shared by the
+/// legacy cursor-backed file and the object-VFS file-description adapter.
+pub(super) fn proc_kpageflags_read_at(offset: usize, output: &mut [u8]) -> usize {
+    let limit = proc_kpageflags_len();
+    let mut cursor = offset;
+    let mut written = 0usize;
+    while written < output.len() && cursor < limit {
+        let entry = cursor / 8;
+        let byte_in_entry = cursor % 8;
+        let value = proc_kpageflags_entry(entry);
+        output[written] = ((value >> (byte_in_entry * 8)) & 0xff) as u8;
+        cursor += 1;
+        written += 1;
+    }
+    written
+}
+
+/// Read `/proc/<pid>/pagemap` at an explicit byte offset.
+pub(super) fn proc_pid_pagemap_read_at(pid: u32, offset: usize, output: &mut [u8]) -> usize {
+    let limit = proc_pid_pagemap_len(pid);
+    let mut cursor = offset;
+    let mut written = 0usize;
+    while written < output.len() && cursor < limit {
+        let entry = cursor / 8;
+        let byte_in_entry = cursor % 8;
+        let value = proc_pid_pagemap_entry(pid, entry);
+        output[written] = ((value >> (byte_in_entry * 8)) & 0xff) as u8;
+        cursor += 1;
+        written += 1;
+    }
+    written
 }
 
 fn proc_pid_smaps(pid: u32) -> String {

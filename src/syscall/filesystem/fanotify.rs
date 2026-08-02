@@ -1,12 +1,13 @@
 use super::{
     AT_FDCWD, FanotifyFile, File, MapPermission, SyscallError, current_files,
     current_files_and_nofile_limit, current_fsuid_gid, err, get_current_token, read_user_cstring,
-    resolve_abs_path, resolve_at_inode, resolve_at_path, translate_mount_abs,
-    try_translated_byte_buffer, with_ext4_inode_read,
+    resolve_at_inode_with_vfs_path, resolve_at_path, try_translated_byte_buffer,
+    with_ext4_inode_read,
 };
 use alloc::sync::Arc;
 
 const FAN_MARK_DONT_FOLLOW: usize = 0x0000_0004;
+const FAN_MARK_FLUSH: usize = 0x0000_0080;
 
 pub fn syscall_fanotify_init(flags: usize, _event_f_flags: usize) -> isize {
     let file = match FanotifyFile::new(flags) {
@@ -42,6 +43,16 @@ pub fn syscall_fanotify_mark(
         file
     };
 
+    if (flags & FAN_MARK_FLUSH) != 0 {
+        let Some(group) = fanotify_file.as_any().downcast_ref::<FanotifyFile>() else {
+            return err(SyscallError::EINVAL);
+        };
+        return match group.flush_marks(flags) {
+            Ok(()) => 0,
+            Err(e) => e,
+        };
+    }
+
     let path = if pathname == 0 {
         if dirfd == AT_FDCWD {
             return err(SyscallError::EFAULT);
@@ -59,23 +70,16 @@ pub fn syscall_fanotify_mark(
     };
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow = (flags & FAN_MARK_DONT_FOLLOW) == 0;
-    let inode = match resolve_at_inode(&at, fsuid, fsgid, follow) {
-        Ok(inode) => inode,
+    let (inode, mark_path) = match resolve_at_inode_with_vfs_path(&at, fsuid, fsgid, follow) {
+        Ok(resolved) => resolved,
         Err(e) => return e,
     };
     let is_dir = with_ext4_inode_read(&inode, || inode.is_dir());
-    let (mark_path, mark_source_path) = match resolve_abs_path(dirfd, &path) {
-        Ok(Some(path)) => {
-            let source_path = translate_mount_abs(&path);
-            (Some(path), Some(source_path))
-        }
-        _ => (None, None),
-    };
 
     let Some(fanotify_file) = fanotify_file.as_any().downcast_ref::<FanotifyFile>() else {
         return err(SyscallError::EINVAL);
     };
-    match fanotify_file.modify_mark(flags, mask, inode, is_dir, mark_path, mark_source_path) {
+    match fanotify_file.modify_mark(flags, mask, inode, is_dir, mark_path) {
         Ok(()) => 0,
         Err(e) => e,
     }

@@ -1,15 +1,16 @@
 //! devtmpfs filesystem view.
 //!
-//! This is a concrete filesystem backend, not part of the VFS object model.
-//! The current implementation is the compatibility provider used by the
-//! legacy pathname dispatcher.  Device registration and lookup will migrate
-//! to `VfsFileSystem` and `VfsNode` without changing this module boundary.
+//! This is a concrete filesystem backend.  [`vfs`] exposes component-based
+//! nodes and pinned device opens; `open_legacy` remains the driver-facing
+//! object constructor while pathname users migrate to the common VFS.
+
+pub(crate) mod vfs;
 
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc};
 
-use super::{File, pseudo, shm_object_name, tty};
+use super::{File, pseudo, tty};
 
 /// Open a devtmpfs object through the transitional path-based provider.
 pub(super) fn open_legacy(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
@@ -171,7 +172,7 @@ pub(super) fn open_legacy(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         }
     }
     if path == "/dev/shm" || path == "/dev/shm/" {
-        let mut entries = alloc::vec![
+        let entries = alloc::vec![
             pseudo::PseudoDirent {
                 name: String::from("."),
                 ino: 1,
@@ -183,13 +184,6 @@ pub(super) fn open_legacy(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
                 dtype: 4,
             },
         ];
-        for (idx, name) in pseudo::shm_list().into_iter().enumerate() {
-            entries.push(pseudo::PseudoDirent {
-                name,
-                ino: (1000 + idx) as u64,
-                dtype: 8,
-            });
-        }
         return Some(Arc::new(pseudo::PseudoDir::new("/dev/shm", entries)));
     }
     if path == "/dev/misc" || path == "/dev/misc/" {
@@ -220,10 +214,6 @@ pub(super) fn open_legacy(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     }
     if matches!(path, "/dev/root" | "/dev/vda" | "/dev/vdb" | "/dev/vdc") {
         return Some(Arc::new(pseudo::PseudoBlock::new()));
-    }
-    if let Some(name) = shm_object_name(path) {
-        let data = pseudo::shm_get(name)?;
-        return Some(Arc::new(pseudo::PseudoShmFile::new(data)));
     }
     if path == "/dev/null" {
         return Some(Arc::new(pseudo::PseudoFile::new_null()));

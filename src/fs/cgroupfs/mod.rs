@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use crate::fs::{File, PseudoDir, PseudoDirent};
+use crate::fs::File;
 use crate::mm::UserBuffer;
 use crate::syscall::misc::{decode_linux_tid_strict, encode_linux_tid};
 use crate::task::{
@@ -33,8 +33,6 @@ use crate::task::{
     task_block::TaskStatus,
 };
 
-/// 文件已存在的错误码
-const EEXIST: isize = -17;
 /// 权限不足的错误码
 const EACCES: isize = -13;
 /// 参数无效的错误码
@@ -43,8 +41,6 @@ const EINVAL: isize = -22;
 const ENOENT: isize = -2;
 /// 设备不存在的错误码
 const ENODEV: isize = -19;
-/// 目录非空的错误码
-const ENOTEMPTY: isize = -39;
 /// 设备或资源忙的错误码
 const EBUSY: isize = -16;
 /// 资源暂时不可用的错误码（fork 检查时用）
@@ -60,6 +56,8 @@ const LINUX_TID_PID_SHIFT: usize = 15;
 
 /// 全局单调递增的 cgroup inode 号分配器，起始值从 0x63_0000 开始
 pub(crate) static NEXT_CGROUP_INO: AtomicU64 = AtomicU64::new(0x63_0000);
+/// Stable superblock identity allocated once per cgroup hierarchy.
+pub(crate) static NEXT_CGROUP_FS_ID: AtomicU64 = AtomicU64::new(0x63_0000_0000);
 
 lazy_static! {
     /// 全局 cgroup 注册表，管理所有已挂载的 cgroup 层次结构
@@ -134,12 +132,13 @@ mod helpers; // 路径解析、命名空间可见性、祖先遍历等辅助函�
 mod mount_state; // 单个 cgroup 层次结构的状态管理（节点树、进程/线程关联、资源限制执行）
 mod node; // CgroupNode 数据结构（控制器字段、统计计数器、限制值）
 mod registry; // 全局 cgroup 注册表（管理所有已挂载层次结构、挂载/卸载生命周期）
+pub(crate) mod vfs; // mountpoint-independent VFS/kernfs-style node projection
 
 pub use file::{CgroupFile, cgroup_maybe_block_current};
-pub(crate) use file::{CgroupFileKind, build_dir_entries};
+pub(crate) use file::{CgroupFileKind, cgroup_file_names};
 pub(crate) use helpers::*;
 pub(crate) use mount_state::CgroupMountState;
-pub(crate) use node::{CgroupNode, CgroupThreadId, LegacyFreezerState};
+pub(crate) use node::{CgroupControlNode, CgroupNode, CgroupThreadId, LegacyFreezerState};
 pub(crate) use registry::CgroupRegistry;
 
 #[derive(Clone)]
@@ -180,6 +179,12 @@ impl CgroupMountSpec {
             .filter(|token| !token.is_empty())
         {
             let parsed = match token {
+                // mount(8) commonly leaves generic VFS options in the data
+                // string (for example `rw,cpu`). Linux's fs_context layer
+                // consumes these before cgroup1_parse_param().
+                "rw" | "ro" | "suid" | "nosuid" | "dev" | "nodev" | "exec" | "noexec" | "sync"
+                | "async" | "dirsync" | "atime" | "noatime" | "diratime" | "nodiratime"
+                | "relatime" | "norelatime" | "strictatime" | "lazytime" | "nolazytime" => None,
                 "none" => None,
                 "debug" => Some((token, CgroupMountKind::LegacyDebug)),
                 "cpuset" => Some((token, CgroupMountKind::LegacyCpuset)),
@@ -237,148 +242,6 @@ impl CgroupMountSpec {
     }
 }
 
-/// 在指定挂载目标上挂载 cgroup 层次结构，委托给全局注册表处理
-pub fn cgroup_mount(target: &str, spec: &CgroupMountSpec) -> isize {
-    let rc = CGROUP_REGISTRY.lock().mount(target, spec);
-    if rc == 0 && spec.kind() == CgroupMountKind::LegacyCpu {
-        refresh_all_legacy_cpu_fair_group_caches();
-    }
-    rc
-}
-
-/// 卸载指定挂载目标上的 cgroup 层次结构
-pub fn cgroup_umount(target: &str) -> isize {
-    let was_legacy_cpu = {
-        let registry = CGROUP_REGISTRY.lock();
-        registry
-            .mounts
-            .get(target)
-            .and_then(|key| registry.hierarchies.get(key))
-            .is_some_and(|state| state.kind == CgroupMountKind::LegacyCpu)
-    };
-    let rc = CGROUP_REGISTRY.lock().umount(target);
-    if rc == 0 && was_legacy_cpu {
-        refresh_all_legacy_cpu_fair_group_caches();
-    }
-    rc
-}
-
-/// 判断给定绝对路径是否位于 cgroup 伪文件系统的挂载点下
-pub fn is_cgroup_pseudo_path(abs: &str) -> bool {
-    split_mount_path(abs).is_some()
-}
-
-/// 通过路径在 cgroup 伪文件系统中打开一个文件或目录
-///
-/// 若路径匹配已有 cgroup 节点则返回伪目录，否则返回具体的 cgroup 控制文件。
-pub fn open_cgroup_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
-    let (_mount_target, mount_rel_path, hierarchy_key) = split_mount_path(path)?;
-    let process = current_process();
-    let (open_euid, open_cgroup_ns_root) = {
-        let inner = process.borrow_mut();
-        (inner.euid, inner.cgroup_ns_root.clone())
-    };
-    // 在 cgroup 命名空间内解析相对路径
-    let rel_path = namespace_resolve_rel_path(&open_cgroup_ns_root, &mount_rel_path)?;
-    let registry = CGROUP_REGISTRY.lock();
-    let state = registry.hierarchies.get(&hierarchy_key)?;
-    if state.nodes.contains_key(&rel_path) {
-        // 路径对应已有 cgroup 节点，返回伪目录及其目录项
-        let entries = build_dir_entries(&rel_path, &open_cgroup_ns_root, state);
-        return Some(Arc::new(PseudoDir::new(path, entries)));
-    }
-    // 否则返回具体的 cgroup 控制文件（如 tasks, cgroup.procs 等）
-    let (parent, name) = split_rel_parent(&rel_path)?;
-    state.nodes.get(&parent)?;
-    let kind = CgroupFileKind::from_name(&name, state.kind)?;
-    Some(CgroupFile::new(
-        path,
-        hierarchy_key,
-        &parent,
-        kind,
-        open_euid,
-        &open_cgroup_ns_root,
-    ))
-}
-
-/// 在 cgroup 层次结构中创建一个新的 cgroup 目录节点
-pub fn cgroup_mkdir(abs: &str) -> isize {
-    let ns_root = current_cgroup_namespace_root();
-    let (.., rel_path, hierarchy_key) = match resolve_mount_path_in_namespace(&ns_root, abs) {
-        Ok(resolved) => resolved,
-        Err(err) => return err,
-    };
-    // 不允许在命名空间根节点上再创建同名节点
-    if rel_path == ns_root {
-        return EEXIST;
-    }
-    let Some((parent, _name)) = split_rel_parent(&rel_path) else {
-        return EINVAL;
-    };
-    let mut registry = CGROUP_REGISTRY.lock();
-    let Some(state) = registry.hierarchies.get_mut(&hierarchy_key) else {
-        return ENOENT;
-    };
-    // 父节点必须存在
-    if !state.nodes.contains_key(&parent) {
-        return ENOENT;
-    }
-    // cgroup 控制文件名由内核保留，不能再创建同名子 cgroup。
-    if CgroupFileKind::from_name(&_name, state.kind).is_some() {
-        return EEXIST;
-    }
-    // 目标节点不能已存在
-    if state.nodes.contains_key(&rel_path) {
-        return EEXIST;
-    }
-    let mut node = CgroupNode::new();
-    // 从父节点继承 clone_children 和 notify_on_release 标志
-    if let Some(parent_node) = state.nodes.get(&parent) {
-        node.clone_children = parent_node.clone_children;
-        node.notify_on_release = parent_node.notify_on_release;
-    }
-    state.nodes.insert(rel_path, node);
-    0
-}
-
-/// 删除 cgroup 层次结构中的一个节点（目录必须为空且无进程/线程关联）
-pub fn cgroup_rmdir(abs: &str) -> isize {
-    let ns_root = current_cgroup_namespace_root();
-    let (.., rel_path, hierarchy_key) = match resolve_mount_path_in_namespace(&ns_root, abs) {
-        Ok(resolved) => resolved,
-        Err(err) => return err,
-    };
-    // 不允许删除命名空间根节点
-    if rel_path == ns_root {
-        return EBUSY;
-    }
-    let mut registry = CGROUP_REGISTRY.lock();
-    let Some(state) = registry.hierarchies.get_mut(&hierarchy_key) else {
-        return ENOENT;
-    };
-    if !state.nodes.contains_key(&rel_path) {
-        return ENOENT;
-    }
-    // 节点下还有子节点则拒绝删除
-    if !state.direct_children(&rel_path).is_empty() {
-        return ENOTEMPTY;
-    }
-    // 有进程或线程关联到此节点时拒绝删除
-    if state
-        .process_assignments
-        .values()
-        .any(|path| path == &rel_path)
-        || state
-            .thread_assignments
-            .values()
-            .any(|path| path == &rel_path)
-    {
-        return EBUSY;
-    }
-    state.nodes.remove(&rel_path);
-    0
-}
-
 /// 将路径中所有以 `old_prefix` 开头的部分替换为 `new_prefix`
 ///
 /// 用于 cgroup 重命名时更新所有相关路径引用。
@@ -407,98 +270,6 @@ fn rename_cgroup_namespace_roots(old_prefix: &str, new_prefix: &str) {
             ));
         }
     }
-}
-
-/// 重命名（移动）cgroup 树中的一个节点及其所有子节点
-///
-/// `no_replace` 参数保留目前未使用，语义上若目标已存在应当返回 EEXIST。
-pub fn cgroup_rename(old_abs: &str, new_abs: &str, no_replace: bool) -> isize {
-    let ns_root = current_cgroup_namespace_root();
-    let (old_mount, old_rel, hierarchy_key) =
-        match resolve_mount_path_in_namespace(&ns_root, old_abs) {
-            Ok(resolved) => resolved,
-            Err(err) => return err,
-        };
-    let (new_mount, new_rel, new_hierarchy_key) =
-        match resolve_mount_path_in_namespace(&ns_root, new_abs) {
-            Ok(resolved) => resolved,
-            Err(err) => return err,
-        };
-    // 跨挂载点或跨层次结构的重命名不允许
-    if old_mount != new_mount || hierarchy_key != new_hierarchy_key {
-        return EROFS;
-    }
-    // 不允许重命名命名空间根节点
-    if old_rel == ns_root || new_rel == ns_root {
-        return EBUSY;
-    }
-    // 源和目标相同则直接成功
-    if old_rel == new_rel {
-        return 0;
-    }
-    let Some((old_parent, _)) = split_rel_parent(&old_rel) else {
-        return EINVAL;
-    };
-    // 不允许将节点移动到自身的子树中（形成循环）
-    if CgroupMountState::is_descendant_or_self(&new_rel, &old_rel) {
-        return EINVAL;
-    }
-    let Some((new_parent, _)) = split_rel_parent(&new_rel) else {
-        return EINVAL;
-    };
-    // 跨父节点的重命名（即移动）不允许，只支持同一父节点下的改名
-    if old_parent != new_parent {
-        return EROFS;
-    }
-
-    let mut registry = CGROUP_REGISTRY.lock();
-    let Some(state) = registry.hierarchies.get_mut(&hierarchy_key) else {
-        return ENOENT;
-    };
-    if !state.nodes.contains_key(&old_rel) {
-        return ENOENT;
-    }
-    if !state.nodes.contains_key(&new_parent) {
-        return ENOENT;
-    }
-    // 目标名已存在
-    if state.nodes.contains_key(&new_rel) {
-        let _ = no_replace;
-        return EEXIST;
-    }
-
-    // 收集所有需要重命名的子树节点（包括自身和所有子孙）
-    let renamed_keys = state
-        .nodes
-        .keys()
-        .filter(|path| CgroupMountState::is_descendant_or_self(path, &old_rel))
-        .cloned()
-        .collect::<Vec<_>>();
-    // 先从 nodes 中移出，再以新路径重新插入
-    let renamed_nodes = renamed_keys
-        .iter()
-        .filter_map(|path| state.nodes.remove(path).map(|node| (path.clone(), node)))
-        .collect::<Vec<_>>();
-    for (old_path, node) in renamed_nodes {
-        let new_path = rename_subtree_path(&old_path, &old_rel, &new_rel);
-        state.nodes.insert(new_path, node);
-    }
-    // 更新所有进程关联路径中的旧前缀
-    for path in state.process_assignments.values_mut() {
-        if CgroupMountState::is_descendant_or_self(path, &old_rel) {
-            *path = rename_subtree_path(path, &old_rel, &new_rel);
-        }
-    }
-    // 更新所有线程关联路径中的旧前缀
-    for path in state.thread_assignments.values_mut() {
-        if CgroupMountState::is_descendant_or_self(path, &old_rel) {
-            *path = rename_subtree_path(path, &old_rel, &new_rel);
-        }
-    }
-    drop(registry);
-    // 更新各进程的 cgroup 命名空间根路径
-    rename_cgroup_namespace_roots(&old_rel, &new_rel);
-    0
 }
 
 /// 返回 `/proc/cgroups` 的内容，列出所有支持的 cgroup 子系统及其状态
@@ -547,25 +318,8 @@ pub fn cgroup_current_path(pid: usize) -> String {
 pub(crate) fn cgroup_clone_into_target_from_file(
     file: &Arc<dyn File + Send + Sync>,
 ) -> Result<CgroupAttachTarget, isize> {
-    let Some(dir) = file.as_any().downcast_ref::<PseudoDir>() else {
-        return Err(EINVAL);
-    };
-    let ns_root = current_cgroup_namespace_root();
-    let (_, rel_path, hierarchy_key) = resolve_mount_path_in_namespace(&ns_root, dir.path())?;
-    let registry = CGROUP_REGISTRY.lock();
-    let Some(state) = registry.hierarchies.get(&hierarchy_key) else {
-        return Err(ENOENT);
-    };
-    if !state.is_unified() {
-        return Err(EINVAL);
-    }
-    if !state.nodes.contains_key(&rel_path) {
-        return Err(ENOENT);
-    }
-    Ok(CgroupAttachTarget {
-        hierarchy_key,
-        rel_path,
-    })
+    let path = file.object_path().ok_or(EINVAL)?;
+    vfs::attach_target_from_path(path)
 }
 
 pub(crate) fn cgroup_attach_process_to_target(
@@ -907,11 +661,4 @@ pub fn cgroup_charge_file_write(pid: usize, bytes: usize) {
             let _ = state.enforce_memory_limits(&path);
         }
     }
-}
-
-/// 获取 cgroup 文件在 cgroup 层次结构中的逻辑路径（若该文件确实是 CgroupFile）
-pub fn cgroup_logical_path_for_file(file: &Arc<dyn File + Send + Sync>) -> Option<String> {
-    file.as_any()
-        .downcast_ref::<CgroupFile>()
-        .map(|file| file.path().to_string())
 }

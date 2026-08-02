@@ -3,21 +3,19 @@ extern crate alloc;
 use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
+use crate::fs::vfs::{LookupFlags, PathWalker, VfsCredentials, VfsLink, VfsNodeKind, VfsPath};
 use crate::fs::{
-    File, NamespaceFile, NamespaceKind, NetSocketFile, OSInode, Pipe, PseudoDir, PseudoFile,
-    PseudoKindTag, PseudoShmFile, RtcFile, ext4_inode_lock, inode_logical_path, inode_path_hint,
-    inode_path_in_roots, path_resolves_to_inode,
+    EventFdFile, FanotifyFile, File, KernelFileSystemKind, MemfdFile, NamespaceFile, NamespaceKind,
+    NetSocketFile, OSInode, Pipe, PseudoDir, PseudoFile, PseudoKindTag, RtcFile, SignalfdFile,
+    TimerFdFile, UserfaultfdFile, VfsOpenedFile, inode_path_hint, inode_path_in_roots,
+    kernel_file_path, path_resolves_to_inode,
 };
 use crate::task::manager::pid2process;
 use crate::task::processor::{current_process, current_task};
 
+use super::ProcMagicLinkFile;
 use super::entries::{encode_proc_linux_tid, proc_pid_exists, proc_pid_task_alive};
-use super::{ProcMagicLinkFile, is_proc_pseudo_path};
-use crate::syscall::error::{SyscallError, err};
-
-const MAX_PROC_MAGIC_SYMLINKS: usize = 40;
 
 /// 返回当前线程对应的 `/proc/thread-self` 目标，形如 `<pid>/task/<tid>`（相对 `/proc`）。
 /// 用 `encode_proc_linux_tid` 把内核内部 tid 索引编码成用户态可见的 Linux TID。
@@ -44,179 +42,6 @@ fn trim_proc_path(path: &str) -> &str {
     } else {
         path
     }
-}
-
-/// 将 `path`（可为相对或绝对）按 `cwd` 基准规范化为绝对路径。
-///
-/// 逐段处理 `.`（忽略）和 `..`（弹出上一段），不访问文件系统、纯字符串运算。
-/// 仅当 `path` 为相对路径时才先展开 `cwd`。
-fn normalize_abs_path(cwd: &str, path: &str) -> String {
-    let mut parts = Vec::new();
-    let absolute = path.starts_with('/');
-    if !absolute {
-        for seg in cwd.split('/') {
-            if seg.is_empty() || seg == "." {
-                continue;
-            }
-            if seg == ".." {
-                parts.pop();
-                continue;
-            }
-            parts.push(seg);
-        }
-    }
-    for seg in path.split('/') {
-        if seg.is_empty() || seg == "." {
-            continue;
-        }
-        if seg == ".." {
-            parts.pop();
-            continue;
-        }
-        parts.push(seg);
-    }
-    let mut out = String::from("/");
-    out.push_str(&parts.join("/"));
-    if out.len() > 1 && out.ends_with('/') {
-        out.pop();
-    }
-    out
-}
-
-/// 把路径拆成（父目录, 末段名）。父目录为顶层时返回空串。
-/// 末尾 `/` 会被忽略；纯 `/` 或空路径返回 `None`。
-fn split_parent_and_name(path: &str) -> Option<(&str, &str)> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.rfind('/') {
-        Some(pos) => {
-            let (parent, name) = trimmed.split_at(pos);
-            Some((parent, &name[1..]))
-        }
-        None => Some(("", trimmed)),
-    }
-}
-
-/// 返回某个 magic link 路径所在的父目录，顶层时回退为 `/`。
-/// 用作解析相对符号链接目标时的基准目录。
-fn proc_magic_link_parent_path(link_path: &str) -> &str {
-    split_parent_and_name(link_path)
-        .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
-        .unwrap_or("/")
-}
-
-/// 计算 magic link 的最终目标绝对路径。
-///
-/// - `target` 为绝对路径时直接采用，否则以 link 的父目录为基准展开。
-/// - `remainder` 是 link 之后还需追加的剩余路径段（如 `fd/3/foo` 中的 `foo`）。
-fn proc_magic_link_target_path(link_path: &str, target: &str, remainder: &str) -> String {
-    let base = if target.starts_with('/') {
-        String::from(target)
-    } else {
-        normalize_abs_path(proc_magic_link_parent_path(link_path), target)
-    };
-    if remainder.is_empty() {
-        base
-    } else {
-        normalize_abs_path(&base, remainder)
-    }
-}
-
-/// 当 magic link 指向一个「目录类」对象（如 `fd/<n>` 指向某打开的目录 fd）时，
-/// 解析出该目录的绝对路径。
-///
-/// - 伪目录 [`PseudoDir`] 直接返回其 `path()`。
-/// - 真实 ext4 目录先尝试 `proc_readlink` 的绝对结果，再回退到 inode 的逻辑路径。
-/// - 非目录对象返回 `ENOTDIR`。
-fn proc_magic_link_dir_target_path(
-    link_path: &str,
-    file: &Arc<dyn File + Send + Sync>,
-) -> Result<String, isize> {
-    if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
-        return Ok(String::from(pdir.path()));
-    }
-
-    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return Err(err(SyscallError::ENOTDIR));
-    };
-    let inode = os_inode.ext4_inode();
-    let inode_lock = ext4_inode_lock(&inode);
-    let _inode_guard = inode_lock.read();
-    let is_dir = inode.is_dir();
-    if !is_dir {
-        return Err(err(SyscallError::ENOTDIR));
-    }
-    if let Some(path) = proc_readlink(link_path).filter(|path| path.starts_with('/')) {
-        return Ok(path);
-    }
-    inode_logical_path(&inode).ok_or(err(SyscallError::ENOENT))
-}
-
-/// 根据 magic link 的解析结果（路径或文件对象）和剩余路径段，得到追加后的绝对路径。
-/// `Path` 目标走字符串拼接，`File` 目标先解析目录路径再追加 `remainder`。
-fn follow_proc_magic_link_target(
-    link_path: &str,
-    target: ProcMagicLinkFollowTarget,
-    remainder: &str,
-) -> Result<String, isize> {
-    match target {
-        ProcMagicLinkFollowTarget::Path(target) => {
-            Ok(proc_magic_link_target_path(link_path, &target, remainder))
-        }
-        ProcMagicLinkFollowTarget::File(file) => {
-            let base = proc_magic_link_dir_target_path(link_path, &file)?;
-            Ok(if remainder.is_empty() {
-                base
-            } else {
-                normalize_abs_path(&base, remainder)
-            })
-        }
-    }
-}
-
-/// 在路径中查找第一个作为「中间组件」出现的 magic link 并展开一层。
-///
-/// 例如 `/proc/<pid>/cwd/sub` 里 `cwd` 是中间符号链接，本函数会把它解析为
-/// 进程的工作目录并拼上 `sub`。逐前缀扫描，命中第一个 magic link 即返回新路径；
-/// 路径非 procfs 或没有可展开组件时返回 `Ok(None)`。
-fn resolve_next_proc_magic_intermediate_component(abs: &str) -> Result<Option<String>, isize> {
-    if !is_proc_pseudo_path(abs) {
-        return Ok(None);
-    }
-
-    let components: Vec<&str> = abs
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .collect();
-    if components.len() < 2 || components[0] != "proc" {
-        return Ok(None);
-    }
-
-    let mut prefix = String::new();
-    for idx in 0..components.len() - 1 {
-        prefix.push('/');
-        prefix.push_str(components[idx]);
-        if let Some(target) = proc_magic_link_follow_target(&prefix) {
-            let remainder = components[idx + 1..].join("/");
-            return follow_proc_magic_link_target(&prefix, target, &remainder).map(Some);
-        }
-    }
-    Ok(None)
-}
-
-/// 反复展开路径中的中间 magic link，直到不含可展开组件为止，返回最终绝对路径。
-/// 设置 `MAX_PROC_MAGIC_SYMLINKS` 上限防止符号链接环，超限返回 `ELOOP`。
-pub(crate) fn resolve_proc_magic_intermediate_abs_path(abs: &str) -> Result<String, isize> {
-    let mut current = String::from(abs);
-    for _ in 0..MAX_PROC_MAGIC_SYMLINKS {
-        let Some(next) = resolve_next_proc_magic_intermediate_component(&current)? else {
-            return Ok(current);
-        };
-        current = next;
-    }
-    Err(err(SyscallError::ELOOP))
 }
 
 /// 把 `/proc/self`、`/proc/thread-self` 这两个别名前缀替换成具体的
@@ -257,11 +82,16 @@ pub fn normalize_proc_magic_path(path: &str) -> Cow<'_, str> {
 /// 无法识别的类型返回 `None`。
 fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     let proc = pid2process(pid as usize)?;
-    let (files, cwd) = {
+    let (files, fs) = {
         let inner = proc.try_borrow_mut()?;
-        (Arc::clone(&inner.files), inner.cwd.clone())
+        (Arc::clone(&inner.files), Arc::clone(&inner.fs))
     };
+    let cwd = fs.cwd_display();
     let file = files.lock().get_file(fd)?;
+
+    if let Some(path) = file.logical_path_hint() {
+        return Some(String::from(path));
+    }
 
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         return Some(String::from(pdir.path()));
@@ -275,10 +105,13 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
         };
     }
     if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
-        return Some(alloc::format!("pipe:[{}]", pipe as *const Pipe as usize));
+        return Some(alloc::format!("pipe:[{}]", pipe.proc_inode()));
     }
     if let Some(sock) = file.as_any().downcast_ref::<NetSocketFile>() {
         return Some(alloc::format!("socket:[{}]", sock.proc_inode()));
+    }
+    if let Some(name) = anonymous_file_name(&file) {
+        return Some(alloc::format!("anon_inode:{name}"));
     }
     if let Some(ns) = file.as_any().downcast_ref::<NamespaceFile>() {
         return Some(ns.target_string());
@@ -289,8 +122,8 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     if file.as_any().downcast_ref::<RtcFile>().is_some() {
         return Some(String::from("/dev/misc/rtc"));
     }
-    if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
-        return Some(String::from("/dev/shm"));
+    if let Some(memfd) = file.as_any().downcast_ref::<MemfdFile>() {
+        return Some(memfd.proc_link_target());
     }
     if let Some(oinode) = file.as_any().downcast_ref::<OSInode>() {
         let inode = oinode.ext4_inode();
@@ -302,11 +135,31 @@ fn proc_fd_target(pid: u32, fd: usize) -> Option<String> {
     None
 }
 
+/// Linux names these objects through anon_inodefs' dynamic dentry callback.
+/// Keep the bracketed inode names identical to the names passed to
+/// `anon_inode_getfile()` by the corresponding Linux subsystems.
+fn anonymous_file_name(file: &Arc<dyn File + Send + Sync>) -> Option<&'static str> {
+    let object = file.as_any();
+    if object.downcast_ref::<EventFdFile>().is_some() {
+        Some("[eventfd]")
+    } else if object.downcast_ref::<TimerFdFile>().is_some() {
+        Some("[timerfd]")
+    } else if object.downcast_ref::<SignalfdFile>().is_some() {
+        Some("[signalfd]")
+    } else if object.downcast_ref::<UserfaultfdFile>().is_some() {
+        Some("[userfaultfd]")
+    } else if object.downcast_ref::<FanotifyFile>().is_some() {
+        Some("[fanotify]")
+    } else {
+        None
+    }
+}
+
 /// 读取目标进程的当前工作目录。进程不存在或锁竞争时返回 `None`（用 `try_borrow_mut` 避免死锁）。
 fn proc_pid_cwd(pid: u32) -> Option<String> {
     let proc = pid2process(pid as usize)?;
     let inner = proc.try_borrow_mut()?;
-    Some(inner.cwd.clone())
+    Some(inner.fs.cwd_display())
 }
 
 /// 读取目标进程当前可执行文件的逻辑绝对路径。
@@ -332,10 +185,183 @@ fn proc_pid_fd_file(pid: u32, fd: usize) -> Option<Arc<dyn File + Send + Sync>> 
     files.lock().get_file(fd)
 }
 
+/// Return the already resolved object pinned by a descriptor. Pathname-backed
+/// descriptions keep their existing path; pipes and sockets jump into the
+/// corresponding kernel-only pseudo mount, mirroring Linux `file->f_path`.
+fn proc_pid_fd_vfs_link(pid: u32, fd: usize) -> Option<VfsLink> {
+    let file = proc_pid_fd_file(pid, fd)?;
+    if let Some(path) = file.object_path() {
+        return Some(VfsLink::Magic(path.clone()));
+    }
+    if let Some(opened) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        return Some(VfsLink::Magic(opened.path().clone()));
+    }
+    if let Some(path) = file
+        .as_any()
+        .downcast_ref::<OSInode>()
+        .and_then(OSInode::vfs_path)
+        .map(|path| path.path().clone())
+    {
+        return Some(VfsLink::Magic(path));
+    }
+    if let Some(node_id) = file.as_any().downcast_ref::<Pipe>().map(Pipe::proc_inode) {
+        let display = alloc::format!("pipe:[{node_id}]");
+        let target =
+            kernel_file_path(file, KernelFileSystemKind::Pipe, node_id, VfsNodeKind::Fifo).ok()?;
+        return Some(VfsLink::MagicDisplay { target, display });
+    }
+    if let Some(node_id) = file
+        .as_any()
+        .downcast_ref::<NetSocketFile>()
+        .map(NetSocketFile::proc_inode)
+    {
+        let display = alloc::format!("socket:[{node_id}]");
+        let target = kernel_file_path(
+            file,
+            KernelFileSystemKind::Socket,
+            node_id,
+            VfsNodeKind::Socket,
+        )
+        .ok()?;
+        return Some(VfsLink::MagicDisplay { target, display });
+    }
+    if let Some(name) = anonymous_file_name(&file) {
+        let node_id = Arc::as_ptr(&file) as *const () as usize as u64;
+        let display = alloc::format!("anon_inode:{name}");
+        let target = kernel_file_path(
+            file,
+            KernelFileSystemKind::Anonymous,
+            node_id,
+            VfsNodeKind::Regular,
+        )
+        .ok()?;
+        return Some(VfsLink::MagicDisplay { target, display });
+    }
+    if let Some(memfd) = file.as_any().downcast_ref::<MemfdFile>() {
+        let node_id = memfd.memfd_id();
+        let display = memfd.proc_link_target();
+        let target = kernel_file_path(
+            file,
+            KernelFileSystemKind::Shmem,
+            node_id,
+            VfsNodeKind::Regular,
+        )
+        .ok()?;
+        return Some(VfsLink::MagicDisplay { target, display });
+    }
+    None
+}
+
+/// Resolve the executable name in the target task's own root and mount graph.
+/// This turns `/proc/<pid>/exe` into an object jump even when that task lives
+/// in a different mount namespace.
+fn proc_pid_exe_vfs_path(pid: u32) -> Option<VfsPath> {
+    let process = pid2process(pid as usize)?;
+    let (exe_path, fs, uid, gid, zombie) = {
+        let inner = process.try_borrow_mut()?;
+        (
+            inner.exe_path.clone(),
+            Arc::clone(&inner.fs),
+            inner.fsuid,
+            inner.fsgid,
+            inner.is_zombie,
+        )
+    };
+    if zombie || exe_path.is_empty() {
+        return None;
+    }
+    let root = fs.root();
+    let cwd = fs.cwd();
+    let namespace = process.mount_namespace().lock().vfs_namespace();
+    PathWalker::new(namespace)
+        .walk(
+            root.path(),
+            cwd.path(),
+            &exe_path,
+            LookupFlags(LookupFlags::FOLLOW_FINAL),
+            VfsCredentials { uid, gid },
+        )
+        .ok()
+}
+
+/// Resolve proc magic links that already have an object-VFS target.
+///
+/// Linux implements these through `nd_jump_link()` rather than by formatting
+/// an absolute path and feeding it back through namei. Namespace links jump
+/// into the internal nsfs mount; anonymous-fd links intentionally remain
+/// absent until their pipefs or sockfs nodes exist.
+pub(crate) fn proc_magic_vfs_link(path: &str) -> Option<VfsLink> {
+    let trimmed = trim_proc_path(path);
+    if trimmed == "/proc/self" {
+        let pid = current_process().getpid();
+        return Some(VfsLink::Text(alloc::format!("{pid}")));
+    }
+    if trimmed == "/proc/thread-self" {
+        return current_thread_self_target().map(VfsLink::Text);
+    }
+
+    let normalized = normalize_proc_magic_path(trimmed);
+    let (pid, rest) = proc_pid_from_path_with_rest(normalized.as_ref())?;
+    if !proc_pid_exists(pid) {
+        return None;
+    }
+    if rest == "cwd" {
+        return pid2process(pid as usize)
+            .map(|process| process.fs_struct().cwd().path().clone())
+            .map(VfsLink::Magic);
+    }
+    if rest == "exe" {
+        return proc_pid_exe_vfs_path(pid).map(VfsLink::Magic);
+    }
+    if let Some(kind) = proc_namespace_kind(rest) {
+        let namespace = proc_pid_namespace_descriptor(pid, kind)?;
+        let display = namespace.target_string();
+        let target = crate::fs::namespace_path(namespace).ok()?;
+        return Some(VfsLink::MagicDisplay { target, display });
+    }
+    if let Some(fd_name) = rest.strip_prefix("fd/") {
+        let fd = parse_proc_fd_component(fd_name)?;
+        return proc_pid_fd_vfs_link(pid, fd);
+    }
+
+    let (tid, tail) = proc_pid_task_rest(rest)?;
+    if !proc_pid_task_alive(pid, tid) {
+        return None;
+    }
+    if tail == "cwd" {
+        return pid2process(pid as usize)
+            .map(|process| process.fs_struct().cwd().path().clone())
+            .map(VfsLink::Magic);
+    }
+    if tail == "exe" {
+        return proc_pid_exe_vfs_path(pid).map(VfsLink::Magic);
+    }
+    if let Some(kind) = proc_namespace_kind(tail) {
+        let namespace = proc_pid_namespace_descriptor(pid, kind)?;
+        let display = namespace.target_string();
+        let target = crate::fs::namespace_path(namespace).ok()?;
+        return Some(VfsLink::MagicDisplay { target, display });
+    }
+    let fd_name = tail.strip_prefix("fd/")?;
+    let fd = parse_proc_fd_component(fd_name)?;
+    proc_pid_fd_vfs_link(pid, fd)
+}
+
+fn proc_namespace_kind(rest: &str) -> Option<NamespaceKind> {
+    match rest {
+        "ns/cgroup" => Some(NamespaceKind::Cgroup),
+        "ns/ipc" => Some(NamespaceKind::Ipc),
+        "ns/mnt" => Some(NamespaceKind::Mount),
+        "ns/net" => Some(NamespaceKind::Net),
+        _ => None,
+    }
+}
+
 /// 返回 `/proc/<pid>/ns/<kind>` 的目标字符串（形如 `ipc:[id]`），用于 readlink。
 fn proc_pid_namespace_target(pid: u32, kind: NamespaceKind) -> Option<String> {
     let proc = pid2process(pid as usize)?;
     let ns_id = match kind {
+        NamespaceKind::Cgroup => proc.try_borrow_mut()?.cgroup_ns_id,
         NamespaceKind::Ipc => proc.try_borrow_mut()?.ipc_ns_id,
         NamespaceKind::Mount => proc.mount_namespace_id(),
         NamespaceKind::Net => proc.net_namespace_id(),
@@ -343,21 +369,31 @@ fn proc_pid_namespace_target(pid: u32, kind: NamespaceKind) -> Option<String> {
     Some(kind.target_string(ns_id))
 }
 
+fn proc_pid_namespace_descriptor(pid: u32, kind: NamespaceKind) -> Option<Arc<NamespaceFile>> {
+    let proc = pid2process(pid as usize)?;
+    match kind {
+        NamespaceKind::Cgroup => {
+            let inner = proc.try_borrow_mut()?;
+            Some(Arc::new(NamespaceFile::new_cgroup(
+                inner.cgroup_ns_id,
+                inner.cgroup_ns_root.clone(),
+            )))
+        }
+        NamespaceKind::Ipc => {
+            let inner = proc.try_borrow_mut()?;
+            Some(Arc::new(NamespaceFile::new_ipc(inner.ipc_ns_id)))
+        }
+        NamespaceKind::Mount => Some(Arc::new(NamespaceFile::new_mount(proc.mount_namespace()))),
+        NamespaceKind::Net => Some(Arc::new(NamespaceFile::new_net(proc.net_namespace_id()))),
+    }
+}
+
 /// 为 `/proc/<pid>/ns/<kind>` 构造一个可打开的 [`NamespaceFile`]（setns/比较用）。
 pub(crate) fn proc_pid_namespace_file(
     pid: u32,
     kind: NamespaceKind,
 ) -> Option<Arc<dyn File + Send + Sync>> {
-    let proc = pid2process(pid as usize)?;
-    let file: Arc<dyn File + Send + Sync> = match kind {
-        NamespaceKind::Ipc => {
-            let inner = proc.try_borrow_mut()?;
-            Arc::new(NamespaceFile::new_ipc(inner.ipc_ns_id))
-        }
-        NamespaceKind::Mount => Arc::new(NamespaceFile::new_mount(proc.mount_namespace())),
-        NamespaceKind::Net => Arc::new(NamespaceFile::new_net(proc.net_namespace_id())),
-    };
-    Some(file)
+    proc_pid_namespace_descriptor(pid, kind).map(|file| file as Arc<dyn File + Send + Sync>)
 }
 
 /// 校验并解析 `fd/<n>` 中的数字 fd 段。非纯数字或含 `/` 一律返回 `None`。
@@ -380,85 +416,6 @@ pub(crate) fn proc_pid_task_rest(rest: &str) -> Option<(u32, &str)> {
     let tid = tid_name.parse::<u32>().ok()?;
     let tail = parts.next().unwrap_or("");
     Some((tid, tail))
-}
-
-/// magic link 的解析目标：要么是一个字符串路径，要么是一个具体的文件对象。
-enum ProcMagicLinkFollowTarget {
-    Path(String),
-    File(Arc<dyn File + Send + Sync>),
-}
-
-/// 判断某个 procfs 路径是否本身是一个 magic link，并解析出它的跟随目标。
-///
-/// 覆盖 `self`/`thread-self` 别名，以及 `/proc/<pid>` 下的 `cwd`、`exe`、
-/// `ns/ipc`、`ns/mnt`、`fd/<n>` 和对应的 `task/<tid>/…` 变体。
-/// 非 magic link 返回 `None`。
-fn proc_magic_link_follow_target(path: &str) -> Option<ProcMagicLinkFollowTarget> {
-    let trimmed = trim_proc_path(path);
-
-    if trimmed == "/proc/self" {
-        let pid = current_process().getpid();
-        return Some(ProcMagicLinkFollowTarget::Path(alloc::format!("{pid}")));
-    }
-    if trimmed == "/proc/thread-self" {
-        return current_thread_self_target().map(ProcMagicLinkFollowTarget::Path);
-    }
-
-    let normalized = normalize_proc_magic_path(trimmed);
-    let trimmed = normalized.as_ref();
-
-    let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
-    if !proc_pid_exists(pid) {
-        return None;
-    }
-    if rest == "cwd" {
-        return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
-    }
-    if rest == "exe" {
-        return proc_pid_exe(pid).map(ProcMagicLinkFollowTarget::Path);
-    }
-    if rest == "ns/ipc" {
-        return proc_pid_namespace_file(pid, NamespaceKind::Ipc)
-            .map(ProcMagicLinkFollowTarget::File);
-    }
-    if rest == "ns/mnt" {
-        return proc_pid_namespace_file(pid, NamespaceKind::Mount)
-            .map(ProcMagicLinkFollowTarget::File);
-    }
-    if rest == "ns/net" {
-        return proc_pid_namespace_file(pid, NamespaceKind::Net)
-            .map(ProcMagicLinkFollowTarget::File);
-    }
-    if let Some(fd_name) = rest.strip_prefix("fd/") {
-        let fd = parse_proc_fd_component(fd_name)?;
-        return proc_pid_fd_file(pid, fd).map(ProcMagicLinkFollowTarget::File);
-    }
-
-    let (tid, tail) = proc_pid_task_rest(rest)?;
-    if !proc_pid_task_alive(pid, tid) {
-        return None;
-    }
-    if tail == "cwd" {
-        return proc_pid_cwd(pid).map(ProcMagicLinkFollowTarget::Path);
-    }
-    if tail == "exe" {
-        return proc_pid_exe(pid).map(ProcMagicLinkFollowTarget::Path);
-    }
-    if tail == "ns/ipc" {
-        return proc_pid_namespace_file(pid, NamespaceKind::Ipc)
-            .map(ProcMagicLinkFollowTarget::File);
-    }
-    if tail == "ns/mnt" {
-        return proc_pid_namespace_file(pid, NamespaceKind::Mount)
-            .map(ProcMagicLinkFollowTarget::File);
-    }
-    if tail == "ns/net" {
-        return proc_pid_namespace_file(pid, NamespaceKind::Net)
-            .map(ProcMagicLinkFollowTarget::File);
-    }
-    let fd_name = tail.strip_prefix("fd/")?;
-    let fd = parse_proc_fd_component(fd_name)?;
-    proc_pid_fd_file(pid, fd).map(ProcMagicLinkFollowTarget::File)
 }
 
 /// 判断给定 procfs 路径是否是一个存在的 magic link（供 `stat`/`access` 等使用）。
@@ -488,7 +445,7 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if rest == "exe" {
         return proc_pid_exe(pid).is_some();
     }
-    if rest == "ns/ipc" || rest == "ns/mnt" || rest == "ns/net" {
+    if rest == "ns/cgroup" || rest == "ns/ipc" || rest == "ns/mnt" || rest == "ns/net" {
         return true;
     }
     if let Some(fd_name) = rest.strip_prefix("fd/") {
@@ -509,37 +466,13 @@ pub fn proc_magic_link_exists(path: &str) -> bool {
     if tail == "exe" {
         return proc_pid_exe(pid).is_some();
     }
-    if tail == "ns/ipc" || tail == "ns/mnt" || tail == "ns/net" {
+    if tail == "ns/cgroup" || tail == "ns/ipc" || tail == "ns/mnt" || tail == "ns/net" {
         return true;
     }
     tail.strip_prefix("fd/")
         .and_then(parse_proc_fd_component)
         .and_then(|fd| proc_pid_fd_file(pid, fd))
         .is_some()
-}
-
-/// 把 `/proc/<pid>/fd/<n>`（含 `task/<tid>/fd/<n>`）直接解析到底层文件对象，
-/// 使经由该路径的 open 复用同一个打开文件（而非重新走路径解析）。非 fd 链接返回 `None`。
-pub fn proc_fd_link_file(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
-    let normalized = normalize_proc_magic_path(path);
-    let trimmed = normalized.as_ref();
-
-    let (pid, rest) = proc_pid_from_path_with_rest(trimmed)?;
-    if !proc_pid_exists(pid) {
-        return None;
-    }
-    if let Some(fd_name) = rest.strip_prefix("fd/") {
-        let fd = parse_proc_fd_component(fd_name)?;
-        return proc_pid_fd_file(pid, fd);
-    }
-
-    let (tid, tail) = proc_pid_task_rest(rest)?;
-    if !proc_pid_task_alive(pid, tid) {
-        return None;
-    }
-    let fd_name = tail.strip_prefix("fd/")?;
-    let fd = parse_proc_fd_component(fd_name)?;
-    proc_pid_fd_file(pid, fd)
 }
 
 /// 实现对 procfs magic link 的 `readlink`：返回链接指向的目标字符串。
@@ -574,6 +507,9 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     if rest == "exe" {
         return proc_pid_exe(pid);
     }
+    if rest == "ns/cgroup" {
+        return proc_pid_namespace_target(pid, NamespaceKind::Cgroup);
+    }
     if rest == "ns/ipc" {
         return proc_pid_namespace_target(pid, NamespaceKind::Ipc);
     }
@@ -598,6 +534,9 @@ pub fn proc_readlink(path: &str) -> Option<String> {
     }
     if tail == "exe" {
         return proc_pid_exe(pid);
+    }
+    if tail == "ns/cgroup" {
+        return proc_pid_namespace_target(pid, NamespaceKind::Cgroup);
     }
     if tail == "ns/ipc" {
         return proc_pid_namespace_target(pid, NamespaceKind::Ipc);

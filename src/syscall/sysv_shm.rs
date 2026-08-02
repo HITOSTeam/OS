@@ -748,7 +748,7 @@ pub fn syscall_shmat(shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
         file_ino: 0,
         file_offset: 0,
         backing_id: 0,
-        memfd_id: 0,
+        shmem_id: 0,
         anon_shared_id: 0,
         sysv_shmid: shmid,
         growsdown: false,

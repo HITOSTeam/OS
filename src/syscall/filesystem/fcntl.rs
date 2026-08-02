@@ -1,7 +1,7 @@
 use super::{
-    Arc, FD_CLOEXEC, FcntlFlock, FcntlOwnerEx, File, O_APPEND, O_ASYNC, O_DIRECT, O_NONBLOCK,
-    O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe, PseudoShmFile, RECORD_LOCKS,
-    RecordLockOwner, SyscallError, Vec, WaitingRecordLock, apply_record_lock_for_owner,
+    Arc, FD_CLOEXEC, FcntlFlock, FcntlOwnerEx, File, MemfdFile, O_APPEND, O_ASYNC, O_DIRECT,
+    O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe, RECORD_LOCKS, RecordLockOwner,
+    SyscallError, Vec, VfsOpenedFile, WaitingRecordLock, apply_record_lock_for_owner,
     block_current_and_run_next, clear_record_lock_waiting, collect_conflict_process_owners,
     current_files, current_files_and_nofile_limit, current_process, current_task,
     detect_record_lock_deadlock, enqueue_record_lock_waiter, err, file_lock_key,
@@ -163,8 +163,22 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             } else {
                 cur &= !(O_ASYNC as u32);
             }
+            if (arg & O_APPEND) != 0 {
+                cur |= O_APPEND as u32;
+            } else {
+                cur &= !(O_APPEND as u32);
+            }
             let _ = files.set_flags(fd, cur);
             drop(files);
+            if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+                let mut status = vfs_file.description().status_flags();
+                if (arg & O_APPEND) != 0 {
+                    status |= crate::fs::vfs::VFS_STATUS_APPEND;
+                } else {
+                    status &= !crate::fs::vfs::VFS_STATUS_APPEND;
+                }
+                vfs_file.description().set_status_flags(status);
+            }
             if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
                 pipe.set_async_enabled((cur & O_ASYNC as u32) != 0);
             }
@@ -196,6 +210,11 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
             if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
                 if os_inode.append() {
+                    flags |= O_APPEND;
+                }
+            }
+            if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+                if vfs_file.is_append() {
                     flags |= O_APPEND;
                 }
             }
@@ -564,7 +583,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 Ok(file) => file,
                 Err(e) => return e,
             };
-            let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
+            let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() else {
                 return err(SyscallError::EINVAL);
             };
             let Some(seals) = shm.memfd_seals() else {
@@ -578,7 +597,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 Err(e) => return e,
             };
             let has_writable_shared_map =
-                if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+                if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
                     let id = shm.memfd_id();
                     let process = current_process();
                     let inner = process.borrow_mut();
@@ -589,15 +608,15 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if !file.writable() {
                 return err(SyscallError::EPERM);
             }
-            let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
+            let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() else {
                 return err(SyscallError::EINVAL);
             };
             let add = arg as u32;
-            if (add & !PseudoShmFile::F_SEAL_ALL) != 0 {
+            if (add & !MemfdFile::F_SEAL_ALL) != 0 {
                 return err(SyscallError::EINVAL);
             }
-            if (add & PseudoShmFile::F_SEAL_WRITE) != 0
-                && !shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE)
+            if (add & MemfdFile::F_SEAL_WRITE) != 0
+                && !shm.has_memfd_seal(MemfdFile::F_SEAL_WRITE)
                 && has_writable_shared_map
             {
                 return err(SyscallError::EBUSY);
@@ -613,7 +632,6 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let Some((file, old_flags)) = files.get_file_and_flags(fd) else {
                 return err(SyscallError::EBADF);
             };
-            let mount = files.get_mount_ref(fd);
             let minfd = arg;
             if minfd >= limit {
                 return err(SyscallError::EINVAL);
@@ -631,8 +649,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             } else {
                 new_flags |= FD_CLOEXEC;
             }
-            let replace_result =
-                files.replace_fd_at_with_mount(newfd, file, new_flags, mount, limit);
+            let replace_result = files.replace_fd_at(newfd, file, new_flags, limit);
             drop(files);
             let replaced = match replace_result {
                 Ok(replaced) => replaced,

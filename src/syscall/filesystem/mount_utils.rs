@@ -2,25 +2,118 @@ use super::{
     AT_FDCWD, Arc, BTreeMap, BTreeSet, CgroupMountSpec, File, InodeTimes, MNT_DETACH, MNT_EXPIRE,
     MNT_FORCE, MS_BIND, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID,
     MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_REMOUNT, MS_SHARED, MS_SLAVE, MS_STRICTATIME,
-    MS_UNBINDABLE, MountBackend, MountNamespace, MountNamespaceState, MountPropagation,
-    MountRecord, Mutex, NEXT_MOUNT_EVENT_ID, NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ,
-    OSInode, Ordering, PID2PCB, ProcessControlBlock, PseudoDir, PseudoFile, PseudoShmFile, RtcFile,
-    ST_NOSYMFOLLOW, String, SyscallError, TMPFILE_SEQ, UMOUNT_NOFOLLOW, Vec,
-    block_device_source_path, cgroup_logical_path_for_file, cgroup_mount, cgroup_umount,
-    clear_ext4_path_cache, current_fsuid_gid, current_process, current_timespec, err,
-    ext4_err_to_errno, ext4_inode_lock, find_path_in_roots, get_current_token, get_inode_times,
-    inode_logical_path, inode_raw_logical_path, mount_namespace_id, normalize_path, open_pseudo,
+    MS_UNBINDABLE, MountBackend, MountHandleObject, MountHandleState, MountNamespace,
+    MountNamespaceState, MountPropagation, MountRecord, NEXT_MOUNT_EVENT_ID,
+    NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ, OSInode, Ordering, PID2PCB,
+    ProcessControlBlock, PseudoDir, PseudoFile, RtcFile, ST_NOSYMFOLLOW, String, SyscallError,
+    UMOUNT_NOFOLLOW, Vec, VfsOpenedFile, block_device_source_path, current_fsuid_gid,
+    current_process, current_timespec, err, find_path_in_roots, get_current_token, get_inode_times,
+    inode_logical_path, inode_raw_logical_path, map_vfs_error, mount_namespace_id, normalize_path,
     pseudo_block_is_read_only, read_user_cstring, resolve_at_inode, resolve_at_path,
-    set_inode_times, with_ext4_inode_read,
+    resolve_at_vfs_path, set_inode_times, with_ext4_inode_read,
+};
+use crate::fs::ext4::Ext4Vfs;
+use crate::fs::tmpfs::TmpFs;
+use crate::fs::vfs::{
+    LookupFlags, PathWalker, VfsCredentials, VfsError, VfsFileSystem, VfsFileSystemFactory,
+    VfsFileSystemRegistry, VfsMountContext, VfsMountFlags, VfsMountPropagation, VfsNodeKind,
+    VfsPath, VfsResult,
+};
+use crate::fs::{
+    Cgroup2FsFactory, CgroupV1FsFactory, DevTmpFsFactory, ProcFsFactory, SysFsFactory,
+    block_root_for_source,
 };
 use alloc::vec;
 use lazy_static::lazy_static;
 
+struct Ext4MountFactory;
+
+impl VfsFileSystemFactory for Ext4MountFactory {
+    fn create(&self, context: &VfsMountContext) -> VfsResult<Arc<dyn VfsFileSystem>> {
+        let source = context.source.as_deref().ok_or(VfsError::Invalid)?;
+        let root = block_root_for_source(source).ok_or(VfsError::NoDevice)?;
+        Ok(Ext4Vfs::new(root))
+    }
+
+    fn requires_device(&self) -> bool {
+        true
+    }
+}
+
+struct TmpFsMountFactory;
+
+impl VfsFileSystemFactory for TmpFsMountFactory {
+    fn create(&self, context: &VfsMountContext) -> VfsResult<Arc<dyn VfsFileSystem>> {
+        let memory_bytes =
+            crate::config::phys_mem_end().saturating_sub(crate::config::phys_mem_start());
+        TmpFs::new(memory_bytes, &context.data)
+            .map(|filesystem| filesystem as Arc<dyn VfsFileSystem>)
+    }
+}
+
 lazy_static! {
-    pub(crate) static ref DEVICE_MOUNT_SOURCES: Mutex<BTreeMap<String, String>> =
-        Mutex::new(BTreeMap::new());
-    pub(crate) static ref TMPFS_REATTACH_SOURCES: Mutex<BTreeMap<String, String>> =
-        Mutex::new(BTreeMap::new());
+    static ref VFS_FILESYSTEM_REGISTRY: VfsFileSystemRegistry = {
+        let registry = VfsFileSystemRegistry::default();
+        registry
+            .register("ext4", Arc::new(Ext4MountFactory))
+            .expect("register ext4 VFS factory");
+        registry
+            .register("tmpfs", Arc::new(TmpFsMountFactory))
+            .expect("register tmpfs VFS factory");
+        registry
+            .register("proc", Arc::new(ProcFsFactory))
+            .expect("register procfs VFS factory");
+        registry
+            .register("sysfs", Arc::new(SysFsFactory))
+            .expect("register sysfs VFS factory");
+        registry
+            .register("devtmpfs", Arc::new(DevTmpFsFactory))
+            .expect("register devtmpfs VFS factory");
+        registry
+            .register("cgroup2", Arc::new(Cgroup2FsFactory))
+            .expect("register cgroup2 VFS factory");
+        registry
+            .register("cgroup", Arc::new(CgroupV1FsFactory))
+            .expect("register cgroup VFS factory");
+        registry
+    };
+}
+
+pub(crate) fn create_registered_vfs_filesystem(
+    fs_type: &str,
+    source: Option<&str>,
+    data: &str,
+    pid_namespace_id: u64,
+    cgroup_namespace_root: &str,
+) -> Result<Arc<dyn VfsFileSystem>, isize> {
+    VFS_FILESYSTEM_REGISTRY
+        .create(
+            fs_type,
+            &VfsMountContext {
+                source: source.map(String::from),
+                data: String::from(data),
+                pid_namespace_id: Some(pid_namespace_id),
+                cgroup_namespace_root: Some(String::from(cgroup_namespace_root)),
+            },
+        )
+        .map_err(map_vfs_error)
+}
+
+/// Render the registered filesystem types using Linux `/proc/filesystems`
+/// syntax.  Device-less filesystems carry the `nodev` marker; ext4 is backed
+/// by a block device and therefore has an empty first column.
+pub(crate) fn proc_filesystems_snapshot() -> String {
+    let mut output = String::new();
+    for (filesystem_type, requires_device) in VFS_FILESYSTEM_REGISTRY.filesystem_types() {
+        if requires_device {
+            output.push('\t');
+        } else {
+            output.push_str("nodev\t");
+        }
+        output.push_str(&filesystem_type);
+        output.push('\n');
+    }
+    output
 }
 
 pub(crate) fn mount_flags_to_proc_opts(flags: usize) -> String {
@@ -108,12 +201,6 @@ pub(crate) fn mount_flags_for_abs(abs: &str) -> usize {
     let state = current_mount_namespace();
     let state = state.lock();
     state.mount_flags_for_path(abs)
-}
-
-pub(crate) fn translate_mount_abs(abs: &str) -> String {
-    let state = current_mount_namespace();
-    let state = state.lock();
-    state.translate_mount_abs(abs)
 }
 
 pub(crate) fn with_mount_namespace_mut<R>(
@@ -421,8 +508,7 @@ pub(crate) fn note_mount_access(abs: &str) {
 }
 
 pub(crate) fn current_cwd_path() -> String {
-    let process = current_process();
-    process.borrow_mut().cwd.clone()
+    current_process().fs_struct().cwd_display()
 }
 
 pub(crate) fn logical_path_for_inode(inode: &Arc<ext4_fs::Inode>) -> Option<String> {
@@ -439,18 +525,27 @@ pub(crate) fn logical_path_for_open_fd(
     file: &Arc<dyn File + Send + Sync>,
     cwd_fallback: &str,
 ) -> String {
+    if let Some(path) = file.logical_path_hint() {
+        return String::from(path);
+    }
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         return String::from(pdir.path());
+    }
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        return String::from(vfs_file.logical_path());
     }
     crate::fs::proc_readlink(&proc_self_fd_path(fd)).unwrap_or_else(|| String::from(cwd_fallback))
 }
 
 pub(crate) fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Option<String> {
+    if let Some(path) = file.logical_path_hint() {
+        return Some(String::from(path));
+    }
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         return Some(String::from(pdir.path()));
     }
-    if let Some(path) = cgroup_logical_path_for_file(file) {
-        return Some(path);
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        return Some(String::from(vfs_file.logical_path()));
     }
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         return match pf.kind_tag() {
@@ -463,34 +558,19 @@ pub(crate) fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Opt
     if file.as_any().downcast_ref::<RtcFile>().is_some() {
         return Some(String::from("/dev/misc/rtc"));
     }
-    if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
-        return Some(String::from("/dev/shm"));
-    }
     let os_inode = file.as_any().downcast_ref::<OSInode>()?;
     inode_raw_logical_path(&os_inode.ext4_inode())
 }
 
-pub(crate) fn pseudo_abs_for_ext4_dirfd(base: &Arc<ext4_fs::Inode>, path: &str) -> Option<String> {
-    let logical_base = logical_path_for_inode(base)?;
-    let abs = normalize_path(&logical_base, path);
-    open_pseudo(&abs).map(|_| abs)
-}
-
 pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
     let top_record = mount_record_for_target(target);
+    let target_object_mount_id = resolve_object_vfs_absolute(target)
+        .ok()
+        .map(|path| path.mount().id());
     let self_bind_root = top_record
         .as_ref()
         .map(|record| record.source == target)
         .unwrap_or(false);
-    if let Some(record) = top_record.as_ref() {
-        let ns = current_mount_namespace();
-        let state = ns.lock();
-        if state.mounts().iter().any(|child| {
-            child.stack_seq != record.stack_seq && path_strictly_under_mount(&child.target, target)
-        }) {
-            return true;
-        }
-    }
     let current_ns_id = current_process().mount_namespace_id();
     let processes = {
         let map = PID2PCB.lock();
@@ -498,10 +578,9 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
     };
     let mut seen_tables = BTreeSet::new();
     for process in processes {
-        let (cwd, root, is_zombie, namespace, files) = match process.try_borrow_mut() {
+        let (fs, is_zombie, namespace, files) = match process.try_borrow_mut() {
             Some(inner) => (
-                inner.cwd.clone(),
-                inner.root.clone(),
+                Arc::clone(&inner.fs),
                 inner.is_zombie,
                 Arc::clone(&inner.mnt_ns),
                 Arc::clone(&inner.files),
@@ -514,8 +593,19 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
         if mount_namespace_id(&namespace) != current_ns_id {
             continue;
         }
-        let cwd_busy = path_under_mount(&cwd, target) && !(self_bind_root && cwd == target);
-        let root_busy = path_under_mount(&root, target) && !(self_bind_root && root == target);
+        let (cwd_busy, root_busy) = if let Some(target_mount_id) = target_object_mount_id {
+            (
+                fs.cwd().path().mount().id() == target_mount_id,
+                fs.root().path().mount().id() == target_mount_id,
+            )
+        } else {
+            let cwd = fs.cwd_display();
+            let root = fs.root_display();
+            (
+                path_under_mount(&cwd, target) && !(self_bind_root && cwd == target),
+                path_under_mount(&root, target) && !(self_bind_root && root == target),
+            )
+        };
         if cwd_busy || root_busy {
             return true;
         }
@@ -523,25 +613,22 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
             continue;
         }
         let files_guard = files.lock();
-        if let Some(record) = top_record.as_ref() {
-            for (fd, mount_ref) in files_guard.iter_mount_refs_snapshot() {
-                if mount_ref.event_id != record.event_id
-                    || mount_ref.stack_seq != record.stack_seq
-                    || mount_ref.target != record.target
-                {
-                    continue;
-                }
-                if writable_only && !files_guard.get_file(fd).is_some_and(|file| file.writable()) {
-                    continue;
-                }
-                return true;
-            }
-        }
-        for (fd, file) in files_guard.iter_files_snapshot() {
-            if files_guard.get_mount_ref(fd).is_some() {
+        for (_fd, file) in files_guard.iter_files_snapshot() {
+            if writable_only && !file.writable() {
                 continue;
             }
-            if writable_only && !file.writable() {
+            if let Some(target_mount_id) = target_object_mount_id {
+                if file
+                    .object_path()
+                    .is_some_and(|path| path.mount().id() == target_mount_id)
+                {
+                    return true;
+                }
+                // Object mounts never infer ownership from a display string.
+                // Path-backed files carry `f_path`; anonymous/control files do
+                // not pin any mount.  Falling through for a console spelling
+                // such as `/dev/tty` would falsely keep an overmount of `/`
+                // busy even though that description belongs to the lower tree.
                 continue;
             }
             let Some(path) = mount_file_logical_path(&file) else {
@@ -555,99 +642,315 @@ pub(crate) fn mount_is_busy(target: &str, writable_only: bool) -> bool {
     false
 }
 
-pub(crate) fn ensure_mount_source_root() -> Result<Arc<ext4_fs::Inode>, isize> {
-    let root = crate::fs::root_inode_for_path("/");
-    let root_lock = ext4_inode_lock(&root);
-    let _root_guard = root_lock.write();
-    if let Some(dir) = root.find(".ltp_mounts") {
-        if dir.is_dir() {
-            return Ok(dir);
-        }
-        return Err(err(SyscallError::ENOTDIR));
-    }
-    match root.create_dir(".ltp_mounts") {
-        Ok(dir) => {
-            clear_ext4_path_cache();
-            dir.set_uid_gid(0, 0);
-            dir.set_mode(0o700);
-            Ok(dir)
-        }
-        Err(e) => Err(ext4_err_to_errno(e)),
-    }
+fn resolve_object_vfs_user_path(path: &str) -> Result<Option<VfsPath>, isize> {
+    let at = resolve_at_path(AT_FDCWD, path)?;
+    let (uid, gid) = current_fsuid_gid();
+    resolve_at_vfs_path(&at, uid, gid, true)
 }
 
-pub(crate) fn source_for_device_mount(key: &str) -> Result<String, isize> {
-    let fresh_instance = key.starts_with("tmpfs:");
-    if fresh_instance {
-        if let Some(path) = TMPFS_REATTACH_SOURCES.lock().remove(key) {
-            return Ok(path);
-        }
-    } else if let Some(path) = DEVICE_MOUNT_SOURCES.lock().get(key).cloned() {
-        return Ok(path);
+fn resolve_object_vfs_absolute(path: &str) -> Result<VfsPath, isize> {
+    let namespace = current_mount_namespace().lock().vfs_namespace();
+    let root = namespace.root_path();
+    PathWalker::new(namespace)
+        .walk(
+            &root,
+            &root,
+            path,
+            LookupFlags(LookupFlags::FOLLOW_FINAL),
+            VfsCredentials::default(),
+        )
+        .map_err(map_vfs_error)
+}
+
+/// Attach a non-recursive bind directly to the mount graph.
+///
+/// `Ok(false)` means one side still belongs to a transitional backend and the
+/// caller must use the legacy record implementation.  A graph mutation is
+/// always completed before its presentation record opts into object lookup.
+fn try_object_vfs_bind_mount(
+    target_user: &str,
+    target_abs: &str,
+    source_user: &str,
+    source_abs: &str,
+    fs_type: &str,
+    flags: usize,
+    recursive: bool,
+) -> Result<bool, isize> {
+    let Some(source) = resolve_object_vfs_user_path(source_user)? else {
+        return Ok(false);
+    };
+    let Some(target) = resolve_object_vfs_user_path(target_user)? else {
+        return Ok(false);
+    };
+    let source_is_dir =
+        source.node().metadata().map_err(map_vfs_error)?.kind == VfsNodeKind::Directory;
+    let target_is_dir =
+        target.node().metadata().map_err(map_vfs_error)?.kind == VfsNodeKind::Directory;
+    if source_is_dir != target_is_dir {
+        return Err(err(SyscallError::ENOTDIR));
     }
-    let root = ensure_mount_source_root()?;
-    loop {
-        let id = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = alloc::format!("mnt.{}", id);
-        let root_lock = ext4_inode_lock(&root);
-        let _root_guard = root_lock.write();
-        if root.find(&name).is_some() {
-            continue;
+    // Bind mounts clone the source mount's per-mount restrictions.  Any
+    // explicitly supplied mount-local bits are additive here; a later
+    // `MS_REMOUNT|MS_BIND` can independently change the clone.
+    let flags = (source.mount().flags().0 & mount_flag_mask()) | (flags & mount_flag_mask());
+
+    let namespace = current_mount_namespace().lock().vfs_namespace();
+    if recursive {
+        namespace
+            .bind_recursive(&target, &source, VfsMountFlags(flags))
+            .map_err(map_vfs_error)?;
+    } else {
+        namespace
+            .bind(&target, &source, VfsMountFlags(flags))
+            .map_err(map_vfs_error)?;
+    }
+    create_object_bind_mount_record_with_propagation(
+        target_abs, source_abs, source_abs, fs_type, flags, recursive,
+    );
+    Ok(true)
+}
+
+/// Instantiate a registered filesystem and attach it directly to the mount
+/// graph.  `record_source` is retained only by the transitional mountinfo
+/// view; pathname lookup is rooted at the filesystem's dentry instead.
+///
+/// Linux's legacy `mount(2)` path creates an `fs_context`, parses the
+/// monolithic data string in the selected filesystem and then grafts the
+/// resulting mount (`do_new_mount()` in `fs/namespace.c`).  Keep that same
+/// ordering here so filesystem-specific options never select a hidden ext4
+/// backing directory.
+fn try_object_vfs_registered_mount(
+    target_user: &str,
+    target_abs: &str,
+    fs_type: &str,
+    source_display: &str,
+    record_source: &str,
+    data: &str,
+    flags: usize,
+) -> Result<bool, isize> {
+    let Some(target) = resolve_object_vfs_user_path(target_user)? else {
+        return Ok(false);
+    };
+    if target.node().metadata().map_err(map_vfs_error)?.kind != VfsNodeKind::Directory {
+        return Err(err(SyscallError::ENOTDIR));
+    }
+    let pid_namespace_id = current_process().pid_namespace_id() as u64;
+    let cgroup_namespace_root = current_process().cgroup_namespace_root();
+    let filesystem = create_registered_vfs_filesystem(
+        fs_type,
+        Some(source_display),
+        data,
+        pid_namespace_id,
+        &cgroup_namespace_root,
+    )?;
+    let namespace = current_mount_namespace().lock().vfs_namespace();
+    namespace
+        .mount_with_source(
+            &target,
+            filesystem,
+            VfsMountFlags(flags),
+            String::from(source_display),
+        )
+        .map_err(map_vfs_error)?;
+    create_object_mount_record_with_propagation(
+        target_abs,
+        record_source,
+        source_display,
+        fs_type,
+        flags,
+    );
+    Ok(true)
+}
+
+fn try_object_vfs_ext4_mount(
+    target_user: &str,
+    target_abs: &str,
+    source_display: &str,
+    legacy_source: &str,
+    flags: usize,
+) -> Result<bool, isize> {
+    try_object_vfs_registered_mount(
+        target_user,
+        target_abs,
+        "ext4",
+        source_display,
+        legacy_source,
+        "",
+        flags,
+    )
+}
+
+/// Attach a detached object created by `fsmount()` or
+/// `open_tree(OPEN_TREE_CLONE)` to the authoritative graph.  Linux represents
+/// both as anonymous mount trees and `move_mount()` performs the single
+/// namespace attachment; this compact model preserves that lifetime and
+/// one-shot transition without manufacturing a pathname for the source.
+pub(crate) fn attach_or_move_mount_handle(
+    target: &VfsPath,
+    target_abs: &str,
+    state: &mut MountHandleState,
+) -> Result<(), isize> {
+    let object = &state.object;
+    let live_path = matches!(object, MountHandleObject::Path { .. });
+    if state.attached && !live_path {
+        return Err(err(SyscallError::EBUSY));
+    }
+
+    let target_kind = target.node().metadata().map_err(map_vfs_error)?.kind;
+    let source_kind = match object {
+        MountHandleObject::Filesystem(filesystem) => {
+            filesystem
+                .root_node()
+                .metadata()
+                .map_err(map_vfs_error)?
+                .kind
         }
-        match root.create_dir(&name) {
-            Ok(dir) => {
-                clear_ext4_path_cache();
-                dir.set_uid_gid(0, 0);
-                if fresh_instance {
-                    // Linux tmpfs defaults its root to 1777, so unprivileged
-                    // tasks can traverse a freshly mounted tmpfs instance.
-                    dir.set_mode(0o1777);
-                } else {
-                    dir.set_mode(0o755);
-                }
-                let path = alloc::format!("/.ltp_mounts/{}", name);
-                if !fresh_instance {
-                    DEVICE_MOUNT_SOURCES
-                        .lock()
-                        .insert(String::from(key), path.clone());
-                }
-                return Ok(path);
+        MountHandleObject::Bind { source, .. } => {
+            source.node().metadata().map_err(map_vfs_error)?.kind
+        }
+        MountHandleObject::Path { source, .. } => {
+            source.node().metadata().map_err(map_vfs_error)?.kind
+        }
+    };
+    if (source_kind == VfsNodeKind::Directory) != (target_kind == VfsNodeKind::Directory) {
+        return Err(err(SyscallError::EINVAL));
+    }
+
+    let namespace = current_mount_namespace().lock().vfs_namespace();
+    let flags = state.flags;
+    let record_source = state.source.clone();
+    let source_display = state.source_display.clone();
+    let fs_type = state.fs_type.clone();
+    match &mut state.object {
+        MountHandleObject::Filesystem(filesystem) => {
+            namespace
+                .mount_with_source(
+                    target,
+                    Arc::clone(filesystem),
+                    VfsMountFlags(flags),
+                    source_display.clone(),
+                )
+                .map_err(map_vfs_error)?;
+            create_object_mount_record_with_propagation(
+                target_abs,
+                &record_source,
+                &source_display,
+                &fs_type,
+                flags,
+            );
+        }
+        MountHandleObject::Bind {
+            source,
+            logical_source,
+            ..
+        } => {
+            let bind_flags =
+                (source.mount().flags().0 & mount_flag_mask()) | (flags & mount_flag_mask());
+            namespace
+                .bind(target, source, VfsMountFlags(bind_flags))
+                .map_err(map_vfs_error)?;
+            create_object_bind_mount_record_with_propagation(
+                target_abs,
+                &record_source,
+                logical_source,
+                &fs_type,
+                bind_flags,
+                false,
+            );
+        }
+        MountHandleObject::Path {
+            source,
+            logical_source,
+            ..
+        } => {
+            let old_target = logical_source.clone();
+            let old_record =
+                mount_record_for_target(&old_target).ok_or_else(|| err(SyscallError::EINVAL))?;
+            if path_under_mount(target_abs, &old_target) || mount_parent_is_shared(&old_target) {
+                return Err(err(SyscallError::EINVAL));
             }
-            Err(e) => return Err(ext4_err_to_errno(e)),
+            let destination =
+                mount_lookup_for_abs(target_abs).ok_or_else(|| err(SyscallError::EINVAL))?;
+            if destination.peer_group_id.is_some() {
+                // The graph does not yet clone moved subtrees to every shared
+                // peer.  Reject this Linux propagation corner instead of
+                // letting the graph and mountinfo view diverge.
+                return Err(err(SyscallError::EINVAL));
+            }
+            let stack_on_existing_target = mount_record_for_target(target_abs).is_some();
+            if source
+                .mount()
+                .owner_namespace()
+                .as_ref()
+                .is_none_or(|owner| !Arc::ptr_eq(owner, &namespace))
+            {
+                return Err(err(SyscallError::EXDEV));
+            }
+            namespace
+                .move_mount(source, target)
+                .map_err(map_vfs_error)?;
+            if !move_mount_subtree_with_propagation(
+                &old_target,
+                target_abs,
+                Some(destination),
+                stack_on_existing_target,
+            ) {
+                if let Ok(old_destination) = resolve_object_vfs_absolute(&old_target) {
+                    let _ = namespace.move_mount(source, &old_destination);
+                }
+                return Err(err(SyscallError::EINVAL));
+            }
+            sync_rofs_mount_flag(&old_target, 0);
+            sync_rofs_mount_flag(target_abs, old_record.flags);
+            *logical_source = String::from(target_abs);
         }
     }
+    if !live_path {
+        state.attached = true;
+    }
+    Ok(())
+}
+
+/// Transactionally apply mount flags to both the object graph and the
+/// transitional presentation record.  `fspick()+fsconfig(RECONFIGURE)` and
+/// legacy `MS_REMOUNT` share this path so neither API can split the two views.
+pub(crate) fn reconfigure_mount_flags(target: &str, flags: usize) -> Result<(), isize> {
+    let Some(record) = mount_record_for_target(target) else {
+        return Err(err(SyscallError::EINVAL));
+    };
+    let new_flags = flags & mount_flag_mask();
+    if (new_flags & MS_RDONLY) != 0 && mount_is_busy(target, true) {
+        return Err(err(SyscallError::EBUSY));
+    }
+    if record.source_display == "/dev/root"
+        && (new_flags & MS_RDONLY) == 0
+        && pseudo_block_is_read_only()
+    {
+        return Err(err(SyscallError::EACCES));
+    }
+
+    let path = resolve_object_vfs_absolute(target)?;
+    let namespace = current_mount_namespace().lock().vfs_namespace();
+    namespace
+        .remount(&path, VfsMountFlags(new_flags))
+        .map_err(map_vfs_error)?;
+    if !update_mount_record_flags(target, new_flags) {
+        let _ = namespace.remount(&path, VfsMountFlags(record.flags));
+        return Err(err(SyscallError::EINVAL));
+    }
+    sync_rofs_mount_flag(target, new_flags);
+    Ok(())
 }
 
 pub(crate) fn target_dir_exists(abs: &str) -> Result<(), isize> {
-    if let Some(node) = open_pseudo(abs) {
-        if node.as_any().downcast_ref::<PseudoDir>().is_some() {
-            return Ok(());
-        }
-        return Err(err(SyscallError::ENOTDIR));
+    // Linux validates a mountpoint through the resolved `struct path`.
+    // Presentation source strings cannot represent overmount and tmpfs roots.
+    let target = resolve_object_vfs_absolute(abs)?;
+    if target.node().metadata().map_err(map_vfs_error)?.kind == VfsNodeKind::Directory {
+        Ok(())
+    } else {
+        Err(err(SyscallError::ENOTDIR))
     }
-    let translated = translate_mount_abs(abs);
-    let inode = find_path_in_roots(&translated).ok_or_else(|| err(SyscallError::ENOENT))?;
-    if !with_ext4_inode_read(&inode, || inode.is_dir()) {
-        return Err(err(SyscallError::ENOTDIR));
-    }
-    Ok(())
-}
-
-fn bind_target_matches_source_kind(abs: &str, source_is_dir: bool) -> Result<(), isize> {
-    if let Some(node) = open_pseudo(abs) {
-        let target_is_dir = node.as_any().downcast_ref::<PseudoDir>().is_some();
-        return if target_is_dir == source_is_dir {
-            Ok(())
-        } else {
-            Err(err(SyscallError::ENOTDIR))
-        };
-    }
-    let translated = translate_mount_abs(abs);
-    let inode = find_path_in_roots(&translated).ok_or_else(|| err(SyscallError::ENOENT))?;
-    if with_ext4_inode_read(&inode, || inode.is_dir()) != source_is_dir {
-        return Err(err(SyscallError::ENOTDIR));
-    }
-    Ok(())
 }
 
 pub(crate) fn collect_live_mount_namespaces() -> Vec<MountNamespace> {
@@ -780,19 +1083,18 @@ fn collect_subtree_mount_clones(
     out
 }
 
-fn bind_should_clone_subtree(recursive_bind: bool, source_mount: Option<&MountRecord>) -> bool {
+fn bind_should_clone_subtree(recursive_bind: bool) -> bool {
+    // Linux's __do_loopback() uses clone_mnt() for a plain bind and only
+    // copy_tree() for MS_BIND|MS_REC.
     recursive_bind
-        || source_mount
-            .is_some_and(|mount| mount.peer_group_id.is_some() || mount.master_group_id.is_some())
 }
 
 fn collect_bind_subtree_mount_clones(
     source_display: &str,
     excluded_source_prefixes: &[String],
     recursive_bind: bool,
-    source_mount: Option<&MountRecord>,
 ) -> Vec<MountSubtreeClone> {
-    if bind_should_clone_subtree(recursive_bind, source_mount) {
+    if bind_should_clone_subtree(recursive_bind) {
         collect_subtree_mount_clones(source_display, excluded_source_prefixes)
     } else {
         Vec::new()
@@ -825,6 +1127,9 @@ fn push_subtree_mount_clones(
                 continue;
             }
             let mut record = item.record.clone();
+            // Recursive object bind has already cloned the corresponding
+            // mount identity in VfsMountNamespace.  These records are only a
+            // mountinfo/proc presentation of that authoritative graph.
             record.target = clone_target;
             record.source_display = if path_under_mount(&record.source_display, source_display) {
                 let display_suffix = mount_target_suffix(source_display, &record.source_display);
@@ -1066,7 +1371,7 @@ fn clone_subtree_mount_records_to_destination(
     );
 }
 
-pub(crate) fn create_mount_record_with_propagation(
+fn create_object_mount_record_with_propagation(
     target: &str,
     source: &str,
     source_display: &str,
@@ -1152,7 +1457,25 @@ fn create_mount_record_with_backend(
     sync_mount_record_rofs(target);
 }
 
-pub(crate) fn create_bind_mount_record_with_propagation(
+fn create_object_bind_mount_record_with_propagation(
+    target: &str,
+    source: &str,
+    source_display: &str,
+    fs_type: &str,
+    flags: usize,
+    recursive_bind: bool,
+) {
+    create_bind_mount_record_impl(
+        target,
+        source,
+        source_display,
+        fs_type,
+        flags,
+        recursive_bind,
+    );
+}
+
+fn create_bind_mount_record_impl(
     target: &str,
     source: &str,
     source_display: &str,
@@ -1189,12 +1512,8 @@ pub(crate) fn create_bind_mount_record_with_propagation(
         if base.peer_group_id.is_some() {
             let event_id = next_mount_event_id();
             let excluded = bind_subtree_clone_exclusions(target, source_display);
-            let subtree_clones = collect_bind_subtree_mount_clones(
-                source_display,
-                &excluded,
-                recursive_bind,
-                source_mount.as_ref(),
-            );
+            let subtree_clones =
+                collect_bind_subtree_mount_clones(source_display, &excluded, recursive_bind);
             let event_peer_group = source_peer_group.unwrap_or_else(next_mount_peer_group_id);
             let origin_master_group = source_master_group;
             let mut created_any = false;
@@ -1246,12 +1565,8 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     if let Some(peer_group) = source_peer_group {
         let event_id = next_mount_event_id();
         let excluded = bind_subtree_clone_exclusions(target, source_display);
-        let subtree_clones = collect_bind_subtree_mount_clones(
-            source_display,
-            &excluded,
-            recursive_bind,
-            source_mount.as_ref(),
-        );
+        let subtree_clones =
+            collect_bind_subtree_mount_clones(source_display, &excluded, recursive_bind);
         push_mount_record(
             target,
             source,
@@ -1272,12 +1587,8 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     if source_master_group.is_some() {
         let event_id = next_mount_event_id();
         let excluded = bind_subtree_clone_exclusions(target, source_display);
-        let subtree_clones = collect_bind_subtree_mount_clones(
-            source_display,
-            &excluded,
-            recursive_bind,
-            source_mount.as_ref(),
-        );
+        let subtree_clones =
+            collect_bind_subtree_mount_clones(source_display, &excluded, recursive_bind);
         push_mount_record(
             target,
             source,
@@ -1297,12 +1608,8 @@ pub(crate) fn create_bind_mount_record_with_propagation(
 
     let event_id = next_mount_event_id();
     let excluded = bind_subtree_clone_exclusions(target, source_display);
-    let subtree_clones = collect_bind_subtree_mount_clones(
-        source_display,
-        &excluded,
-        recursive_bind,
-        source_mount.as_ref(),
-    );
+    let subtree_clones =
+        collect_bind_subtree_mount_clones(source_display, &excluded, recursive_bind);
     push_mount_record(
         target,
         source,
@@ -1317,131 +1624,6 @@ pub(crate) fn create_bind_mount_record_with_propagation(
     );
     sync_mount_record_rofs(target);
     clone_subtree_mount_records_for_bind(target, source_display, event_id, &subtree_clones);
-}
-
-fn downstream_unmount_peer_groups(
-    start_peer_group: usize,
-    namespaces: &[MountNamespace],
-) -> BTreeSet<usize> {
-    let mut groups = BTreeSet::new();
-    let mut pending = Vec::new();
-    pending.push(start_peer_group);
-    while let Some(group) = pending.pop() {
-        if !groups.insert(group) {
-            continue;
-        }
-        for ns in namespaces {
-            for top in top_mounts_for_namespace(ns) {
-                if top.master_group_id != Some(group) {
-                    continue;
-                }
-                if let Some(child_peer_group) = top.peer_group_id {
-                    pending.push(child_peer_group);
-                }
-            }
-        }
-    }
-    groups
-}
-
-fn mount_record_in_unmount_domain(record: &MountRecord, peer_groups: &BTreeSet<usize>) -> bool {
-    if record
-        .peer_group_id
-        .is_some_and(|peer_group| peer_groups.contains(&peer_group))
-    {
-        return true;
-    }
-    record.peer_group_id.is_none()
-        && record
-            .master_group_id
-            .is_some_and(|master_group| peer_groups.contains(&master_group))
-}
-
-pub(crate) fn remove_top_mount_records_by_event(
-    event_id: usize,
-    peer_group_id: usize,
-    origin_target: &str,
-    origin_source: &str,
-    origin_source_display: &str,
-) -> usize {
-    let namespaces = collect_live_mount_namespaces();
-    let peer_groups = downstream_unmount_peer_groups(peer_group_id, &namespaces);
-    let mut removed = 0usize;
-    for ns in namespaces {
-        let mut affected_targets: BTreeMap<String, usize> = BTreeMap::new();
-        let removed_in_ns = with_mount_namespace_mut(&ns, |state| {
-            let mut remove_keys = BTreeSet::new();
-            loop {
-                let before = remove_keys.len();
-                for record in state.mounts() {
-                    if remove_keys.contains(&(record.target.clone(), record.stack_seq)) {
-                        continue;
-                    }
-                    let covered = state.mounts().iter().any(|other| {
-                        other.target == record.target
-                            && other.stack_seq > record.stack_seq
-                            && !remove_keys.contains(&(other.target.clone(), other.stack_seq))
-                    });
-                    let same_event_top = record.event_id == event_id && !covered;
-                    let rewritten_clone_source = origin_source_display == origin_target
-                        && origin_source != origin_target
-                        && record.source == origin_source;
-                    let covered_peer = record
-                        .peer_group_id
-                        .is_some_and(|peer_group| peer_groups.contains(&peer_group))
-                        && record.target != origin_target
-                        && !path_under_mount(origin_target, &record.target)
-                        && (record.source_display == origin_source_display
-                            || rewritten_clone_source)
-                        && covered;
-                    if !(same_event_top && mount_record_in_unmount_domain(record, &peer_groups))
-                        && !covered_peer
-                    {
-                        continue;
-                    }
-                    affected_targets
-                        .entry(record.target.clone())
-                        .and_modify(|stack_seq| *stack_seq = (*stack_seq).max(record.stack_seq))
-                        .or_insert(record.stack_seq);
-                    remove_keys.insert((record.target.clone(), record.stack_seq));
-                }
-                if remove_keys.len() == before {
-                    break;
-                }
-            }
-            if remove_keys.is_empty() {
-                return 0;
-            }
-            for record in state.mounts() {
-                if remove_keys.contains(&(record.target.clone(), record.stack_seq)) {
-                    continue;
-                }
-                if affected_targets.iter().any(|(target, stack_seq)| {
-                    record.stack_seq > *stack_seq
-                        && path_strictly_under_mount(&record.target, target)
-                }) {
-                    affected_targets.insert(record.target.clone(), record.stack_seq);
-                    remove_keys.insert((record.target.clone(), record.stack_seq));
-                }
-            }
-            let before = state.mounts().len();
-            state
-                .mounts_mut()
-                .retain(|record| !remove_keys.contains(&(record.target.clone(), record.stack_seq)));
-            for target in affected_targets.keys() {
-                state.remove_bound_file(target);
-            }
-            before.saturating_sub(state.mounts().len())
-        });
-        if removed_in_ns == 0 {
-            continue;
-        }
-        for target in affected_targets.keys() {
-            sync_mount_record_rofs_in(&ns, &target);
-        }
-        removed = removed.saturating_add(removed_in_ns);
-    }
-    removed
 }
 
 pub(crate) fn remove_mount_record_by_stack(
@@ -1476,11 +1658,6 @@ pub(crate) fn remove_mount_record_by_stack(
         state
             .mounts_mut()
             .retain(|record| !remove_keys.contains(&(record.target.clone(), record.stack_seq)));
-        if before != state.mounts().len() {
-            for target in affected_targets.keys() {
-                state.remove_bound_file(target);
-            }
-        }
         before.saturating_sub(state.mounts().len())
     });
     if removed != 0 {
@@ -1489,6 +1666,80 @@ pub(crate) fn remove_mount_record_by_stack(
         }
     }
     removed
+}
+
+/// Remove mountinfo records for the exact object-graph targets detached by an
+/// unmount propagation event.
+///
+/// Linux derives propagated unmounts from the parent mounts and the covered
+/// mountpoint, not from the peer group of the child being removed.  The VFS
+/// graph has already made that decision; compatibility records must mirror its
+/// result instead of independently guessing from `record.peer_group_id`.
+fn remove_object_mount_records_by_targets(targets: &[(u64, String)]) -> usize {
+    let current = current_mount_namespace();
+    let mut namespaces = BTreeMap::new();
+    let current_vfs_id = current.lock().vfs_namespace().id();
+    namespaces.insert(current_vfs_id, current);
+    for namespace in collect_live_mount_namespaces() {
+        let vfs_id = namespace.lock().vfs_namespace().id();
+        namespaces.entry(vfs_id).or_insert(namespace);
+    }
+
+    let mut removed = 0usize;
+    for (namespace_id, target) in targets {
+        let Some(namespace) = namespaces.get(namespace_id) else {
+            continue;
+        };
+        let Some(record) = mount_record_for_target_in(namespace, target) else {
+            continue;
+        };
+        removed = removed.saturating_add(remove_mount_record_by_stack(
+            namespace,
+            &record.target,
+            record.stack_seq,
+        ));
+    }
+    removed
+}
+
+fn object_vfs_propagation(
+    record: &MountRecord,
+    requested: MountPropagation,
+    current: VfsMountPropagation,
+) -> VfsMountPropagation {
+    match requested {
+        MountPropagation::Private => VfsMountPropagation::Private,
+        MountPropagation::Unbindable => VfsMountPropagation::Unbindable,
+        MountPropagation::Shared => match current {
+            // Linux's set_mnt_shared() keeps an existing peer group.
+            shared @ VfsMountPropagation::Shared { .. } => shared,
+            _ => VfsMountPropagation::Shared {
+                peer_group: record.peer_group_id.unwrap_or(record.event_id) as u64,
+            },
+        },
+        MountPropagation::Slave => {
+            let master_group = match current {
+                VfsMountPropagation::Shared { peer_group } => Some(peer_group),
+                VfsMountPropagation::Slave { master_group } => Some(master_group),
+                _ => record.master_group_id.map(|group| group as u64),
+            };
+            master_group
+                .map(|master_group| VfsMountPropagation::Slave { master_group })
+                .unwrap_or(VfsMountPropagation::Private)
+        }
+    }
+}
+
+fn restore_mount_records(ns: &MountNamespace, originals: &[MountRecord]) {
+    with_mount_namespace_mut(ns, |state| {
+        for original in originals {
+            if let Some(record) = state.mounts_mut().iter_mut().find(|record| {
+                record.target == original.target && record.stack_seq == original.stack_seq
+            }) {
+                *record = original.clone();
+            }
+        }
+    });
 }
 
 pub(crate) fn apply_mount_propagation_change(target: &str, flags: usize) -> Result<(), isize> {
@@ -1505,8 +1756,8 @@ pub(crate) fn apply_mount_propagation_change(target: &str, flags: usize) -> Resu
         _ => return Err(err(SyscallError::EINVAL)),
     };
     let recursive = (flags & MS_REC) != 0;
-    let mut changed = false;
-    with_mount_namespace_mut(&current_mount_namespace(), |state| {
+    let mount_namespace = current_mount_namespace();
+    let (originals, updated) = with_mount_namespace_mut(&mount_namespace, |state| {
         if target == "/" {
             ensure_root_mount_record(state);
         }
@@ -1520,10 +1771,13 @@ pub(crate) fn apply_mount_propagation_change(target: &str, flags: usize) -> Resu
         } else if let Some(record) = state.mount_record_for_target(target) {
             apply_keys.insert((record.target, record.stack_seq));
         }
+        let mut originals = Vec::new();
+        let mut updated = Vec::new();
         for record in state.mounts_mut().iter_mut() {
             if !apply_keys.contains(&(record.target.clone(), record.stack_seq)) {
                 continue;
             }
+            originals.push(record.clone());
             match propagation {
                 MountPropagation::Shared => {
                     let peer_group = record
@@ -1549,11 +1803,42 @@ pub(crate) fn apply_mount_propagation_change(target: &str, flags: usize) -> Resu
                     record.master_group_id = None;
                 }
             }
-            changed = true;
+            updated.push(record.clone());
         }
+        (originals, updated)
     });
-    if !changed {
+    if updated.is_empty() {
         target_dir_exists(target)?;
+        return Ok(());
+    }
+
+    let object_namespace = mount_namespace.lock().vfs_namespace();
+    let object_root = object_namespace.root_path();
+    let mut graph_changes = Vec::new();
+    for record in &updated {
+        let path = match PathWalker::new(Arc::clone(&object_namespace)).walk(
+            &object_root,
+            &object_root,
+            &record.target,
+            LookupFlags(LookupFlags::FOLLOW_FINAL),
+            VfsCredentials::default(),
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                restore_mount_records(&mount_namespace, &originals);
+                return Err(map_vfs_error(error));
+            }
+        };
+        let previous = path.mount().propagation();
+        let desired = object_vfs_propagation(record, propagation, previous);
+        if let Err(error) = object_namespace.set_propagation(&path, desired) {
+            for (path, previous) in graph_changes.into_iter().rev() {
+                let _ = object_namespace.set_propagation(&path, previous);
+            }
+            restore_mount_records(&mount_namespace, &originals);
+            return Err(map_vfs_error(error));
+        }
+        graph_changes.push((path, previous));
     }
     Ok(())
 }
@@ -1626,7 +1911,7 @@ pub(crate) fn syscall_mount_impl(
         return err(SyscallError::ENOENT);
     }
     let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
+    let cwd = process.fs_struct().cwd_display();
     let target = normalize_path(&cwd, &dir);
 
     let propagation_flags = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
@@ -1683,27 +1968,17 @@ pub(crate) fn syscall_mount_impl(
             return err(SyscallError::EINVAL);
         }
 
-        if let Some(source_file) = open_pseudo(&source_abs) {
-            if source_file.as_any().downcast_ref::<PseudoDir>().is_none() {
-                if let Err(e) = bind_target_matches_source_kind(&target, false) {
-                    return e;
-                }
-                let fsname = fstype.as_deref().unwrap_or("none");
-                let base_flags = mount_lookup_for_abs(&source_abs)
-                    .map(|m| m.flags)
-                    .unwrap_or(0);
-                let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
-                create_bind_mount_record_with_propagation(
-                    &target,
-                    &source_abs,
-                    &source_abs,
-                    fsname,
-                    bind_flags,
-                    (flags & MS_REC) != 0,
-                );
-                with_mount_namespace_mut(&current_mount_namespace(), |state| {
-                    state.bind_file(&target, Arc::clone(&source_file));
-                });
+        let fsname = fstype.as_deref().unwrap_or("none");
+        match try_object_vfs_bind_mount(
+            &dir,
+            &target,
+            source_display,
+            &source_abs,
+            fsname,
+            flags,
+            (flags & MS_REC) != 0,
+        ) {
+            Ok(true) => {
                 if (flags & propagation_flags) != 0 {
                     return match apply_mount_propagation_change(
                         &target,
@@ -1715,79 +1990,9 @@ pub(crate) fn syscall_mount_impl(
                 }
                 return 0;
             }
-            if let Err(e) = bind_target_matches_source_kind(&target, true) {
-                return e;
-            }
-            let source_mount = match mount_lookup_for_abs(&source_abs) {
-                Some(mount) if mount.backend.is_pseudo() => mount,
-                _ => return err(SyscallError::EINVAL),
-            };
-            let canonical_source = {
-                let ns = current_mount_namespace();
-                let state = ns.lock();
-                match state.canonical_pseudo_abs(&source_abs) {
-                    Some((_, canonical)) => canonical,
-                    None => return err(SyscallError::EINVAL),
-                }
-            };
-            let base_flags = source_mount.flags;
-            let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
-            create_bind_mount_record_with_propagation(
-                &target,
-                &canonical_source,
-                &source_abs,
-                &source_mount.fs_type,
-                bind_flags,
-                (flags & MS_REC) != 0,
-            );
-            if (flags & propagation_flags) != 0 {
-                return match apply_mount_propagation_change(
-                    &target,
-                    flags & (propagation_flags | MS_REC),
-                ) {
-                    Ok(()) => 0,
-                    Err(e) => e,
-                };
-            }
-            return 0;
+            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Err(e) => return e,
         }
-
-        let source = translate_mount_abs(&source_abs);
-        let source_is_dir = {
-            let Some(source_inode) = find_path_in_roots(&source) else {
-                return err(SyscallError::ENOENT);
-            };
-            with_ext4_inode_read(&source_inode, || source_inode.is_dir())
-        };
-        if let Err(e) = bind_target_matches_source_kind(&target, source_is_dir) {
-            return e;
-        }
-        if !source_is_dir {
-            return err(SyscallError::ENOTDIR);
-        }
-        let fsname = fstype.as_deref().unwrap_or("none");
-        let base_flags = mount_lookup_for_abs(&source_abs)
-            .map(|m| m.flags)
-            .unwrap_or(0);
-        let bind_flags = (base_flags & mount_flag_mask()) | (flags & mount_flag_mask());
-        create_bind_mount_record_with_propagation(
-            &target,
-            &source,
-            &source_abs,
-            fsname,
-            bind_flags,
-            (flags & MS_REC) != 0,
-        );
-        if (flags & propagation_flags) != 0 {
-            return match apply_mount_propagation_change(
-                &target,
-                flags & (propagation_flags | MS_REC),
-            ) {
-                Ok(()) => 0,
-                Err(e) => e,
-            };
-        }
-        return 0;
     }
 
     if let Err(e) = target_dir_exists(&target) {
@@ -1820,12 +2025,40 @@ pub(crate) fn syscall_mount_impl(
             return err(SyscallError::EINVAL);
         }
         let stack_on_existing_target = mount_record_for_target(&target).is_some();
+        let Some(destination_record) = dest_base.as_ref() else {
+            return err(SyscallError::EINVAL);
+        };
+        // Linux propagates a move into a shared destination through
+        // attach_recursive_mnt().  The minimal graph does not clone a moved
+        // subtree yet, so reject that one unsupported case instead of letting
+        // the presentation records diverge from the graph.
+        if destination_record.peer_group_id.is_some() {
+            return err(SyscallError::EINVAL);
+        }
+        let from = match resolve_object_vfs_absolute(&old_target) {
+            Ok(path) => path,
+            Err(e) => return e,
+        };
+        let to = match resolve_object_vfs_user_path(&dir) {
+            Ok(Some(path)) => path,
+            Ok(None) => return err(SyscallError::EINVAL),
+            Err(e) => return e,
+        };
+        let namespace = current_mount_namespace().lock().vfs_namespace();
+        if let Err(error) = namespace.move_mount(&from, &to) {
+            return map_vfs_error(error);
+        }
+        let object_move = (namespace, from);
         if !move_mount_subtree_with_propagation(
             &old_target,
             &target,
             dest_base,
             stack_on_existing_target,
         ) {
+            let (namespace, moving) = object_move;
+            if let Ok(old_destination) = resolve_object_vfs_absolute(&old_target) {
+                let _ = namespace.move_mount(&moving, &old_destination);
+            }
             return err(SyscallError::EINVAL);
         }
         sync_rofs_mount_flag(&old_target, 0);
@@ -1834,22 +2067,10 @@ pub(crate) fn syscall_mount_impl(
     }
 
     if (flags & MS_REMOUNT) != 0 {
-        let Some(record) = mount_record_for_target(&target) else {
-            return err(SyscallError::EINVAL);
+        return match reconfigure_mount_flags(&target, flags) {
+            Ok(()) => 0,
+            Err(e) => e,
         };
-        let new_flags = flags & mount_flag_mask();
-        if (new_flags & MS_RDONLY) != 0 && mount_is_busy(&target, true) {
-            return err(SyscallError::EBUSY);
-        }
-        let _ = update_mount_record_flags(&target, new_flags);
-        sync_rofs_mount_flag(&target, new_flags);
-        if record.source_display == "/dev/root"
-            && (new_flags & MS_RDONLY) == 0
-            && pseudo_block_is_read_only()
-        {
-            return err(SyscallError::EACCES);
-        }
-        return 0;
     }
 
     let Some(source_display) = special.as_deref() else {
@@ -1861,45 +2082,59 @@ pub(crate) fn syscall_mount_impl(
     if source_display.is_empty() || fsname.is_empty() {
         return err(SyscallError::EINVAL);
     }
-    // Linux permits overmounting an existing mount point, but rejects a
-    // direct duplicate of the current top mount when both source and target
-    // are unchanged.  Keep the check this narrow so a different filesystem
-    // can still be stacked on the same target.
-    if mount_record_for_target(&target)
-        .is_some_and(|record| record.source_display == source_display && record.fs_type == fsname)
-    {
-        return err(SyscallError::EBUSY);
+    if fsname == "tmpfs" {
+        let mount_flags = flags & mount_flag_mask();
+        match try_object_vfs_registered_mount(
+            &dir,
+            &target,
+            fsname,
+            source_display,
+            source_display,
+            data.as_deref().unwrap_or(""),
+            mount_flags,
+        ) {
+            Ok(true) => return 0,
+            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Err(e) => return e,
+        }
     }
     if matches!(fsname, "proc" | "sysfs" | "devtmpfs") {
-        let canonical_source = match fsname {
-            "proc" => "/proc",
-            "sysfs" => "/sys",
-            "devtmpfs" => "/dev",
-            _ => unreachable!(),
-        };
-        create_mount_record_with_propagation(
+        let mount_flags = flags & mount_flag_mask();
+        match try_object_vfs_registered_mount(
+            &dir,
             &target,
-            canonical_source,
-            source_display,
             fsname,
-            flags & mount_flag_mask(),
-        );
-        return 0;
+            source_display,
+            match fsname {
+                "proc" => "/proc",
+                "sysfs" => "/sys",
+                "devtmpfs" => "/dev",
+                _ => unreachable!(),
+            },
+            data.as_deref().unwrap_or(""),
+            mount_flags,
+        ) {
+            Ok(true) => return 0,
+            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Err(e) => return e,
+        }
     }
     if fsname == "cgroup2" {
         let spec = CgroupMountSpec::unified();
-        let rc = cgroup_mount(&target, &spec);
-        if rc != 0 {
-            return rc;
+        let mount_flags = flags & mount_flag_mask();
+        match try_object_vfs_registered_mount(
+            &dir,
+            &target,
+            fsname,
+            source_display,
+            spec.source_label(),
+            data.as_deref().unwrap_or(""),
+            mount_flags,
+        ) {
+            Ok(true) => return 0,
+            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Err(e) => return e,
         }
-        create_mount_record_with_propagation(
-            &target,
-            &target,
-            "cgroup2",
-            "cgroup2",
-            flags & mount_flag_mask(),
-        );
-        return 0;
     }
     if fsname == "cgroup" {
         let options = data.as_deref().unwrap_or("");
@@ -1907,18 +2142,20 @@ pub(crate) fn syscall_mount_impl(
             Ok(spec) => spec,
             Err(e) => return e,
         };
-        let rc = cgroup_mount(&target, &spec);
-        if rc != 0 {
-            return rc;
-        }
-        create_mount_record_with_propagation(
+        let mount_flags = flags & mount_flag_mask();
+        match try_object_vfs_registered_mount(
+            &dir,
             &target,
-            &target,
+            fsname,
+            source_display,
             spec.source_label(),
-            "cgroup",
-            flags & mount_flag_mask(),
-        );
-        return 0;
+            options,
+            mount_flags,
+        ) {
+            Ok(true) => return 0,
+            Ok(false) => return err(SyscallError::EOPNOTSUPP),
+            Err(e) => return e,
+        }
     }
     if source_display == "/dev/root" && (flags & MS_RDONLY) == 0 && pseudo_block_is_read_only() {
         return err(SyscallError::EACCES);
@@ -1931,26 +2168,27 @@ pub(crate) fn syscall_mount_impl(
             }
         }
     }
-    let source = if fsname == "ext4" {
+    if fsname != "ext4" {
+        // Linux asks the filesystem registry for a concrete type and returns
+        // ENODEV when no driver exists.  Never manufacture an ext4 directory
+        // as a pretend superblock for an unknown filesystem.
+        return err(SyscallError::ENODEV);
+    }
+    let source = {
         let Some(source) = block_device_source_path(source_display) else {
             return err(SyscallError::ENODEV);
         };
         source
-    } else {
-        let key = alloc::format!("{}:{}", fsname, source_display);
-        match source_for_device_mount(&key) {
-            Ok(v) => v,
+    };
+    let mount_flags = flags & mount_flag_mask();
+    if fsname == "ext4" {
+        match try_object_vfs_ext4_mount(&dir, &target, source_display, &source, mount_flags) {
+            Ok(true) => return 0,
+            Ok(false) => return err(SyscallError::EOPNOTSUPP),
             Err(e) => return e,
         }
-    };
-    create_mount_record_with_propagation(
-        &target,
-        &source,
-        source_display,
-        fsname,
-        flags & mount_flag_mask(),
-    );
-    0
+    }
+    err(SyscallError::EOPNOTSUPP)
 }
 
 pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
@@ -1973,7 +2211,7 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
         return err(SyscallError::ENOENT);
     }
     let process = current_process();
-    let cwd = { process.borrow_mut().cwd.clone() };
+    let cwd = process.fs_struct().cwd_display();
     let abs = normalize_path(&cwd, &path);
 
     if (flags & UMOUNT_NOFOLLOW) != 0 {
@@ -1989,13 +2227,13 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
         }
     }
 
-    let Some(record) = mount_record_for_target(&abs) else {
+    if mount_record_for_target(&abs).is_none() {
         return if find_path_in_roots(&abs).is_some() {
             err(SyscallError::EINVAL)
         } else {
             err(SyscallError::ENOENT)
         };
-    };
+    }
 
     if (flags & MNT_EXPIRE) != 0 {
         let updated = with_mount_namespace_mut(&current_mount_namespace(), |state| {
@@ -2020,42 +2258,16 @@ pub(crate) fn syscall_umount2_impl(special_ptr: usize, flags: usize) -> isize {
         return err(SyscallError::EBUSY);
     }
 
-    if record.fs_type == "tmpfs" {
-        let reattach_key = if (flags & MNT_DETACH) != 0 || record.source_display == "/dev/root" {
-            Some(alloc::format!(
-                "{}:{}",
-                record.fs_type,
-                record.source_display
-            ))
-        } else if record.source_display == "ltp-tmpfs" {
-            Some(String::from("tmpfs:/dev/root"))
-        } else {
-            None
-        };
-        if let Some(key) = reattach_key {
-            TMPFS_REATTACH_SOURCES
-                .lock()
-                .insert(key, record.source.clone());
-        }
-    }
-    if record.fs_type == "cgroup2" || record.fs_type == "cgroup" {
-        let _ = cgroup_umount(&abs);
-    }
-    if let Some(peer_group_id) = record.peer_group_id {
-        let _ = remove_top_mount_records_by_event(
-            record.event_id,
-            peer_group_id,
-            &record.target,
-            &record.source,
-            &record.source_display,
-        );
-    } else {
-        let _ = remove_mount_record_by_stack(
-            &current_mount_namespace(),
-            &record.target,
-            record.stack_seq,
-        );
-    }
+    let path = match resolve_object_vfs_absolute(&abs) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let namespace = current_mount_namespace().lock().vfs_namespace();
+    let targets = match namespace.umount_with_targets(&path, (flags & MNT_DETACH) != 0) {
+        Ok((_mount, targets)) => targets,
+        Err(error) => return map_vfs_error(error),
+    };
+    let _ = remove_object_mount_records_by_targets(&targets);
     0
 }
 
@@ -2297,55 +2509,6 @@ pub(crate) fn unregister_rofs_mount(abs: &str) {
     }
 }
 
-pub(crate) fn path_is_rofs(abs: &str) -> bool {
-    if (mount_flags_for_abs(abs) & MS_RDONLY) != 0 {
-        return true;
-    }
-    let ns = current_mount_namespace();
-    let state = ns.lock();
-    state.rofs_mount_covers(abs)
-}
-
-pub(crate) fn path_is_nodev(abs: &str) -> bool {
-    (mount_flags_for_abs(abs) & MS_NODEV) != 0
-}
-
-pub(crate) fn path_is_noexec(abs: &str) -> bool {
-    (mount_flags_for_abs(abs) & MS_NOEXEC) != 0
-}
-
-pub(crate) fn path_is_nosymfollow(abs: &str) -> bool {
-    (mount_flags_for_abs(abs) & MS_NOSYMFOLLOW) != 0
-}
-
-pub(crate) fn inode_is_rofs_mount_root(inode: &Arc<ext4_fs::Inode>) -> bool {
-    let mounts: Vec<String> = {
-        let ns = current_mount_namespace();
-        let state = ns.lock();
-        state.rofs_mounts().to_vec()
-    };
-    for mount in mounts {
-        let Some(mount_inode) = find_path_in_roots(&translate_mount_abs(&mount)) else {
-            continue;
-        };
-        if mount_inode.device_id() == inode.device_id()
-            && mount_inode.inode_num() == inode.inode_num()
-        {
-            return true;
-        }
-    }
-    false
-}
-
-pub(crate) fn path_is_mount_point(abs: &str) -> bool {
-    if mount_record_for_target(abs).is_some() {
-        return true;
-    }
-    let ns = current_mount_namespace();
-    let state = ns.lock();
-    state.rofs_mount_contains(abs)
-}
-
 pub(crate) fn path_under_mount(abs: &str, mnt: &str) -> bool {
     if mnt == "/" {
         return true;
@@ -2358,24 +2521,4 @@ pub(crate) fn path_under_mount(abs: &str, mnt: &str) -> bool {
 
 pub(crate) fn final_non_empty_component(path: &str) -> Option<&str> {
     path.rsplit('/').find(|comp| !comp.is_empty())
-}
-
-pub(crate) fn rofs_mount_root_for_abs(abs: &str) -> Option<String> {
-    if let Some(mount) = mount_lookup_for_abs(abs) {
-        return Some(mount.target);
-    }
-    let ns = current_mount_namespace();
-    let state = ns.lock();
-    state.rofs_mount_root_for_path(abs)
-}
-
-pub(crate) fn hardlink_cross_mount(old_abs: &str, new_abs: &str) -> bool {
-    match (
-        rofs_mount_root_for_abs(old_abs),
-        rofs_mount_root_for_abs(new_abs),
-    ) {
-        (None, None) => false,
-        (Some(a), Some(b)) => a != b,
-        _ => true,
-    }
 }

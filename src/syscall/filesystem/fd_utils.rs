@@ -1,9 +1,9 @@
 use super::{
-    Arc, BTreeMap, DIRECT_IO_ALIGN, FD_CLOEXEC, File, Mutex, O_APPEND, O_ASYNC, O_CLOEXEC,
-    O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe,
-    ProcPseudoFile, PseudoFile, PseudoShmFile, SocketPairEnd, SyscallError, TaskControlBlock,
-    UserBuffer, current_files, current_files_and_nofile_limit, err, get_current_token, make_pipe,
-    mount_lookup_for_abs, try_read_user_value, try_write_user_value, with_ext4_inode_read,
+    Arc, BTreeMap, DIRECT_IO_ALIGN, FD_CLOEXEC, File, MemfdFile, Mutex, O_APPEND, O_ASYNC,
+    O_CLOEXEC, O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe,
+    ProcPseudoFile, PseudoFile, SocketPairEnd, SyscallError, TaskControlBlock, UserBuffer,
+    VfsOpenedFile, current_files, current_files_and_nofile_limit, err, get_current_token,
+    make_pipe, try_read_user_value, try_write_user_value, with_ext4_inode_read,
 };
 use lazy_static::lazy_static;
 
@@ -125,7 +125,7 @@ impl FifoPipeState {
 }
 
 lazy_static! {
-    pub(crate) static ref FIFO_PIPE_STATES: Mutex<BTreeMap<u64, Arc<FifoPipeState>>> =
+    pub(crate) static ref FIFO_PIPE_STATES: Mutex<BTreeMap<(u64, u64), Arc<FifoPipeState>>> =
         Mutex::new(BTreeMap::new());
 }
 
@@ -139,10 +139,6 @@ pub(crate) fn get_fd_file_and_flags(
     fd: usize,
 ) -> Option<(alloc::sync::Arc<dyn File + Send + Sync>, u32)> {
     current_files().lock().get_file_and_flags(fd)
-}
-
-pub(crate) fn get_fd_mount_ref(fd: usize) -> Option<crate::fs::FdMountRef> {
-    current_files().lock().get_mount_ref(fd)
 }
 
 /// Get the file for `fd`, returning `-EBADF` if the descriptor is not open.
@@ -206,7 +202,13 @@ pub(crate) fn file_is_seekable_for_preadwrite(
     if file.as_any().downcast_ref::<OSInode>().is_some() {
         return true;
     }
-    if file.as_any().downcast_ref::<PseudoShmFile>().is_some() {
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        return matches!(
+            vfs_file.kind(),
+            crate::fs::vfs::VfsNodeKind::Regular | crate::fs::vfs::VfsNodeKind::Directory
+        );
+    }
+    if file.as_any().downcast_ref::<MemfdFile>().is_some() {
         return true;
     }
     if file.as_any().downcast_ref::<ProcPseudoFile>().is_some() {
@@ -383,43 +385,24 @@ pub(crate) fn install_open_file_fd(
     Ok(fd)
 }
 
-pub(crate) fn install_open_file_fd_for_path(
-    file: alloc::sync::Arc<dyn File + Send + Sync>,
-    flags: usize,
-    o_path: bool,
-    logical_abs: &str,
-) -> Result<usize, isize> {
-    let mount = mount_lookup_for_abs(logical_abs).map(|record| (&record).into());
-    let (files, limit) = current_files_and_nofile_limit();
-    let installed = files.lock().install_fd_with_mount(
-        file,
-        open_descriptor_flags(flags, o_path),
-        mount,
-        limit,
-    );
-    let fd = match installed {
-        Ok(fd) => fd,
-        Err(rejected) => {
-            rejected.discard();
-            return Err(err(SyscallError::EMFILE));
-        }
-    };
-    Ok(fd)
-}
-
-/// Returns the shared pipe state for a FIFO inode, recreating it once all ends are gone.
-pub(crate) fn fifo_pipe_state_for_inode(inode_num: u64) -> Arc<FifoPipeState> {
+/// Returns the shared pipe state for one filesystem/node identity, recreating
+/// it once all ends are gone.
+///
+/// Linux keys a FIFO's pipe state by the inode object, not by `i_ino` alone;
+/// inode numbers can overlap across mounts and independent tmpfs instances.
+pub(crate) fn fifo_pipe_state_for_inode(filesystem_id: u64, inode_num: u64) -> Arc<FifoPipeState> {
+    let key = (filesystem_id, inode_num);
     let mut states = FIFO_PIPE_STATES.lock();
-    if let Some(state) = states.get(&inode_num) {
+    if let Some(state) = states.get(&key) {
         // Drop idle state so reopened FIFOs start with an empty buffer.
         if !state.has_open_readers() && !state.has_open_writers() {
-            states.remove(&inode_num);
+            states.remove(&key);
         } else {
             return state.clone();
         }
     }
     let state = Arc::new(FifoPipeState::new());
-    states.insert(inode_num, state.clone());
+    states.insert(key, state.clone());
     state
 }
 

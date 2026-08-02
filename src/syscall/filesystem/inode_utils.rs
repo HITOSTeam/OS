@@ -1,19 +1,21 @@
 use super::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, BTreeSet, FS_APPEND_FL,
     FS_IMMUTABLE_FL, Mutex, O_ACCMODE, O_CREAT, O_DIRECTORY, O_NOATIME, O_NONBLOCK, O_RDONLY,
-    O_TMPFILE, O_TRUNC, O_WRONLY, OSInode, Ordering, PID2PCB, S_IFBLK, S_IFCHR, S_IFMT,
-    SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec, cgroup_rename, clear_ext4_path_cache,
+    O_TRUNC, O_WRONLY, OSInode, Ordering, PID2PCB, S_IFBLK, S_IFCHR, S_IFMT, SIGXFSZ_NUM, String,
+    SyscallError, TMPFILE_SEQ, Vec, apply_chmod_to_vfs_path, clear_ext4_path_cache,
     current_effective_uid_gid, current_files, current_fsuid_gid, current_in_group, current_process,
     current_timespec, empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_inode_lock,
     ext4_topology_lock, fchmod_fd_for_at_empty_path, fifo_pipe_state_for_inode,
     file_lock_key_from_inode, get_current_token, inode_mode_allows, inode_mode_allows_uid_gid,
-    inode_visible_size_with_disk_size, install_open_file_fd, maybe_dispatch_proc_fd_at,
-    maybe_signal_lease_break, note_inode_path_hint, open_pseudo, path_is_nodev, path_is_rofs,
-    pseudo_path_exists_result, queue_process_signal, read_user_cstring,
-    register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_parent_and_name,
-    rofs_for_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
+    inode_visible_size_with_disk_size, install_open_file_fd, map_vfs_error,
+    maybe_signal_lease_break, note_inode_path_hint, pin_legacy_file_path, queue_process_signal,
+    read_user_cstring, register_deferred_unlink_cleanup, resolve_at_inode,
+    resolve_at_inode_with_vfs_path, resolve_at_path, resolve_at_vfs_path, resolve_parent_and_name,
+    resolve_parent_vfs_path, syscall_fchmod, try_copy_from_user, try_copy_to_user_unchecked,
     with_ext4_inode_write, with_ext4_inode_write_set,
 };
+use crate::fs::ext4::Ext4VfsNode;
+use crate::fs::vfs::{VfsMetadata, VfsNodeKind, VfsPath, VfsRenameFlags};
 use crate::mm::{resize_shared_file_page_cache, update_shared_file_page_cache};
 use alloc::vec;
 use lazy_static::lazy_static;
@@ -119,22 +121,32 @@ pub(crate) fn open_existing_ext4_inode(
     path: &str,
     raw_abs: Option<&str>,
     inode: alloc::sync::Arc<ext4_fs::Inode>,
+    vfs_path: Option<VfsPath>,
     flags: usize,
     readable: bool,
     writable: bool,
     append: bool,
     o_path: bool,
 ) -> Result<usize, isize> {
-    let readonly_fs = raw_abs.map(path_is_rofs).unwrap_or(false);
+    let readonly_fs = vfs_path
+        .as_ref()
+        .is_some_and(|path| path.mount().flags().is_read_only());
     let inode_lock = ext4_inode_lock(&inode);
     let inode_guard = inode_lock.read();
 
     if let Some(abs) = raw_abs {
         note_inode_path_hint(&inode, abs);
-        let mode = inode.mode() & S_IFMT;
-        if path_is_nodev(abs) && matches!(mode, S_IFCHR | S_IFBLK) {
-            return Err(err(SyscallError::EACCES));
-        }
+    }
+    let mode = inode.mode() & S_IFMT;
+    if vfs_path
+        .as_ref()
+        .is_some_and(|path| path.mount().flags().is_nodev())
+        && matches!(mode, S_IFCHR | S_IFBLK)
+    {
+        return Err(err(SyscallError::EACCES));
+    }
+    if readonly_fs && !o_path && (writable || (flags & O_TRUNC) != 0) {
+        return Err(err(SyscallError::EROFS));
     }
 
     if !o_path && inode.is_dir() && ((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT) != 0) {
@@ -164,17 +176,20 @@ pub(crate) fn open_existing_ext4_inode(
     }
 
     if !o_path && inode.is_fifo() {
-        let state = fifo_pipe_state_for_inode(inode.inode_num() as u64);
+        let state = fifo_pipe_state_for_inode(inode.device_id() as u64, inode.inode_num() as u64);
         let accmode = flags & O_ACCMODE;
         if (flags & O_NONBLOCK) != 0 && accmode == O_WRONLY && !state.has_open_readers() {
             drop(inode_guard);
             return Err(err(SyscallError::ENXIO));
         }
-        let Some(file) = state.open_file(accmode) else {
+        let Some(mut file) = state.open_file(accmode) else {
             drop(inode_guard);
             return Err(err(SyscallError::EINVAL));
         };
         drop(inode_guard);
+        if let Some(object_path) = vfs_path.as_ref() {
+            file = pin_legacy_file_path(file, object_path.clone(), raw_abs.unwrap_or("/"));
+        }
         return install_open_file_fd(file, flags, o_path);
     }
 
@@ -188,9 +203,10 @@ pub(crate) fn open_existing_ext4_inode(
         false,
         None,
     ) {
-        Ok(file) => {
-            alloc::sync::Arc::new(file.with_fanotify_path(raw_abs.map(alloc::string::String::from)))
-        }
+        Ok(file) => alloc::sync::Arc::new(
+            file.with_fanotify_path(raw_abs.map(alloc::string::String::from))
+                .with_vfs_path(vfs_path),
+        ),
         Err(e) => return Err(e),
     };
 
@@ -225,26 +241,15 @@ pub(crate) fn open_existing_target_path(
     append: bool,
     o_path: bool,
 ) -> Result<usize, isize> {
-    let write_intent =
-        writable || (flags & (O_CREAT | O_TRUNC)) != 0 || (flags & O_TMPFILE) == O_TMPFILE;
-    if write_intent && path_is_rofs(abs) {
-        return Err(err(SyscallError::EROFS));
-    }
-
     let at = resolve_at_path(AT_FDCWD, abs)?;
-    if let AtPath::PseudoAbs(_) = &at {
-        let Some(file) = open_pseudo(abs) else {
-            return Err(err(SyscallError::ENOENT));
-        };
-        return install_open_file_fd(file, flags, o_path);
-    }
 
     let (fsuid, fsgid) = current_fsuid_gid();
-    let inode = resolve_at_inode(&at, fsuid, fsgid, true)?;
+    let (inode, vfs_path) = resolve_at_inode_with_vfs_path(&at, fsuid, fsgid, true)?;
     open_existing_ext4_inode(
         abs,
         Some(abs),
         inode,
+        vfs_path,
         flags,
         readable,
         writable,
@@ -293,23 +298,24 @@ pub(crate) fn do_fchmodat(
         Err(e) => return e,
     };
 
-    if let AtPath::PseudoAbs(abs) = &at {
-        if let Some(ret) =
-            maybe_dispatch_proc_fd_at(abs, flags, |fd| fchmod_fd_for_at_empty_path(fd, mode))
-        {
-            return ret;
-        }
-        return pseudo_path_exists_result(abs);
-    }
-
     let (fsuid, fsgid) = current_fsuid_gid();
     let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
+        Ok(Some(path)) if !path.node().as_any().is::<Ext4VfsNode>() => {
+            return apply_chmod_to_vfs_path(&path, mode);
+        }
+        Ok(path) => path,
+        Err(error) => return error,
+    };
     let inode = match resolve_at_inode(&at, fsuid, fsgid, follow_final) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    if rofs_for_path(dirfd, &path) {
+    if vfs_path
+        .as_ref()
+        .is_some_and(|path| path.mount().flags().is_read_only())
+    {
         return err(SyscallError::EROFS);
     }
     with_ext4_inode_write(&inode, || {
@@ -417,6 +423,256 @@ pub(crate) fn remove_rename_target(parent: &Arc<ext4_fs::Inode>, name: &str) -> 
     }
 }
 
+fn vfs_metadata_allows(metadata: VfsMetadata, mask: u16, uid: u32, gid: u32) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    let shift = if uid == metadata.uid {
+        6
+    } else if gid == metadata.gid {
+        3
+    } else {
+        0
+    };
+    ((metadata.mode >> shift) & mask) == mask
+}
+
+fn vfs_sticky_rename_allowed(parent: VfsMetadata, victim: VfsMetadata, fsuid: u32) -> bool {
+    parent.mode & 0o1000 == 0 || fsuid == 0 || fsuid == parent.uid || fsuid == victim.uid
+}
+
+/// Test directory ancestry using the underlying dentry tree rather than a
+/// reconstructed pathname. Bind mounts may expose the same dentry through a
+/// different mount object, but the filesystem topology remains shared.
+fn vfs_path_descends_from(path: &VfsPath, ancestor: &VfsPath) -> bool {
+    if path.node().filesystem_id() != ancestor.node().filesystem_id() {
+        return false;
+    }
+    let ancestor_id = ancestor.node().node_id();
+    let mut current = Some(Arc::clone(path.dentry()));
+    while let Some(dentry) = current {
+        if dentry.node().node_id() == ancestor_id {
+            return true;
+        }
+        current = dentry.parent();
+    }
+    false
+}
+
+/// Handle rename entirely through object identities for mutable non-ext4
+/// filesystems. `None` leaves two ext4 parents on the existing inode adapter;
+/// every mixed-backend case is completed here so it cannot fall through to a
+/// pathname translation.
+fn try_do_non_ext4_vfs_rename(
+    old_at: &AtPath,
+    new_at: &AtPath,
+    fsuid: u32,
+    fsgid: u32,
+    flags: VfsRenameFlags,
+) -> Option<isize> {
+    let no_replace = flags.contains(VfsRenameFlags::NO_REPLACE);
+    let exchange = flags.contains(VfsRenameFlags::EXCHANGE);
+    let old_parent = match resolve_parent_vfs_path(old_at, fsuid, fsgid) {
+        Ok(parent) => parent,
+        Err(error) => return matches!(old_at, AtPath::Vfs(_)).then_some(error),
+    };
+    let new_parent = match resolve_parent_vfs_path(new_at, fsuid, fsgid) {
+        Ok(parent) => parent,
+        Err(error) => return matches!(new_at, AtPath::Vfs(_)).then_some(error),
+    };
+    let has_non_ext4_parent = old_parent
+        .as_ref()
+        .is_some_and(|parent| !parent.parent.node().as_any().is::<Ext4VfsNode>())
+        || new_parent
+            .as_ref()
+            .is_some_and(|parent| !parent.parent.node().as_any().is::<Ext4VfsNode>());
+    if !has_non_ext4_parent {
+        return None;
+    }
+    let (Some(old_parent), Some(new_parent)) = (old_parent, new_parent) else {
+        return Some(err(SyscallError::EXDEV));
+    };
+    if old_parent.parent.node().as_any().is::<Ext4VfsNode>()
+        || new_parent.parent.node().as_any().is::<Ext4VfsNode>()
+        || old_parent.parent.mount().id() != new_parent.parent.mount().id()
+    {
+        // Linux filename_renameat2() requires the same vfsmount, even when
+        // two bind mounts happen to expose the same superblock.
+        return Some(err(SyscallError::EXDEV));
+    }
+    if old_parent.parent.mount().flags().is_read_only()
+        || new_parent.parent.mount().flags().is_read_only()
+    {
+        return Some(err(SyscallError::EROFS));
+    }
+
+    let source = match resolve_at_vfs_path(old_at, fsuid, fsgid, false) {
+        Ok(Some(path)) => path,
+        Ok(None) => unreachable!("object rename source did not use the VFS walker"),
+        Err(error) => return Some(error),
+    };
+    if source.mount().id() != old_parent.parent.mount().id() {
+        return Some(err(SyscallError::EBUSY));
+    }
+    let source_metadata = match source.node().metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(map_vfs_error(error)),
+    };
+    if source_metadata.kind != VfsNodeKind::Directory && old_parent.trailing_slash {
+        return Some(err(SyscallError::ENOTDIR));
+    }
+
+    let target = match resolve_at_vfs_path(new_at, fsuid, fsgid, false) {
+        Ok(Some(path)) => Some(path),
+        Ok(None) => unreachable!("object rename target did not use the VFS walker"),
+        Err(error) if error == err(SyscallError::ENOENT) => None,
+        Err(error) => return Some(error),
+    };
+    if let Some(target) = target.as_ref() {
+        if no_replace {
+            return Some(err(SyscallError::EEXIST));
+        }
+        if target.mount().id() != new_parent.parent.mount().id() {
+            return Some(err(SyscallError::EBUSY));
+        }
+        if target.node().filesystem_id() == source.node().filesystem_id()
+            && target.node().node_id() == source.node().node_id()
+        {
+            return Some(0);
+        }
+    } else if exchange {
+        return Some(err(SyscallError::ENOENT));
+    }
+    let target_metadata = match target.as_ref() {
+        Some(target) => match target.node().metadata() {
+            Ok(metadata) => Some(metadata),
+            Err(error) => return Some(map_vfs_error(error)),
+        },
+        None => None,
+    };
+    if (!exchange && source_metadata.kind != VfsNodeKind::Directory
+        || exchange
+            && target_metadata.is_some_and(|metadata| metadata.kind != VfsNodeKind::Directory))
+        && new_parent.trailing_slash
+    {
+        return Some(err(SyscallError::ENOTDIR));
+    }
+
+    let old_parent_metadata = match old_parent.parent.node().metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(map_vfs_error(error)),
+    };
+    let new_parent_metadata = match new_parent.parent.node().metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Some(map_vfs_error(error)),
+    };
+    if old_parent_metadata.kind != VfsNodeKind::Directory
+        || new_parent_metadata.kind != VfsNodeKind::Directory
+    {
+        return Some(err(SyscallError::ENOTDIR));
+    }
+    if !vfs_metadata_allows(old_parent_metadata, 3, fsuid, fsgid)
+        || !vfs_metadata_allows(new_parent_metadata, 3, fsuid, fsgid)
+    {
+        return Some(err(SyscallError::EACCES));
+    }
+    if !vfs_sticky_rename_allowed(old_parent_metadata, source_metadata, fsuid) {
+        return Some(err(SyscallError::EPERM));
+    }
+    if source_metadata.kind == VfsNodeKind::Directory
+        && old_parent.parent.node().node_id() != new_parent.parent.node().node_id()
+        && !vfs_metadata_allows(source_metadata, 2, fsuid, fsgid)
+    {
+        // Moving a directory changes its `..` relationship, which Linux
+        // guards with MAY_WRITE on the directory itself.
+        return Some(err(SyscallError::EACCES));
+    }
+    if source_metadata.kind == VfsNodeKind::Directory
+        && vfs_path_descends_from(&new_parent.parent, &source)
+    {
+        return Some(err(SyscallError::EINVAL));
+    }
+    if let (Some(target), Some(target_metadata)) = (target.as_ref(), target_metadata) {
+        if !vfs_sticky_rename_allowed(new_parent_metadata, target_metadata, fsuid) {
+            return Some(err(SyscallError::EPERM));
+        }
+        if exchange
+            && target_metadata.kind == VfsNodeKind::Directory
+            && old_parent.parent.node().node_id() != new_parent.parent.node().node_id()
+            && !vfs_metadata_allows(target_metadata, 2, fsuid, fsgid)
+        {
+            return Some(err(SyscallError::EACCES));
+        }
+        if exchange
+            && target_metadata.kind == VfsNodeKind::Directory
+            && vfs_path_descends_from(&old_parent.parent, target)
+        {
+            return Some(err(SyscallError::EINVAL));
+        }
+    }
+
+    let result = old_parent.parent.node().rename_with_flags(
+        &old_parent.name,
+        new_parent.parent.node(),
+        &new_parent.name,
+        flags,
+    );
+    match result {
+        Ok(()) => {
+            let cache = old_parent.parent.mount().filesystem().dentry_cache();
+            cache.invalidate(old_parent.parent.dentry(), &old_parent.name);
+            cache.invalidate(new_parent.parent.dentry(), &new_parent.name);
+            Some(0)
+        }
+        Err(error) => Some(map_vfs_error(error)),
+    }
+}
+
+/// Enforce mount-local rename rules for ext4 paths before entering the inode
+/// adapter.  Linux compares `struct mount` identity (not only superblocks),
+/// rejects renaming mounted-over objects, and obtains write access from the
+/// parent mount.
+fn validate_ext4_rename_mounts(
+    old_at: &AtPath,
+    new_at: &AtPath,
+    fsuid: u32,
+    fsgid: u32,
+    target_required: bool,
+) -> Result<(), isize> {
+    let old_parent = resolve_parent_vfs_path(old_at, fsuid, fsgid)?;
+    let new_parent = resolve_parent_vfs_path(new_at, fsuid, fsgid)?;
+    let (old_parent, new_parent) = match (old_parent, new_parent) {
+        (Some(old_parent), Some(new_parent)) => (old_parent, new_parent),
+        (None, None) => return Ok(()),
+        _ => return Err(err(SyscallError::EXDEV)),
+    };
+    if old_parent.parent.mount().id() != new_parent.parent.mount().id() {
+        return Err(err(SyscallError::EXDEV));
+    }
+    if old_parent.parent.mount().flags().is_read_only()
+        || new_parent.parent.mount().flags().is_read_only()
+    {
+        return Err(err(SyscallError::EROFS));
+    }
+
+    let source = resolve_at_vfs_path(old_at, fsuid, fsgid, false)?
+        .expect("object rename parent must produce an object source");
+    if source.mount().id() != old_parent.parent.mount().id() {
+        return Err(err(SyscallError::EBUSY));
+    }
+    match resolve_at_vfs_path(new_at, fsuid, fsgid, false) {
+        Ok(Some(target)) => {
+            if target.mount().id() != new_parent.parent.mount().id() {
+                return Err(err(SyscallError::EBUSY));
+            }
+        }
+        Err(error) if !target_required && error == err(SyscallError::ENOENT) => {}
+        Err(error) => return Err(error),
+        Ok(None) => unreachable!("object rename parent must use the object walker"),
+    }
+    Ok(())
+}
+
 pub(crate) fn do_renameat(
     olddirfd: isize,
     old_s: &str,
@@ -433,20 +689,19 @@ pub(crate) fn do_renameat(
         Err(e) => return e,
     };
 
-    if let (AtPath::PseudoAbs(old_abs), AtPath::PseudoAbs(new_abs)) = (&old_at, &new_at) {
-        if crate::fs::is_cgroup_pseudo_path(old_abs) && crate::fs::is_cgroup_pseudo_path(new_abs) {
-            return cgroup_rename(old_abs, new_abs, no_replace);
-        }
-    }
-    if matches!(old_at, AtPath::PseudoAbs(_)) || matches!(new_at, AtPath::PseudoAbs(_)) {
-        return err(SyscallError::EROFS);
-    }
-
-    if rofs_for_path(olddirfd, old_s) || rofs_for_path(newdirfd, new_s) {
-        return err(SyscallError::EROFS);
-    }
-
     let (fsuid, fsgid) = current_fsuid_gid();
+    let flags = VfsRenameFlags(if no_replace {
+        VfsRenameFlags::NO_REPLACE
+    } else {
+        0
+    });
+    if let Some(result) = try_do_non_ext4_vfs_rename(&old_at, &new_at, fsuid, fsgid, flags) {
+        return result;
+    }
+    if let Err(error) = validate_ext4_rename_mounts(&old_at, &new_at, fsuid, fsgid, false) {
+        return error;
+    }
+
     let (old_parent, old_name) = match resolve_parent_and_name(&old_at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
@@ -572,14 +827,20 @@ pub(crate) fn do_renameat_exchange(
         Err(e) => return e,
     };
 
-    if matches!(old_at, AtPath::PseudoAbs(_)) || matches!(new_at, AtPath::PseudoAbs(_)) {
-        return err(SyscallError::EROFS);
+    let (fsuid, fsgid) = current_fsuid_gid();
+    if let Some(result) = try_do_non_ext4_vfs_rename(
+        &old_at,
+        &new_at,
+        fsuid,
+        fsgid,
+        VfsRenameFlags(VfsRenameFlags::EXCHANGE),
+    ) {
+        return result;
     }
-    if rofs_for_path(olddirfd, old_s) || rofs_for_path(newdirfd, new_s) {
-        return err(SyscallError::EROFS);
+    if let Err(error) = validate_ext4_rename_mounts(&old_at, &new_at, fsuid, fsgid, true) {
+        return error;
     }
 
-    let (fsuid, fsgid) = current_fsuid_gid();
     let (old_parent, old_name) = match resolve_parent_and_name(&old_at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,

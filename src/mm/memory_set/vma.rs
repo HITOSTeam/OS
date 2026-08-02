@@ -33,8 +33,8 @@ pub struct VmRegion {
     pub file_offset: usize,
     /// 稳定 backing 入口，fd 关闭后 msync/munmap 仍可找到文件。
     pub backing_id: usize,
-    /// Non-zero for `PseudoShmFile`/memfd-backed mappings.
-    pub memfd_id: u64,
+    /// Non-zero for shmem-backed mappings (anonymous memfd or tmpfs inode).
+    pub shmem_id: u64,
     /// Non-zero for lazy MAP_SHARED anonymous or /dev/zero mappings.
     pub anon_shared_id: u64,
     /// Non-zero for System V shared memory mappings.
@@ -101,7 +101,7 @@ impl VmaInsertArea {
             return false;
         }
 
-        let file_like = region.file_backed || region.memfd_id != 0 || region.sysv_shmid != 0;
+        let file_like = region.file_backed || region.shmem_id != 0 || region.sysv_shmid != 0;
         if start >= region.sigbus_start() {
             return file_like && self.map_type() == MapType::Lazy;
         }
@@ -697,7 +697,7 @@ impl VmRegion {
     fn has_backing_identity(&self) -> bool {
         self.file_backed
             || self.backing_id != 0
-            || self.memfd_id != 0
+            || self.shmem_id != 0
             || self.anon_shared_id != 0
             || self.sysv_shmid != 0
     }
@@ -710,9 +710,9 @@ impl VmRegion {
         self.kind == VmRegionKind::Stack
     }
 
-    /// 是否有文件或共享内存后端（file_backed / memfd / sysv shm）。
+    /// 是否有文件或共享内存后端（file_backed / shmem / SysV shm）。
     pub(super) fn is_file_like(&self) -> bool {
-        self.file_backed || self.memfd_id != 0 || self.sysv_shmid != 0
+        self.file_backed || self.shmem_id != 0 || self.sysv_shmid != 0
     }
 
     /// 是否为纯私有匿名映射（无任何后端）。
@@ -833,7 +833,7 @@ impl VmRegion {
     pub(super) fn set_len(&mut self, len: usize) {
         let old_len = self.len;
         let was_full_valid = self.file_valid_len == old_len;
-        let file_like = self.file_backed || self.memfd_id != 0 || self.sysv_shmid != 0;
+        let file_like = self.file_backed || self.shmem_id != 0 || self.sysv_shmid != 0;
         if !file_like || was_full_valid {
             self.file_valid_len = len;
         } else {
@@ -852,7 +852,7 @@ impl VmRegion {
     /// 同时设置 len 和 file_valid_len，用于文件截断/扩展后的精确更新。
     pub(super) fn set_len_and_file_valid(&mut self, len: usize, file_valid_len: usize) {
         self.set_len(len);
-        if self.file_backed || self.memfd_id != 0 || self.sysv_shmid != 0 {
+        if self.file_backed || self.shmem_id != 0 || self.sysv_shmid != 0 {
             let valid = file_valid_len.min(len);
             self.file_valid_len = valid;
             self.sigbus_start = self.start.saturating_add(align_up_to_page(valid).min(len));
@@ -872,7 +872,7 @@ impl VmRegion {
         self.start = new_start;
         self.len = self.len.saturating_add(grown);
 
-        if !(self.file_backed || self.memfd_id != 0 || self.sysv_shmid != 0) {
+        if !(self.file_backed || self.shmem_id != 0 || self.sysv_shmid != 0) {
             if self.file_valid_len == old_len {
                 self.file_valid_len = self.len;
             }
@@ -896,7 +896,7 @@ impl VmRegion {
             && self.file_dev == next.file_dev
             && self.file_ino == next.file_ino
             && self.backing_id == next.backing_id
-            && self.memfd_id == next.memfd_id
+            && self.shmem_id == next.shmem_id
             && self.anon_shared_id == next.anon_shared_id
             && self.sysv_shmid == next.sysv_shmid
             && self.growsdown == next.growsdown

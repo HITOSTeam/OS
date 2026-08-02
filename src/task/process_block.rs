@@ -9,8 +9,9 @@ use super::mutex::Mutex;
 use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3};
 use crate::config::{MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE};
 use crate::debug_config::{DEBUG_EXEC, DEBUG_FUTEX, DEBUG_LOONGARCH_FULL_COPY_FORK, DEBUG_SYSCALL};
+use crate::fs::vfs::FsStruct;
 use crate::fs::{
-    MountNamespace, PollWaitQueue, cgroup_attach_fork_child, clone_mount_namespace,
+    MountNamespace, PollWaitQueue, cgroup_attach_fork_child, clone_mount_namespace_and_fs,
     initial_mount_namespace, mount_namespace_id,
 };
 use crate::mm::{
@@ -46,6 +47,7 @@ static NEXT_IPC_NS_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_USER_NS_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_PID_NS_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_NET_NS_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_CGROUP_NS_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Reason why `fork_impl()` failed.
 #[derive(Debug)]
@@ -95,6 +97,10 @@ pub fn alloc_pid_namespace_id() -> usize {
 
 pub fn alloc_net_namespace_id() -> usize {
     NEXT_NET_NS_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn alloc_cgroup_namespace_id() -> usize {
+    NEXT_CGROUP_NS_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn register_pid_namespace(parent_ns_id: usize, child_ns_id: usize) {
@@ -1123,16 +1129,14 @@ pub struct ProcessControlBlockInner {
     pub personality: u32,
     /// 按 Linux `ioprio_get/set(2)` 编码的进程级 I/O 优先级。
     pub ioprio: u16,
-    /// 进程级文件创建模式掩码（umask）。
-    pub umask: usize,
+    /// Linux-style shared filesystem context.  CLONE_FS shares this Arc;
+    /// ordinary fork snapshots root/cwd/umask into a private object.
+    pub(crate) fs: Arc<FsStruct>,
     /// 文件描述符表。普通 fork 会快照这个对象；CLONE_FILES 共享同一个 Arc，
     /// 让生命周期跟随引用，而不是依赖进程所有者转发模型。
     pub(crate) files: Arc<FilesLock>,
     /// 所有 POSIX 资源限制。
     pub rlimits: ProcessResourceLimits,
-    /// 进程根目录（宿主绝对路径），用于 `chroot`。
-    pub root: String,
-    pub cwd: String,
     /// SysV IPC / POSIX MQ 隔离使用的 IPC namespace id。
     pub ipc_ns_id: usize,
     /// 用户 namespace id。完整的 uid/gid 转换尚未实现；这里用于跟踪 Linux
@@ -1148,6 +1152,10 @@ pub struct ProcessControlBlockInner {
     pub uts_ns: Arc<SpinMutex<UtsNamespaceState>>,
     /// mount/umount/path 视图系统调用使用的共享 mount namespace 状态。
     pub mnt_ns: MountNamespace,
+    /// Cgroup namespace identity and visible root.  The identity is distinct
+    /// even when two namespaces happen to have the same root cgroup, matching
+    /// Linux's separately allocated `struct cgroup_namespace` objects.
+    pub cgroup_ns_id: usize,
     /// cgroup namespace 根路径。"/" 表示初始 namespace。
     pub cgroup_ns_root: String,
     /// PID namespace id；0 表示初始 namespace。
@@ -1565,6 +1573,15 @@ impl ProcessControlBlock {
             entry_point,
             0,
         );
+        let mnt_ns = initial_mount_namespace();
+        let fs = {
+            let state = mnt_ns.lock();
+            let root = state.vfs_root_path();
+            let cwd = state
+                .resolve_vfs_absolute("/user", true, crate::fs::vfs::VfsCredentials::default())
+                .unwrap_or_else(|_| root.clone());
+            FsStruct::new_with_paths(root, cwd, "/", "/user", 0)
+        };
         let process = Arc::new(Self {
             pid: pid_handle,
             parent_visible_pid: AtomicUsize::new(0),
@@ -1621,7 +1638,7 @@ impl ProcessControlBlock {
                 keep_caps: false,
                 personality: 0,
                 ioprio: 0,
-                umask: 0,
+                fs,
                 files: Arc::new(FilesLock::new(FilesStruct::with_stdio())),
                 rlimits: ProcessResourceLimits {
                     rlimit_nofile_cur: 1024,
@@ -1659,8 +1676,6 @@ impl ProcessControlBlock {
                     rlimit_rttime_cur: u64::MAX,
                     rlimit_rttime_max: u64::MAX,
                 },
-                root: String::from("/"),
-                cwd: String::from("/user"),
                 ipc_ns_id: 0,
                 user_ns_id: 0,
                 userns_uid_map: String::from("0 0 4294967295\n"),
@@ -1668,7 +1683,8 @@ impl ProcessControlBlock {
                 userns_setgroups: String::from("allow\n"),
                 net_ns_id: 0,
                 uts_ns: Arc::new(SpinMutex::new(UtsNamespaceState::new())),
-                mnt_ns: initial_mount_namespace(),
+                mnt_ns,
+                cgroup_ns_id: 0,
                 cgroup_ns_root: String::from("/"),
                 pid_ns_id: 0,
                 pid_ns_vpid: pid,
@@ -2024,6 +2040,7 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         share_files: bool,
         share_vm: bool,
+        share_fs: bool,
     ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
         let caller_task = crate::task::processor::current_task();
         if let Some(task) = caller_task.as_ref() {
@@ -2174,10 +2191,12 @@ impl ProcessControlBlock {
         let keep_caps = parent.keep_caps;
         let personality = parent.personality;
         let ioprio = parent.ioprio;
-        let umask = parent.umask;
+        let fs = if share_fs {
+            Arc::clone(&parent.fs)
+        } else {
+            parent.fs.clone_private()
+        };
         let rlimits = parent.rlimits.clone();
-        let root = parent.root.clone();
-        let cwd = parent.cwd.clone();
         let ipc_ns_id = parent.ipc_ns_id;
         let user_ns_id = parent.user_ns_id;
         let userns_uid_map = parent.userns_uid_map.clone();
@@ -2186,6 +2205,7 @@ impl ProcessControlBlock {
         let net_ns_id = parent.net_ns_id;
         let uts_ns = Arc::clone(&parent.uts_ns);
         let mnt_ns = Arc::clone(&parent.mnt_ns);
+        let cgroup_ns_id = parent.cgroup_ns_id;
         let cgroup_ns_root = parent.cgroup_ns_root.clone();
         let pid_ns_id = parent.pid_ns_id;
         let exec_inode_dev = parent.exec_inode_dev;
@@ -2266,11 +2286,9 @@ impl ProcessControlBlock {
                 keep_caps,
                 personality,
                 ioprio,
-                umask,
+                fs,
                 files: child_files,
                 rlimits,
-                root,
-                cwd,
                 ipc_ns_id,
                 user_ns_id,
                 userns_uid_map,
@@ -2279,6 +2297,7 @@ impl ProcessControlBlock {
                 net_ns_id,
                 uts_ns,
                 mnt_ns,
+                cgroup_ns_id,
                 cgroup_ns_root,
                 pid_ns_id,
                 pid_ns_vpid: pid_value,
@@ -2427,7 +2446,7 @@ impl ProcessControlBlock {
 
     /// Only support processes with a single thread.
     pub fn fork(self: &Arc<Self>) -> Result<Arc<Self>, ForkError> {
-        let (child, task) = self.fork_impl(false, false)?;
+        let (child, task) = self.fork_impl(false, false, false)?;
         // add this thread to scheduler
         add_task(task);
         Ok(child)
@@ -2438,8 +2457,9 @@ impl ProcessControlBlock {
         self: &Arc<Self>,
         share_files: bool,
         share_vm: bool,
+        share_fs: bool,
     ) -> Result<(Arc<Self>, Arc<TaskControlBlock>), ForkError> {
-        self.fork_impl(share_files, share_vm)
+        self.fork_impl(share_files, share_vm, share_fs)
     }
 
     pub fn getpid(&self) -> usize {
@@ -2493,24 +2513,55 @@ impl ProcessControlBlock {
         Arc::clone(&inner.mnt_ns)
     }
 
+    pub fn fs_struct(&self) -> Arc<FsStruct> {
+        Arc::clone(&self.borrow_mut().fs)
+    }
+
+    pub fn unshare_fs(&self) {
+        let private = self.borrow_mut().fs.clone_private();
+        self.borrow_mut().fs = private;
+    }
+
     pub fn mount_namespace_id(&self) -> usize {
         mount_namespace_id(&self.mount_namespace())
     }
 
     pub fn set_mount_namespace(&self, namespace: MountNamespace) {
-        self.borrow_mut().mnt_ns = namespace;
+        let umask = self.fs_struct().umask();
+        let root = namespace.lock().vfs_root_path();
+        let fs = FsStruct::new_with_paths(root.clone(), root, "/", "/", umask);
+        let mut inner = self.borrow_mut();
+        inner.mnt_ns = namespace;
+        inner.fs = fs;
     }
 
     pub fn unshare_mount_namespace(&self) {
-        let namespace = {
+        let (namespace, fs) = {
             let inner = self.borrow_mut();
-            clone_mount_namespace(&inner.mnt_ns)
+            clone_mount_namespace_and_fs(&inner.mnt_ns, &inner.fs)
+                .expect("live fs paths must be remappable into a cloned mount namespace")
         };
-        self.borrow_mut().mnt_ns = namespace;
+        let mut inner = self.borrow_mut();
+        inner.mnt_ns = namespace;
+        inner.fs = fs;
     }
 
     pub fn cgroup_namespace_root(&self) -> String {
         self.borrow_mut().cgroup_ns_root.clone()
+    }
+
+    pub fn cgroup_namespace_id(&self) -> usize {
+        self.borrow_mut().cgroup_ns_id
+    }
+
+    pub fn set_cgroup_namespace(&self, id: usize, root: String) {
+        let mut inner = self.borrow_mut();
+        inner.cgroup_ns_id = id;
+        inner.cgroup_ns_root = root;
+    }
+
+    pub fn unshare_cgroup_namespace(&self, root: String) {
+        self.set_cgroup_namespace(alloc_cgroup_namespace_id(), root);
     }
 
     pub fn set_cgroup_namespace_root(&self, path: String) {

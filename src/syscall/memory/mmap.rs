@@ -66,18 +66,32 @@ fn populate_file_mapping(
     off: usize,
     executable: bool,
 ) -> bool {
-    let Some(inode_file) = file.as_any().downcast_ref::<OSInode>() else {
-        return true;
-    };
-    // Ensure buffered writes are reflected in file-backed mappings.
-    let _ = inode_file.flush();
+    let inode_file = file.as_any().downcast_ref::<OSInode>();
+    let memfd_file = file.as_any().downcast_ref::<MemfdFile>();
+    let tmpfs_file = tmpfs_file_for_kernel_file(file);
+    if inode_file.is_none() && memfd_file.is_none() && tmpfs_file.is_none() {
+        return false;
+    }
+    if let Some(inode_file) = inode_file {
+        // Ensure buffered writes are reflected in file-backed mappings.
+        let _ = inode_file.flush();
+    }
     let token = memory_set.token();
     let mut pos = 0usize;
     let mut wrote = false;
     let mut tmp = [0u8; 512];
     while pos < len {
         let to_read = min(tmp.len(), len - pos);
-        let read = inode_file.pread_at(off + pos, &mut tmp[..to_read]);
+        let read = if let Some(inode_file) = inode_file {
+            inode_file.pread_at(off + pos, &mut tmp[..to_read])
+        } else if let Some(memfd_file) = memfd_file {
+            memfd_file.read_at(off + pos, &mut tmp[..to_read])
+        } else {
+            tmpfs_file
+                .expect("tmpfs reader checked above")
+                .read_at((off + pos) as u64, &mut tmp[..to_read])
+                .unwrap_or(0)
+        };
         if read == 0 {
             break;
         }
@@ -102,9 +116,13 @@ enum MmapSource<'a> {
         ino: u32,
     },
     Shm {
-        shm: &'a PseudoShmFile,
-        memfd_id: u64,
+        shm: &'a MemfdFile,
+        mapping_id: u64,
         sealed_write: bool,
+    },
+    TmpFs {
+        file: &'a TmpFsFile,
+        mapping_id: u64,
     },
     DevZero,
 }
@@ -123,13 +141,37 @@ impl MmapSource<'_> {
                 file_size.saturating_sub(off).min(map_len)
             }
             Self::Shm { shm, .. } => shm.len().saturating_sub(off).min(map_len),
+            Self::TmpFs { file, .. } => file.len().saturating_sub(off).min(map_len),
         }
     }
 
     // 文件长度 是否有超出 的可能性
     fn has_sigbus_tail(self) -> bool {
-        matches!(self, Self::RegularFile { .. } | Self::Shm { .. })
+        matches!(
+            self,
+            Self::RegularFile { .. } | Self::Shm { .. } | Self::TmpFs { .. }
+        )
     }
+}
+
+fn shmem_file_len(file: &Arc<dyn File + Send + Sync>) -> Option<usize> {
+    if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
+        return Some(shm.len());
+    }
+    tmpfs_file_for_kernel_file(file).map(TmpFsFile::len)
+}
+
+fn shmem_shared_frames(
+    file: &Arc<dyn File + Send + Sync>,
+    offset: usize,
+    length: usize,
+) -> Option<Vec<crate::mm::FrameTracker>> {
+    if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
+        return shm.shared_frames_existing(offset, length);
+    }
+    tmpfs_file_for_kernel_file(file)?
+        .shared_frames(offset, length)
+        .ok()
 }
 
 // 根据 mmap source 和共享属性构造需要插入的 VMA 。
@@ -168,6 +210,21 @@ fn build_vma_areas(
                 return Err(err(SyscallError::ENOMEM));
             }
         }
+        (true, MmapSource::TmpFs { file, .. }) => {
+            let file_mapped_len = sigbus_start.saturating_sub(map_start);
+            let frames = file
+                .shared_frames(off, file_mapped_len)
+                .map_err(|_| err(SyscallError::ENOMEM))?;
+            if map_start < sigbus_start {
+                areas.push(VmaInsertArea::SharedFrames {
+                    start: map_start,
+                    end: sigbus_start,
+                    frames,
+                });
+            } else if !frames.is_empty() {
+                return Err(err(SyscallError::ENOMEM));
+            }
+        }
         (true, MmapSource::Anonymous | MmapSource::DevZero) => {
             // Linux 的共享匿名 mmap 只建立 VMA；页在 fault 时分配并按 VMA 身份共享。
             areas.push(VmaInsertArea::Lazy {
@@ -181,7 +238,10 @@ fn build_vma_areas(
                 end: map_end,
             });
         }
-        (false, MmapSource::RegularFile { .. } | MmapSource::Shm { .. }) => {
+        (
+            false,
+            MmapSource::RegularFile { .. } | MmapSource::Shm { .. } | MmapSource::TmpFs { .. },
+        ) => {
             if map_start < sigbus_start {
                 areas.push(VmaInsertArea::Framed {
                     start: map_start,
@@ -341,7 +401,7 @@ fn mmap_packet_socket_ring(
         file_ino: 0,
         file_offset: 0,
         backing_id: 0,
-        memfd_id: 0,
+        shmem_id: 0,
         anon_shared_id: crate::mm::allocate_shared_anon_id(),
         sysv_shmid: 0,
         growsdown: false,
@@ -465,11 +525,16 @@ pub fn syscall_mmap(
                 dev,
                 ino,
             }
-        } else if let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() {
+        } else if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
             MmapSource::Shm {
                 shm,
-                memfd_id: shm.memfd_id(),
-                sealed_write: shm.has_memfd_seal(PseudoShmFile::F_SEAL_WRITE),
+                mapping_id: shm.memfd_id(),
+                sealed_write: shm.has_memfd_seal(MemfdFile::F_SEAL_WRITE),
+            }
+        } else if let Some(tmpfs) = tmpfs_file_for_kernel_file(file) {
+            MmapSource::TmpFs {
+                file: tmpfs,
+                mapping_id: tmpfs.mapping_id(),
             }
         } else if file
             .as_any()
@@ -490,13 +555,16 @@ pub fn syscall_mmap(
         _ => off,
     };
     if is_shared && (prot & PROT_WRITE) != 0 {
-        if let MmapSource::Shm { sealed_write, .. } = source {
-            if sealed_write {
-                return err(SyscallError::EPERM);
+        if matches!(
+            source,
+            MmapSource::Shm {
+                sealed_write: true,
+                ..
             }
+        ) {
+            return err(SyscallError::EPERM);
         }
     }
-    let shared_inode_backed = is_shared && matches!(source, MmapSource::RegularFile { .. });
     let shared_anon_backed =
         is_shared && matches!(source, MmapSource::Anonymous | MmapSource::DevZero);
     // 对齐len
@@ -612,12 +680,13 @@ pub fn syscall_mmap(
         Ok(areas) => areas,
         Err(e) => return e,
     };
-    let (memfd_id, sealed_write) = match source {
+    let (shmem_id, sealed_write) = match source {
         MmapSource::Shm {
-            memfd_id,
+            mapping_id,
             sealed_write,
             ..
-        } => (memfd_id, sealed_write),
+        } => (mapping_id, sealed_write),
+        MmapSource::TmpFs { mapping_id, .. } => (mapping_id, false),
         _ => (0, false),
     };
     let anon_shared_id = if shared_anon_backed {
@@ -647,8 +716,10 @@ pub fn syscall_mmap(
             | (true, MmapSource::Anonymous | MmapSource::DevZero)
             | (false, MmapSource::Anonymous | MmapSource::DevZero) => MapType::Lazy,
             (true, MmapSource::Shm { .. })
+            | (true, MmapSource::TmpFs { .. })
             | (false, MmapSource::RegularFile { .. })
-            | (false, MmapSource::Shm { .. }) => MapType::Framed,
+            | (false, MmapSource::Shm { .. })
+            | (false, MmapSource::TmpFs { .. }) => MapType::Framed,
         },
         map_perm: perm,
         file_valid_len,
@@ -660,17 +731,21 @@ pub fn syscall_mmap(
         file_ino,
         file_offset,
         backing_id: 0,
-        memfd_id,
+        shmem_id,
         anon_shared_id,
         sysv_shmid: 0,
         growsdown: (flags & MAP_GROWSDOWN) != 0,
         fork_inherited_anon: false,
     };
     // shared OSInode 页由 fault 从文件/cache 装入；private/file framed 映射仍可预填充。
-    let should_populate_file =
-        matches!(source, MmapSource::RegularFile { .. }) && !shared_inode_backed;
+    let should_populate_file = matches!(
+        source,
+        MmapSource::RegularFile { .. } | MmapSource::Shm { .. } | MmapSource::TmpFs { .. }
+    ) && !is_shared;
     let backing_file = match source {
-        MmapSource::RegularFile { .. } | MmapSource::Shm { .. } => file.as_ref(),
+        MmapSource::RegularFile { .. } | MmapSource::Shm { .. } | MmapSource::TmpFs { .. } => {
+            file.as_ref()
+        }
         _ => None,
     };
     let populate_file = should_populate_file.then_some(backing_file).flatten();
@@ -1012,21 +1087,20 @@ pub fn syscall_mremap(
                 |_| true,
             )
         }
-    } else if src_region.shared && src_region.memfd_id != 0 {
+    } else if src_region.shared && src_region.shmem_id != 0 {
         let backing_file = {
             let memory_set = inner.memory_set.lock();
             memory_set.mmap_backing_file(src_region.backing_id)
         };
         let Some(file) = backing_file
-            .or_else(|| find_shm_file_in_snapshot(&files_snapshot, src_region.memfd_id))
-            .or_else(|| find_open_shm_file(src_region.memfd_id))
+            .or_else(|| find_shm_file_in_snapshot(&files_snapshot, src_region.shmem_id))
+            .or_else(|| find_open_shm_file(src_region.shmem_id))
         else {
             return err(SyscallError::ENOMEM);
         };
-        let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
+        let Some(file_size) = shmem_file_len(&file) else {
             return err(SyscallError::ENOMEM);
         };
-        let file_size = shm.len();
         let old_slice_file_valid_len = src_region
             .file_valid_end()
             .saturating_sub(old_addr)
@@ -1045,7 +1119,7 @@ pub fn syscall_mremap(
         if grow_start < final_sigbus_start {
             let shared_end = min(final_sigbus_start, target_new_end);
             let shared_len = shared_end.saturating_sub(grow_start);
-            let Some(frames) = shm.shared_frames_existing(grow_file_offset, shared_len) else {
+            let Some(frames) = shmem_shared_frames(&file, grow_file_offset, shared_len) else {
                 return err(SyscallError::ENOMEM);
             };
             grow_areas.push(VmaInsertArea::SharedFrames {

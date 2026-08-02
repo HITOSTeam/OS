@@ -65,6 +65,7 @@ pub(crate) fn proc_root_entries_for_pid_namespace(namespace_id: usize) -> Vec<Ps
     for name in [
         "mounts",
         "mountinfo",
+        "filesystems",
         "cgroups",
         "meminfo",
         "cpuinfo",
@@ -658,6 +659,11 @@ pub(crate) fn proc_pid_ns_entries(pid: u32) -> Vec<PseudoDirent> {
         name: String::from(".."),
         ino: pid as u64,
         dtype: 4,
+    });
+    entries.push(PseudoDirent {
+        name: String::from("cgroup"),
+        ino: pid as u64,
+        dtype: 10,
     });
     entries.push(PseudoDirent {
         name: String::from("ipc"),

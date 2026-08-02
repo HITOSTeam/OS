@@ -24,7 +24,7 @@ static NEXT_SHARED_ANON_ID: AtomicUsize = AtomicUsize::new(1);
 lazy_static::lazy_static! {
     /// OSInode-backed MAP_SHARED 的第一阶段共享页缓存。
     ///
-    /// 只覆盖普通文件共享映射；memfd/SysV shm 走各自的 shared-frame，
+    /// 只覆盖普通文件共享映射；shmem/SysV shm 走各自的 shared-frame，
     /// MAP_PRIVATE 不能复用这里的 frame。
     static ref SHARED_FILE_PAGE_CACHE: Mutex<BTreeMap<SharedFilePageKey, FrameTracker>> =
         Mutex::new(BTreeMap::new());
@@ -176,17 +176,22 @@ pub(super) fn shared_file_page_cache_reclaim_unreferenced() -> usize {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MmapBackingKind {
-    File { dev: usize, ino: u32 },
-    // 内存中文件
-    Memfd { id: u64 },
+    File {
+        dev: usize,
+        ino: u32,
+    },
+    /// Linux shmem family: anonymous memfd and pathname-backed tmpfs.
+    Shmem {
+        id: u64,
+    },
 }
 
 impl MmapBackingKind {
-    /// 从 VmRegion 推导 backing 类型：memfd 优先，其次普通文件，匿名映射返回 None。
+    /// 从 VmRegion 推导 backing 类型：shmem 优先，其次普通文件，匿名映射返回 None。
     pub(super) fn from_region(region: &VmRegion) -> Option<Self> {
-        if region.memfd_id != 0 {
-            Some(Self::Memfd {
-                id: region.memfd_id,
+        if region.shmem_id != 0 {
+            Some(Self::Shmem {
+                id: region.shmem_id,
             })
         } else if region.file_backed {
             Some(Self::File {
@@ -198,16 +203,16 @@ impl MmapBackingKind {
         }
     }
 
-    /// 检查 region 是否属于本 backing（dev/ino 或 memfd id 匹配）。
+    /// 检查 region 是否属于本 backing（dev/ino 或 shmem id 匹配）。
     pub(super) fn matches_region(self, region: &VmRegion) -> bool {
         match self {
             Self::File { dev, ino } => {
                 region.file_backed
-                    && region.memfd_id == 0
+                    && region.shmem_id == 0
                     && region.file_dev == dev
                     && region.file_ino == ino
             }
-            Self::Memfd { id } => region.memfd_id == id,
+            Self::Shmem { id } => region.shmem_id == id,
         }
     }
 }

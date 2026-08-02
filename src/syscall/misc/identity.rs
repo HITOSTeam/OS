@@ -500,20 +500,14 @@ pub fn syscall_getresgid(rgid: usize, egid: usize, sgid: usize) -> isize {
 }
 
 pub fn current_umask() -> usize {
-    let process = current_process();
-    let inner = process.borrow_mut();
-    inner.umask & 0o777
+    current_process().fs_struct().umask()
 }
 
 /// Linux `umask(2)` (syscall 166 on riscv64).
 ///
 /// A minimal implementation for daemon() and common utilities.
 pub fn syscall_umask(mask: usize) -> isize {
-    let process = current_process();
-    let mut inner = process.borrow_mut();
-    let prev = inner.umask & 0o777;
-    inner.umask = mask & 0o777;
-    prev as isize
+    current_process().fs_struct().swap_umask(mask) as isize
 }
 
 /// Linux `seteuid(2)` — convenience wrapper used by some LTP tests.

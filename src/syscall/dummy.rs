@@ -1,10 +1,10 @@
 use crate::syscall::error::{SyscallError, err};
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use crate::{
     fs::{
-        DummyFile, EventFdFile, File, PidFdFile, PseudoShmFile, SignalfdFile, TimerFdFile,
-        UserfaultfdFile, shm_create_anonymous, userfaultfd_active,
+        DummyFile, EventFdFile, File, MemfdFile, PidFdFile, SignalfdFile, TimerFdFile,
+        UserfaultfdFile, memfd_create_backing, userfaultfd_active,
     },
     mm::{try_copy_from_user, try_read_user_value, try_write_user_value},
     task::{
@@ -54,20 +54,22 @@ fn alloc_dummy_fd(descriptor_flags: u32) -> isize {
     alloc_fd(Arc::new(DummyFile::new(true, true)), descriptor_flags)
 }
 
-fn validate_user_cstr(name: usize, max_len: usize) -> Result<(), isize> {
+fn read_user_cstr(name: usize, max_len: usize) -> Result<String, isize> {
     if name == 0 {
         return Err(err(SyscallError::EFAULT));
     }
     let token = get_current_token();
     let mut byte = [0u8; 1];
+    let mut bytes = Vec::new();
     for i in 0..=max_len {
         let ptr = name.checked_add(i).ok_or(err(SyscallError::EFAULT))? as *const u8;
         if try_copy_from_user(token, ptr, &mut byte).is_err() {
             return Err(err(SyscallError::EFAULT));
         }
         if byte[0] == 0 {
-            return Ok(());
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
         }
+        bytes.push(byte[0]);
     }
     // Linux memfd_create rejects unterminated or overlong names with err(SyscallError::EINVAL).
     Err(err(SyscallError::EINVAL))
@@ -378,16 +380,17 @@ pub fn syscall_memfd_create(name: usize, flags: usize) -> isize {
     if (flags & !KNOWN_FLAGS) != 0 {
         return err(SyscallError::EINVAL);
     }
-    if let Err(e) = validate_user_cstr(name, MEMFD_NAME_MAX) {
-        return e;
-    }
+    let name = match read_user_cstr(name, MEMFD_NAME_MAX) {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
     let mut descriptor_flags = 0u32;
     if (flags & MFD_CLOEXEC) != 0 {
         descriptor_flags |= FD_CLOEXEC;
     }
     let allow_sealing = (flags & MFD_ALLOW_SEALING) != 0;
     let file: Arc<dyn File + Send + Sync> =
-        Arc::new(PseudoShmFile::new(shm_create_anonymous(allow_sealing)));
+        Arc::new(MemfdFile::new(memfd_create_backing(&name, allow_sealing)));
     alloc_fd(file, descriptor_flags)
 }
 

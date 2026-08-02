@@ -4,12 +4,18 @@ use crate::{
     arch::{hart_id, read_time, set_timer},
     config::{MAX_HARTS, clock_freq},
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 /// 默认一秒钟执行 100 个时钟中断。
 const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
 const NSEC_PER_SEC: u128 = 1_000_000_000;
+const DEFAULT_REALTIME_EPOCH_NS: i64 = 1_700_000_000_000_000_000;
+
+/// Difference between the monotonic clocksource and `CLOCK_REALTIME`.
+/// Keeping wall-clock state in the timekeeping layer lets filesystems obtain
+/// inode timestamps without depending on syscall implementation details.
+static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(DEFAULT_REALTIME_EPOCH_NS);
 
 #[cfg(target_arch = "loongarch64")]
 use core::sync::atomic::AtomicBool;
@@ -48,6 +54,21 @@ pub fn get_time() -> usize {
 pub fn get_time_ns() -> u64 {
     let freq = clock_freq() as u128;
     ((read_time() as u128).saturating_mul(1_000_000_000u128) / freq) as u64
+}
+
+/// Return the current Unix wall-clock time in nanoseconds.
+pub fn get_realtime_ns() -> u64 {
+    let monotonic = get_time_ns() as i128;
+    let offset = REALTIME_OFFSET_NS.load(Ordering::Relaxed) as i128;
+    (monotonic + offset).clamp(0, u64::MAX as i128) as u64
+}
+
+/// Set `CLOCK_REALTIME` while preserving the monotonic clocksource.
+pub fn set_realtime_ns(target_ns: u64) {
+    let offset = (target_ns as i128)
+        .saturating_sub(get_time_ns() as i128)
+        .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
 }
 
 /// get current time in milliseconds

@@ -6,9 +6,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use super::File;
+use super::block_root;
+use super::ext4::Ext4Vfs;
+use super::vfs::{
+    FsStruct, LookupFlags, PathWalker, VfsCredentials, VfsFileSystem, VfsMountFlags,
+    VfsMountNamespace, VfsMountNamespaceClone, VfsMountPropagation, VfsPath, VfsResult,
+};
 
 const INITIAL_ROOT_PEER_GROUP_ID: usize = 1;
+const INITIAL_VFS_ROOT_PEER_GROUP_ID: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MountPropagation {
@@ -35,20 +41,6 @@ pub(crate) enum MountBackend {
 }
 
 impl MountBackend {
-    pub(crate) fn is_pseudo(&self) -> bool {
-        !matches!(self, Self::Storage)
-    }
-
-    pub(crate) fn canonical_root(&self) -> Option<&'static str> {
-        match self {
-            Self::Storage => None,
-            Self::Proc { .. } => Some("/proc"),
-            Self::SysFs => Some("/sys"),
-            Self::DevTmpFs => Some("/dev"),
-            Self::Cgroup => None,
-        }
-    }
-
     pub(crate) fn statfs_magic(&self) -> i64 {
         match self {
             Self::Storage => 0xef53,
@@ -65,7 +57,7 @@ impl MountBackend {
 pub(crate) struct MountRecord {
     /// Logical mount point seen by processes, e.g. `/proc` or `/mnt`.
     pub(crate) target: String,
-    /// Internal source path used for path translation in this kernel.
+    /// Mount source retained for device selection and `/proc/*/mountinfo` display.
     pub(crate) source: String,
     /// Source name shown to userspace in `/proc/*/mountinfo`.
     pub(crate) source_display: String,
@@ -91,41 +83,15 @@ pub(crate) struct MountRecord {
     pub(crate) expire_mark_seq: Option<usize>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct FdMountRef {
-    pub(crate) target: String,
-    pub(crate) event_id: usize,
-    pub(crate) stack_seq: usize,
-    pub(crate) flags: usize,
-    pub(crate) backend: MountBackend,
-}
-
-impl From<&MountRecord> for FdMountRef {
-    fn from(record: &MountRecord) -> Self {
-        Self {
-            target: record.target.clone(),
-            event_id: record.event_id,
-            stack_seq: record.stack_seq,
-            flags: record.flags,
-            backend: record.backend.clone(),
-        }
-    }
-}
-
 pub(crate) type MountNamespace = Arc<Mutex<MountNamespaceState>>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// whether a path is psudo file or real file
-pub(crate) enum ClassifiedAbsPath {
-    Ext4(String),
-    Pseudo(String),
-}
 
 pub(crate) struct MountNamespaceState {
     id: usize,
+    /// Authoritative object graph for pathname lookup and mount identity.
+    /// Records below are presentation metadata for mountinfo and propagation.
+    vfs: Arc<VfsMountNamespace>,
     mounts: Vec<MountRecord>,
     rofs_mounts: Vec<String>,
-    file_binds: BTreeMap<String, Arc<dyn File + Send + Sync>>,
 }
 
 impl MountNamespaceState {
@@ -202,14 +168,37 @@ impl MountNamespaceState {
         }
         Self {
             id,
+            vfs: build_initial_vfs_namespace(),
             mounts,
             rofs_mounts: Vec::new(),
-            file_binds: BTreeMap::new(),
         }
     }
 
     pub(crate) fn id(&self) -> usize {
         self.id
+    }
+
+    pub(crate) fn vfs_namespace(&self) -> Arc<VfsMountNamespace> {
+        Arc::clone(&self.vfs)
+    }
+
+    pub(crate) fn vfs_root_path(&self) -> VfsPath {
+        self.vfs.root_path()
+    }
+
+    pub(crate) fn resolve_vfs_absolute(
+        &self,
+        path: &str,
+        follow_final: bool,
+        credentials: VfsCredentials,
+    ) -> VfsResult<VfsPath> {
+        let root = self.vfs.root_path();
+        let flags = LookupFlags(if follow_final {
+            LookupFlags::FOLLOW_FINAL
+        } else {
+            0
+        });
+        PathWalker::new(Arc::clone(&self.vfs)).walk(&root, &root, path, flags, credentials)
     }
 
     pub(crate) fn mounts(&self) -> &[MountRecord] {
@@ -226,18 +215,6 @@ impl MountNamespaceState {
 
     pub(crate) fn rofs_mounts_mut(&mut self) -> &mut Vec<String> {
         &mut self.rofs_mounts
-    }
-
-    pub(crate) fn bound_file_for_path(&self, abs: &str) -> Option<Arc<dyn File + Send + Sync>> {
-        self.file_binds.get(abs).cloned()
-    }
-
-    pub(crate) fn bind_file(&mut self, target: &str, file: Arc<dyn File + Send + Sync>) {
-        self.file_binds.insert(String::from(target), file);
-    }
-
-    pub(crate) fn remove_bound_file(&mut self, target: &str) {
-        self.file_binds.remove(target);
     }
 
     pub(crate) fn top_mount_index_for_target(&self, target: &str) -> Option<usize> {
@@ -291,49 +268,6 @@ impl MountNamespaceState {
         self.mount_record_for_path(abs)
             .map(|mount| mount.flags)
             .unwrap_or(0)
-    }
-
-    pub(crate) fn classify_logical_abs_path(&self, abs: &str) -> ClassifiedAbsPath {
-        if self.bound_file_for_path(abs).is_some() {
-            return ClassifiedAbsPath::Pseudo(String::from(abs));
-        }
-        if self
-            .mount_record_for_path(abs)
-            .is_some_and(|mount| mount.backend.is_pseudo())
-        {
-            return ClassifiedAbsPath::Pseudo(String::from(abs));
-        }
-        ClassifiedAbsPath::Ext4(self.translate_mount_abs(abs))
-    }
-
-    /// Translate a logical path inside a virtual mount to the canonical path
-    /// understood by the existing proc/sys/dev providers.
-    pub(crate) fn canonical_pseudo_abs(&self, abs: &str) -> Option<(MountRecord, String)> {
-        let mount = self.mount_record_for_path(abs)?;
-        let canonical_root = mount.backend.canonical_root()?;
-        let root = if path_under_mount(&mount.source, canonical_root) {
-            mount.source.clone()
-        } else {
-            String::from(canonical_root)
-        };
-        let suffix = if abs == mount.target {
-            ""
-        } else {
-            &abs[mount.target.len()..]
-        };
-        Some((mount, mount_path_join(&root, suffix)))
-    }
-
-    pub(crate) fn translate_mount_abs(&self, abs: &str) -> String {
-        let Some(mount) = self.mount_record_for_path(abs) else {
-            return String::from(abs);
-        };
-        let suffix = if abs == mount.target {
-            ""
-        } else {
-            &abs[mount.target.len()..]
-        };
-        mount_path_join(&mount.source, suffix)
     }
 
     pub(crate) fn display_mount_abs(&self, abs: &str) -> String {
@@ -422,14 +356,97 @@ impl MountNamespaceState {
         best.map(String::from)
     }
 
-    fn clone_detached(&self) -> Self {
-        Self {
+    fn clone_detached_with_map(&self) -> (Self, VfsMountNamespaceClone) {
+        let vfs_clone = self.vfs.clone_namespace_with_map();
+        let state = Self {
             id: alloc_mount_namespace_id(),
+            vfs: Arc::clone(vfs_clone.namespace()),
             mounts: self.mounts.clone(),
             rofs_mounts: self.rofs_mounts.clone(),
-            file_binds: self.file_binds.clone(),
+        };
+        (state, vfs_clone)
+    }
+}
+
+fn build_initial_vfs_namespace() -> Arc<VfsMountNamespace> {
+    let root_inode = block_root(0).expect("[vfs] /dev/vda has no ext4 root inode");
+    let root_fs: Arc<dyn VfsFileSystem> = Ext4Vfs::new(root_inode);
+    let namespace = VfsMountNamespace::new(root_fs);
+    let root = namespace.root_path();
+    namespace
+        .set_propagation(
+            &root,
+            VfsMountPropagation::Shared {
+                peer_group: INITIAL_VFS_ROOT_PEER_GROUP_ID,
+            },
+        )
+        .expect("[vfs] failed to mark the initial root mount shared");
+
+    if let Some(user_root) = block_root(1) {
+        let target = vfs_lookup_absolute(&namespace, "/user")
+            .expect("[vfs] initial /user mountpoint is missing");
+        let filesystem: Arc<dyn VfsFileSystem> = Ext4Vfs::new(user_root);
+        let mounted = namespace
+            .mount_with_source(
+                &target,
+                filesystem,
+                VfsMountFlags::default(),
+                String::from("/dev/vdb"),
+            )
+            .expect("[vfs] failed to mount /dev/vdb at /user");
+        let mounted_root = VfsPath::new(Arc::clone(&mounted), Arc::clone(mounted.root()));
+        namespace
+            .set_propagation(&mounted_root, VfsMountPropagation::Private)
+            .expect("[vfs] failed to make /user private");
+    }
+
+    if let Some(test_root) = block_root(2) {
+        let target = vfs_lookup_absolute(&namespace, "/mnt/oscomp")
+            .expect("[vfs] initial /mnt/oscomp mountpoint is missing");
+        let filesystem: Arc<dyn VfsFileSystem> = Ext4Vfs::new(test_root);
+        let mounted = namespace
+            .mount_with_source(
+                &target,
+                filesystem,
+                VfsMountFlags::default(),
+                String::from("/dev/vdc"),
+            )
+            .expect("[vfs] failed to mount /dev/vdc at /mnt/oscomp");
+        let mounted_root = VfsPath::new(Arc::clone(&mounted), Arc::clone(mounted.root()));
+        namespace
+            .set_propagation(&mounted_root, VfsMountPropagation::Private)
+            .expect("[vfs] failed to make /mnt/oscomp private");
+
+        for (source, target) in [
+            ("/mnt/oscomp/glibc", "/glibc"),
+            ("/mnt/oscomp/musl", "/musl"),
+        ] {
+            let source = vfs_lookup_absolute(&namespace, source)
+                .expect("[vfs] initial bind source is missing");
+            let target = vfs_lookup_absolute(&namespace, target)
+                .expect("[vfs] initial bind target is missing");
+            let bind = namespace
+                .bind(&target, &source, VfsMountFlags::default())
+                .expect("[vfs] failed to create initial bind mount");
+            let bind_root = VfsPath::new(Arc::clone(&bind), Arc::clone(bind.root()));
+            namespace
+                .set_propagation(&bind_root, VfsMountPropagation::Private)
+                .expect("[vfs] failed to make initial bind private");
         }
     }
+
+    namespace
+}
+
+fn vfs_lookup_absolute(namespace: &Arc<VfsMountNamespace>, path: &str) -> VfsResult<VfsPath> {
+    let root = namespace.root_path();
+    PathWalker::new(Arc::clone(namespace)).walk(
+        &root,
+        &root,
+        path,
+        LookupFlags(LookupFlags::FOLLOW_FINAL),
+        VfsCredentials::default(),
+    )
 }
 
 static NEXT_MOUNT_NS_ID: AtomicUsize = AtomicUsize::new(1);
@@ -480,9 +497,13 @@ pub(crate) fn initial_mount_namespace() -> MountNamespace {
     Arc::clone(&INITIAL_MOUNT_NAMESPACE)
 }
 
-pub(crate) fn clone_mount_namespace(ns: &MountNamespace) -> MountNamespace {
-    let snapshot = ns.lock().clone_detached();
-    Arc::new(Mutex::new(snapshot))
+pub(crate) fn clone_mount_namespace_and_fs(
+    ns: &MountNamespace,
+    fs: &FsStruct,
+) -> VfsResult<(MountNamespace, Arc<FsStruct>)> {
+    let (snapshot, vfs_clone) = ns.lock().clone_detached_with_map();
+    let cloned_fs = fs.clone_for_namespace(&vfs_clone)?;
+    Ok((Arc::new(Mutex::new(snapshot)), cloned_fs))
 }
 
 pub(crate) fn mount_namespace_id(ns: &MountNamespace) -> usize {

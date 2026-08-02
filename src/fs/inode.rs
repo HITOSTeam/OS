@@ -1,5 +1,6 @@
 //! Inode abstraction for ext4 filesystem
 
+use super::vfs::{PinnedPath, VfsPath};
 use super::{File, POLLIN, POLLOUT};
 use crate::drivers::BLOCK_DEVICES;
 use crate::mm::UserBuffer;
@@ -418,7 +419,7 @@ pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
         let base = if index == 0 {
             String::from("/")
         } else {
-            alloc::format!("/.block_devices/vd{}", (b'a' + index as u8) as char)
+            alloc::format!("/dev/vd{}", (b'a' + index as u8) as char)
         };
         if root.device_id() == target_dev && root.inode_num() == target_ino {
             return Some(base);
@@ -502,6 +503,7 @@ pub struct OSInode {
     replace_on_write: bool,
     fanotify_silent: bool,
     fanotify_path: Option<String>,
+    vfs_path: Option<PinnedPath>,
     tmpfile_cleanup: Option<TmpfileCleanup>,
     write_open: Mutex<WriteOpenState>,
     inner: Arc<Mutex<OSInodeInner>>,
@@ -744,6 +746,7 @@ impl OSInode {
             replace_on_write,
             fanotify_silent: false,
             fanotify_path: None,
+            vfs_path: None,
             tmpfile_cleanup: tmpfile_cleanup.map(|(parent, name)| TmpfileCleanup { parent, name }),
             write_open: Mutex::new(write_open),
             inner,
@@ -753,6 +756,15 @@ impl OSInode {
     pub(crate) fn with_fanotify_path(mut self, path: Option<String>) -> Self {
         self.fanotify_path = path;
         self
+    }
+
+    pub(crate) fn with_vfs_path(mut self, path: Option<VfsPath>) -> Self {
+        self.vfs_path = path.map(PinnedPath::new);
+        self
+    }
+
+    pub(crate) fn vfs_path(&self) -> Option<&PinnedPath> {
+        self.vfs_path.as_ref()
     }
 
     pub fn append(&self) -> bool {
@@ -782,7 +794,10 @@ impl OSInode {
     }
 
     pub fn readonly_fs(&self) -> bool {
-        self.readonly_fs
+        self.vfs_path
+            .as_ref()
+            .map(|path| path.path().mount().flags().is_read_only())
+            .unwrap_or(self.readonly_fs)
     }
 
     pub(crate) fn fanotify_silent(&self) -> bool {
@@ -1316,10 +1331,13 @@ pub(crate) fn ensure_root_mount_directory(name: &str) {
 pub(crate) fn block_device_source_path(name: &str) -> Option<String> {
     let index = block_device_index(name)?;
     BLOCK_ROOTS.get(index)?.as_ref()?;
-    Some(alloc::format!(
-        "/.block_devices/vd{}",
-        (b'a' + index as u8) as char
-    ))
+    Some(alloc::format!("/dev/vd{}", (b'a' + index as u8) as char))
+}
+
+/// Resolve a block-device mount source directly to that device's ext4 root.
+/// Object-VFS callers use this instead of manufacturing a hidden pathname.
+pub(crate) fn block_root_for_source(name: &str) -> Option<Arc<Inode>> {
+    block_device_index(name).and_then(block_root)
 }
 
 fn block_device_index(name: &str) -> Option<usize> {
@@ -1337,12 +1355,12 @@ fn block_device_index(name: &str) -> Option<usize> {
 }
 
 fn device_path_parts(path: &str) -> Option<(usize, &str)> {
-    let path = path.strip_prefix("/.block_devices/")?;
+    let path = path.strip_prefix("/dev/")?;
     let (device, suffix) = path.split_once('/').unwrap_or((path, ""));
     Some((block_device_index(device)?, suffix))
 }
 
-fn block_root(index: usize) -> Option<Arc<Inode>> {
+pub(crate) fn block_root(index: usize) -> Option<Arc<Inode>> {
     BLOCK_ROOTS
         .get(index)
         .and_then(|root| root.as_ref())
@@ -1351,9 +1369,10 @@ fn block_root(index: usize) -> Option<Arc<Inode>> {
 
 /// Find a path in exactly one filesystem.
 ///
-/// Logical mount translation encodes non-root filesystems under the internal
-/// `/.block_devices/vdX` prefix.  Missing files never fall through to another
-/// disk, matching Linux mount semantics.
+/// Transitional callers may identify a non-root filesystem as `/dev/vdX`.
+/// The device name selects exactly one ext4 root; missing files never fall
+/// through to another disk, matching Linux mount semantics.  Object-VFS
+/// callers hold the selected filesystem directly and do not use this path.
 ///
 fn find_path_from_inode(start: Arc<Inode>, path: &str) -> Option<Arc<Inode>> {
     let mut current = start;
@@ -1555,6 +1574,14 @@ impl File for OSInode {
 
     fn fixed_poll_mask(&self) -> Option<i16> {
         self.regular_file_poll_ready.then_some(POLLIN | POLLOUT)
+    }
+
+    fn object_path(&self) -> Option<&VfsPath> {
+        self.vfs_path.as_ref().map(PinnedPath::path)
+    }
+
+    fn logical_path_hint(&self) -> Option<&str> {
+        self.fanotify_path.as_deref()
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {

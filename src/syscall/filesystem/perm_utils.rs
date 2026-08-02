@@ -1,6 +1,7 @@
 use super::{
-    SyscallError, clear_ext4_path_cache, current_process, err, with_ext4_inode_write,
+    SyscallError, clear_ext4_path_cache, current_process, err, map_vfs_error, with_ext4_inode_write,
 };
+use crate::fs::vfs::{VfsNodeKind, VfsPath};
 
 /// Converts ext4 backend errors into Linux-style `errno` values.
 pub(crate) fn ext4_err_to_errno(e: ext4_fs::Ext4Error) -> isize {
@@ -64,6 +65,72 @@ pub(crate) fn maybe_clear_suid_sgid_after_chown(inode: &ext4_fs::Inode, touched_
 /// Applies `chown`/`chgrp` semantics to an inode using current credentials.
 pub(crate) fn apply_chown_to_inode(inode: &ext4_fs::Inode, uid: usize, gid: usize) -> isize {
     with_ext4_inode_write(inode, || apply_chown_to_inode_locked(inode, uid, gid))
+}
+
+/// Apply chmod to an object-VFS node using the mount and inode metadata that
+/// were pinned by lookup. This mirrors Linux notify_change ownership and
+/// setgid filtering without reconstructing a pathname.
+pub(crate) fn apply_chmod_to_vfs_path(path: &VfsPath, mode: usize) -> isize {
+    if path.mount().flags().is_read_only() {
+        return err(SyscallError::EROFS);
+    }
+    let metadata = match path.node().metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return map_vfs_error(error),
+    };
+    let (euid, _) = current_effective_uid_gid();
+    if euid != 0 && metadata.uid != euid {
+        return err(SyscallError::EPERM);
+    }
+    let mut new_mode = (mode as u16) & 0o7777;
+    if euid != 0 && new_mode & 0o2000 != 0 && !current_in_group(metadata.gid) {
+        new_mode &= !0o2000;
+    }
+    match path.node().set_mode(new_mode) {
+        Ok(()) => 0,
+        Err(error) => map_vfs_error(error),
+    }
+}
+
+/// Apply chown/chgrp and the associated set-id clearing as one backend
+/// metadata transaction.
+pub(crate) fn apply_chown_to_vfs_path(path: &VfsPath, uid: usize, gid: usize) -> isize {
+    if path.mount().flags().is_read_only() {
+        return err(SyscallError::EROFS);
+    }
+    let metadata = match path.node().metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return map_vfs_error(error),
+    };
+    let uid_req = parse_chown_id(uid);
+    let gid_req = parse_chown_id(gid);
+    let (euid, _) = current_effective_uid_gid();
+    if euid != 0 {
+        if metadata.uid != euid {
+            return err(SyscallError::EPERM);
+        }
+        if uid_req.is_some_and(|new_uid| new_uid != metadata.uid) {
+            return err(SyscallError::EPERM);
+        }
+        if gid_req.is_some_and(|new_gid| new_gid != metadata.gid && !current_in_group(new_gid)) {
+            return err(SyscallError::EPERM);
+        }
+    }
+
+    let new_uid = uid_req.unwrap_or(metadata.uid);
+    let new_gid = gid_req.unwrap_or(metadata.gid);
+    let touched_owner = uid_req.is_some() || gid_req.is_some();
+    let mut new_mode = metadata.mode;
+    if touched_owner && metadata.kind == VfsNodeKind::Regular {
+        new_mode &= !0o4000;
+        if new_mode & 0o0010 != 0 {
+            new_mode &= !0o2000;
+        }
+    }
+    match path.node().set_mode_owner(new_mode, new_uid, new_gid) {
+        Ok(()) => 0,
+        Err(error) => map_vfs_error(error),
+    }
 }
 
 fn apply_chown_to_inode_locked(inode: &ext4_fs::Inode, uid: usize, gid: usize) -> isize {
@@ -141,6 +208,33 @@ pub(crate) fn inode_mode_allows_uid_gid(
         return false;
     }
     true
+}
+
+/// Evaluate rwx permission bits from a VFS metadata snapshot. Root bypasses
+/// read/write checks; executing a non-directory still requires at least one
+/// executable bit, matching Linux access(2) behavior.
+pub(crate) fn vfs_mode_allows_uid_gid(
+    metadata: crate::fs::vfs::VfsMetadata,
+    mask: usize,
+    uid: u32,
+    gid: u32,
+) -> bool {
+    if mask == 0 {
+        return true;
+    }
+    if uid == 0 {
+        return mask & 1 == 0
+            || metadata.kind == VfsNodeKind::Directory
+            || metadata.mode & 0o111 != 0;
+    }
+    let permissions = if uid == metadata.uid {
+        (metadata.mode >> 6) & 0o7
+    } else if gid == metadata.gid {
+        (metadata.mode >> 3) & 0o7
+    } else {
+        metadata.mode & 0o7
+    } as usize;
+    permissions & mask == mask
 }
 
 /// Evaluates rwx permission bits using the caller's fsuid/fsgid.

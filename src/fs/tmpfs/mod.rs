@@ -4,20 +4,22 @@
 //! files and dentries keep unlinked nodes alive through `Arc`.
 
 use crate::config::PAGE_SIZE;
-use crate::fs::File;
 use crate::fs::vfs::{
-    DentryCachePolicy, VfsDirEntry, VfsError, VfsFileSystem, VfsLink, VfsMetadata, VfsNode,
-    VfsNodeKind, VfsOpenOptions, VfsResult, VfsStatFs, VfsTimes,
+    DentryCachePolicy, VfsDirEntry, VfsError, VfsFileOperations, VfsFileSystem, VfsFileSystemState,
+    VfsLink, VfsMetadata, VfsNode, VfsNodeKind, VfsOpenOptions, VfsRenameFlags, VfsResult,
+    VfsStatFs, VfsTimes,
 };
-use crate::mm::UserBuffer;
+#[cfg(not(target_os = "none"))]
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, RwLock};
+
+use crate::mm::{FrameTracker, frame_alloc};
 
 /// Linux `TMPFS_MAGIC`，由 `statfs(2)` 的 `f_type` 返回。
 const TMPFS_MAGIC: u64 = 0x0102_1994;
@@ -28,6 +30,73 @@ const XATTR_REPLACE: u32 = 2;
 
 /// 为每个独立 TmpFs 实例分配稳定的 filesystem ID。
 static NEXT_TMPFS_ID: AtomicUsize = AtomicUsize::new(0x10000);
+/// Stable identity used by VMAs backed by a TmpFs inode.
+///
+/// Keep the high bit set so these IDs cannot collide with the low, monotonic
+/// IDs currently used by the kernel's anonymous memfd/shmem objects.
+static NEXT_TMPFS_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
+const TMPFS_MAPPING_ID_TAG: u64 = 1 << 63;
+
+/// One resident tmpfs page.
+///
+/// The kernel target stores a refcounted physical frame so MAP_SHARED can map
+/// the same page into multiple address spaces, just as Linux tmpfs keeps data
+/// in the page cache. Host-side unit tests retain a boxed page because there
+/// is no initialized physical-frame allocator there.
+struct TmpFsPage {
+    #[cfg(target_os = "none")]
+    frame: FrameTracker,
+    #[cfg(not(target_os = "none"))]
+    bytes: Box<[u8; PAGE_SIZE]>,
+}
+
+impl TmpFsPage {
+    fn allocate() -> Option<Self> {
+        #[cfg(target_os = "none")]
+        {
+            return frame_alloc().map(|frame| Self { frame });
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            Some(Self {
+                bytes: Box::new([0; PAGE_SIZE]),
+            })
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        #[cfg(target_os = "none")]
+        {
+            self.frame.ppn.get_bytes_array()
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            &self.bytes
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        #[cfg(target_os = "none")]
+        {
+            self.frame.ppn.get_bytes_array()
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            &mut self.bytes
+        }
+    }
+
+    fn frame(&self) -> Option<FrameTracker> {
+        #[cfg(target_os = "none")]
+        {
+            Some(self.frame.clone())
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            None
+        }
+    }
+}
 
 /// 创建一个 TmpFs 实例时使用的挂载参数。
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +197,8 @@ pub struct TmpFs {
     options: TmpFsOptions,
     /// 文件系统根节点，固定使用 inode 1。
     root: Arc<TmpFsNode>,
+    /// Stable root dentry and positive dcache shared by every mount/walker.
+    vfs_state: VfsFileSystemState,
     /// 下一个待分配的 inode 编号。
     next_inode: AtomicUsize,
     /// 当前仍存活的节点数量，包括已 unlink 但仍被打开的节点。
@@ -147,10 +218,8 @@ impl TmpFs {
     pub fn new(total_memory_bytes: usize, data: &str) -> VfsResult<Arc<Self>> {
         let options = TmpFsOptions::parse(total_memory_bytes, data)?;
         let id = NEXT_TMPFS_ID.fetch_add(1, Ordering::Relaxed) as u64;
-        let filesystem = Arc::new_cyclic(|weak_fs| Self {
-            id,
-            options,
-            root: Arc::new(TmpFsNode::new(
+        let filesystem = Arc::new_cyclic(|weak_fs| {
+            let root = Arc::new(TmpFsNode::new(
                 weak_fs.clone(),
                 1,
                 VfsNodeKind::Directory,
@@ -158,12 +227,19 @@ impl TmpFs {
                 options.uid,
                 options.gid,
                 0,
-            )),
-            next_inode: AtomicUsize::new(2),
-            used_inodes: AtomicUsize::new(1),
-            used_pages: AtomicUsize::new(0),
-            nodes: RwLock::new(BTreeMap::new()),
-            rename_lock: Mutex::new(()),
+            ));
+            let vfs_state = VfsFileSystemState::new(Arc::clone(&root) as Arc<dyn VfsNode>);
+            Self {
+                id,
+                options,
+                root,
+                vfs_state,
+                next_inode: AtomicUsize::new(2),
+                used_inodes: AtomicUsize::new(1),
+                used_pages: AtomicUsize::new(0),
+                nodes: RwLock::new(BTreeMap::new()),
+                rename_lock: Mutex::new(()),
+            }
         });
         filesystem
             .nodes
@@ -228,9 +304,8 @@ impl VfsFileSystem for TmpFs {
         "tmpfs"
     }
 
-    /// 返回文件系统根节点的 trait-object 强引用。
-    fn root_node(&self) -> Arc<dyn VfsNode> {
-        Arc::clone(&self.root) as Arc<dyn VfsNode>
+    fn vfs_state(&self) -> &VfsFileSystemState {
+        &self.vfs_state
     }
 
     /// 根据实际分配页和存活 inode 数量生成 `statfs` 快照。
@@ -243,6 +318,7 @@ impl VfsFileSystem for TmpFs {
             block_size: PAGE_SIZE as u64,
             blocks,
             blocks_free: blocks.saturating_sub(used_pages),
+            blocks_available: blocks.saturating_sub(used_pages),
             files: self.options.inode_limit as u64,
             files_free: (self.options.inode_limit as u64).saturating_sub(used_inodes),
             name_len: 255,
@@ -260,7 +336,7 @@ enum TmpFsData {
     /// 目录项名称到节点对象的有序映射；多个名称可以指向同一个硬链接节点。
     Directory(BTreeMap<String, Arc<TmpFsNode>>),
     /// 稀疏普通文件：key 为页号，只为实际写入过的 4 KiB 页分配内存。
-    Regular(BTreeMap<usize, Box<[u8; PAGE_SIZE]>>),
+    Regular(BTreeMap<usize, TmpFsPage>),
     /// 符号链接保存未经解析的目标字符串。
     Symlink(String),
     /// FIFO、字符/块设备和 socket 等当前只保存元数据的特殊节点。
@@ -286,6 +362,8 @@ pub struct TmpFsNode {
     fs: Weak<TmpFs>,
     /// 在所属 TmpFs 实例内稳定且唯一的 inode 编号。
     inode: u64,
+    /// VM-visible identity for shared mappings of this inode.
+    mapping_id: u64,
     /// 节点局部可变状态；普通 lookup/read 可以并发获取读锁。
     inner: RwLock<TmpFsNodeInner>,
 }
@@ -301,7 +379,7 @@ impl TmpFsNode {
         gid: u32,
         rdev: u64,
     ) -> Self {
-        let now = crate::time::get_time_ns();
+        let now = crate::time::get_realtime_ns();
         let data = match kind {
             VfsNodeKind::Directory => TmpFsData::Directory(BTreeMap::new()),
             VfsNodeKind::Regular => TmpFsData::Regular(BTreeMap::new()),
@@ -311,6 +389,8 @@ impl TmpFsNode {
         Self {
             fs,
             inode,
+            mapping_id: TMPFS_MAPPING_ID_TAG
+                | NEXT_TMPFS_MAPPING_ID.fetch_add(1, Ordering::Relaxed),
             inner: RwLock::new(TmpFsNodeInner {
                 metadata: VfsMetadata {
                     kind,
@@ -398,11 +478,11 @@ impl TmpFsNode {
             let chunk = (PAGE_SIZE - in_page).min(length - done);
             // 空洞读取 暗含在这里
             if let Some(page) = pages.get(&page_index) {
-                output[done..done + chunk].copy_from_slice(&page[in_page..in_page + chunk]);
+                output[done..done + chunk].copy_from_slice(&page.bytes()[in_page..in_page + chunk]);
             }
             done += chunk;
         }
-        inner.metadata.times.access_ns = crate::time::get_time_ns();
+        inner.metadata.times.access_ns = crate::time::get_realtime_ns();
         Ok(length)
     }
 
@@ -413,6 +493,15 @@ impl TmpFsNode {
     pub fn write_at(&self, offset: u64, input: &[u8]) -> VfsResult<usize> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        Self::write_locked(&fs, &mut inner, offset, input)
+    }
+
+    fn write_locked(
+        fs: &TmpFs,
+        inner: &mut TmpFsNodeInner,
+        offset: u64,
+        input: &[u8],
+    ) -> VfsResult<usize> {
         // 同上
         if inner.metadata.kind != VfsNodeKind::Regular {
             return Err(if inner.metadata.kind == VfsNodeKind::Directory {
@@ -438,11 +527,14 @@ impl TmpFsNode {
                 if !fs.reserve_page() {
                     break;
                 }
-                // 插入新分配的也买到 这个file
-                pages.insert(page_index, Box::new([0; PAGE_SIZE]));
+                let Some(page) = TmpFsPage::allocate() else {
+                    fs.release_pages(1);
+                    break;
+                };
+                pages.insert(page_index, page);
             }
             let page = pages.get_mut(&page_index).expect("page inserted");
-            page[in_page..in_page + chunk].copy_from_slice(&input[done..done + chunk]);
+            page.bytes_mut()[in_page..in_page + chunk].copy_from_slice(&input[done..done + chunk]);
             done += chunk;
         }
         if done == 0 && !input.is_empty() {
@@ -451,6 +543,15 @@ impl TmpFsNode {
         inner.metadata.size = inner.metadata.size.max(offset.saturating_add(done as u64));
         touch_modify_change(&mut inner.metadata);
         Ok(done)
+    }
+
+    /// Atomically choose EOF and append while holding this inode's data lock.
+    fn append_data(&self, input: &[u8]) -> VfsResult<(u64, usize)> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        let offset = inner.metadata.size;
+        let written = Self::write_locked(&fs, &mut inner, offset, input)?;
+        Ok((offset, written))
     }
 
     /// 将普通文件调整到 `size` 字节。
@@ -479,12 +580,77 @@ impl TmpFsNode {
             if keep != 0
                 && let Some(page) = pages.get_mut(&last_page_index)
             {
-                page[keep..].fill(0);
+                page.bytes_mut()[keep..].fill(0);
             }
         }
         inner.metadata.size = size;
         touch_modify_change(&mut inner.metadata);
         Ok(())
+    }
+
+    /// Return physical frames for a shared mapping, allocating pages for
+    /// sparse holes without changing the inode's logical size.
+    ///
+    /// Linux performs this allocation lazily from `shmem_fault()`. This
+    /// minimal VFS prepares only the pages covered by the mapping up front;
+    /// the inode remains sparse outside that range and the same frames are
+    /// reused by every MAP_SHARED mapping.
+    pub fn shared_frames(&self, offset: usize, length: usize) -> VfsResult<Vec<FrameTracker>> {
+        if offset % PAGE_SIZE != 0 {
+            return Err(VfsError::Invalid);
+        }
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset.checked_add(length).ok_or(VfsError::Invalid)?;
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        if inner.metadata.kind != VfsNodeKind::Regular {
+            return Err(VfsError::Invalid);
+        }
+        let mapped_size = (inner.metadata.size as usize)
+            .checked_add(PAGE_SIZE - 1)
+            .map(|size| size / PAGE_SIZE * PAGE_SIZE)
+            .ok_or(VfsError::Invalid)?;
+        if end > mapped_size {
+            return Err(VfsError::Invalid);
+        }
+        let TmpFsData::Regular(pages) = &mut inner.data else {
+            unreachable!();
+        };
+        let start_page = offset / PAGE_SIZE;
+        let end_page = end.div_ceil(PAGE_SIZE);
+        let mut inserted = Vec::new();
+        for page_index in start_page..end_page {
+            if pages.contains_key(&page_index) {
+                continue;
+            }
+            if !fs.reserve_page() {
+                for index in inserted.drain(..) {
+                    pages.remove(&index);
+                    fs.release_pages(1);
+                }
+                return Err(VfsError::NoSpace);
+            }
+            let Some(page) = TmpFsPage::allocate() else {
+                fs.release_pages(1);
+                for index in inserted.drain(..) {
+                    pages.remove(&index);
+                    fs.release_pages(1);
+                }
+                return Err(VfsError::NoSpace);
+            };
+            pages.insert(page_index, page);
+            inserted.push(page_index);
+        }
+        let mut frames = Vec::with_capacity(end_page.saturating_sub(start_page));
+        for page_index in start_page..end_page {
+            let Some(frame) = pages.get(&page_index).and_then(TmpFsPage::frame) else {
+                return Err(VfsError::NotSupported);
+            };
+            frames.push(frame);
+        }
+        Ok(frames)
     }
 }
 
@@ -570,14 +736,12 @@ impl VfsNode for TmpFsNode {
         Ok(VfsLink::Text(target.clone()))
     }
 
-    /// 使用指定访问模式打开节点，并创建具有独立 offset 的文件对象。
-    fn open(self: Arc<Self>, options: VfsOpenOptions) -> VfsResult<Arc<dyn File + Send + Sync>> {
+    /// 使用指定访问模式打开节点；顺序 offset 由 FileDescription 保存。
+    fn open(self: Arc<Self>, options: VfsOpenOptions) -> VfsResult<Arc<dyn VfsFileOperations>> {
         Ok(Arc::new(TmpFsFile {
             node: self,
             readable: options.readable,
             writable: options.writable,
-            append: options.append,
-            offset: Mutex::new(0),
         }))
     }
 
@@ -695,6 +859,22 @@ impl VfsNode for TmpFsNode {
         new_parent: &Arc<dyn VfsNode>,
         new_name: &str,
     ) -> VfsResult<()> {
+        self.rename_with_flags(old_name, new_parent, new_name, VfsRenameFlags::default())
+    }
+
+    fn rename_with_flags(
+        &self,
+        old_name: &str,
+        new_parent: &Arc<dyn VfsNode>,
+        new_name: &str,
+        flags: VfsRenameFlags,
+    ) -> VfsResult<()> {
+        if flags.0 & !(VfsRenameFlags::NO_REPLACE | VfsRenameFlags::EXCHANGE) != 0
+            || flags.contains(VfsRenameFlags::NO_REPLACE)
+                && flags.contains(VfsRenameFlags::EXCHANGE)
+        {
+            return Err(VfsError::Invalid);
+        }
         validate_name(old_name)?;
         validate_name(new_name)?;
         let new_parent = new_parent
@@ -706,16 +886,78 @@ impl VfsNode for TmpFsNode {
         }
         let fs = self.fs()?;
         let _mutation = fs.rename_lock.lock();
-        if self.inode == new_parent.inode {
-            let mut inner = self.inner.write();
-            let TmpFsData::Directory(children) = &mut inner.data else {
-                return Err(VfsError::NotDirectory);
-            };
-            if children.contains_key(new_name) {
+        let validate_target = |source: &Arc<TmpFsNode>, target: &Arc<TmpFsNode>| {
+            if flags.contains(VfsRenameFlags::NO_REPLACE) {
                 return Err(VfsError::Exists);
             }
-            let node = children.remove(old_name).ok_or(VfsError::NoEntry)?;
-            children.insert(new_name.to_string(), node);
+            if Arc::ptr_eq(source, target) {
+                return Ok(());
+            }
+            let source_kind = source.inner.read().metadata.kind;
+            let target_inner = target.inner.read();
+            let target_kind = target_inner.metadata.kind;
+            if source_kind == VfsNodeKind::Directory && target_kind != VfsNodeKind::Directory {
+                return Err(VfsError::NotDirectory);
+            }
+            if source_kind != VfsNodeKind::Directory && target_kind == VfsNodeKind::Directory {
+                return Err(VfsError::IsDirectory);
+            }
+            if let TmpFsData::Directory(children) = &target_inner.data
+                && !children.is_empty()
+            {
+                return Err(VfsError::NotEmpty);
+            }
+            Ok(())
+        };
+        if self.inode == new_parent.inode {
+            let mut inner = self.inner.write();
+            let removed_target_directory = {
+                let TmpFsData::Directory(children) = &mut inner.data else {
+                    return Err(VfsError::NotDirectory);
+                };
+                let source = children.get(old_name).cloned().ok_or(VfsError::NoEntry)?;
+                if old_name == new_name {
+                    return if flags.contains(VfsRenameFlags::NO_REPLACE) {
+                        Err(VfsError::Exists)
+                    } else {
+                        Ok(())
+                    };
+                }
+                if flags.contains(VfsRenameFlags::EXCHANGE) {
+                    let target = children.get(new_name).cloned().ok_or(VfsError::NoEntry)?;
+                    if Arc::ptr_eq(&source, &target) {
+                        return Ok(());
+                    }
+                    children.insert(old_name.to_string(), target);
+                    children.insert(new_name.to_string(), source);
+                    false
+                } else {
+                    let mut removed_target_directory = false;
+                    if let Some(target) = children.get(new_name).cloned() {
+                        validate_target(&source, &target)?;
+                        if Arc::ptr_eq(&source, &target) {
+                            return Ok(());
+                        }
+                        children.remove(new_name);
+                        let mut target_inner = target.inner.write();
+                        if target_inner.metadata.kind == VfsNodeKind::Directory {
+                            target_inner.metadata.nlink = 0;
+                            removed_target_directory = true;
+                        } else {
+                            target_inner.metadata.nlink =
+                                target_inner.metadata.nlink.saturating_sub(1);
+                        }
+                    }
+                    let node = children
+                        .remove(old_name)
+                        .expect("rename source checked above");
+                    children.insert(new_name.to_string(), node);
+                    removed_target_directory
+                }
+            };
+            if removed_target_directory {
+                inner.metadata.nlink = inner.metadata.nlink.saturating_sub(1);
+            }
             touch_modify_change(&mut inner.metadata);
             return Ok(());
         }
@@ -729,18 +971,78 @@ impl VfsNode for TmpFsNode {
             let old = self.inner.write();
             (old, new)
         };
-        let TmpFsData::Directory(old_children) = &mut old_inner.data else {
-            return Err(VfsError::NotDirectory);
-        };
-        let TmpFsData::Directory(new_children) = &mut new_inner.data else {
-            return Err(VfsError::NotDirectory);
-        };
-        if new_children.contains_key(new_name) {
-            return Err(VfsError::Exists);
+        if flags.contains(VfsRenameFlags::EXCHANGE) {
+            let (source_directory, target_directory) = {
+                let TmpFsData::Directory(old_children) = &mut old_inner.data else {
+                    return Err(VfsError::NotDirectory);
+                };
+                let TmpFsData::Directory(new_children) = &mut new_inner.data else {
+                    return Err(VfsError::NotDirectory);
+                };
+                let source = old_children
+                    .get(old_name)
+                    .cloned()
+                    .ok_or(VfsError::NoEntry)?;
+                let target = new_children
+                    .get(new_name)
+                    .cloned()
+                    .ok_or(VfsError::NoEntry)?;
+                if Arc::ptr_eq(&source, &target) {
+                    return Ok(());
+                }
+                let source_directory = source.inner.read().metadata.kind == VfsNodeKind::Directory;
+                let target_directory = target.inner.read().metadata.kind == VfsNodeKind::Directory;
+                old_children.insert(old_name.to_string(), target);
+                new_children.insert(new_name.to_string(), source);
+                (source_directory, target_directory)
+            };
+            if source_directory && !target_directory {
+                old_inner.metadata.nlink = old_inner.metadata.nlink.saturating_sub(1);
+                new_inner.metadata.nlink = new_inner.metadata.nlink.saturating_add(1);
+            } else if !source_directory && target_directory {
+                old_inner.metadata.nlink = old_inner.metadata.nlink.saturating_add(1);
+                new_inner.metadata.nlink = new_inner.metadata.nlink.saturating_sub(1);
+            }
+            touch_modify_change(&mut old_inner.metadata);
+            touch_modify_change(&mut new_inner.metadata);
+            return Ok(());
         }
-        let node = old_children.remove(old_name).ok_or(VfsError::NoEntry)?;
-        let moved_directory = node.inner.read().metadata.kind == VfsNodeKind::Directory;
-        new_children.insert(new_name.to_string(), node);
+        let (moved_directory, removed_target_directory) = {
+            let TmpFsData::Directory(old_children) = &mut old_inner.data else {
+                return Err(VfsError::NotDirectory);
+            };
+            let TmpFsData::Directory(new_children) = &mut new_inner.data else {
+                return Err(VfsError::NotDirectory);
+            };
+            let source = old_children
+                .get(old_name)
+                .cloned()
+                .ok_or(VfsError::NoEntry)?;
+            let mut removed_target_directory = false;
+            if let Some(target) = new_children.get(new_name).cloned() {
+                validate_target(&source, &target)?;
+                if Arc::ptr_eq(&source, &target) {
+                    return Ok(());
+                }
+                new_children.remove(new_name);
+                let mut target_inner = target.inner.write();
+                if target_inner.metadata.kind == VfsNodeKind::Directory {
+                    target_inner.metadata.nlink = 0;
+                    removed_target_directory = true;
+                } else {
+                    target_inner.metadata.nlink = target_inner.metadata.nlink.saturating_sub(1);
+                }
+            }
+            let node = old_children
+                .remove(old_name)
+                .expect("rename source checked above");
+            let moved_directory = node.inner.read().metadata.kind == VfsNodeKind::Directory;
+            new_children.insert(new_name.to_string(), node);
+            (moved_directory, removed_target_directory)
+        };
+        if removed_target_directory {
+            new_inner.metadata.nlink = new_inner.metadata.nlink.saturating_sub(1);
+        }
         if moved_directory {
             old_inner.metadata.nlink = old_inner.metadata.nlink.saturating_sub(1);
             new_inner.metadata.nlink = new_inner.metadata.nlink.saturating_add(1);
@@ -765,9 +1067,16 @@ impl VfsNode for TmpFsNode {
             .ok_or(VfsError::NoEntry)
     }
 
+    fn list_xattrs(&self) -> VfsResult<Vec<String>> {
+        Ok(self.inner.read().xattrs.keys().cloned().collect())
+    }
+
     /// 创建或替换扩展属性，并执行 `XATTR_CREATE/XATTR_REPLACE` 条件检查。
     fn set_xattr(&self, name: &str, value: &[u8], flags: u32) -> VfsResult<()> {
-        if name.is_empty() || flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        if name.is_empty()
+            || flags & !(XATTR_CREATE | XATTR_REPLACE) != 0
+            || flags & (XATTR_CREATE | XATTR_REPLACE) == (XATTR_CREATE | XATTR_REPLACE)
+        {
             return Err(VfsError::Invalid);
         }
         let mut inner = self.inner.write();
@@ -779,7 +1088,7 @@ impl VfsNode for TmpFsNode {
             return Err(VfsError::NoEntry);
         }
         inner.xattrs.insert(name.to_string(), value.to_vec());
-        inner.metadata.times.change_ns = crate::time::get_time_ns();
+        inner.metadata.times.change_ns = crate::time::get_realtime_ns();
         Ok(())
     }
 
@@ -787,7 +1096,7 @@ impl VfsNode for TmpFsNode {
     fn remove_xattr(&self, name: &str) -> VfsResult<()> {
         let mut inner = self.inner.write();
         inner.xattrs.remove(name).ok_or(VfsError::NoEntry)?;
-        inner.metadata.times.change_ns = crate::time::get_time_ns();
+        inner.metadata.times.change_ns = crate::time::get_realtime_ns();
         Ok(())
     }
 
@@ -820,7 +1129,7 @@ impl VfsNode for TmpFsNode {
     fn set_mode(&self, mode: u16) -> VfsResult<()> {
         let mut inner = self.inner.write();
         inner.metadata.mode = mode & 0o7777;
-        inner.metadata.times.change_ns = crate::time::get_time_ns();
+        inner.metadata.times.change_ns = crate::time::get_realtime_ns();
         Ok(())
     }
 
@@ -829,7 +1138,34 @@ impl VfsNode for TmpFsNode {
         let mut inner = self.inner.write();
         inner.metadata.uid = uid;
         inner.metadata.gid = gid;
-        inner.metadata.times.change_ns = crate::time::get_time_ns();
+        inner.metadata.times.change_ns = crate::time::get_realtime_ns();
+        Ok(())
+    }
+
+    fn set_mode_owner(&self, mode: u16, uid: u32, gid: u32) -> VfsResult<()> {
+        let mut inner = self.inner.write();
+        inner.metadata.mode = mode & 0o7777;
+        inner.metadata.uid = uid;
+        inner.metadata.gid = gid;
+        inner.metadata.times.change_ns = crate::time::get_realtime_ns();
+        Ok(())
+    }
+
+    /// Commit the selected inode timestamps under one node lock.
+    fn update_times(
+        &self,
+        access_ns: Option<u64>,
+        modify_ns: Option<u64>,
+        change_ns: u64,
+    ) -> VfsResult<()> {
+        let mut inner = self.inner.write();
+        if let Some(access_ns) = access_ns {
+            inner.metadata.times.access_ns = access_ns;
+        }
+        if let Some(modify_ns) = modify_ns {
+            inner.metadata.times.modify_ns = modify_ns;
+        }
+        inner.metadata.times.change_ns = change_ns;
         Ok(())
     }
 }
@@ -860,15 +1196,14 @@ fn validate_name(name: &str) -> VfsResult<()> {
 
 /// 同时更新节点的 mtime 和 ctime。
 fn touch_modify_change(metadata: &mut VfsMetadata) {
-    let now = crate::time::get_time_ns();
+    let now = crate::time::get_realtime_ns();
     metadata.times.modify_ns = now;
     metadata.times.change_ns = now;
 }
 
 /// 打开一个 TmpFs 节点后得到的文件对象。
 ///
-/// 它持有节点强引用，从而实现 open-unlinked 生命周期。多个共享同一
-/// `TmpFsFile Arc` 的描述符也会共享当前 offset。
+/// 它持有节点强引用，从而实现 open-unlinked 生命周期；对象本身无 cursor。
 pub struct TmpFsFile {
     /// 被打开的稳定 TmpFs 节点。
     node: Arc<TmpFsNode>,
@@ -876,10 +1211,6 @@ pub struct TmpFsFile {
     readable: bool,
     /// 此次 open 是否允许写入。
     writable: bool,
-    /// 写入前是否将 offset 移动到当前 EOF。
-    append: bool,
-    /// 顺序 read/write 使用并共享的当前文件位置。
-    offset: Mutex<u64>,
 }
 
 impl TmpFsFile {
@@ -897,9 +1228,28 @@ impl TmpFsFile {
     pub fn write_at(&self, offset: u64, input: &[u8]) -> VfsResult<usize> {
         self.node.write_at(offset, input)
     }
+
+    /// Stable identity used to reconnect an existing shared VMA to this inode.
+    pub fn mapping_id(&self) -> u64 {
+        self.node.mapping_id
+    }
+
+    /// Current logical length of the tmpfs inode.
+    pub fn len(&self) -> usize {
+        self.node.inner.read().metadata.size as usize
+    }
+
+    /// Prepare and return the inode pages covered by a shared mapping.
+    pub fn shared_frames(&self, offset: usize, length: usize) -> VfsResult<Vec<FrameTracker>> {
+        self.node.shared_frames(offset, length)
+    }
 }
 
-impl File for TmpFsFile {
+impl VfsFileOperations for TmpFsFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     /// 返回该打开实例是否可读。
     fn readable(&self) -> bool {
         self.readable
@@ -910,66 +1260,51 @@ impl File for TmpFsFile {
         self.writable
     }
 
-    /// 按当前 offset 顺序读取用户缓冲区，并推进文件位置。
-    fn read(&self, mut buffer: UserBuffer) -> usize {
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> VfsResult<usize> {
         if !self.readable {
-            return 0;
+            return Err(VfsError::Access);
         }
-        let mut offset = self.offset.lock();
-        let mut total = 0usize;
-        for output in buffer.buffers.iter_mut() {
-            match self.node.read_at(*offset, output) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    *offset = offset.saturating_add(read as u64);
-                    total += read;
-                    if read < output.len() {
-                        break;
-                    }
-                }
-            }
-        }
-        total
+        self.node.read_at(offset, output)
     }
 
-    /// 按当前 offset 顺序写入用户缓冲区，并推进文件位置。
-    ///
-    /// append 模式下，每次调用开始时先读取最新 EOF。
-    fn write(&self, buffer: UserBuffer) -> usize {
+    fn write_at(&self, offset: u64, input: &[u8]) -> VfsResult<usize> {
         if !self.writable {
-            return 0;
+            return Err(VfsError::Access);
         }
-        let mut offset = self.offset.lock();
-        if self.append {
-            *offset = self.node.inner.read().metadata.size;
-        }
-        let mut total = 0usize;
-        for input in buffer.buffers {
-            match self.node.write_at(*offset, input) {
-                Ok(0) | Err(_) => break,
-                Ok(written) => {
-                    *offset = offset.saturating_add(written as u64);
-                    total += written;
-                    if written < input.len() {
-                        break;
-                    }
-                }
-            }
-        }
-        total
+        self.node.write_at(offset, input)
     }
 
-    /// 普通内存文件不会阻塞，按打开权限始终报告可读/可写。
-    fn fixed_poll_mask(&self) -> Option<i16> {
-        Some(
-            (if self.readable { crate::fs::POLLIN } else { 0 })
-                | (if self.writable { crate::fs::POLLOUT } else { 0 }),
-        )
+    fn size(&self) -> VfsResult<u64> {
+        Ok(self.node.inner.read().metadata.size)
     }
 
-    /// 支持从通用 `File` trait object downcast 回 `TmpFsFile`。
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn append(&self, input: &[u8]) -> VfsResult<(u64, usize)> {
+        if !self.writable {
+            return Err(VfsError::Access);
+        }
+        self.node.append_data(input)
+    }
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        match self.node.inner.read().metadata.kind {
+            VfsNodeKind::Regular | VfsNodeKind::Directory => Ok(()),
+            _ => Err(VfsError::Invalid),
+        }
+    }
+
+    fn sync_range(&self, _offset: u64, _length: u64, _flags: u32) -> VfsResult<()> {
+        match self.node.inner.read().metadata.kind {
+            VfsNodeKind::Regular | VfsNodeKind::Directory => Ok(()),
+            _ => Err(VfsError::Invalid),
+        }
+    }
+
+    fn advise(&self, _offset: u64, _length: u64, _advice: u32) -> VfsResult<()> {
+        if self.node.inner.read().metadata.kind == VfsNodeKind::Regular {
+            Ok(())
+        } else {
+            Err(VfsError::Invalid)
+        }
     }
 }
 
@@ -1074,6 +1409,68 @@ mod tests {
     }
 
     #[test]
+    fn file_description_is_the_only_shared_position_owner() {
+        let fs = tmpfs(PAGE_SIZE * 2, 16);
+        let root = fs.root_node();
+        let node = root.create("description", 0o600).unwrap();
+        let operations = Arc::clone(&node)
+            .open(VfsOpenOptions {
+                readable: true,
+                writable: true,
+                append: false,
+            })
+            .unwrap();
+        let description = crate::fs::vfs::FileDescription::new(None, operations, 0);
+        let duplicated = Arc::clone(&description);
+
+        description.write(b"ab").unwrap();
+        duplicated.write(b"cd").unwrap();
+        assert_eq!(description.position().offset, 4);
+        assert_eq!(duplicated.position().offset, 4);
+
+        let mut all = [0; 4];
+        description.read_at(0, &mut all).unwrap();
+        assert_eq!(&all, b"abcd");
+        // pread-style I/O must not change the shared sequential cursor.
+        assert_eq!(description.position().offset, 4);
+        description.set_offset(0);
+        let mut first = [0; 2];
+        duplicated.read(&mut first).unwrap();
+        assert_eq!(&first, b"ab");
+        assert_eq!(description.position().offset, 2);
+    }
+
+    #[test]
+    fn append_is_atomic_in_the_backend_not_size_plus_write_at() {
+        let fs = tmpfs(PAGE_SIZE * 2, 16);
+        let root = fs.root_node();
+        let node = root.create("append", 0o600).unwrap();
+        let open = || {
+            Arc::clone(&node)
+                .open(VfsOpenOptions {
+                    readable: true,
+                    writable: true,
+                    append: true,
+                })
+                .unwrap()
+        };
+        let first =
+            crate::fs::vfs::FileDescription::new(None, open(), crate::fs::vfs::VFS_STATUS_APPEND);
+        let second =
+            crate::fs::vfs::FileDescription::new(None, open(), crate::fs::vfs::VFS_STATUS_APPEND);
+        first.write(b"one").unwrap();
+        second.write(b"two").unwrap();
+        let mut output = [0; 6];
+        first.read_at(0, &mut output).unwrap();
+        assert_eq!(&output, b"onetwo");
+        assert_eq!(first.position().offset, 3);
+        assert_eq!(second.position().offset, 6);
+        first.sync(false).unwrap();
+        first.sync_range(0, 6, 0).unwrap();
+        first.advise(0, 6, 2).unwrap();
+    }
+
+    #[test]
     fn rename_symlink_and_xattr_are_node_operations() {
         let fs = tmpfs(PAGE_SIZE * 2, 32);
         let root = fs.root_node();
@@ -1087,15 +1484,118 @@ mod tests {
         let link = right.symlink("link", "moved").unwrap();
         match link.readlink().unwrap() {
             VfsLink::Text(target) => assert_eq!(target, "moved"),
-            VfsLink::Magic(_) => panic!("tmpfs created an unexpected magic link"),
+            VfsLink::Magic(_) | VfsLink::MagicDisplay { .. } => {
+                panic!("tmpfs created an unexpected magic link")
+            }
         }
         file.set_xattr("user.test", b"value", XATTR_CREATE).unwrap();
         assert_eq!(file.get_xattr("user.test").unwrap(), b"value");
+        assert_eq!(file.list_xattrs().unwrap(), [String::from("user.test")]);
         assert_eq!(
             file.set_xattr("user.test", b"again", XATTR_CREATE).err(),
             Some(VfsError::Exists)
         );
+        assert_eq!(
+            file.set_xattr("user.test", b"again", XATTR_CREATE | XATTR_REPLACE,)
+                .err(),
+            Some(VfsError::Invalid)
+        );
         file.remove_xattr("user.test").unwrap();
+
+        let original_mtime = file.metadata().unwrap().times.modify_ns;
+        file.update_times(Some(10), None, 30).unwrap();
+        let times = file.metadata().unwrap().times;
+        assert_eq!(times.access_ns, 10);
+        assert_eq!(times.modify_ns, original_mtime);
+        assert_eq!(times.change_ns, 30);
+        file.update_times(None, Some(20), 31).unwrap();
+        let times = file.metadata().unwrap().times;
+        assert_eq!(times.access_ns, 10);
+        assert_eq!(times.modify_ns, 20);
+        assert_eq!(times.change_ns, 31);
+    }
+
+    #[test]
+    fn rename_replaces_target_and_honors_no_replace_atomically() {
+        let fs = tmpfs(PAGE_SIZE * 2, 32);
+        let root = fs.root_node();
+        let source = root.create("source", 0o644).unwrap();
+        let target = root.create("target", 0o600).unwrap();
+
+        assert_eq!(
+            root.rename_with_flags(
+                "source",
+                &root,
+                "target",
+                VfsRenameFlags(VfsRenameFlags::NO_REPLACE),
+            )
+            .err(),
+            Some(VfsError::Exists)
+        );
+        assert_eq!(root.lookup("source").unwrap().node_id(), source.node_id());
+        assert_eq!(root.lookup("target").unwrap().node_id(), target.node_id());
+        assert_eq!(target.metadata().unwrap().nlink, 1);
+
+        root.rename("source", &root, "target").unwrap();
+        assert_eq!(root.lookup("source").err(), Some(VfsError::NoEntry));
+        assert_eq!(root.lookup("target").unwrap().node_id(), source.node_id());
+        assert_eq!(source.metadata().unwrap().nlink, 1);
+        assert_eq!(target.metadata().unwrap().nlink, 0);
+    }
+
+    #[test]
+    fn cross_directory_rename_updates_parent_links_and_rejects_nonempty_target() {
+        let fs = tmpfs(PAGE_SIZE * 2, 64);
+        let root = fs.root_node();
+        let left = root.mkdir("left", 0o755).unwrap();
+        let right = root.mkdir("right", 0o755).unwrap();
+        let moved = left.mkdir("moved", 0o755).unwrap();
+        let victim = right.mkdir("victim", 0o755).unwrap();
+        victim.create("child", 0o600).unwrap();
+        let left_links = left.metadata().unwrap().nlink;
+        let right_links = right.metadata().unwrap().nlink;
+
+        assert_eq!(
+            left.rename("moved", &right, "victim").err(),
+            Some(VfsError::NotEmpty)
+        );
+        assert_eq!(left.lookup("moved").unwrap().node_id(), moved.node_id());
+
+        victim.unlink("child", false).unwrap();
+        left.rename("moved", &right, "victim").unwrap();
+        assert_eq!(left.lookup("moved").err(), Some(VfsError::NoEntry));
+        assert_eq!(right.lookup("victim").unwrap().node_id(), moved.node_id());
+        assert_eq!(victim.metadata().unwrap().nlink, 0);
+        assert_eq!(left.metadata().unwrap().nlink, left_links - 1);
+        // Replacing one destination directory and then adding the moved one
+        // leaves the destination parent's directory link count unchanged.
+        assert_eq!(right.metadata().unwrap().nlink, right_links);
+    }
+
+    #[test]
+    fn rename_exchange_swaps_nodes_and_directory_parent_links() {
+        let fs = tmpfs(PAGE_SIZE * 2, 64);
+        let root = fs.root_node();
+        let left = root.mkdir("left", 0o755).unwrap();
+        let right = root.mkdir("right", 0o755).unwrap();
+        let directory = left.mkdir("directory", 0o755).unwrap();
+        let file = right.create("file", 0o600).unwrap();
+        let left_links = left.metadata().unwrap().nlink;
+        let right_links = right.metadata().unwrap().nlink;
+
+        left.rename_with_flags(
+            "directory",
+            &right,
+            "file",
+            VfsRenameFlags(VfsRenameFlags::EXCHANGE),
+        )
+        .unwrap();
+        assert_eq!(left.lookup("directory").unwrap().node_id(), file.node_id());
+        assert_eq!(right.lookup("file").unwrap().node_id(), directory.node_id());
+        assert_eq!(left.metadata().unwrap().nlink, left_links - 1);
+        assert_eq!(right.metadata().unwrap().nlink, right_links + 1);
+        assert_eq!(directory.metadata().unwrap().nlink, 2);
+        assert_eq!(file.metadata().unwrap().nlink, 1);
     }
 
     #[test]

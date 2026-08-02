@@ -174,12 +174,6 @@ pub(crate) fn thread_cpu_time_ns(thread_id: CgroupThreadId) -> u64 {
     crate::task::runtime::task_cpu_time_ns(&task)
 }
 
-pub(crate) fn path_under_mount(abs: &str, mount: &str) -> bool {
-    abs == mount
-        || (abs.starts_with(mount)
-            && abs.as_bytes().get(mount.len()).copied().unwrap_or_default() == b'/')
-}
-
 pub(crate) fn normalize_rel_path(rel: &str) -> String {
     let trimmed = rel.trim_matches('/');
     if trimmed.is_empty() {
@@ -206,22 +200,6 @@ pub(crate) fn split_rel_parent(path: &str) -> Option<(String, String)> {
     Some((parent, name))
 }
 
-pub(crate) fn namespace_resolve_rel_path(ns_root: &str, mount_rel: &str) -> Option<String> {
-    if ns_root == "/" {
-        return Some(String::from(mount_rel));
-    }
-    let actual = if mount_rel == "/" {
-        String::from(ns_root)
-    } else {
-        alloc::format!(
-            "{}/{}",
-            ns_root.trim_end_matches('/'),
-            mount_rel.trim_start_matches('/')
-        )
-    };
-    CgroupMountState::is_descendant_or_self(&actual, ns_root).then_some(actual)
-}
-
 pub(crate) fn namespace_visible_path(actual_path: &str, ns_root: &str) -> String {
     if ns_root == "/" {
         return String::from(actual_path);
@@ -235,42 +213,4 @@ pub(crate) fn namespace_visible_path(actual_path: &str, ns_root: &str) -> String
         }
     }
     String::from("/")
-}
-
-pub(crate) fn current_cgroup_namespace_root() -> String {
-    current_process().cgroup_namespace_root()
-}
-
-pub(crate) fn resolve_mount_path_in_namespace(
-    ns_root: &str,
-    abs: &str,
-) -> Result<(String, String, CgroupHierarchyKey), isize> {
-    let Some((mount_target, mount_rel_path, hierarchy_key)) = split_mount_path(abs) else {
-        return Err(EROFS);
-    };
-    let Some(rel_path) = namespace_resolve_rel_path(ns_root, &mount_rel_path) else {
-        return Err(ENOENT);
-    };
-    Ok((mount_target, rel_path, hierarchy_key))
-}
-
-pub(crate) fn split_mount_path(abs: &str) -> Option<(String, String, CgroupHierarchyKey)> {
-    let registry = CGROUP_REGISTRY.lock();
-    let mut best: Option<(&str, &CgroupHierarchyKey)> = None;
-    for (target, hierarchy_key) in registry.mounts.iter() {
-        if !path_under_mount(abs, target) {
-            continue;
-        }
-        match best {
-            Some((cur, _)) if cur.len() >= target.len() => {}
-            _ => best = Some((target.as_str(), hierarchy_key)),
-        }
-    }
-    let (target, hierarchy_key) = best?;
-    let rel = if abs == target {
-        String::from("/")
-    } else {
-        normalize_rel_path(&abs[target.len()..])
-    };
-    Some((String::from(target), rel, hierarchy_key.clone()))
 }

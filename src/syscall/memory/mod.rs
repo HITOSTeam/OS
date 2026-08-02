@@ -10,8 +10,8 @@ pub(super) use crate::syscall::error::{SyscallError, err};
 pub(super) use crate::{
     config::PAGE_SIZE,
     fs::{
-        File, OSInode, PseudoShmFile, vm_commit_limit_bytes, vm_committed_as_bytes,
-        vm_overcommit_memory,
+        File, MemfdFile, OSInode, TmpFsFile, VfsOpenedFile, vm_commit_limit_bytes,
+        vm_committed_as_bytes, vm_overcommit_memory,
     },
     mm::{
         BrkUpdate, MapPermission, MapType, MemorySet, MprotectError, PTEFlags, VmRegion,
@@ -42,6 +42,28 @@ pub(super) const MAP_LOCKED: usize = 0x2000;
 pub(super) const MAP_STACK: usize = 0x20000;
 pub(super) const MAP_FIXED_NOREPLACE: usize = 0x100000;
 pub(super) const MAP_TYPE_MASK: usize = 0x0f;
+
+/// Return the tmpfs file operations hidden behind the generic VFS adapter.
+///
+/// Linux reaches shmem through `file->f_mapping`; this kernel's equivalent
+/// lives behind `VfsOpenedFile -> FileDescription -> VfsFileOperations`.
+pub(super) fn tmpfs_file_for_kernel_file(file: &Arc<dyn File + Send + Sync>) -> Option<&TmpFsFile> {
+    let opened = file.as_any().downcast_ref::<VfsOpenedFile>()?;
+    opened
+        .description()
+        .operations()
+        .as_any()
+        .downcast_ref::<TmpFsFile>()
+}
+
+/// Stable ID for either an anonymous memfd object or a pathname-backed tmpfs
+/// inode. VMAs use this to reconnect after descriptor-table changes.
+pub(super) fn shmem_mapping_id(file: &Arc<dyn File + Send + Sync>) -> Option<u64> {
+    if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
+        return Some(shm.memfd_id());
+    }
+    tmpfs_file_for_kernel_file(file).map(TmpFsFile::mapping_id)
+}
 
 pub(super) const LARGE_ANON_MMAP: usize = 1 * 1024 * 1024;
 
@@ -142,24 +164,21 @@ pub(super) fn find_open_inode_file(
 
 pub(super) fn find_shm_file_in_snapshot(
     files: &[(usize, Arc<dyn File + Send + Sync>)],
-    memfd_id: u64,
+    shmem_id: u64,
 ) -> Option<Arc<dyn File + Send + Sync>> {
-    if memfd_id == 0 {
+    if shmem_id == 0 {
         return None;
     }
     for (_fd, file) in files {
-        let Some(shm) = file.as_any().downcast_ref::<PseudoShmFile>() else {
-            continue;
-        };
-        if shm.memfd_id() == memfd_id {
+        if shmem_mapping_id(file) == Some(shmem_id) {
             return Some(Arc::clone(file));
         }
     }
     None
 }
 
-pub(super) fn find_open_shm_file(memfd_id: u64) -> Option<Arc<dyn File + Send + Sync>> {
-    if memfd_id == 0 {
+pub(super) fn find_open_shm_file(shmem_id: u64) -> Option<Arc<dyn File + Send + Sync>> {
+    if shmem_id == 0 {
         return None;
     }
     let processes = {
@@ -177,7 +196,7 @@ pub(super) fn find_open_shm_file(memfd_id: u64) -> Option<Arc<dyn File + Send + 
             continue;
         }
         let snapshot = files.lock().iter_files_snapshot();
-        if let Some(file) = find_shm_file_in_snapshot(&snapshot, memfd_id) {
+        if let Some(file) = find_shm_file_in_snapshot(&snapshot, shmem_id) {
             return Some(file);
         }
     }

@@ -1,18 +1,50 @@
 use super::{
     AT_EMPTY_PATH, AT_SYMLINK_FOLLOW, AtPath, MapPermission, OSInode, ProcMagicLinkFile, PseudoDir,
-    S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, SyscallError, align_up, apply_umask,
-    cgroup_mkdir, cgroup_rmdir, current_effective_uid_gid, current_fsuid_gid, current_process,
+    S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, SyscallError, VfsOpenedFile, align_up,
+    apply_umask, current_effective_uid_gid, current_fsuid_gid, current_process,
     defer_unlink_open_file, do_renameat, do_renameat_exchange, dt_type_from_ext4, err,
     ext4_err_to_errno, ext4_inode_lock, final_non_empty_component, get_current_token, get_fd_file,
-    gid_for_created_inode, hardlink_cross_mount, inode_is_immutable_or_append,
-    inode_is_rofs_mount_root, inode_logical_path, inode_mode_allows_uid_gid,
-    invalidate_ext4_path_cache_for_at, invalidate_ext4_path_cache_inode, maybe_update_inode_atime,
-    min, mode_for_created_file, open_pseudo, parent_forces_gid_inherit,
-    parse_proc_fd_for_current_process, path_is_mount_point, proc_path_for_at, read_u16_le,
-    read_u32_le, read_user_cstring, resolve_abs_path, resolve_at_inode, resolve_at_path,
-    resolve_parent_and_name, rofs_for_path, shm_object_name, shm_remove, sticky_rename_allowed,
-    translated_byte_buffer, try_copy_to_user,
+    gid_for_created_inode, inode_is_immutable_or_append, inode_mode_allows_uid_gid,
+    invalidate_ext4_path_cache_for_at, invalidate_ext4_path_cache_inode,
+    invalidate_vfs_parent_entry, map_vfs_error, maybe_update_inode_atime, min,
+    mode_for_created_file, parent_forces_gid_inherit, read_u16_le, read_u32_le, read_user_cstring,
+    resolve_at_inode, resolve_at_path, resolve_at_vfs_path, resolve_parent_and_name,
+    resolve_parent_vfs_path, sticky_rename_allowed, translated_byte_buffer, try_copy_to_user,
+    vfs_at_path_is_process_root,
 };
+use crate::fs::ext4::Ext4VfsNode;
+
+fn vfs_metadata_allows(
+    metadata: crate::fs::vfs::VfsMetadata,
+    mask: u16,
+    uid: u32,
+    gid: u32,
+) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    let shift = if uid == metadata.uid {
+        6
+    } else if gid == metadata.gid {
+        3
+    } else {
+        0
+    };
+    ((metadata.mode >> shift) & mask) == mask
+}
+
+fn vfs_readlink_target(path: &crate::fs::vfs::VfsPath) -> Result<alloc::string::String, isize> {
+    match path.node().readlink().map_err(map_vfs_error)? {
+        crate::fs::vfs::VfsLink::Text(target) => Ok(target),
+        crate::fs::vfs::VfsLink::Magic(target) => path
+            .mount()
+            .owner_namespace()
+            .ok_or_else(|| err(SyscallError::ENOENT))?
+            .path_string(&target)
+            .map_err(map_vfs_error),
+        crate::fs::vfs::VfsLink::MagicDisplay { display, .. } => Ok(display),
+    }
+}
 
 /// Reads a symlink target by pathname or, with `AT_EMPTY_PATH`, directly from an fd.
 pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usize) -> isize {
@@ -42,6 +74,18 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
             }
             return len as isize;
         }
+        if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+            let target = match vfs_readlink_target(vfs_file.path()) {
+                Ok(target) => target,
+                Err(error) => return error,
+            };
+            let bytes = target.as_bytes();
+            let len = min(bytes.len(), bufsiz);
+            if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
+                return err(SyscallError::EFAULT);
+            }
+            return len as isize;
+        }
         let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
             return err(SyscallError::EINVAL);
         };
@@ -59,27 +103,18 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
         return len as isize;
     }
 
-    let raw_abs = match resolve_abs_path(dirfd, &path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
     let at = match resolve_at_path(dirfd, &path) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    if let AtPath::PseudoAbs(abs) = &at {
-        if let Some(proc_path) = proc_path_for_at(raw_abs.as_deref(), &at) {
-            if let Some(target) = crate::fs::mounted_proc_readlink(&proc_path) {
-                let bytes = target.as_bytes();
-                let len = min(bytes.len(), bufsiz);
-                if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
-                    return err(SyscallError::EFAULT);
-                }
-                return len as isize;
-            }
-        }
-        if let Some(target) = crate::fs::proc_readlink(abs) {
+    let (fsuid, fsgid) = current_fsuid_gid();
+    match resolve_at_vfs_path(&at, fsuid, fsgid, false) {
+        Ok(Some(vfs_path)) if !vfs_path.node().as_any().is::<Ext4VfsNode>() => {
+            let target = match vfs_readlink_target(&vfs_path) {
+                Ok(target) => target,
+                Err(error) => return error,
+            };
             let bytes = target.as_bytes();
             let len = min(bytes.len(), bufsiz);
             if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
@@ -87,14 +122,9 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
             }
             return len as isize;
         }
-        return if open_pseudo(abs).is_some() {
-            err(SyscallError::EINVAL)
-        } else {
-            err(SyscallError::ENOENT)
-        };
+        Ok(_) => {}
+        Err(error) => return error,
     }
-
-    let (fsuid, fsgid) = current_fsuid_gid();
     let inode = match resolve_at_inode(&at, fsuid, fsgid, false) {
         Ok(v) => v,
         Err(e) => return e,
@@ -131,12 +161,42 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
         Ok(v) => v,
         Err(e) => return e,
     };
-    if let AtPath::PseudoAbs(_) = &at {
+    let (fsuid, fsgid) = current_fsuid_gid();
+    let vfs_parent = match resolve_parent_vfs_path(&at, fsuid, fsgid) {
+        Ok(parent) => parent,
+        Err(error) => return error,
+    };
+    if vfs_parent
+        .as_ref()
+        .is_some_and(|parent| parent.parent.mount().flags().is_read_only())
+    {
         return err(SyscallError::EROFS);
     }
-    let path_rofs = rofs_for_path(newdirfd, &path);
-
-    let (fsuid, fsgid) = current_fsuid_gid();
+    if let Some(parent) = vfs_parent
+        && !parent.parent.node().as_any().is::<Ext4VfsNode>()
+    {
+        let metadata = match parent.parent.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return map_vfs_error(error),
+        };
+        if !vfs_metadata_allows(metadata, 3, fsuid, fsgid) {
+            return err(SyscallError::EACCES);
+        }
+        let link = match parent.parent.node().symlink(&parent.name, &target_path) {
+            Ok(link) => link,
+            Err(error) => return map_vfs_error(error),
+        };
+        let gid = if metadata.mode & 0o2000 != 0 {
+            metadata.gid
+        } else {
+            fsgid
+        };
+        if let Err(error) = link.set_owner(fsuid, gid) {
+            return map_vfs_error(error);
+        }
+        invalidate_vfs_parent_entry(&parent);
+        return 0;
+    }
     let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
@@ -149,10 +209,6 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
         return err(SyscallError::EACCES);
     }
-    if path_rofs {
-        return err(SyscallError::EROFS);
-    }
-
     match parent.create_symlink(&name, &target_path) {
         Ok(inode) => {
             invalidate_ext4_path_cache_for_at(&at, false);
@@ -207,61 +263,78 @@ pub fn syscall_linkat(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let old_abs = if old_s.is_empty() {
-        None
-    } else {
-        match resolve_abs_path(olddirfd, &old_s) {
-            Ok(v) => v,
-            Err(e) => return e,
-        }
-    };
-    let new_abs = match resolve_abs_path(newdirfd, &new_s) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if matches!(new_at, AtPath::PseudoAbs(_)) {
-        return err(SyscallError::EROFS);
-    }
-    if let Some(AtPath::PseudoAbs(abs)) = &old_at {
-        if parse_proc_fd_for_current_process(abs).is_none() {
-            return err(SyscallError::EXDEV);
-        }
-    }
-    let old_is_proc_fd_magic = matches!(&old_at, Some(AtPath::PseudoAbs(abs)) if parse_proc_fd_for_current_process(abs).is_some());
-    if let (Some(old_abs), Some(new_abs)) = (old_abs.as_deref(), new_abs.as_deref()) {
-        // `/proc/self/fd/N` is a magic link to the opened inode. Its textual
-        // path is under procfs, but Linux applies EXDEV to the resolved inode.
-        if !old_is_proc_fd_magic && hardlink_cross_mount(old_abs, new_abs) {
-            return err(SyscallError::EXDEV);
-        }
-    }
-
-    let new_path_rofs = rofs_for_path(newdirfd, &new_s);
-    if new_path_rofs {
-        return err(SyscallError::EROFS);
-    }
-
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_old = (flags & AT_SYMLINK_FOLLOW) != 0;
-    let source = if let Some(at) = old_at {
-        match at {
-            AtPath::PseudoAbs(abs) => {
-                let fd = match parse_proc_fd_for_current_process(&abs) {
-                    Some(v) => v,
-                    None => return err(SyscallError::EXDEV),
-                };
-                let Some(file) = get_fd_file(fd) else {
-                    return err(SyscallError::EBADF);
-                };
-                let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-                    return err(SyscallError::EPERM);
-                };
-                os_inode.ext4_inode()
+    let source_vfs = if let Some(at) = old_at.as_ref() {
+        match resolve_at_vfs_path(at, fsuid, fsgid, follow_old) {
+            Ok(path) => path,
+            Err(error) => return error,
+        }
+    } else if olddirfd >= 0 {
+        get_fd_file(olddirfd as usize).and_then(|file| file.object_path().cloned())
+    } else {
+        None
+    };
+    let new_parent_vfs = match resolve_parent_vfs_path(&new_at, fsuid, fsgid) {
+        Ok(parent) => parent,
+        Err(error) => return error,
+    };
+    if let Some(parent) = new_parent_vfs.as_ref() {
+        if source_vfs
+            .as_ref()
+            .is_some_and(|source| source.mount().id() != parent.parent.mount().id())
+        {
+            // Linux compares vfsmount identity, not only superblock identity.
+            return err(SyscallError::EXDEV);
+        }
+        if parent.parent.mount().flags().is_read_only() {
+            return err(SyscallError::EROFS);
+        }
+    }
+    let source_is_non_ext4 = source_vfs
+        .as_ref()
+        .is_some_and(|path| !path.node().as_any().is::<Ext4VfsNode>());
+    let parent_is_non_ext4 = new_parent_vfs
+        .as_ref()
+        .is_some_and(|parent| !parent.parent.node().as_any().is::<Ext4VfsNode>());
+    if source_is_non_ext4 || parent_is_non_ext4 {
+        let (Some(source), Some(parent)) = (source_vfs, new_parent_vfs) else {
+            return err(SyscallError::EXDEV);
+        };
+        if source.node().as_any().is::<Ext4VfsNode>()
+            || parent.parent.node().as_any().is::<Ext4VfsNode>()
+            || source.mount().id() != parent.parent.mount().id()
+        {
+            // Linux filename_linkat() rejects different vfsmount objects,
+            // including two bind mounts of the same superblock.
+            return err(SyscallError::EXDEV);
+        }
+        let source_metadata = match source.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return map_vfs_error(error),
+        };
+        if source_metadata.kind == crate::fs::vfs::VfsNodeKind::Directory {
+            return err(SyscallError::EPERM);
+        }
+        let parent_metadata = match parent.parent.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return map_vfs_error(error),
+        };
+        if !vfs_metadata_allows(parent_metadata, 3, fsuid, fsgid) {
+            return err(SyscallError::EACCES);
+        }
+        return match parent.parent.node().link(&parent.name, source.node()) {
+            Ok(()) => {
+                invalidate_vfs_parent_entry(&parent);
+                0
             }
-            other => match resolve_at_inode(&other, fsuid, fsgid, follow_old) {
-                Ok(v) => v,
-                Err(e) => return e,
-            },
+            Err(error) => map_vfs_error(error),
+        };
+    }
+    let source = if let Some(at) = old_at {
+        match resolve_at_inode(&at, fsuid, fsgid, follow_old) {
+            Ok(v) => v,
+            Err(e) => return e,
         }
     } else {
         if olddirfd < 0 {
@@ -299,10 +372,6 @@ pub fn syscall_linkat(
     if parent.device_id() != source.device_id() {
         return err(SyscallError::EXDEV);
     }
-    if new_path_rofs {
-        return err(SyscallError::EROFS);
-    }
-
     match parent.link_inode(&name, &source) {
         Ok(_) => {
             invalidate_ext4_path_cache_for_at(&new_at, false);
@@ -392,25 +461,96 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
         Ok(v) => v,
         Err(e) => return e,
     };
-    if let AtPath::PseudoAbs(_) = &at {
-        return err(SyscallError::EROFS);
-    }
-    let path_rofs = rofs_for_path(dirfd, &path);
     let (fsuid, fsgid) = current_fsuid_gid();
 
-    let dirfd_rofs = matches!(
-        &at,
-        AtPath::Ext4Rel { base, .. } if inode_is_rofs_mount_root(base)
-    );
+    let mut file_type = (mode as u16) & S_IFMT;
+    if file_type == 0 {
+        file_type = S_IFREG;
+    }
+    if !matches!(file_type, S_IFREG | S_IFIFO | S_IFCHR | S_IFBLK | S_IFSOCK) {
+        return err(SyscallError::EINVAL);
+    }
+    if matches!(file_type, S_IFCHR | S_IFBLK) {
+        let (euid, _) = current_effective_uid_gid();
+        if euid != 0 {
+            return err(SyscallError::EPERM);
+        }
+    }
+
+    let vfs_parent = match resolve_parent_vfs_path(&at, fsuid, fsgid) {
+        Ok(parent) => parent,
+        Err(error) => return error,
+    };
+    if vfs_parent
+        .as_ref()
+        .is_some_and(|parent| parent.parent.mount().flags().is_read_only())
+    {
+        return err(SyscallError::EROFS);
+    }
+    if let Some(parent) = vfs_parent
+        && !parent.parent.node().as_any().is::<Ext4VfsNode>()
+    {
+        let parent_metadata = match parent.parent.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return map_vfs_error(error),
+        };
+        if parent_metadata.kind != crate::fs::vfs::VfsNodeKind::Directory {
+            return err(SyscallError::ENOTDIR);
+        }
+        if !vfs_metadata_allows(parent_metadata, 3, fsuid, fsgid) {
+            return err(SyscallError::EACCES);
+        }
+        let gid = if parent_metadata.mode & 0o2000 != 0 {
+            parent_metadata.gid
+        } else {
+            fsgid
+        };
+        let create_mode = mode_for_created_file(file_type | apply_umask(mode), gid);
+        let created = match file_type {
+            S_IFREG => parent.parent.node().create(&parent.name, create_mode),
+            S_IFIFO => parent.parent.node().mknod(
+                &parent.name,
+                crate::fs::vfs::VfsNodeKind::Fifo,
+                create_mode,
+                0,
+            ),
+            S_IFSOCK => parent.parent.node().mknod(
+                &parent.name,
+                crate::fs::vfs::VfsNodeKind::Socket,
+                create_mode,
+                0,
+            ),
+            S_IFCHR => parent.parent.node().mknod(
+                &parent.name,
+                crate::fs::vfs::VfsNodeKind::CharacterDevice,
+                create_mode,
+                dev as u64,
+            ),
+            S_IFBLK => parent.parent.node().mknod(
+                &parent.name,
+                crate::fs::vfs::VfsNodeKind::BlockDevice,
+                create_mode,
+                dev as u64,
+            ),
+            _ => unreachable!(),
+        };
+        let created = match created {
+            Ok(created) => created,
+            Err(error) => return map_vfs_error(error),
+        };
+        if let Err(error) = created.set_owner(fsuid, gid) {
+            return map_vfs_error(error);
+        }
+        invalidate_vfs_parent_entry(&parent);
+        return 0;
+    }
+
     let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
         Ok(v) => v,
         Err(e) => return e,
     };
     let parent_lock = ext4_inode_lock(&parent);
     let _parent_guard = parent_lock.write();
-    if dirfd_rofs || path_rofs {
-        return err(SyscallError::EROFS);
-    }
     if !parent.is_dir() {
         return err(SyscallError::ENOTDIR);
     }
@@ -421,25 +561,9 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
         return err(SyscallError::EEXIST);
     }
 
-    let mut file_type = (mode as u16) & S_IFMT;
-    if file_type == 0 {
-        file_type = S_IFREG;
-    }
-    let valid_type = matches!(file_type, S_IFREG | S_IFIFO | S_IFCHR | S_IFBLK | S_IFSOCK);
-    if !valid_type {
-        return err(SyscallError::EINVAL);
-    }
-
     let gid = gid_for_created_inode(Some(&parent), fsgid);
     let perm_bits = apply_umask(mode) & 0o7777;
     let create_mode = mode_for_created_file(file_type | perm_bits, gid);
-
-    if matches!(file_type, S_IFCHR | S_IFBLK) {
-        let (euid, _) = current_effective_uid_gid();
-        if euid != 0 {
-            return err(SyscallError::EPERM);
-        }
-    }
 
     let create_result = match file_type {
         S_IFREG => parent.create_file(&name),
@@ -490,39 +614,71 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     if crate::debug_config::DEBUG_SYSCALL {
         let pid = current_process().getpid();
         match &at {
+            AtPath::Vfs(_) => {
+                crate::println!("[mkdir] pid={} vfs-path='{}'", pid, path);
+            }
             AtPath::Ext4Abs(abs) => {
                 crate::println!("[mkdir] pid={} abs='{}'", pid, abs);
             }
             AtPath::Ext4Rel { rel, .. } => {
                 crate::println!("[mkdir] pid={} rel='{}'", pid, rel);
             }
-            AtPath::PseudoAbs(abs) => {
-                crate::println!("[mkdir] pid={} pseudo='{}'", pid, abs);
-            }
         }
     }
-
-    if let AtPath::PseudoAbs(abs) = &at {
-        let cgroup_rc = cgroup_mkdir(abs);
-        if cgroup_rc != err(SyscallError::EROFS) {
-            return cgroup_rc;
+    if matches!(at, AtPath::Vfs(_)) {
+        match resolve_at_vfs_path(&at, fsuid, fsgid, false) {
+            Ok(Some(_)) => return err(SyscallError::EEXIST),
+            Ok(None) => unreachable!("Vfs AtPath must resolve through the object walker"),
+            Err(e) if e == err(SyscallError::ENOENT) => {}
+            Err(e) => return e,
         }
-        if open_pseudo(abs).is_some() || crate::fs::proc_readlink(abs).is_some() {
-            return err(SyscallError::EEXIST);
-        }
-        let rc = crate::fs::pseudo_dev_dir_mkdir(abs);
-        if rc != err(SyscallError::EROFS) {
-            return rc;
-        }
-        return err(SyscallError::EROFS);
     }
-    let path_rofs = rofs_for_path(dirfd, &path);
 
     if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
         return err(SyscallError::EEXIST);
     }
     if matches!(at, AtPath::Ext4Rel { ref rel, .. } if rel.is_empty()) {
         return err(SyscallError::EEXIST);
+    }
+    let vfs_parent = match resolve_parent_vfs_path(&at, fsuid, fsgid) {
+        Ok(parent) => parent,
+        Err(error) => return error,
+    };
+    if vfs_parent
+        .as_ref()
+        .is_some_and(|parent| parent.parent.mount().flags().is_read_only())
+    {
+        return err(SyscallError::EROFS);
+    }
+    if let Some(parent) = vfs_parent
+        && !parent.parent.node().as_any().is::<Ext4VfsNode>()
+    {
+        let metadata = match parent.parent.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return map_vfs_error(error),
+        };
+        if metadata.kind != crate::fs::vfs::VfsNodeKind::Directory {
+            return err(SyscallError::ENOTDIR);
+        }
+        if !vfs_metadata_allows(metadata, 3, fsuid, fsgid) {
+            return err(SyscallError::EACCES);
+        }
+        let inherit_gid = metadata.mode & 0o2000 != 0;
+        let gid = if inherit_gid { metadata.gid } else { fsgid };
+        let directory_mode = if inherit_gid {
+            create_mode | 0o2000
+        } else {
+            create_mode
+        };
+        let directory = match parent.parent.node().mkdir(&parent.name, directory_mode) {
+            Ok(directory) => directory,
+            Err(error) => return map_vfs_error(error),
+        };
+        if let Err(error) = directory.set_owner(fsuid, gid) {
+            return map_vfs_error(error);
+        }
+        invalidate_vfs_parent_entry(&parent);
+        return 0;
     }
     let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
         Ok(v) => v,
@@ -538,9 +694,6 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     }
     if parent.find(&name).is_some() {
         return err(SyscallError::EEXIST);
-    }
-    if path_rofs {
-        return err(SyscallError::EROFS);
     }
     match parent.create_dir(&name) {
         Ok(dir) => {
@@ -617,66 +770,68 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         }
         _ => {}
     }
-    if remove_dir {
-        if let AtPath::PseudoAbs(abs) = &at {
-            let cgroup_rc = cgroup_rmdir(abs);
-            if cgroup_rc != err(SyscallError::EROFS) {
-                return cgroup_rc;
-            }
-        }
-        if let Some(abs) = match resolve_abs_path(dirfd, &path) {
-            Ok(v) => v,
-            Err(e) => return e,
-        } {
-            if path_is_mount_point(&abs) {
-                return err(SyscallError::EBUSY);
-            }
-        }
-    }
-
-    if let AtPath::PseudoAbs(abs) = &at {
-        // Minimal `/dev/shm` support for POSIX `shm_unlink`.
-        if abs == "/dev/shm" || abs == "/dev/shm/" {
-            return if remove_dir {
-                err(SyscallError::EROFS)
-            } else {
-                err(SyscallError::EISDIR)
-            };
-        }
-        if crate::fs::is_cgroup_pseudo_path(abs) {
-            return if open_pseudo(abs).is_some() {
-                err(SyscallError::EISDIR)
-            } else {
-                err(SyscallError::ENOENT)
-            };
-        }
-        if let Some(name) = shm_object_name(abs) {
-            if remove_dir {
-                return err(SyscallError::ENOTDIR);
-            }
-            return if shm_remove(name) {
-                0
-            } else {
-                err(SyscallError::ENOENT)
-            };
-        }
-        if crate::fs::pseudo_dev_dir_exists(abs) {
-            return if remove_dir {
-                crate::fs::pseudo_dev_dir_rmdir(abs)
-            } else {
-                err(SyscallError::EISDIR)
-            };
-        }
-        return err(SyscallError::EROFS);
-    }
-    let path_rofs = rofs_for_path(dirfd, &path);
-
     let (fsuid, fsgid) = current_fsuid_gid();
+    match vfs_at_path_is_process_root(&at, fsuid, fsgid) {
+        Ok(true) => return err(SyscallError::EISDIR),
+        Ok(false) => {}
+        Err(e) => return e,
+    }
     if matches!(at, AtPath::Ext4Abs(ref abs) if abs == "/") {
         return err(SyscallError::EISDIR);
     }
     if matches!(at, AtPath::Ext4Rel { ref rel, .. } if rel.is_empty()) {
         return err(SyscallError::EISDIR);
+    }
+    let vfs_parent = match resolve_parent_vfs_path(&at, fsuid, fsgid) {
+        Ok(parent) => parent,
+        Err(error) => return error,
+    };
+    let target_vfs = if vfs_parent.is_some() {
+        match resolve_at_vfs_path(&at, fsuid, fsgid, false) {
+            Ok(Some(target)) => Some(target),
+            Ok(None) => unreachable!("Vfs parent existed without an object target lookup"),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    if let (Some(parent), Some(target)) = (vfs_parent.as_ref(), target_vfs.as_ref()) {
+        if target.mount().id() != parent.parent.mount().id() {
+            return err(SyscallError::EBUSY);
+        }
+        if parent.parent.mount().flags().is_read_only() {
+            return err(SyscallError::EROFS);
+        }
+    }
+    if let Some(parent) = vfs_parent
+        && !parent.parent.node().as_any().is::<Ext4VfsNode>()
+    {
+        let target = target_vfs.expect("object target resolved above");
+        let parent_metadata = match parent.parent.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return map_vfs_error(error),
+        };
+        if !vfs_metadata_allows(parent_metadata, 3, fsuid, fsgid) {
+            return err(SyscallError::EACCES);
+        }
+        let child_metadata = match target.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return map_vfs_error(error),
+        };
+        if parent_metadata.mode & 0o1000 != 0
+            && fsuid != 0
+            && fsuid != parent_metadata.uid
+            && fsuid != child_metadata.uid
+        {
+            return err(SyscallError::EPERM);
+        }
+        return match parent.parent.node().unlink(&parent.name, remove_dir) {
+            Ok(()) => {
+                invalidate_vfs_parent_entry(&parent);
+                0
+            }
+            Err(error) => map_vfs_error(error),
+        };
     }
     let (parent, name) = match resolve_parent_and_name(&at, fsuid, fsgid) {
         Ok(v) => v,
@@ -700,9 +855,6 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
 
     // Validate target type: unlink vs rmdir semantics.
     let Some(child) = parent.find(&name) else {
-        if path_rofs {
-            return err(SyscallError::EROFS);
-        }
         return err(SyscallError::ENOENT);
     };
     let child_lock = ext4_inode_lock(&child);
@@ -725,10 +877,6 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     if inode_is_immutable_or_append(&child) {
         return err(SyscallError::EPERM);
     }
-    if path_rofs {
-        return err(SyscallError::EROFS);
-    }
-
     if !remove_dir {
         match defer_unlink_open_file(&parent, &name, &child) {
             Ok(true) => return 0,
@@ -748,7 +896,19 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     }
 }
 
-/// Emits Linux `dirent64` records for pseudo and ext4-backed directories.
+fn dt_type_from_vfs(kind: crate::fs::vfs::VfsNodeKind) -> u8 {
+    match kind {
+        crate::fs::vfs::VfsNodeKind::Fifo => 1,
+        crate::fs::vfs::VfsNodeKind::CharacterDevice => 2,
+        crate::fs::vfs::VfsNodeKind::Directory => 4,
+        crate::fs::vfs::VfsNodeKind::BlockDevice => 6,
+        crate::fs::vfs::VfsNodeKind::Regular => 8,
+        crate::fs::vfs::VfsNodeKind::Symlink => 10,
+        crate::fs::vfs::VfsNodeKind::Socket => 12,
+    }
+}
+
+/// Emits Linux `dirent64` records for pseudo and object/ext4-backed directories.
 pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
     // Avoid unbounded kernel heap allocations from user-provided buffer sizes.
     // Returning fewer bytes is allowed; callers will retry with the remaining entries.
@@ -809,59 +969,70 @@ pub fn syscall_getdents64(fd: usize, dirp: usize, len: usize) -> isize {
         return written as isize;
     }
 
+    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+        if vfs_file.kind() != crate::fs::vfs::VfsNodeKind::Directory {
+            return err(SyscallError::ENOTDIR);
+        }
+        if len == 0 {
+            return 0;
+        }
+        let entries = match vfs_file.path().node().readdir() {
+            Ok(entries) => entries,
+            Err(error) => return map_vfs_error(error),
+        };
+        let mut index = vfs_file.directory_cookie() as usize;
+        if index >= entries.len().saturating_add(2) {
+            return 0;
+        }
+        let this_ino = vfs_file.path().node().node_id();
+        let parent_ino = vfs_file
+            .path()
+            .dentry()
+            .parent()
+            .map(|parent| parent.node().node_id())
+            .unwrap_or(this_ino);
+        let mut kbuf = alloc::vec![0u8; len];
+        let mut written = 0usize;
+        while index < entries.len().saturating_add(2) {
+            let (name, ino, dtype) = match index {
+                0 => (".", this_ino, 4),
+                1 => ("..", parent_ino, 4),
+                _ => {
+                    let entry = &entries[index - 2];
+                    (
+                        entry.name.as_str(),
+                        entry.node_id,
+                        dt_type_from_vfs(entry.kind),
+                    )
+                }
+            };
+            let name_bytes = name.as_bytes();
+            let reclen = align_up(19 + name_bytes.len() + 1, 8);
+            if written + reclen > len {
+                break;
+            }
+            let next = index + 1;
+            let base = written;
+            kbuf[base..base + 8].copy_from_slice(&ino.to_le_bytes());
+            kbuf[base + 8..base + 16].copy_from_slice(&(next as i64).to_le_bytes());
+            kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            kbuf[base + 18] = dtype;
+            kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+            kbuf[base + 19 + name_bytes.len()] = 0;
+            written += reclen;
+            index = next;
+        }
+        if try_copy_to_user(token, dirp as *mut u8, &kbuf[..written]).is_err() {
+            return err(SyscallError::EFAULT);
+        }
+        vfs_file.set_directory_cookie(index as u64);
+        return written as isize;
+    }
+
     let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
         return err(SyscallError::ENOTDIR);
     };
     let inode = os_inode.ext4_inode();
-    if let Some(path) = inode_logical_path(&inode) {
-        if let Some(node) = open_pseudo(&path) {
-            if let Some(pdir) = node.as_any().downcast_ref::<PseudoDir>() {
-                let entries = pdir.entries();
-                let mut index = os_inode.dir_offset();
-                if index >= entries.len() || len == 0 {
-                    return 0;
-                }
-
-                let mut kbuf = alloc::vec![0u8; len];
-                let mut written = 0usize;
-                while index < entries.len() {
-                    let ent = &entries[index];
-                    let name_bytes = ent.name.as_bytes();
-                    let reclen = align_up(19 + name_bytes.len() + 1, 8);
-                    if written + reclen > len {
-                        break;
-                    }
-                    let base = written;
-                    kbuf[base..base + 8].copy_from_slice(&ent.ino.to_le_bytes());
-                    kbuf[base + 8..base + 16].copy_from_slice(&((index + 1) as i64).to_le_bytes());
-                    kbuf[base + 16..base + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-                    kbuf[base + 18] = ent.dtype;
-                    kbuf[base + 19..base + 19 + name_bytes.len()].copy_from_slice(name_bytes);
-                    kbuf[base + 19 + name_bytes.len()] = 0;
-                    for b in kbuf[base + 19 + name_bytes.len() + 1..base + reclen].iter_mut() {
-                        *b = 0;
-                    }
-
-                    written += reclen;
-                    index += 1;
-                }
-
-                let user_bufs =
-                    translated_byte_buffer(token, dirp as *mut u8, written, MapPermission::W);
-                let mut src_off = 0usize;
-                for ub in user_bufs {
-                    let end = src_off + ub.len();
-                    ub.copy_from_slice(&kbuf[src_off..end]);
-                    src_off = end;
-                }
-                os_inode.set_dir_offset(index);
-                if written > 0 {
-                    maybe_update_inode_atime(&inode, true);
-                }
-                return written as isize;
-            }
-        }
-    }
 
     let inode_lock = ext4_inode_lock(&inode);
     let _inode_guard = inode_lock.read();

@@ -1,10 +1,12 @@
-use crate::fs::File;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
-use super::{VfsDirEntry, VfsError, VfsMetadata, VfsNodeKind, VfsOpenOptions, VfsPath, VfsResult};
+use super::{
+    VfsDirEntry, VfsError, VfsFileOperations, VfsMetadata, VfsNodeKind, VfsOpenOptions, VfsPath,
+    VfsResult,
+};
 
 /// A symlink either contains text or is a proc-style magic link to an already
 /// resolved object.  Magic links never synthesize an absolute pathname.
@@ -12,6 +14,14 @@ use super::{VfsDirEntry, VfsError, VfsMetadata, VfsNodeKind, VfsOpenOptions, Vfs
 pub enum VfsLink {
     Text(String),
     Magic(VfsPath),
+    /// An object-valued magic link whose user-visible spelling is supplied by
+    /// the backend. Linux nsfs uses this for names such as `mnt:[4026531841]`:
+    /// path walking jumps to the nsfs object, while readlink returns the
+    /// dynamic display name rather than an internal mount path.
+    MagicDisplay {
+        target: VfsPath,
+        display: String,
+    },
 }
 
 /// used in cache.
@@ -19,6 +29,19 @@ pub enum VfsLink {
 pub enum DentryCachePolicy {
     Stable,
     Revalidate,
+}
+
+/// Flags for an atomic VFS rename operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VfsRenameFlags(pub u32);
+
+impl VfsRenameFlags {
+    pub const NO_REPLACE: u32 = 1;
+    pub const EXCHANGE: u32 = 2;
+
+    pub fn contains(self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
 }
 
 /// Stable filesystem object operations.
@@ -47,7 +70,7 @@ pub trait VfsNode: Send + Sync {
         Err(VfsError::Invalid)
     }
 
-    fn open(self: Arc<Self>, _options: VfsOpenOptions) -> VfsResult<Arc<dyn File + Send + Sync>> {
+    fn open(self: Arc<Self>, _options: VfsOpenOptions) -> VfsResult<Arc<dyn VfsFileOperations>> {
         Err(VfsError::NotSupported)
     }
 
@@ -80,11 +103,30 @@ pub trait VfsNode: Send + Sync {
         Err(VfsError::NotSupported)
     }
 
+    /// Atomic rename with Linux `renameat2` policy flags. Backends that only
+    /// implement classic rename retain the existing method as their fallback.
+    fn rename_with_flags(
+        &self,
+        old_name: &str,
+        new_parent: &Arc<dyn VfsNode>,
+        new_name: &str,
+        flags: VfsRenameFlags,
+    ) -> VfsResult<()> {
+        if flags.0 != 0 {
+            return Err(VfsError::NotSupported);
+        }
+        self.rename(old_name, new_parent, new_name)
+    }
+
     fn truncate(&self, _size: u64) -> VfsResult<()> {
         Err(VfsError::NotSupported)
     }
 
     fn get_xattr(&self, _name: &str) -> VfsResult<Vec<u8>> {
+        Err(VfsError::NotSupported)
+    }
+
+    fn list_xattrs(&self) -> VfsResult<Vec<String>> {
         Err(VfsError::NotSupported)
     }
 
@@ -111,6 +153,26 @@ pub trait VfsNode: Send + Sync {
     }
 
     fn set_owner(&self, _uid: u32, _gid: u32) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// Atomically update the common ownership and permission fields. Mutable
+    /// filesystems override this so chown's set-id clearing is not visible as
+    /// a sequence of partially applied metadata changes.
+    fn set_mode_owner(&self, mode: u16, uid: u32, gid: u32) -> VfsResult<()> {
+        self.set_owner(uid, gid)?;
+        self.set_mode(mode)
+    }
+
+    /// Atomically update inode timestamps selected by `utimensat(2)`.
+    /// `None` preserves the corresponding atime/mtime; ctime always records
+    /// the metadata change that successfully committed both selections.
+    fn update_times(
+        &self,
+        _access_ns: Option<u64>,
+        _modify_ns: Option<u64>,
+        _change_ns: u64,
+    ) -> VfsResult<()> {
         Err(VfsError::NotSupported)
     }
 }

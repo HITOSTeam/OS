@@ -22,6 +22,21 @@ fn logical_exec_path(dirfd: isize, path: &str, inode: &Arc<ext4_fs::Inode>) -> S
         .unwrap_or_else(|| String::from(path))
 }
 
+/// Resolve the object path used by fanotify for an exec event.  Linux passes
+/// the same opened `struct path` to fsnotify; it does not reconstruct a mount
+/// identity from the executable's display name.
+fn exec_event_vfs_path(dirfd: isize, path: &str) -> Option<VfsPath> {
+    if path.is_empty() {
+        return (dirfd >= 0)
+            .then(|| get_fd_file(dirfd as usize))
+            .flatten()
+            .and_then(|file| file.object_path().cloned());
+    }
+    let at = resolve_at_path(dirfd, path).ok()?;
+    let (fsuid, fsgid) = current_fsuid_gid();
+    resolve_at_vfs_path(&at, fsuid, fsgid, true).ok().flatten()
+}
+
 fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>, path: &str) -> Result<LoadedExecImage, isize> {
     let reservation = crate::fs::ExecInodeReservation::new(inode.device_id(), inode.inode_num())?;
     let exec_inode = reservation.key();
@@ -956,26 +971,22 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
                 }
             }
             if DEBUG_EXEC {
-                let cwd = { current_process().borrow_mut().cwd.clone() };
+                let cwd = current_process().fs_struct().cwd_display();
                 let abs = if path.starts_with('/') {
                     normalize_path("/", &path)
                 } else {
                     normalize_path(&cwd, &path)
                 };
-                let backing_hit = crate::fs::find_path_in_roots(
-                    &crate::syscall::filesystem::translate_mount_abs(&abs),
-                )
-                .is_some();
                 println!(
-                    "[exec] path='{}' abs='{}' cwd='{}' err={} backing_hit={}",
-                    path, abs, cwd, e, backing_hit
+                    "[exec] path='{}' abs='{}' cwd='{}' err={}",
+                    path, abs, cwd, e
                 );
             }
             return e;
         }
     };
-    let fanotify_path = resolve_abs_path(AT_FDCWD, &path).ok().flatten();
-    if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
+    let fanotify_path = exec_event_vfs_path(AT_FDCWD, &exe_path);
+    if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_ref()) {
         return e;
     }
     let exec_reservation =
@@ -983,7 +994,7 @@ pub fn syscall_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isiz
             Ok(reservation) => reservation,
             Err(e) => return e,
         };
-    fanotify_notify_open_exec(&inode, false, fanotify_path.as_deref());
+    fanotify_notify_open_exec(&inode, false, fanotify_path.as_ref());
 
     execve_with_inode(path, exe_path, args_vec, envs_vec, inode, exec_reservation)
 }
@@ -1012,11 +1023,12 @@ pub fn syscall_execveat(
         Ok(inode) => inode,
         Err(e) => return e,
     };
-    let fanotify_path = resolve_abs_path(dirfd, &path).ok().flatten();
-    let exe_path = fanotify_path
+    let logical_path = resolve_abs_path(dirfd, &path).ok().flatten();
+    let exe_path = logical_path
         .clone()
         .unwrap_or_else(|| logical_exec_path(dirfd, &path, &inode));
-    if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_deref()) {
+    let fanotify_path = exec_event_vfs_path(dirfd, &path);
+    if let Err(e) = fanotify_permission_open(&inode, true, false, fanotify_path.as_ref()) {
         return e;
     }
     let exec_reservation =
@@ -1024,6 +1036,6 @@ pub fn syscall_execveat(
             Ok(reservation) => reservation,
             Err(e) => return e,
         };
-    fanotify_notify_open_exec(&inode, false, fanotify_path.as_deref());
+    fanotify_notify_open_exec(&inode, false, fanotify_path.as_ref());
     execve_with_inode(path, exe_path, args_vec, envs_vec, inode, exec_reservation)
 }

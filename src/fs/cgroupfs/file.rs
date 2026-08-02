@@ -120,6 +120,84 @@ impl CgroupFileKind {
             | Self::MemoryLow => 0o100644,
         }
     }
+
+    pub(crate) fn writable(self) -> bool {
+        !matches!(
+            self,
+            Self::Controllers
+                | Self::PidsCurrent
+                | Self::CpuAcctUsage
+                | Self::MemoryUsageInBytes
+                | Self::MemoryCurrent
+                | Self::MemoryEvents
+                | Self::MemoryStat
+        )
+    }
+}
+
+pub(crate) fn cgroup_file_names(kind: CgroupMountKind) -> &'static [&'static str] {
+    match kind {
+        CgroupMountKind::Unified => &[
+            "cgroup.controllers",
+            "cgroup.subtree_control",
+            "cgroup.procs",
+            "cgroup.kill",
+            "pids.max",
+            "pids.current",
+            "memory.current",
+            "memory.max",
+            "memory.swap.max",
+            "memory.min",
+            "memory.low",
+            "memory.events",
+            "memory.stat",
+        ],
+        CgroupMountKind::LegacyCpuAcct => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+            "cpuacct.usage",
+        ],
+        CgroupMountKind::LegacyCpu => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+            "cpu.shares",
+            "cpu.rt_runtime_us",
+            "cpu.rt_period_us",
+        ],
+        CgroupMountKind::LegacyFreezer => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+            "freezer.state",
+        ],
+        CgroupMountKind::LegacyMemory => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+        ],
+        CgroupMountKind::LegacyCpuset => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+            "cpuset.cpus",
+            "cpuset.mems",
+        ],
+        _ => &[
+            "tasks",
+            "cgroup.procs",
+            "cgroup.clone_children",
+            "notify_on_release",
+        ],
+    }
 }
 
 fn controller_mask_to_string(mask: u32) -> String {
@@ -261,37 +339,38 @@ pub(crate) struct CgroupFileInner {
 }
 
 pub struct CgroupFile {
-    path: String,
     pub(crate) hierarchy_key: CgroupHierarchyKey,
-    pub(crate) rel_path: String,
+    rel_ino: u64,
     pub(crate) kind: CgroupFileKind,
     open_euid: u32,
-    open_cgroup_ns_root: String,
+    namespace_root_ino: u64,
     inner: Mutex<CgroupFileInner>,
 }
 
 impl CgroupFile {
-    pub(crate) fn new(
-        path: &str,
+    pub(crate) fn new_object(
         hierarchy_key: CgroupHierarchyKey,
-        rel_path: &str,
+        rel_ino: u64,
         kind: CgroupFileKind,
         open_euid: u32,
-        open_cgroup_ns_root: &str,
+        namespace_root_ino: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
-            path: String::from(path),
             hierarchy_key,
-            rel_path: String::from(rel_path),
+            rel_ino,
             kind,
             open_euid,
-            open_cgroup_ns_root: String::from(open_cgroup_ns_root),
+            namespace_root_ino,
             inner: Mutex::new(CgroupFileInner { offset: 0 }),
         })
     }
 
-    pub fn path(&self) -> &str {
-        &self.path
+    fn resolved_rel_path(&self, state: &CgroupMountState) -> Option<String> {
+        state.node_path_by_ino(self.rel_ino)
+    }
+
+    fn resolved_namespace_root(&self, state: &CgroupMountState) -> Option<String> {
+        state.node_path_by_ino(self.namespace_root_ino)
     }
 
     pub fn mode(&self) -> u32 {
@@ -310,17 +389,31 @@ impl CgroupFile {
         self.read_string().len()
     }
 
+    pub(crate) fn read_at_bytes(&self, offset: usize, output: &mut [u8]) -> Result<usize, isize> {
+        let data = self.read_string();
+        let bytes = data.as_bytes();
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let count = core::cmp::min(output.len(), bytes.len() - offset);
+        output[..count].copy_from_slice(&bytes[offset..offset + count]);
+        Ok(count)
+    }
+
     fn read_string(&self) -> String {
         let registry = CGROUP_REGISTRY.lock();
         let Some(state) = registry.hierarchies.get(&self.hierarchy_key) else {
             return String::new();
         };
-        let Some(node) = state.nodes.get(&self.rel_path) else {
+        let Some(rel_path) = self.resolved_rel_path(state) else {
+            return String::new();
+        };
+        let Some(node) = state.nodes.get(&rel_path) else {
             return String::new();
         };
         match self.kind {
             CgroupFileKind::Controllers => {
-                controller_mask_to_string(state.available_controllers(&self.rel_path))
+                controller_mask_to_string(state.available_controllers(&rel_path))
             }
             CgroupFileKind::SubtreeControl => controller_mask_to_string(node.subtree_control),
             CgroupFileKind::Procs => {
@@ -328,12 +421,12 @@ impl CgroupFile {
                 let mut out = String::new();
                 let members = if state.is_unified() {
                     state
-                        .direct_member_processes(&self.rel_path)
+                        .direct_member_processes(&rel_path)
                         .into_iter()
                         .filter_map(|pid| visible_pid_in_namespace(pid, pid_ns_id))
                         .collect::<Vec<_>>()
                 } else {
-                    state.direct_member_legacy_procs(&self.rel_path, pid_ns_id)
+                    state.direct_member_legacy_procs(&rel_path, pid_ns_id)
                 };
                 for pid in members {
                     out.push_str(&alloc::format!("{pid}\n"));
@@ -343,7 +436,7 @@ impl CgroupFile {
             CgroupFileKind::Tasks => {
                 let pid_ns_id = current_process().pid_namespace_id();
                 let mut out = String::new();
-                for tid in state.direct_member_threads(&self.rel_path, pid_ns_id) {
+                for tid in state.direct_member_threads(&rel_path, pid_ns_id) {
                     out.push_str(&alloc::format!("{tid}\n"));
                 }
                 out
@@ -366,20 +459,20 @@ impl CgroupFile {
                 None => String::from("max\n"),
             },
             CgroupFileKind::PidsCurrent => {
-                alloc::format!("{}\n", state.subtree_pid_count(&self.rel_path))
+                alloc::format!("{}\n", state.subtree_pid_count(&rel_path))
             }
             CgroupFileKind::CpuAcctUsage => {
-                alloc::format!("{}\n", state.subtree_cpu_usage_ns(&self.rel_path))
+                alloc::format!("{}\n", state.subtree_cpu_usage_ns(&rel_path))
             }
             CgroupFileKind::MemoryLimitInBytes => match node.memory_max {
                 Some(limit) => alloc::format!("{limit}\n"),
                 None => String::from("-1\n"),
             },
             CgroupFileKind::MemoryUsageInBytes => {
-                alloc::format!("{}\n", state.subtree_memory_usage(&self.rel_path))
+                alloc::format!("{}\n", state.subtree_memory_usage(&rel_path))
             }
             CgroupFileKind::MemoryCurrent => {
-                alloc::format!("{}\n", state.subtree_memory_usage(&self.rel_path))
+                alloc::format!("{}\n", state.subtree_memory_usage(&rel_path))
             }
             CgroupFileKind::MemoryMax => match node.memory_max {
                 Some(limit) => alloc::format!("{limit}\n"),
@@ -398,8 +491,8 @@ impl CgroupFile {
             ),
             CgroupFileKind::MemoryStat => alloc::format!(
                 "anon {}\nfile {}\n",
-                state.subtree_anon_bytes(&self.rel_path),
-                state.subtree_file_usage(&self.rel_path)
+                state.subtree_anon_bytes(&rel_path),
+                state.subtree_file_usage(&rel_path)
             ),
         }
     }
@@ -407,10 +500,25 @@ impl CgroupFile {
     pub fn write_payload(&self, data: &[u8]) -> Result<usize, isize> {
         let raw = core::str::from_utf8(data).map_err(|_| EINVAL)?;
         let text = raw.trim_matches(|c| c == '\n' || c == '\r' || c == ' ' || c == '\t');
+        let (initial_rel_path, _) = {
+            let registry = CGROUP_REGISTRY.lock();
+            let state = registry
+                .hierarchies
+                .get(&self.hierarchy_key)
+                .ok_or(ENOENT)?;
+            (
+                self.resolved_rel_path(state).ok_or(ENOENT)?,
+                self.resolved_namespace_root(state).ok_or(ENOENT)?,
+            )
+        };
         if self.kind == CgroupFileKind::FreezerState {
             let should_block_current = match text {
-                "THAWED" => apply_legacy_freezer_state(&self.hierarchy_key, &self.rel_path, false)?,
-                "FROZEN" => apply_legacy_freezer_state(&self.hierarchy_key, &self.rel_path, true)?,
+                "THAWED" => {
+                    apply_legacy_freezer_state(&self.hierarchy_key, &initial_rel_path, false)?
+                }
+                "FROZEN" => {
+                    apply_legacy_freezer_state(&self.hierarchy_key, &initial_rel_path, true)?
+                }
                 "FREEZING" => return Err(-5),
                 _ => return Err(EINVAL),
             };
@@ -423,8 +531,10 @@ impl CgroupFile {
         let Some(state) = registry.hierarchies.get_mut(&self.hierarchy_key) else {
             return Err(ENOENT);
         };
-        let available = state.available_controllers(&self.rel_path);
-        if !state.nodes.contains_key(&self.rel_path) {
+        let rel_path = self.resolved_rel_path(state).ok_or(ENOENT)?;
+        let open_cgroup_ns_root = self.resolved_namespace_root(state).ok_or(ENOENT)?;
+        let available = state.available_controllers(&rel_path);
+        if !state.nodes.contains_key(&rel_path) {
             return Err(ENOENT);
         }
         match self.kind {
@@ -436,7 +546,7 @@ impl CgroupFile {
             | CgroupFileKind::MemoryEvents
             | CgroupFileKind::MemoryStat => Err(EROFS),
             CgroupFileKind::CloneChildren => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.clone_children = match text {
                     "0" => false,
                     "1" => true,
@@ -445,7 +555,7 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::NotifyOnRelease => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.notify_on_release = match text {
                     "0" => false,
                     "1" => true,
@@ -455,12 +565,12 @@ impl CgroupFile {
             }
             CgroupFileKind::FreezerState => Err(EINVAL),
             CgroupFileKind::CpuShares => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
-                if self.rel_path == "/" {
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
+                if rel_path == "/" {
                     return Err(EINVAL);
                 }
                 node.cpu_shares = parse_legacy_cpu_shares(text)?;
-                let affected = descendant_processes(state, &self.rel_path);
+                let affected = descendant_processes(state, &rel_path);
                 drop(registry);
                 for pid in affected {
                     if let Some(process) = pid2process(pid) {
@@ -471,19 +581,19 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::CpuRtRuntimeUs => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.cpu_rt_runtime_us =
                     parse_legacy_cpu_rt_runtime_us(text, node.cpu_rt_period_us)?;
                 Ok(data.len())
             }
             CgroupFileKind::CpuRtPeriodUs => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.cpu_rt_period_us =
                     parse_legacy_cpu_rt_period_us(text, node.cpu_rt_runtime_us)?;
                 Ok(data.len())
             }
             CgroupFileKind::CpusetCpus => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 if text.is_empty() {
                     return Err(EINVAL);
                 }
@@ -491,7 +601,7 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::CpusetMems => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 if text.is_empty() {
                     return Err(EINVAL);
                 }
@@ -499,7 +609,7 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::SubtreeControl => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 if text.is_empty() {
                     return Ok(data.len());
                 }
@@ -519,7 +629,7 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::PidsMax => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 if text == "max" {
                     node.pids_max = None;
                     return Ok(data.len());
@@ -559,18 +669,15 @@ impl CgroupFile {
                         return Err(EINVAL);
                     }
                 }
-                if !CgroupMountState::is_descendant_or_self(
-                    &self.rel_path,
-                    &self.open_cgroup_ns_root,
-                ) {
+                if !CgroupMountState::is_descendant_or_self(&rel_path, &open_cgroup_ns_root) {
                     return Err(ENOENT);
                 }
                 let old_path = state.path_for_pid(pid);
-                if self.open_euid != 0 && old_path != self.rel_path {
+                if self.open_euid != 0 && old_path != rel_path {
                     return Err(EACCES);
                 }
                 if legacy_freezer_path_frozen(state, &old_path)
-                    || legacy_freezer_path_frozen(state, &self.rel_path)
+                    || legacy_freezer_path_frozen(state, &rel_path)
                 {
                     return Err(EBUSY);
                 }
@@ -578,7 +685,7 @@ impl CgroupFile {
                     let thread_old_path = state.path_for_thread(thread_id);
                     state.flush_thread_cpu_usage(thread_id, &thread_old_path);
                 }
-                state.attach_process(pid, &self.rel_path);
+                state.attach_process(pid, &rel_path);
                 let should_refresh = state.kind == CgroupMountKind::LegacyCpu;
                 drop(registry);
                 if should_refresh {
@@ -607,23 +714,20 @@ impl CgroupFile {
                 {
                     return Err(EINVAL);
                 }
-                if !CgroupMountState::is_descendant_or_self(
-                    &self.rel_path,
-                    &self.open_cgroup_ns_root,
-                ) {
+                if !CgroupMountState::is_descendant_or_self(&rel_path, &open_cgroup_ns_root) {
                     return Err(ENOENT);
                 }
                 let old_path = state.path_for_thread(thread_id);
-                if self.open_euid != 0 && old_path != self.rel_path {
+                if self.open_euid != 0 && old_path != rel_path {
                     return Err(EACCES);
                 }
                 if legacy_freezer_path_frozen(state, &old_path)
-                    || legacy_freezer_path_frozen(state, &self.rel_path)
+                    || legacy_freezer_path_frozen(state, &rel_path)
                 {
                     return Err(EBUSY);
                 }
                 state.flush_thread_cpu_usage(thread_id, &old_path);
-                state.attach_thread(thread_id, &self.rel_path);
+                state.attach_thread(thread_id, &rel_path);
                 let should_refresh = state.kind == CgroupMountKind::LegacyCpu;
                 drop(registry);
                 if should_refresh {
@@ -642,8 +746,7 @@ impl CgroupFile {
                     .process_assignments
                     .iter()
                     .filter_map(|(pid, pid_path)| {
-                        CgroupMountState::is_descendant_or_self(pid_path, &self.rel_path)
-                            .then_some(*pid)
+                        CgroupMountState::is_descendant_or_self(pid_path, &rel_path).then_some(*pid)
                     })
                     .collect::<Vec<_>>();
                 drop(registry);
@@ -653,12 +756,12 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::MemoryMax => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.memory_max = parse_memory_value(text)?;
                 Ok(data.len())
             }
             CgroupFileKind::MemoryLimitInBytes => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.memory_max = if text == "-1" {
                     None
                 } else {
@@ -667,17 +770,17 @@ impl CgroupFile {
                 Ok(data.len())
             }
             CgroupFileKind::MemorySwapMax => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.memory_swap_max = parse_memory_value(text)?;
                 Ok(data.len())
             }
             CgroupFileKind::MemoryMin => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.memory_min = parse_memory_value(text)?.unwrap_or(usize::MAX);
                 Ok(data.len())
             }
             CgroupFileKind::MemoryLow => {
-                let node = state.nodes.get_mut(&self.rel_path).ok_or(ENOENT)?;
+                let node = state.nodes.get_mut(&rel_path).ok_or(ENOENT)?;
                 node.memory_low = parse_memory_value(text)?.unwrap_or(usize::MAX);
                 Ok(data.len())
             }
@@ -733,117 +836,4 @@ impl File for CgroupFile {
     fn as_any(&self) -> &dyn Any {
         self
     }
-}
-
-pub(crate) fn build_dir_entries(
-    rel_path: &str,
-    ns_root: &str,
-    state: &CgroupMountState,
-) -> Vec<PseudoDirent> {
-    let ino = state.nodes.get(rel_path).map(|node| node.ino).unwrap_or(1);
-    let parent_ino = if rel_path == "/" || rel_path == ns_root {
-        ino
-    } else {
-        split_rel_parent(rel_path)
-            .and_then(|(parent, _)| state.nodes.get(&parent).map(|node| node.ino))
-            .unwrap_or(ino)
-    };
-    let mut entries = Vec::new();
-    entries.push(PseudoDirent {
-        name: String::from("."),
-        ino,
-        dtype: 4,
-    });
-    entries.push(PseudoDirent {
-        name: String::from(".."),
-        ino: parent_ino,
-        dtype: 4,
-    });
-    for child in state.direct_children(rel_path) {
-        let child_path = if rel_path == "/" {
-            alloc::format!("/{child}")
-        } else {
-            alloc::format!("{rel_path}/{child}")
-        };
-        let child_ino = state
-            .nodes
-            .get(&child_path)
-            .map(|node| node.ino)
-            .unwrap_or(1);
-        entries.push(PseudoDirent {
-            name: child,
-            ino: child_ino,
-            dtype: 4,
-        });
-    }
-    let file_names: &[&str] = match state.kind {
-        CgroupMountKind::Unified => &[
-            "cgroup.controllers",
-            "cgroup.subtree_control",
-            "cgroup.procs",
-            "cgroup.kill",
-            "pids.max",
-            "pids.current",
-            "memory.current",
-            "memory.max",
-            "memory.swap.max",
-            "memory.min",
-            "memory.low",
-            "memory.events",
-            "memory.stat",
-        ],
-        CgroupMountKind::LegacyCpuAcct => &[
-            "tasks",
-            "cgroup.procs",
-            "cgroup.clone_children",
-            "notify_on_release",
-            "cpuacct.usage",
-        ],
-        CgroupMountKind::LegacyCpu => &[
-            "tasks",
-            "cgroup.procs",
-            "cgroup.clone_children",
-            "notify_on_release",
-            "cpu.shares",
-            "cpu.rt_runtime_us",
-            "cpu.rt_period_us",
-        ],
-        CgroupMountKind::LegacyFreezer => &[
-            "tasks",
-            "cgroup.procs",
-            "cgroup.clone_children",
-            "notify_on_release",
-            "freezer.state",
-        ],
-        CgroupMountKind::LegacyMemory => &[
-            "tasks",
-            "cgroup.procs",
-            "cgroup.clone_children",
-            "notify_on_release",
-            "memory.limit_in_bytes",
-            "memory.usage_in_bytes",
-        ],
-        CgroupMountKind::LegacyCpuset => &[
-            "tasks",
-            "cgroup.procs",
-            "cgroup.clone_children",
-            "notify_on_release",
-            "cpuset.cpus",
-            "cpuset.mems",
-        ],
-        _ => &[
-            "tasks",
-            "cgroup.procs",
-            "cgroup.clone_children",
-            "notify_on_release",
-        ],
-    };
-    for name in file_names {
-        entries.push(PseudoDirent {
-            name: String::from(*name),
-            ino: NEXT_CGROUP_INO.fetch_add(1, Ordering::Relaxed),
-            dtype: 8,
-        });
-    }
-    entries
 }

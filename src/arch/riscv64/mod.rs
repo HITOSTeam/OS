@@ -1,7 +1,7 @@
+mod irq;
 pub mod mm;
 pub mod task;
 pub mod trap;
-mod irq;
 
 pub use irq::{enable_external_irq, handle_external_interrupt, init_external_interrupts};
 

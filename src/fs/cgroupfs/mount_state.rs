@@ -2,6 +2,7 @@ use super::*;
 
 #[derive(Clone)]
 pub(crate) struct CgroupMountState {
+    pub(crate) filesystem_id: u64,
     pub(crate) kind: CgroupMountKind,
     pub(crate) nodes: BTreeMap<String, CgroupNode>,
     pub(crate) process_assignments: BTreeMap<usize, String>,
@@ -19,6 +20,7 @@ impl CgroupMountState {
         }
         nodes.insert(String::from("/"), root);
         Self {
+            filesystem_id: NEXT_CGROUP_FS_ID.fetch_add(1, Ordering::Relaxed),
             kind,
             nodes,
             process_assignments: BTreeMap::new(),
@@ -30,6 +32,29 @@ impl CgroupMountState {
 
     pub(crate) fn is_unified(&self) -> bool {
         matches!(self.kind, CgroupMountKind::Unified)
+    }
+
+    /// Resolve the current path of a kernfs-style stable directory object.
+    /// Paths remain the domain model's indexing scheme, while VFS nodes and
+    /// open files retain the inode number across rename.
+    pub(crate) fn node_path_by_ino(&self, ino: u64) -> Option<String> {
+        self.nodes
+            .iter()
+            .find_map(|(path, node)| (node.ino == ino).then(|| path.clone()))
+    }
+
+    pub(crate) fn ensure_control_node(
+        &mut self,
+        path: &str,
+        name: &str,
+    ) -> Option<(CgroupFileKind, CgroupControlNode)> {
+        let kind = CgroupFileKind::from_name(name, self.kind)?;
+        let node = self.nodes.get_mut(path)?;
+        let control = node
+            .control_nodes
+            .entry(String::from(name))
+            .or_insert_with(|| CgroupControlNode::new(kind.mode() as u16));
+        Some((kind, control.clone()))
     }
 
     pub(crate) fn direct_children(&self, path: &str) -> Vec<String> {

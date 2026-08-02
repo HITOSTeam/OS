@@ -2,9 +2,10 @@
 //!
 //! procfs is a concrete VFS backend and therefore remains a sibling of
 //! `fs::vfs`, rather than becoming part of its generic object model.  This
-//! module still exposes the transitional path-based provider; node conversion
-//! will replace it with component lookup and proc magic links returning
-//! `VfsPath`.  Process and PID-namespace state stays owned by the task layer.
+//! Its VFS adapter performs component lookup and returns `VfsPath` targets for
+//! proc magic links.  The older path-shaped provider is now only an internal
+//! node-construction detail; pathname syscalls never dispatch through it.
+//! Process and PID-namespace state stays owned by the task layer.
 
 extern crate alloc;
 
@@ -21,20 +22,19 @@ pub(crate) mod content;
 pub(crate) mod entries;
 pub(crate) mod magic_link;
 pub(crate) mod open;
+#[allow(dead_code)]
+pub(crate) mod vfs;
 
 pub use content::{vm_commit_limit_bytes, vm_committed_as_bytes, vm_overcommit_memory};
 pub(crate) use entries::{net_core_busy_poll_usecs, net_core_busy_read_usecs, vm_max_map_count};
-pub(crate) use magic_link::resolve_proc_magic_intermediate_abs_path;
-pub use magic_link::{
-    normalize_proc_magic_path, proc_fd_link_file, proc_magic_link_exists, proc_readlink,
-};
-pub use open::open_proc_pseudo;
+pub use magic_link::{normalize_proc_magic_path, proc_magic_link_exists, proc_readlink};
 pub(crate) use open::{open_proc_pseudo_in, proc_provider_path_for_namespace};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ProcFileKind {
     Mounts,
     Mountinfo,
+    Filesystems,
     Cgroups,
     Meminfo,
     Cpuinfo,
@@ -146,6 +146,36 @@ impl ProcPseudoFile {
 
     pub fn len(&self) -> Option<usize> {
         Some(proc_file_len(&self.kind))
+    }
+
+    /// Read without using the transitional file object's cursor.  Linux keeps
+    /// `f_pos` in `struct file`; the object VFS mirrors that by passing an
+    /// explicit offset into backend operations.
+    pub(crate) fn pread_bytes(&self, offset: usize, output: &mut [u8]) -> usize {
+        match self.kind {
+            ProcFileKind::PidPagemap(pid) => {
+                return content::proc_pid_pagemap_read_at(pid, offset, output);
+            }
+            ProcFileKind::Kpageflags => {
+                return content::proc_kpageflags_read_at(offset, output);
+            }
+            _ => {}
+        }
+        let mut inner = self.inner.lock();
+        if inner.cache.is_none() {
+            inner.cache = Some(content::proc_file_content(&self.kind));
+        }
+        let bytes = inner
+            .cache
+            .as_ref()
+            .expect("proc cache populated")
+            .as_bytes();
+        if offset >= bytes.len() {
+            return 0;
+        }
+        let read = core::cmp::min(output.len(), bytes.len() - offset);
+        output[..read].copy_from_slice(&bytes[offset..offset + read]);
+        read
     }
 
     pub fn pwrite_bytes(&self, offset: usize, data: &[u8]) -> Result<usize, isize> {
@@ -351,10 +381,6 @@ fn proc_file_len(kind: &ProcFileKind) -> usize {
         ProcFileKind::PidPagemap(pid) => content::proc_pid_pagemap_len(*pid),
         _ => content::proc_file_content(kind).len(),
     }
-}
-
-pub fn is_proc_pseudo_path(abs: &str) -> bool {
-    abs == "/proc" || abs.starts_with("/proc/")
 }
 
 pub(crate) fn parse_proc_sys_usize(data: &[u8]) -> Result<usize, isize> {

@@ -3,6 +3,11 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct CgroupNode {
     pub(crate) ino: u64,
+    pub(crate) mode: u16,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// Stable kernfs-like identities and inode attributes for control files.
+    pub(crate) control_nodes: BTreeMap<String, CgroupControlNode>,
     pub(crate) subtree_control: u32,
     pub(crate) clone_children: bool,
     pub(crate) notify_on_release: bool,
@@ -26,8 +31,16 @@ pub(crate) struct CgroupNode {
 
 impl CgroupNode {
     pub(crate) fn new() -> Self {
+        Self::new_with_mode(0o755)
+    }
+
+    pub(crate) fn new_with_mode(mode: u16) -> Self {
         Self {
             ino: NEXT_CGROUP_INO.fetch_add(1, Ordering::Relaxed),
+            mode: mode & 0o7777,
+            uid: 0,
+            gid: 0,
+            control_nodes: BTreeMap::new(),
             subtree_control: 0,
             clone_children: false,
             notify_on_release: false,
@@ -47,6 +60,25 @@ impl CgroupNode {
             local_file_bytes: 0,
             local_cpu_usage_ns: 0,
             subtree_thread_count: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CgroupControlNode {
+    pub(crate) ino: u64,
+    pub(crate) mode: u16,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+impl CgroupControlNode {
+    pub(crate) fn new(mode: u16) -> Self {
+        Self {
+            ino: NEXT_CGROUP_INO.fetch_add(1, Ordering::Relaxed),
+            mode: mode & 0o7777,
+            uid: 0,
+            gid: 0,
         }
     }
 }

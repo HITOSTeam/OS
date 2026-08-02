@@ -6,6 +6,7 @@ use super::{
     find_path_in_roots, get_current_token, mount_lookup_for_abs, read_user_cstring,
     register_rofs_mount, resolve_abs_path, unregister_rofs_mount, with_ext4_inode_read,
 };
+use crate::fs::vfs::{PinnedPath, VfsFileSystem, VfsMountNamespace, VfsPath};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum FsContextMode {
@@ -16,11 +17,24 @@ pub(crate) enum FsContextMode {
 pub(crate) struct FsContextState {
     pub(crate) mode: FsContextMode,
     pub(crate) fs_type: String,
+    /// PID namespace captured when fsopen/fspick created this context.
+    /// procfs consumes it when the superblock is instantiated.
+    pub(crate) pid_namespace_id: u64,
+    /// Cgroup namespace view captured with this fs_context, as Linux does in
+    /// `cgroup_init_fs_context()`.
+    pub(crate) cgroup_namespace_root: String,
     pub(crate) source_display: String,
     pub(crate) source_abs: Option<String>,
     pub(crate) target_abs: Option<String>,
+    /// Filesystem-specific options accumulated by `fsconfig(2)`.
+    ///
+    /// The filesystem factory consumes this in the same form as legacy
+    /// `mount(2)`'s monolithic data string, keeping a single parser and one
+    /// set of validation rules for both mount APIs.
+    pub(crate) mount_data: String,
     pub(crate) pending_flags: usize,
     pub(crate) created: bool,
+    pub(crate) created_filesystem: Option<Arc<dyn VfsFileSystem>>,
 }
 
 pub(crate) struct FsContextFile {
@@ -34,11 +48,17 @@ impl FsContextFile {
             state: Mutex::new(FsContextState {
                 mode: FsContextMode::Create,
                 fs_type: String::from(fs_type),
+                pid_namespace_id: crate::task::processor::current_process().pid_namespace_id()
+                    as u64,
+                cgroup_namespace_root: crate::task::processor::current_process()
+                    .cgroup_namespace_root(),
                 source_display: String::from("/dev/root"),
                 source_abs: None,
                 target_abs: None,
+                mount_data: String::new(),
                 pending_flags: 0,
                 created: false,
+                created_filesystem: None,
             }),
         }
     }
@@ -55,11 +75,17 @@ impl FsContextFile {
             state: Mutex::new(FsContextState {
                 mode: FsContextMode::Reconfigure,
                 fs_type: String::from(fs_type),
+                pid_namespace_id: crate::task::processor::current_process().pid_namespace_id()
+                    as u64,
+                cgroup_namespace_root: crate::task::processor::current_process()
+                    .cgroup_namespace_root(),
                 source_display: String::from(source_display),
                 source_abs: Some(String::from(source_abs)),
                 target_abs: Some(String::from(target_abs)),
+                mount_data: String::new(),
                 pending_flags: flags,
                 created: false,
+                created_filesystem: None,
             }),
         }
     }
@@ -83,27 +109,114 @@ impl File for FsContextFile {
     }
 }
 
+pub(crate) enum MountHandleObject {
+    Filesystem(Arc<dyn VfsFileSystem>),
+    Bind {
+        source: VfsPath,
+        /// Keep the anonymous clone's origin graph alive without pinning the
+        /// original mounted path as a busy user-visible mount.
+        _source_namespace: Arc<VfsMountNamespace>,
+        logical_source: String,
+    },
+    /// A live `open_tree()` path.  Unlike `OPEN_TREE_CLONE`, Linux returns an
+    /// ordinary O_PATH file whose `f_path` still belongs to the namespace;
+    /// `move_mount()` therefore moves that existing mount instead of grafting
+    /// a detached copy.
+    Path {
+        source: VfsPath,
+        _source_namespace: Arc<VfsMountNamespace>,
+        logical_source: String,
+    },
+}
+
 pub(crate) struct MountHandleState {
     pub(crate) source: String,
     pub(crate) source_display: String,
     pub(crate) fs_type: String,
     pub(crate) flags: usize,
+    pub(crate) object: MountHandleObject,
+    pub(crate) attached: bool,
 }
 
 pub(crate) struct MountHandleFile {
     pub(crate) state: Mutex<MountHandleState>,
+    /// `open_tree()` without `OPEN_TREE_CLONE` is an O_PATH file for a live
+    /// namespace path.  Keep that path outside the mutable handle state so
+    /// the generic `File::object_path()` ABI can return a stable reference.
+    path: Option<PinnedPath>,
 }
 
 impl MountHandleFile {
-    /// Creates a detached mount-handle file with the captured source metadata.
-    pub(crate) fn new(source: &str, source_display: &str, fs_type: &str, flags: usize) -> Self {
+    pub(crate) fn new_filesystem(
+        source: &str,
+        source_display: &str,
+        fs_type: &str,
+        flags: usize,
+        filesystem: Arc<dyn VfsFileSystem>,
+    ) -> Self {
         Self {
             state: Mutex::new(MountHandleState {
                 source: String::from(source),
                 source_display: String::from(source_display),
                 fs_type: String::from(fs_type),
                 flags,
+                object: MountHandleObject::Filesystem(filesystem),
+                attached: false,
             }),
+            path: None,
+        }
+    }
+
+    pub(crate) fn new_bind(
+        source: &str,
+        source_display: &str,
+        fs_type: &str,
+        flags: usize,
+        path: VfsPath,
+        source_namespace: Arc<VfsMountNamespace>,
+        logical_source: &str,
+    ) -> Self {
+        Self {
+            state: Mutex::new(MountHandleState {
+                source: String::from(source),
+                source_display: String::from(source_display),
+                fs_type: String::from(fs_type),
+                flags,
+                object: MountHandleObject::Bind {
+                    source: path,
+                    _source_namespace: source_namespace,
+                    logical_source: String::from(logical_source),
+                },
+                attached: false,
+            }),
+            path: None,
+        }
+    }
+
+    pub(crate) fn new_path(
+        source: &str,
+        source_display: &str,
+        fs_type: &str,
+        flags: usize,
+        path: VfsPath,
+        source_namespace: Arc<VfsMountNamespace>,
+        logical_source: &str,
+    ) -> Self {
+        let pinned_path = PinnedPath::new(path.clone());
+        Self {
+            state: Mutex::new(MountHandleState {
+                source: String::from(source),
+                source_display: String::from(source_display),
+                fs_type: String::from(fs_type),
+                flags,
+                object: MountHandleObject::Path {
+                    source: path,
+                    _source_namespace: source_namespace,
+                    logical_source: String::from(logical_source),
+                },
+                attached: false,
+            }),
+            path: Some(pinned_path),
         }
     }
 }
@@ -120,6 +233,9 @@ impl File for MountHandleFile {
     }
     fn write(&self, _buf: UserBuffer) -> usize {
         0
+    }
+    fn object_path(&self) -> Option<&VfsPath> {
+        self.path.as_ref().map(PinnedPath::path)
     }
     fn as_any(&self) -> &dyn Any {
         self

@@ -15,7 +15,8 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::fs::{
-    File, NamespaceFile, NamespaceKind, POLLERR, POLLIN, POLLOUT, PollWaitQueue, wake_tasks,
+    File, NamespaceKind, POLLERR, POLLIN, POLLOUT, PollWaitQueue, namespace_file_from_open_file,
+    wake_tasks,
 };
 use crate::mm::{
     UserBuffer, try_copy_from_user, try_copy_to_user, try_read_user_value, try_write_user_value,
@@ -817,7 +818,7 @@ fn target_net_ns_from_attrs(attrs: &[(u16, Vec<u8>)]) -> Result<Option<usize>, i
         let Some(file) = files.lock().get_file(fd as usize) else {
             return Err(err(SyscallError::EBADF));
         };
-        let Some(ns_file) = file.as_any().downcast_ref::<NamespaceFile>() else {
+        let Some(ns_file) = namespace_file_from_open_file(&file) else {
             return Err(err(SyscallError::EINVAL));
         };
         if ns_file.kind() != NamespaceKind::Net {

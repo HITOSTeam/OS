@@ -91,6 +91,13 @@ pub struct Pipe {
 }
 
 impl Pipe {
+    /// Stable inode identity shared by both endpoints of one anonymous pipe.
+    /// Linux assigns this identity to the pipefs inode rather than to either
+    /// `struct file`; the shared ring-buffer allocation is our equivalent.
+    pub(crate) fn proc_inode(&self) -> u64 {
+        Arc::as_ptr(&self.buffer) as usize as u64
+    }
+
     /// 返回一个pipe的写端,对于给定缓冲区
     /// 具体而言，就是 通过readble 和 writebale两个bool 控制
     /// 注意设置是双向的，你需要在pipe内部保留对于Buffer的指针

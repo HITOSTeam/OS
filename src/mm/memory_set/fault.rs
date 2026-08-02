@@ -285,7 +285,7 @@ impl MemorySet {
                 .saturating_add(page_start.saturating_sub(region.start))
                 / PAGE_SIZE
         });
-        let shared_inode_backed = region.shared && region.file_backed && region.memfd_id == 0;
+        let shared_inode_backed = region.shared && region.file_backed && region.shmem_id == 0;
         let shared_anon_backed = region.shared && region.anon_shared_id != 0;
         let anon_page = shared_anon_backed.then(|| {
             region

@@ -20,7 +20,7 @@ use crate::{
         CgroupAttachTarget, PidFdFile, cgroup_attach_process_to_target, cgroup_attach_thread,
         cgroup_clone_into_target_from_file, cgroup_current_path, cgroup_fork_precheck,
         ext4_inode_lock, fanotify_notify_open_exec, fanotify_permission_open,
-        refresh_thread_legacy_cpu_fair_group_cache,
+        refresh_thread_legacy_cpu_fair_group_cache, vfs::VfsPath,
     },
     mm::{
         MapPermission, MemorySet, kernel_token, try_copy_from_user, try_read_user_value,
@@ -29,7 +29,8 @@ use crate::{
     println,
     syscall::{
         filesystem::{
-            AT_FDCWD, normalize_path, resolve_abs_path, resolve_exec_inode, resolve_exec_inode_at,
+            AT_FDCWD, current_fsuid_gid, get_fd_file, normalize_path, resolve_abs_path,
+            resolve_at_path, resolve_at_vfs_path, resolve_exec_inode, resolve_exec_inode_at,
             resolve_read_inode,
         },
         misc::encode_linux_tid,

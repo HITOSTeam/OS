@@ -1216,7 +1216,7 @@ pub(super) fn parse_unix_bound_addr(addr: usize, addrlen: usize) -> Result<UnixB
     let Ok(path_part) = core::str::from_utf8(&raw_name) else {
         return Err(err(SyscallError::EINVAL));
     };
-    let cwd = { current_process().borrow_mut().cwd.clone() };
+    let cwd = current_process().fs_struct().cwd_display();
     // 相对路径需要结合 cwd 规范化，保证不同进程使用同一路径时能命中同一注册表条目
     let abs = normalize_path(&cwd, path_part);
     Ok(UnixBoundAddr::Path(abs))

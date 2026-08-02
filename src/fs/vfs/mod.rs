@@ -42,6 +42,8 @@ pub type VfsResult<T> = core::result::Result<T, VfsError>;
 pub enum VfsError {
     /// 当前凭证没有执行操作所需的权限（通常为 `EACCES` 或 `EPERM`）。
     Access,
+    /// 操作被文件系统策略禁止，而不是普通 DAC 检查失败（`EPERM`）。
+    Permission,
     /// 对象仍被引用、目录是 cwd/root 或 mount 仍被 pin（`EBUSY`）。
     Busy,
     /// 操作不允许跨越 mount/filesystem 边界（`EXDEV`）。
@@ -50,6 +52,8 @@ pub enum VfsError {
     Exists,
     /// 参数、对象类型或状态组合无效（`EINVAL`）。
     Invalid,
+    /// 后端对象存在，但当前操作发生 I/O/内部状态错误（`EIO`）。
+    Io,
     /// 期望普通文件，但目标是目录（`EISDIR`）。
     IsDirectory,
     /// 符号链接解析次数过多或形成循环（`ELOOP`）。
@@ -58,6 +62,10 @@ pub enum VfsError {
     NameTooLong,
     /// 路径分量或目标对象不存在（`ENOENT`）。
     NoEntry,
+    /// 进程或线程 ID 在调用者可见命名空间中不存在（`ESRCH`）。
+    NoProcess,
+    /// 请求的块设备或其他挂载源不存在（`ENODEV`）。
+    NoDevice,
     /// 文件系统没有剩余块、inode 或其他可分配资源（`ENOSPC`）。
     NoSpace,
     /// 期望目录，但路径分量不是目录（`ENOTDIR`）。
@@ -135,6 +143,8 @@ pub struct VfsStatFs {
     pub blocks: u64,
     /// 当前可用块数。
     pub blocks_free: u64,
+    /// 非特权调用者实际可分配的块数；ext4 会扣除保留块。
+    pub blocks_available: u64,
     /// 可分配的文件/inode 总数。
     pub files: u64,
     /// 当前可用文件/inode 数量。
@@ -191,6 +201,7 @@ mod tests {
     struct TestFs {
         id: u64,
         root: Arc<TestNode>,
+        vfs_state: VfsFileSystemState,
     }
 
     impl TestFs {
@@ -204,7 +215,12 @@ mod tests {
                     children: RwLock::new(BTreeMap::new()),
                     link: RwLock::new(None),
                 });
-                Self { id, root }
+                let vfs_state = VfsFileSystemState::new(Arc::clone(&root) as Arc<dyn VfsNode>);
+                Self {
+                    id,
+                    root,
+                    vfs_state,
+                }
             })
         }
 
@@ -264,8 +280,8 @@ mod tests {
             "testfs"
         }
 
-        fn root_node(&self) -> Arc<dyn VfsNode> {
-            Arc::clone(&self.root) as Arc<dyn VfsNode>
+        fn vfs_state(&self) -> &VfsFileSystemState {
+            &self.vfs_state
         }
 
         fn statfs(&self) -> VfsResult<VfsStatFs> {
@@ -448,6 +464,102 @@ mod tests {
             .err(),
             Some(VfsError::Loop)
         );
+        assert_eq!(
+            lookup(
+                &walker,
+                &root,
+                &root,
+                "/magic",
+                LookupFlags::FOLLOW_FINAL | LookupFlags::NO_SYMLINKS,
+            )
+            .err(),
+            Some(VfsError::Loop)
+        );
+        assert_eq!(
+            lookup(&walker, &root, &root, "/magic", LookupFlags::NO_SYMLINKS,)
+                .unwrap()
+                .node()
+                .node_id(),
+            link.id
+        );
+    }
+
+    /// `MNT_NOSYMFOLLOW` belongs to the mount containing the link.  It blocks
+    /// every attempted traversal, including intermediate and magic links,
+    /// while lookup/readlink-style operations may still address the link
+    /// object itself.
+    #[test]
+    fn nosymfollow_is_enforced_by_the_link_mount() {
+        let (root_fs, namespace, walker, root) = root_fixture();
+        let target = root_fs.add(&root_fs.root, "target", 2, VfsNodeKind::Regular);
+        root_fs.add(&root_fs.root, "mnt", 3, VfsNodeKind::Directory);
+        let mountpoint = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+
+        let mounted_fs = TestFs::new(20);
+        let directory = mounted_fs.add(&mounted_fs.root, "dir", 2, VfsNodeKind::Directory);
+        mounted_fs.add(&directory, "file", 3, VfsNodeKind::Regular);
+        mounted_fs.add_link(&mounted_fs.root, "text", 4, "dir");
+        let magic = mounted_fs.add(&mounted_fs.root, "magic", 5, VfsNodeKind::Symlink);
+        let target_path = lookup(&walker, &root, &root, "/target", 0).unwrap();
+        *magic.link.write() = Some(TestLink::Magic(target_path));
+
+        let mounted = namespace
+            .mount(
+                &mountpoint,
+                Arc::clone(&mounted_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags(VfsMountFlags::NOSYMFOLLOW),
+            )
+            .unwrap();
+        assert!(mounted.flags().is_nosymfollow());
+        assert!(!mounted.flags().is_read_only());
+
+        let link = lookup(&walker, &root, &root, "/mnt/text", 0).unwrap();
+        assert_eq!(link.node().node_id(), 4);
+        assert_eq!(
+            lookup(
+                &walker,
+                &root,
+                &root,
+                "/mnt/text",
+                LookupFlags::FOLLOW_FINAL,
+            )
+            .err(),
+            Some(VfsError::Loop)
+        );
+        assert_eq!(
+            lookup(&walker, &root, &root, "/mnt/text/file", 0).err(),
+            Some(VfsError::Loop)
+        );
+        assert_eq!(
+            lookup(&walker, &root, &root, "/mnt/text/", 0).err(),
+            Some(VfsError::Loop)
+        );
+        assert_eq!(
+            lookup(
+                &walker,
+                &root,
+                &root,
+                "/mnt/magic",
+                LookupFlags::FOLLOW_FINAL,
+            )
+            .err(),
+            Some(VfsError::Loop)
+        );
+
+        mounted.set_flags(VfsMountFlags::default());
+        assert_eq!(
+            lookup(
+                &walker,
+                &root,
+                &root,
+                "/mnt/magic",
+                LookupFlags::FOLLOW_FINAL,
+            )
+            .unwrap()
+            .node()
+            .node_id(),
+            target.id
+        );
     }
 
     /// 验证硬链接拥有不同 dentry identity，但指向同一个 node/inode identity。
@@ -513,6 +625,89 @@ mod tests {
         );
     }
 
+    /// A syscall resolves an existing mountpoint to its visible root.  A
+    /// second mount through that object must still extend the original mount
+    /// stack, and popping the top must reveal the lower filesystem.
+    #[test]
+    fn overmount_through_visible_root_extends_existing_stack() {
+        let (root_fs, namespace, walker, root) = root_fixture();
+        root_fs.add(&root_fs.root, "mnt", 2, VfsNodeKind::Directory);
+        let mountpoint = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        let lower = TestFs::new(20);
+        lower.add(&lower.root, "lower", 2, VfsNodeKind::Regular);
+        let lower_mount = namespace
+            .mount(
+                &mountpoint,
+                Arc::clone(&lower) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+
+        let visible_lower = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        let upper = TestFs::new(30);
+        upper.add(&upper.root, "upper", 2, VfsNodeKind::Regular);
+        let upper_mount = namespace
+            .mount(
+                &visible_lower,
+                Arc::clone(&upper) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            namespace.top_mount_at(&mountpoint).unwrap().id(),
+            upper_mount.id()
+        );
+        assert!(lookup(&walker, &root, &root, "/mnt/upper", 0).is_ok());
+        let visible_upper = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        assert_eq!(
+            namespace.umount(&visible_upper, false).unwrap().id(),
+            upper_mount.id()
+        );
+        assert_eq!(
+            namespace.top_mount_at(&mountpoint).unwrap().id(),
+            lower_mount.id()
+        );
+        assert!(lookup(&walker, &root, &root, "/mnt/lower", 0).is_ok());
+    }
+
+    /// Absolute lookup starts from the visible mount covering the process
+    /// root.  A relative lookup through an already pinned lower root remains
+    /// on that old object, and removing the top mount reveals it again.
+    #[test]
+    fn root_overmount_is_visible_only_to_absolute_lookup() {
+        let (_root_fs, namespace, walker, root) = root_fixture();
+        let upper = TestFs::new(20);
+        upper.add(&upper.root, "upper", 2, VfsNodeKind::Regular);
+        let upper_mount = namespace
+            .mount(
+                &root,
+                Arc::clone(&upper) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+
+        let visible_root = lookup(&walker, &root, &root, "/", 0).unwrap();
+        assert_eq!(visible_root.mount().id(), upper_mount.id());
+        assert!(lookup(&walker, &root, &root, "/upper", 0).is_ok());
+
+        let pinned_lower = lookup(&walker, &root, &root, ".", 0).unwrap();
+        assert_eq!(pinned_lower.mount().id(), root.mount().id());
+        assert_eq!(
+            lookup(&walker, &root, &root, "/..", 0)
+                .unwrap()
+                .mount()
+                .id(),
+            upper_mount.id()
+        );
+
+        namespace.umount(&visible_root, false).unwrap();
+        assert_eq!(
+            lookup(&walker, &root, &root, "/", 0).unwrap().mount().id(),
+            root.mount().id()
+        );
+    }
+
     /// 验证 bind mount 子树和路径 pin：普通卸载报告 busy，lazy detach 只移除
     /// namespace 可达性，已经 pin 的对象仍保持有效。
     #[test]
@@ -543,6 +738,132 @@ mod tests {
         );
     }
 
+    /// Recursive bind clones every nested mount identity while sharing each
+    /// filesystem and dentry tree. Detaching the source subtree must not
+    /// detach its clone, and a normal unmount of the clone root remains busy
+    /// until cloned child mounts are removed.
+    #[test]
+    fn recursive_bind_clones_nested_mount_tree() {
+        let (fs, namespace, walker, root) = root_fixture();
+        let source = fs.add(&fs.root, "source", 2, VfsNodeKind::Directory);
+        fs.add(&source, "child", 3, VfsNodeKind::Directory);
+        fs.add(&fs.root, "target", 4, VfsNodeKind::Directory);
+
+        let child_fs = TestFs::new(20);
+        child_fs.add(&child_fs.root, "file", 2, VfsNodeKind::Regular);
+        child_fs.add(&child_fs.root, "nested", 3, VfsNodeKind::Directory);
+        let source_child = lookup(&walker, &root, &root, "/source/child", 0).unwrap();
+        let original_child = namespace
+            .mount(
+                &source_child,
+                Arc::clone(&child_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+
+        let nested_fs = TestFs::new(30);
+        nested_fs.add(&nested_fs.root, "deep", 2, VfsNodeKind::Regular);
+        let source_nested = lookup(&walker, &root, &root, "/source/child/nested", 0).unwrap();
+        let original_nested = namespace
+            .mount(
+                &source_nested,
+                Arc::clone(&nested_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+
+        let source_path = lookup(&walker, &root, &root, "/source", 0).unwrap();
+        let target_path = lookup(&walker, &root, &root, "/target", 0).unwrap();
+        namespace
+            .bind_recursive(&target_path, &source_path, VfsMountFlags::default())
+            .unwrap();
+
+        let cloned_child = lookup(&walker, &root, &root, "/target/child", 0).unwrap();
+        let cloned_nested = lookup(&walker, &root, &root, "/target/child/nested", 0).unwrap();
+        assert_ne!(cloned_child.mount().id(), original_child.id());
+        assert_ne!(cloned_nested.mount().id(), original_nested.id());
+        assert!(Arc::ptr_eq(
+            cloned_child.mount().filesystem(),
+            original_child.filesystem()
+        ));
+        assert!(Arc::ptr_eq(
+            cloned_nested.mount().filesystem(),
+            original_nested.filesystem()
+        ));
+        assert_eq!(
+            lookup(&walker, &root, &root, "/target/child/nested/deep", 0)
+                .unwrap()
+                .node()
+                .filesystem_id(),
+            nested_fs.id
+        );
+
+        namespace.umount(&source_nested, false).unwrap();
+        let source_child_visible = lookup(&walker, &root, &root, "/source/child", 0).unwrap();
+        namespace.umount(&source_child_visible, false).unwrap();
+        assert!(lookup(&walker, &root, &root, "/source/child/file", 0).is_err());
+        assert!(lookup(&walker, &root, &root, "/target/child/file", 0).is_ok());
+        assert_eq!(
+            namespace.umount(&target_path, false).err(),
+            Some(VfsError::Busy)
+        );
+
+        let target_nested = lookup(&walker, &root, &root, "/target/child/nested", 0).unwrap();
+        namespace.umount(&target_nested, false).unwrap();
+        let target_child = lookup(&walker, &root, &root, "/target/child", 0).unwrap();
+        namespace.umount(&target_child, false).unwrap();
+        namespace.umount(&target_path, false).unwrap();
+    }
+
+    /// Unmount propagation is selected by the parent mount and covered
+    /// mountpoint.  Merely sharing the child mount's peer group must not make
+    /// two children below unrelated private parents disappear together.
+    #[test]
+    fn unmount_propagation_uses_parent_peer_group() {
+        let (fs, namespace, walker, root) = root_fixture();
+        let source = fs.add(&fs.root, "source", 2, VfsNodeKind::Directory);
+        fs.add(&source, "child", 3, VfsNodeKind::Directory);
+        fs.add(&fs.root, "target", 4, VfsNodeKind::Directory);
+
+        let child_fs = TestFs::new(20);
+        child_fs.add(&child_fs.root, "file", 2, VfsNodeKind::Regular);
+        let source_child = lookup(&walker, &root, &root, "/source/child", 0).unwrap();
+        let original_child = namespace
+            .mount(
+                &source_child,
+                Arc::clone(&child_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+        let source_child_visible = lookup(&walker, &root, &root, "/source/child", 0).unwrap();
+        namespace
+            .set_propagation(
+                &source_child_visible,
+                VfsMountPropagation::Shared { peer_group: 900 },
+            )
+            .unwrap();
+
+        let source_path = lookup(&walker, &root, &root, "/source", 0).unwrap();
+        let target_path = lookup(&walker, &root, &root, "/target", 0).unwrap();
+        namespace
+            .bind_recursive(&target_path, &source_path, VfsMountFlags::default())
+            .unwrap();
+        let cloned_child = lookup(&walker, &root, &root, "/target/child", 0).unwrap();
+        assert_ne!(cloned_child.mount().id(), original_child.id());
+        assert_eq!(
+            cloned_child.mount().propagation(),
+            VfsMountPropagation::Shared { peer_group: 900 }
+        );
+
+        namespace.umount(&source_child_visible, false).unwrap();
+        assert!(lookup(&walker, &root, &root, "/source/child/file", 0).is_err());
+        assert!(lookup(&walker, &root, &root, "/target/child/file", 0).is_ok());
+
+        let target_child = lookup(&walker, &root, &root, "/target/child", 0).unwrap();
+        namespace.umount(&target_child, false).unwrap();
+        namespace.umount(&target_path, false).unwrap();
+    }
+
     /// 验证 clone 后的 mount namespace 拥有独立 mount graph，父空间卸载不会修改副本。
     #[test]
     fn namespace_clone_has_independent_mount_stacks() {
@@ -557,11 +878,20 @@ mod tests {
                 VfsMountFlags::default(),
             )
             .unwrap();
-        let clone = namespace.clone_namespace();
+        let cloned = namespace.clone_namespace_with_map();
+        let clone_mountpoint = cloned.remap_path(&mountpoint).unwrap();
+        let clone = Arc::clone(cloned.namespace());
+        let original_mount = namespace.top_mount_at(&mountpoint).unwrap();
+        let cloned_mount = clone.top_mount_at(&clone_mountpoint).unwrap();
+        assert_ne!(original_mount.id(), cloned_mount.id());
+        assert!(Arc::ptr_eq(
+            original_mount.filesystem(),
+            cloned_mount.filesystem()
+        ));
         namespace.umount(&mountpoint, false).unwrap();
 
         assert!(namespace.top_mount_at(&mountpoint).is_none());
-        assert!(clone.top_mount_at(&mountpoint).is_some());
+        assert!(clone.top_mount_at(&clone_mountpoint).is_some());
     }
 
     /// 验证 move/remount 操作以及 `NO_XDEV` 对跨 mount 的 `..` 同样生效。
@@ -600,5 +930,422 @@ mod tests {
         );
         namespace.remount(&to, VfsMountFlags(0x55)).unwrap();
         assert_eq!(namespace.top_mount_at(&to).unwrap().flags().0, 0x55);
+
+        namespace.remount(&root, VfsMountFlags(0xaa)).unwrap();
+        assert_eq!(root.mount().flags().0, 0xaa);
+    }
+
+    /// Two bind mounts may expose the same dentry and superblock while keeping
+    /// independent mount flags.  Remounting one clone must not alter either
+    /// the source path or its sibling clone.
+    #[test]
+    fn bind_mounts_keep_independent_flags() {
+        let (fs, namespace, walker, root) = root_fixture();
+        let source_node = fs.add(&fs.root, "source", 2, VfsNodeKind::Directory);
+        fs.add(&source_node, "file", 3, VfsNodeKind::Regular);
+        fs.add(&fs.root, "first", 4, VfsNodeKind::Directory);
+        fs.add(&fs.root, "second", 5, VfsNodeKind::Directory);
+        let source = lookup(&walker, &root, &root, "/source", 0).unwrap();
+        let first = lookup(&walker, &root, &root, "/first", 0).unwrap();
+        let second = lookup(&walker, &root, &root, "/second", 0).unwrap();
+
+        let first_mount = namespace
+            .bind(&first, &source, VfsMountFlags(VfsMountFlags::READ_ONLY))
+            .unwrap();
+        let second_mount = namespace
+            .bind(&second, &source, VfsMountFlags(VfsMountFlags::NODEV))
+            .unwrap();
+        let first_visible = lookup(&walker, &root, &root, "/first/file", 0).unwrap();
+        let second_visible = lookup(&walker, &root, &root, "/second/file", 0).unwrap();
+        assert_eq!(
+            first_visible.node().node_id(),
+            second_visible.node().node_id()
+        );
+        assert!(first_mount.flags().is_read_only());
+        assert!(!first_mount.flags().is_nodev());
+        assert!(second_mount.flags().is_nodev());
+        assert!(!second_mount.flags().is_read_only());
+        assert!(!source.mount().flags().is_read_only());
+
+        let first_root = lookup(&walker, &root, &root, "/first", 0).unwrap();
+        namespace
+            .remount(
+                &first_root,
+                VfsMountFlags(VfsMountFlags::NOEXEC | VfsMountFlags::NOSYMFOLLOW),
+            )
+            .unwrap();
+        assert!(first_mount.flags().is_noexec());
+        assert!(first_mount.flags().is_nosymfollow());
+        assert!(!first_mount.flags().is_read_only());
+        assert!(second_mount.flags().is_nodev());
+        assert!(!second_mount.flags().is_noexec());
+        assert_eq!(source.mount().flags(), VfsMountFlags::default());
+    }
+
+    /// A filesystem owns one positive dcache, so separate syscall walkers must
+    /// recover the same dentry object.  Mount lookup depends on this identity.
+    #[test]
+    fn shares_dentry_identity_across_walkers_and_mounts() {
+        let (fs, namespace, first_walker, root) = root_fixture();
+        fs.add(&fs.root, "plain", 2, VfsNodeKind::Regular);
+        fs.add(&fs.root, "mnt", 3, VfsNodeKind::Directory);
+        let second_walker = PathWalker::new(Arc::clone(&namespace));
+
+        let first = lookup(&first_walker, &root, &root, "/plain", 0).unwrap();
+        let second = lookup(&second_walker, &root, &root, "/plain", 0).unwrap();
+        assert_eq!(first.dentry().id(), second.dentry().id());
+        assert!(Arc::ptr_eq(first.dentry(), second.dentry()));
+
+        let mountpoint = lookup(&first_walker, &root, &root, "/mnt", 0).unwrap();
+        let mounted_fs = TestFs::new(20);
+        mounted_fs.add(&mounted_fs.root, "inside", 2, VfsNodeKind::Regular);
+        let mounted = namespace
+            .mount(
+                &mountpoint,
+                Arc::clone(&mounted_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            lookup(&second_walker, &root, &root, "/mnt/inside", 0)
+                .unwrap()
+                .mount()
+                .id(),
+            mounted.id()
+        );
+    }
+
+    /// Namespace copies share superblocks and dentries, not mount identities or
+    /// mutable mount state.
+    #[test]
+    fn namespace_clone_isolates_remount_move_and_pins() {
+        let (fs, namespace, walker, root) = root_fixture();
+        fs.add(&fs.root, "from", 2, VfsNodeKind::Directory);
+        fs.add(&fs.root, "to", 3, VfsNodeKind::Directory);
+        let from = lookup(&walker, &root, &root, "/from", 0).unwrap();
+        let to = lookup(&walker, &root, &root, "/to", 0).unwrap();
+        let mounted_fs = TestFs::new(20);
+        mounted_fs.add(&mounted_fs.root, "file", 2, VfsNodeKind::Regular);
+        let original_mount = namespace
+            .mount(
+                &from,
+                Arc::clone(&mounted_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+        let original_visible = lookup(&walker, &root, &root, "/from", 0).unwrap();
+        let original_pin = PinnedPath::new(original_visible);
+
+        let cloned = namespace.clone_namespace_with_map();
+        let clone = Arc::clone(cloned.namespace());
+        let clone_from = cloned.remap_path(&from).unwrap();
+        let clone_to = cloned.remap_path(&to).unwrap();
+        let clone_mount = clone.top_mount_at(&clone_from).unwrap();
+        assert_ne!(original_mount.id(), clone_mount.id());
+        assert_eq!(original_mount.pin_count(), 1);
+        assert_eq!(clone_mount.pin_count(), 0);
+
+        let clone_walker = PathWalker::new(Arc::clone(&clone));
+        let clone_root = clone.root_path();
+        let clone_visible = lookup(&clone_walker, &clone_root, &clone_root, "/from", 0).unwrap();
+        clone.remount(&clone_visible, VfsMountFlags(0x77)).unwrap();
+        assert_eq!(clone_mount.flags().0, 0x77);
+        assert_eq!(original_mount.flags().0, 0);
+
+        clone.move_mount(&clone_visible, &clone_to).unwrap();
+        assert!(lookup(&clone_walker, &clone_root, &clone_root, "/from/file", 0).is_err());
+        assert!(lookup(&clone_walker, &clone_root, &clone_root, "/to/file", 0).is_ok());
+        assert!(lookup(&walker, &root, &root, "/from/file", 0).is_ok());
+        assert!(lookup(&walker, &root, &root, "/to/file", 0).is_err());
+
+        let clone_moved = lookup(&clone_walker, &clone_root, &clone_root, "/to", 0).unwrap();
+        clone.umount(&clone_moved, false).unwrap();
+        assert_eq!(original_pin.path().mount().id(), original_mount.id());
+    }
+
+    /// Normal pathname resolution returns the mounted root, so mount operations
+    /// must accept that visible object rather than requiring a hidden covered
+    /// dentry retained by the caller.
+    #[test]
+    fn unmounts_through_visible_root_and_detached_dotdot_cannot_escape() {
+        let (fs, namespace, walker, root) = root_fixture();
+        fs.add(&fs.root, "mnt", 2, VfsNodeKind::Directory);
+        let mountpoint = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        let mounted_fs = TestFs::new(20);
+        let nested = mounted_fs.add(&mounted_fs.root, "nested", 2, VfsNodeKind::Directory);
+        mounted_fs.add(&nested, "file", 3, VfsNodeKind::Regular);
+        let mount = namespace
+            .mount(
+                &mountpoint,
+                Arc::clone(&mounted_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+
+        let visible = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        let nested_path = lookup(&walker, &root, &root, "/mnt/nested", 0).unwrap();
+        let pinned = PinnedPath::new(nested_path);
+        assert_eq!(
+            namespace.umount(&visible, false).err(),
+            Some(VfsError::Busy)
+        );
+        assert_eq!(namespace.umount(&visible, true).unwrap().id(), mount.id());
+
+        let detached_parent = lookup(&walker, &root, pinned.path(), "../..", 0).unwrap();
+        assert_eq!(detached_parent.mount().id(), mount.id());
+        assert!(Arc::ptr_eq(detached_parent.dentry(), mount.root()));
+        assert!(lookup(&walker, &root, &root, "/mnt/nested", 0).is_err());
+    }
+
+    /// A pinned dirfd keeps its original namespace graph alive.  Replacing the
+    /// corresponding mount in a cloned namespace must not redirect relative
+    /// lookup through that old descriptor.
+    #[test]
+    fn old_dirfd_keeps_original_mount_tree_after_namespace_clone() {
+        let (fs, namespace, walker, root) = root_fixture();
+        fs.add(&fs.root, "mnt", 2, VfsNodeKind::Directory);
+        let mountpoint = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        let old_fs = TestFs::new(20);
+        let old_dir = old_fs.add(&old_fs.root, "dir", 2, VfsNodeKind::Directory);
+        old_fs.add(&old_dir, "old", 3, VfsNodeKind::Regular);
+        namespace
+            .mount(
+                &mountpoint,
+                Arc::clone(&old_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+        let old_dirfd = PinnedPath::new(lookup(&walker, &root, &root, "/mnt/dir", 0).unwrap());
+
+        let cloned = namespace.clone_namespace_with_map();
+        let clone = Arc::clone(cloned.namespace());
+        let clone_mountpoint = cloned.remap_path(&mountpoint).unwrap();
+        let clone_walker = PathWalker::new(Arc::clone(&clone));
+        let clone_root = clone.root_path();
+        let clone_visible = lookup(&clone_walker, &clone_root, &clone_root, "/mnt", 0).unwrap();
+        clone.umount(&clone_visible, false).unwrap();
+
+        let replacement = TestFs::new(30);
+        replacement.add(&replacement.root, "new", 2, VfsNodeKind::Regular);
+        clone
+            .mount(
+                &clone_mountpoint,
+                Arc::clone(&replacement) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+
+        assert!(lookup(&clone_walker, &clone_root, old_dirfd.path(), "old", 0,).is_ok());
+        assert!(lookup(&clone_walker, &clone_root, &clone_root, "/mnt/new", 0).is_ok());
+        assert!(lookup(&clone_walker, &clone_root, &clone_root, "/mnt/dir/old", 0).is_err());
+    }
+
+    /// Scoped openat2 lookup rejects proc-style magic jumps exactly as Linux
+    /// nd_jump_link(), and dotdot requires search permission on the directory
+    /// being left.
+    #[test]
+    fn scoped_lookup_blocks_magic_links_and_checks_dotdot_search_permission() {
+        let (fs, _, walker, root) = root_fixture();
+        let jail = fs.add(&fs.root, "jail", 2, VfsNodeKind::Directory);
+        fs.add(&jail, "inside", 3, VfsNodeKind::Regular);
+        let outside = fs.add(&fs.root, "outside", 4, VfsNodeKind::Regular);
+        let outside_path = lookup(&walker, &root, &root, "/outside", 0).unwrap();
+        assert_eq!(outside_path.node().node_id(), outside.id);
+        let magic = fs.add(&jail, "magic", 5, VfsNodeKind::Symlink);
+        *magic.link.write() = Some(TestLink::Magic(outside_path));
+        let jail_path = lookup(&walker, &root, &root, "/jail", 0).unwrap();
+
+        assert_eq!(
+            lookup(&walker, &root, &jail_path, "..", LookupFlags::BENEATH).err(),
+            Some(VfsError::CrossDevice)
+        );
+        assert!(
+            lookup(
+                &walker,
+                &root,
+                &jail_path,
+                "../inside",
+                LookupFlags::IN_ROOT
+            )
+            .is_ok()
+        );
+
+        for scoped in [LookupFlags::BENEATH, LookupFlags::IN_ROOT] {
+            assert_eq!(
+                lookup(
+                    &walker,
+                    &root,
+                    &jail_path,
+                    "magic",
+                    LookupFlags::FOLLOW_FINAL | scoped,
+                )
+                .err(),
+                Some(VfsError::CrossDevice)
+            );
+        }
+
+        *jail.metadata.write() = test_metadata(VfsNodeKind::Directory, 0o600);
+        assert_eq!(
+            walker
+                .walk(
+                    &root,
+                    &jail_path,
+                    "..",
+                    LookupFlags::default(),
+                    VfsCredentials {
+                        uid: 1000,
+                        gid: 1000
+                    },
+                )
+                .err(),
+            Some(VfsError::Access)
+        );
+    }
+
+    #[test]
+    fn resolves_mutation_parent_without_absolute_path_reconstruction() {
+        let (fs, _, walker, root) = root_fixture();
+        let dir = fs.add(&fs.root, "dir", 2, VfsNodeKind::Directory);
+        fs.add(&dir, "nested", 3, VfsNodeKind::Directory);
+        fs.add_link(&fs.root, "alias", 4, "dir/nested");
+
+        let parent = walker
+            .walk_parent(
+                &root,
+                &root,
+                "/alias/new/",
+                LookupFlags::default(),
+                VfsCredentials::default(),
+            )
+            .unwrap();
+        assert_eq!(parent.parent.node().node_id(), 3);
+        assert_eq!(parent.name, "new");
+        assert!(parent.trailing_slash);
+        assert_eq!(
+            walker
+                .walk_parent(
+                    &root,
+                    &root,
+                    &alloc::format!("/{}", "x".repeat(256)),
+                    LookupFlags::default(),
+                    VfsCredentials::default(),
+                )
+                .err(),
+            Some(VfsError::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn fs_struct_remaps_root_and_cwd_but_private_clone_keeps_mounts() {
+        let (fs, namespace, walker, root) = root_fixture();
+        fs.add(&fs.root, "mnt", 2, VfsNodeKind::Directory);
+        let mountpoint = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        let mounted_fs = TestFs::new(20);
+        mounted_fs.add(&mounted_fs.root, "cwd", 2, VfsNodeKind::Directory);
+        namespace
+            .mount(
+                &mountpoint,
+                Arc::clone(&mounted_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+        let cwd = lookup(&walker, &root, &root, "/mnt/cwd", 0).unwrap();
+        let fs_struct = FsStruct::new(root.clone());
+        fs_struct.set_cwd(cwd.clone());
+
+        let private = fs_struct.clone_private();
+        assert_eq!(private.root().path().mount().id(), root.mount().id());
+        assert_eq!(private.cwd().path().mount().id(), cwd.mount().id());
+
+        let cloned = namespace.clone_namespace_with_map();
+        let remapped = fs_struct.clone_for_namespace(&cloned).unwrap();
+        assert_ne!(remapped.root().path().mount().id(), root.mount().id());
+        assert_ne!(remapped.cwd().path().mount().id(), cwd.mount().id());
+        assert_eq!(remapped.cwd().path().node().node_id(), cwd.node().node_id());
+        assert_eq!(remapped.root().namespace().id(), cloned.namespace().id());
+
+        let jailed =
+            FsStruct::new_with_paths(root.clone(), cwd.clone(), "/jail", "/jail/subdir", 0);
+        assert_eq!(jailed.cwd_visible(), "/subdir");
+        jailed.set_cwd_display("/jail");
+        assert_eq!(jailed.cwd_visible(), "/");
+        jailed.set_cwd_display("/outside");
+        assert_eq!(jailed.cwd_visible(), "(unreachable)/outside");
+    }
+
+    #[test]
+    fn shared_mount_events_reach_peers_and_slaves_atomically() {
+        let (fs, namespace, walker, root) = root_fixture();
+        fs.add(&fs.root, "mnt", 2, VfsNodeKind::Directory);
+        let mountpoint = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        namespace
+            .set_propagation(&root, VfsMountPropagation::Shared { peer_group: 700 })
+            .unwrap();
+
+        let peer_clone = namespace.clone_namespace_with_map();
+        let peer = Arc::clone(peer_clone.namespace());
+        let peer_mountpoint = peer_clone.remap_path(&mountpoint).unwrap();
+        let peer_root = peer.root_path();
+
+        let slave_clone = namespace.clone_namespace_with_map();
+        let slave = Arc::clone(slave_clone.namespace());
+        let slave_mountpoint = slave_clone.remap_path(&mountpoint).unwrap();
+        let slave_root = slave.root_path();
+        slave
+            .set_propagation(
+                &slave_root,
+                VfsMountPropagation::Slave { master_group: 700 },
+            )
+            .unwrap();
+
+        let mounted_fs = TestFs::new(20);
+        mounted_fs.add(&mounted_fs.root, "file", 2, VfsNodeKind::Regular);
+        let local_mount = namespace
+            .mount(
+                &mountpoint,
+                Arc::clone(&mounted_fs) as Arc<dyn VfsFileSystem>,
+                VfsMountFlags::default(),
+            )
+            .unwrap();
+        let peer_mount = peer.top_mount_at(&peer_mountpoint).unwrap();
+        let slave_mount = slave.top_mount_at(&slave_mountpoint).unwrap();
+        let child_group = match local_mount.propagation() {
+            VfsMountPropagation::Shared { peer_group } => peer_group,
+            _ => panic!("local child did not become shared"),
+        };
+        assert_eq!(
+            peer_mount.propagation(),
+            VfsMountPropagation::Shared {
+                peer_group: child_group
+            }
+        );
+        assert_eq!(
+            slave_mount.propagation(),
+            VfsMountPropagation::Slave {
+                master_group: child_group
+            }
+        );
+
+        let peer_walker = PathWalker::new(Arc::clone(&peer));
+        let slave_walker = PathWalker::new(Arc::clone(&slave));
+        assert!(lookup(&peer_walker, &peer_root, &peer_root, "/mnt/file", 0).is_ok());
+        assert!(lookup(&slave_walker, &slave_root, &slave_root, "/mnt/file", 0).is_ok());
+
+        let peer_visible = lookup(&peer_walker, &peer_root, &peer_root, "/mnt", 0).unwrap();
+        let peer_pin = PinnedPath::new(peer_visible);
+        let local_visible = lookup(&walker, &root, &root, "/mnt", 0).unwrap();
+        assert_eq!(
+            namespace.umount(&local_visible, false).err(),
+            Some(VfsError::Busy)
+        );
+        assert!(namespace.top_mount_at(&mountpoint).is_some());
+        assert!(peer.top_mount_at(&peer_mountpoint).is_some());
+        assert!(slave.top_mount_at(&slave_mountpoint).is_some());
+
+        drop(peer_pin);
+        namespace.umount(&local_visible, false).unwrap();
+        assert!(namespace.top_mount_at(&mountpoint).is_none());
+        assert!(peer.top_mount_at(&peer_mountpoint).is_none());
+        assert!(slave.top_mount_at(&slave_mountpoint).is_none());
     }
 }

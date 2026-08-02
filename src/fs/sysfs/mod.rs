@@ -1,9 +1,11 @@
 //! sysfs filesystem view.
 //!
-//! This is a concrete filesystem backend, not part of the VFS object model.
-//! The current implementation is the compatibility provider used by the
-//! legacy pathname dispatcher.  New work should expose these entries through
-//! `VfsFileSystem` and `VfsNode` instead of adding path translations here.
+//! This is a concrete filesystem backend.  [`vfs`] exposes its objects to the
+//! common VFS, while `open_legacy` remains as the content provider during the
+//! pathname migration.  Provider paths are private sysfs keys and are never
+//! derived from a userspace mountpoint.
+
+pub(crate) mod vfs;
 
 extern crate alloc;
 
@@ -77,6 +79,120 @@ pub(super) fn open_legacy(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
             },
         ];
         return Some(Arc::new(pseudo::PseudoDir::new("/sys", entries)));
+    }
+    if path == "/sys/devices" || path == "/sys/devices/" {
+        let entries = alloc::vec![
+            pseudo::PseudoDirent {
+                name: String::from("."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from(".."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("system"),
+                ino: 2,
+                dtype: 4,
+            },
+        ];
+        return Some(Arc::new(pseudo::PseudoDir::new("/sys/devices", entries)));
+    }
+    if path == "/sys/devices/system" || path == "/sys/devices/system/" {
+        let entries = alloc::vec![
+            pseudo::PseudoDirent {
+                name: String::from("."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from(".."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("cpu"),
+                ino: 2,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("node"),
+                ino: 3,
+                dtype: 4,
+            },
+        ];
+        return Some(Arc::new(pseudo::PseudoDir::new(
+            "/sys/devices/system",
+            entries,
+        )));
+    }
+    if path == "/sys/devices/system/cpu" || path == "/sys/devices/system/cpu/" {
+        let entries = alloc::vec![
+            pseudo::PseudoDirent {
+                name: String::from("."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from(".."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("possible"),
+                ino: 2,
+                dtype: 8,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("present"),
+                ino: 3,
+                dtype: 8,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("online"),
+                ino: 4,
+                dtype: 8,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("kernel_max"),
+                ino: 5,
+                dtype: 8,
+            },
+        ];
+        return Some(Arc::new(pseudo::PseudoDir::new(
+            "/sys/devices/system/cpu",
+            entries,
+        )));
+    }
+    if path == "/sys/devices/system/node" || path == "/sys/devices/system/node/" {
+        let entries = alloc::vec![
+            pseudo::PseudoDirent {
+                name: String::from("."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from(".."),
+                ino: 1,
+                dtype: 4,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("online"),
+                ino: 2,
+                dtype: 8,
+            },
+            pseudo::PseudoDirent {
+                name: String::from("possible"),
+                ino: 3,
+                dtype: 8,
+            },
+        ];
+        return Some(Arc::new(pseudo::PseudoDir::new(
+            "/sys/devices/system/node",
+            entries,
+        )));
     }
     if path == "/sys/class" || path == "/sys/class/" {
         let entries = alloc::vec![

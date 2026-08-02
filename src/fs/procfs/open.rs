@@ -278,6 +278,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     match trimmed {
         "/proc/mounts" => return Some(ProcPseudoFile::new(ProcFileKind::Mounts)),
         "/proc/mountinfo" => return Some(ProcPseudoFile::new(ProcFileKind::Mountinfo)),
+        "/proc/filesystems" => return Some(ProcPseudoFile::new(ProcFileKind::Filesystems)),
         "/proc/cgroups" => return Some(ProcPseudoFile::new(ProcFileKind::Cgroups)),
         "/proc/meminfo" => return Some(ProcPseudoFile::new(ProcFileKind::Meminfo)),
         "/proc/cpuinfo" => return Some(ProcPseudoFile::new(ProcFileKind::Cpuinfo)),
@@ -419,6 +420,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         }
         if let Some(ns_name) = tail.strip_prefix("ns/") {
             return match ns_name {
+                "cgroup" => proc_pid_namespace_file(pid, NamespaceKind::Cgroup),
                 "ipc" => proc_pid_namespace_file(pid, NamespaceKind::Ipc),
                 "mnt" => proc_pid_namespace_file(pid, NamespaceKind::Mount),
                 "net" => proc_pid_namespace_file(pid, NamespaceKind::Net),
@@ -436,6 +438,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
     }
     if let Some(ns_name) = rest.strip_prefix("ns/") {
         return match ns_name {
+            "cgroup" => proc_pid_namespace_file(pid, NamespaceKind::Cgroup),
             "ipc" => proc_pid_namespace_file(pid, NamespaceKind::Ipc),
             "mnt" => proc_pid_namespace_file(pid, NamespaceKind::Mount),
             "net" => proc_pid_namespace_file(pid, NamespaceKind::Net),

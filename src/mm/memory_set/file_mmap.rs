@@ -480,7 +480,7 @@ impl MemorySet {
     /// 检查本 MemorySet 内是否存在对指定 memfd 的可写共享映射（用于 F_SEAL_WRITE 检查）。
     pub fn has_writable_shared_memfd_mapping(&self, memfd_id: u64) -> bool {
         self.vm_regions.iter().any(|region| {
-            region.memfd_id == memfd_id
+            region.shmem_id == memfd_id
                 && region.shared
                 && region.map_permission().contains(MapPermission::W)
         })
@@ -790,7 +790,7 @@ impl MemorySet {
     pub(super) fn prune_unused_mmap_backings(&mut self) {
         self.mmap_backings.retain(|backing_id, backing| {
             self.vm_regions.iter().any(|region| {
-                (region.file_backed || region.memfd_id != 0)
+                (region.file_backed || region.shmem_id != 0)
                     && region.backing_id == *backing_id
                     && backing.kind.matches_region(region)
             })
