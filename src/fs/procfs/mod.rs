@@ -39,6 +39,7 @@ pub enum ProcFileKind {
     Meminfo,
     Cpuinfo,
     Cmdline,
+    Version,
     Interrupts,
     Loadavg,
     Uptime,

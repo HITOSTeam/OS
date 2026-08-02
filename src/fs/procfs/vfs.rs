@@ -20,7 +20,7 @@ use crate::fs::vfs::{
     VfsFileSystemFactory, VfsFileSystemState, VfsLink, VfsMetadata, VfsMountContext, VfsNode,
     VfsNodeKind, VfsOpenOptions, VfsResult, VfsStatFs, VfsTimes,
 };
-use crate::fs::{File, NamespaceFile, ProcPseudoFile, PseudoDir, PseudoFile};
+use crate::fs::{File, ProcPseudoFile, PseudoDir, PseudoFile};
 use crate::task::processor::{current_process, current_task};
 
 use super::{
@@ -165,15 +165,14 @@ impl ProcNode {
         let file = open_proc_pseudo_in(&self.provider_path, fs.pid_namespace_id)
             .ok_or(VfsError::NoEntry)?;
         if file.as_any().downcast_ref::<PseudoDir>().is_some() {
-            Ok(ProcObject::Directory(file))
-        } else if file.as_any().downcast_ref::<ProcPseudoFile>().is_some()
-            || file.as_any().downcast_ref::<PseudoFile>().is_some()
-            || file.as_any().downcast_ref::<NamespaceFile>().is_some()
-        {
-            Ok(ProcObject::Regular(file))
-        } else {
-            Err(VfsError::NotSupported)
+            return Ok(ProcObject::Directory(file));
         }
+        // Linux installs the generic proc_reg_file_ops for every proc entry
+        // that is neither a directory nor a symlink.  Content providers are
+        // deliberately free to use specialized File implementations; their
+        // concrete Rust type must not decide whether the VFS inode is a
+        // regular proc file.
+        Ok(ProcObject::Regular(file))
     }
 
     fn child_path(&self, name: &str) -> VfsResult<String> {

@@ -283,6 +283,7 @@ pub fn open_proc_pseudo(path: &str) -> Option<Arc<dyn File + Send + Sync>> {
         "/proc/meminfo" => return Some(ProcPseudoFile::new(ProcFileKind::Meminfo)),
         "/proc/cpuinfo" => return Some(ProcPseudoFile::new(ProcFileKind::Cpuinfo)),
         "/proc/cmdline" => return Some(ProcPseudoFile::new(ProcFileKind::Cmdline)),
+        "/proc/version" => return Some(ProcPseudoFile::new(ProcFileKind::Version)),
         "/proc/loadavg" => return Some(ProcPseudoFile::new(ProcFileKind::Loadavg)),
         "/proc/uptime" => return Some(ProcPseudoFile::new(ProcFileKind::Uptime)),
         "/proc/stat" => return Some(ProcPseudoFile::new(ProcFileKind::Stat)),

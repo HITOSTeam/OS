@@ -70,6 +70,7 @@ pub(crate) fn proc_root_entries_for_pid_namespace(namespace_id: usize) -> Vec<Ps
         "meminfo",
         "cpuinfo",
         "cmdline",
+        "version",
         "interrupts",
         "loadavg",
         "uptime",

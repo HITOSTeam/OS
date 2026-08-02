@@ -94,6 +94,7 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
         ProcFileKind::Meminfo => proc_meminfo(),
         ProcFileKind::Cpuinfo => proc_cpuinfo(),
         ProcFileKind::Cmdline => proc_cmdline(),
+        ProcFileKind::Version => crate::syscall::misc::proc_version_content(),
         ProcFileKind::Interrupts => proc_interrupts(),
         ProcFileKind::Loadavg => String::from("0.00 0.00 0.00 1/1 1\n"),
         ProcFileKind::Uptime => proc_uptime(),

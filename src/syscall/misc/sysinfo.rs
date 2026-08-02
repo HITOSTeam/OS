@@ -8,6 +8,15 @@ use crate::{
     trap::get_current_token,
 };
 
+pub(crate) const UTS_RELEASE: &str = "5.15.0";
+pub(crate) const UTS_VERSION: &str = "CongCore";
+
+/// Linux exposes the same compiled release/version identity through uname(2)
+/// and /proc/version. Keep the proc banner derived from these shared values.
+pub(crate) fn proc_version_content() -> alloc::string::String {
+    alloc::format!("Linux version {} ({}) #1 SMP\n", UTS_RELEASE, UTS_VERSION)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct UtsName {
@@ -116,8 +125,8 @@ pub fn syscall_uname(buf: usize) -> isize {
     write_name_field(&mut un.sysname, b"Linux");
     // glibc/busybox may abort early if the reported kernel release is "too old".
     // Report a modern Linux-like release string for compatibility.
-    write_name_field(&mut un.release, b"5.15.0");
-    write_name_field(&mut un.version, b"CongCore");
+    write_name_field(&mut un.release, UTS_RELEASE.as_bytes());
+    write_name_field(&mut un.version, UTS_VERSION.as_bytes());
     let machine = if cfg!(target_arch = "loongarch64") {
         b"loongarch64".as_slice()
     } else {
