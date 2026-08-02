@@ -32,7 +32,7 @@ pub fn syscall_brk(addr: usize) -> isize {
         USER_VA_TOP,
         BRK_RELATIVE_COMPAT_MAX,
         |page| page_overlaps_sysv_shm_regions(page, &shm_attaches),
-        exceeds_overcommit_limit,
+        |additional_bytes| overcommit_rejects("brk", pid, additional_bytes),
     );
     if crate::debug_config::DEBUG_SYSCALL {
         crate::println!(
@@ -503,12 +503,13 @@ pub fn syscall_mmap(
     } else {
         0
     };
-    // 检查是否超出限制
-    if exceeds_overcommit_limit(commit_charge) {
+    let process = current_process();
+    // 检查是否超出限制。mode 0 只比较本次申请与 RAM，mode 2 才使用全局
+    // Committed_AS；这使 pthread 的小栈映射不会被其他 rustc 进程误伤。
+    if overcommit_rejects("mmap", process.getpid(), commit_charge) {
         return err(SyscallError::ENOMEM);
     }
 
-    let process = current_process();
     // Keep only the address-space reference while mmap validates and commits
     // the VMA.  Private file mappings may sleep on the inode rwsem while they
     // populate pages; a PCB ticket lock must never span that wait.
