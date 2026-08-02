@@ -25,8 +25,8 @@ pub use self::fair::{
     prime_fair_timer_wakeup_lag, protect_fair_fork_parent, record_fair_sleep_lag,
 };
 pub use self::pid_map::{
-    insert_into_pid2process, live_process_uses_net_namespace, pid2process,
-    register_shared_mm_process_owner, release_process_mm_owner, remove_from_pid2process,
+    insert_into_pid2process, pid2process, register_shared_mm_process_owner,
+    release_process_mm_owner, remove_from_pid2process,
 };
 pub use self::rt::{account_rt_runtime, rt_bandwidth_throttled};
 pub use self::run_queue::TaskManager;
@@ -122,13 +122,31 @@ fn enqueue_task(task: Arc<TaskControlBlock>, kind: EnqueueKind) -> Option<(usize
 /// 返回 `Some(hart_id)` 表示本次实际入队的目标 hart；`None` 表示任务已在就绪
 /// 队列中、未重复入队（调用方据此决定是否触发唤醒抢占）。
 pub fn add_task(task: Arc<TaskControlBlock>) -> Option<usize> {
+    // A just-published clone and a concurrent exec teardown may both try to
+    // make the task runnable.  Only the winner owns ENQUEUE_INITIAL; the other
+    // side must not infer ownership from transient in_ready_queue/on_cpu bits.
+    if !task.try_begin_initial_enqueue() {
+        return None;
+    }
     let local_hart = crate::task::processor::hart_id() % MAX_HARTS;
     let protect_parent = matches!(task_queue_slot(&task), ReadyQueueSlot::Fair);
     if protect_parent && let Some(parent) = crate::task::processor::current_task() {
         protect_fair_fork_parent(&parent);
     }
-    let Some((hart_id, was_empty)) = enqueue_task(Arc::clone(&task), EnqueueKind::Initial) else {
-        return None;
+    let (hart_id, was_empty) = loop {
+        if let Some(queued) = enqueue_task(Arc::clone(&task), EnqueueKind::Initial) {
+            break queued;
+        }
+        // TaskManager::add() can also return None when a concurrent runqueue
+        // refresh clears its marker after the CAS but before the entity reaches
+        // the queue lock.  That is not a completed initial enqueue: retry until
+        // `in_ready_queue` confirms that an entity is physically present.  A
+        // marker by itself represents only an in-flight insertion claim.
+        if task.in_ready_queue.load(Ordering::Acquire) {
+            task.finish_initial_enqueue();
+            return None;
+        }
+        core::hint::spin_loop();
     };
     // Linux `wake_up_new_task()` 会带 WF_FORK 调用 wakeup_preempt()。公平调度类
     // 会刻意忽略 WF_FORK，而更高调度类仍可抢占。保留这个形态：刚 clone 出来的
@@ -141,6 +159,7 @@ pub fn add_task(task: Arc<TaskControlBlock>) -> Option<usize> {
     } else if local_hart != hart_id && was_empty {
         arch::send_ipi(hart_id);
     }
+    task.finish_initial_enqueue();
     Some(hart_id)
 }
 
@@ -249,11 +268,21 @@ fn wakeup_task_with_batch_inner(
         sync_source_hart: Option<usize>,
     ) {
         let mut task_inner = task.borrow_mut();
-        if task_inner.res.is_none() {
+        // Taking TaskUserRes begins exit cleanup; it does not retire the task.
+        // Cleanup can still sleep on a kernel mutex (notably the shared mm
+        // lock), so such a task must remain wakeable until the common exit
+        // point publishes RETIRED.  Published, non-retired tasks without
+        // resources are therefore kernel-only exit continuations.
+        if task_inner.res.is_none() && task.exit_lifecycle_retired() {
             return;
         }
         if task_inner.task_status == TaskStatus::Blocked {
-            if task_inner.cgroup_frozen {
+            let sigkill_pending =
+                task_inner.pending_signals & (1u64 << (crate::task::signal::SIGKILL_NUM - 1)) != 0;
+            let kernel_exit_cleanup = task_inner.res.is_none();
+            let fatal_teardown =
+                task.exec_exit_requested() || sigkill_pending || kernel_exit_cleanup;
+            if task_inner.cgroup_frozen && !fatal_teardown {
                 task_inner.wake_on_cgroup_thaw = true;
                 task.wakeup_pending
                     .store(false, core::sync::atomic::Ordering::Release);

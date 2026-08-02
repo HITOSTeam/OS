@@ -819,7 +819,7 @@ impl NetSocketFile {
     pub fn new_tcp_with_domain(domain: u16) -> Arc<Self> {
         debug_assert!(domain == AF_INET || domain == AF_INET6);
         let process = current_process();
-        let net_ns_id = process.net_namespace_id();
+        let net_ns_id = process.acquire_net_namespace_for_socket();
         let proc_uid = process.borrow_mut().euid;
         let handle = crate::net::with_sockets_mut_in(net_ns_id, |_iface, _dev, sockets| {
             // TCP 默认就按大吞吐场景分配较大的环形缓冲区，避免 iperf 等测试被小 buffer 人为限速。
@@ -908,7 +908,7 @@ impl NetSocketFile {
         debug_assert!(domain == AF_INET || domain == AF_INET6);
         debug_assert!(matches!(protocol, IPPROTO_UDP | IPPROTO_UDPLITE));
         let process = current_process();
-        let net_ns_id = process.net_namespace_id();
+        let net_ns_id = process.acquire_net_namespace_for_socket();
         let proc_uid = process.borrow_mut().euid;
         let handle = crate::net::with_sockets_mut_in(net_ns_id, |_iface, _dev, sockets| {
             // UDP 按“整包”管理数据，因此直接给收发 packet buffer 预留较大的连续空间。
@@ -3111,6 +3111,7 @@ impl NetSocketFile {
                 set_tcp_socket_reuseaddr_meta(self.net_ns_id, &[h], accepted_opts.reuseaddr);
                 drop(inner);
                 self.notify_poll_waiters();
+                assert!(crate::fs::register_net_namespace_socket_ref(self.net_ns_id));
                 let accepted = Arc::new(NetSocketFile {
                     net_ns_id: self.net_ns_id,
                     domain: self.domain,
@@ -4476,7 +4477,8 @@ impl Drop for NetSocketFile {
                     note_udp_handle_freed(rx_bytes, tx_bytes);
                 }
             }
-        })
+        });
+        crate::fs::release_net_namespace_socket_ref(self.net_ns_id);
     }
 }
 
@@ -4526,11 +4528,13 @@ impl File for NetSocketFile {
                 if self.opts.lock().rd_shutdown {
                     return 0;
                 }
+                let capacity = buf.len();
+                if capacity == 0 {
+                    return 0;
+                }
+                let mut data = alloc::vec![0u8; capacity];
                 let mut total = 0usize;
-                for slice in buf.buffers.iter_mut() {
-                    if slice.is_empty() {
-                        break;
-                    }
+                'read: while total < capacity {
                     if total > 0 && !self.poll_readable() {
                         break;
                     }
@@ -4544,7 +4548,7 @@ impl File for NetSocketFile {
                         let res = self.with_sockets_mut(|_iface, _dev, sockets| {
                             let s = sockets.get_mut::<tcp::Socket>(handle);
                             if s.can_recv() {
-                                match s.recv_slice(*slice) {
+                                match s.recv_slice(&mut data[total..]) {
                                     Ok(n) => ReadStep::Data(n),
                                     Err(_) => ReadStep::Blocked,
                                 }
@@ -4560,17 +4564,14 @@ impl File for NetSocketFile {
                                 if n > 0 {
                                     self.poll_net();
                                 }
-                                if n < slice.len() {
-                                    return total;
-                                }
-                                break;
+                                break 'read;
                             }
                             // TCP 是流语义：一旦读到 EOF，就应立即把已经拿到的数据返回给上层，
                             // 不再继续填后续 UserBuffer 分片。
-                            ReadStep::Eof => return total,
+                            ReadStep::Eof => break 'read,
                             ReadStep::Blocked => {
                                 if total > 0 {
-                                    return total;
+                                    break 'read;
                                 }
                             }
                         }
@@ -4579,7 +4580,7 @@ impl File for NetSocketFile {
                         }
                     }
                 }
-                total
+                buf.copy_from_slice(&data[..total])
             }
             NetSocketKind::Udp => {
                 if self.opts.lock().rd_shutdown {
@@ -4587,7 +4588,7 @@ impl File for NetSocketFile {
                 }
                 // UDP 没有“把一个报文拆成多次 read” 的流式语义，必须先整包收进临时缓冲区，
                 // 再按 UserBuffer 的分片布局复制出去；否则会把一次 datagram 错误地暴露成多次读取。
-                let total_len = buf.buffers.iter().map(|b| b.len()).sum::<usize>();
+                let total_len = buf.len();
                 if total_len == 0 {
                     return 0;
                 }
@@ -4596,16 +4597,7 @@ impl File for NetSocketFile {
                     Ok((n, _, _, _, _)) => n,
                     Err(_) => return 0,
                 };
-                let mut copied = 0usize;
-                for slice in buf.buffers.iter_mut() {
-                    let to_copy = min(slice.len(), n - copied);
-                    slice[..to_copy].copy_from_slice(&tmp[copied..copied + to_copy]);
-                    copied += to_copy;
-                    if copied >= n {
-                        break;
-                    }
-                }
-                copied
+                buf.copy_from_slice(&tmp[..n])
             }
             NetSocketKind::TcpListener => 0,
         }
@@ -4629,16 +4621,11 @@ impl File for NetSocketFile {
                 if self.opts.lock().wr_shutdown {
                     return 0;
                 }
+                let data = buf.to_vec();
                 if self.opts.lock().tcp_cork {
-                    let total_len = buf.buffers.iter().map(|b| b.len()).sum::<usize>();
+                    let total_len = data.len();
                     if total_len == 0 {
                         return 0;
-                    }
-                    let mut data = alloc::vec![0u8; total_len];
-                    let mut off = 0usize;
-                    for slice in buf.buffers.iter() {
-                        data[off..off + slice.len()].copy_from_slice(slice);
-                        off += slice.len();
                     }
                     crate::syscall::net::queue_tcp_msg_more_pending_for_addr(
                         self as *const Self as usize,
@@ -4647,61 +4634,52 @@ impl File for NetSocketFile {
                     return total_len;
                 }
                 let mut total = 0usize;
-                for slice in buf.buffers.iter() {
-                    let mut off = 0usize;
-                    while off < slice.len() {
-                        self.poll_net();
-                        enum TcpWriteStep {
-                            Sent(usize),
-                            WouldBlock,
-                            Closed,
-                        }
-                        let step = self.with_sockets_mut(|_iface, _dev, sockets| {
-                            let s = sockets.get_mut::<tcp::Socket>(handle);
-                            if !s.may_send() {
-                                return TcpWriteStep::Closed;
-                            }
-                            if !s.can_send() {
-                                return TcpWriteStep::WouldBlock;
-                            }
-                            // TCP 写是流式的，允许把一个用户缓冲区分多轮塞进底层发送队列。
-                            match s.send_slice(&slice[off..]) {
-                                Ok(n) if n > 0 => TcpWriteStep::Sent(n),
-                                Ok(_) => TcpWriteStep::WouldBlock,
-                                Err(_) => TcpWriteStep::Closed,
-                            }
-                        });
-                        let sent = match step {
-                            TcpWriteStep::Sent(n) => n,
-                            TcpWriteStep::WouldBlock => {
-                                // send buffer 暂时满时主动让出 CPU，等待后续 poll 推进 ACK / 窗口更新。
-                                crate::task::processor::suspend_current_and_run_next();
-                                continue;
-                            }
-                            TcpWriteStep::Closed => return total,
-                        };
-                        if sent == 0 {
-                            return total;
-                        }
-                        off += sent;
-                        total += sent;
-                        self.poll_net();
+                while total < data.len() {
+                    self.poll_net();
+                    enum TcpWriteStep {
+                        Sent(usize),
+                        WouldBlock,
+                        Closed,
                     }
+                    let step = self.with_sockets_mut(|_iface, _dev, sockets| {
+                        let s = sockets.get_mut::<tcp::Socket>(handle);
+                        if !s.may_send() {
+                            return TcpWriteStep::Closed;
+                        }
+                        if !s.can_send() {
+                            return TcpWriteStep::WouldBlock;
+                        }
+                        // TCP 写是流式的，允许把一个用户缓冲区分多轮塞进底层发送队列。
+                        match s.send_slice(&data[total..]) {
+                            Ok(n) if n > 0 => TcpWriteStep::Sent(n),
+                            Ok(_) => TcpWriteStep::WouldBlock,
+                            Err(_) => TcpWriteStep::Closed,
+                        }
+                    });
+                    let sent = match step {
+                        TcpWriteStep::Sent(n) => n,
+                        TcpWriteStep::WouldBlock => {
+                            // send buffer 暂时满时主动让出 CPU，等待后续 poll 推进 ACK / 窗口更新。
+                            crate::task::processor::suspend_current_and_run_next();
+                            continue;
+                        }
+                        TcpWriteStep::Closed => return total,
+                    };
+                    if sent == 0 {
+                        return total;
+                    }
+                    total += sent;
+                    self.poll_net();
                 }
                 total
             }
             WriteSnapshot::Udp => {
-                let total_len = buf.buffers.iter().map(|b| b.len()).sum::<usize>();
+                let total_len = buf.len();
                 if total_len == 0 {
                     return 0;
                 }
                 // UDP 一次 write 对应一个完整 datagram，因此先把所有分片拼成连续缓冲区再一次性发送。
-                let mut data = alloc::vec![0u8; total_len];
-                let mut off = 0usize;
-                for slice in buf.buffers.iter() {
-                    data[off..off + slice.len()].copy_from_slice(slice);
-                    off += slice.len();
-                }
+                let data = buf.to_vec();
                 self.udp_send_connected(&data, false, false, false, None, None, None, None)
                     .unwrap_or(0)
             }

@@ -2,14 +2,11 @@ use alloc::{collections::BTreeSet, sync::Arc, sync::Weak};
 
 use crate::{
     config::{KERNEL_STACK_SIZE, KERNEL_STACK_TOP, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
-    mm::{KERNEL_SPACE, MapPermission, PhysPageNum, VirtAddr},
+    mm::{KERNEL_SPACE, MapPermission, MmRef, PhysPageNum, VirtAddr},
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
 };
-use core::{
-    mem::ManuallyDrop,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 const PID_MAX_DEFAULT: usize = 32768;
@@ -166,6 +163,12 @@ pub fn kstack_alloc() -> Option<KernelStack> {
         KSTACK_ALLOCATOR.lock().dealloc(kstack_id);
         return None;
     }
+    // Kernel stacks live in the shared high-half page table. A user-ASID
+    // invalidation batch cannot publish this new mapping to harts currently
+    // running with the LoongArch kernel PGDH/ASID 0 (and the same distinction
+    // applies to RISC-V global kernel mappings). Match the removal path and
+    // complete a shared-kernel shootdown before the stack can be scheduled.
+    crate::mm::flush_kernel_shared_tlb();
     KSTACK_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
     maybe_log_kstack_inflight("alloc");
     Some(KernelStack(kstack_id))
@@ -193,7 +196,48 @@ pub struct TaskUserRes {
     trap_cx_slot: usize,
     pub ustack_base: usize,
     pub process: Weak<ProcessControlBlock>,
+    memory_set: MmRef,
     owns_ustack: bool,
+    ustack_mapped: bool,
+    trap_cx_mapped: bool,
+    trap_cx_slot_reserved: bool,
+    live_thread_registered: bool,
+}
+
+/// Delays the live-thread release until the exiting task is no longer current
+/// and has been detached from scheduler/user-visible per-thread state.
+///
+/// Linux elects the final process teardown only after the task has crossed its
+/// common exit point.  Keeping this ticket separate from `TaskUserRes` lets us
+/// unmap trap/user resources first without making another hart believe the
+/// complete thread has already retired.
+#[must_use]
+pub struct LiveThreadRetirement {
+    process: Weak<ProcessControlBlock>,
+    registered: bool,
+}
+
+impl LiveThreadRetirement {
+    pub fn retire(mut self) -> bool {
+        if !core::mem::take(&mut self.registered) {
+            return false;
+        }
+        self.process
+            .upgrade()
+            .map(|process| process.unregister_live_thread())
+            .unwrap_or(true)
+    }
+}
+
+impl Drop for LiveThreadRetirement {
+    fn drop(&mut self) {
+        if self.registered {
+            if let Some(process) = self.process.upgrade() {
+                let _ = process.unregister_live_thread();
+            }
+            self.registered = false;
+        }
+    }
 }
 
 // Trap contexts live in per-mm slots near the top of user VA. The slot is
@@ -230,92 +274,103 @@ impl TaskUserRes {
         ustack_base: usize,
         alloc_user_res: bool,
     ) -> Option<Self> {
-        let (tid, trap_cx_slot) = {
+        let (tid, memory_set) = {
             let mut process_inner = process.borrow_mut();
-            let tid = process_inner.alloc_tid();
-            let trap_cx_slot = if alloc_user_res {
-                process_inner.memory_set.alloc_trap_context_slot()
-            } else {
-                process_inner.memory_set.reserve_trap_context_slot(tid);
-                tid
-            };
-            (tid, trap_cx_slot)
+            (process_inner.alloc_tid(), process_inner.memory_set.clone())
         };
-        let task_user_res = Self {
+        let trap_cx_slot = if alloc_user_res {
+            memory_set.alloc_trap_context_slot()
+        } else {
+            memory_set.reserve_trap_context_slot(tid);
+            tid
+        };
+        let mut task_user_res = Self {
             tid,
             trap_cx_slot,
             ustack_base,
             process: Arc::downgrade(&process),
+            memory_set,
             owns_ustack: true,
+            // `from_elf` and fork already contain the main task's mappings
+            // when `alloc_user_res` is false.
+            ustack_mapped: !alloc_user_res,
+            trap_cx_mapped: !alloc_user_res,
+            trap_cx_slot_reserved: true,
+            live_thread_registered: false,
         };
         if alloc_user_res && !task_user_res.try_alloc_user_res() {
             return None;
         }
+        process.register_live_thread();
+        task_user_res.live_thread_registered = true;
         Some(task_user_res)
     }
 
     pub fn try_new_trap_cx_only(process: Arc<ProcessControlBlock>) -> Option<Self> {
-        let (tid, trap_cx_slot) = {
+        let (tid, memory_set) = {
             let mut process_inner = process.borrow_mut();
-            (
-                process_inner.alloc_tid(),
-                process_inner.memory_set.alloc_trap_context_slot(),
-            )
+            (process_inner.alloc_tid(), process_inner.memory_set.clone())
         };
-        let task_user_res = Self {
+        let trap_cx_slot = memory_set.alloc_trap_context_slot();
+        let mut task_user_res = Self {
             tid,
             trap_cx_slot,
             ustack_base: 0,
             process: Arc::downgrade(&process),
+            memory_set,
             owns_ustack: false,
+            ustack_mapped: false,
+            trap_cx_mapped: false,
+            trap_cx_slot_reserved: true,
+            live_thread_registered: false,
         };
         if !task_user_res.try_alloc_trap_cx_only() {
             return None;
         }
+        process.register_live_thread();
+        task_user_res.live_thread_registered = true;
         Some(task_user_res)
     }
 
-    fn try_alloc_trap_cx_only(&self) -> bool {
-        let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.borrow_mut();
+    fn try_alloc_trap_cx_only(&mut self) -> bool {
         let trap_cx_bottom = trap_cx_bottom_from_slot(self.trap_cx_slot);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.try_insert_framed_area(
+        self.trap_cx_mapped = self.memory_set.try_insert_framed_area(
             trap_cx_bottom.into(),
             trap_cx_top.into(),
             MapPermission::R | MapPermission::W,
-        )
+        );
+        self.trap_cx_mapped
     }
 
     // 具体的 插入 用户资源 ,如 用户栈 和 trap_cx
-    pub fn alloc_user_res(&self) {
+    pub fn alloc_user_res(&mut self) {
         assert!(
             self.try_alloc_user_res(),
             "OOM: TaskUserRes::alloc_user_res"
         );
     }
 
-    fn try_alloc_user_res(&self) -> bool {
-        let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.borrow_mut();
+    fn try_alloc_user_res(&mut self) -> bool {
         if self.owns_ustack {
             // alloc user stack
             let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
             let ustack_top = ustack_bottom + USER_STACK_SIZE;
             // insert the user resource into the program memory space
-            if !process_inner.memory_set.try_insert_stack_framed_range(
+            if !self.memory_set.try_insert_stack_framed_range(
                 ustack_bottom,
                 ustack_top,
                 MapPermission::R | MapPermission::W | MapPermission::U,
             ) {
                 return false;
             }
+            self.ustack_mapped = true;
         }
         // alloc trap_cx
         // if trap alloc failed,we will remove the user_stack too
         let trap_cx_bottom = trap_cx_bottom_from_slot(self.trap_cx_slot);
         let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        if !process_inner.memory_set.try_insert_framed_area(
+        if !self.memory_set.try_insert_framed_area(
             trap_cx_bottom.into(),
             trap_cx_top.into(),
             MapPermission::R | MapPermission::W,
@@ -323,37 +378,36 @@ impl TaskUserRes {
             if self.owns_ustack {
                 let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
                 let ustack_top = ustack_bottom + USER_STACK_SIZE;
-                process_inner
-                    .memory_set
+                self.memory_set
                     .unmap_user_vma_range(ustack_bottom.into(), ustack_top.into());
+                self.ustack_mapped = false;
             }
             return false;
         }
+        self.trap_cx_mapped = true;
         true
     }
 
-    fn dealloc_user_res(&self) {
-        // dealloc tid
-        let Some(process) = self.process.upgrade() else {
-            return;
-        };
-        let mut process_inner = process.borrow_mut();
-        if self.owns_ustack {
+    fn dealloc_user_res(&mut self) {
+        if self.ustack_mapped {
             // dealloc ustack manually
             let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
             let ustack_top = ustack_bottom + USER_STACK_SIZE;
-            process_inner
-                .memory_set
+            self.memory_set
                 .unmap_user_vma_range(ustack_bottom.into(), ustack_top.into());
+            self.ustack_mapped = false;
         }
         // dealloc trap_cx manually
-        let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_slot(self.trap_cx_slot).into();
-        process_inner
-            .memory_set
-            .remove_area_with_start_vpn(trap_cx_bottom_va.into());
-        process_inner
-            .memory_set
-            .dealloc_trap_context_slot(self.trap_cx_slot);
+        if self.trap_cx_mapped {
+            let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_slot(self.trap_cx_slot).into();
+            self.memory_set
+                .remove_area_with_start_vpn(trap_cx_bottom_va.into());
+            self.trap_cx_mapped = false;
+        }
+        if self.trap_cx_slot_reserved {
+            self.memory_set.dealloc_trap_context_slot(self.trap_cx_slot);
+            self.trap_cx_slot_reserved = false;
+        }
     }
 
     pub fn dealloc_tid(&self) {
@@ -369,11 +423,8 @@ impl TaskUserRes {
     }
 
     pub fn trap_cx_ppn(&self) -> PhysPageNum {
-        let process = self.process.upgrade().expect("process already dropped");
-        let process_inner = process.borrow_mut();
         let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_slot(self.trap_cx_slot).into();
-        process_inner
-            .memory_set
+        self.memory_set
             .translate(trap_cx_bottom_va.into())
             .unwrap()
             .ppn()
@@ -390,14 +441,23 @@ impl TaskUserRes {
         self.trap_cx_slot
     }
 
-    pub fn reset_for_exec(&mut self, ustack_base: usize) {
+    pub fn memory_set(&self) -> MmRef {
+        self.memory_set.clone()
+    }
+
+    pub fn reset_for_exec(&mut self, ustack_base: usize, memory_set: MmRef) -> MmRef {
         // After de-threading, the exec caller becomes the sole thread-group
         // leader. The old address space (including its old TID-indexed
         // resources) is about to be discarded.
         self.tid = 0;
         self.trap_cx_slot = 0;
         self.ustack_base = ustack_base;
+        let old_memory_set = core::mem::replace(&mut self.memory_set, memory_set);
         self.owns_ustack = true;
+        self.ustack_mapped = true;
+        self.trap_cx_mapped = true;
+        self.trap_cx_slot_reserved = true;
+        old_memory_set
     }
 
     /// Whether this thread uses a user-managed stack (Linux CLONE_VM threads do).
@@ -405,17 +465,26 @@ impl TaskUserRes {
         !self.owns_ustack
     }
 
-    /// Consume thread user-resource bookkeeping during whole-process exit without
-    /// individually unmapping its stack/trap-cx areas. The address space is being
-    /// detached as one `mm`, so per-thread VMA teardown would duplicate work on
-    /// the latency-sensitive exit path.
-    pub fn detach_for_process_exit(self) {
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` will not run `Drop`, so explicitly drop the only field
-        // with ownership semantics. The remaining fields are plain integers/bools.
-        unsafe {
-            core::ptr::drop_in_place(&mut this.process);
+    /// Finish one task's user-resource teardown and elect the thread that may
+    /// perform process-wide cleanup.
+    ///
+    /// `drop_user_stack == false` is used for a process leader whose stack VMA
+    /// may still be visible through another PCB sharing this mm.  Trap state is
+    /// always task-private and must be removed before the live-thread release.
+    pub fn finish_thread_exit(mut self, drop_user_stack: bool) -> LiveThreadRetirement {
+        if !drop_user_stack {
+            self.ustack_mapped = false;
         }
+        self.dealloc_user_res();
+        let retirement = LiveThreadRetirement {
+            process: self.process.clone(),
+            registered: core::mem::take(&mut self.live_thread_registered),
+        };
+        // Run TaskUserRes::drop (including TID release) before publishing the
+        // live-thread retirement. The flag was moved into `retirement`, so the
+        // fallback Drop path cannot decrement the counter twice.
+        drop(self);
+        retirement
     }
 }
 
@@ -427,5 +496,11 @@ impl Drop for TaskUserRes {
         // panic (or worse, use-after-unmap).
         self.dealloc_user_res();
         self.dealloc_tid();
+        if self.live_thread_registered {
+            if let Some(process) = self.process.upgrade() {
+                let _ = process.unregister_live_thread();
+            }
+            self.live_thread_registered = false;
+        }
     }
 }

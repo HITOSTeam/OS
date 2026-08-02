@@ -8,6 +8,11 @@
 _start:
     csrrd $a0, CSR_CPUID
 
+    # The physical CPU ID indexes the statically reserved early stack array.
+    # Reject unsupported IDs before deriving or touching a stack pointer.
+    li.d $t0, {max_harts}
+    bgeu $a0, $t0, .Lunsupported_hart
+
     li.d $t0, 4096 * 16
     mul.d $t1, $a0, $t0
     la.global $sp, boot_stack_top
@@ -32,9 +37,14 @@ _start:
 
     bl rust_main
 
+.Lunsupported_hart:
+    idle 0
+    b .Lunsupported_hart
+
     .section .bss.stack
     .globl boot_stack
 boot_stack:
-    .space 4096 * 16 * 4
+    # `max_harts` is supplied by global_asm! from config::MAX_HARTS.
+    .space 4096 * 16 * {max_harts}
     .globl boot_stack_top
 boot_stack_top:

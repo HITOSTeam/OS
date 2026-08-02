@@ -156,16 +156,7 @@ impl File for EventFdFile {
             return 0;
         };
         let bytes = value.to_ne_bytes();
-        let mut copied = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            let n = slice.len().min(bytes.len().saturating_sub(copied));
-            slice[..n].copy_from_slice(&bytes[copied..copied + n]);
-            copied += n;
-            if copied >= bytes.len() {
-                break;
-            }
-        }
-        copied
+        buf.copy_from_slice(&bytes)
     }
 
     fn write(&self, buf: UserBuffer) -> usize {
@@ -173,15 +164,7 @@ impl File for EventFdFile {
             return 0;
         }
         let mut bytes = [0u8; size_of::<u64>()];
-        let mut copied = 0usize;
-        for slice in buf.buffers.iter() {
-            let n = slice.len().min(bytes.len().saturating_sub(copied));
-            bytes[copied..copied + n].copy_from_slice(&slice[..n]);
-            copied += n;
-            if copied >= bytes.len() {
-                break;
-            }
-        }
+        let copied = buf.copy_to_slice(&mut bytes);
         if copied < bytes.len() {
             return 0;
         }

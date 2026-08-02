@@ -56,7 +56,7 @@ ifeq ($(ARCH),riscv64)
     EXT4_BASE_TAR    ?= ../img/disk.tar
     EXT4_BASE_TAR_XZ ?= ../img/disk.tar.xz
 else ifeq ($(ARCH),loongarch64)
-    TARGET           := loongarch64-unknown-none
+    TARGET           := loongarch64-unknown-none-softfloat
     QEMU_BIN         := qemu-system-loongarch64
     QEMU_BLK_DEV0    := virtio-blk-pci,drive=x0
     QEMU_BLK_DEV1    := virtio-blk-pci,drive=x1

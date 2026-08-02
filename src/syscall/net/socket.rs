@@ -409,10 +409,11 @@ struct PacketRingMapping {
 
 impl PacketSocketFile {
     fn new(socket_type: usize, protocol: usize) -> Arc<Self> {
+        let net_ns_id = current_process().acquire_net_namespace_for_socket();
         let sock = Arc::new(Self {
             socket_type,
             protocol: protocol as u16,
-            net_ns_id: current_process().net_namespace_id(),
+            net_ns_id,
             state: Mutex::new(PacketSocketState::default()),
         });
         PACKET_SOCKETS.lock().push(Arc::downgrade(&sock));
@@ -1835,6 +1836,7 @@ impl PacketSocketFile {
 impl Drop for PacketSocketFile {
     fn drop(&mut self) {
         self.release_memberships();
+        crate::fs::release_net_namespace_socket_ref(self.net_ns_id);
     }
 }
 
@@ -2793,16 +2795,7 @@ impl File for PacketSocketFile {
         loop {
             if let Some(packet) = self.recv_packet(false) {
                 let total = core::cmp::min(cap, packet.data.len());
-                let mut copied = 0usize;
-                for slice in buf.buffers.iter_mut() {
-                    let len = core::cmp::min(slice.len(), total - copied);
-                    slice[..len].copy_from_slice(&packet.data[copied..copied + len]);
-                    copied += len;
-                    if copied >= total {
-                        break;
-                    }
-                }
-                return copied;
+                return buf.copy_from_slice(&packet.data[..total]);
             }
             crate::task::processor::suspend_current_and_run_next();
         }
@@ -2986,7 +2979,7 @@ pub(crate) struct RawPacket {
 impl RawSocketFile {
     fn new(socket_type: usize, protocol: usize) -> Arc<Self> {
         let process = current_process();
-        let net_ns_id = process.net_namespace_id();
+        let net_ns_id = process.acquire_net_namespace_for_socket();
         let proc_uid = process.borrow_mut().euid;
         let sock = Arc::new(Self {
             socket_type,
@@ -4319,6 +4312,7 @@ impl RawSocketFile {
 impl Drop for RawSocketFile {
     fn drop(&mut self) {
         self.release_ipv4_multicast_memberships();
+        crate::fs::release_net_namespace_socket_ref(self.net_ns_id);
     }
 }
 
@@ -4342,16 +4336,7 @@ impl File for RawSocketFile {
         loop {
             if let Some(packet) = self.recv_packet(false) {
                 let total = core::cmp::min(cap, packet.data.len());
-                let mut copied = 0usize;
-                for slice in buf.buffers.iter_mut() {
-                    let len = core::cmp::min(slice.len(), total - copied);
-                    slice[..len].copy_from_slice(&packet.data[copied..copied + len]);
-                    copied += len;
-                    if copied >= total {
-                        break;
-                    }
-                }
-                return copied;
+                return buf.copy_from_slice(&packet.data[..total]);
             }
             crate::task::processor::suspend_current_and_run_next();
         }
@@ -4362,12 +4347,7 @@ impl File for RawSocketFile {
         if len == 0 {
             return 0;
         }
-        let mut data = Vec::with_capacity(len);
-        for ptr in buf.into_iter() {
-            // SAFETY: UserBuffer iteration yields readable user bytes already
-            // translated by the caller before invoking File::write.
-            data.push(unsafe { *ptr });
-        }
+        let data = buf.to_vec();
         match self.handle_outbound_probe(
             &data,
             self.remote_addr_v4(),

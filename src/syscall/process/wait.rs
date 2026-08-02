@@ -464,12 +464,19 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             while index < process_inner.exited_children.len() {
                 let child = Arc::clone(&process_inner.exited_children[index]);
                 let mut child_inner = child.borrow_mut();
+                let child_parent_index = child_inner.child_parent_index;
                 let still_child = child_inner
                     .parent
                     .as_ref()
                     .and_then(|parent| parent.upgrade())
-                    .map_or(false, |parent| Arc::ptr_eq(&parent, &cur_process));
-                if !still_child || !child_inner.is_zombie {
+                    .is_some_and(|parent| Arc::ptr_eq(&parent, &cur_process))
+                    && child_parent_index.is_some_and(|owned_index| {
+                        process_inner
+                            .children
+                            .get(owned_index)
+                            .is_some_and(|owned| Arc::ptr_eq(owned, &child))
+                    });
+                if !still_child || !child_inner.is_zombie || child_inner.wait_reaped {
                     if child_inner.exited_parent_queue_pid == Some(parent_pid) {
                         child_inner.exited_parent_queue_pid = None;
                     }
@@ -482,6 +489,12 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                     index += 1;
                     continue;
                 }
+                // Claim the exit status while both the parent child-list lock
+                // and child PCB lock are held.  This mirrors Linux's
+                // EXIT_ZOMBIE -> EXIT_DEAD transition and prevents an exit
+                // publisher from re-queueing the child after this point.
+                child_inner.wait_reaped = true;
+                child_inner.exited_parent_queue_pid = None;
                 temp_exit_code = child_inner.exit_code;
                 temp_signal = if temp_exit_code < 0 {
                     Some(-temp_exit_code)
@@ -494,8 +507,10 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                     .exited_children
                     .remove(index)
                     .expect("queued child index disappeared");
-                let _ = process_inner.remove_child(&child);
-                queued_zombie_child = Some(child);
+                let owned_child = process_inner
+                    .remove_child_at(child_parent_index.expect("queued child lost parent index"));
+                debug_assert!(Arc::ptr_eq(&owned_child, &child));
+                queued_zombie_child = Some(owned_child);
                 break;
             }
         }
@@ -508,7 +523,7 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
             let mut found: Option<usize> = None;
             let mut has_match = false;
             for (index, child) in process_inner.children.iter().enumerate() {
-                let child_inner = child.borrow_mut();
+                let mut child_inner = child.borrow_mut();
                 let pid_matches = match pid {
                     -1 => true, // any child
                     0 => child_inner.pgid == parent_pgid,
@@ -524,7 +539,9 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                 if matches {
                     has_match = true;
                 }
-                if matches && child_inner.is_zombie {
+                if matches && child_inner.is_zombie && !child_inner.wait_reaped {
+                    child_inner.wait_reaped = true;
+                    child_inner.exited_parent_queue_pid = None;
                     temp_exit_code = child_inner.exit_code;
                     temp_signal = if temp_exit_code < 0 {
                         Some(-temp_exit_code)
@@ -882,7 +899,7 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
                 continue;
             }
             has_match = true;
-            if (options & WEXITED) != 0 && child_inner.is_zombie {
+            if (options & WEXITED) != 0 && child_inner.is_zombie && !child_inner.wait_reaped {
                 let exit_code = child_inner.exit_code;
                 let signal = if exit_code < 0 {
                     Some(-exit_code)
@@ -912,6 +929,12 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
             let child_pid = process_inner.children[index].pid.0;
             // WNOWAIT：不从 children 列表移除，保留僵尸以供后续 wait 重复查询。
             let child = if (options & WNOWAIT) == 0 {
+                {
+                    let mut child_inner = process_inner.children[index].borrow_mut();
+                    debug_assert!(!child_inner.wait_reaped);
+                    child_inner.wait_reaped = true;
+                    child_inner.exited_parent_queue_pid = None;
+                }
                 let child = process_inner.remove_child_at(index);
                 remove_exited_child_ref(&mut process_inner.exited_children, &child);
                 Some(child)

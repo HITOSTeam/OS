@@ -2114,7 +2114,8 @@ pub(crate) struct NetlinkSocketFile {
 impl NetlinkSocketFile {
     /// 创建一个未绑定的 netlink socket，消息队列和等待者列表均为空。
     pub(super) fn new(socket_type: usize, protocol: usize) -> Self {
-        Self {
+        let net_ns_id = current_process().acquire_net_namespace_for_socket();
+        let socket = Self {
             id: alloc_netlink_socket_id(),
             proc_inode: alloc_socket_inode(),
             state: Mutex::new(NetlinkSocketState {
@@ -2144,10 +2145,11 @@ impl NetlinkSocketFile {
                 rcvtimeo_ms: None,
                 sndtimeo_ms: None,
             }),
-            net_ns_id: current_process().net_namespace_id(),
+            net_ns_id,
             socket_type,
             protocol,
-        }
+        };
+        socket
     }
 
     pub(super) fn new_registered(socket_type: usize, protocol: usize) -> Arc<Self> {
@@ -2745,6 +2747,12 @@ impl NetlinkSocketFile {
     #[allow(dead_code)]
     pub(crate) fn poll_writable(&self) -> bool {
         true
+    }
+}
+
+impl Drop for NetlinkSocketFile {
+    fn drop(&mut self) {
+        crate::fs::release_net_namespace_socket_ref(self.net_ns_id);
     }
 }
 

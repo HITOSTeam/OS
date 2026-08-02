@@ -862,7 +862,7 @@ impl File for SocketPairEnd {
         self.poll_writable()
     }
 
-    fn read(&self, buf: UserBuffer) -> usize {
+    fn read(&self, mut buf: UserBuffer) -> usize {
         match &self.backend {
             SocketPairBackend::Stream { .. } => {
                 let len = buf.len();
@@ -874,12 +874,7 @@ impl File for SocketPairEnd {
                 let Ok((copied, _, _)) = self.recv_to_slice(&mut data, false, false) else {
                     return 0;
                 };
-                for (dst, src) in buf.into_iter().zip(data.iter().take(copied)) {
-                    unsafe {
-                        *dst = *src;
-                    }
-                }
-                copied
+                buf.copy_from_slice(&data[..copied])
             }
             SocketPairBackend::Datagram { .. } => {
                 let len = buf.len();
@@ -891,12 +886,7 @@ impl File for SocketPairEnd {
                 let Ok((copied, _, _)) = self.recv_to_slice(&mut data, false, false) else {
                     return 0;
                 };
-                for (dst, src) in buf.into_iter().zip(data.iter().take(copied)) {
-                    unsafe {
-                        *dst = *src;
-                    }
-                }
-                copied
+                buf.copy_from_slice(&data[..copied])
             }
         }
     }
@@ -908,12 +898,7 @@ impl File for SocketPairEnd {
                 if len == 0 {
                     return 0;
                 }
-                let mut data = Vec::with_capacity(len);
-                for byte_ref in buf.into_iter() {
-                    unsafe {
-                        data.push(*byte_ref);
-                    }
-                }
+                let data = buf.to_vec();
                 self.write_from_slice(&data, false).unwrap_or(0)
             }
         }

@@ -7,7 +7,7 @@ use crate::{
     syscall::futex::futex_wake_shared,
     task::{
         FilesLock, FilesStruct, INITPROC,
-        id::{KernelStack, TaskUserRes},
+        id::{KernelStack, LiveThreadRetirement, TaskUserRes},
         manager::{
             PID2PCB, account_rt_runtime, fair_current_deadline_expired, fair_task_is_next_on_hart,
             fair_wakeup_preempts_current_on_hart, fetch_task, has_ready_rt_any_at_or_above,
@@ -159,31 +159,48 @@ fn try_reparent_child_to(
     reaper: &Arc<ProcessControlBlock>,
 ) -> bool {
     let mut reaper_inner = reaper.borrow_mut();
-    if reaper_inner.is_zombie {
+    if reaper_inner.is_zombie || reaper_inner.exit_teardown || reaper.live_thread_count() == 0 {
         return false;
     }
     let reaper_pid = reaper.getpid();
     let reaper_pid_ns_id = reaper_inner.pid_ns_id;
     let reaper_visible_pid = reaper_inner.pid_ns_vpid;
-    let queue_for_reaper = {
+    let (queue_for_reaper, exit_signal) = {
         let mut child_inner = child.borrow_mut();
+        if child_inner.wait_reaped {
+            return false;
+        }
         child_inner.parent = Some(Arc::downgrade(reaper));
         child.update_parent_visible_pid_from_locked_child(
             child_inner.pid_ns_id,
             reaper_pid_ns_id,
             reaper_visible_pid,
         );
-        if child_inner.is_zombie && child_inner.exited_parent_queue_pid != Some(reaper_pid) {
+        if child_inner.is_zombie
+            && !child_inner.wait_reaped
+            && child_inner.exited_parent_queue_pid != Some(reaper_pid)
+        {
             child_inner.exited_parent_queue_pid = Some(reaper_pid);
-            true
+            (true, child_inner.exit_signal)
         } else {
-            false
+            (false, child_inner.exit_signal)
         }
     };
     reaper_inner.add_child(child.clone());
+    let mut waiters = Vec::new();
     if queue_for_reaper {
         reaper_inner.exited_children.push_back(child.clone());
+        waiters.extend(reaper_inner.wait_queue.drain(..));
+        waiters.extend(reaper_inner.vfork_wait_queue.drain(..));
+        for waiter in &waiters {
+            prime_fair_sync_wakeup_lag(waiter);
+        }
     }
+    drop(reaper_inner);
+    if queue_for_reaper && exit_signal > 0 {
+        crate::task::signal::queue_process_signal(reaper_pid, exit_signal as usize);
+    }
+    wakeup_tasks(waiters);
     true
 }
 
@@ -434,12 +451,13 @@ fn finish_thread_exit_cleanup(
     process: &Arc<ProcessControlBlock>,
     cleanup: ThreadExitCleanup,
     drop_user_res: bool,
-) -> (usize, bool, Option<usize>) {
+) -> (usize, bool, Option<usize>, Option<LiveThreadRetirement>) {
     let pid = process.getpid();
-    let token = {
-        let inner = process.borrow_mut();
-        inner.memory_set.token()
-    };
+    let token = cleanup
+        .res_to_drop
+        .as_ref()
+        .map(|res| res.memory_set().token())
+        .unwrap_or_else(|| process.memory_set().token());
 
     if cleanup.robust_list_head != 0 {
         let linux_tid = crate::syscall::misc::encode_linux_tid(pid, cleanup.tid) as u32;
@@ -450,17 +468,12 @@ fn finish_thread_exit_cleanup(
             linux_tid,
         );
     }
-
     if let Some(ctid) = cleanup.clear_child_tid_addr {
         clear_child_tid_now(pid, token, ctid);
     }
-    if let Some(res) = cleanup.res_to_drop {
-        if drop_user_res {
-            drop(res);
-        } else {
-            res.detach_for_process_exit();
-        }
-    }
+    let live_thread_retirement = cleanup
+        .res_to_drop
+        .map(|res| res.finish_thread_exit(drop_user_res));
     for waiter in &cleanup.join_waiters {
         prime_fair_sync_wakeup_lag(waiter);
     }
@@ -470,7 +483,80 @@ fn finish_thread_exit_cleanup(
         cleanup.tid,
         cleanup.is_linux_thread || cleanup.clear_child_tid_addr.is_some(),
         cleanup.clear_child_tid_addr,
+        live_thread_retirement,
     )
+}
+
+fn transfer_exiting_thread_bookkeeping(
+    process: &Arc<ProcessControlBlock>,
+    task: &Arc<TaskControlBlock>,
+    tid: usize,
+) {
+    if tid != 0 && tid != usize::MAX {
+        cgroup_exit_thread(process.getpid(), tid);
+    }
+    let thread_cpu_ns = crate::task::runtime::task_cpu_time_ns(task);
+    let mut process_inner = process.borrow_mut();
+    if task.try_mark_cpu_time_transferred() {
+        process_inner.cpu_time_ns = process_inner.cpu_time_ns.saturating_add(thread_cpu_ns);
+    }
+}
+
+fn remove_exiting_task_slot(
+    process: &Arc<ProcessControlBlock>,
+    task: &Arc<TaskControlBlock>,
+    tid: usize,
+) {
+    let mut process_inner = process.borrow_mut();
+    let remove_slot = process_inner
+        .tasks
+        .get(tid)
+        .and_then(|slot| slot.as_ref())
+        .map(|candidate| Arc::ptr_eq(candidate, task))
+        .unwrap_or(false);
+    if remove_slot {
+        process_inner.tasks[tid] = None;
+    }
+}
+
+/// Publish the common, fully cleaned exit point and consume an exec token when
+/// one was installed concurrently.
+///
+/// The live-thread ticket is released only after the task is off CPU and all
+/// queue/user cleanup is complete.  The final NONE/COUNTED -> RETIRED CAS then
+/// closes both sides of exec's snapshot race without spinning in IRQ context.
+fn retire_exiting_task(
+    process: &Arc<ProcessControlBlock>,
+    task: &Arc<TaskControlBlock>,
+    tid: usize,
+    detach_regular_thread: bool,
+    live_thread_retirement: Option<LiveThreadRetirement>,
+) -> (bool, bool) {
+    // A signal wake may leave references in futex/timer/ready queues. Remove
+    // them before either last-thread teardown or an exec owner may release the
+    // old address space.
+    remove_inactive_task(Arc::clone(task));
+    // Every task performs its cgroup/CPU handoff before releasing the live
+    // ticket. This remains true for group-exit members whose zombie slot is
+    // intentionally retained until the process is reaped.
+    transfer_exiting_thread_bookkeeping(process, task, tid);
+    if detach_regular_thread {
+        remove_exiting_task_slot(process, task, tid);
+    }
+
+    let last_live_thread = live_thread_retirement
+        .map(LiveThreadRetirement::retire)
+        .unwrap_or(false);
+    let exec_peer = task.retire_exec_lifecycle();
+    if exec_peer {
+        if !detach_regular_thread {
+            remove_exiting_task_slot(process, task, tid);
+        }
+        // This is the final publication for a counted peer.  Everything above
+        // must remain ordered before the counter can wake the exec owner.
+        process.finish_exec_peer_exit();
+    }
+    (exec_peer, last_live_thread)
 }
 
 fn process_dumped_core(process: &Arc<ProcessControlBlock>, exit_code: i32) -> bool {
@@ -483,77 +569,118 @@ fn process_dumped_core(process: &Arc<ProcessControlBlock>, exit_code: i32) -> bo
     process.borrow_mut().rlimits.rlimit_core_cur != 0
 }
 
-/// 把已退出的子进程加入父进程的 exited_children 队列，并取出全部
-/// 等待 wait4/vfork 的阻塞线程用于唤醒。
-///
-/// 用 `exited_parent_queue_pid` 去重，防止同一子进程被重复入队
-///（exit 与 group_exit 可能并发）。返回 drain 出的等待队列，
-/// 调用方负责唤醒它们。
-fn queue_exited_child_and_drain_waiters(
-    parent: &Arc<ProcessControlBlock>,
-    child: &Arc<ProcessControlBlock>,
-) -> Vec<Arc<TaskControlBlock>> {
-    let parent_pid = parent.getpid();
-    let mut parent_inner = parent.borrow_mut();
-    let should_queue = {
-        let mut child_inner = child.borrow_mut();
-        if child_inner.exited_parent_queue_pid == Some(parent_pid) {
-            false
-        } else {
-            child_inner.exited_parent_queue_pid = Some(parent_pid);
-            true
-        }
-    };
-    if should_queue {
-        parent_inner.exited_children.push_back(Arc::clone(child));
-    }
-    let mut waiters = parent_inner.wait_queue.drain(..).collect::<Vec<_>>();
-    waiters.extend(parent_inner.vfork_wait_queue.drain(..));
-    for waiter in &waiters {
-        prime_fair_sync_wakeup_lag(waiter);
-    }
-    waiters
+struct ExitPublication {
+    parent: Option<Arc<ProcessControlBlock>>,
+    exit_signal: i32,
+    parent_waiters: Vec<Arc<TaskControlBlock>>,
+    pidfd_waiters: Vec<Arc<TaskControlBlock>>,
 }
 
-/// 进程组退出时清理同组所有其他线程，回收它们的用户态资源。
+/// Publish the final waitable state after teardown has completed.
 ///
-/// 遍历进程的 `tasks` 列表：当前线程只清调度定时器引用（自己由
-/// 调用方处理）；其他线程调 `remove_inactive_task` 移出就绪队列、
-/// 走 `finish_thread_exit_cleanup` 完成退出记账。最后收集所有线程
-/// 的 `TaskUserRes` 返回，供调用方统一回收用户态资源（tid、
-/// clear_child_tid 等）。
-fn cleanup_process_threads_for_group_exit(
+/// The parent PCB is locked before the child PCB, matching wait4/waitid.  Thus
+/// a waiter either observes a non-zombie child and sleeps in `wait_queue`, or
+/// observes the fully initialized zombie and claims it; it cannot reap between
+/// `is_zombie` becoming visible and `exited_children` publication.  Pidfd
+/// waiters are detached in the same child critical section so PID-table removal
+/// cannot lose their wakeup.
+fn publish_process_exit(
     process: &Arc<ProcessControlBlock>,
-    current_task: &Arc<TaskControlBlock>,
+    dumped_core: bool,
     exit_code: i32,
-) -> Vec<TaskUserRes> {
-    let members = {
-        let process_inner = process.borrow_mut();
-        process_inner
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().cloned())
-            .collect::<Vec<_>>()
-    };
+    cpu_time_ns: u64,
+) -> ExitPublication {
+    loop {
+        let parent = {
+            let process_inner = process.borrow_mut();
+            process_inner.parent.as_ref().and_then(|p| p.upgrade())
+        };
 
-    let mut recycle_res = Vec::<TaskUserRes>::new();
-    for member in &members {
-        if Arc::ptr_eq(member, current_task) {
-            remove_sched_timer_refs(Arc::clone(member));
+        let Some(parent) = parent else {
+            let mut process_inner = process.borrow_mut();
+            // Reparenting may have completed between the first snapshot and
+            // this lock acquisition. Retry under the canonical parent->child
+            // order rather than publishing against the stale parent state.
+            if process_inner
+                .parent
+                .as_ref()
+                .and_then(|p| p.upgrade())
+                .is_some()
+            {
+                continue;
+            }
+            debug_assert!(!process_inner.is_zombie);
+            debug_assert!(process_inner.exit_teardown);
+            debug_assert!(!process_inner.wait_reaped);
+            process_inner.dumped_core = dumped_core;
+            process_inner.exit_code = exit_code;
+            process_inner.cpu_time_ns = cpu_time_ns;
+            process_inner.is_zombie = true;
+            let exit_signal = process_inner.exit_signal;
+            let pidfd_waiters = process_inner.pidfd_poll_waiters.take_wakeups();
+            return ExitPublication {
+                parent: None,
+                exit_signal,
+                parent_waiters: Vec::new(),
+                pidfd_waiters,
+            };
+        };
+
+        let parent_pid = parent.getpid();
+        let mut parent_inner = parent.borrow_mut();
+        let mut process_inner = process.borrow_mut();
+        let still_parent = process_inner
+            .parent
+            .as_ref()
+            .and_then(|p| p.upgrade())
+            .is_some_and(|current| Arc::ptr_eq(&current, &parent));
+        if !still_parent {
+            drop(process_inner);
+            drop(parent_inner);
             continue;
         }
-        remove_inactive_task(Arc::clone(member));
-        let cleanup = take_thread_exit_cleanup(member, exit_code);
-        let drop_user_res = cleanup.is_linux_thread;
-        let _ = finish_thread_exit_cleanup(process, cleanup, drop_user_res);
-    }
-    for member in members {
-        let mut member_inner = member.borrow_mut();
-        if let Some(res) = member_inner.res.take() {
-            recycle_res.push(res);
+        let owned_by_parent = process_inner.child_parent_index.is_some_and(|index| {
+            parent_inner
+                .children
+                .get(index)
+                .is_some_and(|owned| Arc::ptr_eq(owned, process))
+        });
+        debug_assert!(
+            owned_by_parent,
+            "exiting process missing from parent children"
+        );
+        debug_assert!(!process_inner.is_zombie);
+        debug_assert!(process_inner.exit_teardown);
+        debug_assert!(!process_inner.wait_reaped);
+        process_inner.dumped_core = dumped_core;
+        process_inner.exit_code = exit_code;
+        process_inner.cpu_time_ns = cpu_time_ns;
+        process_inner.is_zombie = true;
+        let exit_signal = process_inner.exit_signal;
+        let pidfd_waiters = process_inner.pidfd_poll_waiters.take_wakeups();
+        let should_queue =
+            owned_by_parent && process_inner.exited_parent_queue_pid != Some(parent_pid);
+        if should_queue {
+            process_inner.exited_parent_queue_pid = Some(parent_pid);
         }
+        drop(process_inner);
+
+        if should_queue {
+            parent_inner.exited_children.push_back(Arc::clone(process));
+        }
+        let mut parent_waiters = parent_inner.wait_queue.drain(..).collect::<Vec<_>>();
+        parent_waiters.extend(parent_inner.vfork_wait_queue.drain(..));
+        for waiter in &parent_waiters {
+            prime_fair_sync_wakeup_lag(waiter);
+        }
+        drop(parent_inner);
+        return ExitPublication {
+            parent: Some(parent),
+            exit_signal,
+            parent_waiters,
+            pidfd_waiters,
+        };
     }
-    recycle_res
 }
 
 /// 每线程 CPU 时间尽力统计，供 `*_CPUTIME` 时钟使用。
@@ -900,47 +1027,6 @@ pub(crate) fn current_files_and_nofile_limit() -> (Arc<FilesLock>, usize) {
     )
 }
 
-// todo
-pub fn current_process_has_child(pid_or_negative: isize, exit_code: &mut i32) -> Option<usize> {
-    // 获取当前任务（当前正在运行的进程）
-    let pid = pid_or_negative;
-
-    let cur_process = current_process();
-    // Clone children_vec in a separate scope to release the borrow immediately
-    let children_vec = {
-        let process_inner = cur_process.borrow_mut();
-        process_inner.children.clone()
-    }; // process_inner is dropped here, releasing the borrow
-
-    // 遍历当前任务的所有子任务
-    let mut possible_index: Option<usize> = None;
-    let mut found_pid: Option<usize> = None;
-
-    for (index, child) in children_vec.iter().enumerate() {
-        // 匹配 pid 且子进程已退出
-        let child_inner = child.borrow_mut();
-        if (pid == -1 || child.pid.0 == pid as usize) && child_inner.is_zombie {
-            // 将退出码写入 exit_code
-            *exit_code = child_inner.exit_code;
-            possible_index = Some(index);
-            found_pid = Some(child.pid.0);
-            drop(child_inner);
-            break;
-        }
-        drop(child_inner);
-    }
-
-    if let Some(pid_index) = possible_index {
-        // Remove the child from parent's children list
-        let mut process_inner = cur_process.borrow_mut();
-        let child = process_inner.remove_child_at(pid_index);
-        drop(process_inner);
-        // The child process will be deallocated when Arc count reaches 0
-        return found_pid;
-    }
-    None
-}
-
 pub fn debug_count_task_refs_in_processors(task: &Arc<TaskControlBlock>) -> usize {
     PROCESSORS
         .iter()
@@ -988,6 +1074,11 @@ pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
 /// 调度核心函数,直接完成任务的切换，传入参数为我们需要切换的任务的上下文
 /// 完毕之后，该hart 进入idle_task,idle-Task会进入调度循环idle_task()
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+    // Keep current-task removal, FP owner teardown and the actual context
+    // switch atomic with respect to local timer/IPI handling. Exit paths call
+    // schedule directly, so gate stale user extension state here as well.
+    let _ = arch::disable_interrupts();
+    arch::discard_user_fp_state();
     #[cfg(target_arch = "riscv64")]
     // The RISC-V trap path runs part of the kernel on the current user SATP
     // with shared kernel roots. Switch to the full kernel SATP before the idle
@@ -1272,6 +1363,11 @@ pub fn idle_task() {
             }
         }
 
+        // Socket destructors only enqueue their final network-namespace
+        // release: they may run while a weak-socket registry is locked. Retry
+        // teardown here, outside file/registry locks, one namespace per loop.
+        crate::syscall::net::drain_pending_net_namespace_cleanup();
+
         // 2c：释放地址空间（mm）。drop 页表可能很重，故限制每轮预算。
         for _ in 0..mm_drop_budget {
             let Some(mm) = local_processor().lock().take_pending_mm_drop() else {
@@ -1344,8 +1440,15 @@ pub fn idle_task() {
         let _ = arch::disable_interrupts();
         drain_deferred_kernel_timer_work();
         if let Some(task) = fetch_task() {
-            // 恢复目标任务的浮点寄存器状态。
-            arch::restore_user_fp_state(&task);
+            // A task may be scheduled after taking TaskUserRes solely to
+            // finish kernel-side exit cleanup.  It resumes its saved kernel
+            // context and must not touch the already-unmapped user/FP state.
+            let has_user_res = task.borrow_mut().res.is_some();
+            if has_user_res {
+                arch::restore_user_fp_state(&task);
+            } else {
+                arch::discard_user_fp_state();
+            }
             if crate::debug_config::DEBUG_TASK_LIFECYCLE {
                 let seq =
                     TASK_FETCH_REF_DIAG_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
@@ -1410,7 +1513,10 @@ pub fn idle_task() {
                 );
             }
             // 同步 trap context 中的 kernel_tp（hart id），适配跨核迁移。
-            task_inner.get_trap_cx().kernel_tp = hart_id();
+            // Exit-cleanup continuations no longer own a trap context.
+            if task_inner.res.is_some() {
+                task_inner.get_trap_cx().kernel_tp = hart_id();
+            }
             task.mark_on_cpu(hart_id());
             task_inner.task_status = TaskStatus::Running;
 
@@ -1506,18 +1612,39 @@ pub fn go_to_first_task() -> ! {
     panic!("Unreachable in go_to_first_task!");
 }
 fn suspend_current_and_run_next_impl(interruptible: bool) {
+    // Once TaskUserRes has been taken, this stack is already executing the
+    // one-shot exit cleanup.  A cold robust-list/clear_child_tid access may
+    // still yield through block-device I/O; that yield must not recursively
+    // enter exit again or inspect user signal state after the trap context was
+    // removed.
+    let (kernel_exit_cleanup, exec_exit_requested) = current_task()
+        .map(|task| {
+            let kernel_exit_cleanup = task.borrow_mut().res.is_none();
+            (kernel_exit_cleanup, task.exec_exit_requested())
+        })
+        .unwrap_or((false, false));
+    // Exec de-threading is task-local and does not enqueue a normal SIGKILL
+    // bit (which would risk being rebroadcast to the exec owner).  Interruptible
+    // kernel wait loops must therefore consume the token directly instead of
+    // waiting to reach the user-return signal path.
+    if interruptible && !kernel_exit_cleanup && exec_exit_requested {
+        exit_current_and_run_next(0);
+    }
     // If the current process has a fatal pending signal, terminate it even if we are
     // inside a long-running/blocking syscall loop (where we may never return to the
     // trap handler's "check signal then return to user" path).
     //
     // Use `try_borrow_mut` to avoid deadlocking if the caller already holds the PCB lock.
     if interruptible
+        && !kernel_exit_cleanup
         && let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error()
     {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
+    let interrupts_were_enabled = arch::disable_interrupts();
     let Some(task) = take_current_task() else {
+        arch::restore_interrupts(interrupts_were_enabled);
         return;
     };
     charge_task_runtime_for_scheduler(&task);
@@ -1525,6 +1652,7 @@ fn suspend_current_and_run_next_impl(interruptible: bool) {
     // ---- access current TCB exclusively
     let mut task_inner = task.borrow_mut();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
+    let has_user_res = task_inner.res.is_some();
     task_inner.task_status = TaskStatus::Ready;
     task_inner.rr_ticks = 0;
     drop(task_inner);
@@ -1536,10 +1664,15 @@ fn suspend_current_and_run_next_impl(interruptible: bool) {
     //
     // Instead, stash it on this hart and let `idle_task()` enqueue it after the
     // context switch completes.
-    arch::save_user_fp_state(&task);
+    if has_user_res {
+        arch::save_user_fp_state(&task);
+    } else {
+        arch::discard_user_fp_state();
+    }
     local_processor().lock().set_pending_ready(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
+    arch::restore_interrupts(interrupts_were_enabled);
 }
 
 pub fn suspend_current_and_run_next() {
@@ -1553,16 +1686,28 @@ pub fn suspend_current_and_run_next_uninterruptible() {
 }
 
 fn block_current_and_run_next_impl(interruptible: bool) {
+    let (kernel_exit_cleanup, exec_exit_requested) = current_task()
+        .map(|task| {
+            let kernel_exit_cleanup = task.borrow_mut().res.is_none();
+            (kernel_exit_cleanup, task.exec_exit_requested())
+        })
+        .unwrap_or((false, false));
+    if interruptible && !kernel_exit_cleanup && exec_exit_requested {
+        exit_current_and_run_next(0);
+    }
     // Ordinary syscall waits remain killable.  Kernel-owned resources such as
     // an in-flight DMA request use the uninterruptible entry point below so a
     // fatal signal cannot abandon device-owned memory or a lock hand-off.
     if interruptible
+        && !kernel_exit_cleanup
         && let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error()
     {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
     }
+    let interrupts_were_enabled = arch::disable_interrupts();
     let Some(task) = take_current_task() else {
+        arch::restore_interrupts(interrupts_were_enabled);
         return;
     };
     charge_task_runtime_for_scheduler(&task);
@@ -1578,6 +1723,7 @@ fn block_current_and_run_next_impl(interruptible: bool) {
         );
     }
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
+    let has_user_res = task_inner.res.is_some();
     let should_block = match task_inner.task_status {
         TaskStatus::Ready => false,
         TaskStatus::Running | TaskStatus::Blocked => true,
@@ -1589,18 +1735,24 @@ fn block_current_and_run_next_impl(interruptible: bool) {
     drop(task_inner);
     // ---- release current PCB
 
+    if has_user_res {
+        arch::save_user_fp_state(&task);
+    } else {
+        // The task is already committed to exit and will never return to user
+        // mode; only its saved kernel context remains live.
+        arch::discard_user_fp_state();
+    }
     if should_block {
         record_fair_sleep_lag(&task);
-        arch::save_user_fp_state(&task);
         local_processor().lock().set_pending_blocked(task);
     } else {
         // Behave like a yield: enqueue after we have switched back to idle
         // to avoid "run on two harts".
-        arch::save_user_fp_state(&task);
         local_processor().lock().set_pending_ready(task);
     }
     // jump to scheduling cycle
     schedule(task_cx_ptr);
+    arch::restore_interrupts(interrupts_were_enabled);
 }
 
 pub fn block_current_and_run_next() {
@@ -1641,14 +1793,19 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         schedule(&mut _unused as *mut _);
         unreachable!("schedule should not return after task exit");
     };
+    // A concurrent exit_group owns the process exit status and teardown.  Join
+    // that rendezvous even if this thread reached the plain exit syscall just
+    // before observing its SIGKILL.
+    if process.group_exit_in_progress() && !task.exec_exit_requested() {
+        exit_group_and_run_next(process.group_exit_code());
+    }
     // Extract exit bookkeeping first, then perform Linux-thread cleanup without
     // holding the TCB lock so the same logic can be reused by exit_group().
     let cleanup = take_thread_exit_cleanup(&task, exit_code);
     let drop_user_res = cleanup.tid != 0;
     let drop_user_res = drop_user_res || cleanup.is_linux_thread;
-    let (tid, is_linux_thread, clear_child_tid_addr) =
+    let (tid, is_linux_thread, clear_child_tid_addr, live_thread_retirement) =
         finish_thread_exit_cleanup(&process, cleanup, drop_user_res);
-    let exec_victim = task.exec_exit_requested();
 
     let installed_task = take_current_task().expect("current task disappeared during exit cleanup");
     debug_assert!(Arc::ptr_eq(&task, &installed_task));
@@ -1662,37 +1819,27 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // This task will never be scheduled again; ensure it is considered off CPU.
     task.clear_on_cpu();
 
-    if exec_victim {
-        if tid != 0 && tid != usize::MAX {
-            cgroup_exit_thread(process.getpid(), tid);
-        }
-        let thread_cpu_ns = crate::task::runtime::task_cpu_time_ns(&task);
-        {
-            let mut process_inner = process.borrow_mut();
-            let remove_slot = process_inner
-                .tasks
-                .get(tid)
-                .and_then(|slot| slot.as_ref())
-                .map(|candidate| Arc::ptr_eq(candidate, &task))
-                .unwrap_or(false);
-            if remove_slot {
-                process_inner.cpu_time_ns = process_inner.cpu_time_ns.saturating_add(thread_cpu_ns);
-                process_inner.tasks[tid] = None;
-            }
-        }
-        // A signal wake may leave references in futex/timer/ready queues.
-        // Remove them before notifying the exec owner that this task is fully
-        // quiescent and can no longer touch the old mm.
-        remove_inactive_task(task.clone());
-        process.finish_exec_peer_exit(&task);
+    let (exec_peer, last_live_thread) = retire_exiting_task(
+        &process,
+        &task,
+        tid,
+        is_linux_thread && tid != 0 && tid != usize::MAX,
+        live_thread_retirement,
+    );
+    if exec_peer && !last_live_thread {
         queue_exiting_task_drop(task);
         drop(process);
         let mut _unused = TaskContext::new();
         schedule(&mut _unused as *mut _);
         unreachable!("schedule should not return for an exec peer");
     }
+    if last_live_thread {
+        let mut process_inner = process.borrow_mut();
+        debug_assert!(!process_inner.exit_teardown);
+        process_inner.exit_teardown = true;
+    }
 
-    if tid != 0 && tid != usize::MAX {
+    if !exec_peer && tid != 0 && tid != usize::MAX {
         if DEBUG_PTHREAD {
             log::debug!(
                 "[thread_exit] pid={} tid={} ctid={:#x} linux_thread={}",
@@ -1702,33 +1849,28 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
                 is_linux_thread
             );
         }
-        if is_linux_thread {
-            cgroup_exit_thread(process.getpid(), tid);
-            // For Linux threads, remove from the process task table immediately.
-            // Joiners use futexes instead of waittid, so we don't need the slot.
-            let thread_cpu_ns = crate::task::runtime::task_cpu_time_ns(&task);
-            let mut process_inner = process.borrow_mut();
-            let remove_slot = process_inner
-                .tasks
-                .get(tid)
-                .and_then(|slot| slot.as_ref())
-                .map(|t| Arc::ptr_eq(t, &task))
-                .unwrap_or(false);
-            if remove_slot {
-                process_inner.cpu_time_ns = process_inner.cpu_time_ns.saturating_add(thread_cpu_ns);
-                process_inner.tasks[tid] = None;
-            }
-        }
+    }
+
+    // A plain exit may have crossed its initial group-exit check just before a
+    // peer published exit_group(), or it may be the final exec peer after the
+    // exec owner was killed.  Linux preserves the winning group status.
+    let effective_exit_code = if process.group_exit_in_progress() {
+        process.group_exit_code()
+    } else {
+        exit_code
+    };
+    if effective_exit_code != exit_code {
+        task.borrow_mut().exit_code = Some(effective_exit_code);
     }
 
     log::debug!(
         "[exit] pid={} tid={} exit_code={}",
         process.getpid(),
         tid,
-        exit_code
+        effective_exit_code
     );
 
-    let dumped_core = process_dumped_core(&process, exit_code);
+    let dumped_core = process_dumped_core(&process, effective_exit_code);
     let process_cpu_ns =
         crate::task::runtime::process_cpu_time_ns_at(&process, monotonic_time_ns());
 
@@ -1742,14 +1884,14 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     //      回收资源的思路是: 将所有子线程的资源拿走,放到一个临时的 vec 中,通过 drop 进行回收
     //      然后回收 进程的内存空间,文件描述符
     // 对于主线程,需要进行更多的清理工作
-    if tid == 0 {
+    if last_live_thread {
         let pid = process.getpid();
         if pid == IDLE_PID {
             println!(
                 "[kernel] Idle process exit with exit_code {} ...",
-                exit_code
+                effective_exit_code
             );
-            if exit_code != 0 {
+            if effective_exit_code != 0 {
                 //crate::sbi::shutdown(255); //255 == -1 for err hint
                 arch::shutdown();
             } else {
@@ -1760,7 +1902,7 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
         // Detach and semantically close this process' fd table before the
         // zombie becomes visible to waiters.  Heavy file object drops remain
         // deferred below.
-        let (parent, exit_signal, old_files) = {
+        let old_files = {
             let mut process_inner = process.borrow_mut();
             crate::syscall::process::unregister_executing_inode(
                 process_inner.exec_inode_dev,
@@ -1771,69 +1913,64 @@ pub fn exit_current_and_run_next(exit_code: i32) -> ! {
                 Arc::new(FilesLock::new(FilesStruct::new())),
             );
             close_files_struct_fd_refs_if_unshared(&old_files);
-            process_inner.is_zombie = true;
-            process_inner.dumped_core = dumped_core;
-            process_inner.exit_code = exit_code;
-            process_inner.cpu_time_ns = process_cpu_ns;
-            (
-                process_inner.parent.as_ref().and_then(|p| p.upgrade()),
-                process_inner.exit_signal,
-                old_files,
-            )
+            old_files
         }; // drop child PCB lock before touching parent to avoid lock inversion
         crate::syscall::process::release_ptrace_tracer(&process);
-        crate::fs::wake_pidfd_poll_waiters(pid);
         kill_pid_namespace_members_on_init_exit(&process);
         cgroup_exit_process(pid);
         crate::syscall::sysv_ipc::exit_cleanup(pid);
-        crate::syscall::filesystem::acct_process_exit(&process, exit_code);
-
-        // ...then wake parent waiters (waitpid) without holding the child PCB lock.
-        if let Some(parent) = parent {
-            // clone(2) allows exit_signal=0 to suppress parent notification entirely.
-            // Only send the signal when the caller explicitly requested one.
-            if exit_signal > 0 {
-                crate::task::signal::queue_process_signal(parent.getpid(), exit_signal as usize);
-            }
-            let waiters = queue_exited_child_and_drain_waiters(&parent, &process);
-            wakeup_tasks(waiters);
-        }
+        crate::syscall::filesystem::acct_process_exit(&process, effective_exit_code);
 
         reparent_orphaned_children(&process);
 
-        // Deallocate user-thread resources only after each member has run the
-        // same exit-side futex/join cleanup as the current thread.
-        let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
-        recycle_res.clear();
-        let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
+        let empty_mm = MmRef::new(MemorySet::new_bare());
+        let (old_mm_token, old_net_ns_id, mut old_mm, zombie_tasks) = {
             let mut process_inner = process.borrow_mut();
             process_inner.clear_children();
             process_inner.exited_children.clear();
             let old_mm_token = process_inner.memory_set.token();
             let old_net_ns_id = process_inner.net_ns_id;
-            let old_shm_cleanup = process_inner
-                .memory_set
-                .take_sysv_shm_attaches_for_cleanup();
+            let zombie_tasks = process_inner
+                .tasks
+                .iter()
+                .filter_map(|task| task.as_ref().map(Arc::clone))
+                .collect::<Vec<_>>();
             // Linux releases `mm_struct` at exit and keeps only zombie metadata.
             // Drop the full user address space here so unreaped zombies do not pin
             // page-table pages (and COW refs) during fork-heavy workloads.
-            let old_mm = core::mem::replace(
-                &mut process_inner.memory_set,
-                MmRef::new(MemorySet::new_bare()),
-            );
-            crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
-            crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-            (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
+            let old_mm = core::mem::replace(&mut process_inner.memory_set, empty_mm.clone());
+            (old_mm_token, old_net_ns_id, old_mm, zombie_tasks)
         };
+        for zombie_task in zombie_tasks {
+            drop(zombie_task.replace_memory_set(empty_mm.clone()));
+        }
+        let old_shm_cleanup = old_mm.take_sysv_shm_attaches_for_cleanup();
+        crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
+        crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
         if !release_process_mm_owner(old_mm_token) {
             crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
         }
         if let Some(old_shm) = old_shm_cleanup {
             crate::syscall::sysv_shm::exit_cleanup(&old_shm);
         }
-        crate::syscall::net::cleanup_net_namespace_if_unused(old_net_ns_id);
+        if let Some(released_net_ns_id) = process.release_net_namespace_owner() {
+            debug_assert_eq!(released_net_ns_id, old_net_ns_id);
+            crate::syscall::net::cleanup_net_namespace_if_unused(released_net_ns_id);
+        }
         queue_files_struct_drop(old_files);
         queue_mm_drop(old_mm);
+        let publication =
+            publish_process_exit(&process, dumped_core, effective_exit_code, process_cpu_ns);
+        if let Some(parent) = publication.parent.as_ref()
+            && publication.exit_signal > 0
+        {
+            crate::task::signal::queue_process_signal(
+                parent.getpid(),
+                publication.exit_signal as usize,
+            );
+        }
+        wakeup_tasks(publication.parent_waiters);
+        crate::fs::wake_tasks(publication.pidfd_waiters);
         // Keep zombie `tasks[]` until wait4() reaps the process so reaping has
         // a deterministic place to drop any lingering task Arcs.
     }
@@ -1879,19 +2016,24 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         .as_ref()
         .map(|res| res.tid)
         .unwrap_or(usize::MAX - 1);
-
     // The initiating thread broadcasts SIGKILL to the complete thread group.
     // Every member then exits independently. This mirrors Linux's group-exit
     // rendezvous and, crucially, never spins waiting for a remote hart that may
     // currently be inside a long-running syscall.
-    if process.begin_group_exit(tid, exit_code) {
+    if process.begin_group_exit(&task, tid, exit_code) {
         let _ = crate::task::signal::kill_current(crate::task::signal::SIGKILL_NUM as i32);
+    }
+    // begin_group_exit() serializes with exec snapshot publication.  If exec
+    // won while this task was entering group exit, its task-local request is
+    // now fully visible and must not be turned into a process-wide exit.
+    if task.exec_exit_requested() {
+        exit_current_and_run_next(0);
     }
     let exit_code = process.group_exit_code();
 
     let cleanup = take_thread_exit_cleanup(&task, exit_code);
-    let drop_user_res = cleanup.is_linux_thread;
-    let (tid, _is_linux_thread, _clear_child_tid_addr) =
+    let drop_user_res = cleanup.tid != 0 || cleanup.is_linux_thread;
+    let (tid, _is_linux_thread, _clear_child_tid_addr, live_thread_retirement) =
         finish_thread_exit_cleanup(&process, cleanup, drop_user_res);
 
     let installed_task =
@@ -1904,6 +2046,21 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
     charge_task_runtime_for_scheduler(&task);
     task.clear_on_cpu();
 
+    let (exec_peer, last_live_thread) =
+        retire_exiting_task(&process, &task, tid, false, live_thread_retirement);
+    if exec_peer && !last_live_thread {
+        queue_exiting_task_drop(task);
+        drop(process);
+        let mut _unused = TaskContext::new();
+        schedule(&mut _unused as *mut _);
+        unreachable!("schedule should not return for an exec peer");
+    }
+    if last_live_thread {
+        let mut process_inner = process.borrow_mut();
+        debug_assert!(!process_inner.exit_teardown);
+        process_inner.exit_teardown = true;
+    }
+
     log::debug!(
         "[exit_group] pid={} tid={} exit_code={}",
         process.getpid(),
@@ -1911,7 +2068,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         exit_code
     );
 
-    if !process.finish_group_exit_thread() {
+    if !last_live_thread {
         // This member is fully detached from user resources. Keep its TCB alive
         // through the context switch; the final member will perform shared PCB
         // cleanup after every peer has reached this point.
@@ -1939,7 +2096,7 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
         }
     }
 
-    let (parent, exit_signal, old_files) = {
+    let old_files = {
         let mut process_inner = process.borrow_mut();
         crate::syscall::process::unregister_executing_inode(
             process_inner.exec_inode_dev,
@@ -1950,65 +2107,63 @@ pub fn exit_group_and_run_next(exit_code: i32) -> ! {
             Arc::new(FilesLock::new(FilesStruct::new())),
         );
         close_files_struct_fd_refs_if_unshared(&old_files);
-        process_inner.is_zombie = true;
-        process_inner.dumped_core = dumped_core;
-        process_inner.exit_code = exit_code;
-        process_inner.cpu_time_ns = process_cpu_ns;
-        (
-            process_inner.parent.as_ref().and_then(|p| p.upgrade()),
-            process_inner.exit_signal,
-            old_files,
-        )
+        old_files
     };
     crate::syscall::process::release_ptrace_tracer(&process);
-    crate::fs::wake_pidfd_poll_waiters(pid);
     kill_pid_namespace_members_on_init_exit(&process);
     cgroup_exit_process(pid);
     crate::syscall::sysv_ipc::exit_cleanup(pid);
     crate::syscall::filesystem::acct_process_exit(&process, exit_code);
 
-    if let Some(parent) = parent {
-        // clone(2) allows exit_signal=0 to suppress parent notification entirely.
-        // Only send the signal when the caller explicitly requested one.
-        if exit_signal > 0 {
-            crate::task::signal::queue_process_signal(parent.getpid(), exit_signal as usize);
-        }
-        let waiters = queue_exited_child_and_drain_waiters(&parent, &process);
-        wakeup_tasks(waiters);
-    }
-
     reparent_orphaned_children(&process);
 
-    let mut recycle_res = cleanup_process_threads_for_group_exit(&process, &task, exit_code);
-    recycle_res.clear();
-    let (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm) = {
+    let empty_mm = MmRef::new(MemorySet::new_bare());
+    let (old_mm_token, old_net_ns_id, mut old_mm, zombie_tasks) = {
         let mut process_inner = process.borrow_mut();
         process_inner.clear_children();
         process_inner.exited_children.clear();
         let old_mm_token = process_inner.memory_set.token();
         let old_net_ns_id = process_inner.net_ns_id;
-        let old_shm_cleanup = process_inner
-            .memory_set
-            .take_sysv_shm_attaches_for_cleanup();
+        let zombie_tasks = process_inner
+            .tasks
+            .iter()
+            .filter_map(|task| task.as_ref().map(Arc::clone))
+            .collect::<Vec<_>>();
         // Same as exit_current_and_run_next(): release the whole user address
         // space eagerly and keep only zombie bookkeeping in the PCB.
-        let old_mm = core::mem::replace(
-            &mut process_inner.memory_set,
-            MmRef::new(MemorySet::new_bare()),
-        );
-        crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
-        crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
-        (old_shm_cleanup, old_mm_token, old_net_ns_id, old_mm)
+        let old_mm = core::mem::replace(&mut process_inner.memory_set, empty_mm.clone());
+        (old_mm_token, old_net_ns_id, old_mm, zombie_tasks)
     };
+    for zombie_task in zombie_tasks {
+        drop(zombie_task.replace_memory_set(empty_mm.clone()));
+    }
+    let old_shm_cleanup = old_mm.take_sysv_shm_attaches_for_cleanup();
+    crate::syscall::filesystem::release_all_record_locks_for_owner(pid);
+    crate::syscall::filesystem::release_all_file_leases_for_owner(pid);
     if !release_process_mm_owner(old_mm_token) {
         crate::syscall::net::clear_packet_ring_mmaps_for_token(old_mm_token);
     }
     if let Some(old_shm) = old_shm_cleanup {
         crate::syscall::sysv_shm::exit_cleanup(&old_shm);
     }
-    crate::syscall::net::cleanup_net_namespace_if_unused(old_net_ns_id);
+    if let Some(released_net_ns_id) = process.release_net_namespace_owner() {
+        debug_assert_eq!(released_net_ns_id, old_net_ns_id);
+        crate::syscall::net::cleanup_net_namespace_if_unused(released_net_ns_id);
+    }
     queue_files_struct_drop(old_files);
     queue_mm_drop(old_mm);
+
+    let publication = publish_process_exit(&process, dumped_core, exit_code, process_cpu_ns);
+    if let Some(parent) = publication.parent.as_ref()
+        && publication.exit_signal > 0
+    {
+        crate::task::signal::queue_process_signal(
+            parent.getpid(),
+            publication.exit_signal as usize,
+        );
+    }
+    wakeup_tasks(publication.parent_waiters);
+    crate::fs::wake_tasks(publication.pidfd_waiters);
 
     // Same as `exit_current_and_run_next()`: keep zombie `tasks[]` until wait4().
 

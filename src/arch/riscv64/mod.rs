@@ -1,7 +1,7 @@
+mod irq;
 pub mod mm;
 pub mod task;
 pub mod trap;
-mod irq;
 
 pub use irq::{enable_external_irq, handle_external_interrupt, init_external_interrupts};
 
@@ -341,6 +341,10 @@ pub fn restore_user_fp_state(task: &Arc<TaskControlBlock>) {
         inner.get_trap_cx().sstatus.set_fs(FS::Clean);
     }
     drop(inner);
+    disable_fp();
+}
+
+pub fn discard_user_fp_state() {
     disable_fp();
 }
 

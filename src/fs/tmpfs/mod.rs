@@ -915,15 +915,19 @@ impl File for TmpFsFile {
         if !self.readable {
             return 0;
         }
+        let output_len = buffer.len();
+        let mut output = alloc::vec![0u8; core::cmp::min(output_len, PAGE_SIZE)];
         let mut offset = self.offset.lock();
         let mut total = 0usize;
-        for output in buffer.buffers.iter_mut() {
-            match self.node.read_at(*offset, output) {
+        while total < output_len {
+            let chunk = core::cmp::min(output.len(), output_len - total);
+            match self.node.read_at(*offset, &mut output[..chunk]) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
-                    *offset = offset.saturating_add(read as u64);
-                    total += read;
-                    if read < output.len() {
+                    let copied = buffer.copy_from_slice_at(total, &output[..read]);
+                    *offset = offset.saturating_add(copied as u64);
+                    total += copied;
+                    if copied != read || read != chunk {
                         break;
                     }
                 }
@@ -939,18 +943,25 @@ impl File for TmpFsFile {
         if !self.writable {
             return 0;
         }
+        let input_len = buffer.len();
+        let mut input = alloc::vec![0u8; core::cmp::min(input_len, PAGE_SIZE)];
         let mut offset = self.offset.lock();
         if self.append {
             *offset = self.node.inner.read().metadata.size;
         }
         let mut total = 0usize;
-        for input in buffer.buffers {
-            match self.node.write_at(*offset, input) {
+        while total < input_len {
+            let chunk = core::cmp::min(input.len(), input_len - total);
+            let copied = buffer.copy_to_slice_at(total, &mut input[..chunk]);
+            if copied == 0 {
+                break;
+            }
+            match self.node.write_at(*offset, &input[..copied]) {
                 Ok(0) | Err(_) => break,
                 Ok(written) => {
                     *offset = offset.saturating_add(written as u64);
                     total += written;
-                    if written < input.len() {
+                    if written != copied {
                         break;
                     }
                 }

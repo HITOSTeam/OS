@@ -68,7 +68,7 @@ fn enable_cpu_line() {
     unsafe {
         asm!("csrrd {}, 0x4", out(reg) ecfg);
         ecfg |= super::csr_defs::ECFG_LIE_EIOINTC;
-        asm!("csrwr {}, 0x4", in(reg) ecfg);
+        super::csr_write::<0x4>(ecfg);
     }
 }
 

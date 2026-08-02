@@ -30,25 +30,6 @@ fn log_clone_tid_write_failure(
     );
 }
 
-fn rollback_unstarted_thread(
-    process: &Arc<ProcessControlBlock>,
-    task: &Arc<TaskControlBlock>,
-    tid: usize,
-) {
-    {
-        let mut process_inner = process.borrow_mut();
-        if process_inner
-            .tasks
-            .get(tid)
-            .and_then(|slot| slot.as_ref())
-            .is_some_and(|candidate| Arc::ptr_eq(candidate, task))
-        {
-            process_inner.tasks[tid] = None;
-        }
-    }
-    crate::fs::cgroup_exit_thread(process.getpid(), tid);
-}
-
 fn should_report_fork_diag(count: usize) -> bool {
     count <= 16 || count % 128 == 0
 }
@@ -236,7 +217,7 @@ fn clone_from_parts(
             *inner.get_trap_cx()
         };
         let process = current_process();
-        if process.exec_in_progress() {
+        if process.exec_in_progress() || process.group_exit_in_progress() {
             return err(SyscallError::EAGAIN);
         }
         // 在当前进程下新建一个 Linux 风格线程的 TCB（共享地址空间/文件等）
@@ -255,24 +236,6 @@ fn clone_from_parts(
             let tid_index = res.tid;
             // 编码为 Linux 视角的 TID（高位含 PID，低位为线程槽位）
             let linux_tid = encode_linux_tid(process.getpid(), tid_index);
-
-            // Attach to process thread table.
-            // 将新线程登记进进程的 tasks 数组；按 tid_index 扩容并填入对应槽位
-            {
-                let mut process_inner = process.borrow_mut();
-                // Serialize the insertion against exec's task-table snapshot.
-                // If exec published its owner while this thread was being
-                // allocated, discard the unstarted task instead of letting a
-                // new peer enter the old mm after the snapshot.
-                if process.exec_in_progress() {
-                    return err(SyscallError::EAGAIN);
-                }
-                let tasks = &mut process_inner.tasks;
-                while tasks.len() < tid_index + 1 {
-                    tasks.push(None);
-                }
-                tasks[tid_index] = Some(Arc::clone(&new_task));
-            }
 
             // 继承父线程的信号屏蔽字
             new_inner.signal_mask = parent_mask;
@@ -296,33 +259,21 @@ fn clone_from_parts(
             if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
                 new_inner.clear_child_tid = Some(_ctid);
             }
-            // 将新线程挂入 cgroup。普通线程继承父线程路径；clone3(CLONE_INTO_CGROUP)
-            // 仅覆盖目标 unified hierarchy，其他 hierarchy 仍继承父线程。
-            if let Err(e) = cgroup_attach_thread(
-                process.getpid(),
-                parent_tid_index,
-                tid_index,
-                clone_into_cgroup.as_ref(),
-            ) {
-                let mut process_inner = process.borrow_mut();
-                if process_inner
-                    .tasks
-                    .get(tid_index)
-                    .and_then(|slot| slot.as_ref())
-                    .is_some_and(|task| Arc::ptr_eq(task, &new_task))
-                {
-                    process_inner.tasks[tid_index] = None;
-                }
-                return e;
-            }
             (tid_index, linux_tid)
         };
-        refresh_thread_legacy_cpu_fair_group_cache(process.getpid(), _tid_index);
-        crate::syscall::cyclic_diag_note(
-            crate::syscall::CyclicDiagEvent::Clone,
+
+        // Complete every fallible initialization step before publishing the
+        // TCB in process.tasks.  Exec snapshots only published tasks; exposing
+        // an unstarted task here and later rolling it back could strand the
+        // exec coordinator's one-shot peer token forever.
+        if let Err(e) = cgroup_attach_thread(
             process.getpid(),
+            parent_tid_index,
             _tid_index,
-        );
+            clone_into_cgroup.as_ref(),
+        ) {
+            return e;
+        }
 
         // 线程克隆路径的调试日志：仅在打开 DEBUG_PTHREAD 时输出
         if DEBUG_PTHREAD {
@@ -345,7 +296,7 @@ fn clone_from_parts(
         if (flags & CLONE_PARENT_SETTID) != 0 && _ptid != 0 {
             if try_write_user_value(token, _ptid as *mut i32, &(linux_tid as i32)).is_err() {
                 log_clone_tid_write_failure(&process, &new_task, "parent_tid", token, _ptid, flags);
-                rollback_unstarted_thread(&process, &new_task, _tid_index);
+                crate::fs::cgroup_exit_thread(process.getpid(), _tid_index);
                 return err(SyscallError::EFAULT);
             }
         }
@@ -353,10 +304,35 @@ fn clone_from_parts(
         if (flags & CLONE_CHILD_SETTID) != 0 && _ctid != 0 {
             if try_write_user_value(token, _ctid as *mut i32, &(linux_tid as i32)).is_err() {
                 log_clone_tid_write_failure(&process, &new_task, "child_tid", token, _ctid, flags);
-                rollback_unstarted_thread(&process, &new_task, _tid_index);
+                crate::fs::cgroup_exit_thread(process.getpid(), _tid_index);
                 return err(SyscallError::EFAULT);
             }
         }
+
+        // Publish exactly once, after no failing operation remains. Holding
+        // the PCB lock serializes this insertion with exec's task snapshot. If
+        // a group-wide action won while initialization was in flight, discard
+        // the still-private TCB and its old-mm reference.
+        {
+            let mut process_inner = process.borrow_mut();
+            if process.exec_in_progress() || process.group_exit_in_progress() {
+                drop(process_inner);
+                crate::fs::cgroup_exit_thread(process.getpid(), _tid_index);
+                return err(SyscallError::EAGAIN);
+            }
+            let tasks = &mut process_inner.tasks;
+            while tasks.len() < _tid_index + 1 {
+                tasks.push(None);
+            }
+            debug_assert!(tasks[_tid_index].is_none());
+            tasks[_tid_index] = Some(Arc::clone(&new_task));
+        }
+        refresh_thread_legacy_cpu_fair_group_cache(process.getpid(), _tid_index);
+        crate::syscall::cyclic_diag_note(
+            crate::syscall::CyclicDiagEvent::Clone,
+            process.getpid(),
+            _tid_index,
+        );
 
         // The creating thread is still fair until the new pthreads finish their
         // scheduler setup. Give that control path one bounded startup credit so
@@ -409,15 +385,13 @@ fn clone_from_parts(
     // 父进程继承下来的 System V 共享内存挂载需要回滚（新 ns 内不应可见），
     // 然后再分配一个独立的 ipc_ns_id
     if (flags & CLONE_NEWIPC) != 0 {
-        let inherited_attaches = {
-            let child_inner = child.borrow_mut();
-            child_inner.memory_set.sysv_shm_attaches_snapshot()
-        };
+        let child_memory_set = child.memory_set();
+        let inherited_attaches = child_memory_set.sysv_shm_attaches_snapshot();
         if !share_vm && !inherited_attaches.is_empty() {
             crate::syscall::sysv_shm::rollback_fork_inherit(&inherited_attaches);
         }
+        child_memory_set.replace_sysv_shm_attaches(Vec::new());
         let mut child_inner = child.borrow_mut();
-        child_inner.memory_set.replace_sysv_shm_attaches(Vec::new());
         child_inner.ipc_ns_id = crate::task::alloc_ipc_namespace_id();
     }
     // CLONE_NEWUTS：拆出独立的 UTS（hostname/domain）命名空间
@@ -471,7 +445,7 @@ fn clone_from_parts(
     // clone3 的 CLONE_INTO_CGROUP：把新进程原子性附挂到目标 cgroup
     if let Some(target) = clone_into_cgroup.as_ref() {
         if let Err(e) = cgroup_attach_process_to_target(child_pid, target) {
-            rollback_unstarted_child(&child);
+            rollback_unstarted_child(&child, share_vm);
             return e;
         }
     }
@@ -499,33 +473,69 @@ fn clone_from_parts(
     // CLONE_PARENT：把子的父亲改成调用者的父亲（产生"兄弟"关系），
     // 这是 pthread 创建组等场景需要的语义
     if (flags & CLONE_PARENT) != 0 {
-        let real_parent = {
-            let inner = process.borrow_mut();
-            inner.parent.as_ref().and_then(|p| p.upgrade())
+        let attached = loop {
+            let real_parent = {
+                let inner = process.borrow_mut();
+                inner.parent.as_ref().and_then(|p| p.upgrade())
+            };
+            let Some(real_parent) = real_parent else {
+                break false;
+            };
+            // Hold the prospective parent's PCB lock across the liveness
+            // recheck and child-list insertion. If its last thread starts
+            // exit concurrently, either live_threads is already zero and this
+            // clone fails safely, or exit waits for this lock and includes the
+            // newly attached child in its orphan snapshot.
+            let mut real_parent_inner = real_parent.borrow_mut();
+            let mut caller_inner = process.borrow_mut();
+            let still_real_parent = caller_inner
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+                .is_some_and(|parent| Arc::ptr_eq(&parent, &real_parent));
+            if !still_real_parent {
+                // The caller was reparented between the optimistic lookup and
+                // the ordered parent -> caller lock acquisition. Retry using
+                // the new parent rather than attaching to a stale ancestor.
+                drop(caller_inner);
+                drop(real_parent_inner);
+                continue;
+            }
+            let can_adopt = !real_parent_inner.is_zombie
+                && !real_parent_inner.exit_teardown
+                && real_parent.live_thread_count() != 0;
+            if !can_adopt {
+                break false;
+            }
+            let real_parent_pid_ns_id = real_parent_inner.pid_ns_id;
+            let real_parent_visible_pid = if real_parent_pid_ns_id == 0 {
+                real_parent.getpid()
+            } else {
+                real_parent_inner.pid_ns_vpid
+            };
+            // The real parent is the caller's ancestor, so parent -> caller ->
+            // child is the same lock order used by wait and exit publication.
+            if caller_inner.remove_child(&child).is_none() {
+                break false;
+            }
+            let mut child_inner = child.borrow_mut();
+            child_inner.parent = Some(Arc::downgrade(&real_parent));
+            child.update_parent_visible_pid_from_locked_child(
+                child_inner.pid_ns_id,
+                real_parent_pid_ns_id,
+                real_parent_visible_pid,
+            );
+            drop(child_inner);
+            real_parent_inner.add_child(Arc::clone(&child));
+            break true;
         };
-        if let Some(real_parent) = real_parent {
-            let real_parent_pid_ns_id = real_parent.pid_namespace_id();
-            let real_parent_visible_pid = real_parent.visible_pid();
-            // 1) 从调用者的子列表里移除新子
-            {
-                let mut caller_inner = process.borrow_mut();
-                let _ = caller_inner.remove_child(&child);
-            }
-            // 2) 把新子的父指针改指向调用者的真父
-            {
-                let mut child_inner = child.borrow_mut();
-                child_inner.parent = Some(Arc::downgrade(&real_parent));
-                child.update_parent_visible_pid_from_locked_child(
-                    child_inner.pid_ns_id,
-                    real_parent_pid_ns_id,
-                    real_parent_visible_pid,
-                );
-            }
-            // 3) 把新子挂到真父的子列表
-            {
-                let mut real_parent_inner = real_parent.borrow_mut();
-                real_parent_inner.add_child(Arc::clone(&child));
-            }
+        if !attached {
+            // Linux serializes CLONE_PARENT attachment with task reparenting.
+            // If the prospective parent is already irreversibly exiting, fail
+            // before the child is runnable instead of silently changing its
+            // parent semantics or leaving a phantom child behind.
+            rollback_unstarted_child(&child, share_vm);
+            return err(SyscallError::EAGAIN);
         }
     }
 
@@ -551,14 +561,14 @@ fn clone_from_parts(
         let _ = child_memory_set.resolve_lazy_fault_for(_ctid, MapPermission::W, child_pid);
         let child_token = child_memory_set.token();
         if try_write_user_value(child_token, _ctid as *mut i32, &(child_pid as i32)).is_err() {
-            rollback_unstarted_child(&child);
+            rollback_unstarted_child(&child, share_vm);
             return err(SyscallError::EFAULT);
         }
     }
     if let Some(pidfd_user_ptr) = pidfd_user_ptr {
         let token = get_current_token();
         if let Err(e) = install_child_pidfd(&child, token, pidfd_user_ptr) {
-            rollback_unstarted_child(&child);
+            rollback_unstarted_child(&child, share_vm);
             return err(e);
         }
     }
@@ -746,32 +756,98 @@ fn install_child_pidfd(
     Ok(fd)
 }
 
-fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>) {
+fn rollback_unstarted_child(child: &Arc<ProcessControlBlock>, share_vm: bool) {
+    // First make the unpublished child impossible to reparent. The parent may
+    // itself be exiting, so validate child.parent while holding parent -> child
+    // locks and retry if ownership changed before the locks were acquired.
+    loop {
+        let parent = {
+            let child_inner = child.borrow_mut();
+            child_inner
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
+        };
+        let Some(parent) = parent else {
+            let mut child_inner = child.borrow_mut();
+            child_inner.wait_reaped = true;
+            child_inner.exit_teardown = true;
+            child_inner.child_parent_index = None;
+            break;
+        };
+        let mut parent_inner = parent.borrow_mut();
+        let mut child_inner = child.borrow_mut();
+        let still_child_of_parent = child_inner
+            .parent
+            .as_ref()
+            .and_then(|candidate| candidate.upgrade())
+            .is_some_and(|candidate| Arc::ptr_eq(&candidate, &parent));
+        if !still_child_of_parent {
+            drop(child_inner);
+            drop(parent_inner);
+            continue;
+        }
+
+        // `try_reparent_child_to()` checks wait_reaped under the child lock.
+        // Publishing it here makes any concurrent reparent attempt abort once
+        // this lock is released.
+        child_inner.wait_reaped = true;
+        child_inner.exit_teardown = true;
+        child_inner.parent = None;
+        child_inner.exited_parent_queue_pid = None;
+
+        let index = child_inner
+            .child_parent_index
+            .filter(|index| {
+                *index < parent_inner.children.len()
+                    && Arc::ptr_eq(&parent_inner.children[*index], child)
+            })
+            .or_else(|| {
+                parent_inner
+                    .children
+                    .iter()
+                    .position(|candidate| Arc::ptr_eq(candidate, child))
+            });
+        if let Some(index) = index {
+            let removed = parent_inner.children.swap_remove(index);
+            debug_assert!(Arc::ptr_eq(&removed, child));
+            if index < parent_inner.children.len() {
+                parent_inner.children[index].borrow_mut().child_parent_index = Some(index);
+            }
+        }
+        child_inner.child_parent_index = None;
+        break;
+    }
+
     let child_pid = child.getpid();
     crate::fs::cgroup_exit_process(child_pid);
     let detached = child.files().lock().release_process_owner();
     crate::task::complete_fd_closes(detached);
-    let (exec_dev, exec_ino, shm_attaches, parent) = {
-        let mut child_inner = child.borrow_mut();
-        let shm_attaches = child_inner.memory_set.take_sysv_shm_attaches_for_cleanup();
+    let child_memory_set = child.memory_set();
+    let child_mm_token = child_memory_set.token();
+    let shm_attaches = if share_vm {
+        Vec::new()
+    } else {
+        let attaches = child_memory_set.sysv_shm_attaches_snapshot();
+        child_memory_set.replace_sysv_shm_attaches(Vec::new());
+        crate::syscall::net::clear_packet_ring_mmaps_for_token(child_mm_token);
+        attaches
+    };
+    let (exec_dev, exec_ino, net_ns_id) = {
+        let child_inner = child.borrow_mut();
         (
             child_inner.exec_inode_dev,
             child_inner.exec_inode_num,
-            shm_attaches,
-            child_inner.parent.as_ref().and_then(|p| p.upgrade()),
+            child_inner.net_ns_id,
         )
     };
-    if let Some(shm_attaches) = shm_attaches {
-        if !shm_attaches.is_empty() {
-            crate::syscall::sysv_shm::rollback_fork_inherit(&shm_attaches);
-        }
+    if !shm_attaches.is_empty() {
+        crate::syscall::sysv_shm::rollback_fork_inherit(&shm_attaches);
     }
     unregister_executing_inode(exec_dev, exec_ino);
-    if let Some(parent) = parent {
-        parent
-            .borrow_mut()
-            .children
-            .retain(|candidate| !Arc::ptr_eq(candidate, child));
+    if let Some(released_net_ns_id) = child.release_net_namespace_owner() {
+        debug_assert_eq!(released_net_ns_id, net_ns_id);
+        crate::syscall::net::cleanup_net_namespace_if_unused(released_net_ns_id);
     }
     crate::task::manager::remove_from_pid2process(child_pid);
 }

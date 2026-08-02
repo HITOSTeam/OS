@@ -1007,7 +1007,7 @@ pub(super) fn proc_kpageflags_read(offset: &mut usize, buf: &mut UserBuffer) -> 
         return 0;
     }
     let mut total = 0usize;
-    for slice in buf.buffers.iter_mut() {
+    buf.for_each_chunk_mut(|slice| {
         let mut i = 0usize;
         while i < slice.len() && *offset < limit {
             let entry = (*offset) / 8;
@@ -1018,7 +1018,8 @@ pub(super) fn proc_kpageflags_read(offset: &mut usize, buf: &mut UserBuffer) -> 
             i += 1;
             total += 1;
         }
-    }
+        *offset < limit
+    });
     total
 }
 
@@ -1028,7 +1029,7 @@ pub(super) fn proc_pid_pagemap_read(pid: u32, offset: &mut usize, buf: &mut User
         return 0;
     }
     let mut total = 0usize;
-    for slice in buf.buffers.iter_mut() {
+    buf.for_each_chunk_mut(|slice| {
         let mut i = 0usize;
         while i < slice.len() && *offset < limit {
             let entry = (*offset) / 8;
@@ -1039,7 +1040,8 @@ pub(super) fn proc_pid_pagemap_read(pid: u32, offset: &mut usize, buf: &mut User
             i += 1;
             total += 1;
         }
-    }
+        *offset < limit
+    });
     total
 }
 

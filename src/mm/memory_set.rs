@@ -8,12 +8,12 @@ use super::elf_loader::{
     elf_arch_abi_from_bytes, parse_elf_headers, read_exact_with, validate_elf_arch_abi,
     validate_elf_interp_abi,
 };
-use super::{FrameTracker, frame_alloc, try_copy_to_user_unchecked};
+use super::{FrameTracker, UserBuffer, UserBufferSegment, frame_alloc, try_copy_to_user_unchecked};
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 #[cfg(target_arch = "loongarch64")]
-use crate::arch::loongarch64::mm::AsidContext;
+use crate::arch::loongarch64::mm::{AsidContext, UserTlbInvalidationBatch};
 #[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::mm::{AsidContext, UserTlbInvalidationBatch};
 #[cfg(target_arch = "riscv64")]
@@ -75,12 +75,7 @@ const MMAP_ASLR_RANGE: usize = 256 * 1024 * 1024;
 
 #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
 pub(super) struct PageTableUpdateBatch {
-    #[cfg(target_arch = "riscv64")]
     tlb: Option<UserTlbInvalidationBatch>,
-    #[cfg(target_arch = "loongarch64")]
-    asid: Arc<AsidContext>,
-    #[cfg(target_arch = "loongarch64")]
-    user_changed: bool,
     deferred_frames: Vec<FrameTracker>,
     kernel_full: bool,
     icache_stale: bool,
@@ -93,9 +88,7 @@ impl PageTableUpdateBatch {
             #[cfg(target_arch = "riscv64")]
             tlb: Some(crate::arch::riscv64::mm::begin_user_tlb_batch(asid)),
             #[cfg(target_arch = "loongarch64")]
-            asid: Arc::clone(asid),
-            #[cfg(target_arch = "loongarch64")]
-            user_changed: false,
+            tlb: Some(crate::arch::loongarch64::mm::begin_user_tlb_batch(asid)),
             deferred_frames: Vec::new(),
             kernel_full: false,
             icache_stale: false,
@@ -103,26 +96,14 @@ impl PageTableUpdateBatch {
     }
 
     pub(super) fn record_page(&mut self, vaddr: usize) {
-        #[cfg(target_arch = "riscv64")]
         if let Some(tlb) = self.tlb.as_mut() {
             tlb.record_page(vaddr);
-        }
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let _ = vaddr;
-            self.user_changed = true;
         }
     }
 
     pub(super) fn record_range(&mut self, start: usize, end: usize) {
-        #[cfg(target_arch = "riscv64")]
         if let Some(tlb) = self.tlb.as_mut() {
             tlb.record_range(start, end);
-        }
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let _ = (start, end);
-            self.user_changed = true;
         }
     }
 
@@ -150,23 +131,11 @@ impl PageTableUpdateBatch {
             self.icache_stale = false;
         }
         if self.kernel_full {
-            #[cfg(target_arch = "loongarch64")]
-            crate::arch::loongarch64::mm::flush_tlb_all();
-            #[cfg(target_arch = "riscv64")]
             crate::mm::flush_kernel_shared_tlb();
             self.kernel_full = false;
         }
-        #[cfg(target_arch = "riscv64")]
         if let Some(tlb) = self.tlb.take() {
             tlb.commit();
-        }
-        #[cfg(target_arch = "loongarch64")]
-        if core::mem::take(&mut self.user_changed) {
-            // The current LoongArch mainline starts one hart. Retiring the mm
-            // ASID before releasing deferred frames makes the old translations
-            // unreachable on the next user return without importing the
-            // separate LoongArch SMP series.
-            crate::arch::loongarch64::mm::drop_user_asid(self.asid.as_ref());
         }
         // Physical frames become reusable only after every target hart has
         // acknowledged the invalidation above.
@@ -394,8 +363,19 @@ impl MemorySet {
     const RISCV_SHARED_KSTACK_ROOT_COUNT: usize = 1;
 
     pub fn new_bare() -> Self {
+        Self::from_page_table(PageTable::new())
+    }
+
+    /// Construct an otherwise empty address space while allowing the root
+    /// page-table allocation to fail. Fork uses this path so memory pressure is
+    /// reported to the caller instead of panicking in `PageTable::new()`.
+    fn try_new_bare() -> Option<Self> {
+        Some(Self::from_page_table(PageTable::try_new()?))
+    }
+
+    fn from_page_table(page_table: PageTable) -> Self {
         Self {
-            page_table: PageTable::new(),
+            page_table,
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
             asid: Arc::new(AsidContext::new()),
             areas: Vec::new(),
@@ -532,6 +512,24 @@ impl MemorySet {
 
     pub fn dealloc_trap_context_slot(&mut self, slot: usize) {
         self.trap_context_slots.dealloc(slot);
+    }
+
+    /// A process fork keeps only the caller's main trap-context mapping.
+    /// Derive the stale slots from the cloned mm-local allocator so this does
+    /// not need to nest the mmap lock with PCB/TCB locks or race thread exit.
+    pub fn retain_only_main_trap_context(&mut self) {
+        let stale_slots = self
+            .trap_context_slots
+            .allocated_ids()
+            .into_iter()
+            .filter(|slot| *slot != 0)
+            .collect::<Vec<_>>();
+        for slot in stale_slots {
+            let trap_cx_bottom: VirtAddr = (TRAP_CONTEXT - slot * PAGE_SIZE).into();
+            self.remove_area_with_start_vpn(trap_cx_bottom);
+        }
+        self.trap_context_slots = RecycleAllocator::new();
+        self.trap_context_slots.reserve(0);
     }
 
     fn try_insert_initial_trap_context(&mut self) -> bool {
@@ -2150,6 +2148,7 @@ impl MemorySet {
         }
         let mut vpn = VirtAddr::from(start).floor();
         let end_vpn = VirtAddr::from(end).ceil();
+        let mut installed_mapping = false;
         while vpn < end_vpn {
             let mapped = self
                 .page_table
@@ -2159,8 +2158,17 @@ impl MemorySet {
             if !mapped {
                 let ppn = PhysPageNum(vpn.0);
                 self.page_table.map(vpn, ppn, PTEFlags::from(permission));
+                installed_mapping = true;
             }
             vpn.step();
+        }
+        // This API is used for shared kernel identity mappings (boot DTB and
+        // runtime PCI ECAM/BAR discovery). Publish newly installed PTEs to all
+        // online harts before a driver can dereference the range. In
+        // particular, LoongArch kernel translations use PGDH with ASID 0, so
+        // flushing an arbitrary MemorySet user ASID would not cover them.
+        if installed_mapping {
+            crate::mm::flush_kernel_shared_tlb();
         }
     }
 
@@ -2377,8 +2385,9 @@ impl MemorySet {
     }
 
     fn map_user_trampoline_pages(&mut self) -> bool {
-        self.map_trampoline();
-        self.map_sigreturn_trampoline_user();
+        if !self.try_map_trampoline() || !self.try_map_sigreturn_trampoline_user() {
+            return false;
+        }
         #[cfg(target_arch = "riscv64")]
         {
             self.map_riscv_user_kernel_mappings()
@@ -2391,24 +2400,28 @@ impl MemorySet {
 
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
+        assert!(self.try_map_trampoline());
+    }
+
+    fn try_map_trampoline(&mut self) -> bool {
         let mut flags = PTEFlags::from(MapPermission::R | MapPermission::X);
         #[cfg(target_arch = "riscv64")]
         {
             flags |= PTEFlags::G;
         }
-        self.page_table.map(
+        self.page_table.try_map(
             VirtAddr::from(TRAMPOLINE).into(),
             PhysAddr::from(strampoline as usize).into(),
             flags,
-        );
+        )
     }
 
-    fn map_sigreturn_trampoline_user(&mut self) {
-        self.page_table.map(
+    fn try_map_sigreturn_trampoline_user(&mut self) -> bool {
+        self.page_table.try_map(
             VirtAddr::from(SIGRETURN_TRAMPOLINE).into(),
             PhysAddr::from(strampoline as usize).into(),
             PTEFlags::from(MapPermission::R | MapPermission::X | MapPermission::U),
-        );
+        )
     }
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
@@ -3110,15 +3123,17 @@ impl MemorySet {
     /// - User pages (PTE.U) that were writable are remapped read-only and tagged with `PTEFlags::COW`
     ///   in both parent and child.
     /// - Kernel-only pages (e.g., TrapContext, no PTE.U) are copied eagerly.
-    pub fn from_existed_user_cow(user_space: &mut MemorySet) -> MemorySet {
+    pub fn from_existed_user_cow(user_space: &mut MemorySet) -> Result<MemorySet, ()> {
         let diag_enabled = crate::debug_config::DEBUG_FUTEX;
         let start_cycles = if diag_enabled {
             crate::arch::read_time()
         } else {
             0
         };
-        let mut memory_set = Self::new_bare();
-        assert!(memory_set.map_user_trampoline_pages());
+        let mut memory_set = Self::try_new_bare().ok_or(())?;
+        if !memory_set.map_user_trampoline_pages() {
+            return Err(());
+        }
 
         let mut parent_update_count = 0usize;
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
@@ -3129,8 +3144,10 @@ impl MemorySet {
         let mut identical_pages = 0usize;
         let mut shared_pages = 0usize;
         let mut kernel_private_pages = 0usize;
+        let mut uaccess_private_pages = 0usize;
+        let mut parent_saved_cow_updates: Vec<(usize, VirtPageNum, PTEFlags)> = Vec::new();
 
-        for area in user_space.areas.iter() {
+        for (area_index, area) in user_space.areas.iter().enumerate() {
             area_count = area_count.saturating_add(1);
             src_walk_cache.reset();
             dst_walk_cache.reset();
@@ -3151,55 +3168,137 @@ impl MemorySet {
                         identical_pages = identical_pages.saturating_add(1);
                         let src_ppn = src_pte.ppn();
                         let src_flags = src_pte.flags();
-                        memory_set.page_table.map_cached(
+                        if !memory_set.page_table.try_map_cached(
                             vpn,
                             src_ppn,
                             src_flags,
                             &mut dst_walk_cache,
-                        );
+                        ) {
+                            return Err(());
+                        }
                     }
                 }
                 // For Framed/Lazy areas we only walk materialized pages.
                 // This avoids O(vma_len) scans for huge untouched lazy mappings.
                 MapType::Framed | MapType::Lazy => {
                     for (vpn, frame_tracker) in area.tracked_frames() {
-                        let Some(src_pte) = user_space
+                        let src_pte = user_space
                             .page_table
-                            .translate_cached(vpn, &mut src_walk_cache)
-                        else {
-                            continue;
+                            .translate_cached(vpn, &mut src_walk_cache);
+                        let (src_ppn, mut src_flags, pte_present) = match src_pte {
+                            Some(pte) if pte.is_valid() => {
+                                if pte.ppn() != frame_tracker.ppn {
+                                    return Err(());
+                                }
+                                (pte.ppn(), pte.flags(), true)
+                            }
+                            _ => {
+                                // PROT_NONE removes the PTE but deliberately keeps both the
+                                // resident frame and its former flags in MapArea. Fork must
+                                // preserve that state without making the page accessible in
+                                // the child.
+                                let Some(saved_flags) = area.saved_pte_flags(vpn) else {
+                                    return Err(());
+                                };
+                                (frame_tracker.ppn, saved_flags, false)
+                            }
                         };
-                        if !src_pte.is_valid() {
-                            continue;
-                        }
-                        let src_ppn = src_pte.ppn();
-                        let mut src_flags = src_pte.flags();
 
                         // Kernel-only pages must not be shared (e.g., TrapContext is per-thread).
                         if !src_flags.contains(PTEFlags::U) {
+                            if !pte_present {
+                                return Err(());
+                            }
                             let Some(frame) = frame_alloc() else {
-                                continue;
+                                return Err(());
                             };
                             frame
                                 .ppn
                                 .get_bytes_array()
                                 .copy_from_slice(src_ppn.get_bytes_array());
-                            memory_set.page_table.map_cached(
+                            if !memory_set.page_table.try_map_cached(
                                 vpn,
                                 frame.ppn,
                                 src_flags,
                                 &mut dst_walk_cache,
-                            );
+                            ) {
+                                return Err(());
+                            }
                             new_area.insert_tracked_frame(vpn, frame);
                             kernel_private_pages = kernel_private_pages.saturating_add(1);
                             continue;
                         }
 
+                        if !pte_present {
+                            if !src_flags.contains(PTEFlags::SHARED)
+                                && frame_tracker.writable_uaccess_pins() != 0
+                            {
+                                // A writable uaccess can outlive mprotect(PROT_NONE). Give the
+                                // child its fork-time snapshot, but retain PROT_NONE by keeping
+                                // the child PTE absent and copying only the saved flags.
+                                let Some(frame) = frame_alloc() else {
+                                    return Err(());
+                                };
+                                frame
+                                    .ppn
+                                    .get_bytes_array()
+                                    .copy_from_slice(src_ppn.get_bytes_array());
+                                new_area.insert_tracked_frame(vpn, frame);
+                                new_area.save_pte_flags(vpn, src_flags);
+                                uaccess_private_pages = uaccess_private_pages.saturating_add(1);
+                                continue;
+                            }
+
+                            if !src_flags.contains(PTEFlags::SHARED) {
+                                // No PTE exists to demote or flush. Store the COW state in both
+                                // MapAreas so even a currently read-only private mapping remains
+                                // private if a later mprotect() upgrades it to writable.
+                                src_flags.remove(PTEFlags::W);
+                                src_flags.remove(PTEFlags::D);
+                                src_flags.insert(PTEFlags::COW);
+                                parent_saved_cow_updates.push((area_index, vpn, src_flags));
+                            }
+                            new_area.insert_tracked_frame(vpn, frame_tracker.clone());
+                            new_area.save_pte_flags(vpn, src_flags);
+                            shared_pages = shared_pages.saturating_add(1);
+                            continue;
+                        }
+
                         // Share the physical page.
+                        if !src_flags.contains(PTEFlags::SHARED)
+                            && frame_tracker.writable_uaccess_pins() != 0
+                        {
+                            // A sleeping read(2)-style syscall can retain a
+                            // writable physical view after we release mmap_lock.
+                            // Sharing that page COW would let its eventual write
+                            // corrupt the child's fork snapshot. Keep the parent
+                            // mapping as-is and give this child an eager copy.
+                            let Some(frame) = frame_alloc() else {
+                                return Err(());
+                            };
+                            frame
+                                .ppn
+                                .get_bytes_array()
+                                .copy_from_slice(src_ppn.get_bytes_array());
+                            if !memory_set.page_table.try_map_cached(
+                                vpn,
+                                frame.ppn,
+                                src_flags,
+                                &mut dst_walk_cache,
+                            ) {
+                                return Err(());
+                            }
+                            new_area.insert_tracked_frame(vpn, frame);
+                            uaccess_private_pages = uaccess_private_pages.saturating_add(1);
+                            continue;
+                        }
+
                         shared_pages = shared_pages.saturating_add(1);
-                        let writable =
-                            src_flags.contains(PTEFlags::W) || src_flags.contains(PTEFlags::D);
-                        if writable && !src_flags.contains(PTEFlags::SHARED) {
+                        if !src_flags.contains(PTEFlags::SHARED) {
+                            // Every private resident page shared with the child needs a COW
+                            // marker, including a currently read-only page: either side may
+                            // later use mprotect(PROT_WRITE), which must not make the shared
+                            // physical frame directly writable.
                             src_flags.remove(PTEFlags::W);
                             src_flags.remove(PTEFlags::D);
                             src_flags.insert(PTEFlags::COW);
@@ -3230,18 +3329,32 @@ impl MemorySet {
                                 parent_tlb_batch.as_mut().unwrap().record_page(vpn.0 << 12);
                             }
                         }
-                        memory_set.page_table.map_cached(
+                        if !memory_set.page_table.try_map_cached(
                             vpn,
                             src_ppn,
                             src_flags,
                             &mut dst_walk_cache,
-                        );
+                        ) {
+                            return Err(());
+                        }
                         new_area.insert_tracked_frame(vpn, frame_tracker.clone());
                     }
                 }
             }
 
             memory_set.push_mapped_raw(new_area);
+        }
+
+        // Apply saved-flag COW demotions only after every fallible child mapping/copy above
+        // succeeded. The parent PTE is absent for these pages, so no TLB invalidation is needed.
+        for (area_index, vpn, flags) in parent_saved_cow_updates {
+            let Some(area) = user_space.areas.get_mut(area_index) else {
+                return Err(());
+            };
+            if area.saved_pte_flags(vpn).is_none() {
+                return Err(());
+            }
+            area.save_pte_flags(vpn, flags);
         }
 
         let before_parent_update_cycles = if diag_enabled {
@@ -3278,7 +3391,7 @@ impl MemorySet {
                 let walk_us = to_us(before_parent_update_cycles.wrapping_sub(start_cycles));
                 let update_us = to_us(end_cycles.wrapping_sub(before_parent_update_cycles));
                 log::warn!(
-                    "[cow_clone_diag] seq={} total_us={} walk_us={} parent_update_us={} areas={} ident_pages={} shared_pages={} kernel_copy_pages={} cow_marked={} parent_updates={}",
+                    "[cow_clone_diag] seq={} total_us={} walk_us={} parent_update_us={} areas={} ident_pages={} shared_pages={} kernel_copy_pages={} uaccess_copy_pages={} cow_marked={} parent_updates={}",
                     seq,
                     total_us,
                     walk_us,
@@ -3287,6 +3400,7 @@ impl MemorySet {
                     identical_pages,
                     shared_pages,
                     kernel_private_pages,
+                    uaccess_private_pages,
                     parent_update_count,
                     parent_update_count
                 );
@@ -3294,7 +3408,7 @@ impl MemorySet {
         }
 
         memory_set.inherit_user_vm_metadata_from(user_space);
-        memory_set
+        Ok(memory_set)
     }
 
     /// Fork a user address space by copying all mapped pages (no COW).
@@ -3469,6 +3583,73 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Pin every resident frame backing a user I/O buffer while the mmap lock
+    /// is held.  File, pipe, tty, and socket operations may sleep after their
+    /// initial address translation; retaining these owners prevents a racing
+    /// `munmap`/COW replacement on another hart from recycling a physical page
+    /// underneath the kernel's scatter/gather view.
+    pub(crate) fn try_pin_user_buffer(
+        &self,
+        ptr: *const u8,
+        len: usize,
+        access: MapPermission,
+    ) -> Result<UserBuffer, ()> {
+        if len == 0 {
+            return Ok(UserBuffer::empty());
+        }
+        let mut start = ptr as usize;
+        let end = start.checked_add(len).ok_or(())?;
+        let mut segments = Vec::new();
+        while start < end {
+            let start_va = VirtAddr::from(start);
+            let vpn = start_va.floor();
+            let pte = self.page_table.translate(vpn).ok_or(())?;
+            if !pte.is_valid()
+                || !pte.flags().contains(PTEFlags::U)
+                || (access.contains(MapPermission::R) && !pte.readable())
+                || (access.contains(MapPermission::W) && !pte.writable())
+                || (access.contains(MapPermission::X) && !pte.executable())
+            {
+                return Err(());
+            }
+
+            let page_end = start
+                .checked_add(PAGE_SIZE - start_va.page_offset())
+                .ok_or(())?;
+            let segment_end = core::cmp::min(page_end, end);
+            let page_offset = start_va.page_offset();
+            let segment_len = segment_end - start;
+
+            if vpn != VirtAddr::from(SIGRETURN_TRAMPOLINE).floor() {
+                let area_index = self.areas.partition_point(|area| area.end_vpn() <= vpn);
+                let area = self
+                    .areas
+                    .get(area_index)
+                    .filter(|area| area.contains_vpn(vpn))
+                    .ok_or(())?;
+                let frame = area
+                    .tracked_frame(vpn)
+                    .filter(|frame| frame.ppn == pte.ppn())
+                    .ok_or(())?;
+                segments.push(UserBufferSegment::managed(
+                    frame.pin_user_buffer(access.contains(MapPermission::W)),
+                    page_offset,
+                    segment_len,
+                ));
+            } else {
+                segments.push(UserBufferSegment::permanent(
+                    pte.ppn(),
+                    page_offset,
+                    segment_len,
+                ));
+            }
+            // SIGRETURN_TRAMPOLINE is the sole user mapping outside `areas`;
+            // its kernel-image frame is permanent and needs no owner pin.
+            start = segment_end;
+        }
+        Ok(UserBuffer::from_segments(segments, access))
+    }
+
     pub fn set_pte_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) -> bool {
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         {
@@ -3477,9 +3658,6 @@ impl MemorySet {
                     return false;
                 };
                 if changed {
-                    #[cfg(target_arch = "loongarch64")]
-                    crate::arch::loongarch64::mm::flush_tlb_all();
-                    #[cfg(target_arch = "riscv64")]
                     crate::mm::flush_kernel_shared_tlb();
                 }
                 return true;

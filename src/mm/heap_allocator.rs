@@ -1,7 +1,7 @@
 //! The global allocator.
 
 use crate::{
-    config::{KERNEL_HEAP_SIZE, MAX_HARTS},
+    config::{KERNEL_HEAP_SIZE, MAX_HARTS, PAGE_SIZE},
     println,
     sync::LocalIrqSaveGuard,
 };
@@ -12,7 +12,22 @@ use core::{
 };
 use spin::mutex::SpinMutex;
 
-const HEAP_SHARD_SIZE: usize = KERNEL_HEAP_SIZE / MAX_HARTS;
+const HEAP_PAGE_COUNT: usize = KERNEL_HEAP_SIZE / PAGE_SIZE;
+const HEAP_SHARD_BASE_PAGES: usize = HEAP_PAGE_COUNT / MAX_HARTS;
+const HEAP_SHARD_EXTRA_PAGES: usize = HEAP_PAGE_COUNT % MAX_HARTS;
+
+const fn heap_shard_page_offset(index: usize) -> usize {
+    index * HEAP_SHARD_BASE_PAGES
+        + if index < HEAP_SHARD_EXTRA_PAGES {
+            index
+        } else {
+            HEAP_SHARD_EXTRA_PAGES
+        }
+}
+
+const fn heap_shard_page_count(index: usize) -> usize {
+    HEAP_SHARD_BASE_PAGES + if index < HEAP_SHARD_EXTRA_PAGES { 1 } else { 0 }
+}
 
 /// Per-hart buddy heaps.
 ///
@@ -39,15 +54,19 @@ impl ShardedHeap {
 
     unsafe fn init(&self, start: usize, size: usize) {
         debug_assert_eq!(size, KERNEL_HEAP_SIZE);
-        debug_assert_eq!(size % MAX_HARTS, 0);
+        debug_assert_eq!(size % PAGE_SIZE, 0);
+        debug_assert!(HEAP_SHARD_BASE_PAGES > 0);
         for (index, shard) in self.shards.iter().enumerate() {
-            let shard_start = start + index * HEAP_SHARD_SIZE;
+            let shard_start = start + heap_shard_page_offset(index) * PAGE_SIZE;
+            let shard_size = heap_shard_page_count(index) * PAGE_SIZE;
             // SAFETY: init_heap calls this once before secondary harts and
-            // userspace start. The ranges are disjoint and cover HEAP_SPACE.
+            // userspace start. Whole pages left by division are distributed
+            // over the first shards, so ranges are disjoint and cover all of
+            // HEAP_SPACE even when MAX_HARTS does not divide 512 MiB.
             let _irq_guard = LocalIrqSaveGuard::new();
             let mut shard = shard.lock();
             unsafe {
-                shard.init(shard_start, HEAP_SHARD_SIZE);
+                shard.init(shard_start, shard_size);
             }
         }
     }
@@ -72,7 +91,15 @@ impl ShardedHeap {
         if offset >= KERNEL_HEAP_SIZE {
             return None;
         }
-        self.shards.get(offset / HEAP_SHARD_SIZE)
+        let page_offset = offset / PAGE_SIZE;
+        let larger_shard_pages = HEAP_SHARD_BASE_PAGES + 1;
+        let larger_shards_end = HEAP_SHARD_EXTRA_PAGES * larger_shard_pages;
+        let index = if page_offset < larger_shards_end {
+            page_offset / larger_shard_pages
+        } else {
+            HEAP_SHARD_EXTRA_PAGES + (page_offset - larger_shards_end) / HEAP_SHARD_BASE_PAGES
+        };
+        self.shards.get(index)
     }
 }
 
@@ -139,9 +166,12 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     panic!("Heap allocation error, layout = {:?}", layout);
 }
 
-/// heap space ([u8; KERNEL_HEAP_SIZE])
+#[repr(C, align(4096))]
+struct HeapSpace([u8; KERNEL_HEAP_SIZE]);
+
+/// Page-aligned heap space, partitioned into page-aligned per-hart shards.
 #[allow(dead_code)]
-static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
+static mut HEAP_SPACE: HeapSpace = HeapSpace([0; KERNEL_HEAP_SIZE]);
 
 /// initiate heap allocator
 /// 这个部分初始化的是rust的动态分配内容,测试发现几乎就是bss段(还有一些别的全局变量啥的),

@@ -40,4 +40,10 @@ impl RecycleAllocator {
             self.recycled.swap_remove(pos);
         }
     }
+
+    pub fn allocated_ids(&self) -> Vec<usize> {
+        (0..self.current)
+            .filter(|id| !self.recycled.contains(id))
+            .collect()
+    }
 }

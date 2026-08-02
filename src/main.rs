@@ -35,7 +35,10 @@ global_asm!(
     max_harts = const config::MAX_HARTS,
 );
 #[cfg(target_arch = "loongarch64")]
-global_asm!(include_str!("entry_loongarch.S"));
+global_asm!(
+    include_str!("entry_loongarch.S"),
+    max_harts = const config::MAX_HARTS,
+);
 global_asm!(include_str!("link_app.asm"));
 
 // Keep this flag in .data so clearing .bss doesn't reset it after the
@@ -51,6 +54,15 @@ static BOOT_GLOBAL_INIT_DONE: AtomicBool = AtomicBool::new(false);
 // QEMU's FDT-derived physical-hart mask.  It is published before the global
 // init barrier releases secondary harts.
 static BOOT_PRESENT_HART_MASK: AtomicUsize = AtomicUsize::new(0);
+
+/// LoongArch CPUs publish local MMU/trap/timer readiness here before the boot
+/// hart freezes the SMP membership and ELF capability intersection.
+#[cfg(target_arch = "loongarch64")]
+static BOOT_LOONGARCH_READY_HART_MASK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "loongarch64")]
+static BOOT_LOONGARCH_ADMITTED_HART_MASK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "loongarch64")]
+static BOOT_LOONGARCH_SMP_FINALIZED: AtomicBool = AtomicBool::new(false);
 
 fn clear_bss() {
     unsafe extern "C" {
@@ -148,6 +160,143 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
     task::task_start_secondary();
 }
 
+#[cfg(target_arch = "loongarch64")]
+fn start_loongarch_secondaries(boot_hart_id: usize, present_mask: usize) {
+    unsafe extern "C" {
+        fn _start();
+    }
+
+    let start_addr = _start as *const () as usize;
+    let boot_bit = 1usize << boot_hart_id;
+    let mut started_mask = boot_bit;
+    let mut failed_mask = 0usize;
+    BOOT_LOONGARCH_READY_HART_MASK.store(boot_bit, Ordering::Release);
+    for hart_id in 0..config::MAX_HARTS {
+        let hart_bit = 1usize << hart_id;
+        if hart_id == boot_hart_id || present_mask & hart_bit == 0 {
+            continue;
+        }
+        let error = arch::hart_start(hart_id, start_addr, 0);
+        if error != 0 {
+            println!(
+                "[kernel] failed to start LoongArch hart {}: error={}",
+                hart_id, error
+            );
+            failed_mask |= hart_bit;
+            continue;
+        }
+        started_mask |= hart_bit;
+    }
+
+    let started_at = arch::read_time();
+    let timeout_ticks = config::clock_freq().saturating_mul(5);
+    let ready_mask = loop {
+        let ready = BOOT_LOONGARCH_READY_HART_MASK.load(Ordering::Acquire);
+        if ready & started_mask == started_mask {
+            break ready & started_mask;
+        }
+        if arch::read_time().wrapping_sub(started_at) >= timeout_ticks {
+            println!(
+                "[kernel] loongarch64 SMP readiness timeout: present={:#x} started={:#x} ready={:#x} missing={:#x} failed={:#x}",
+                present_mask,
+                started_mask,
+                ready,
+                started_mask & !ready,
+                failed_mask
+            );
+            break ready & started_mask;
+        }
+        core::hint::spin_loop();
+    };
+
+    // Freeze both the admitted CPU set and AT_HWCAP before creating the first
+    // user process. A CPU that becomes ready after this point remains parked.
+    BOOT_LOONGARCH_ADMITTED_HART_MASK.store(ready_mask | boot_bit, Ordering::Release);
+    arch::freeze_elf_hwcap();
+    BOOT_LOONGARCH_SMP_FINALIZED.store(true, Ordering::Release);
+
+    let online_started_at = arch::read_time();
+    loop {
+        let online = task::manager::online_hart_mask();
+        if online & ready_mask == ready_mask {
+            println!(
+                "[kernel] loongarch64 SMP online mask {:#x} ({} harts), failed={:#x}",
+                online & present_mask,
+                (online & present_mask).count_ones(),
+                failed_mask
+            );
+            return;
+        }
+        if arch::read_time().wrapping_sub(online_started_at) >= timeout_ticks {
+            println!(
+                "[kernel] loongarch64 SMP online timeout: admitted={:#x} online={:#x} missing={:#x}",
+                ready_mask,
+                online,
+                ready_mask & !online
+            );
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn loongarch_secondary_main(hart_id: usize) -> ! {
+    // The boot hart publishes both barriers with Release ordering after BSS
+    // clearing and global initialization. Mailbox-released CPUs pair with
+    // Acquire loads before touching shared kernel state.
+    while !BOOT_BSS_CLEARED.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    while !BOOT_GLOBAL_INIT_DONE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    let present_mask = BOOT_PRESENT_HART_MASK.load(Ordering::Acquire);
+    if hart_id >= config::MAX_HARTS || present_mask & (1usize << hart_id) == 0 {
+        loop {
+            arch::wait_for_interrupt();
+        }
+    }
+
+    // These registers are hart-local on LoongArch. Match Linux's CPU bring-up
+    // ordering: establish local MMU state first, then interrupt sources, and
+    // publish the CPU as online only after it can safely enter the scheduler.
+    arch::bootstrap_init();
+    mm::activate_kernel_space();
+    arch::disable_direct_map_windows();
+    trap::init_trap();
+    arch::init_external_interrupts();
+    trap::trap::enable_timer_interrupt();
+    time::set_next_trigger();
+    println!(
+        "[kernel] loongarch64 secondary hart {} ready, entering scheduler...",
+        hart_id
+    );
+    let hart_bit = 1usize << hart_id;
+    BOOT_LOONGARCH_READY_HART_MASK.fetch_or(hart_bit, Ordering::AcqRel);
+    while !BOOT_LOONGARCH_SMP_FINALIZED.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    if BOOT_LOONGARCH_ADMITTED_HART_MASK.load(Ordering::Acquire) & hart_bit == 0 {
+        println!(
+            "[kernel] loongarch64 secondary hart {} missed SMP admission; parking",
+            hart_id
+        );
+        loop {
+            arch::wait_for_interrupt();
+        }
+    }
+    // A hart becomes a shootdown target only after it can take IPIs. Publish
+    // online first and then flush locally: a writer that sampled the old mask
+    // is ordered before this final flush, while a later writer includes us.
+    arch::enable_interrupts();
+    task::manager::mark_hart_online(hart_id);
+    crate::arch::loongarch64::mm::local_flush_tlb_all();
+    crate::arch::loongarch64::memory_barrier();
+    task::task_start_secondary();
+}
+
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
@@ -214,10 +363,13 @@ fn rust_main(hart_id: usize) -> ! {
         .is_ok()
     {
         clear_bss();
-        BOOT_BSS_CLEARED.store(true, Ordering::SeqCst);
-        // Ensure the boot hart is marked online so tasks stay on the running hart.
-        task::manager::mark_hart_online(hart_id);
-        println!("[kernel] loongarch64 boot hart {}", hart_id);
+        BOOT_BSS_CLEARED.store(true, Ordering::Release);
+        let topology = mm::hart_topology_from_dtb(crate::config::DEVICE_TREE_ADDR, hart_id);
+        BOOT_PRESENT_HART_MASK.store(topology.present_mask, Ordering::Release);
+        println!(
+            "[kernel] loongarch64 boot hart {}, FDT harts={} mask={:#x} ignored={}",
+            hart_id, topology.discovered, topology.present_mask, topology.ignored
+        );
         arch::bootstrap_init();
         mm::init_phys_mem_from_dtb(crate::config::DEVICE_TREE_ADDR);
         mm::init();
@@ -227,10 +379,16 @@ fn rust_main(hart_id: usize) -> ! {
         arch::init_external_interrupts();
         trap::trap::enable_timer_interrupt();
         time::set_next_trigger();
+        BOOT_GLOBAL_INIT_DONE.store(true, Ordering::Release);
+        arch::enable_interrupts();
+        task::manager::mark_hart_online(hart_id);
+        crate::arch::loongarch64::mm::local_flush_tlb_all();
+        crate::arch::loongarch64::memory_barrier();
+        start_loongarch_secondaries(hart_id, topology.present_mask);
         list_apps();
         task::task_start();
+    } else {
+        loongarch_secondary_main(hart_id);
     }
-    loop {
-        core::hint::spin_loop();
-    }
+    panic!("shouldn't be here");
 }

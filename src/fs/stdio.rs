@@ -38,25 +38,26 @@ impl File for Stdin {
             return 0;
         }
         let mut written = 0usize;
-        for slice in user_buf.buffers.iter_mut() {
-            for b in slice.iter_mut() {
-                let c = loop {
-                    let c = console_getchar();
-                    // OpenSBI returns `usize::MAX` when no input is available.
-                    // Some environments may return 0; treat both as "no data".
-                    if c == 0 || c == usize::MAX {
-                        if written == 0 {
-                            suspend_current_and_run_next();
-                            continue;
-                        } else {
-                            return written;
-                        }
+        while written < user_buf.len() {
+            let c = loop {
+                let c = console_getchar();
+                // OpenSBI returns `usize::MAX` when no input is available.
+                // Some environments may return 0; treat both as "no data".
+                if c == 0 || c == usize::MAX {
+                    if written == 0 {
+                        suspend_current_and_run_next();
+                        continue;
+                    } else {
+                        return written;
                     }
-                    break c;
-                };
-                *b = c as u8;
-                written += 1;
+                }
+                break c;
+            };
+            let byte = [c as u8];
+            if user_buf.copy_from_slice_at(written, &byte) != 1 {
+                break;
             }
+            written += 1;
         }
         written
     }
@@ -80,22 +81,21 @@ impl File for Stdout {
         0
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
+        let bytes = user_buf.to_vec();
         #[cfg(target_arch = "loongarch64")]
         {
             let flush_threshold = crate::arch::UART_FIFO_DEPTH.saturating_sub(2).max(4);
             let mut pending = 0usize;
             let mut total = 0usize;
-            for buffer in user_buf.buffers.iter() {
-                for &b in buffer.iter() {
-                    console_putchar(b as usize);
-                    pending += 1;
-                    total += 1;
-                    if pending >= flush_threshold {
-                        let start = crate::perf::uart_flush_begin();
-                        console_flush();
-                        crate::perf::uart_flush_end(start);
-                        pending = 0;
-                    }
+            for &b in &bytes {
+                console_putchar(b as usize);
+                pending += 1;
+                total += 1;
+                if pending >= flush_threshold {
+                    let start = crate::perf::uart_flush_begin();
+                    console_flush();
+                    crate::perf::uart_flush_end(start);
+                    pending = 0;
                 }
             }
             if pending != 0 {
@@ -107,13 +107,11 @@ impl File for Stdout {
         }
         #[cfg(not(target_arch = "loongarch64"))]
         {
-            for buffer in user_buf.buffers.iter() {
-                for &b in buffer.iter() {
-                    console_putchar(b as usize);
-                }
+            for &b in &bytes {
+                console_putchar(b as usize);
             }
         }
-        user_buf.len()
+        bytes.len()
     }
 
     fn as_any(&self) -> &dyn core::any::Any {

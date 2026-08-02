@@ -810,9 +810,9 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
     let process = current_process();
-    let inner = process.borrow_mut();
+    let memory_set = process.memory_set();
     let Some((a, transferred_account)) = ({
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = memory_set.lock();
         let result = memory_set.remove_sysv_shm_attach(shmaddr);
         if let Some((a, _)) = result {
             let end = a.addr + a.len;
@@ -822,7 +822,6 @@ pub fn syscall_shmdt(shmaddr: usize) -> isize {
     }) else {
         return err(SyscallError::EINVAL);
     };
-    drop(inner);
 
     let (_, _, pid, _) = current_ids();
     let mut managers = SHM_MANAGERS.lock();

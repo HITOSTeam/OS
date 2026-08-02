@@ -7,7 +7,6 @@ use crate::mm::{
 };
 use crate::task::processor::current_task;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
 use core::{
@@ -132,17 +131,25 @@ impl PageWalkCache {
     }
 }
 
-/// Assume that it won't oom when creating/mapping.
+/// Ordinary callers keep the historical infallible API; fork/setup callers use
+/// the `try_*` variants to propagate page-table allocation failures.
 impl PageTable {
     const ROOT_ENTRIES: usize = 512;
     const ROOT_ENTRY_SHIFT: usize = 30;
 
     pub fn new() -> Self {
-        let frame = frame_alloc().unwrap();
-        PageTable {
-            root_ppn: frame.ppn,
-            frames: vec![frame],
-        }
+        Self::try_new().expect("failed to allocate page-table root")
+    }
+
+    /// Allocate a page-table root without panicking on physical-memory or
+    /// tracking-metadata exhaustion.
+    pub fn try_new() -> Option<Self> {
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(1).ok()?;
+        let frame = frame_alloc()?;
+        let root_ppn = frame.ppn;
+        frames.push(frame);
+        Some(PageTable { root_ppn, frames })
     }
 
     pub fn root_index_of_va(va: usize) -> usize {
@@ -165,6 +172,9 @@ impl PageTable {
         let pte = &mut self.root_ppn.get_pte_array()[index];
         if pte.is_valid() {
             return true;
+        }
+        if self.frames.try_reserve(1).is_err() {
+            return false;
         }
         let Some(frame) = frame_alloc() else {
             return false;
@@ -269,11 +279,35 @@ impl PageTable {
         flags: PTEFlags,
         cache: &mut PageWalkCache,
     ) {
+        assert!(self.try_map_cached(vpn, ppn, flags, cache));
+    }
+
+    /// Fallible one-shot map. Clone/setup paths use this instead of `map()` so
+    /// an upper-level page-table allocation failure can be propagated.
+    pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        self.try_map_cached(vpn, ppn, flags, &mut PageWalkCache::new())
+    }
+
+    /// Fallible cached map used while cloning an address space. Any partially
+    /// allocated upper-level tables remain owned by this PageTable and are
+    /// reclaimed when the failed clone is dropped.
+    pub fn try_map_cached(
+        &mut self,
+        vpn: VirtPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+        cache: &mut PageWalkCache,
+    ) -> bool {
         let idxs = vpn.indexes();
         if !cache.l0_valid || cache.l0_idx != idxs[0] {
             let pte_l0 = &mut self.root_ppn.get_pte_array()[idxs[0]];
             if !pte_l0.is_valid() {
-                let frame = frame_alloc().unwrap();
+                if self.frames.try_reserve(1).is_err() {
+                    return false;
+                }
+                let Some(frame) = frame_alloc() else {
+                    return false;
+                };
                 *pte_l0 = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
@@ -285,7 +319,12 @@ impl PageTable {
         if !cache.l1_valid || cache.l1_idx != idxs[1] {
             let pte_l1 = &mut cache.l0_ppn.get_pte_array()[idxs[1]];
             if !pte_l1.is_valid() {
-                let frame = frame_alloc().unwrap();
+                if self.frames.try_reserve(1).is_err() {
+                    return false;
+                }
+                let Some(frame) = frame_alloc() else {
+                    return false;
+                };
                 *pte_l1 = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
@@ -300,6 +339,7 @@ impl PageTable {
             vpn
         );
         *pte_leaf = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
     }
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
@@ -934,4 +974,29 @@ pub fn try_translated_byte_buffer(
         start = end_va.into();
     }
     Ok(v)
+}
+
+/// Fault in and validate every page in a prospective long-lived user buffer
+/// without manufacturing raw references.  The caller must subsequently pin
+/// the resolved frames while holding the address-space lock before it drops
+/// that lock or performs any blocking operation.
+pub fn try_prepare_user_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: MapPermission,
+) -> Result<(), ()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let mut start = ptr as usize;
+    let end = start.checked_add(len).ok_or(())?;
+    while start < end {
+        resolve_user_pte(token, start, access)?;
+        let page_end = start
+            .checked_add(PAGE_SIZE - VirtAddr::from(start).page_offset())
+            .ok_or(())?;
+        start = core::cmp::min(page_end, end);
+    }
+    Ok(())
 }

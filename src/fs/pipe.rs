@@ -670,7 +670,7 @@ impl Pipe {
     /// objects to squash signal interruption into a zero-length read.  Syscall
     /// paths use this typed helper so a signal that wakes an interruptible pipe
     /// wait returns `-EINTR`, matching Linux pipe semantics.
-    pub fn read_user_result(&self, buf: UserBuffer, nonblock: bool) -> Result<usize, isize> {
+    pub fn read_user_result(&self, mut buf: UserBuffer, nonblock: bool) -> Result<usize, isize> {
         const EAGAIN: isize = -11;
         assert!(self.readable());
         let want_to_read = buf.len();
@@ -682,6 +682,7 @@ impl Pipe {
             let inner = task.borrow_mut();
             has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
         };
+        let mut data = alloc::vec![0u8; core::cmp::min(want_to_read, MAX_PIPE_CAPACITY)];
         loop {
             let mut ring_buffer = self.buffer.lock();
             let avail = ring_buffer.available_read();
@@ -704,15 +705,8 @@ impl Pipe {
                 continue;
             }
 
-            let mut read_now = 0usize;
             let to_read = core::cmp::min(avail, want_to_read);
-            for dst in buf.buffers {
-                if read_now >= to_read {
-                    break;
-                }
-                let n = core::cmp::min(dst.len(), to_read - read_now);
-                read_now += ring_buffer.read_into_slice(&mut dst[..n]);
-            }
+            let read_now = ring_buffer.read_into_slice(&mut data[..to_read]);
             let writer = if read_now > 0 {
                 ring_buffer.pop_writer()
             } else {
@@ -725,7 +719,7 @@ impl Pipe {
             };
             drop(ring_buffer);
             wake_pipe_waiters(wakeups, writer);
-            return Ok(read_now);
+            return Ok(buf.copy_from_slice(&data[..read_now]));
         }
     }
 
@@ -738,28 +732,22 @@ impl Pipe {
             return Ok(0);
         }
 
-        let buffers = buf.buffers;
         let task = current_task().unwrap();
         let has_pending_signal = || {
             let inner = task.borrow_mut();
             has_wait_interrupting_pending(inner.pending_signals, inner.signal_mask)
         };
         let mut written = 0usize;
-        let mut buffer_index = 0usize;
-        let mut offset_in_buffer = 0usize;
-
+        let mut scratch = alloc::vec![0u8; core::cmp::min(want_to_write, PIPE_BUF)];
         loop {
             let mut ring_buffer = self.buffer.lock();
             if ring_buffer.has_filter() {
                 ring_buffer.remove_writer(&task);
                 drop(ring_buffer);
-                let data = collect_user_buffer_tail(
-                    &buffers,
-                    buffer_index,
-                    offset_in_buffer,
-                    want_to_write - written,
-                );
-                return match self.write_from_slice_with_deadline(data.as_slice(), nonblock, None) {
+                let mut data = alloc::vec![0u8; want_to_write - written];
+                let copied = buf.copy_to_slice_at(written, &mut data);
+                data.truncate(copied);
+                return match self.write_from_slice_with_deadline(&data, nonblock, None) {
                     Ok(n) => Ok(written + n),
                     Err(_e) if written > 0 => Ok(written),
                     Err(e) => Err(e),
@@ -803,25 +791,18 @@ impl Pipe {
             let to_write = remaining.min(avail);
             let mut write_now = 0usize;
             while write_now < to_write {
-                while buffer_index < buffers.len()
-                    && offset_in_buffer >= buffers[buffer_index].len()
-                {
-                    buffer_index += 1;
-                    offset_in_buffer = 0;
-                }
-                if buffer_index >= buffers.len() {
-                    break;
-                }
-                let src = &buffers[buffer_index][offset_in_buffer..];
-                let chunk = core::cmp::min(src.len(), to_write - write_now);
-                let copied = ring_buffer.write_from_slice_bytes(&src[..chunk]);
+                let chunk = core::cmp::min(scratch.len(), to_write - write_now);
+                let copied = buf.copy_to_slice_at(written + write_now, &mut scratch[..chunk]);
                 if copied == 0 {
                     break;
                 }
-                write_now += copied;
-                written += copied;
-                offset_in_buffer += copied;
+                let pushed = ring_buffer.write_from_slice_bytes(&scratch[..copied]);
+                write_now += pushed;
+                if pushed != copied {
+                    break;
+                }
             }
+            written += write_now;
 
             let reader_to_wake = if write_now > 0 {
                 ring_buffer.pop_reader()
@@ -1414,30 +1395,6 @@ impl PipeRingBuffer {
     fn has_filter(&self) -> bool {
         self.classic_filter.is_some() || self.attached_bpf.is_some()
     }
-}
-
-fn collect_user_buffer_tail(
-    buffers: &[&'static mut [u8]],
-    mut buffer_index: usize,
-    mut offset_in_buffer: usize,
-    len: usize,
-) -> Vec<u8> {
-    let mut data = Vec::with_capacity(len);
-    let mut remaining = len;
-    while remaining > 0 && buffer_index < buffers.len() {
-        if offset_in_buffer >= buffers[buffer_index].len() {
-            buffer_index += 1;
-            offset_in_buffer = 0;
-            continue;
-        }
-        let src = &buffers[buffer_index][offset_in_buffer..];
-        let n = core::cmp::min(src.len(), remaining);
-        data.extend_from_slice(&src[..n]);
-        remaining -= n;
-        offset_in_buffer += n;
-    }
-    debug_assert_eq!(data.len(), len);
-    data
 }
 
 fn queue_sigpipe(task: &Arc<crate::task::task_block::TaskControlBlock>) {

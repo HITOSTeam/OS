@@ -1,9 +1,148 @@
 use super::*;
 
+#[cfg(target_arch = "loongarch64")]
+#[allow(clippy::too_many_arguments)]
+fn setup_loongarch_rt_signal_frame(
+    inner: &mut crate::task::task_block::TaskControlBlockInner,
+    user_stack_top: usize,
+    saved_trap: &crate::trap::context::TrapContext,
+    saved_mask: u64,
+    was_on_sigaltstack: bool,
+    signum: usize,
+    sender_pid: i32,
+    sender_uid: u32,
+    si_code: i32,
+    sig_value: usize,
+    handler: usize,
+) -> Option<()> {
+    use crate::task::task_block::LoongArchFpWidth;
+
+    let token = get_current_token();
+    let fp = inner.loongarch_fp;
+    let aligned_top = user_stack_top & !0x0f;
+
+    // Linux grows the variable extcontext chain downward first. The fixed
+    // rt_sigframe ends exactly where the first context header begins, so the
+    // zero-length sc_extcontext member is a valid chain pointer.
+    let end_info_ptr = aligned_top.checked_sub(core::mem::size_of::<LoongArchSctxInfo>())?;
+    write_user_value(
+        token,
+        end_info_ptr as *mut LoongArchSctxInfo,
+        &LoongArchSctxInfo::default(),
+    );
+
+    let ext_bottom = match fp.width {
+        LoongArchFpWidth::None => end_info_ptr,
+        LoongArchFpWidth::Scalar => {
+            let payload_size = core::mem::size_of::<LoongArchFpuContext>();
+            let info_ptr = end_info_ptr
+                .checked_sub(payload_size)?
+                .checked_sub(core::mem::size_of::<LoongArchSctxInfo>())?;
+            let info = LoongArchSctxInfo {
+                magic: LOONGARCH_FPU_CTX_MAGIC,
+                size: (end_info_ptr - info_ptr) as u32,
+                padding: 0,
+            };
+            let payload = LoongArchFpuContext::from_state(&fp);
+            write_user_value(token, info_ptr as *mut LoongArchSctxInfo, &info);
+            write_user_value(
+                token,
+                (info_ptr + core::mem::size_of::<LoongArchSctxInfo>()) as *mut LoongArchFpuContext,
+                &payload,
+            );
+            info_ptr
+        }
+        LoongArchFpWidth::Lsx => {
+            let payload_size = core::mem::size_of::<LoongArchLsxContext>();
+            let info_ptr = end_info_ptr
+                .checked_sub(payload_size)?
+                .checked_sub(core::mem::size_of::<LoongArchSctxInfo>())?;
+            let info = LoongArchSctxInfo {
+                magic: LOONGARCH_LSX_CTX_MAGIC,
+                size: (end_info_ptr - info_ptr) as u32,
+                padding: 0,
+            };
+            let payload = LoongArchLsxContext::from_state(&fp);
+            write_user_value(token, info_ptr as *mut LoongArchSctxInfo, &info);
+            write_user_value(
+                token,
+                (info_ptr + core::mem::size_of::<LoongArchSctxInfo>()) as *mut LoongArchLsxContext,
+                &payload,
+            );
+            info_ptr
+        }
+    };
+
+    let frame_ptr = ext_bottom.checked_sub(core::mem::size_of::<LoongArchRtSigFrame>())?;
+    if frame_ptr & 0x0f != 0 {
+        return None;
+    }
+    let ucontext_ptr = frame_ptr + core::mem::size_of::<LinuxSigInfo>();
+
+    let mut siginfo = LinuxSigInfo::default();
+    siginfo.si_signo = signum as i32;
+    siginfo.si_code = si_code;
+    if si_code > 0 && matches!(signum, 4 | 7 | 8 | 11) {
+        // For synchronous faults the siginfo union begins with a 64-bit
+        // si_addr, not sender pid/uid.
+        siginfo.field[0] = sig_value as u32 as i32;
+        siginfo.field[1] = (sig_value >> 32) as u32 as i32;
+    } else {
+        siginfo.field[0] = translate_sender_pid_for_receiver(sender_pid);
+        siginfo.field[1] = sender_uid as i32;
+        siginfo.field[2] = sig_value as i32;
+        siginfo.field[3] = (sig_value >> 32) as i32;
+    }
+
+    let uc_stack = SigStack {
+        ss_sp: inner.sigaltstack_sp,
+        ss_flags: if !inner.sigaltstack_enabled {
+            SS_DISABLE
+        } else if was_on_sigaltstack {
+            SS_ONSTACK
+        } else {
+            0
+        },
+        _pad: 0,
+        ss_size: inner.sigaltstack_size,
+    };
+    let frame = LoongArchRtSigFrame {
+        rs_info: siginfo,
+        rs_uctx: LoongArchUContext {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack,
+            uc_sigmask: saved_mask,
+            __unused: [0; UCONTEXT_SIGSET_PAD],
+            uc_mcontext: LoongArchSigContext::from_trap(saved_trap, &fp),
+        },
+    };
+    write_user_value(token, frame_ptr as *mut LoongArchRtSigFrame, &frame);
+
+    if let Some(saved) = inner.sig_saved_ctx.last_mut() {
+        saved.ucontext_ptr = ucontext_ptr;
+        saved.uses_ucontext = true;
+    }
+    let cx = inner.get_trap_cx();
+    cx.x[REG_SP] = frame_ptr;
+    cx.sepc = handler;
+    cx.x[REG_A0] = signum;
+    cx.x[REG_A1] = frame_ptr;
+    cx.x[REG_A2] = ucontext_ptr;
+    cx.x[REG_RA] = sigreturn_trampoline_va();
+    Some(())
+}
+
 pub fn maybe_deliver_signal() {
     let Some(task) = current_task() else {
         return;
     };
+    // Exec de-threading uses a task-local, unmaskable teardown token. Handle it
+    // before the ordinary pending-signal fast path so no concurrent refresh of
+    // the signal bitmap can hide the request.
+    if task.exec_exit_requested() {
+        exit_current_and_run_next(0);
+    }
     if !task.has_signal_pending() {
         return;
     }
@@ -276,7 +415,6 @@ pub fn maybe_deliver_signal() {
         if signum <= crate::task::signal::MAX_SIG {
             if let Some(flag) = SignalFlags::from_bits(1u32 << signum) {
                 if let Some((errno, msg)) = flag.check_error() {
-                    let _ = kill_current(signum as i32);
                     crate::task::signal::log_signal_exit(msg);
                     exit_group_and_run_next(errno);
                 }
@@ -286,6 +424,8 @@ pub fn maybe_deliver_signal() {
         return;
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    crate::arch::save_user_fp_state(&task);
     let mut inner = task.borrow_mut();
     let cx = inner.get_trap_cx();
     let cur_mask = inner.signal_mask;
@@ -309,6 +449,8 @@ pub fn maybe_deliver_signal() {
     if signum == 11 || signum == 7 {
         inner.sig_saved_ctx.clear();
     }
+    #[cfg(target_arch = "loongarch64")]
+    let saved_loongarch_fp = inner.loongarch_fp;
     inner.sig_saved_ctx.push(SigSavedContext {
         trap_cx: saved_trap,
         mask: saved_mask,
@@ -316,6 +458,8 @@ pub fn maybe_deliver_signal() {
         uses_ucontext: false,
         signum,
         was_on_sigaltstack,
+        #[cfg(target_arch = "loongarch64")]
+        loongarch_fp: saved_loongarch_fp,
     });
 
     let mut new_mask = cur_mask | action.mask;
@@ -335,79 +479,106 @@ pub fn maybe_deliver_signal() {
         user_sp = inner.sigaltstack_sp.saturating_add(inner.sigaltstack_size);
         inner.on_sigaltstack = true;
     }
-    let mut _siginfo_ptr = 0usize;
-    let mut _ucontext_ptr = 0usize;
-    if (action.flags & SA_SIGINFO) != 0 {
-        user_sp = (user_sp.saturating_sub(15)) & !0x0f;
-        user_sp = user_sp.saturating_sub(core::mem::size_of::<LinuxSigInfo>());
-        _siginfo_ptr = user_sp;
 
-        user_sp = (user_sp.saturating_sub(15)) & !0x0f;
-        user_sp = user_sp.saturating_sub(core::mem::size_of::<UContext>());
-        _ucontext_ptr = user_sp;
-
-        let mut siginfo = LinuxSigInfo::default();
-        siginfo.si_signo = signum as i32;
-        siginfo.si_code = si_code;
-        siginfo.field[0] = translate_sender_pid_for_receiver(sender_pid);
-        siginfo.field[1] = sender_uid as i32;
-        siginfo.field[2] = sig_value as i32;
-        siginfo.field[3] = (sig_value >> 32) as i32;
-
-        let sig_context = SigContext {
-            regs: UserRegsStruct::from_trap(&saved_trap),
-            ..Default::default()
-        };
-        let uc_stack = SigStack {
-            ss_sp: inner.sigaltstack_sp,
-            ss_flags: if !inner.sigaltstack_enabled {
-                SS_DISABLE
-            } else if was_on_sigaltstack {
-                SS_ONSTACK
-            } else {
-                0
-            },
-            _pad: 0,
-            ss_size: inner.sigaltstack_size,
-        };
-        let ucontext = UContext {
-            uc_flags: 0,
-            uc_link: 0,
-            uc_stack,
-            uc_sigmask: saved_mask,
-            uc_mcontext: sig_context,
-            ..Default::default()
-        };
-
-        let token = get_current_token();
-        write_user_value(token, _siginfo_ptr as *mut LinuxSigInfo, &siginfo);
-        write_user_value(token, _ucontext_ptr as *mut UContext, &ucontext);
-        if let Some(saved) = inner.sig_saved_ctx.last_mut() {
-            saved.ucontext_ptr = _ucontext_ptr;
-            saved.uses_ucontext = true;
+    #[cfg(target_arch = "loongarch64")]
+    {
+        if setup_loongarch_rt_signal_frame(
+            &mut inner,
+            user_sp,
+            &saved_trap,
+            saved_mask,
+            was_on_sigaltstack,
+            signum,
+            sender_pid,
+            sender_uid,
+            si_code,
+            sig_value,
+            action.handler,
+        )
+        .is_none()
+        {
+            drop(inner);
+            exit_current_and_run_next(-1);
         }
-
-        cx.x[REG_A1] = _siginfo_ptr;
-        cx.x[REG_A2] = _ucontext_ptr;
-        if DEBUG_PTHREAD && signum == 33 {
-            log::debug!(
-                "[sigcancel] frame sp={:#x} siginfo={:#x} ucontext={:#x}",
-                user_sp,
-                _siginfo_ptr,
-                _ucontext_ptr
-            );
-        }
-    } else {
-        cx.x[REG_A1] = 0;
-        cx.x[REG_A2] = 0;
+        return;
     }
 
-    cx.x[REG_SP] = user_sp;
-    cx.sepc = action.handler;
-    cx.x[REG_A0] = signum;
-    // Always use the kernel-provided rt_sigreturn trampoline to avoid invalid
-    // user restorer pointers causing instruction page faults.
-    cx.x[REG_RA] = sigreturn_trampoline_va();
+    #[cfg(target_arch = "riscv64")]
+    {
+        let mut siginfo_ptr = 0usize;
+        let mut ucontext_ptr = 0usize;
+        if (action.flags & SA_SIGINFO) != 0 {
+            user_sp = (user_sp.saturating_sub(15)) & !0x0f;
+            user_sp = user_sp.saturating_sub(core::mem::size_of::<LinuxSigInfo>());
+            siginfo_ptr = user_sp;
+
+            user_sp = (user_sp.saturating_sub(15)) & !0x0f;
+            user_sp = user_sp.saturating_sub(core::mem::size_of::<UContext>());
+            ucontext_ptr = user_sp;
+
+            let mut siginfo = LinuxSigInfo::default();
+            siginfo.si_signo = signum as i32;
+            siginfo.si_code = si_code;
+            siginfo.field[0] = translate_sender_pid_for_receiver(sender_pid);
+            siginfo.field[1] = sender_uid as i32;
+            siginfo.field[2] = sig_value as i32;
+            siginfo.field[3] = (sig_value >> 32) as i32;
+
+            let sig_context = SigContext {
+                regs: UserRegsStruct::from_trap(&saved_trap),
+                ..Default::default()
+            };
+            let uc_stack = SigStack {
+                ss_sp: inner.sigaltstack_sp,
+                ss_flags: if !inner.sigaltstack_enabled {
+                    SS_DISABLE
+                } else if was_on_sigaltstack {
+                    SS_ONSTACK
+                } else {
+                    0
+                },
+                _pad: 0,
+                ss_size: inner.sigaltstack_size,
+            };
+            let ucontext = UContext {
+                uc_flags: 0,
+                uc_link: 0,
+                uc_stack,
+                uc_sigmask: saved_mask,
+                uc_mcontext: sig_context,
+                ..Default::default()
+            };
+
+            let token = get_current_token();
+            write_user_value(token, siginfo_ptr as *mut LinuxSigInfo, &siginfo);
+            write_user_value(token, ucontext_ptr as *mut UContext, &ucontext);
+            if let Some(saved) = inner.sig_saved_ctx.last_mut() {
+                saved.ucontext_ptr = ucontext_ptr;
+                saved.uses_ucontext = true;
+            }
+
+            cx.x[REG_A1] = siginfo_ptr;
+            cx.x[REG_A2] = ucontext_ptr;
+            if DEBUG_PTHREAD && signum == 33 {
+                log::debug!(
+                    "[sigcancel] frame sp={:#x} siginfo={:#x} ucontext={:#x}",
+                    user_sp,
+                    siginfo_ptr,
+                    ucontext_ptr
+                );
+            }
+        } else {
+            cx.x[REG_A1] = 0;
+            cx.x[REG_A2] = 0;
+        }
+
+        cx.x[REG_SP] = user_sp;
+        cx.sepc = action.handler;
+        cx.x[REG_A0] = signum;
+        // Always use the kernel-provided rt_sigreturn trampoline to avoid invalid
+        // user restorer pointers causing instruction page faults.
+        cx.x[REG_RA] = sigreturn_trampoline_va();
+    }
 }
 
 pub fn try_sigreturn_from_fault() -> bool {
@@ -419,5 +590,12 @@ pub fn try_sigreturn_from_fault() -> bool {
     *inner.get_trap_cx() = saved.trap_cx;
     inner.signal_mask = saved.mask;
     inner.on_sigaltstack = saved.was_on_sigaltstack;
+    #[cfg(target_arch = "loongarch64")]
+    {
+        inner.loongarch_fp = saved.loongarch_fp;
+    }
+    drop(inner);
+    #[cfg(target_arch = "loongarch64")]
+    crate::arch::restore_user_fp_state(&task);
     true
 }

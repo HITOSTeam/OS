@@ -44,8 +44,8 @@ pub fn syscall_madvise(addr: usize, len: usize, advice: usize) -> isize {
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
         | MADV_DONTDUMP | MADV_DODUMP => {
             let process = current_process();
-            let inner = process.borrow_mut();
-            let mut memory_set = inner.memory_set.lock();
+            let memory_set = process.memory_set();
+            let mut memory_set = memory_set.lock();
             if !memory_set.user_range_fully_mapped(addr.into(), end.into()) {
                 return err(SyscallError::ENOMEM);
             }
@@ -203,8 +203,8 @@ pub fn syscall_munlock(addr: usize, len: usize) -> isize {
         return err(SyscallError::ENOMEM);
     }
     let process = current_process();
-    let inner = process.borrow_mut();
-    let mut memory_set = inner.memory_set.lock();
+    let memory_set = process.memory_set();
+    let mut memory_set = memory_set.lock();
     if !memory_set.user_range_fully_mapped(start.into(), end.into()) {
         return err(SyscallError::ENOMEM);
     }
@@ -224,10 +224,15 @@ pub fn syscall_mlockall(flags: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
     let process = current_process();
-    let inner = process.borrow_mut();
-    let euid = inner.euid;
-    let memlock_limit = inner.rlimits.rlimit_memlock_cur as usize;
-    let mut memory_set = inner.memory_set.lock();
+    let (euid, memlock_limit, memory_set) = {
+        let inner = process.borrow_mut();
+        (
+            inner.euid,
+            inner.rlimits.rlimit_memlock_cur as usize,
+            inner.memory_set.clone(),
+        )
+    };
+    let mut memory_set = memory_set.lock();
     let next_locked_bytes = if (flags & MCL_CURRENT) != 0 {
         memory_set.locked_bytes_after_mlockall_current()
     } else {
@@ -251,8 +256,8 @@ pub fn syscall_mlockall(flags: usize) -> isize {
 /// Linux `munlockall` (syscall 231).
 pub fn syscall_munlockall() -> isize {
     let process = current_process();
-    let inner = process.borrow_mut();
-    let mut memory_set = inner.memory_set.lock();
+    let memory_set = process.memory_set();
+    let mut memory_set = memory_set.lock();
     memory_set.clear_mlock_state();
     0
 }
@@ -274,8 +279,8 @@ pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
     }
 
     let process = current_process();
-    let inner = process.borrow_mut();
-    let memory_set = inner.memory_set.lock();
+    let memory_set = process.memory_set();
+    let memory_set = memory_set.lock();
     if !memory_set.user_range_fully_mapped(addr.into(), end.into()) {
         return err(SyscallError::ENOMEM);
     }
@@ -293,7 +298,6 @@ pub fn syscall_mincore(addr: usize, len: usize, vec: usize) -> isize {
         }
     }
     drop(memory_set);
-    drop(inner);
 
     if try_copy_to_user(get_current_token(), vec as *mut u8, &residency).is_err() {
         return err(SyscallError::EFAULT);

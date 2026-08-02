@@ -1558,6 +1558,7 @@ impl File for OSInode {
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {
+        let output_len = buf.len();
         let mut read_locked = || {
             let mut inner = self.inner.lock();
             if self.writable {
@@ -1571,51 +1572,53 @@ impl File for OSInode {
                 inner.read_buf_valid = 0;
             }
 
-            for slice in buf.buffers.iter_mut() {
-                let mut out: &mut [u8] = *slice;
-                while !out.is_empty() {
-                    let need_refill = inner.read_buf_valid == 0
-                        || inner.offset < inner.read_buf_off
-                        || inner.offset >= inner.read_buf_off + inner.read_buf_valid;
+            while total_read_size < output_len {
+                let need_refill = inner.read_buf_valid == 0
+                    || inner.offset < inner.read_buf_off
+                    || inner.offset >= inner.read_buf_off + inner.read_buf_valid;
 
-                    if need_refill {
-                        let sequential = inner.read_buf_valid > 0
-                            && inner.offset
-                                == inner.read_buf_off.saturating_add(inner.read_buf_valid);
-                        let refill_len = if sequential {
-                            READBUF_MAX
-                        } else {
-                            core::cmp::min(READBUF_MAX, core::cmp::max(out.len(), READBUF_MIN))
-                        };
-                        inner.read_buf_off = inner.offset;
-                        let inode = inner.inode.clone();
-                        let off = inner.read_buf_off;
-                        let n = inode.read_at(off, &mut inner.read_buf[..refill_len]);
-                        inner.read_buf_valid = n;
-                        let inode_num = inode.inode_num();
-                        if debug_iozone_tracked(inode_num) {
-                            let size = inode.size() as usize;
-                            println!(
-                                "[iozone-debug] read inode={} off={} len={} size={}",
-                                inode_num, off, n, size
-                            );
-                        }
-                        if n == 0 {
-                            return total_read_size;
-                        }
+                if need_refill {
+                    let sequential = inner.read_buf_valid > 0
+                        && inner.offset == inner.read_buf_off.saturating_add(inner.read_buf_valid);
+                    let refill_len = if sequential {
+                        READBUF_MAX
+                    } else {
+                        core::cmp::min(
+                            READBUF_MAX,
+                            core::cmp::max(output_len - total_read_size, READBUF_MIN),
+                        )
+                    };
+                    inner.read_buf_off = inner.offset;
+                    let inode = inner.inode.clone();
+                    let off = inner.read_buf_off;
+                    let n = inode.read_at(off, &mut inner.read_buf[..refill_len]);
+                    inner.read_buf_valid = n;
+                    let inode_num = inode.inode_num();
+                    if debug_iozone_tracked(inode_num) {
+                        let size = inode.size() as usize;
+                        println!(
+                            "[iozone-debug] read inode={} off={} len={} size={}",
+                            inode_num, off, n, size
+                        );
                     }
-
-                    let buf_off = inner.offset - inner.read_buf_off;
-                    let avail = inner.read_buf_valid.saturating_sub(buf_off);
-                    if avail == 0 {
-                        continue;
+                    if n == 0 {
+                        break;
                     }
+                }
 
-                    let n = core::cmp::min(avail, out.len());
-                    out[..n].copy_from_slice(&inner.read_buf[buf_off..buf_off + n]);
-                    inner.offset += n;
-                    total_read_size += n;
-                    out = &mut out[n..];
+                let buf_off = inner.offset - inner.read_buf_off;
+                let avail = inner.read_buf_valid.saturating_sub(buf_off);
+                if avail == 0 {
+                    continue;
+                }
+
+                let n = core::cmp::min(avail, output_len - total_read_size);
+                let copied =
+                    buf.copy_from_slice_at(total_read_size, &inner.read_buf[buf_off..buf_off + n]);
+                inner.offset += copied;
+                total_read_size += copied;
+                if copied != n {
+                    break;
                 }
             }
             total_read_size
@@ -1631,6 +1634,8 @@ impl File for OSInode {
     }
 
     fn write(&self, _buf: UserBuffer) -> usize {
+        let input_len = _buf.len();
+        let mut input = alloc::vec![0u8; core::cmp::min(input_len, crate::config::PAGE_SIZE)];
         let _inode_guard = self.inode_lock.write();
         let mut inner = self.inner.lock();
         if self.append {
@@ -1657,7 +1662,14 @@ impl File for OSInode {
             return 0;
         }
 
-        for slice in _buf.buffers.iter() {
+        let mut input_offset = 0usize;
+        while input_offset < input_len {
+            let chunk = core::cmp::min(input.len(), input_len - input_offset);
+            let copied = _buf.copy_to_slice_at(input_offset, &mut input[..chunk]);
+            if copied == 0 {
+                break;
+            }
+            let slice = &input[..copied];
             // Flush on non-sequential writes.
             if !inner.write_buf.is_empty()
                 && inner.offset != inner.write_buf_off.saturating_add(inner.write_buf.len())
@@ -1679,6 +1691,7 @@ impl File for OSInode {
             }
             inner.offset += slice.len();
             total_write_size += slice.len();
+            input_offset += slice.len();
             inner.read_buf_valid = 0;
 
             if inner.write_buf.len() >= WRITEBUF_MAX {

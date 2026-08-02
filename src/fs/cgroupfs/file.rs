@@ -711,18 +711,16 @@ impl File for CgroupFile {
             return 0;
         }
         let mut total = 0usize;
-        for slice in buf.buffers.iter_mut() {
+        buf.for_each_chunk_mut(|slice| {
             if inner.offset >= bytes.len() {
-                break;
+                return false;
             }
             let n = core::cmp::min(slice.len(), bytes.len() - inner.offset);
             slice[..n].copy_from_slice(&bytes[inner.offset..inner.offset + n]);
             inner.offset += n;
             total += n;
-            if n < slice.len() {
-                break;
-            }
-        }
+            n == slice.len()
+        });
         total
     }
 

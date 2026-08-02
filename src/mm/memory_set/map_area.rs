@@ -427,15 +427,20 @@ impl MapArea {
             }
             mapped.push(vpn);
         }
-        if self.contains_perm(MapPermission::U) {
-            batch.record_range(
-                self.vpn_range.get_start().0 << 12,
-                self.vpn_range.get_end().0 << 12,
-            );
-            #[cfg(target_arch = "riscv64")]
-            if self.contains_perm(MapPermission::X) {
-                batch.mark_icache_stale();
-            }
+        // A newly installed PTE may replace a cached invalid translation even
+        // when the mapping itself is supervisor-only.  Per-thread trap-context
+        // pages are exactly such mappings: they live in each user page table
+        // without `U`, and adjacent or recycled virtual slots can inherit a
+        // cached invalid half-entry.  Missing this invalidation can leave a
+        // LoongArch hart taking a page-invalid exception on the first trap
+        // trampoline store, before it can service a synchronous shootdown IPI.
+        batch.record_range(
+            self.vpn_range.get_start().0 << 12,
+            self.vpn_range.get_end().0 << 12,
+        );
+        #[cfg(target_arch = "riscv64")]
+        if self.contains_perm(MapPermission::U) && self.contains_perm(MapPermission::X) {
+            batch.mark_icache_stale();
         }
         true
     }

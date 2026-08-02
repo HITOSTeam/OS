@@ -244,23 +244,12 @@ impl File for UserfaultfdFile {
         debug_assert!(result.is_ok(), "userfaultfd descriptor reference underflow");
     }
 
-    fn read(&self, buf: UserBuffer) -> usize {
+    fn read(&self, mut buf: UserBuffer) -> usize {
         let msg = self.wait_for_message();
         let src = unsafe {
             core::slice::from_raw_parts((&msg as *const UffdMsg) as *const u8, size_of::<UffdMsg>())
         };
-        let mut copied = 0usize;
-        let mut it = buf.into_iter();
-        while copied < src.len() {
-            let Some(dst) = it.next() else {
-                break;
-            };
-            unsafe {
-                *dst = src[copied];
-            }
-            copied += 1;
-        }
-        copied
+        buf.copy_from_slice(src)
     }
 
     fn write(&self, _buf: UserBuffer) -> usize {

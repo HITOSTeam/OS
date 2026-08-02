@@ -1,5 +1,171 @@
 use super::*;
 
+#[cfg(target_arch = "loongarch64")]
+fn loongarch_bad_sigreturn(task: &Arc<TaskControlBlock>) -> isize {
+    const SIGSEGV: usize = 11;
+    const SI_KERNEL: i32 = 0x80;
+
+    // A malformed user frame is not allowed to strand us at the sigreturn
+    // trampoline or on its bad stack. Recover the kernel-side snapshot solely
+    // as a safe delivery base, then force SIGSEGV just as Linux's badframe path
+    // does. The user frame remains authoritative on every successful return.
+    let (restored_fp, force_default) = {
+        let mut inner = task.borrow_mut();
+        match inner.sig_saved_ctx.pop() {
+            Some(saved) => {
+                let segv_bit = signal_bit(SIGSEGV).unwrap_or(0);
+                let segv_was_blocked = (inner.signal_mask & segv_bit) != 0;
+                let segv_already_active = saved.signum == SIGSEGV
+                    || inner
+                        .sig_saved_ctx
+                        .iter()
+                        .any(|context| context.signum == SIGSEGV);
+                *inner.get_trap_cx() = saved.trap_cx;
+                inner.signal_mask = saved.mask;
+                inner.on_sigaltstack = saved.was_on_sigaltstack;
+                inner.loongarch_fp = saved.loongarch_fp;
+                // If a SIGSEGV handler is already active, another user-handler
+                // delivery would recurse forever. Linux also resets a forced
+                // signal to SIG_DFL when user space had it blocked.
+                (true, segv_already_active || segv_was_blocked)
+            }
+            None => (false, true),
+        }
+    };
+
+    if restored_fp {
+        crate::arch::restore_user_fp_state(task);
+    }
+    if force_default {
+        let process = current_process();
+        let mut process_inner = process.borrow_mut();
+        if let Some(action) = process_inner.rt_sig_handlers.get_mut(SIGSEGV) {
+            *action = RtSigAction::default();
+        }
+        process_inner.signals_actions.table[SIGSEGV] = SignalAction::default();
+    }
+
+    // Linux's force_sig(SIGSEGV) uses kernel-origin siginfo rather than
+    // pretending the malformed frame was a new hardware page fault.
+    crate::task::signal::force_current_fault_signal(SIGSEGV, SI_KERNEL, 0);
+    0
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn read_loongarch_signal_fp_state(
+    token: usize,
+    mut info_ptr: usize,
+    flags: u32,
+) -> Option<crate::task::task_block::LoongArchFpState> {
+    use crate::task::task_block::LoongArchFpState;
+
+    let mut state: Option<LoongArchFpState> = None;
+    for _ in 0..8 {
+        let info = try_read_user_value(token, info_ptr as *const LoongArchSctxInfo)?;
+        if info.magic == 0 {
+            if info.size != 0 {
+                return None;
+            }
+            return match ((flags & LOONGARCH_SC_USED_FP) != 0, state) {
+                (false, None) => Some(LoongArchFpState::new()),
+                (true, Some(state)) => Some(state),
+                _ => None,
+            };
+        }
+
+        let size = info.size as usize;
+        if size < core::mem::size_of::<LoongArchSctxInfo>() || size & 0x0f != 0 {
+            return None;
+        }
+        let payload_ptr = info_ptr.checked_add(core::mem::size_of::<LoongArchSctxInfo>())?;
+        let restored = match info.magic {
+            LOONGARCH_FPU_CTX_MAGIC => {
+                if size
+                    < core::mem::size_of::<LoongArchSctxInfo>()
+                        + core::mem::size_of::<LoongArchFpuContext>()
+                {
+                    return None;
+                }
+                try_read_user_value(token, payload_ptr as *const LoongArchFpuContext)?.into_state()
+            }
+            LOONGARCH_LSX_CTX_MAGIC => {
+                if size
+                    < core::mem::size_of::<LoongArchSctxInfo>()
+                        + core::mem::size_of::<LoongArchLsxContext>()
+                {
+                    return None;
+                }
+                try_read_user_value(token, payload_ptr as *const LoongArchLsxContext)?.into_state()
+            }
+            _ => return None,
+        };
+        if state.replace(restored).is_some() {
+            return None;
+        }
+        info_ptr = info_ptr.checked_add(size)?;
+    }
+    None
+}
+
+/// Linux LoongArch `rt_sigreturn`: the user rt_sigframe is authoritative.
+/// This is required for fork-from-handler and for handlers that intentionally
+/// edit GPR/FP/LSX state in their ucontext.
+#[cfg(target_arch = "loongarch64")]
+pub fn syscall_rt_sigreturn() -> isize {
+    let task = current_task().unwrap();
+    let token = get_current_token();
+    let frame_ptr = task.borrow_mut().get_trap_cx().x[REG_SP];
+    if frame_ptr & 0x0f != 0 {
+        return loongarch_bad_sigreturn(&task);
+    }
+    let Some(frame) = try_read_user_value(token, frame_ptr as *const LoongArchRtSigFrame) else {
+        return loongarch_bad_sigreturn(&task);
+    };
+    let Some(extcontext_ptr) = frame_ptr.checked_add(core::mem::size_of::<LoongArchRtSigFrame>())
+    else {
+        return loongarch_bad_sigreturn(&task);
+    };
+    let Some(mut fp_state) =
+        read_loongarch_signal_fp_state(token, extcontext_ptr, frame.rs_uctx.uc_mcontext.sc_flags)
+    else {
+        return loongarch_bad_sigreturn(&task);
+    };
+    fp_state.hardware_live = false;
+    let pending_fpe = crate::arch::sanitize_user_fcsr(&mut fp_state.fcsr);
+    let restored_pc = frame.rs_uctx.uc_mcontext.sc_pc as usize;
+
+    let result = {
+        let mut inner = task.borrow_mut();
+        let mut restored = *inner.get_trap_cx();
+        frame.rs_uctx.uc_mcontext.write_to_trap(&mut restored);
+        *inner.get_trap_cx() = restored;
+        inner.signal_mask = frame.rs_uctx.uc_sigmask;
+        inner.loongarch_fp = fp_state;
+
+        let stack = frame.rs_uctx.uc_stack;
+        if stack.ss_flags & SS_DISABLE != 0 {
+            inner.sigaltstack_sp = 0;
+            inner.sigaltstack_size = 0;
+            inner.sigaltstack_enabled = false;
+            inner.on_sigaltstack = false;
+        } else {
+            inner.sigaltstack_sp = stack.ss_sp;
+            inner.sigaltstack_size = stack.ss_size;
+            inner.sigaltstack_enabled = true;
+            inner.on_sigaltstack = stack.ss_flags & SS_ONSTACK != 0;
+        }
+        // Keep the private stack only as a fallback for legacy fault-return;
+        // normal LoongArch sigreturn never depends on it.
+        let _ = inner.sig_saved_ctx.pop();
+        restored.x[REG_A0] as isize
+    };
+    crate::arch::restore_user_fp_state(&task);
+    if let Some(si_code) = pending_fpe {
+        crate::task::signal::force_current_fault_signal(8, si_code, restored_pc);
+    }
+    result
+}
+
 /// Linux `rt_sigsuspend` (syscall 133).
 pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
     if !valid_sigset_size(sigsetsize) {
@@ -37,6 +203,7 @@ pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
 }
 
 /// Linux `rt_sigreturn` (syscall 139).
+#[cfg(target_arch = "riscv64")]
 pub fn syscall_rt_sigreturn() -> isize {
     let task = current_task().unwrap();
     let mut inner = task.borrow_mut();
@@ -87,12 +254,20 @@ pub fn syscall_rt_sigreturn() -> isize {
             *inner.get_trap_cx() = restored;
             inner.signal_mask = uc.uc_sigmask;
             inner.on_sigaltstack = saved.was_on_sigaltstack;
+            #[cfg(target_arch = "loongarch64")]
+            {
+                inner.loongarch_fp = saved.loongarch_fp;
+            }
             return restored.x[REG_A0] as isize;
         }
     }
     *inner.get_trap_cx() = saved.trap_cx;
     inner.signal_mask = saved.mask;
     inner.on_sigaltstack = saved.was_on_sigaltstack;
+    #[cfg(target_arch = "loongarch64")]
+    {
+        inner.loongarch_fp = saved.loongarch_fp;
+    }
     saved.trap_cx.x[REG_A0] as isize
 }
 

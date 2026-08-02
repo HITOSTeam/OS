@@ -355,7 +355,10 @@ pub(crate) fn proc_pid_namespace_file(
             Arc::new(NamespaceFile::new_ipc(inner.ipc_ns_id))
         }
         NamespaceKind::Mount => Arc::new(NamespaceFile::new_mount(proc.mount_namespace())),
-        NamespaceKind::Net => Arc::new(NamespaceFile::new_net(proc.net_namespace_id())),
+        NamespaceKind::Net => {
+            let ns_id = proc.acquire_net_namespace_for_file()?;
+            Arc::new(NamespaceFile::new_net_with_acquired_ref(ns_id))
+        }
     };
     Some(file)
 }

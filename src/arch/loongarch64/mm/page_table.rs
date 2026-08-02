@@ -1,5 +1,9 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
+use crate::arch::loongarch64::csr_defs::{
+    CSR_ASID, CSR_ASID_VALUE_MASK, INVTLB_ADDR_GFALSE_AND_ASID, INVTLB_ADDR_GTRUE_OR_ASID,
+    INVTLB_CURRENT_ALL,
+};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
     FrameTracker, LazyFaultResult, MapPermission, PhysAddr, PhysPageNum, StepByOne, VirtAddr,
@@ -7,7 +11,6 @@ use crate::mm::{
 };
 use crate::task::processor::current_task;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
 use core::{
@@ -50,10 +53,32 @@ const PALEN: usize = 48;
 
 #[inline(always)]
 fn flush_tlb_vaddr(vaddr: usize) {
-    // SAFETY: `invtlb` is a privileged instruction and this kernel-only helper uses it to evict
-    // the translation for `vaddr` on the current hart. Issuing it outside kernel mode would trap.
+    let asid: usize;
+    let pair_addr = vaddr & !((PAGE_SIZE << 1) - 1);
+    // Most mutable user mappings use the mm-level synchronous batch. Keep the
+    // low-level API correct for the current ASID and possible global mapping;
+    // LoongArch TLB entries cover an even/odd 8-KiB pair.
     unsafe {
-        asm!("invtlb 0x4, $r0, {}", in(reg) vaddr);
+        asm!(
+            "csrrd {asid}, {csr}",
+            asid = out(reg) asid,
+            csr = const CSR_ASID,
+            options(nostack)
+        );
+        asm!(
+            "invtlb {op}, {asid}, {addr}",
+            op = const INVTLB_ADDR_GFALSE_AND_ASID,
+            asid = in(reg) asid & CSR_ASID_VALUE_MASK,
+            addr = in(reg) pair_addr,
+            options(nostack)
+        );
+        asm!(
+            "invtlb {op}, $r0, {addr}",
+            op = const INVTLB_ADDR_GTRUE_OR_ASID,
+            addr = in(reg) pair_addr,
+            options(nostack)
+        );
+        asm!("dbar 0", options(nostack));
     }
 }
 
@@ -62,7 +87,10 @@ pub(crate) fn flush_tlb_all() {
     // SAFETY: This is the kernel's full-TLB invalidation path; executing `invtlb` in kernel mode
     // is required after page-table changes. Running it in the wrong context would fault.
     unsafe {
-        asm!("invtlb 0x1, $r0, $r0");
+        asm!(
+            "invtlb {op}, $r0, $r0",
+            op = const INVTLB_CURRENT_ALL
+        );
     }
 }
 
@@ -190,15 +218,24 @@ impl PageWalkCache {
     }
 }
 
-/// Assume that it won't oom when creating/mapping.
+/// Ordinary callers keep the historical infallible API; fork/setup callers use
+/// the `try_*` variants to propagate page-table allocation failures.
 impl PageTable {
     pub fn new() -> Self {
-        let frame = frame_alloc().unwrap();
-        PageTable {
-            root_ppn: frame.ppn,
-            frames: vec![frame],
-        }
+        Self::try_new().expect("failed to allocate page-table root")
     }
+
+    /// Allocate a page-table root without panicking on physical-memory or
+    /// tracking-metadata exhaustion.
+    pub fn try_new() -> Option<Self> {
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(1).ok()?;
+        let frame = frame_alloc()?;
+        let root_ppn = frame.ppn;
+        frames.push(frame);
+        Some(PageTable { root_ppn, frames })
+    }
+
     /// Temporarily used to get arguments from user space.
     pub fn from_token(token: usize) -> Self {
         Self {
@@ -261,11 +298,35 @@ impl PageTable {
         flags: PTEFlags,
         cache: &mut PageWalkCache,
     ) {
+        assert!(self.try_map_cached(vpn, ppn, flags, cache));
+    }
+
+    /// Fallible one-shot map. Clone/setup paths use this instead of `map()` so
+    /// an upper-level page-table allocation failure can be propagated.
+    pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        self.try_map_cached(vpn, ppn, flags, &mut PageWalkCache::new())
+    }
+
+    /// Fallible cached map used while cloning an address space. Any partially
+    /// allocated upper-level tables remain owned by this PageTable and are
+    /// reclaimed when the failed clone is dropped.
+    pub fn try_map_cached(
+        &mut self,
+        vpn: VirtPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+        cache: &mut PageWalkCache,
+    ) -> bool {
         let idxs = vpn.indexes();
         if !cache.l0_valid || cache.l0_idx != idxs[0] {
             let pte_l0 = &mut self.root_ppn.get_pte_array()[idxs[0]];
             if !pte_l0.is_valid() {
-                let frame = frame_alloc().unwrap();
+                if self.frames.try_reserve(1).is_err() {
+                    return false;
+                }
+                let Some(frame) = frame_alloc() else {
+                    return false;
+                };
                 *pte_l0 = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
@@ -277,7 +338,12 @@ impl PageTable {
         if !cache.l1_valid || cache.l1_idx != idxs[1] {
             let pte_l1 = &mut cache.l0_ppn.get_pte_array()[idxs[1]];
             if !pte_l1.is_valid() {
-                let frame = frame_alloc().unwrap();
+                if self.frames.try_reserve(1).is_err() {
+                    return false;
+                }
+                let Some(frame) = frame_alloc() else {
+                    return false;
+                };
                 *pte_l1 = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
@@ -292,6 +358,7 @@ impl PageTable {
             vpn
         );
         *pte_leaf = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
     }
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
@@ -889,4 +956,29 @@ pub fn try_translated_byte_buffer(
         start = end_va.into();
     }
     Ok(v)
+}
+
+/// Fault in and validate every page in a prospective long-lived user buffer
+/// without manufacturing raw references.  The caller must subsequently pin
+/// the resolved frames while holding the address-space lock before it drops
+/// that lock or performs any blocking operation.
+pub fn try_prepare_user_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: MapPermission,
+) -> Result<(), ()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let mut start = ptr as usize;
+    let end = start.checked_add(len).ok_or(())?;
+    while start < end {
+        resolve_user_pte(token, start, access)?;
+        let page_end = start
+            .checked_add(PAGE_SIZE - VirtAddr::from(start).page_offset())
+            .ok_or(())?;
+        start = core::cmp::min(page_end, end);
+    }
+    Ok(())
 }
