@@ -478,6 +478,44 @@ pub fn flush_user_range(ctx: &Arc<AsidContext>, start: usize, end: usize) {
     batch.commit();
 }
 
+/// Publish a leaf PTE that was non-present before the current page fault.
+///
+/// Linux does not issue a remote `flush_tlb_page()` for this transition.  Its
+/// LoongArch fault path calls `update_mmu_cache()`, which is local to the
+/// faulting CPU (and is a no-op when the hardware page-table walker is in
+/// use).  A second CPU racing the same missing PTE may take a spurious fault;
+/// after observing the now-present PTE it refreshes its own TLB locally.
+///
+/// CongCore still needs an explicit local invalidation because a LoongArch
+/// paired TLB entry can retain an invalid half while the adjacent 4-KiB page
+/// is valid.  Scope that invalidation to this mm's current-hart ASID and pair.
+/// Existing-PTE replacement, permission demotion, unmap, and supervisor-only
+/// trap-context publication continue to use the synchronous mm-wide batch.
+pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
+    let hart_id = super::super::hart_id();
+    if hart_id >= MAX_HARTS {
+        return;
+    }
+
+    let context = ctx.hart_contexts[hart_id].load(Ordering::Acquire);
+    let generation = ASID_GENERATION[hart_id].load(Ordering::Acquire);
+    if context_asid(context) == KERNEL_ASID || context_generation(context) != generation {
+        // No reusable translation for this mm exists on the current hart.
+        // prepare_user_asid() will allocate a clean context before user return.
+        return;
+    }
+
+    // Publish the PTE before invalidating a possibly cached invalid half, then
+    // keep the invalidation ordered before the subsequent return to userspace.
+    full_memory_barrier();
+    local_flush_tlb_range(
+        context_asid(context),
+        vaddr,
+        vaddr.saturating_add(PAGE_SIZE),
+    );
+    full_memory_barrier();
+}
+
 #[inline(always)]
 pub fn write_kernel_asid() {
     write_asid(KERNEL_ASID);

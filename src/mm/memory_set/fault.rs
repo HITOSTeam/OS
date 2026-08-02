@@ -408,6 +408,11 @@ impl MemorySet {
             _ => candidate.clone(),
         };
 
+        // RISC-V keeps its existing PTE-publication transaction, including
+        // cross-hart fencing and executable-mapping I-cache synchronization.
+        // LoongArch follows Linux's missing-PTE path below and updates only
+        // the faulting hart's MMU cache after the leaf is installed.
+        #[cfg(target_arch = "riscv64")]
         let mut batch = self.begin_page_table_update();
         self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
         let shared_file_backing_frame = (plan.inode_backed && region.shared).then(|| frame.clone());
@@ -422,12 +427,16 @@ impl MemorySet {
                 plan.pte_flags.contains(PTEFlags::D),
             );
         }
-        batch.record_page(fault_va);
         #[cfg(target_arch = "riscv64")]
-        if plan.pte_flags.contains(PTEFlags::X) {
-            batch.mark_icache_stale();
+        {
+            batch.record_page(fault_va);
+            if plan.pte_flags.contains(PTEFlags::X) {
+                batch.mark_icache_stale();
+            }
+            batch.commit();
         }
-        batch.commit();
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va);
         LazyFaultCommit::Installed
     }
 }
@@ -507,7 +516,7 @@ impl MmRef {
                 match self.lock().prepare_lazy_fault(fault_va, access) {
                     LazyFaultPrepare::Ready(plan) => plan,
                     LazyFaultPrepare::Resolved => {
-                        self.flush_user_page(fault_va);
+                        self.refresh_new_pte_fault(fault_va);
                         return LazyFaultResult::Resolved;
                     }
                     LazyFaultPrepare::Cow => {
@@ -607,7 +616,7 @@ impl MmRef {
                     return LazyFaultResult::Resolved;
                 }
                 LazyFaultCommit::Resolved => {
-                    self.flush_user_page(fault_va);
+                    self.refresh_new_pte_fault(fault_va);
                     return LazyFaultResult::Resolved;
                 }
                 LazyFaultCommit::Oom => return LazyFaultResult::Oom,
