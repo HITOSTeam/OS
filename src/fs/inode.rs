@@ -390,6 +390,9 @@ pub struct OSInode {
     open_fd_refs: AtomicUsize,
     inode_device_id: usize,
     inode_num: u32,
+    /// Stable inode identity outside the open-file-description state.
+    /// Positional reads do not need to serialize on the shared file offset.
+    inode: Arc<Inode>,
     inode_lock: Arc<Ext4InodeLock>,
     readable: bool,
     writable: bool,
@@ -746,7 +749,7 @@ impl OSInode {
             Mutex::new(OSInodeInner {
                 offset: 0,
                 dir_offset: 0,
-                inode,
+                inode: Arc::clone(&inode),
                 write_buf_off: 0,
                 write_buf: Vec::new(),
                 write_buf_counted: false,
@@ -763,6 +766,7 @@ impl OSInode {
             open_fd_refs: AtomicUsize::new(0),
             inode_device_id,
             inode_num,
+            inode,
             inode_lock,
             readable,
             writable,
@@ -873,7 +877,7 @@ impl OSInode {
     }
 
     pub fn ext4_inode(&self) -> Arc<Inode> {
-        self.inner.lock().inode.clone()
+        Arc::clone(&self.inode)
     }
 
     /// Return the end offset of buffered (not-yet-flushed) writes.
@@ -918,13 +922,24 @@ impl OSInode {
             return self.pread_at_locked(offset, buf);
         }
         let _inode_guard = self.inode_lock.read();
-        self.pread_at_locked(offset, buf)
+        // Linux pread(2) supplies a private ki_pos and therefore does not take
+        // file->f_pos_lock. Preserve the small per-description readahead cache
+        // on the uncontended path, but do not spin behind another positional
+        // reader while it is yielding in ext4/block I/O.
+        let Some(mut inner) = self.inner.try_lock() else {
+            return self.inode.read_at(offset, buf);
+        };
+        self.pread_with_inner(&mut inner, offset, buf)
     }
 
     fn pread_at_locked(&self, offset: usize, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
+        self.pread_with_inner(&mut inner, offset, buf)
+    }
+
+    fn pread_with_inner(&self, inner: &mut OSInodeInner, offset: usize, buf: &mut [u8]) -> usize {
         if self.writable {
-            let _ = Self::flush_inner_locked(&mut inner);
+            let _ = Self::flush_inner_locked(inner);
         }
         let inode_num = inner.inode.inode_num();
 
