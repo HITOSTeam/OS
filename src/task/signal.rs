@@ -28,7 +28,8 @@ use crate::{
     task::processor::current_process,
     task::{
         manager::{
-            pid2process, prime_fair_sync_wakeup_lag, wakeup_signal_tasks, wakeup_task, wakeup_tasks,
+            add_task, pid2process, prime_fair_sync_wakeup_lag, wakeup_signal_tasks, wakeup_task,
+            wakeup_tasks,
         },
         pid_namespace_member_pids,
         process_block::{ProcessControlBlock, ProcessControlBlockInner},
@@ -549,6 +550,7 @@ pub struct RtSigAction {
     pub mask: u64,
 }
 
+#[derive(Clone)]
 pub struct SignalActions {
     pub table: [SignalAction; MAX_SIG + 1],
     // pub table: i32,
@@ -853,6 +855,39 @@ pub fn kill_current(signum: i32) -> isize {
     0
 }
 
+/// Queue a synchronous architecture fault to the faulting thread only.
+///
+/// Linux force-signals cannot remain blocked or ignored: otherwise returning
+/// to the unchanged faulting instruction would livelock forever. Preserve a
+/// real user handler, but reset SIG_IGN to the default disposition and unblock
+/// this instance before recording its si_code/si_addr metadata.
+pub fn force_current_fault_signal(signum: usize, si_code: i32, fault_addr: usize) {
+    let Some(bit) = signal_bit(signum) else {
+        return;
+    };
+    let Some(task) = current_task() else {
+        return;
+    };
+    let process = current_process();
+    {
+        let mut process_inner = process.borrow_mut();
+        if let Some(action) = process_inner.rt_sig_handlers.get_mut(signum)
+            && action.handler == SIG_IGN
+        {
+            *action = RtSigAction::default();
+        }
+        if signum <= MAX_SIG && process_inner.signals_actions.table[signum].handler == SIG_IGN {
+            process_inner.signals_actions.table[signum] = SignalAction::default();
+        }
+    }
+    {
+        let mut inner = task.borrow_mut();
+        inner.signal_mask &= !bit;
+        mark_pending_signal(&mut inner, signum, 0, 0, si_code, fault_addr);
+    }
+    task.mark_signal_pending();
+}
+
 /// Deliver the unmaskable exec teardown request to a preselected set of
 /// thread-group peers without setting a process-wide SIGKILL bit.
 ///
@@ -863,23 +898,30 @@ pub(crate) fn terminate_tasks_for_exec(tasks: alloc::vec::Vec<Arc<TaskControlBlo
     if tasks.is_empty() {
         return;
     }
-    let (sender_pid, sender_uid, _, _) = current_sender_ids();
     let mut running_signal_ipi_mask = 0usize;
-    for task in &tasks {
-        {
-            let mut inner = task.borrow_mut();
-            mark_pending_signal(&mut inner, SIGKILL_NUM, sender_pid, sender_uid, 0, 0);
+    let mut live_tasks = alloc::vec::Vec::with_capacity(tasks.len());
+    for task in tasks {
+        // The exec token itself is the unmaskable task-local teardown request;
+        // no normal SIGKILL bit is needed.  Avoiding the TCB inner lock here is
+        // important on LoongArch: this coordinator may be interrupted by a
+        // device completion that wakes the same peer.
+        if !task.exec_exit_requested() {
+            continue;
         }
+        // The creator normally owns this task's first enqueue. If exec found
+        // it in the publication window, the one-shot enqueue state lets the
+        // coordinator safely take over instead.
+        add_task(Arc::clone(&task));
         task.mark_signal_pending();
-        prime_fair_sync_wakeup_lag(task);
-        request_reschedule_for_signal_target(task);
+        request_reschedule_for_signal_target(&task);
         let on_cpu = task.on_cpu.load(core::sync::atomic::Ordering::Acquire);
         if on_cpu != TaskControlBlock::OFF_CPU {
             running_signal_ipi_mask |= hart_mask_bit(on_cpu);
         }
+        live_tasks.push(task);
     }
-    wakeup_signal_tasks(tasks.clone());
-    for task in &tasks {
+    wakeup_signal_tasks(live_tasks.clone());
+    for task in &live_tasks {
         request_reschedule_for_signal_target(task);
     }
     if running_signal_ipi_mask != 0 {

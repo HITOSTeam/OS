@@ -31,11 +31,14 @@ pub use sendrecv::*;
 pub use socket::*;
 pub use sockopt::*;
 
+use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
+use lazy_static::lazy_static;
+use spin::Mutex;
 
 use crate::fs::File;
 use crate::mm::{
@@ -48,15 +51,38 @@ use crate::trap::get_current_token;
 
 static NEXT_SOCKET_INODE: AtomicU64 = AtomicU64::new(100_000);
 
+lazy_static! {
+    static ref PENDING_NET_NAMESPACE_CLEANUP: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+}
+
 pub(crate) fn alloc_socket_inode() -> u64 {
     NEXT_SOCKET_INODE.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Queue a teardown retry outside socket Drop/registry lock contexts.
+pub(crate) fn queue_net_namespace_cleanup(ns_id: usize) {
+    if ns_id != 0 {
+        PENDING_NET_NAMESPACE_CLEANUP.lock().insert(ns_id);
+    }
+}
+
+/// Drain one deferred namespace teardown from the idle cleanup worker.
+pub(crate) fn drain_pending_net_namespace_cleanup() {
+    let ns_id = {
+        let mut pending = PENDING_NET_NAMESPACE_CLEANUP.lock();
+        let ns_id = pending.iter().next().copied();
+        if let Some(ns_id) = ns_id {
+            pending.remove(&ns_id);
+        }
+        ns_id
+    };
+    if let Some(ns_id) = ns_id {
+        cleanup_net_namespace_if_unused(ns_id);
+    }
+}
+
 pub(crate) fn cleanup_net_namespace_if_unused(ns_id: usize) {
-    if ns_id == 0
-        || crate::task::manager::live_process_uses_net_namespace(ns_id)
-        || crate::fs::net_namespace_file_refs(ns_id) != 0
-    {
+    if !crate::fs::try_begin_net_namespace_cleanup(ns_id) {
         return;
     }
     crate::fs::cleanup_net_socket_namespace(ns_id);
@@ -65,6 +91,7 @@ pub(crate) fn cleanup_net_namespace_if_unused(ns_id: usize) {
     NetlinkSocketFile::cleanup_net_namespace(ns_id);
     netdev::cleanup_net_namespace(ns_id);
     crate::net::cleanup_namespace(ns_id);
+    crate::fs::finish_net_namespace_cleanup(ns_id);
 }
 
 /// 套接字层记录的一个时间戳（秒 + 纳秒），用于 `SO_TIMESTAMP*` 选项返回收包时刻。
@@ -549,34 +576,19 @@ pub(crate) fn mq_notify_send_thread_event(
     0
 }
 
-/// 将内核侧切片 `src` 逐字节写入用户空间 `UserBuffer`，返回实际写入字节数。
+/// 将内核侧切片 `src` 写入用户空间 `UserBuffer`，返回实际写入字节数。
 ///
-/// 使用迭代器逐指针写入，而非 memcpy，是因为 UserBuffer 可能跨越不连续的物理页，
-/// 其迭代器负责处理页边界的跳转。
-fn copy_slice_to_user_buffer(buf: UserBuffer, src: &[u8]) -> usize {
-    let mut it = buf.into_iter();
-    let mut copied = 0usize;
-    while copied < src.len() {
-        let Some(dst) = it.next() else {
-            break;
-        };
-        // SAFETY: dst 来自 UserBuffer 迭代器，是有效可写指针；src[copied] 不越界。
-        unsafe { *dst = src[copied] };
-        copied += 1;
-    }
-    copied
+/// `UserBuffer` 的 copy API 负责跨越不连续的物理页，并把每次物理页访问限制在
+/// 页级访问锁保护的短作用域内。
+fn copy_slice_to_user_buffer(mut buf: UserBuffer, src: &[u8]) -> usize {
+    buf.copy_from_slice(src)
 }
 
 /// 将用户空间 `UserBuffer` 的内容读取到内核堆分配的 `Vec<u8>` 中。
 ///
-/// 同 `copy_slice_to_user_buffer`，以迭代器方式处理跨页缓冲区。
+/// 同 `copy_slice_to_user_buffer`，通过受控 copy API 处理跨页缓冲区。
 fn copy_user_buffer_to_vec(buf: UserBuffer) -> Vec<u8> {
-    let mut data = Vec::with_capacity(buf.len());
-    for p in buf.into_iter() {
-        // SAFETY: p 来自 UserBuffer 迭代器，迭代器保证对应页面已映射。
-        data.push(unsafe { *p });
-    }
-    data
+    buf.to_vec()
 }
 
 /// 从用户空间读取 `sockaddr_in` 并解析为内核使用的 IPv4 地址和端口。

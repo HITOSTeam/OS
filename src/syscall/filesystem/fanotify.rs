@@ -1,8 +1,7 @@
 use super::{
     AT_FDCWD, FanotifyFile, File, MapPermission, SyscallError, current_files,
     current_files_and_nofile_limit, current_fsuid_gid, err, get_current_token, read_user_cstring,
-    resolve_at_inode_with_vfs_path, resolve_at_path, try_translated_byte_buffer,
-    with_ext4_inode_read,
+    resolve_at_inode_with_vfs_path, resolve_at_path, try_current_user_buffer, with_ext4_inode_read,
 };
 use alloc::sync::Arc;
 
@@ -92,20 +91,13 @@ pub(crate) fn fanotify_read_result(
     nonblock: bool,
 ) -> Option<isize> {
     let fanotify = file.as_any().downcast_ref::<FanotifyFile>()?;
-    let Ok(user_bufs) = try_translated_byte_buffer(
-        get_current_token(),
-        buffer as *mut u8,
-        len,
-        MapPermission::W,
-    ) else {
+    let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
         return Some(err(SyscallError::EFAULT));
     };
-    Some(
-        match fanotify.read_events(super::UserBuffer::new(user_bufs), nonblock) {
-            Ok(n) => n as isize,
-            Err(e) => e,
-        },
-    )
+    Some(match fanotify.read_events(buf, nonblock) {
+        Ok(n) => n as isize,
+        Err(e) => e,
+    })
 }
 
 pub(crate) fn fanotify_write_result(
@@ -114,18 +106,11 @@ pub(crate) fn fanotify_write_result(
     len: usize,
 ) -> Option<isize> {
     let fanotify = file.as_any().downcast_ref::<FanotifyFile>()?;
-    let Ok(user_bufs) = try_translated_byte_buffer(
-        get_current_token(),
-        buffer as *mut u8,
-        len,
-        MapPermission::R,
-    ) else {
+    let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R) else {
         return Some(err(SyscallError::EFAULT));
     };
-    Some(
-        match fanotify.write_response(super::UserBuffer::new(user_bufs)) {
-            Ok(n) => n as isize,
-            Err(e) => e,
-        },
-    )
+    Some(match fanotify.write_response(buf) {
+        Ok(n) => n as isize,
+        Err(e) => e,
+    })
 }

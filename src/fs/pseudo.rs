@@ -477,14 +477,9 @@ impl TunTapFile {
         Some((ns_id, dev.name, ifindex, kind, flags))
     }
 
-    fn copy_packet_to_user(buf: UserBuffer, packet: Vec<u8>) -> usize {
+    fn copy_packet_to_user(mut buf: UserBuffer, packet: Vec<u8>) -> usize {
         let copied = core::cmp::min(buf.len(), packet.len());
-        for (dst, src) in buf.into_iter().zip(packet.iter().take(copied)) {
-            unsafe {
-                *dst = *src;
-            }
-        }
-        copied
+        buf.copy_from_slice(&packet[..copied])
     }
 
     fn user_visible_packet(
@@ -582,12 +577,7 @@ impl TunTapFile {
         let len = buf.len();
         let (ns_id, _name, ifindex, kind, flags) =
             self.attached_device().ok_or(err(SyscallError::EBADFD))?;
-        let mut data = Vec::with_capacity(len);
-        for byte_ref in buf.into_iter() {
-            unsafe {
-                data.push(*byte_ref);
-            }
-        }
+        let data = buf.to_vec();
 
         let mut payload_start = 0usize;
         if (flags & TUNTAP_IFF_NO_PI) == 0 {
@@ -1082,29 +1072,27 @@ impl File for MemfdFile {
         if cur_off >= data.len() {
             return 0;
         }
+        let requested = core::cmp::min(buf.len(), data.len() - cur_off);
+        let mut output = alloc::vec![0u8; core::cmp::min(requested, PAGE_SIZE)];
         let mut total = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            if cur_off >= data.len() {
+        while total < requested {
+            let page = cur_off / PAGE_SIZE;
+            let in_page = cur_off % PAGE_SIZE;
+            if page >= data.frames.len() {
                 break;
             }
-            let n = core::cmp::min(slice.len(), data.len() - cur_off);
-            let mut remaining = n;
-            let mut dst_off = 0usize;
-            while remaining > 0 {
-                let page = cur_off / PAGE_SIZE;
-                let in_page = cur_off % PAGE_SIZE;
-                if page >= data.frames.len() {
-                    break;
-                }
+            let chunk = core::cmp::min(
+                core::cmp::min(output.len(), requested - total),
+                PAGE_SIZE - in_page,
+            );
+            {
                 let frame = data.frames[page].ppn.get_bytes_array();
-                let chunk = core::cmp::min(remaining, PAGE_SIZE - in_page);
-                slice[dst_off..dst_off + chunk].copy_from_slice(&frame[in_page..in_page + chunk]);
-                cur_off += chunk;
-                dst_off += chunk;
-                remaining -= chunk;
+                output[..chunk].copy_from_slice(&frame[in_page..in_page + chunk]);
             }
-            total += dst_off;
-            if dst_off < slice.len() {
+            let copied = buf.copy_from_slice_at(total, &output[..chunk]);
+            cur_off += copied;
+            total += copied;
+            if copied != chunk {
                 break;
             }
         }
@@ -1113,13 +1101,21 @@ impl File for MemfdFile {
     }
 
     fn write(&self, buf: UserBuffer) -> usize {
+        let input_len = buf.len();
+        let mut input = alloc::vec![0u8; core::cmp::min(input_len, PAGE_SIZE)];
         let mut off = self.offset.lock();
         let mut data = self.data.lock();
         let mut cur_off = *off;
         let mut total = 0usize;
-        for slice in buf.buffers.iter() {
+        while total < input_len {
+            let chunk = core::cmp::min(input.len(), input_len - total);
+            let copied = buf.copy_to_slice_at(total, &mut input[..chunk]);
+            if copied == 0 {
+                break;
+            }
+            let slice = &input[..copied];
             if slice.is_empty() {
-                continue;
+                break;
             }
             let end = cur_off.saturating_add(slice.len());
             if end > data.len() {
@@ -1143,7 +1139,7 @@ impl File for MemfdFile {
                 remaining -= chunk;
             }
             total += src_off;
-            if src_off < slice.len() {
+            if src_off != slice.len() {
                 break;
             }
         }
@@ -1295,24 +1291,22 @@ impl File for PseudoFile {
                     return 0;
                 }
                 let mut total = 0usize;
-                for slice in buf.buffers.iter_mut() {
+                buf.for_each_chunk_mut(|slice| {
                     if *offset >= data.len() {
-                        break;
+                        return false;
                     }
                     let n = core::cmp::min(slice.len(), data.len() - *offset);
                     slice[..n].copy_from_slice(&data[*offset..*offset + n]);
                     *offset += n;
                     total += n;
-                    if n < slice.len() {
-                        break;
-                    }
-                }
+                    n == slice.len()
+                });
                 total
             }
             PseudoKind::Urandom(seed) => {
                 // xorshift64*
                 let mut total = 0usize;
-                for slice in buf.buffers.iter_mut() {
+                buf.for_each_chunk_mut(|slice| {
                     for b in slice.iter_mut() {
                         let mut x = *seed;
                         x ^= x >> 12;
@@ -1323,16 +1317,18 @@ impl File for PseudoFile {
                         *b = (x & 0xff) as u8;
                         total += 1;
                     }
-                }
+                    true
+                });
                 total
             }
             PseudoKind::Null => 0,
             PseudoKind::Zero => {
                 let mut total = 0usize;
-                for slice in buf.buffers.iter_mut() {
+                buf.for_each_chunk_mut(|slice| {
                     slice.fill(0);
                     total += slice.len();
-                }
+                    true
+                });
                 total
             }
         }

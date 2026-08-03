@@ -893,15 +893,7 @@ fn current_has_wait_interrupting_signal() -> bool {
 
 fn read_response(buf: UserBuffer) -> Option<FanotifyResponse> {
     let mut bytes = [0u8; size_of::<FanotifyResponse>()];
-    let mut copied = 0usize;
-    for slice in buf.buffers.iter() {
-        let n = slice.len().min(bytes.len().saturating_sub(copied));
-        bytes[copied..copied + n].copy_from_slice(&slice[..n]);
-        copied += n;
-        if copied == bytes.len() {
-            break;
-        }
-    }
+    let copied = buf.copy_to_slice(&mut bytes);
     if copied < bytes.len() {
         return None;
     }
@@ -921,22 +913,7 @@ fn write_metadata(buf: &mut UserBuffer, offset: usize, meta: &FanotifyEventMetad
     bytes[16..20].copy_from_slice(&meta.fd.to_ne_bytes());
     bytes[20..24].copy_from_slice(&meta.pid.to_ne_bytes());
 
-    let mut skip = offset;
-    let mut copied = 0usize;
-    for slice in buf.buffers.iter_mut() {
-        if skip >= slice.len() {
-            skip -= slice.len();
-            continue;
-        }
-        let start = skip;
-        skip = 0;
-        let n = (slice.len() - start).min(bytes.len() - copied);
-        slice[start..start + n].copy_from_slice(&bytes[copied..copied + n]);
-        copied += n;
-        if copied == bytes.len() {
-            break;
-        }
-    }
+    buf.copy_from_slice_at(offset, &bytes);
 }
 
 fn add_waiter_once(waiters: &mut VecDeque<Weak<TaskControlBlock>>, task: &Arc<TaskControlBlock>) {

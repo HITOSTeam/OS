@@ -49,26 +49,6 @@ pub fn remove_from_pid2process(pid: usize) {
     }
 }
 
-/// 返回是否仍有非 zombie 进程持有指定网络 namespace。
-///
-/// Zombie PCB 会留在 `PID2PCB` 中直到 wait4() 回收，但它们的 fd table 和地址空间
-/// 已经释放。因此网络 namespace teardown 必须忽略 zombie，只把存活进程
-/// 当作持有者。
-pub fn live_process_uses_net_namespace(ns_id: usize) -> bool {
-    let map = PID2PCB.lock();
-    for process in map.values() {
-        let Some(inner) = process.try_borrow_mut() else {
-            // 正在竞争的 PCB 可能处于 clone/exit/setns 中。此时保留 namespace，
-            // 不要让 teardown 与它竞态。
-            return true;
-        };
-        if !inner.is_zombie && inner.net_ns_id == ns_id {
-            return true;
-        }
-    }
-    false
-}
-
 /// Register a newly created process-style CLONE_VM owner of `token`.
 ///
 /// Normal fork gives the child a private mm, but vfork and clone(CLONE_VM

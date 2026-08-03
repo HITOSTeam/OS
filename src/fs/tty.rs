@@ -414,32 +414,19 @@ enum PtyEndpoint {
 }
 
 fn user_buffer_to_vec(buf: UserBuffer) -> Vec<u8> {
-    let mut out = Vec::with_capacity(buf.len());
-    for byte_ref in buf.into_iter() {
-        unsafe {
-            out.push(*byte_ref);
-        }
-    }
-    out
+    buf.to_vec()
 }
 
-fn drain_queue_to_user(queue: &mut VecDeque<u8>, buf: UserBuffer) -> usize {
+fn drain_queue_to_user(queue: &mut VecDeque<u8>, mut buf: UserBuffer) -> usize {
     let to_read = core::cmp::min(queue.len(), buf.len());
-    let mut read = 0;
-    let mut iter = buf.into_iter();
+    let mut bytes = Vec::with_capacity(to_read);
     for _ in 0..to_read {
-        let Some(byte_ref) = iter.next() else {
-            break;
-        };
         let Some(byte) = queue.pop_front() else {
             break;
         };
-        unsafe {
-            *byte_ref = byte;
-        }
-        read += 1;
+        bytes.push(byte);
     }
-    read
+    buf.copy_from_slice(&bytes)
 }
 
 fn pty_read(

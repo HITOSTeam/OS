@@ -344,6 +344,10 @@ pub fn restore_user_fp_state(task: &Arc<TaskControlBlock>) {
     disable_fp();
 }
 
+pub fn discard_user_fp_state() {
+    disable_fp();
+}
+
 pub fn handle_user_fp_disabled() -> bool {
     let Some(task) = crate::task::processor::current_task() else {
         return false;

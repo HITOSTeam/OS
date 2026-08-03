@@ -420,16 +420,7 @@ impl File for TimerFdFile {
             return 0;
         };
         let bytes = value.to_ne_bytes();
-        let mut copied = 0usize;
-        for slice in buf.buffers.iter_mut() {
-            let n = slice.len().min(bytes.len().saturating_sub(copied));
-            slice[..n].copy_from_slice(&bytes[copied..copied + n]);
-            copied += n;
-            if copied >= bytes.len() {
-                break;
-            }
-        }
-        copied
+        buf.copy_from_slice(&bytes)
     }
 
     fn write(&self, _buf: UserBuffer) -> usize {

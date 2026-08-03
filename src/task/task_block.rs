@@ -14,6 +14,49 @@ use crate::{
     trap::{context::TrapContext, trap_handler, trap_return},
 };
 
+/// Saved LoongArch user floating-point/SIMD register width.
+///
+/// This is deliberately separate from `hardware_live`: a forked task inherits
+/// the memory snapshot, but never inherits ownership of a hart's extension
+/// registers or its EUEN bits.
+#[cfg(target_arch = "loongarch64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum LoongArchFpWidth {
+    None = 0,
+    Scalar = 1,
+    Lsx = 2,
+}
+
+/// LoongArch stores FPR, LSX and LASX in overlapping physical registers.
+/// Reserve Linux's full 256-bit slot now so widening to LASX will not change
+/// the TCB layout. LSX uses lanes 0 and 1; scalar FP uses lane 0.
+#[cfg(target_arch = "loongarch64")]
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+pub struct LoongArchFpState {
+    pub regs: [[u64; 4]; 32],
+    /// Linux's in-memory format gives FCC0..FCC7 one byte each.
+    pub fcc: u64,
+    pub fcsr: u32,
+    pub width: LoongArchFpWidth,
+    /// Whether this task's values are currently resident in this hart.
+    pub hardware_live: bool,
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl LoongArchFpState {
+    pub const fn new() -> Self {
+        Self {
+            regs: [[0; 4]; 32],
+            fcc: 0,
+            fcsr: 0,
+            width: LoongArchFpWidth::None,
+            hardware_live: false,
+        }
+    }
+}
+
 pub struct TaskControlBlock {
     // 不可变字段
     // 对于所有的线程,共享一个父进程
@@ -53,6 +96,16 @@ pub struct TaskControlBlock {
     /// Set by the thread-group exec coordinator for every peer that must leave
     /// the old address space before it can be replaced.
     exec_exit_state: AtomicU8,
+    /// Whether this task's final CPU time has been transferred into the PCB.
+    cpu_time_transferred: AtomicBool,
+    /// One-shot ownership of the task's first runqueue insertion.
+    ///
+    /// A thread becomes visible in `process.tasks` just before its creator
+    /// calls `add_task()`.  A concurrent exec may need to make that new peer
+    /// runnable itself.  This state gives exactly one side ownership of the
+    /// initial enqueue without guessing from the transient runqueue/on-CPU
+    /// flags.
+    initial_enqueue_state: AtomicU8,
     /// 当前任务是否已经进入某个每 hart 就绪队列。
     pub in_ready_queue: AtomicBool,
     /// 当前持有该任务的 hart 运行队列；未入队时为 `OFF_CPU`。
@@ -95,8 +148,11 @@ fn maybe_log_tcb_inflight(event: &str) {
 impl TaskControlBlock {
     pub const OFF_CPU: usize = usize::MAX;
     const EXEC_EXIT_NONE: u8 = 0;
-    const EXEC_EXIT_PREPARING: u8 = 1;
-    const EXEC_EXIT_COUNTED: u8 = 2;
+    const EXEC_EXIT_COUNTED: u8 = 1;
+    const EXEC_EXIT_RETIRED: u8 = 2;
+    const INITIAL_ENQUEUE_NEW: u8 = 0;
+    const INITIAL_ENQUEUE_IN_PROGRESS: u8 = 1;
+    const INITIAL_ENQUEUE_DONE: u8 = 2;
 
     pub fn set_cpu_id(&self, cpu_id: usize) {
         self.cpu_id.store(cpu_id, Ordering::Release);
@@ -135,48 +191,103 @@ impl TaskControlBlock {
         self.signal_pending.load(Ordering::Acquire)
     }
 
-    pub(crate) fn request_exec_exit(&self) {
-        let previous = self.exec_exit_state.compare_exchange(
-            Self::EXEC_EXIT_NONE,
-            Self::EXEC_EXIT_PREPARING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        debug_assert!(previous.is_ok(), "duplicate exec exit request");
-    }
-
-    pub(crate) fn confirm_exec_exit(&self) {
-        let previous = self.exec_exit_state.compare_exchange(
-            Self::EXEC_EXIT_PREPARING,
-            Self::EXEC_EXIT_COUNTED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        debug_assert!(previous.is_ok(), "exec exit request was not preparing");
-    }
-
-    pub(crate) fn cancel_exec_exit(&self) {
-        let _ = self.exec_exit_state.compare_exchange(
-            Self::EXEC_EXIT_PREPARING,
-            Self::EXEC_EXIT_NONE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
-    pub(crate) fn exec_exit_requested(&self) -> bool {
-        self.exec_exit_state.load(Ordering::Acquire) != Self::EXEC_EXIT_NONE
-    }
-
-    pub(crate) fn take_exec_exit_request(&self) -> bool {
+    /// Try to attach this task to an exec de-thread counter.
+    ///
+    /// The coordinator increments its counter before this CAS.  An exit path
+    /// changes NONE/COUNTED to RETIRED only after user-mm and runqueue cleanup,
+    /// so either the coordinator observes RETIRED and cancels its increment or
+    /// the exiting peer consumes the COUNTED token exactly once.  No state is
+    /// allowed to make an IRQ/wakeup path spin waiting for another hart.
+    pub(crate) fn try_count_exec_exit(&self) -> bool {
         self.exec_exit_state
             .compare_exchange(
-                Self::EXEC_EXIT_COUNTED,
                 Self::EXEC_EXIT_NONE,
+                Self::EXEC_EXIT_COUNTED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    pub(crate) fn exec_exit_requested(&self) -> bool {
+        self.exec_exit_state.load(Ordering::Acquire) == Self::EXEC_EXIT_COUNTED
+    }
+
+    /// Whether this task has crossed the final scheduler/user-resource cleanup
+    /// point and must never become runnable again.
+    ///
+    /// `TaskControlBlockInner::res == None` alone is not a retirement marker:
+    /// an exiting task takes its user resources before it unmaps them and may
+    /// sleep on the address-space mutex while completing that kernel cleanup.
+    pub(crate) fn exit_lifecycle_retired(&self) -> bool {
+        self.exec_exit_state.load(Ordering::Acquire) == Self::EXEC_EXIT_RETIRED
+    }
+
+    /// Publish that this task can no longer execute or clean up in its old mm.
+    /// Returns true when an exec coordinator counted this retirement.
+    pub(crate) fn retire_exec_lifecycle(&self) -> bool {
+        loop {
+            match self.exec_exit_state.load(Ordering::Acquire) {
+                Self::EXEC_EXIT_NONE => {
+                    if self
+                        .exec_exit_state
+                        .compare_exchange_weak(
+                            Self::EXEC_EXIT_NONE,
+                            Self::EXEC_EXIT_RETIRED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                }
+                Self::EXEC_EXIT_COUNTED => {
+                    if self
+                        .exec_exit_state
+                        .compare_exchange_weak(
+                            Self::EXEC_EXIT_COUNTED,
+                            Self::EXEC_EXIT_RETIRED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                Self::EXEC_EXIT_RETIRED => return false,
+                _ => unreachable!("invalid exec exit state"),
+            }
+        }
+    }
+
+    pub(crate) fn try_mark_cpu_time_transferred(&self) -> bool {
+        self.cpu_time_transferred
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn cpu_time_transferred(&self) -> bool {
+        self.cpu_time_transferred.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_begin_initial_enqueue(&self) -> bool {
+        self.initial_enqueue_state
+            .compare_exchange(
+                Self::INITIAL_ENQUEUE_NEW,
+                Self::INITIAL_ENQUEUE_IN_PROGRESS,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn finish_initial_enqueue(&self) {
+        let previous = self
+            .initial_enqueue_state
+            .swap(Self::INITIAL_ENQUEUE_DONE, Ordering::AcqRel);
+        debug_assert_eq!(previous, Self::INITIAL_ENQUEUE_IN_PROGRESS);
     }
 
     pub fn borrow_mut(&self) -> MutexGuard<'_, TaskControlBlockInner> {
@@ -209,13 +320,19 @@ impl TaskControlBlock {
     }
 
     /// Replace the task's cached mm after exec installs a new address space.
-    pub fn set_memory_set(&self, memory_set: MmRef) {
-        *self.memory_set.lock() = memory_set;
+    /// The caller drops the old handle after releasing this task-local lock.
+    pub fn replace_memory_set(&self, memory_set: MmRef) -> MmRef {
+        core::mem::replace(&mut *self.memory_set.lock(), memory_set)
     }
 
     #[cfg(target_arch = "loongarch64")]
     pub fn prepare_user_asid(&self) -> (usize, bool) {
         self.memory_set.lock().prepare_user_asid()
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn leave_user_asid(&self) {
+        self.memory_set.lock().leave_user_asid();
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -233,11 +350,32 @@ impl TaskControlBlock {
     /// 初始化 fp 相关寄存器。
     pub fn reset_fp_state(&self) {
         let mut inner = self.borrow_mut();
-        inner.fp_regs = [0; 32];
-        inner.fp_fcsr = 0;
-        inner.fp_fcc = 0;
-        inner.fp_valid = true;
-        inner.fp_used = false;
+        #[cfg(target_arch = "riscv64")]
+        {
+            inner.fp_regs = [0; 32];
+            inner.fp_fcsr = 0;
+            inner.fp_fcc = 0;
+            inner.fp_valid = true;
+            inner.fp_used = false;
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            inner.loongarch_fp = LoongArchFpState::new();
+        }
+    }
+
+    /// Discard signal-handler bookkeeping that belongs to the old executable.
+    /// Linux disables the alternate signal stack across a successful exec;
+    /// user pending signals and the signal mask remain separate and survive.
+    pub fn reset_signal_delivery_state_for_exec(&self) {
+        let mut inner = self.borrow_mut();
+        inner.sig_saved_ctx.clear();
+        inner.sigsuspend_old_mask = None;
+        inner.sigwait_mask = None;
+        inner.sigaltstack_sp = 0;
+        inner.sigaltstack_size = 0;
+        inner.sigaltstack_enabled = false;
+        inner.on_sigaltstack = false;
     }
 
     /// 将父任务保存的用户态浮点状态复制到刚 fork/clone 出来的子任务。
@@ -246,21 +384,30 @@ impl TaskControlBlock {
     /// 快照，但不继承“当前 CPU 已加载 FPU”的 owner 状态。
     /// 继承父任务的寄存器。
     pub fn inherit_fp_state_from(&self, parent: &TaskControlBlock) {
-        let (fp_regs, fp_fcsr, fp_fcc, fp_valid) = {
-            let parent_inner = parent.borrow_mut();
-            (
-                parent_inner.fp_regs,
-                parent_inner.fp_fcsr,
-                parent_inner.fp_fcc,
-                parent_inner.fp_valid,
-            )
-        };
-        let mut inner = self.borrow_mut();
-        inner.fp_regs = fp_regs;
-        inner.fp_fcsr = fp_fcsr;
-        inner.fp_fcc = fp_fcc;
-        inner.fp_valid = fp_valid;
-        inner.fp_used = false;
+        #[cfg(target_arch = "riscv64")]
+        {
+            let (fp_regs, fp_fcsr, fp_fcc, fp_valid) = {
+                let parent_inner = parent.borrow_mut();
+                (
+                    parent_inner.fp_regs,
+                    parent_inner.fp_fcsr,
+                    parent_inner.fp_fcc,
+                    parent_inner.fp_valid,
+                )
+            };
+            let mut inner = self.borrow_mut();
+            inner.fp_regs = fp_regs;
+            inner.fp_fcsr = fp_fcsr;
+            inner.fp_fcc = fp_fcc;
+            inner.fp_valid = fp_valid;
+            inner.fp_used = false;
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            let mut state = parent.borrow_mut().loongarch_fp;
+            state.hardware_live = false;
+            self.borrow_mut().loongarch_fp = state;
+        }
     }
 
     pub fn scheduling_snapshot(&self) -> ProcessScheduling {
@@ -409,16 +556,24 @@ pub struct TaskControlBlockInner {
     /// 任务级调度属性。Linux 将调度策略、RT 优先级和 CPU 亲和性保存在
     /// `task_struct` 中；PCB 中的字段只作为创建新任务时使用的默认值。
     pub scheduling: ProcessScheduling,
+    #[cfg(target_arch = "riscv64")]
     /// 上下文切换时保存的用户态浮点寄存器（`f0..f31`）。
     pub fp_regs: [u64; 32],
+    #[cfg(target_arch = "riscv64")]
     /// 保存的浮点控制/状态寄存器。
     pub fp_fcsr: u32,
+    #[cfg(target_arch = "riscv64")]
     /// 保存的浮点条件码寄存器（LoongArch FCC0-FCC7）。
     pub fp_fcc: u8,
+    #[cfg(target_arch = "riscv64")]
     /// `fp_regs/fp_fcsr` 是否包含有效快照。
     pub fp_valid: bool,
+    #[cfg(target_arch = "riscv64")]
     /// 当前任务是否已经实际使用过 FP，且硬件 FPU 中可能持有它的 live 状态。
     pub fp_used: bool,
+    #[cfg(target_arch = "loongarch64")]
+    /// Unified scalar-FP/LSX state; the register files overlap architecturally.
+    pub loongarch_fp: LoongArchFpState,
 }
 
 #[derive(Clone, Copy)]
@@ -429,6 +584,9 @@ pub struct SigSavedContext {
     pub uses_ucontext: bool,
     pub signum: usize,
     pub was_on_sigaltstack: bool,
+    #[cfg(target_arch = "loongarch64")]
+    /// Kernel-side preservation until the LoongArch extcontext ABI is parsed.
+    pub loongarch_fp: LoongArchFpState,
 }
 
 impl TaskControlBlockInner {
@@ -460,11 +618,12 @@ impl TaskControlBlock {
         let res = TaskUserRes::try_new(Arc::clone(&process), ustack_base, alloc_user_res)
             .ok_or(TaskAllocError::TrapCxAllocFailed)?;
         let trap_cx_ppn = res.trap_cx_ppn();
+        let memory_set = res.memory_set();
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
-        let (process_scheduling, memory_set) = {
+        let process_scheduling = {
             let inner = process.borrow_mut();
-            (inner.scheduling.clone(), inner.memory_set.clone())
+            inner.scheduling.clone()
         };
         let tcb = Self {
             process: Arc::downgrade(&process),
@@ -477,6 +636,8 @@ impl TaskControlBlock {
             wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
             exec_exit_state: AtomicU8::new(Self::EXEC_EXIT_NONE),
+            cpu_time_transferred: AtomicBool::new(false),
+            initial_enqueue_state: AtomicU8::new(Self::INITIAL_ENQUEUE_NEW),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
             futex_wait: Mutex::new(None),
@@ -525,11 +686,18 @@ impl TaskControlBlock {
                 nice: process_scheduling.nice,
                 nice_query_hint: false,
                 scheduling: process_scheduling,
+                #[cfg(target_arch = "riscv64")]
                 fp_regs: [0; 32],
+                #[cfg(target_arch = "riscv64")]
                 fp_fcsr: 0,
+                #[cfg(target_arch = "riscv64")]
                 fp_fcc: 0,
+                #[cfg(target_arch = "riscv64")]
                 fp_valid: true,
+                #[cfg(target_arch = "riscv64")]
                 fp_used: false,
+                #[cfg(target_arch = "loongarch64")]
+                loongarch_fp: LoongArchFpState::new(),
             }),
         };
         TASK_TCB_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -560,13 +728,14 @@ impl TaskControlBlock {
             .ok_or(TaskAllocError::TrapCxAllocFailed)?;
         // 取出 trap_cx 所在物理页号，后续切换时内核据此找回该线程的陷入现场
         let trap_cx_ppn = res.trap_cx_ppn();
+        let memory_set = res.memory_set();
         // 为新线程分配独立的内核栈；OOM 时上抛 KernelStackOom
         let kstack = kstack_alloc().ok_or(TaskAllocError::KernelStackOom)?;
         let kstack_top = kstack.get_top();
         // 继承进程当前的 nice 值，避免新线程上调度器后 nice 不一致
-        let (process_scheduling, memory_set) = {
+        let process_scheduling = {
             let inner = process.borrow_mut();
-            (inner.scheduling.clone(), inner.memory_set.clone())
+            inner.scheduling.clone()
         };
         let tcb = Self {
             // 用 Weak 反指回所属进程，避免线程 TCB 与进程 PCB 之间形成 Arc 循环引用
@@ -584,6 +753,8 @@ impl TaskControlBlock {
             wakeup_sync_hart: AtomicUsize::new(Self::OFF_CPU),
             signal_pending: AtomicBool::new(false),
             exec_exit_state: AtomicU8::new(Self::EXEC_EXIT_NONE),
+            cpu_time_transferred: AtomicBool::new(false),
+            initial_enqueue_state: AtomicU8::new(Self::INITIAL_ENQUEUE_NEW),
             in_ready_queue: AtomicBool::new(false),
             ready_queue_hart: AtomicUsize::new(Self::OFF_CPU),
             futex_wait: Mutex::new(None),
@@ -641,12 +812,20 @@ impl TaskControlBlock {
                 nice: process_scheduling.nice,
                 nice_query_hint: false,
                 scheduling: process_scheduling,
-                // 浮点寄存器初值是有效的全零快照，避免首次调度继承 hart 残留状态
+                // RISC-V starts from a valid zero snapshot. LoongArch keeps
+                // width=None and initializes Linux's NaN pattern on first use.
+                #[cfg(target_arch = "riscv64")]
                 fp_regs: [0; 32],
+                #[cfg(target_arch = "riscv64")]
                 fp_fcsr: 0,
+                #[cfg(target_arch = "riscv64")]
                 fp_fcc: 0,
+                #[cfg(target_arch = "riscv64")]
                 fp_valid: true,
+                #[cfg(target_arch = "riscv64")]
                 fp_used: false,
+                #[cfg(target_arch = "loongarch64")]
+                loongarch_fp: LoongArchFpState::new(),
             }),
         };
         // 全局 TCB 计数 +1，配合 drop 端的减法可监控泄漏

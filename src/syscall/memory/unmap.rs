@@ -8,7 +8,7 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
     let process = current_process();
-    let inner = process.borrow_mut();
+    let memory_set = process.memory_set();
     let start = addr;
     let Some(end) = start.checked_add(len) else {
         return err(SyscallError::EINVAL);
@@ -18,7 +18,7 @@ pub fn syscall_munmap(addr: usize, len: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
 
-    let mut memory_set = inner.memory_set.lock();
+    let mut memory_set = memory_set.lock();
     if memory_set
         .writeback_shared_file_mmap_range(start, end, false)
         .is_err()
@@ -58,9 +58,9 @@ pub fn syscall_msync(addr: usize, len: usize, flags: usize) -> isize {
         return err(SyscallError::EINVAL);
     }
     let process = current_process();
-    let inner = process.borrow_mut();
+    let memory_set = process.memory_set();
     let cleared_dirty = {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = memory_set.lock();
         if !memory_set.user_range_fully_mapped(addr.into(), end.into()) {
             return err(SyscallError::ENOMEM);
         }
@@ -107,9 +107,9 @@ pub fn syscall_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     }
 
     let process = current_process();
-    let inner = process.borrow_mut();
+    let memory_set = process.memory_set();
     {
-        let mut memory_set = inner.memory_set.lock();
+        let mut memory_set = memory_set.lock();
         match memory_set.mprotect_user_vma_range(addr.into(), end.into(), prot) {
             Ok(()) => {}
             Err(MprotectError::AccessDenied) => return err(SyscallError::EACCES),

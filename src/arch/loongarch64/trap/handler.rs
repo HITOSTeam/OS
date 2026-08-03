@@ -28,11 +28,28 @@ const ECODE_PAGE_NON_EXEC: usize = 0x6;
 const ECODE_PAGE_PRIV: usize = 0x7;
 const ECODE_ADDR_ERROR: usize = 0x8;
 const ECODE_ADDR_ALIGN: usize = 0x9;
+const ECODE_INSTRUCTION_NOT_EXIST: usize = 0xd;
+const ECODE_INSTRUCTION_PRIVILEGE: usize = 0xe;
 const ECODE_FP_DISABLED: usize = 0xf;
+const ECODE_LSX_DISABLED: usize = 0x10;
+const ECODE_LASX_DISABLED: usize = 0x11;
+const ECODE_FP_EXCEPTION: usize = 0x12;
+
+const SIGILL: usize = 4;
+const SIGBUS: usize = 7;
+const SIGFPE: usize = 8;
+const SIGSEGV: usize = 11;
+
+// Linux uapi siginfo codes. Keep these next to the architecture exception
+// translation so an unresolved hardware fault always carries useful metadata.
+const BUS_ADRALN: i32 = 1;
+const BUS_ADRERR: i32 = 2;
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
 
 use super::super::csr_defs::{
-    ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, ESTAT_IS_EIOINTC, ESTAT_IS_IPI, ESTAT_IS_TIMER,
-    PRMD_USER_IE, PRMD_USER_IE_MASK,
+    ESTAT_ECODE_MASK, ESTAT_ECODE_SHIFT, ESTAT_INTERRUPT_MASK, ESTAT_IS_EIOINTC, ESTAT_IS_IPI,
+    ESTAT_IS_TIMER, PRMD_USER_IE, PRMD_USER_IE_MASK,
 };
 
 /// Log only the first trap_return to see initial user entry.
@@ -75,7 +92,7 @@ fn read_badi() -> usize {
 fn write_eentry(val: usize) {
     // SAFETY: `val` is a kernel trap-entry address chosen by the caller, and writing EENTRY is
     // only valid in kernel mode. A bad address here would redirect traps to invalid code.
-    unsafe { asm!("csrwr {}, 0xc", in(reg) val) };
+    unsafe { super::super::csr_write::<0xc>(val) };
 }
 
 fn set_kernel_trap_entry() {
@@ -89,6 +106,29 @@ fn set_user_trap_entry() {
     // Use the trampoline VA so traps from user mode always enter via a
     // user-mapped page (matches the RISC-V flow).
     write_eentry(TRAMPOLINE as usize);
+}
+
+#[inline]
+fn is_user_page_fault(ecode: usize) -> bool {
+    matches!(
+        ecode,
+        ECODE_PAGE_INVALID_LOAD
+            | ECODE_PAGE_INVALID_STORE
+            | ECODE_PAGE_INVALID_FETCH
+            | ECODE_PAGE_MODIFY
+            | ECODE_PAGE_NON_READ
+            | ECODE_PAGE_NON_EXEC
+            | ECODE_PAGE_PRIV
+    )
+}
+
+#[inline]
+fn page_fault_access(ecode: usize) -> MapPermission {
+    match ecode {
+        ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
+        ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
+        _ => MapPermission::W,
+    }
 }
 
 fn get_trap_context() -> &'static mut TrapContext {
@@ -121,12 +161,20 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             return;
         }
         if (estat & ESTAT_IS_IPI) != 0 {
-            super::super::clear_ipi_interrupt();
+            super::super::handle_ipi_interrupt();
+            return;
+        }
+        // A live level source can disappear after trap entry but before this
+        // CSR read, for example when another hart completes fallback polling.
+        // Linux's LoongArch CPUINTC treats an empty pending bitmap as a no-op.
+        if (estat & ESTAT_INTERRUPT_MASK) == 0 {
             return;
         }
     }
     panic!(
-        "Unhandled kernel trap: ecode={} badv={:#x} badi={:#x} era={:#x}",
+        "Unhandled kernel trap: hart={} estat={:#x} ecode={} badv={:#x} badi={:#x} era={:#x}",
+        super::super::hart_id(),
+        estat,
         ecode,
         read_badv(),
         read_badi(),
@@ -135,6 +183,18 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
 }
 
 fn handle_user_exception(ecode: usize, badv: usize) {
+    // Linux LoongArch reports address-error and alignment exceptions as
+    // thread-directed SIGBUS faults. They are not page faults and therefore
+    // must not enter the COW/lazy/growsdown recovery chain.
+    if ecode == ECODE_ADDR_ERROR {
+        crate::task::signal::force_current_fault_signal(SIGBUS, BUS_ADRERR, badv);
+        return;
+    }
+    if ecode == ECODE_ADDR_ALIGN {
+        crate::task::signal::force_current_fault_signal(SIGBUS, BUS_ADRALN, badv);
+        return;
+    }
+
     if ecode == ECODE_PAGE_INVALID_FETCH && badv == 0 {
         if crate::syscall::signal::try_sigreturn_from_fault() {
             return;
@@ -146,21 +206,8 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             return;
         }
     }
-    if matches!(
-        ecode,
-        ECODE_PAGE_INVALID_LOAD
-            | ECODE_PAGE_INVALID_STORE
-            | ECODE_PAGE_INVALID_FETCH
-            | ECODE_PAGE_MODIFY
-            | ECODE_PAGE_NON_READ
-            | ECODE_PAGE_NON_EXEC
-            | ECODE_PAGE_PRIV
-    ) {
-        let access = match ecode {
-            ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
-            ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
-            _ => MapPermission::W,
-        };
+    if is_user_page_fault(ecode) {
+        let access = page_fault_access(ecode);
         let memory_set = crate::task::processor::current_task().unwrap().memory_set();
         match memory_set.resolve_lazy_fault(badv, access) {
             LazyFaultResult::Resolved => return,
@@ -168,21 +215,8 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             LazyFaultResult::Invalid => {}
         }
     }
-    if matches!(
-        ecode,
-        ECODE_PAGE_INVALID_LOAD
-            | ECODE_PAGE_INVALID_STORE
-            | ECODE_PAGE_INVALID_FETCH
-            | ECODE_PAGE_MODIFY
-            | ECODE_PAGE_NON_READ
-            | ECODE_PAGE_NON_EXEC
-            | ECODE_PAGE_PRIV
-    ) {
-        let access = match ecode {
-            ECODE_PAGE_INVALID_LOAD | ECODE_PAGE_NON_READ => MapPermission::R,
-            ECODE_PAGE_INVALID_FETCH | ECODE_PAGE_NON_EXEC => MapPermission::X,
-            _ => MapPermission::W,
-        };
+    if is_user_page_fault(ecode) {
+        let access = page_fault_access(ecode);
         let memory_set = crate::task::processor::current_task().unwrap().memory_set();
         match memory_set.try_expand_growsdown(badv, access) {
             LazyFaultResult::Resolved => return,
@@ -190,6 +224,29 @@ fn handle_user_exception(ecode: usize, badv: usize) {
             LazyFaultResult::Invalid => {}
         }
     }
+
+    if is_user_page_fault(ecode) {
+        // Linux starts a page fault as SEGV_MAPERR and changes it to
+        // SEGV_ACCERR once a VMA has been found. Preserve the mmap EOF-tail
+        // exception as SIGBUS/BUS_ADRERR, matching VM_FAULT_SIGBUS.
+        let memory_set = crate::task::processor::current_task().unwrap().memory_set();
+        let region = badv
+            .checked_add(1)
+            .and_then(|end| memory_set.lock().vm_region_containing(badv, end));
+        match region {
+            Some(region) if badv >= region.sigbus_start() => {
+                crate::task::signal::force_current_fault_signal(SIGBUS, BUS_ADRERR, badv);
+            }
+            Some(_) => {
+                crate::task::signal::force_current_fault_signal(SIGSEGV, SEGV_ACCERR, badv);
+            }
+            None => {
+                crate::task::signal::force_current_fault_signal(SIGSEGV, SEGV_MAPERR, badv);
+            }
+        }
+        return;
+    }
+
     if let Some((errno, msg)) = check_if_current_signals_error() {
         crate::task::signal::log_signal_exit(msg);
         exit_group_and_run_next(errno);
@@ -209,6 +266,15 @@ fn handle_user_exception(ecode: usize, badv: usize) {
 
 #[unsafe(no_mangle)]
 pub fn trap_handler() {
+    // The trampoline has already selected kernel PGD/ASID 0. A synchronous
+    // invalidator may hold this mm's write lock while waiting for our ack, so
+    // service its lockless request before taking task/mm locks, then withdraw
+    // this hart from the address space's user-active mask.
+    super::super::service_pending_tlb_shootdowns();
+    if let Some(task) = crate::task::processor::current_task() {
+        task.leave_user_asid();
+    }
+
     if DEBUG_TRAP {
         let idx = TRAP_HANDLER_COUNT.fetch_add(1, Ordering::SeqCst);
         if idx < 4 {
@@ -240,6 +306,10 @@ pub fn trap_handler() {
             super::super::clear_timer_interrupt();
             crate::time::loongarch_record_timer_tick();
             set_next_trigger();
+            // Linux keeps lengthy timer work interruptible. Nested timer
+            // interrupts are converted to deferred work by trap_from_kernel,
+            // while call-function IPIs must remain serviceable for TLB acks.
+            super::super::enable_interrupts();
             crate::drivers::block::poll_all();
             check_timer();
             crate::task::processor::account_current_task_tick();
@@ -273,12 +343,15 @@ pub fn trap_handler() {
             if crate::task::processor::should_preempt_current_on_tick() {
                 suspend_current_and_run_next();
             }
+            super::super::disable_interrupts();
         } else if (estat & ESTAT_IS_EIOINTC) != 0 {
             crate::arch::handle_external_interrupt();
         } else if (estat & ESTAT_IS_IPI) != 0 {
-            super::super::clear_ipi_interrupt();
+            super::super::handle_ipi_interrupt();
+        } else if (estat & ESTAT_INTERRUPT_MASK) == 0 {
+            // The source was withdrawn after trap entry; resume user mode.
         } else {
-            //非时钟中断目前先panic
+            // A nonzero, unsupported pending source is a real dispatch bug.
             panic!(
                 "Unhandled interrupt: estat={:#x} badv={:#x} badi={:#x}",
                 estat, badv, badi
@@ -297,18 +370,50 @@ pub fn trap_handler() {
             cx.x[super::super::REG_A5],
         ];
         let syscall_id = cx.x[super::super::REG_A7];
+        // Normal Linux syscall work is interruptible. This also prevents a
+        // deadlock where another hart holds an mm lock and waits for our TLB
+        // shootdown acknowledgement while this syscall waits for that lock.
+        super::super::enable_interrupts();
         let result = syscall(syscall_id, args);
+        super::super::disable_interrupts();
         let cx = get_trap_context();
         cx.x[super::super::REG_A0] = result as usize;
-    } else if ecode == ECODE_FP_DISABLED {
+    } else if ecode == ECODE_FP_DISABLED && super::super::handle_user_fp_disabled() {
         // Lazy-FPU path: enable/restore the task's FP state and retry the
         // trapped user instruction instead of saving FP on every context switch.
-        super::super::handle_user_fp_disabled();
+    } else if ecode == ECODE_LSX_DISABLED && super::super::handle_user_lsx_disabled() {
+        // LSX overlaps the scalar FPR file. The architecture helper preserves
+        // the live low halves, restores/initializes the upper halves, and
+        // retries this instruction without advancing ERA.
+    } else if ecode == ECODE_FP_EXCEPTION {
+        let si_code = super::super::handle_user_fp_exception();
+        let era = get_trap_context().sepc;
+        crate::task::signal::force_current_fault_signal(SIGFPE, si_code, era);
+    } else if matches!(
+        ecode,
+        ECODE_INSTRUCTION_NOT_EXIST
+            | ECODE_INSTRUCTION_PRIVILEGE
+            | ECODE_FP_DISABLED
+            | ECODE_LSX_DISABLED
+            | ECODE_LASX_DISABLED
+    ) {
+        // Unsupported FP/SIMD and illegal instructions are synchronous,
+        // thread-directed SIGILL faults. LASX remains deliberately gated
+        // until its 256-bit context implementation exists.
+        let si_code = if ecode == ECODE_INSTRUCTION_PRIVILEGE {
+            5 // ILL_PRVOPC
+        } else {
+            1 // ILL_ILLOPC
+        };
+        let era = get_trap_context().sepc;
+        crate::task::signal::force_current_fault_signal(SIGILL, si_code, era);
     } else {
+        super::super::enable_interrupts();
         match ecode {
             ECODE_ADDR_ERROR | ECODE_ADDR_ALIGN => handle_user_exception(ecode, badv),
             _ => handle_user_exception(ecode, badv),
         }
+        super::super::disable_interrupts();
     }
 
     if let Some((errno, msg)) = check_if_current_signals_error() {
@@ -362,7 +467,7 @@ pub fn trap_return() -> ! {
     // scheduler later restores it, execution reaches this path directly without
     // another trap handler pass, so honor pending signals before userspace.
     if let Some(task) = crate::task::processor::current_task()
-        && task.has_signal_pending()
+        && (task.has_signal_pending() || task.exec_exit_requested())
     {
         if let Some((errno, msg)) = check_task_signals_error(&task) {
             crate::task::signal::log_signal_exit(msg);
@@ -461,8 +566,7 @@ pub fn trap_return() -> ! {
 }
 
 pub fn get_current_token() -> usize {
-    let now_task_block = crate::task::processor::current_task().unwrap();
-    let process = now_task_block.process.upgrade().unwrap();
-    let process_inner = process.borrow_mut();
-    process_inner.memory_set.token()
+    crate::task::processor::current_task()
+        .expect("get_current_token without current task")
+        .get_user_token()
 }

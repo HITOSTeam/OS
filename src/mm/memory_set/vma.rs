@@ -606,8 +606,12 @@ impl VmRegionSet {
         true
     }
 
-    /// 找出所有映射了 (dev, ino) 文件 [write_off, write_off+len) 区段的 region，
-    /// 更新其 file_valid_len，并返回需要同步写入的 (va, file_delta, len) 三元组列表。
+    /// 找出所有 MAP_SHARED 映射了 (dev, ino) 文件
+    /// [write_off, write_off+len) 区段的 region，并返回需要同步写入的
+    /// (va, file_delta, len) 三元组列表。
+    ///
+    /// MAP_PRIVATE 的干净页通过 inode page cache 观察 fd write；已经 COW 的
+    /// 私有页必须保持匿名快照，不能再由这个旧的虚拟地址镜像路径覆盖。
     pub(super) fn file_copy_targets(
         &mut self,
         dev: usize,
@@ -618,7 +622,11 @@ impl VmRegionSet {
         let write_end = write_off.saturating_add(len);
         let mut pending = Vec::new();
         for region in self.regions.values_mut() {
-            if !region.file_backed || region.file_dev != dev || region.file_ino != ino {
+            if !region.shared
+                || !region.file_backed
+                || region.file_dev != dev
+                || region.file_ino != ino
+            {
                 continue;
             }
             let mapped_len = region.file_mapped_len();

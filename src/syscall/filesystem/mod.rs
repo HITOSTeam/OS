@@ -25,8 +25,8 @@ use crate::{
     },
     mm::{
         MapPermission, UserBuffer, translated_byte_buffer, translated_mutref, try_copy_from_user,
-        try_copy_to_user, try_copy_to_user_unchecked, try_read_user_value,
-        try_translated_byte_buffer, try_write_user_value,
+        try_copy_to_user, try_copy_to_user_unchecked, try_current_user_buffer, try_read_user_value,
+        try_write_user_value,
     },
     task::processor::{
         block_current_and_run_next, current_files, current_files_and_nofile_limit, current_process,

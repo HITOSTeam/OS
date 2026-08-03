@@ -2,18 +2,17 @@ use super::{
     CgroupFile, EventFdFile, FifoDuplexFile, IOV_MAX, MapPermission, MemfdFile, O_NOATIME,
     O_NONBLOCK, O_PATH, OSInode, PIPE_BUF, Pipe, ProcPseudoFile, PseudoBlock, PseudoDir,
     PseudoFile, SIGXFSZ_NUM, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE, SPLICE_F_NONBLOCK,
-    SocketPairEnd, SyscallError, TimerFdFile, UserBuffer, Vec, VfsOpenedFile,
-    cgroup_charge_file_write, current_process, err, ext4_err_to_errno, fanotify_notify_access,
-    fanotify_notify_modify, fanotify_permission_access, fanotify_read_result,
-    fanotify_write_result, fd_has_append, fd_has_noatime, fd_has_nonblock, fd_has_o_path,
-    file_is_pipe, file_is_seekable_for_preadwrite, get_current_token, get_fd_file_and_flags,
-    inode_visible_size_with_disk_size, map_vfs_error, maybe_update_inode_atime,
-    mirror_inode_kernel_write_to_shared_mmaps, mirror_inode_write_to_current_mmaps,
-    pipe_read_to_kernel, pipe_write_from_kernel, queue_process_signal, read_optional_offset,
-    read_vm_iovec, require_fd_file, socketpair_write_from_kernel, touch_inode_mtime_ctime_now,
-    try_copy_from_user, try_copy_to_user, try_read_user_value, try_translated_byte_buffer,
-    try_write_proc_pseudo_file, try_write_user_value, validate_direct_io_request,
-    with_ext4_inode_read, write_optional_offset,
+    SocketPairEnd, SyscallError, TimerFdFile, UserBuffer, VfsOpenedFile, cgroup_charge_file_write,
+    current_process, err, ext4_err_to_errno, fanotify_notify_access, fanotify_notify_modify,
+    fanotify_permission_access, fanotify_read_result, fanotify_write_result, fd_has_append,
+    fd_has_noatime, fd_has_nonblock, fd_has_o_path, file_is_pipe, file_is_seekable_for_preadwrite,
+    get_current_token, get_fd_file_and_flags, inode_visible_size_with_disk_size, map_vfs_error,
+    maybe_update_inode_atime, mirror_inode_kernel_write_to_shared_mmaps,
+    mirror_inode_write_to_current_mmaps, pipe_read_to_kernel, pipe_write_from_kernel,
+    queue_process_signal, read_optional_offset, read_vm_iovec, require_fd_file,
+    socketpair_write_from_kernel, touch_inode_mtime_ctime_now, try_copy_from_user,
+    try_copy_to_user, try_current_user_buffer, try_read_user_value, try_write_proc_pseudo_file,
+    try_write_user_value, validate_direct_io_request, with_ext4_inode_read, write_optional_offset,
 };
 use crate::fs::{PseudoKindTag, PtyMasterFile, PtySlaveFile, Stdout, TunTapFile};
 use alloc::vec;
@@ -35,15 +34,11 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         return 0;
     }
     if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::W,
-        ) else {
+        let Ok(user_bufs) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W)
+        else {
             return err(SyscallError::EFAULT);
         };
-        return match vfs_file.read_user_result(UserBuffer::new(user_bufs)) {
+        return match vfs_file.read_user_result(user_bufs) {
             Ok(read) => read as isize,
             Err(error) => map_vfs_error(error),
         };
@@ -60,29 +55,19 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         return read_zero_to_user(buffer, len);
     }
     if let Some(pty) = file.as_any().downcast_ref::<PtyMasterFile>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::W,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
             return err(SyscallError::EFAULT);
         };
-        return match pty.read_result(UserBuffer::new(user_bufs)) {
+        return match pty.read_result(buf) {
             Ok(n) => n as isize,
             Err(e) => e,
         };
     }
     if let Some(pty) = file.as_any().downcast_ref::<PtySlaveFile>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::W,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
             return err(SyscallError::EFAULT);
         };
-        return match pty.read_result(UserBuffer::new(user_bufs)) {
+        return match pty.read_result(buf) {
             Ok(n) => n as isize,
             Err(e) => e,
         };
@@ -94,17 +79,12 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             return e;
         }
         let buf = if len == 0 {
-            UserBuffer::new(Vec::new())
+            UserBuffer::empty()
         } else {
-            let Ok(user_bufs) = try_translated_byte_buffer(
-                get_current_token(),
-                buffer as *mut u8,
-                len,
-                MapPermission::W,
-            ) else {
+            let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
                 return err(SyscallError::EFAULT);
             };
-            UserBuffer::new(user_bufs)
+            buf
         };
         return match tun.read_packet(buf) {
             Ok(n) => n as isize,
@@ -177,15 +157,10 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
         return core::mem::size_of::<u64>() as isize;
     }
     if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::W,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
             return err(SyscallError::EFAULT);
         };
-        return match pipe.read_user_result(UserBuffer::new(user_bufs), nonblock) {
+        return match pipe.read_user_result(buf, nonblock) {
             Ok(n) => n as isize,
             Err(e) => e,
         };
@@ -202,15 +177,9 @@ pub fn syscall_read(fd: usize, buffer: usize, len: usize) -> isize {
             return e;
         }
     }
-    let Ok(user_bufs) = try_translated_byte_buffer(
-        get_current_token(),
-        buffer as *mut u8,
-        len,
-        MapPermission::W,
-    ) else {
+    let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
         return err(SyscallError::EFAULT);
     };
-    let buf = UserBuffer::new(user_bufs);
     let read_len = file.read(buf) as isize;
     if read_len >= 0 && !noatime {
         if let Some(os_inode) = file
@@ -289,46 +258,31 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         return len as isize;
     }
     if let Some(pty) = file.as_any().downcast_ref::<PtyMasterFile>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R) else {
             return err(SyscallError::EFAULT);
         };
-        return match pty.write_result(UserBuffer::new(user_bufs)) {
+        return match pty.write_result(buf) {
             Ok(n) => n as isize,
             Err(e) => e,
         };
     }
     if let Some(pty) = file.as_any().downcast_ref::<PtySlaveFile>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R) else {
             return err(SyscallError::EFAULT);
         };
-        return match pty.write_result(UserBuffer::new(user_bufs)) {
+        return match pty.write_result(buf) {
             Ok(n) => n as isize,
             Err(e) => e,
         };
     }
     if let Some(tun) = file.as_any().downcast_ref::<TunTapFile>() {
         let buf = if len == 0 {
-            UserBuffer::new(Vec::new())
+            UserBuffer::empty()
         } else {
-            let Ok(user_bufs) = try_translated_byte_buffer(
-                get_current_token(),
-                buffer as *mut u8,
-                len,
-                MapPermission::R,
-            ) else {
+            let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R) else {
                 return err(SyscallError::EFAULT);
             };
-            UserBuffer::new(user_bufs)
+            buf
         };
         return match tun.write_packet(buf) {
             Ok(n) => n as isize,
@@ -372,15 +326,11 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
                 hit_fsize_limit = true;
             }
         }
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            write_len,
-            MapPermission::R,
-        ) else {
+        let Ok(user_bufs) = try_current_user_buffer(buffer as *mut u8, write_len, MapPermission::R)
+        else {
             return err(SyscallError::EFAULT);
         };
-        let written = match vfs_file.write_user_result(UserBuffer::new(user_bufs)) {
+        let written = match vfs_file.write_user_result(user_bufs) {
             Ok(written) => written,
             Err(error) => return map_vfs_error(error),
         };
@@ -404,36 +354,22 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         None
     };
     if let Some(cgroup) = file.as_any().downcast_ref::<CgroupFile>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(user_bufs) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R)
+        else {
             return err(SyscallError::EFAULT);
         };
-        let mut data = Vec::with_capacity(len);
-        for slice in user_bufs {
-            data.extend_from_slice(slice);
-        }
+        let data = user_bufs.to_vec();
         return match cgroup.write_payload(&data) {
             Ok(n) => n as isize,
             Err(e) => e,
         };
     }
     if file.as_any().downcast_ref::<ProcPseudoFile>().is_some() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(user_bufs) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R)
+        else {
             return err(SyscallError::EFAULT);
         };
-        let mut data = Vec::with_capacity(len);
-        for slice in user_bufs {
-            data.extend_from_slice(slice);
-        }
+        let data = user_bufs.to_vec();
         if let Some(ret) = try_write_proc_pseudo_file(
             &file,
             &data,
@@ -522,15 +458,10 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
         }
     }
     if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R) else {
             return err(SyscallError::EFAULT);
         };
-        return match pipe.write_user_result(UserBuffer::new(user_bufs), nonblock) {
+        return match pipe.write_user_result(buf, nonblock) {
             Ok(0) if len > 0 && pipe.all_read_ends_closed() => err(SyscallError::EPIPE),
             Ok(n) => n as isize,
             Err(e) => e,
@@ -567,15 +498,9 @@ pub fn syscall_write(fd: usize, buffer: usize, len: usize) -> isize {
             return err(SyscallError::EPERM);
         }
     }
-    let Ok(user_bufs) = try_translated_byte_buffer(
-        get_current_token(),
-        buffer as *mut u8,
-        write_len,
-        MapPermission::R,
-    ) else {
+    let Ok(buf) = try_current_user_buffer(buffer as *mut u8, write_len, MapPermission::R) else {
         return err(SyscallError::EFAULT);
     };
-    let buf = UserBuffer::new(user_bufs);
     let written = file.write(buf) as isize;
     if written == 0 && write_len > 0 {
         if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
@@ -641,15 +566,11 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     }
 
     if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::W,
-        ) else {
+        let Ok(user_bufs) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W)
+        else {
             return err(SyscallError::EFAULT);
         };
-        return match vfs_file.pread_user_result(pos as u64, UserBuffer::new(user_bufs)) {
+        return match vfs_file.pread_user_result(pos as u64, user_bufs) {
             Ok(read) => read as isize,
             Err(error) => map_vfs_error(error),
         };
@@ -699,16 +620,10 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
         let old = shm.offset();
         shm.set_offset(pos as usize);
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::W,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
             shm.set_offset(old);
             return err(SyscallError::EFAULT);
         };
-        let buf = UserBuffer::new(user_bufs);
         let n = file.read(buf) as isize;
         shm.set_offset(old);
         return n;
@@ -717,16 +632,10 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
     if let Some(proc_file) = file.as_any().downcast_ref::<ProcPseudoFile>() {
         let old = proc_file.offset();
         proc_file.set_offset(pos as usize);
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::W,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
             proc_file.set_offset(old);
             return err(SyscallError::EFAULT);
         };
-        let buf = UserBuffer::new(user_bufs);
         let n = file.read(buf) as isize;
         proc_file.set_offset(old);
         return n;
@@ -739,16 +648,10 @@ pub fn syscall_pread64(fd: usize, buffer: usize, len: usize, pos: isize) -> isiz
         }
         let old = pf.offset();
         pf.set_offset(pos as usize);
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::W,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::W) else {
             pf.set_offset(old);
             return err(SyscallError::EFAULT);
         };
-        let buf = UserBuffer::new(user_bufs);
         let n = file.read(buf) as isize;
         pf.set_offset(old);
         return n;
@@ -815,15 +718,11 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
                 hit_fsize_limit = true;
             }
         }
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            write_len,
-            MapPermission::R,
-        ) else {
+        let Ok(user_bufs) = try_current_user_buffer(buffer as *mut u8, write_len, MapPermission::R)
+        else {
             return err(SyscallError::EFAULT);
         };
-        let written = match vfs_file.pwrite_user_result(effective_pos, UserBuffer::new(user_bufs)) {
+        let written = match vfs_file.pwrite_user_result(effective_pos, user_bufs) {
             Ok(written) => written,
             Err(error) => return map_vfs_error(error),
         };
@@ -923,18 +822,11 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
     }
 
     if file.as_any().downcast_ref::<ProcPseudoFile>().is_some() {
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(user_bufs) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R)
+        else {
             return err(SyscallError::EFAULT);
         };
-        let mut data = Vec::with_capacity(len);
-        for slice in user_bufs {
-            data.extend_from_slice(slice);
-        }
+        let data = user_bufs.to_vec();
         if let Some(ret) = try_write_proc_pseudo_file(&file, &data, pos as usize, false) {
             return ret;
         }
@@ -951,16 +843,10 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         }
         let old = shm.offset();
         shm.set_offset(start);
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R) else {
             shm.set_offset(old);
             return err(SyscallError::EFAULT);
         };
-        let buf = UserBuffer::new(user_bufs);
         let n = file.write(buf) as isize;
         shm.set_offset(old);
         return n;
@@ -973,16 +859,10 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         }
         let old = pf.offset();
         pf.set_offset(pos as usize);
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(buf) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R) else {
             pf.set_offset(old);
             return err(SyscallError::EFAULT);
         };
-        let buf = UserBuffer::new(user_bufs);
         let n = file.write(buf) as isize;
         pf.set_offset(old);
         return n;
@@ -992,18 +872,11 @@ pub fn syscall_pwrite64(fd: usize, buffer: usize, len: usize, pos: isize) -> isi
         if pos != 0 {
             return err(SyscallError::EINVAL);
         }
-        let Ok(user_bufs) = try_translated_byte_buffer(
-            get_current_token(),
-            buffer as *mut u8,
-            len,
-            MapPermission::R,
-        ) else {
+        let Ok(user_bufs) = try_current_user_buffer(buffer as *mut u8, len, MapPermission::R)
+        else {
             return err(SyscallError::EFAULT);
         };
-        let mut data = Vec::with_capacity(len);
-        for slice in user_bufs {
-            data.extend_from_slice(slice);
-        }
+        let data = user_bufs.to_vec();
         return match cgroup.write_payload(&data) {
             Ok(n) => n as isize,
             Err(e) => e,

@@ -36,6 +36,8 @@ pub const ECFG_LIE_IPI: usize = 1 << 12;
 pub const ECFG_LIE_EIOINTC: usize = 1 << 3;
 
 // ── ESTAT (Exception Status, CSR 0x5) ─────────────────────────────────────
+/// Bits [12:0] — interrupt-pending bitmap.
+pub const ESTAT_INTERRUPT_MASK: usize = (1 << 13) - 1;
 /// Bits [21:16] — Exception Code shift.
 pub const ESTAT_ECODE_SHIFT: usize = 16;
 /// 6-bit mask for the exception code field.
@@ -60,8 +62,43 @@ pub const IOCSR_IPI_SEND: usize = 0x1040;
 pub const IOCSR_IPI_SEND_BLOCKING: usize = 1 << 31;
 /// IPI send target CPU shift.
 pub const IOCSR_IPI_SEND_CPU_SHIFT: usize = 16;
-/// Linux ACTION_RESCHEDULE/SMP_RESCHEDULE bit.
-pub const IPI_ACTION_RESCHEDULE: usize = 1 << 0;
+/// Cross-core mailbox send register and Linux-compatible payload fields.
+pub const IOCSR_MBUF_SEND: usize = 0x1048;
+pub const IOCSR_MBUF_SEND_BLOCKING: u64 = 1 << 31;
+pub const IOCSR_MBUF_SEND_BOX_SHIFT: usize = 2;
+pub const IOCSR_MBUF_SEND_CPU_SHIFT: usize = 16;
+pub const IOCSR_MBUF_SEND_BUF_SHIFT: usize = 32;
+pub const IOCSR_MBUF_SEND_H32_MASK: u64 = 0xffff_ffff_0000_0000;
+
+/// IOCSR_IPI_SEND takes an action index. IOCSR_IPI_STATUS reports the
+/// corresponding bit, so keep these indices separate from status masks.
+pub const IPI_ACTION_BOOT_CPU: usize = 0;
+pub const IPI_ACTION_RESCHEDULE: usize = 1;
+pub const IPI_ACTION_TLB_SHOOTDOWN: usize = 2;
+pub const IPI_STATUS_RESCHEDULE: u32 = 1 << IPI_ACTION_RESCHEDULE;
+pub const IPI_STATUS_TLB_SHOOTDOWN: u32 = 1 << IPI_ACTION_TLB_SHOOTDOWN;
+
+// ── ASID / TLB configuration and invalidation ─────────────────────────────
+pub const CSR_ASID: usize = 0x18;
+pub const CSR_ASID_VALUE_MASK: usize = 0x3ff;
+pub const CSR_ASID_BITS_SHIFT: usize = 16;
+pub const CSR_ASID_BITS_MASK: usize = 0xff;
+
+pub const CSR_PRCFG3: usize = 0x23;
+pub const PRCFG3_TLB_TYPE_MASK: usize = 0xf;
+pub const PRCFG3_MTLB_SIZE_SHIFT: usize = 4;
+pub const PRCFG3_MTLB_SIZE_MASK: usize = 0xff;
+pub const PRCFG3_STLB_WAYS_SHIFT: usize = 12;
+pub const PRCFG3_STLB_WAYS_MASK: usize = 0xff;
+pub const PRCFG3_STLB_INDEX_SHIFT: usize = 20;
+pub const PRCFG3_STLB_INDEX_MASK: usize = 0x3f;
+
+pub const INVTLB_ALL: usize = 0x0;
+pub const INVTLB_CURRENT_ALL: usize = 0x1;
+pub const INVTLB_CURRENT_GFALSE: usize = 0x3;
+pub const INVTLB_GFALSE_AND_ASID: usize = 0x4;
+pub const INVTLB_ADDR_GFALSE_AND_ASID: usize = 0x5;
+pub const INVTLB_ADDR_GTRUE_OR_ASID: usize = 0x6;
 
 // ── TCFG (Timer Config, CSR 0x41) ─────────────────────────────────────────
 /// Bit [0] — Timer Enable (also doubles as periodic-mode flag on some revisions).

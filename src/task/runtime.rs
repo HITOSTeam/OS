@@ -188,7 +188,12 @@ pub fn process_cpu_time_ns_at(process: &Arc<ProcessControlBlock>, now_ns: u64) -
         let tasks = inner
             .tasks
             .iter()
-            .filter_map(|task| task.as_ref().cloned())
+            .filter_map(|task| task.as_ref())
+            // Exit transfers this TCB's final total into cpu_time_ns while
+            // holding the same PCB lock. Retained zombie/waittid slots must
+            // not make the process total count that task a second time.
+            .filter(|task| !task.cpu_time_transferred())
+            .cloned()
             .collect::<Vec<_>>();
         (inner.cpu_time_ns, tasks)
     };

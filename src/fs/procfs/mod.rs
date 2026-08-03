@@ -329,18 +329,16 @@ impl File for ProcPseudoFile {
             return 0;
         }
         let mut total = 0usize;
-        for slice in buf.buffers.iter_mut() {
+        buf.for_each_chunk_mut(|slice| {
             if offset >= bytes.len() {
-                break;
+                return false;
             }
             let n = core::cmp::min(slice.len(), bytes.len() - offset);
             slice[..n].copy_from_slice(&bytes[offset..offset + n]);
             offset += n;
             total += n;
-            if n < slice.len() {
-                break;
-            }
-        }
+            n == slice.len()
+        });
         inner.offset = offset;
         total
     }

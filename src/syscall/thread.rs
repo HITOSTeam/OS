@@ -25,8 +25,16 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let Some(process) = task.process.upgrade() else {
         return -1;
     };
-    let Some(ustack_base) = task.borrow_mut().res.as_ref().map(|r| r.ustack_base) else {
-        return -1;
+    if process.exec_in_progress() || process.group_exit_in_progress() {
+        return err(SyscallError::EAGAIN);
+    }
+    arch::save_user_fp_state(&task);
+    let (ustack_base, parent_mask) = {
+        let inner = task.borrow_mut();
+        let Some(ustack_base) = inner.res.as_ref().map(|res| res.ustack_base) else {
+            return -1;
+        };
+        (ustack_base, inner.signal_mask)
     };
     let parent_scheduling = task.scheduling_snapshot();
     // create a new thread
@@ -34,28 +42,20 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         Ok(t) => Arc::new(t),
         Err(e) => return err(SyscallError::from(e)),
     };
+    new_task.inherit_fp_state_from(&task);
     new_task.set_scheduling_snapshot(parent_scheduling);
     // Spread newly created threads across harts (Linux-like: task has a target cpu).
     new_task.set_cpu_id(select_hart_for_new_task());
 
-    // Fully initialize the new thread (PCB slot + TrapContext) *before* enqueueing it.
+    // Fully initialize the new thread's TrapContext before publishing it.
     // Otherwise, another hart might schedule it and jump to user with an uninitialized TrapContext.
     let new_task_tid = {
-        let new_task_inner = new_task.borrow_mut();
+        let mut new_task_inner = new_task.borrow_mut();
+        new_task_inner.signal_mask = parent_mask;
         let Some(new_task_res) = new_task_inner.res.as_ref() else {
             return -1;
         };
         let new_task_tid = new_task_res.tid;
-
-        // add new thread to current process
-        {
-            let mut process_inner = process.borrow_mut();
-            let tasks = &mut process_inner.tasks;
-            while tasks.len() < new_task_tid + 1 {
-                tasks.push(None);
-            }
-            tasks[new_task_tid] = Some(Arc::clone(&new_task));
-        }
 
         let new_task_trap_cx = new_task_inner.get_trap_cx();
         *new_task_trap_cx = TrapContext::app_init_context(
@@ -68,6 +68,21 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         (*new_task_trap_cx).x[REG_A0] = arg;
         new_task_tid
     };
+
+    // Publish only after initialization, under the same PCB lock used by the
+    // exec peer snapshot. No fallible operation remains after this point.
+    {
+        let mut process_inner = process.borrow_mut();
+        if process.exec_in_progress() || process.group_exit_in_progress() {
+            return err(SyscallError::EAGAIN);
+        }
+        let tasks = &mut process_inner.tasks;
+        while tasks.len() < new_task_tid + 1 {
+            tasks.push(None);
+        }
+        debug_assert!(tasks[new_task_tid].is_none());
+        tasks[new_task_tid] = Some(Arc::clone(&new_task));
+    }
 
     // add new task to scheduler
     add_task(Arc::clone(&new_task));

@@ -232,10 +232,9 @@ fn get_trap_context() -> &'static mut TrapContext {
     trap_cx_ppn.get_mut()
 }
 pub fn get_current_token() -> usize {
-    let now_task_block = crate::task::processor::current_task().unwrap();
-    let process = now_task_block.process.upgrade().unwrap();
-    let process_inner = process.borrow_mut();
-    process_inner.memory_set.token()
+    crate::task::processor::current_task()
+        .expect("get_current_token without current task")
+        .get_user_token()
 }
 
 #[unsafe(no_mangle)]
@@ -678,7 +677,7 @@ pub fn trap_return() -> ! {
     // scheduler, bypassing `trap_handler()`, so handle pending user-return
     // signals here as Linux does before returning to userspace.
     if let Some(task) = crate::task::processor::current_task()
-        && task.has_signal_pending()
+        && (task.has_signal_pending() || task.exec_exit_requested())
     {
         if let Some((errno, msg)) = check_task_signals_error(&task) {
             crate::task::signal::log_signal_exit(msg);

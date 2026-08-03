@@ -125,11 +125,16 @@ pub fn syscall_setns(fd: isize, nstype: usize) -> isize {
             0
         }
         crate::fs::NamespaceKind::Net => {
-            if expected != CLONE_NEWNET {
+            if expected != CLONE_NEWNET || !ns_file.holds_live_net_ref() {
                 return err(SyscallError::EINVAL);
             }
-            inner.net_ns_id = ns_file.ns_id();
-            0
+            let ns_id = ns_file.ns_id();
+            drop(inner);
+            if process.set_net_namespace_id(ns_id) {
+                0
+            } else {
+                err(SyscallError::ENOENT)
+            }
         }
         crate::fs::NamespaceKind::Cgroup => {
             if expected != CLONE_NEWCGROUP {

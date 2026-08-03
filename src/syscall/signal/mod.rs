@@ -12,10 +12,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::arch::{
-    REG_A0, REG_A1, REG_A2, REG_A3, REG_A4, REG_A5, REG_A6, REG_A7, REG_GP, REG_RA, REG_S0, REG_S1,
-    REG_SP, REG_T0, REG_T1, REG_T2, REG_TP,
-};
+use crate::arch::{REG_A0, REG_A1, REG_A2, REG_A3, REG_A4, REG_A5, REG_A7, REG_RA, REG_SP, REG_TP};
+#[cfg(target_arch = "riscv64")]
+use crate::arch::{REG_A6, REG_GP, REG_S0, REG_S1, REG_T0, REG_T1, REG_T2};
 use crate::config::SIGRETURN_TRAMPOLINE;
 use crate::syscall::error::{SyscallError, err};
 use crate::{
@@ -35,7 +34,7 @@ use crate::{
         signal::{
             RT_SIG_MAX, RtSigAction, SIG_DFL, SIG_IGN, SIGALRM_NUM, SIGCONT_NUM, SIGKILL_NUM,
             SIGSTOP_NUM, SIGTSTP_NUM, SIGTTIN_NUM, SIGTTOU_NUM, SignalAction, SignalFlags,
-            can_signal_process, has_wait_interrupting_pending, kill, kill_current,
+            can_signal_process, has_wait_interrupting_pending, kill,
             request_reschedule_for_signal_target, set_signal, set_signal_mask, signal_bit,
             take_first_unmasked,
         },
@@ -301,6 +300,7 @@ struct SigStack {
     ss_size: usize,
 }
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct UserRegsStruct {
@@ -338,6 +338,7 @@ struct UserRegsStruct {
     t6: usize,
 }
 
+#[cfg(target_arch = "riscv64")]
 impl UserRegsStruct {
     fn from_trap(cx: &crate::trap::context::TrapContext) -> Self {
         Self {
@@ -413,8 +414,10 @@ impl UserRegsStruct {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 const RISCV_FP_STATE_SIZE: usize = 528;
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 struct SigContext {
@@ -422,6 +425,7 @@ struct SigContext {
     fp_state: [u8; RISCV_FP_STATE_SIZE],
 }
 
+#[cfg(target_arch = "riscv64")]
 impl Default for SigContext {
     fn default() -> Self {
         Self {
@@ -433,6 +437,7 @@ impl Default for SigContext {
 
 const UCONTEXT_SIGSET_PAD: usize = 128 - core::mem::size_of::<u64>();
 
+#[cfg(target_arch = "riscv64")]
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 struct UContext {
@@ -444,6 +449,7 @@ struct UContext {
     uc_mcontext: SigContext,
 }
 
+#[cfg(target_arch = "riscv64")]
 impl Default for UContext {
     fn default() -> Self {
         Self {
@@ -456,6 +462,170 @@ impl Default for UContext {
         }
     }
 }
+
+#[cfg(target_arch = "loongarch64")]
+const LOONGARCH_SC_USED_FP: u32 = 1 << 0;
+#[cfg(target_arch = "loongarch64")]
+const LOONGARCH_FPU_CTX_MAGIC: u32 = 0x4650_5501;
+#[cfg(target_arch = "loongarch64")]
+const LOONGARCH_LSX_CTX_MAGIC: u32 = 0x5358_0001;
+
+/// Linux LoongArch base signal context. The zero-length `sc_extcontext`
+/// starts immediately after this 272-byte, 16-byte-aligned structure.
+#[cfg(target_arch = "loongarch64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct LoongArchSigContext {
+    sc_pc: u64,
+    sc_regs: [u64; 32],
+    sc_flags: u32,
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl LoongArchSigContext {
+    fn from_trap(
+        cx: &crate::trap::context::TrapContext,
+        fp: &crate::task::task_block::LoongArchFpState,
+    ) -> Self {
+        let mut regs = [0u64; 32];
+        for (dst, src) in regs.iter_mut().zip(cx.x.iter()) {
+            *dst = *src as u64;
+        }
+        regs[0] = 0;
+        Self {
+            sc_pc: cx.sepc as u64,
+            sc_regs: regs,
+            sc_flags: if fp.width == crate::task::task_block::LoongArchFpWidth::None {
+                0
+            } else {
+                LOONGARCH_SC_USED_FP
+            },
+        }
+    }
+
+    fn write_to_trap(&self, cx: &mut crate::trap::context::TrapContext) {
+        cx.sepc = self.sc_pc as usize;
+        for (dst, src) in cx.x.iter_mut().zip(self.sc_regs.iter()) {
+            *dst = *src as usize;
+        }
+        cx.x[0] = 0;
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+struct LoongArchSctxInfo {
+    magic: u32,
+    size: u32,
+    padding: u64,
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LoongArchFpuContext {
+    regs: [u64; 32],
+    fcc: u64,
+    fcsr: u32,
+    _padding: u32,
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl LoongArchFpuContext {
+    fn from_state(state: &crate::task::task_block::LoongArchFpState) -> Self {
+        let mut regs = [0u64; 32];
+        for (dst, src) in regs.iter_mut().zip(state.regs.iter()) {
+            *dst = src[0];
+        }
+        Self {
+            regs,
+            fcc: state.fcc,
+            fcsr: state.fcsr,
+            _padding: 0,
+        }
+    }
+
+    fn into_state(self) -> crate::task::task_block::LoongArchFpState {
+        let mut state = crate::task::task_block::LoongArchFpState::new();
+        for (dst, src) in state.regs.iter_mut().zip(self.regs.iter()) {
+            dst[0] = *src;
+        }
+        state.fcc = self.fcc;
+        state.fcsr = self.fcsr;
+        state.width = crate::task::task_block::LoongArchFpWidth::Scalar;
+        state
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LoongArchLsxContext {
+    regs: [u64; 64],
+    fcc: u64,
+    fcsr: u32,
+    _padding: u32,
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl LoongArchLsxContext {
+    fn from_state(state: &crate::task::task_block::LoongArchFpState) -> Self {
+        let mut regs = [0u64; 64];
+        for (index, src) in state.regs.iter().enumerate() {
+            regs[index * 2] = src[0];
+            regs[index * 2 + 1] = src[1];
+        }
+        Self {
+            regs,
+            fcc: state.fcc,
+            fcsr: state.fcsr,
+            _padding: 0,
+        }
+    }
+
+    fn into_state(self) -> crate::task::task_block::LoongArchFpState {
+        let mut state = crate::task::task_block::LoongArchFpState::new();
+        for (index, dst) in state.regs.iter_mut().enumerate() {
+            dst[0] = self.regs[index * 2];
+            dst[1] = self.regs[index * 2 + 1];
+        }
+        state.fcc = self.fcc;
+        state.fcsr = self.fcsr;
+        state.width = crate::task::task_block::LoongArchFpWidth::Lsx;
+        state
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct LoongArchUContext {
+    uc_flags: usize,
+    uc_link: usize,
+    uc_stack: SigStack,
+    uc_sigmask: u64,
+    __unused: [u8; UCONTEXT_SIGSET_PAD],
+    uc_mcontext: LoongArchSigContext,
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct LoongArchRtSigFrame {
+    rs_info: LinuxSigInfo,
+    rs_uctx: LoongArchUContext,
+}
+
+#[cfg(target_arch = "loongarch64")]
+const _: () = {
+    assert!(core::mem::size_of::<LoongArchSigContext>() == 272);
+    assert!(core::mem::size_of::<LoongArchSctxInfo>() == 16);
+    assert!(core::mem::size_of::<LoongArchFpuContext>() == 272);
+    assert!(core::mem::size_of::<LoongArchLsxContext>() == 528);
+    assert!(core::mem::size_of::<LoongArchUContext>() == 448);
+    assert!(core::mem::size_of::<LoongArchRtSigFrame>() == 576);
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]

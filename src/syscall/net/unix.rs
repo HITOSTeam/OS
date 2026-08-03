@@ -250,13 +250,15 @@ pub(crate) struct UnixSocketFile {
 impl UnixSocketFile {
     /// 创建一个未绑定、未连接的空白 Unix socket。
     pub(super) fn new(sock_type: usize) -> Self {
-        Self {
+        let net_ns_id = current_process().acquire_net_namespace_for_socket();
+        let socket = Self {
             sock_type,
             proc_inode: alloc_socket_inode(),
-            net_ns_id: current_process().net_namespace_id(),
+            net_ns_id,
             bind_lock: KernelMutex::new(()),
             state: Mutex::new(UnixSocketState::new()),
-        }
+        };
+        socket
     }
 
     /// 创建一条已完成握手的 stream socket，供 `connect_unix` 在服务端 `pending_accept` 中插入。
@@ -278,13 +280,15 @@ impl UnixSocketFile {
         state.peer_addr = peer_addr;
         state.peer_cred = peer_cred;
         state.passcred = passcred;
-        Self {
+        assert!(crate::fs::register_net_namespace_socket_ref(net_ns_id));
+        let socket = Self {
             sock_type,
             proc_inode: alloc_socket_inode(),
             net_ns_id,
             bind_lock: KernelMutex::new(()),
             state: Mutex::new(state),
-        }
+        };
+        socket
     }
 
     /// 判断是否为面向流的类型（SOCK_STREAM 或 SOCK_SEQPACKET）。
@@ -1058,6 +1062,7 @@ impl Drop for UnixSocketFile {
         // Drop the pinned mount only after the registry no longer exposes the
         // endpoint. The filesystem socket inode itself remains until unlink.
         drop(path_binding);
+        crate::fs::release_net_namespace_socket_ref(self.net_ns_id);
     }
 }
 
@@ -1358,7 +1363,7 @@ fn register_path_socket(
 ) -> Result<(), isize> {
     let mut registry = UNIX_BOUND_PATHS.lock();
     if let Some(existing) = registry.get(&key)
-        && existing.file.upgrade().is_some()
+        && existing.file.strong_count() != 0
     {
         return Err(err(SyscallError::EADDRINUSE));
     }
@@ -1387,7 +1392,7 @@ fn register_abstract_socket(
     let key = (ns_id, name.to_vec());
     let mut registry = UNIX_BOUND_ABSTRACT.lock();
     if let Some(existing) = registry.get(&key)
-        && existing.file.upgrade().is_some()
+        && existing.file.strong_count() != 0
     {
         return Err(err(SyscallError::EADDRINUSE));
     }

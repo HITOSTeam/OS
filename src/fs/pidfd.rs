@@ -6,7 +6,7 @@ use crate::{
     task::{ProcessControlBlock, task_block::TaskControlBlock},
 };
 
-use super::{File, POLLIN, wake_tasks};
+use super::{File, POLLIN};
 
 /// `pidfd_open(2)` / `clone3(CLONE_PIDFD)` / `waitid(P_PIDFD, ...)` 用到的 pidfd 对象。
 ///
@@ -83,15 +83,4 @@ impl File for PidFdFile {
     fn as_any(&self) -> &dyn Any {
         self
     }
-}
-
-pub(crate) fn wake_pidfd_poll_waiters(pid: usize) {
-    let Some(process) = crate::task::manager::pid2process(pid) else {
-        return;
-    };
-    let waiters = {
-        let mut inner = process.borrow_mut();
-        inner.pidfd_poll_waiters.take_wakeups()
-    };
-    wake_tasks(waiters);
 }

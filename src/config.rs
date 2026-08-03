@@ -52,11 +52,8 @@ pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 pub const KERNEL_STACK_TOP: usize = 0xffff_ffff_ffff_f000;
 #[cfg(target_arch = "riscv64")]
 pub const MAX_HARTS: usize = 8;
-// LoongArch secondary-core startup is a separate architecture concern and is
-// not enabled yet; retain its existing capacity until that path is implemented.
-// TODO: real support for multi-core
 #[cfg(target_arch = "loongarch64")]
-pub const MAX_HARTS: usize = 4;
+pub const MAX_HARTS: usize = 12;
 #[allow(dead_code)]
 pub const KERNEL_ENTRY_PA: usize = 0x8020_0000;
 /// Return (bottom, top) of a kernel stack in kernel space. Bottom is smaller while top is bigger.

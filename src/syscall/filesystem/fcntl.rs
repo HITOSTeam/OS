@@ -600,8 +600,7 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 if let Some(shm) = file.as_any().downcast_ref::<MemfdFile>() {
                     let id = shm.memfd_id();
                     let process = current_process();
-                    let inner = process.borrow_mut();
-                    inner.memory_set.has_writable_shared_memfd_mapping(id)
+                    process.memory_set().has_writable_shared_memfd_mapping(id)
                 } else {
                     false
                 };

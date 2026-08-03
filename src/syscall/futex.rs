@@ -3,7 +3,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::syscall::error::{SyscallError, err};
 use lazy_static::lazy_static;
@@ -12,7 +12,10 @@ use spin::Mutex;
 use crate::{
     config::clock_freq,
     debug_config::DEBUG_FUTEX,
-    mm::{PageTable, VirtAddr, read_user_value},
+    mm::{
+        MapPermission, PageTable, UserBuffer, VirtAddr, read_user_value, try_current_user_buffer,
+        try_read_user_value,
+    },
     syscall::time_sys::realtime_now_timespec,
     task::block_sleep::add_timer,
     task::{
@@ -54,6 +57,30 @@ lazy_static! {
 
 static FUTEX_TIMEOUT_SEQ: AtomicUsize = AtomicUsize::new(0);
 static FUTEX_WAIT_DIAG_BASE_NS: AtomicUsize = AtomicUsize::new(0);
+
+/// Load an already faulted-in and pinned futex word without taking the mmap
+/// lock or triggering a page fault.
+///
+/// Linux performs the final value check while holding the futex hash-bucket
+/// lock.  The same rule applies here: callers may hold `FUTEX_QUEUES`, so this
+/// helper must remain a short, non-sleeping atomic load.
+fn load_pinned_futex_word(word: &UserBuffer) -> Option<u32> {
+    let mut value = None;
+    word.for_each_chunk(|bytes| {
+        if bytes.len() != core::mem::size_of::<u32>()
+            || !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<u32>())
+        {
+            return false;
+        }
+        let ptr = bytes.as_ptr().cast::<AtomicU32>();
+        // SAFETY: the caller validated natural u32 alignment, UserBuffer pins
+        // the complete four-byte page-local object, and the slice remains
+        // borrowed for the duration of this atomic load.
+        value = Some(unsafe { &*ptr }.load(Ordering::Acquire));
+        false
+    });
+    value
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -135,12 +162,12 @@ fn futex_key(pid: usize, token: usize, uaddr: usize, private: bool) -> FutexKey 
     } else {
         pid2process(pid)
             .and_then(|process| {
-                let inner = process.borrow_mut();
-                if inner.memory_set.token() != token {
+                let memory_set = process.memory_set();
+                if memory_set.token() != token {
                     return None;
                 }
                 let end = uaddr.checked_add(core::mem::size_of::<u32>())?;
-                inner.memory_set.lock().vm_region_containing(uaddr, end)
+                memory_set.lock().vm_region_containing(uaddr, end)
             })
             .is_some_and(|region| region.shared)
     };
@@ -341,7 +368,7 @@ pub fn syscall_futex(
     let clock_realtime = (op & FUTEX_CLOCK_REALTIME) != 0;
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            if uaddr == 0 {
+            if uaddr == 0 || !uaddr.is_multiple_of(core::mem::align_of::<u32>()) {
                 return err(SyscallError::EINVAL);
             }
             let task = current_task().unwrap();
@@ -362,8 +389,22 @@ pub fn syscall_futex(
             } else {
                 FUTEX_BITSET_MATCH_ANY
             };
-            let cur = read_user_value(token, uaddr as *const i32);
-            if cur != val as i32 {
+            // Resolve lazy mappings and pin the backing frame before taking
+            // the futex-queue lock.  The pinned view gives the locked section
+            // a no-fault atomic load and keeps a shared futex's physical
+            // identity alive while this waiter sleeps.
+            let futex_word = match try_current_user_buffer(
+                uaddr as *const u8,
+                core::mem::size_of::<u32>(),
+                MapPermission::R,
+            ) {
+                Ok(word) => word,
+                Err(()) => return err(SyscallError::EFAULT),
+            };
+            let Some(cur) = load_pinned_futex_word(&futex_word) else {
+                return err(SyscallError::EFAULT);
+            };
+            if cur != val as u32 {
                 if DEBUG_FUTEX {
                     log::debug!(
                         "[futex_wait] mismatch pid={} tid={} uaddr={:#x} cur={} expected={}",
@@ -374,18 +415,11 @@ pub fn syscall_futex(
                         val
                     );
                 }
-                return if pending_unmasked_signal() {
-                    err(SyscallError::EINTR)
-                } else {
-                    err(SyscallError::EAGAIN)
-                };
+                return err(SyscallError::EAGAIN);
             }
-            // Read first, then derive key. This forces lazy mappings to be
+            // Pin first, then derive the key. This forces lazy mappings to be
             // instantiated before shared-key PA translation.
             let key = futex_key(pid, token, uaddr, _private);
-            let in_queue = Arc::new(AtomicBool::new(true));
-            let mut map = FUTEX_QUEUES.lock();
-            let queue_len_before = map.get(&key).map(VecDeque::len).unwrap_or(0);
             if crate::debug_config::DEBUG_PTHREAD {
                 let (tid, pending_sig, mask) = {
                     let inner = task.borrow_mut();
@@ -421,7 +455,9 @@ pub fn syscall_futex(
             let deadline_ns = if _timeout == 0 {
                 None
             } else {
-                let ts = read_user_value(token, _timeout as *const TimeSpec);
+                let Some(ts) = try_read_user_value(token, _timeout as *const TimeSpec) else {
+                    return err(SyscallError::EFAULT);
+                };
                 let timeout_ns = match timespec_to_ns(ts) {
                     Some(ns) => ns,
                     None => return err(SyscallError::EINVAL),
@@ -437,6 +473,20 @@ pub fn syscall_futex(
                 }
                 Some(deadline_ns)
             };
+
+            let in_queue = Arc::new(AtomicBool::new(true));
+            let mut map = FUTEX_QUEUES.lock();
+            // This second comparison and queue publication form one atomic
+            // protocol with FUTEX_WAKE under the same queue lock.  A waker
+            // can therefore observe either a changed word or this waiter, but
+            // can no longer slip through the old compare/enqueue window.
+            let Some(locked_cur) = load_pinned_futex_word(&futex_word) else {
+                return err(SyscallError::EFAULT);
+            };
+            if locked_cur != val as u32 {
+                return err(SyscallError::EAGAIN);
+            }
+            let queue_len_before = map.get(&key).map(VecDeque::len).unwrap_or(0);
             map.entry(key)
                 .or_insert_with(VecDeque::new)
                 .push_back(FutexWaiter {
@@ -600,7 +650,11 @@ pub fn syscall_futex(
             futex_wake_with_mask(key, uaddr, nr_wake as usize, bitset_mask)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
-            if uaddr == 0 || _uaddr2 == 0 {
+            if uaddr == 0
+                || _uaddr2 == 0
+                || !uaddr.is_multiple_of(core::mem::align_of::<u32>())
+                || !_uaddr2.is_multiple_of(core::mem::align_of::<u32>())
+            {
                 return err(SyscallError::EINVAL);
             }
             let nr_wake = val as isize;
@@ -610,11 +664,25 @@ pub fn syscall_futex(
             }
             let pid = current_process().getpid();
             let token = get_current_token();
-            // Shared futex keys are PA based.  Fault both addresses in before
-            // computing keys so requeue cannot move waiters to a VA fallback
-            // key that a later wake on uaddr2 will never look up.
-            let cur = read_user_value(token, uaddr as *const i32);
-            let _ = read_user_value(token, _uaddr2 as *const i32);
+            // Shared futex keys are PA based. Fault and pin both addresses
+            // before computing keys so requeue cannot move waiters to a VA
+            // fallback key that a later wake on uaddr2 will never look up.
+            let futex_word1 = match try_current_user_buffer(
+                uaddr as *const u8,
+                core::mem::size_of::<u32>(),
+                MapPermission::R,
+            ) {
+                Ok(word) => word,
+                Err(()) => return err(SyscallError::EFAULT),
+            };
+            let _futex_word2 = match try_current_user_buffer(
+                _uaddr2 as *const u8,
+                core::mem::size_of::<u32>(),
+                MapPermission::R,
+            ) {
+                Ok(word) => word,
+                Err(()) => return err(SyscallError::EFAULT),
+            };
             let key1 = futex_key(pid, token, uaddr, _private);
             let key2 = futex_key(pid, token, _uaddr2, _private);
             if DEBUG_FUTEX {
@@ -634,34 +702,33 @@ pub fn syscall_futex(
                     _val3
                 );
             }
-            if cmd == FUTEX_CMP_REQUEUE {
-                if DEBUG_FUTEX {
-                    log::warn!(
-                        "[futex_cmp_requeue_cmp] pid={} uaddr={:#x} key1=({:#x},{:#x}) cur={} expected={}",
-                        pid,
-                        uaddr,
-                        key1.0,
-                        key1.1,
-                        cur,
-                        _val3
-                    );
-                }
-                if cur != _val3 as i32 {
-                    if DEBUG_FUTEX {
-                        log::warn!(
-                            "[futex_cmp_requeue_cmp] cmp mismatch -> err(SyscallError::EAGAIN) pid={} uaddr={:#x}",
-                            pid,
-                            uaddr
-                        );
-                    }
-                    return err(SyscallError::EAGAIN);
-                }
-            }
             let val2 = nr_requeue as usize;
             let mut wake_list = Vec::new();
             let mut requeue_updates = Vec::new();
             let (woke, moved) = {
                 let mut map = FUTEX_QUEUES.lock();
+                // FUTEX_CMP_REQUEUE has the same compare/queue atomicity
+                // requirement as FUTEX_WAIT: validate under the queue lock so
+                // a concurrent wake/requeue cannot observe a stale value.
+                if cmd == FUTEX_CMP_REQUEUE {
+                    let Some(cur) = load_pinned_futex_word(&futex_word1) else {
+                        return err(SyscallError::EFAULT);
+                    };
+                    if DEBUG_FUTEX {
+                        log::warn!(
+                            "[futex_cmp_requeue_cmp] pid={} uaddr={:#x} key1=({:#x},{:#x}) cur={} expected={}",
+                            pid,
+                            uaddr,
+                            key1.0,
+                            key1.1,
+                            cur,
+                            _val3
+                        );
+                    }
+                    if cur != _val3 as u32 {
+                        return err(SyscallError::EAGAIN);
+                    }
+                }
                 let key1_len_before = map.get(&key1).map(VecDeque::len).unwrap_or(0);
                 let key2_len_before = map.get(&key2).map(VecDeque::len).unwrap_or(0);
                 let Some(mut queue1) = map.remove(&key1) else {

@@ -15,7 +15,7 @@ pub(super) use crate::{
     },
     mm::{
         BrkUpdate, MapPermission, MapType, MemorySet, MprotectError, PTEFlags, VmRegion,
-        VmRegionKind, VmaInsertArea, frame_available_pages, reclaim_shared_file_page_cache,
+        VmRegionKind, VmaInsertArea, frame_available_pages, reclaim_file_page_cache,
         try_copy_to_user, try_copy_to_user_unchecked,
     },
     task::{
@@ -26,6 +26,7 @@ pub(super) use crate::{
 };
 pub(super) use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
 pub(super) use core::cmp::min;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) const PROT_READ: usize = 1;
 pub(super) const PROT_WRITE: usize = 2;
@@ -93,30 +94,165 @@ pub(super) fn user_range_valid(start: usize, end: usize) -> bool {
     start < end && end <= USER_VA_TOP
 }
 
-pub(super) fn overcommit_limit_bytes() -> Option<usize> {
-    match vm_overcommit_memory() {
-        // 模式 0 是 Linux 的启发式 overcommit。当前内核还没有 swap/reclaim，
-        // 因此给匿名私有可写 commit 留出有限裕量，但仍拒绝明显超过
-        // 物理内存两倍的大额请求。
-        0 => {
-            let total = crate::mm::frame_managed_pages().saturating_mul(PAGE_SIZE);
-            Some(total.saturating_add(total / 2))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OvercommitRejectReason {
+    GuessRequestExceedsMemory,
+    StrictCommitLimit,
+}
+
+impl OvercommitRejectReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GuessRequestExceedsMemory => "request-exceeds-memory",
+            Self::StrictCommitLimit => "commit-limit",
         }
-        // 不设限
-        1 => None,
-        2 => Some(vm_commit_limit_bytes()),
-        _ => None,
     }
 }
 
-pub(super) fn exceeds_overcommit_limit(additional_bytes: usize) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OvercommitRejection {
+    mode: usize,
+    reason: OvercommitRejectReason,
+    requested_bytes: usize,
+    committed_bytes: usize,
+    limit_bytes: usize,
+}
+
+static OVERCOMMIT_REJECT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Apply Linux's three overcommit policies to one new accountable mapping.
+///
+/// `OVERCOMMIT_GUESS` (mode 0) deliberately does not compare the system-wide
+/// committed counter against `CommitLimit`: Linux only rejects a single request
+/// larger than RAM plus swap in this mode.  This kernel has no swap, so managed
+/// RAM is the corresponding bound.  The global committed counter is a hard gate
+/// only for `OVERCOMMIT_NEVER` (mode 2).
+fn evaluate_overcommit(
+    mode: usize,
+    additional_bytes: usize,
+    committed_bytes: usize,
+    managed_bytes: usize,
+    strict_limit_bytes: usize,
+) -> Option<OvercommitRejection> {
     if additional_bytes == 0 {
-        return false;
+        return None;
     }
-    let Some(limit) = overcommit_limit_bytes() else {
+
+    let (reason, limit_bytes, rejected) = match mode {
+        0 => (
+            OvercommitRejectReason::GuessRequestExceedsMemory,
+            managed_bytes,
+            additional_bytes > managed_bytes,
+        ),
+        1 => return None,
+        2 => (
+            OvercommitRejectReason::StrictCommitLimit,
+            strict_limit_bytes,
+            committed_bytes.saturating_add(additional_bytes) > strict_limit_bytes,
+        ),
+        // /proc/sys/vm/overcommit_memory accepts only 0..=2.  Keep an invalid
+        // internal value permissive instead of unexpectedly breaking mmap.
+        _ => return None,
+    };
+
+    rejected.then_some(OvercommitRejection {
+        mode,
+        reason,
+        requested_bytes: additional_bytes,
+        committed_bytes,
+        limit_bytes,
+    })
+}
+
+fn overcommit_rejection(additional_bytes: usize) -> Option<OvercommitRejection> {
+    evaluate_overcommit(
+        vm_overcommit_memory(),
+        additional_bytes,
+        vm_committed_as_bytes(),
+        crate::mm::frame_managed_pages().saturating_mul(PAGE_SIZE),
+        vm_commit_limit_bytes(),
+    )
+}
+
+/// Return true when the current overcommit policy rejects an allocation and
+/// emit a sampled diagnostic.  Rejections are rare and actionable; sampling
+/// keeps a malformed workload from flooding the serial console.
+pub(super) fn overcommit_rejects(
+    operation: &'static str,
+    pid: usize,
+    additional_bytes: usize,
+) -> bool {
+    let Some(rejection) = overcommit_rejection(additional_bytes) else {
         return false;
     };
-    vm_committed_as_bytes().saturating_add(additional_bytes) > limit
+
+    let sequence = OVERCOMMIT_REJECT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 8 || sequence.is_power_of_two() {
+        log::warn!(
+            "[mm-overcommit] seq={} op={} pid={} mode={} reason={} request={} committed={} limit={} free={}",
+            sequence,
+            operation,
+            pid,
+            rejection.mode,
+            rejection.reason.as_str(),
+            rejection.requested_bytes,
+            rejection.committed_bytes,
+            rejection.limit_bytes,
+            frame_available_pages().saturating_mul(PAGE_SIZE),
+        );
+    }
+    true
+}
+
+#[cfg(test)]
+mod overcommit_tests {
+    use super::*;
+
+    const RAM: usize = 8 * 1024 * 1024;
+    const STRICT_LIMIT: usize = RAM / 2;
+
+    #[test]
+    fn guess_mode_ignores_aggregate_commit_for_small_requests() {
+        let rejection = evaluate_overcommit(0, 64 * 1024, RAM * 8, RAM, STRICT_LIMIT);
+        assert_eq!(rejection, None);
+    }
+
+    #[test]
+    fn guess_mode_rejects_only_a_single_request_larger_than_memory() {
+        assert_eq!(evaluate_overcommit(0, RAM, 0, RAM, STRICT_LIMIT), None);
+        assert_eq!(
+            evaluate_overcommit(0, RAM + PAGE_SIZE, 0, RAM, STRICT_LIMIT)
+                .map(|rejection| rejection.reason),
+            Some(OvercommitRejectReason::GuessRequestExceedsMemory)
+        );
+    }
+
+    #[test]
+    fn always_mode_never_rejects_from_commit_accounting() {
+        assert_eq!(
+            evaluate_overcommit(1, usize::MAX, usize::MAX, RAM, STRICT_LIMIT),
+            None
+        );
+    }
+
+    #[test]
+    fn strict_mode_checks_aggregate_commit_limit() {
+        assert_eq!(
+            evaluate_overcommit(2, PAGE_SIZE, STRICT_LIMIT - PAGE_SIZE, RAM, STRICT_LIMIT),
+            None
+        );
+        assert_eq!(
+            evaluate_overcommit(
+                2,
+                PAGE_SIZE * 2,
+                STRICT_LIMIT - PAGE_SIZE,
+                RAM,
+                STRICT_LIMIT
+            )
+            .map(|rejection| rejection.reason),
+            Some(OvercommitRejectReason::StrictCommitLimit)
+        );
+    }
 }
 
 pub(super) fn find_inode_file_in_snapshot(

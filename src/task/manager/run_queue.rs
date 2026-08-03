@@ -218,8 +218,6 @@ impl TaskManager {
         {
             return None;
         }
-        task.in_ready_queue
-            .store(true, core::sync::atomic::Ordering::Release);
         task.set_cpu_id(hart_id);
         let mut hart_rq = self.ready_queues[hart_id].lock();
         if task
@@ -227,8 +225,9 @@ impl TaskManager {
             .load(core::sync::atomic::Ordering::Acquire)
             != hart_id
         {
-            task.in_ready_queue
-                .store(false, core::sync::atomic::Ordering::Release);
+            // The owner that changed ready_queue_hart also owns publication
+            // of in_ready_queue.  Clearing it here could race with a new add
+            // that has already inserted the task on another hart.
             return None;
         }
         let was_empty = hart_rq.len() == 0;
@@ -248,7 +247,7 @@ impl TaskManager {
         }
         match task_queue_slot(&task) {
             ReadyQueueSlot::Rt(idx) => {
-                hart_rq.rt_queues[idx].push_back(task);
+                hart_rq.rt_queues[idx].push_back(Arc::clone(&task));
                 inc_ready_rt_count(hart_id, idx);
             }
             ReadyQueueSlot::Fair => {
@@ -269,11 +268,17 @@ impl TaskManager {
                     fair_nice_weight(inner.nice)
                 };
                 let task_id = fair_task_id(&task);
-                group.insert_task(task_id, task, task_vruntime, deadline, weight);
+                group.insert_task(task_id, Arc::clone(&task), task_vruntime, deadline, weight);
                 hart_rq.relink_fair_group_if_runnable(group_id);
                 inc_ready_fair_count(hart_id);
             }
         }
+        // Publish the boolean only after the entity is physically present in
+        // the locked runqueue.  Refresh/removal code can now distinguish a
+        // claimed marker from a completed insertion instead of canceling the
+        // add in the CAS-to-rq-lock window.
+        task.in_ready_queue
+            .store(true, core::sync::atomic::Ordering::Release);
         if DEBUG_SCHED {
             log::debug!(
                 "[sched] hart={} ready_queue_len_after={}",
@@ -292,19 +297,30 @@ impl TaskManager {
     ) -> Option<Arc<TaskControlBlock>> {
         while let Some(candidate) = queue.pop_front() {
             dec_ready_rt_count(hart_id, rt_idx);
-            let still_queued_here = candidate
+            if candidate
+                .ready_queue_hart
+                .load(core::sync::atomic::Ordering::Acquire)
+                != hart_id
+            {
+                continue;
+            }
+            // Publish OFF only after the physical queue entry and its boolean
+            // have both been cleared while the owning rq lock is held.  A new
+            // add on another hart may claim OFF immediately afterwards.
+            candidate
+                .in_ready_queue
+                .store(false, core::sync::atomic::Ordering::Release);
+            let released = candidate
                 .ready_queue_hart
                 .compare_exchange(
                     hart_id,
                     TaskControlBlock::OFF_CPU,
-                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Release,
                     core::sync::atomic::Ordering::Acquire,
                 )
                 .is_ok();
-            candidate
-                .in_ready_queue
-                .store(false, core::sync::atomic::Ordering::Release);
-            if !still_queued_here {
+            debug_assert!(released, "rq ownership changed while its lock was held");
+            if !released {
                 continue;
             }
             let status = candidate.borrow_mut().task_status;
@@ -412,17 +428,20 @@ impl TaskManager {
             dec_ready_fair_count(hart_id);
             // 如果 没有就绪，释放任务
             if queued_here {
-                let _ = candidate.ready_queue_hart.compare_exchange(
+                candidate
+                    .in_ready_queue
+                    .store(false, core::sync::atomic::Ordering::Release);
+                let released = candidate.ready_queue_hart.compare_exchange(
                     hart_id,
                     TaskControlBlock::OFF_CPU,
-                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Release,
                     core::sync::atomic::Ordering::Acquire,
                 );
+                debug_assert!(
+                    released.is_ok(),
+                    "rq ownership changed while its lock was held"
+                );
             }
-            // 移除任务本身 的 记录
-            candidate
-                .in_ready_queue
-                .store(false, core::sync::atomic::Ordering::Release);
             if DEBUG_SCHED {
                 let tid = candidate
                     .borrow_mut()
@@ -499,18 +518,26 @@ impl TaskManager {
             let Some(task) = task else {
                 continue;
             };
-            let still_queued_here = task
+            if task
+                .ready_queue_hart
+                .load(core::sync::atomic::Ordering::Acquire)
+                != hart_id
+            {
+                continue;
+            }
+            task.in_ready_queue
+                .store(false, core::sync::atomic::Ordering::Release);
+            let released = task
                 .ready_queue_hart
                 .compare_exchange(
                     hart_id,
                     TaskControlBlock::OFF_CPU,
-                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Release,
                     core::sync::atomic::Ordering::Acquire,
                 )
                 .is_ok();
-            task.in_ready_queue
-                .store(false, core::sync::atomic::Ordering::Release);
-            if !still_queued_here {
+            debug_assert!(released, "rq ownership changed while its lock was held");
+            if !released {
                 continue;
             }
             {
@@ -562,13 +589,28 @@ impl TaskManager {
     }
     /// 从所有 hart 的就绪队列中移除指定任务（同时清理 RT 和 Fair 队列中可能存在的重复条目）
     pub fn remove(&self, task: Arc<TaskControlBlock>) -> usize {
-        let queued_hart = task.ready_queue_hart.swap(
-            TaskControlBlock::OFF_CPU,
-            core::sync::atomic::Ordering::AcqRel,
-        );
-        let mut removed = 0usize;
-        if queued_hart < MAX_HARTS {
+        loop {
+            let queued_hart = task
+                .ready_queue_hart
+                .load(core::sync::atomic::Ordering::Acquire);
+            if queued_hart >= MAX_HARTS {
+                return 0;
+            }
             let mut rq = self.ready_queues[queued_hart].lock();
+            // fetch/remove on the old hart may have released ownership while
+            // we waited for its rq lock, and a new enqueue may already target
+            // another hart.  Retry against that owner rather than deleting a
+            // stale entry and clobbering the new queue's boolean.
+            if task
+                .ready_queue_hart
+                .load(core::sync::atomic::Ordering::Acquire)
+                != queued_hart
+            {
+                drop(rq);
+                core::hint::spin_loop();
+                continue;
+            }
+            let mut removed = 0usize;
             for (rt_idx, q) in rq.rt_queues.iter_mut().enumerate() {
                 let before = q.len();
                 q.retain(|t| !Arc::ptr_eq(t, &task));
@@ -602,19 +644,47 @@ impl TaskManager {
                 }
             }
             removed = removed.saturating_add(fair_removed);
+            if removed == 0
+                && !task
+                    .in_ready_queue
+                    .load(core::sync::atomic::Ordering::Acquire)
+            {
+                // The marker can be owned by an add that won OFF -> hart but
+                // has not acquired this rq lock yet.  Do not cancel that
+                // enqueue generation: a concurrent refresh would otherwise
+                // see remove=0 while the producer also aborts, losing a Ready
+                // task from every queue.  Let the producer publish its entity
+                // and retry the physical removal afterwards.
+                drop(rq);
+                core::hint::spin_loop();
+                continue;
+            }
+            if crate::debug_config::DEBUG_TASK_LIFECYCLE && removed > 1 {
+                let tid = task
+                    .borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX);
+                crate::println!("[sched-remove] tid={} removed_dup_entries={}", tid, removed);
+            }
+            // OFF is the release publication that the old physical entry has
+            // gone away.  Keep it last and under the rq lock so a concurrent
+            // add cannot be followed by our stale `in_ready_queue = false`.
+            task.in_ready_queue
+                .store(false, core::sync::atomic::Ordering::Release);
+            let released = task
+                .ready_queue_hart
+                .compare_exchange(
+                    queued_hart,
+                    TaskControlBlock::OFF_CPU,
+                    core::sync::atomic::Ordering::Release,
+                    core::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok();
+            debug_assert!(released, "rq ownership changed while its lock was held");
+            return removed;
         }
-        if crate::debug_config::DEBUG_TASK_LIFECYCLE && removed > 1 {
-            let tid = task
-                .borrow_mut()
-                .res
-                .as_ref()
-                .map(|r| r.tid)
-                .unwrap_or(usize::MAX);
-            crate::println!("[sched-remove] tid={} removed_dup_entries={}", tid, removed);
-        }
-        task.in_ready_queue
-            .store(false, core::sync::atomic::Ordering::Release);
-        removed
     }
 
     /// 返回每个 hart 的就绪队列长度（用于调试和负载均衡）

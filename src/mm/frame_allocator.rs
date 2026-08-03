@@ -18,6 +18,14 @@ static FRAME_OWNER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct FrameOwner {
     ppn: PhysPageNum,
+    writable_uaccess_pins: AtomicUsize,
+    /// Serializes short-lived kernel views created for pinned user buffers.
+    ///
+    /// A physical page can be mapped at more than one user virtual address and
+    /// can consequently appear in overlapping `UserBuffer`s.  Keeping this
+    /// lock in the shared owner makes those views mutually exclusive without
+    /// manufacturing long-lived aliased Rust references.
+    user_buffer_access: Mutex<()>,
 }
 
 impl Drop for FrameOwner {
@@ -44,12 +52,93 @@ impl FrameTracker {
         FRAME_OWNER_COUNT.fetch_add(1, Ordering::Relaxed);
         Self {
             ppn,
-            owner: Arc::new(FrameOwner { ppn }),
+            owner: Arc::new(FrameOwner {
+                ppn,
+                writable_uaccess_pins: AtomicUsize::new(0),
+                user_buffer_access: Mutex::new(()),
+            }),
         }
     }
 
     pub fn refcount(&self) -> usize {
         Arc::strong_count(&self.owner)
+    }
+
+    pub fn writable_uaccess_pins(&self) -> usize {
+        self.owner.writable_uaccess_pins.load(Ordering::Acquire)
+    }
+
+    pub fn pin_user_buffer(&self, writable: bool) -> UserFramePin {
+        if writable {
+            self.owner
+                .writable_uaccess_pins
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        UserFramePin {
+            frame: self.clone(),
+            writable,
+        }
+    }
+}
+
+/// A physical-page lifetime pin held by a potentially sleeping uaccess.
+/// Writable pins are visible to fork so it can snapshot the child eagerly
+/// instead of sharing a page that the blocked syscall may later modify.
+pub struct UserFramePin {
+    frame: FrameTracker,
+    writable: bool,
+}
+
+impl UserFramePin {
+    /// Borrow a page fragment only while its per-frame access lock is held.
+    pub(crate) fn with_bytes<R>(
+        &self,
+        page_offset: usize,
+        len: usize,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> R {
+        debug_assert!(page_offset <= crate::config::PAGE_SIZE);
+        debug_assert!(len <= crate::config::PAGE_SIZE.saturating_sub(page_offset));
+        let _access = self.frame.owner.user_buffer_access.lock();
+        let page: PhysAddr = self.frame.ppn.into();
+        // SAFETY: the pin keeps the frame allocated, bounds were validated by
+        // the UserBuffer constructor, and the owner lock excludes every other
+        // UserBuffer view of this physical page for the duration of `f`.
+        let bytes =
+            unsafe { core::slice::from_raw_parts((page.0 + page_offset) as *const u8, len) };
+        f(bytes)
+    }
+
+    /// Mutably borrow a page fragment only while its per-frame access lock is
+    /// held.  The slice cannot escape the closure through this safe API.
+    pub(crate) fn with_bytes_mut<R>(
+        &self,
+        page_offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> R {
+        debug_assert!(page_offset <= crate::config::PAGE_SIZE);
+        debug_assert!(len <= crate::config::PAGE_SIZE.saturating_sub(page_offset));
+        let _access = self.frame.owner.user_buffer_access.lock();
+        let page: PhysAddr = self.frame.ppn.into();
+        // SAFETY: as in `with_bytes`; the exclusive owner lock additionally
+        // ensures no other pinned UserBuffer creates a simultaneous view.
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut((page.0 + page_offset) as *mut u8, len) };
+        f(bytes)
+    }
+}
+
+impl Drop for UserFramePin {
+    fn drop(&mut self) {
+        if self.writable {
+            let previous = self
+                .frame
+                .owner
+                .writable_uaccess_pins
+                .fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0, "writable uaccess pin underflow");
+        }
     }
 }
 
@@ -192,7 +281,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         return Some(FrameTracker::new(ppn));
     }
 
-    let reclaimed = super::memory_set::reclaim_shared_file_page_cache();
+    let reclaimed = super::memory_set::reclaim_file_page_cache();
     if reclaimed > 0 {
         let ppn = with_frame_allocator(|allocator| allocator.alloc());
         if let Some(ppn) = ppn {

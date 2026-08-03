@@ -256,8 +256,13 @@ pub(crate) use mountns::{
     MountBackend, MountNamespace, MountNamespaceState, MountPropagation, MountRecord,
     clone_mount_namespace_and_fs, initial_mount_namespace, mount_namespace_id,
 };
-pub(crate) use namespace_file::net_namespace_file_refs;
 pub use namespace_file::{NamespaceFile, NamespaceKind};
+pub(crate) use namespace_file::{
+    finish_net_namespace_cleanup, pin_net_namespace, register_net_namespace_file_ref,
+    register_net_namespace_socket_ref, release_net_namespace_process_ref,
+    release_net_namespace_socket_ref, switch_net_namespace_process_ref,
+    try_begin_net_namespace_cleanup,
+};
 pub use net_socket::{Ipv4SourceFilterMode, NetSocketFile, NetSocketKind, ProcNetSocketSnapshot};
 pub(crate) use net_socket::{
     cleanup_net_namespace as cleanup_net_socket_namespace, debug_net_socket_atomic_heap_state,
@@ -265,7 +270,6 @@ pub(crate) use net_socket::{
 };
 pub(crate) use nsfs::{namespace_file_from_open_file, namespace_path};
 pub use pidfd::PidFdFile;
-pub(crate) use pidfd::wake_pidfd_poll_waiters;
 pub(crate) use pipe::remove_task_waiters as remove_pipe_waiters_for_task;
 pub use pipe::{
     Pipe, debug_count_task_waiters as debug_count_pipe_waiters_for_task, make_pipe,

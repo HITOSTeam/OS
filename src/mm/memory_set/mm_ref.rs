@@ -132,6 +132,11 @@ impl MmRef {
         crate::arch::loongarch64::mm::prepare_user_asid(self.asid.as_ref())
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    pub fn leave_user_asid(&self) {
+        crate::arch::loongarch64::mm::leave_user_asid(self.asid.as_ref());
+    }
+
     #[cfg(target_arch = "riscv64")]
     pub fn prepare_user_satp(&self) -> (usize, bool, bool) {
         crate::arch::riscv64::mm::prepare_user_satp(&self.asid, self.token)
@@ -139,12 +144,27 @@ impl MmRef {
 
     #[cfg(target_arch = "loongarch64")]
     pub(super) fn flush_user_page(&self, va: usize) {
-        crate::arch::loongarch64::mm::flush_user_page(self.asid.as_ref(), va);
+        crate::arch::loongarch64::mm::flush_user_page(&self.asid, va);
     }
 
     #[cfg(target_arch = "riscv64")]
     pub(super) fn flush_user_page(&self, va: usize) {
         crate::arch::riscv64::mm::flush_user_page(&self.asid, va);
+    }
+
+    /// Refresh a spurious missing-page fault after another thread published
+    /// the formerly absent PTE.  LoongArch mirrors Linux update_mmu_cache():
+    /// only the faulting hart can retain the recoverable invalid half.  Keep
+    /// the existing stronger RISC-V behavior until that architecture is
+    /// audited independently.
+    #[cfg(target_arch = "loongarch64")]
+    pub(super) fn refresh_new_pte_fault(&self, va: usize) {
+        crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), va);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub(super) fn refresh_new_pte_fault(&self, va: usize) {
+        self.flush_user_page(va);
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -243,6 +263,15 @@ impl MmRef {
         self.lock().translate(vpn)
     }
 
+    pub(crate) fn try_pin_user_buffer(
+        &self,
+        ptr: *const u8,
+        len: usize,
+        access: MapPermission,
+    ) -> Result<UserBuffer, ()> {
+        self.lock().try_pin_user_buffer(ptr, len, access)
+    }
+
     /// 删除以 start_va 为起始地址的 MapArea。
     pub fn remove_area_with_start_vpn(&self, start_va: VirtAddr) {
         self.lock().remove_area_with_start_vpn(start_va);
@@ -268,9 +297,9 @@ impl MmRef {
     }
 
     /// fork：以 COW 方式克隆父进程地址空间，子进程与父进程共享物理页直到写操作。
-    pub fn from_existed_user_cow(parent: &Self) -> Self {
+    pub fn from_existed_user_cow(parent: &Self) -> Result<Self, ()> {
         let mut parent = parent.lock();
-        Self::new(MemorySet::from_existed_user_cow(&mut parent))
+        MemorySet::from_existed_user_cow(&mut parent).map(Self::new)
     }
 
     /// fork（LoongArch）：深拷贝父进程地址空间（不使用 COW）。

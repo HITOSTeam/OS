@@ -35,21 +35,28 @@ pub fn dump_system_state() {
             let in_rq = tcb
                 .in_ready_queue
                 .load(core::sync::atomic::Ordering::Acquire);
+            let ready_hart = tcb
+                .ready_queue_hart
+                .load(core::sync::atomic::Ordering::Acquire);
             let wp = tcb
                 .wakeup_pending
                 .load(core::sync::atomic::Ordering::Acquire);
-            let (status, exit_code) = if let Some(g) = tcb.try_borrow_mut() {
-                (Some(g.task_status), g.exit_code)
+            let (status, exit_code, has_res) = if let Some(g) = tcb.try_borrow_mut() {
+                (Some(g.task_status), g.exit_code, Some(g.res.is_some()))
             } else {
-                (None, None)
+                (None, None, None)
             };
             log::warn!(
-                "[watchdog]  tid={} status={:?} on_cpu={} in_rq={} wakeup_pending={} exit_code={:?}",
+                "[watchdog]  tid={} status={:?} res={:?} on_cpu={} ready_hart={} in_rq={} wakeup_pending={} exec={} retired={} exit_code={:?}",
                 tid,
                 status,
+                has_res,
                 on_cpu,
+                ready_hart,
                 in_rq,
                 wp,
+                tcb.exec_exit_requested(),
+                tcb.exit_lifecycle_retired(),
                 exit_code
             );
         }

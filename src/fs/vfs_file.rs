@@ -203,18 +203,20 @@ impl VfsOpenedFile {
             return Err(VfsError::IsDirectory);
         }
         let mut total = 0usize;
-        for segment in buffer.buffers.iter_mut() {
-            let output: &mut [u8] = segment;
-            match self.description.read(output) {
-                Ok(read) => {
-                    total += read;
-                    if read < output.len() {
-                        break;
-                    }
-                }
-                Err(_) if total != 0 => return Ok(total),
-                Err(error) => return Err(error),
+        let mut failure = None;
+        buffer.for_each_chunk_mut(|output| match self.description.read(output) {
+            Ok(read) => {
+                total += read;
+                read == output.len()
             }
+            Err(_) if total != 0 => false,
+            Err(error) => {
+                failure = Some(error);
+                false
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(total)
     }
@@ -224,18 +226,20 @@ impl VfsOpenedFile {
             return Err(VfsError::IsDirectory);
         }
         let mut total = 0usize;
-        for segment in buffer.buffers.iter() {
-            let input: &[u8] = segment;
-            match self.description.write(input) {
-                Ok(written) => {
-                    total += written;
-                    if written < input.len() {
-                        break;
-                    }
-                }
-                Err(_) if total != 0 => return Ok(total),
-                Err(error) => return Err(error),
+        let mut failure = None;
+        buffer.for_each_chunk(|input| match self.description.write(input) {
+            Ok(written) => {
+                total += written;
+                written == input.len()
             }
+            Err(_) if total != 0 => false,
+            Err(error) => {
+                failure = Some(error);
+                false
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(total)
     }
@@ -249,19 +253,21 @@ impl VfsOpenedFile {
             return Err(VfsError::IsDirectory);
         }
         let mut total = 0usize;
-        for segment in buffer.buffers.iter_mut() {
-            let output: &mut [u8] = segment;
-            match self.description.read_at(offset, output) {
-                Ok(read) => {
-                    total += read;
-                    offset = offset.saturating_add(read as u64);
-                    if read < output.len() {
-                        break;
-                    }
-                }
-                Err(_) if total != 0 => return Ok(total),
-                Err(error) => return Err(error),
+        let mut failure = None;
+        buffer.for_each_chunk_mut(|output| match self.description.read_at(offset, output) {
+            Ok(read) => {
+                total += read;
+                offset = offset.saturating_add(read as u64);
+                read == output.len()
             }
+            Err(_) if total != 0 => false,
+            Err(error) => {
+                failure = Some(error);
+                false
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(total)
     }
@@ -275,19 +281,21 @@ impl VfsOpenedFile {
             return Err(VfsError::IsDirectory);
         }
         let mut total = 0usize;
-        for segment in buffer.buffers.iter() {
-            let input: &[u8] = segment;
-            match self.description.write_at(offset, input) {
-                Ok(written) => {
-                    total += written;
-                    offset = offset.saturating_add(written as u64);
-                    if written < input.len() {
-                        break;
-                    }
-                }
-                Err(_) if total != 0 => return Ok(total),
-                Err(error) => return Err(error),
+        let mut failure = None;
+        buffer.for_each_chunk(|input| match self.description.write_at(offset, input) {
+            Ok(written) => {
+                total += written;
+                offset = offset.saturating_add(written as u64);
+                written == input.len()
             }
+            Err(_) if total != 0 => false,
+            Err(error) => {
+                failure = Some(error);
+                false
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(total)
     }
