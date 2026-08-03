@@ -185,6 +185,29 @@ pub(crate) fn resize_file_page_cache(dev: usize, ino: u32, file_size: usize) {
     backing::file_page_cache_resize(dev, ino, file_size);
 }
 
+/// Publish an ordinary-file VMA in the inode-local weak reverse index.
+///
+/// This is the small-kernel counterpart of Linux `address_space::i_mmap` and
+/// its VMA interval tree: later fd writes and i_size changes visit only mms
+/// that have mapped this inode, never the global process table.
+pub(crate) fn register_file_mmap(mm: &MmRef, dev: usize, ino: u32) {
+    backing::file_page_cache_register_mm(dev, ino, mm);
+}
+
+pub(crate) fn update_file_mmap_sizes(dev: usize, ino: u32, file_size: usize) {
+    resize_file_page_cache(dev, ino, file_size);
+    for mm in backing::file_page_cache_mapped_mms(dev, ino) {
+        let _ = mm.update_file_vm_size(dev, ino, file_size);
+    }
+}
+
+pub(crate) fn mirror_file_mmap_write(dev: usize, ino: u32, write_off: usize, data: &[u8]) {
+    update_file_page_cache(dev, ino, write_off, data);
+    for mm in backing::file_page_cache_mapped_mms(dev, ino) {
+        let _ = mm.mirror_shared_file_write(dev, ino, write_off, data);
+    }
+}
+
 pub(crate) fn reclaim_file_page_cache() -> usize {
     backing::file_page_cache_reclaim_unreferenced()
 }

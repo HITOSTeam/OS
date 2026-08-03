@@ -8,10 +8,9 @@ use crate::sync::WaitQueue;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct FilePageCacheKey {
+struct FilePageCacheInodeKey {
     dev: usize,
     ino: u32,
-    file_page: usize,
 }
 
 const FILE_PAGE_LOADING: u8 = 0;
@@ -56,6 +55,28 @@ enum FilePageCacheSlot {
     Ready(FrameTracker),
 }
 
+/// Per-inode page index, corresponding to Linux `inode->i_mapping->i_pages`.
+///
+/// The former single global `(dev, ino, page)` tree made unrelated rustc
+/// workers serialize on every cache write and made each truncate/growth scan
+/// every cached page in the system.  The outer table now only resolves the
+/// inode mapping; page lookup and invalidation use this inode-local lock.
+struct FilePageCacheMapping {
+    pages: Mutex<BTreeMap<usize, FilePageCacheSlot>>,
+    /// Weak reverse map corresponding to Linux `address_space::i_mmap`.
+    /// Stale entries are pruned opportunistically; they never retain an mm.
+    mmap_mms: Mutex<Vec<super::mm_ref::WeakMmRef>>,
+}
+
+impl FilePageCacheMapping {
+    fn new() -> Self {
+        Self {
+            pages: Mutex::new(BTreeMap::new()),
+            mmap_mms: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FilePageCacheLoadError {
     Oom,
@@ -73,13 +94,14 @@ struct SharedAnonPageKey {
 static NEXT_SHARED_ANON_ID: AtomicUsize = AtomicUsize::new(1);
 
 lazy_static::lazy_static! {
-    /// OSInode-backed regular-file page cache, keyed like Linux
-    /// `address_space::i_pages` by inode identity and page index.
+    /// OSInode-backed regular-file address spaces, keyed by inode identity.
     ///
-    /// Clean MAP_PRIVATE pages and MAP_SHARED pages both reference the same
-    /// frame.  A private write replaces that mapping through COW; memfd and
-    /// SysV shm keep using their own shared-frame stores.
-    static ref FILE_PAGE_CACHE: Mutex<BTreeMap<FilePageCacheKey, FilePageCacheSlot>> =
+    /// Each value owns an inode-local page tree. Clean MAP_PRIVATE pages and
+    /// MAP_SHARED pages both reference the same frame. A private write
+    /// replaces that mapping through COW; memfd and SysV shm keep using their
+    /// own shared-frame stores.
+    static ref FILE_PAGE_MAPPINGS:
+        Mutex<BTreeMap<FilePageCacheInodeKey, Arc<FilePageCacheMapping>>> =
         Mutex::new(BTreeMap::new());
     /// MAP_SHARED|MAP_ANONYMOUS 的 lazy 页缓存。
     ///
@@ -89,13 +111,46 @@ lazy_static::lazy_static! {
         Mutex::new(BTreeMap::new());
 }
 
-/// 用 (dev, ino, file_page) 构造缓存键。
-fn file_page_cache_key(dev: usize, ino: u32, file_page: usize) -> FilePageCacheKey {
-    FilePageCacheKey {
-        dev,
-        ino,
-        file_page,
+fn file_page_cache_inode_key(dev: usize, ino: u32) -> FilePageCacheInodeKey {
+    FilePageCacheInodeKey { dev, ino }
+}
+
+fn file_page_cache_mapping(
+    dev: usize,
+    ino: u32,
+    create: bool,
+) -> Option<Arc<FilePageCacheMapping>> {
+    let key = file_page_cache_inode_key(dev, ino);
+    let mut mappings = FILE_PAGE_MAPPINGS.lock();
+    if let Some(mapping) = mappings.get(&key) {
+        return Some(Arc::clone(mapping));
     }
+    if !create {
+        return None;
+    }
+    let mapping = Arc::new(FilePageCacheMapping::new());
+    mappings.insert(key, Arc::clone(&mapping));
+    Some(mapping)
+}
+
+pub(super) fn file_page_cache_register_mm(dev: usize, ino: u32, mm: &MmRef) {
+    let mapping = file_page_cache_mapping(dev, ino, true)
+        .expect("creating a regular-file mmap reverse index cannot fail");
+    let weak = mm.downgrade();
+    let mut mms = mapping.mmap_mms.lock();
+    mms.retain(super::mm_ref::WeakMmRef::is_alive);
+    if !mms.iter().any(|existing| existing.ptr_eq(&weak)) {
+        mms.push(weak);
+    }
+}
+
+pub(super) fn file_page_cache_mapped_mms(dev: usize, ino: u32) -> Vec<super::mm_ref::WeakMmRef> {
+    let Some(mapping) = file_page_cache_mapping(dev, ino, false) else {
+        return Vec::new();
+    };
+    let mut mms = mapping.mmap_mms.lock();
+    mms.retain(super::mm_ref::WeakMmRef::is_alive);
+    mms.clone()
 }
 
 fn shared_anon_page_key(id: u64, page: usize) -> SharedAnonPageKey {
@@ -121,14 +176,15 @@ pub(super) fn file_page_cache_get_or_load<F>(
 where
     F: FnOnce(&mut [u8]),
 {
-    let key = file_page_cache_key(dev, ino, file_page);
+    let mapping = file_page_cache_mapping(dev, ino, true)
+        .expect("creating a regular-file page-cache mapping cannot fail");
     let mut fill = Some(fill);
     let mut must_observe_published = false;
 
     loop {
         let loading = {
-            let cache = FILE_PAGE_CACHE.lock();
-            match cache.get(&key) {
+            let cache = mapping.pages.lock();
+            match cache.get(&file_page) {
                 Some(FilePageCacheSlot::Ready(frame)) => return Ok(frame.clone()),
                 Some(FilePageCacheSlot::Loading { state, .. }) => Some(Arc::clone(state)),
                 None if must_observe_published => {
@@ -152,13 +208,13 @@ where
         let candidate = frame_alloc().ok_or(FilePageCacheLoadError::Oom)?;
         let state = Arc::new(FilePageLoadState::new());
         let competing_load = {
-            let mut cache = FILE_PAGE_CACHE.lock();
-            match cache.get(&key) {
+            let mut cache = mapping.pages.lock();
+            match cache.get(&file_page) {
                 Some(FilePageCacheSlot::Ready(frame)) => return Ok(frame.clone()),
                 Some(FilePageCacheSlot::Loading { state, .. }) => Some(Arc::clone(state)),
                 None => {
                     cache.insert(
-                        key,
+                        file_page,
                         FilePageCacheSlot::Loading {
                             _frame: candidate.clone(),
                             state: Arc::clone(&state),
@@ -181,14 +237,14 @@ where
         fill.take().expect("file page fill called more than once")(candidate.ppn.get_bytes_array());
 
         let published = {
-            let mut cache = FILE_PAGE_CACHE.lock();
+            let mut cache = mapping.pages.lock();
             let owns_slot = matches!(
-                cache.get(&key),
+                cache.get(&file_page),
                 Some(FilePageCacheSlot::Loading { state: current, .. })
                     if Arc::ptr_eq(current, &state)
             );
             if owns_slot {
-                cache.insert(key, FilePageCacheSlot::Ready(candidate.clone()));
+                cache.insert(file_page, FilePageCacheSlot::Ready(candidate.clone()));
             }
             owns_slot
         };
@@ -236,6 +292,9 @@ pub(super) fn file_page_cache_write(dev: usize, ino: u32, write_off: usize, data
     if data.is_empty() {
         return;
     }
+    let Some(mapping) = file_page_cache_mapping(dev, ino, false) else {
+        return;
+    };
 
     let mut copied = 0usize;
     while copied < data.len() {
@@ -243,11 +302,10 @@ pub(super) fn file_page_cache_write(dev: usize, ino: u32, write_off: usize, data
         let file_page = file_off / PAGE_SIZE;
         let page_off = file_off & (PAGE_SIZE - 1);
         let chunk = core::cmp::min(PAGE_SIZE - page_off, data.len() - copied);
-        let key = file_page_cache_key(dev, ino, file_page);
         loop {
             let loading = {
-                let cache = FILE_PAGE_CACHE.lock();
-                match cache.get(&key) {
+                let cache = mapping.pages.lock();
+                match cache.get(&file_page) {
                     Some(FilePageCacheSlot::Ready(frame)) => {
                         frame.ppn.get_bytes_array()[page_off..page_off + chunk]
                             .copy_from_slice(&data[copied..copied + chunk]);
@@ -271,6 +329,9 @@ pub(super) fn file_page_cache_write(dev: usize, ino: u32, write_off: usize, data
 
 /// 文件 truncate 后同步缓存：EOF 页尾部清零，超出新 file_size 的缓存页全部丢弃。
 pub(super) fn file_page_cache_resize(dev: usize, ino: u32, file_size: usize) {
+    let Some(mapping) = file_page_cache_mapping(dev, ino, false) else {
+        return;
+    };
     let eof_page = file_size / PAGE_SIZE;
     let eof_off = file_size & (PAGE_SIZE - 1);
     let remove_from = if eof_off == 0 {
@@ -280,29 +341,26 @@ pub(super) fn file_page_cache_resize(dev: usize, ino: u32, file_size: usize) {
     };
 
     let mut invalidated = Vec::new();
-    let mut cache = FILE_PAGE_CACHE.lock();
+    let mut cache = mapping.pages.lock();
     // truncate 后 EOF 页尾清零，EOF 之后的缓存页必须丢弃，避免 shrink/grow 复用旧脏页。
     if eof_off != 0 {
-        let eof_key = file_page_cache_key(dev, ino, eof_page);
-        match cache.get(&eof_key) {
+        match cache.get(&eof_page) {
             Some(FilePageCacheSlot::Ready(frame)) => {
                 frame.ppn.get_bytes_array()[eof_off..PAGE_SIZE].fill(0);
             }
             Some(FilePageCacheSlot::Loading { state, .. }) => {
                 invalidated.push(Arc::clone(state));
-                cache.remove(&eof_key);
+                cache.remove(&eof_page);
             }
             None => {}
         }
     }
 
-    let stale_keys = cache
-        .keys()
-        .filter(|key| key.dev == dev && key.ino == ino && key.file_page >= remove_from)
-        .copied()
-        .collect::<Vec<_>>();
-    for key in stale_keys {
-        if let Some(FilePageCacheSlot::Loading { state, .. }) = cache.remove(&key) {
+    // `split_off` is O(log pages-for-this-inode), unlike the former full
+    // global-cache scan performed on every file growth or truncate.
+    let stale = cache.split_off(&remove_from);
+    for (_, slot) in stale {
+        if let FilePageCacheSlot::Loading { state, .. } = slot {
             invalidated.push(state);
         }
     }
@@ -318,17 +376,24 @@ pub(super) fn file_page_cache_resize(dev: usize, ino: u32, file_size: usize) {
 /// reclaim，因此在分配失败前只丢弃 refcount==1 的页，也就是仅由全局 cache
 /// 自己持有、没有 resident PTE/MapArea 继续使用的页。
 pub(super) fn file_page_cache_reclaim_unreferenced() -> usize {
-    let mut cache = FILE_PAGE_CACHE.lock();
-    let stale_keys = cache
-        .iter()
-        .filter_map(|(key, slot)| match slot {
-            FilePageCacheSlot::Ready(frame) if frame.refcount() <= 1 => Some(*key),
-            FilePageCacheSlot::Loading { .. } | FilePageCacheSlot::Ready(_) => None,
-        })
-        .collect::<Vec<_>>();
-    let reclaimed = stale_keys.len();
-    for key in stale_keys {
-        cache.remove(&key);
+    let mappings = {
+        let mappings = FILE_PAGE_MAPPINGS.lock();
+        mappings.values().cloned().collect::<Vec<_>>()
+    };
+    let mut reclaimed = 0usize;
+    for mapping in mappings {
+        let mut pages = mapping.pages.lock();
+        let stale_pages = pages
+            .iter()
+            .filter_map(|(page, slot)| match slot {
+                FilePageCacheSlot::Ready(frame) if frame.refcount() <= 1 => Some(*page),
+                FilePageCacheSlot::Loading { .. } | FilePageCacheSlot::Ready(_) => None,
+            })
+            .collect::<Vec<_>>();
+        reclaimed = reclaimed.saturating_add(stale_pages.len());
+        for page in stale_pages {
+            pages.remove(&page);
+        }
     }
     reclaimed
 }

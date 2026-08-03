@@ -1,6 +1,7 @@
 //! memoryset 多进程、多线程包装。
 use super::*;
 use crate::sync::{KernelMutex, KernelMutexGuard};
+use alloc::sync::Weak;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -94,18 +95,79 @@ pub struct MmRef {
     asid: Arc<AsidContext>,
 }
 
+/// Non-owning entry used by an inode's mmap reverse index.
+///
+/// Linux keeps VMAs in `address_space::i_mmap`.  A weak mm handle provides
+/// the same lifetime rule here: file metadata updates can find only address
+/// spaces that mapped the inode without keeping an exited mm alive.
+#[derive(Clone)]
+pub(super) struct WeakMmRef {
+    inner: Weak<MmState>,
+}
+
+impl WeakMmRef {
+    pub(super) fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(super) fn is_alive(&self) -> bool {
+        self.inner.strong_count() != 0
+    }
+
+    pub(super) fn update_file_vm_size(&self, dev: usize, ino: u32, file_size: usize) -> bool {
+        let Some(state) = self.inner.upgrade() else {
+            return false;
+        };
+        let mut memory_set = MmGuard {
+            guard: state.memory_set.lock(),
+            state: state.as_ref(),
+        };
+        memory_set.update_file_vm_size(dev, ino, file_size);
+        true
+    }
+
+    pub(super) fn mirror_shared_file_write(
+        &self,
+        dev: usize,
+        ino: u32,
+        write_off: usize,
+        data: &[u8],
+    ) -> bool {
+        let Some(state) = self.inner.upgrade() else {
+            return false;
+        };
+        let mut memory_set = MmGuard {
+            guard: state.memory_set.lock(),
+            state: state.as_ref(),
+        };
+        memory_set.mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
+        true
+    }
+}
+
 impl MmRef {
     /// 将 MemorySet 包装为 MmRef（用于进程创建时）。
     pub fn new(memory_set: MemorySet) -> Self {
         let token = memory_set.token();
         #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
         let asid = Arc::clone(&memory_set.asid);
-        Self {
+        let mm = Self {
             inner: Arc::new(MmState::new(memory_set)),
             fault_retry_lock: Arc::new(crate::sync::KernelMutex::new(())),
             token,
             #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
             asid,
+        };
+        let mapped_inodes = mm.lock().file_mapped_inode_keys();
+        for (dev, ino) in mapped_inodes {
+            super::register_file_mmap(&mm, dev, ino);
+        }
+        mm
+    }
+
+    pub(super) fn downgrade(&self) -> WeakMmRef {
+        WeakMmRef {
+            inner: Arc::downgrade(&self.inner),
         }
     }
 
@@ -192,7 +254,6 @@ impl MmRef {
         self.lock().has_writable_shared_memfd_mapping(memfd_id)
     }
 
-    /// 返回需要将 fd write 数据镜像到用户内存的 (va, src_offset, len) 列表。
     pub fn file_vm_copy_targets(
         &self,
         dev: usize,
@@ -203,12 +264,10 @@ impl MmRef {
         self.lock().file_vm_copy_targets(dev, ino, write_off, len)
     }
 
-    /// 文件大小变化后同步所有映射了该文件的 VMA（更新 sigbus_start 等）。
     pub fn update_file_vm_size(&self, dev: usize, ino: u32, file_size: usize) -> bool {
         self.lock().update_file_vm_size(dev, ino, file_size)
     }
 
-    /// fd write 后将数据镜像到所有共享文件映射的驻留页。
     pub fn mirror_shared_file_write_to_resident_mmaps(
         &self,
         dev: usize,

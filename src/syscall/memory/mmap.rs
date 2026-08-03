@@ -785,6 +785,9 @@ pub fn syscall_mmap(
         let clear_token = replace_existing.then_some(memory_set.token());
         (detached_shmids, clear_token)
     };
+    if file_backed {
+        crate::mm::register_file_mmap(&mm, file_dev, file_ino);
+    }
     let pid = process.getpid() as u32;
     if let Some(token) = fixed_packet_ring_token {
         crate::syscall::net::clear_packet_ring_mmaps_for_range(token, map_start, map_end);

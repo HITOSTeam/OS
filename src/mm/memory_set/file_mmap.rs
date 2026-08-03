@@ -6,11 +6,22 @@ use super::vma::VmRegion;
 use crate::config::PAGE_SIZE;
 use crate::fs::{File, OSInode};
 use crate::mm::{FrameTracker, PTEFlags, PhysAddr, PhysPageNum, VPNRange, VirtAddr, VirtPageNum};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 impl MemorySet {
+    /// Distinct ordinary-file inode identities currently represented by this
+    /// mm's VMA set.  MmRef uses this when publishing a newly created/forked
+    /// address space into each inode's reverse mmap index.
+    pub(super) fn file_mapped_inode_keys(&self) -> Vec<(usize, u32)> {
+        let mut keys = BTreeSet::new();
+        for region in self.vm_regions.iter().filter(|region| region.file_backed) {
+            keys.insert((region.file_dev, region.file_ino));
+        }
+        keys.into_iter().collect()
+    }
+
     /// 收集 [start, end) 内所有共享文件映射的 VmRegion。
     pub fn shared_file_vm_regions_overlapping(&self, start: usize, end: usize) -> Vec<VmRegion> {
         self.vm_regions
@@ -475,8 +486,9 @@ impl MemorySet {
         })
     }
 
-    /// 返回需要将 fd write 数据镜像到 MAP_SHARED 用户内存的
-    /// (va, src_offset, len) 列表。
+    /// Return MAP_SHARED virtual ranges that still use the legacy direct
+    /// write mirroring path. Kept until all filesystem writers use the
+    /// inode-local reverse mmap index.
     pub fn file_vm_copy_targets(
         &mut self,
         dev: usize,

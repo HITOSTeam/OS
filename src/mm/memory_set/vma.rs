@@ -606,12 +606,8 @@ impl VmRegionSet {
         true
     }
 
-    /// 找出所有 MAP_SHARED 映射了 (dev, ino) 文件
-    /// [write_off, write_off+len) 区段的 region，并返回需要同步写入的
-    /// (va, file_delta, len) 三元组列表。
-    ///
-    /// MAP_PRIVATE 的干净页通过 inode page cache 观察 fd write；已经 COW 的
-    /// 私有页必须保持匿名快照，不能再由这个旧的虚拟地址镜像路径覆盖。
+    /// Return MAP_SHARED ranges overlapping one file write for the legacy
+    /// direct user-address mirroring path.
     pub(super) fn file_copy_targets(
         &mut self,
         dev: usize,
