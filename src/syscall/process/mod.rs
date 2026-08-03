@@ -43,8 +43,8 @@ use crate::{
             remove_sched_timer_refs, select_hart_for_new_task, wakeup_task,
         },
         processor::{
-            block_current_and_run_next, current_files, current_files_and_nofile_limit,
-            current_process, current_task,
+            PreparedWait, block_current_and_run_next, current_files,
+            current_files_and_nofile_limit, current_process, current_task,
         },
         signal::{
             RT_SIG_MAX, SIG_DFL, SIG_IGN, SIGCHLD_NUM, SIGKILL_NUM, SIGSTOP_NUM,

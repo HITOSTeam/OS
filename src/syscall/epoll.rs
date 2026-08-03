@@ -13,9 +13,7 @@ use crate::{
     fs::{File, POLLIN, PollWaitQueue, wake_tasks},
     mm::{UserBuffer, try_read_user_value, try_write_user_value},
     task::{
-        processor::{
-            block_current_and_run_next, current_files, current_files_and_nofile_limit, current_task,
-        },
+        processor::{PreparedWait, current_files, current_files_and_nofile_limit, current_task},
         signal::{SIGKILL_NUM, SIGSTOP_NUM, has_wait_interrupting_pending, signal_bit},
         task_block::TaskControlBlock,
     },
@@ -559,6 +557,11 @@ fn epoll_wait_common(
             let mut visited = BTreeSet::new();
             ep.register_poll_waiter_internal(&task, &mut visited)
         };
+        // Linux ep_poll() installs its wait entry and sets TASK_INTERRUPTIBLE
+        // before the final readiness scan.  PreparedWait provides the same
+        // atomic hand-off against local timer preemption and remote wakeups.
+        let prepared =
+            waiter_armed.then(|| PreparedWait::new().expect("epoll wait lost its current task"));
 
         match should_block(&epoll_file, maxevents as usize, token, events_ptr) {
             Ok(ready) if ready > 0 => break ready,
@@ -576,18 +579,23 @@ fn epoll_wait_common(
             if sleep_ms == 0 {
                 sleep_ms = 1;
             }
-            let r = crate::syscall::thread::sys_sleep(sleep_ms);
-            if r == err(SyscallError::EINTR) {
-                let (pending, mask) = {
-                    let inner = task.borrow_mut();
-                    (inner.pending_signals, inner.signal_mask)
-                };
-                if has_wait_interrupting_pending(pending, mask) {
-                    break err(SyscallError::EINTR);
+            if let Some(prepared) = prepared {
+                crate::task::block_sleep::add_timer(Arc::clone(&task), sleep_ms);
+                prepared.sleep();
+            } else {
+                let r = crate::syscall::thread::sys_sleep(sleep_ms);
+                if r == err(SyscallError::EINTR) {
+                    let (pending, mask) = {
+                        let inner = task.borrow_mut();
+                        (inner.pending_signals, inner.signal_mask)
+                    };
+                    if has_wait_interrupting_pending(pending, mask) {
+                        break err(SyscallError::EINTR);
+                    }
                 }
             }
-        } else if waiter_armed {
-            block_current_and_run_next();
+        } else if let Some(prepared) = prepared {
+            prepared.sleep();
         } else {
             // We do not have wait-queue registration for all epoll targets yet,
             // so keep the task in a stable sleeping state long enough for

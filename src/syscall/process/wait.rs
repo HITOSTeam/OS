@@ -780,9 +780,14 @@ pub fn syscall_wait4(pid: isize, wstatus_ptr: usize, options: usize, _rusage: us
                 );
             }
         }
+        // Match Linux prepare_to_wait(): publish Blocked while the parent PCB
+        // lock still excludes child-exit publication, then retain irq-disable
+        // until the scheduler commit.  A concurrent exit after the lock is
+        // dropped is latched in wakeup_pending instead of being lost.
+        let prepared = PreparedWait::new().expect("wait4 lost its current task");
         drop(process_inner);
         checked_pending_signal = false;
-        block_current_and_run_next();
+        prepared.sleep();
     }
 }
 
@@ -1040,8 +1045,9 @@ pub fn syscall_waitid(idtype: usize, id: usize, infop: usize, options: usize) ->
                 );
             }
         }
+        let prepared = PreparedWait::new().expect("waitid lost its current task");
         drop(process_inner);
-        block_current_and_run_next();
+        prepared.sleep();
     }
 }
 

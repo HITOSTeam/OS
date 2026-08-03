@@ -28,6 +28,92 @@ use crate::{
 use alloc::{collections::VecDeque, sync::Arc, task, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::lazy_static;
+
+/// A Linux-style prepared sleep for condition wait queues.
+///
+/// The caller arms this token while still holding the lock that protects the
+/// wait condition, then drops that lock and calls [`PreparedWait::sleep`].
+/// Local interrupts remain disabled across that hand-off, so a timer
+/// preemption cannot turn the task back into `Running` between the final
+/// condition check and the scheduler commit.  A remote wakeup is retained in
+/// `wakeup_pending` and makes `sleep()` return without blocking.
+#[must_use = "a prepared wait must be slept or cancelled"]
+pub(crate) struct PreparedWait {
+    task: Arc<TaskControlBlock>,
+    irq_guard: Option<crate::sync::LocalIrqSaveGuard>,
+    armed: bool,
+}
+
+impl PreparedWait {
+    pub(crate) fn new() -> Option<Self> {
+        Self::with_irq_guard(crate::sync::LocalIrqSaveGuard::new())
+    }
+
+    pub(crate) fn with_irq_guard(irq_guard: crate::sync::LocalIrqSaveGuard) -> Option<Self> {
+        let task = current_task()?;
+        {
+            let _wakeup_guard = task.lock_wakeup_transition();
+            let mut inner = task.borrow_mut();
+            debug_assert_eq!(inner.task_status, TaskStatus::Running);
+            inner.task_status = TaskStatus::Blocked;
+        }
+        Some(Self {
+            task,
+            irq_guard: Some(irq_guard),
+            armed: true,
+        })
+    }
+
+    pub(crate) fn sleep(mut self) {
+        let wake_already_pending = {
+            let _wakeup_guard = self.task.lock_wakeup_transition();
+            let pending = self
+                .task
+                .wakeup_pending
+                .swap(false, core::sync::atomic::Ordering::AcqRel);
+            if pending {
+                self.task.wakeup_sync_hart.store(
+                    TaskControlBlock::OFF_CPU,
+                    core::sync::atomic::Ordering::Release,
+                );
+                let mut inner = self.task.borrow_mut();
+                inner.task_status = TaskStatus::Running;
+            }
+            pending
+        };
+        if wake_already_pending {
+            self.armed = false;
+            return;
+        }
+
+        self.armed = false;
+        block_prepared_current_and_run_next();
+    }
+}
+
+impl Drop for PreparedWait {
+    fn drop(&mut self) {
+        if self.armed {
+            let _wakeup_guard = self.task.lock_wakeup_transition();
+            let mut inner = self.task.borrow_mut();
+            if inner.task_status == TaskStatus::Blocked {
+                inner.task_status = TaskStatus::Running;
+            }
+            // Cancellation means the caller rechecked its condition and will
+            // keep running or return.  A wake latched while the token was
+            // armed is therefore already observed and must not leak into a
+            // later unrelated sleep.
+            self.task
+                .wakeup_pending
+                .store(false, core::sync::atomic::Ordering::Release);
+            self.task.wakeup_sync_hart.store(
+                TaskControlBlock::OFF_CPU,
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+        drop(self.irq_guard.take());
+    }
+}
 use log;
 use spin::Mutex;
 
@@ -1683,6 +1769,35 @@ pub fn suspend_current_and_run_next() {
 /// resource. Pending fatal signals are handled after the resource completes.
 pub fn suspend_current_and_run_next_uninterruptible() {
     suspend_current_and_run_next_impl(false);
+}
+
+/// Commit a task that was marked `Blocked` by [`PreparedWait`].
+///
+/// `PreparedWait` owns the irq-save guard across this call.  Do not perform
+/// signal checks or re-enable interrupts here: condition-wait callers check
+/// interruption before arming, and a signal arriving after arming sets
+/// `wakeup_pending`, which cancels or immediately reverses this sleep.
+fn block_prepared_current_and_run_next() {
+    let Some(task) = take_current_task() else {
+        return;
+    };
+    charge_task_runtime_for_scheduler(&task);
+
+    let mut task_inner = task.borrow_mut();
+    debug_assert_eq!(task_inner.task_status, TaskStatus::Blocked);
+    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
+    let has_user_res = task_inner.res.is_some();
+    task_inner.rr_ticks = 0;
+    drop(task_inner);
+
+    if has_user_res {
+        arch::save_user_fp_state(&task);
+    } else {
+        arch::discard_user_fp_state();
+    }
+    record_fair_sleep_lag(&task);
+    local_processor().lock().set_pending_blocked(task);
+    schedule(task_cx_ptr);
 }
 
 fn block_current_and_run_next_impl(interruptible: bool) {

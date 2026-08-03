@@ -14,7 +14,7 @@ use spin::Mutex as SpinMutex;
 
 use crate::task::{
     manager::{wakeup_task, wakeup_tasks},
-    processor::{block_current_and_run_next_uninterruptible, current_task},
+    processor::{PreparedWait, current_task},
     task_block::TaskControlBlock,
 };
 
@@ -76,19 +76,22 @@ impl WaitQueue {
                 core::hint::spin_loop();
                 continue;
             };
-            {
-                // Linux wait_queue_head uses spin_lock_irqsave because wakeups
-                // may come from a device hardirq.
-                let _irq_guard = LocalIrqSaveGuard::new();
-                let mut waiters = self.inner.lock();
-                if ready() {
-                    return;
-                }
-                if !waiters.iter().any(|waiter| Arc::ptr_eq(waiter, &task)) {
-                    waiters.push_back(task);
-                }
+            // Linux prepare_to_wait() adds the waiter and publishes the sleep
+            // state while holding the wait-queue lock.  Transfer the irq-save
+            // guard into PreparedWait so local preemption stays disabled until
+            // the task has either consumed a wakeup or committed to schedule.
+            let irq_guard = LocalIrqSaveGuard::new();
+            let mut waiters = self.inner.lock();
+            if ready() {
+                return;
             }
-            block_current_and_run_next_uninterruptible();
+            if !waiters.iter().any(|waiter| Arc::ptr_eq(waiter, &task)) {
+                waiters.push_back(task);
+            }
+            let prepared = PreparedWait::with_irq_guard(irq_guard)
+                .expect("kernel wait queue lost its current task");
+            drop(waiters);
+            prepared.sleep();
         }
     }
 

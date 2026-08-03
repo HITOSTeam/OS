@@ -10,7 +10,7 @@ use crate::{
     },
     task::{
         manager::pid2process,
-        processor::{block_current_and_run_next, current_files, current_process, current_task},
+        processor::{PreparedWait, current_files, current_process, current_task},
         signal::{SIGKILL_NUM, SIGSTOP_NUM, has_wait_interrupting_pending, signal_bit},
     },
     time::get_time,
@@ -414,6 +414,11 @@ pub fn syscall_ppoll(
             }
             waiter_armed = file.register_poll_waiter(&task) || waiter_armed;
         }
+        // Match Linux do_poll(): publish the sleeping task state before the
+        // final table scan.  Otherwise a timer preemption can make a waker see
+        // Ready just before this task resumes and blocks forever.
+        let prepared = (waiter_armed || (nfds == 0 && deadline_ns.is_none()))
+            .then(|| PreparedWait::new().expect("ppoll wait lost its current task"));
         let ready = scan_ready(&mut pfds, &poll_files);
         if ready != 0 {
             break ready;
@@ -437,7 +442,9 @@ pub fn syscall_ppoll(
             }
             if waiter_armed {
                 crate::task::block_sleep::add_timer(Arc::clone(&task), sleep_ms);
-                block_current_and_run_next();
+                prepared
+                    .expect("armed ppoll waiter has no prepared sleep")
+                    .sleep();
             } else {
                 let r = crate::syscall::thread::sys_sleep(sleep_ms);
                 if r == EINTR {
@@ -451,12 +458,16 @@ pub fn syscall_ppoll(
                 }
             }
         } else if nfds == 0 {
-            block_current_and_run_next();
+            prepared
+                .expect("fd-less ppoll wait has no prepared sleep")
+                .sleep();
         } else if waiter_armed {
             if net_timer_needed {
                 crate::task::block_sleep::add_timer(Arc::clone(&task), 1);
             }
-            block_current_and_run_next();
+            prepared
+                .expect("armed ppoll waiter has no prepared sleep")
+                .sleep();
         } else {
             crate::task::processor::suspend_current_and_run_next();
         }

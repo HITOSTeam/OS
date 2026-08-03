@@ -600,7 +600,18 @@ fn clone_from_parts(
     if (flags & CLONE_VFORK) != 0 {
         let parent_task = current_task().unwrap();
         loop {
-            let should_block = {
+            // Preserve the old interruptible-block semantics before arming the
+            // atomic wait.  Signals arriving after this check wake the token
+            // and are consumed on the next loop iteration.
+            if parent_task.exec_exit_requested() {
+                crate::task::processor::exit_current_and_run_next(0);
+            }
+            if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
+                crate::task::signal::log_signal_exit(msg);
+                crate::task::processor::exit_group_and_run_next(errno);
+            }
+
+            let prepared = {
                 let mut parent_inner = process.borrow_mut();
                 let inner = child.borrow_mut();
                 let done = inner.is_zombie || inner.did_exec;
@@ -610,22 +621,19 @@ fn clone_from_parts(
                         &mut parent_inner.vfork_wait_queue,
                         &parent_task,
                     );
-                    false
+                    None
                 } else {
                     super::wait::enqueue_waiter_once(
                         &mut parent_inner.vfork_wait_queue,
                         &parent_task,
                     );
-                    true
+                    Some(PreparedWait::new().expect("vfork wait lost its current task"))
                 }
             };
-            if !should_block {
-                parent_task
-                    .wakeup_pending
-                    .store(false, core::sync::atomic::Ordering::Release);
+            let Some(prepared) = prepared else {
                 break;
-            }
-            block_current_and_run_next();
+            };
+            prepared.sleep();
         }
         // 唤醒后清理等待队列残留，避免悬挂引用。
         {

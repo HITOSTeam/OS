@@ -19,7 +19,7 @@ use crate::{
     },
     task::{
         manager::pid2process,
-        processor::{current_files, current_process, current_task},
+        processor::{PreparedWait, current_files, current_process, current_task},
         runtime::{
             current_task_cpu_time_ns, process_cpu_time_ns, process_task_by_index, task_cpu_time_ns,
         },
@@ -1287,7 +1287,19 @@ pub fn syscall_pselect6(
                 // 没 deadline → block(等显式唤醒,减少无谓 busy 唤醒)。
                 crate::task::processor::suspend_current_and_run_next();
             } else {
-                crate::task::processor::block_current_and_run_next();
+                // Publish Blocked with local IRQs disabled, then recheck the
+                // signal condition.  This is the pselect equivalent of Linux
+                // set_current_state() before schedule(); it closes the window
+                // where a signal wake races with timer preemption.
+                let prepared = PreparedWait::new().expect("pselect wait lost its current task");
+                let (pending, mask) = {
+                    let inner = task.borrow_mut();
+                    (inner.pending_signals, inner.signal_mask)
+                };
+                if has_wait_interrupting_pending(pending, mask) {
+                    break err(SyscallError::EINTR);
+                }
+                prepared.sleep();
             }
         };
         // 退出快速路径前同样要恢复 ② 段临时替换的 signal_mask。
