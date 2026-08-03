@@ -64,6 +64,36 @@ impl PreparedWait {
         })
     }
 
+    /// Leave a prepared interruptible sleep for exec or fatal signal teardown.
+    ///
+    /// Linux's wait queues call `signal_pending_state()` before committing a
+    /// TASK_INTERRUPTIBLE/TASK_KILLABLE sleep.  Consequently SIGKILL from
+    /// `do_group_exit()` and the fatal signal used by `de_thread()` cannot be
+    /// consumed as an ordinary wake followed by another sleep.  Exec uses a
+    /// task-local token here, while ordinary group exit uses the pending signal
+    /// bitmap, so this boundary must check both forms of fatal teardown.
+    fn exit_for_fatal_teardown_if_requested(&mut self) {
+        // Taking TaskUserRes is the point of no return for thread exit. Exit
+        // cleanup itself may sleep while unmapping the old mm; waking that
+        // continuation must resume its original stack, not recursively enter
+        // exit_current_and_run_next() without the LiveThreadRetirement ticket.
+        // This is the same guard used by the ordinary block/suspend paths.
+        if self.task.borrow_mut().res.is_none() {
+            return;
+        }
+        if self.task.exec_exit_requested() {
+            self.armed = false;
+            drop(self.irq_guard.take());
+            exit_current_and_run_next(0);
+        }
+        if let Some((errno, msg)) = crate::task::signal::check_if_current_signals_error() {
+            self.armed = false;
+            drop(self.irq_guard.take());
+            crate::task::signal::log_signal_exit(msg);
+            exit_group_and_run_next(errno);
+        }
+    }
+
     pub(crate) fn sleep(mut self) {
         let wake_already_pending = {
             let _wakeup_guard = self.task.lock_wakeup_transition();
@@ -83,11 +113,20 @@ impl PreparedWait {
         };
         if wake_already_pending {
             self.armed = false;
+            self.exit_for_fatal_teardown_if_requested();
             return;
         }
 
+        // Close the interval between prepare_to_wait() and schedule(). If a
+        // fatal teardown won before the task committed the sleep, it must not
+        // enter the wait queue again.
+        self.exit_for_fatal_teardown_if_requested();
         self.armed = false;
         block_prepared_current_and_run_next();
+        // Fatal teardown can arrive after the pre-schedule check. Its wake
+        // makes block_prepared_current_and_run_next() return; consume it before
+        // the syscall's readiness loop can prepare another sleep.
+        self.exit_for_fatal_teardown_if_requested();
     }
 }
 
