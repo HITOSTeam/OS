@@ -606,54 +606,6 @@ impl VmRegionSet {
         true
     }
 
-    /// Return MAP_SHARED ranges overlapping one file write for the legacy
-    /// direct user-address mirroring path.
-    pub(super) fn file_copy_targets(
-        &mut self,
-        dev: usize,
-        ino: u32,
-        write_off: usize,
-        len: usize,
-    ) -> Vec<(usize, usize, usize)> {
-        let write_end = write_off.saturating_add(len);
-        let mut pending = Vec::new();
-        for region in self.regions.values_mut() {
-            if !region.shared
-                || !region.file_backed
-                || region.file_dev != dev
-                || region.file_ino != ino
-            {
-                continue;
-            }
-            let mapped_len = region.file_mapped_len();
-            let Some(region_file_end) = region.file_offset.checked_add(region.len) else {
-                continue;
-            };
-            let Some(mapped_file_end) = region.file_offset.checked_add(mapped_len) else {
-                continue;
-            };
-            let overlap_start = core::cmp::max(write_off, region.file_offset);
-            let overlap_end =
-                core::cmp::min(core::cmp::min(write_end, region_file_end), mapped_file_end);
-            if overlap_end <= overlap_start {
-                continue;
-            }
-            let new_valid_len = write_end
-                .saturating_sub(region.file_offset)
-                .min(mapped_len)
-                .min(region.len);
-            if new_valid_len > region.file_valid_len {
-                region.file_valid_len = new_valid_len;
-            }
-            pending.push((
-                region.start + (overlap_start - region.file_offset),
-                overlap_start - write_off,
-                overlap_end - overlap_start,
-            ));
-        }
-        pending
-    }
-
     /// 查找紧接在 fault_page 上方（fault_page + PAGE_SIZE）且带 MAP_GROWSDOWN 的 region，
     /// 用于栈向下扩展的 guard page fault 处理。
     pub(super) fn growsdown_candidate_before(&self, fault_page: usize) -> Option<VmRegion> {

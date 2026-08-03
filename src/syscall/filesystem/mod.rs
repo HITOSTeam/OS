@@ -20,13 +20,12 @@ use crate::{
         fanotify_permission_open, find_path_in_roots, inode_logical_path, inode_raw_logical_path,
         invalidate_ext4_path_cache_inode, make_pipe, mount_namespace_id, note_inode_path_hint,
         pin_legacy_file_path, pseudo_block_is_read_only, pseudo_block_note_sync,
-        register_deferred_unlink_cleanup, root_inode_for_device, with_ext4_inode_read,
+        reserve_deferred_unlink, root_inode_for_device, with_ext4_inode_read,
         with_ext4_inode_write, with_ext4_inode_write_set,
     },
     mm::{
         MapPermission, UserBuffer, translated_byte_buffer, translated_mutref, try_copy_from_user,
-        try_copy_to_user, try_copy_to_user_unchecked, try_current_user_buffer, try_read_user_value,
-        try_write_user_value,
+        try_copy_to_user, try_current_user_buffer, try_read_user_value, try_write_user_value,
     },
     task::processor::{
         block_current_and_run_next, current_files, current_files_and_nofile_limit, current_process,

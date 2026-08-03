@@ -486,21 +486,6 @@ impl MemorySet {
         })
     }
 
-    /// Return MAP_SHARED virtual ranges that still use the legacy direct
-    /// write mirroring path. Kept until all filesystem writers use the
-    /// inode-local reverse mmap index.
-    pub fn file_vm_copy_targets(
-        &mut self,
-        dev: usize,
-        ino: u32,
-        write_off: usize,
-        len: usize,
-    ) -> Vec<(usize, usize, usize)> {
-        let pending = self.vm_regions.file_copy_targets(dev, ino, write_off, len);
-        self.debug_assert_user_vm_invariants();
-        pending
-    }
-
     /// 将 data 写入已驻留的用户页（仅覆盖已 fault 的页，未 fault 页由后续 lazy fault 从文件读）。
     fn copy_to_resident_user_bytes(&self, start: usize, data: &[u8]) -> bool {
         // fd 写入只镜像已经 resident 的 mmap 页；未 fault 页由后续 lazy fault 读文件/cache。

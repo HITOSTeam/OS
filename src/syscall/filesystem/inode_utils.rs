@@ -1,18 +1,18 @@
 use super::{
-    AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, BTreeSet, FS_APPEND_FL,
-    FS_IMMUTABLE_FL, Mutex, OSInode, Ordering, PID2PCB, SIGXFSZ_NUM, String, SyscallError,
-    TMPFILE_SEQ, Vec, apply_chmod_to_vfs_path, clear_ext4_path_cache, current_effective_uid_gid,
-    current_files, current_fsuid_gid, current_in_group, current_process, current_timespec,
+    AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, Arc, AtPath, BTreeMap, FS_APPEND_FL, FS_IMMUTABLE_FL,
+    Mutex, OSInode, Ordering, SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec,
+    apply_chmod_to_vfs_path, clear_ext4_path_cache, current_effective_uid_gid, current_files,
+    current_fsuid_gid, current_in_group, current_process, current_timespec,
     empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_topology_lock,
     fchmod_fd_for_at_empty_path, get_current_token, inode_mode_allows_uid_gid,
     inode_visible_size_with_disk_size, map_vfs_error, queue_process_signal, read_user_cstring,
-    register_deferred_unlink_cleanup, resolve_at_inode, resolve_at_path, resolve_at_vfs_path,
+    reserve_deferred_unlink, resolve_at_inode, resolve_at_path, resolve_at_vfs_path,
     resolve_parent_and_name, resolve_parent_vfs_path, syscall_fchmod, try_copy_from_user,
-    try_copy_to_user_unchecked, with_ext4_inode_write, with_ext4_inode_write_set,
+    with_ext4_inode_write, with_ext4_inode_write_set,
 };
 use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{VfsMetadata, VfsNodeKind, VfsPath, VfsRenameFlags};
-use crate::mm::{resize_file_page_cache, update_file_page_cache};
+use crate::mm::{mirror_file_mmap_write, update_file_mmap_sizes};
 use alloc::vec;
 use lazy_static::lazy_static;
 
@@ -789,41 +789,10 @@ pub(crate) fn mirror_inode_write_to_current_mmaps(
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
     });
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
-    update_inode_mmaps_size_all_processes(dev, ino, file_size);
-    // 当前进程的 user-buffer write 可以直接对 MAP_SHARED 做旧路径镜像。
-    // MAP_PRIVATE 由 inode page cache + COW 保持 Linux 语义。
-    let copies: Vec<(usize, usize, usize)> = {
-        let process = current_process();
-        let memory_set = process.memory_set();
-        memory_set.update_file_vm_size(dev, ino, file_size);
-        memory_set.file_vm_copy_targets(dev, ino, write_off, len)
-    };
-    if !copies.is_empty() {
-        let token = get_current_token();
-        let mut tmp = [0u8; 1024];
-        for (dst, src_off, total) in copies {
-            let mut done = 0usize;
-            while done < total {
-                let chunk = core::cmp::min(tmp.len(), total - done);
-                if try_copy_from_user(
-                    token,
-                    (user_src + src_off + done) as *const u8,
-                    &mut tmp[..chunk],
-                )
-                .is_err()
-                {
-                    return;
-                }
-                if try_copy_to_user_unchecked(token, (dst + done) as *mut u8, &tmp[..chunk])
-                    .is_err()
-                {
-                    return;
-                }
-                done += chunk;
-            }
-        }
-    }
-    // 其他 mm 不能使用当前 token 写用户地址，只能先拷贝到内核缓冲再广播。
+    update_inode_mmap_sizes(dev, ino, file_size);
+    // Page-cache frames are shared by resident MAP_SHARED PTEs.  Copy once
+    // into the cache, then use the inode-local reverse index only for VMA
+    // metadata and legacy resident aliases; never scan every process.
     mirror_inode_write_to_shared_mmaps_all_processes(dev, ino, write_off, user_src, len);
 }
 
@@ -834,14 +803,6 @@ fn mirror_inode_write_to_shared_mmaps_all_processes(
     user_src: usize,
     len: usize,
 ) {
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    if processes.is_empty() {
-        return;
-    }
-
     let token = get_current_token();
     let mut tmp = [0u8; 1024];
     let mut done = 0usize;
@@ -850,19 +811,10 @@ fn mirror_inode_write_to_shared_mmaps_all_processes(
         if try_copy_from_user(token, (user_src + done) as *const u8, &mut tmp[..chunk]).is_err() {
             return;
         }
-        // 同步全局 cache 和所有已 resident 的 MAP_SHARED 页。
-        update_file_page_cache(dev, ino, write_off + done, &tmp[..chunk]);
-        for process in processes.iter() {
-            let Some(memory_set) = process.try_memory_set() else {
-                continue;
-            };
-            memory_set.mirror_shared_file_write_to_resident_mmaps(
-                dev,
-                ino,
-                write_off + done,
-                &tmp[..chunk],
-            );
-        }
+        // Linux reaches mapped VMAs through address_space::i_mmap.  Our
+        // inode-local weak reverse index likewise avoids scanning PID2PCB for
+        // every write to an ordinary, usually-unmapped compiler output file.
+        mirror_file_mmap_write(dev, ino, write_off + done, &tmp[..chunk]);
         done += chunk;
     }
 }
@@ -881,35 +833,14 @@ pub(crate) fn mirror_inode_kernel_write_to_shared_mmaps(
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
     });
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
-    update_inode_mmaps_size_all_processes(dev, ino, file_size);
+    update_inode_mmap_sizes(dev, ino, file_size);
     // sendfile/splice/copy_file_range 等 kernel-buffer 写入也要同步 mmap 视图。
-    update_file_page_cache(dev, ino, write_off, data);
-
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    for process in processes.iter() {
-        let Some(memory_set) = process.try_memory_set() else {
-            continue;
-        };
-        memory_set.mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
-    }
+    mirror_file_mmap_write(dev, ino, write_off, data);
 }
 
-fn update_inode_mmaps_size_all_processes(dev: usize, ino: u32, file_size: usize) {
-    // inode size 是全局事实，所有 mm 的 file_valid_len/SIGBUS tail 都要更新。
-    resize_file_page_cache(dev, ino, file_size);
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    for process in processes {
-        let Some(memory_set) = process.try_memory_set() else {
-            continue;
-        };
-        memory_set.update_file_vm_size(dev, ino, file_size);
-    }
+fn update_inode_mmap_sizes(dev: usize, ino: u32, file_size: usize) {
+    // inode size 是全局事实，只需更新实际映射该 inode 的 mm。
+    update_file_mmap_sizes(dev, ino, file_size);
 }
 
 pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
@@ -917,11 +848,7 @@ pub(crate) fn update_current_inode_mmaps_size(inode: &Arc<ext4_fs::Inode>) {
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
     });
     let file_size = inode_visible_size_with_disk_size(inode, disk_size);
-    update_inode_mmaps_size_all_processes(dev, ino, file_size);
-    let process = current_process();
-    process
-        .memory_set()
-        .update_file_vm_size(dev, ino, file_size);
+    update_inode_mmap_sizes(dev, ino, file_size);
 }
 
 pub(crate) fn update_current_os_inode_mmaps_size(os_inode: &OSInode) {
@@ -930,11 +857,7 @@ pub(crate) fn update_current_os_inode_mmaps_size(os_inode: &OSInode) {
         (inode.device_id(), inode.inode_num(), inode.size() as usize)
     });
     let file_size = inode_visible_size_with_disk_size(&inode, disk_size);
-    update_inode_mmaps_size_all_processes(dev, ino, file_size);
-    let process = current_process();
-    process
-        .memory_set()
-        .update_file_vm_size(dev, ino, file_size);
+    update_inode_mmap_sizes(dev, ino, file_size);
 }
 
 /// Linux `pread64(2)` (syscall 67 on riscv64).
@@ -978,54 +901,17 @@ pub(crate) fn flush_open_inode_views(target: &Arc<ext4_fs::Inode>) {
     }
 }
 
-pub(crate) fn has_open_inode_view(target: &Arc<ext4_fs::Inode>) -> bool {
-    let target_ino = target.inode_num();
-    let target_dev = target.device_id();
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    let mut seen_tables = BTreeSet::new();
-    for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            // Cannot inspect this process — conservatively report the inode
-            // as open so the caller defers the unlink rather than deleting
-            // a file that may still be in use.
-            return true;
-        };
-        let table = Arc::clone(&inner.files);
-        drop(inner);
-        if !seen_tables.insert(Arc::as_ptr(&table) as usize) {
-            continue;
-        }
-        if table
-            .lock()
-            .iter_files_snapshot()
-            .into_iter()
-            .any(|(_fd, file)| {
-                file.as_any()
-                    .downcast_ref::<OSInode>()
-                    .map(|o| {
-                        let inode = o.ext4_inode();
-                        inode.inode_num() == target_ino && inode.device_id() == target_dev
-                    })
-                    .unwrap_or(false)
-            })
-        {
-            return true;
-        }
-    }
-    false
-}
-
 pub(crate) fn defer_unlink_open_file(
     parent: &Arc<ext4_fs::Inode>,
     name: &str,
     child: &Arc<ext4_fs::Inode>,
 ) -> Result<bool, isize> {
-    if !child.is_file() || !has_open_inode_view(child) {
+    if !child.is_file() {
         return Ok(false);
     }
+    let Some(reservation) = reserve_deferred_unlink(child) else {
+        return Ok(false);
+    };
     let pid = current_process().getpid();
     for _ in 0..64 {
         let seq = TMPFILE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1036,7 +922,7 @@ pub(crate) fn defer_unlink_open_file(
         clear_ext4_path_cache();
         match parent.rename(name, &hidden) {
             Ok(_) => {
-                register_deferred_unlink_cleanup(child, Arc::clone(parent), hidden);
+                reservation.commit(Arc::clone(parent), hidden);
                 return Ok(true);
             }
             Err(e) => return Err(ext4_err_to_errno(e)),

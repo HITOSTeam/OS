@@ -6,8 +6,7 @@ use crate::drivers::BLOCK_DEVICES;
 use crate::mm::UserBuffer;
 use crate::println;
 use crate::sync::{KernelMutex, KernelMutexGuard, KernelRwSemaphore};
-use crate::task::manager::PID2PCB;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -38,7 +37,7 @@ lazy_static! {
         Mutex<BTreeMap<(usize, u32), Weak<KernelRwSemaphore<()>>>> =
         Mutex::new(BTreeMap::new());
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-    static ref DEFERRED_UNLINK_CLEANUP: Mutex<BTreeMap<(usize, u32), TmpfileCleanup>> =
+    static ref INODE_LIFETIMES: Mutex<BTreeMap<(usize, u32), InodeLifetimeState>> =
         Mutex::new(BTreeMap::new());
     static ref INODE_PATH_HINTS: Mutex<BTreeMap<(usize, u32), String>> =
         Mutex::new(BTreeMap::new());
@@ -411,6 +410,135 @@ struct TmpfileCleanup {
     name: String,
 }
 
+#[derive(Default)]
+struct InodeLifetimeState {
+    /// Number of live open file descriptions for this on-disk inode.
+    ///
+    /// This deliberately counts `OSInode` objects rather than descriptor
+    /// slots.  `dup()` and `fork()` share one description, while epoll and
+    /// SCM_RIGHTS references can keep a description alive after its last fd
+    /// slot disappears, matching Linux's `struct file` lifetime model.
+    open_descriptions: usize,
+    /// An unlink reserves the lifetime before renaming the target to its
+    /// hidden compatibility name.  This closes the last-close-vs-rename race
+    /// without holding this short spin lock across ext4 I/O.
+    unlink_reservations: usize,
+    /// Hidden names waiting for the last open description to disappear.
+    /// One inode can have multiple dentries (hard links), and more than one
+    /// of those names may be unlinked while the inode remains open.
+    deferred_cleanups: Vec<TmpfileCleanup>,
+}
+
+fn cleanup_deferred_unlink(cleanup: TmpfileCleanup) {
+    let parent_lock = ext4_inode_lock(&cleanup.parent);
+    let _parent_guard = parent_lock.write();
+    let child = cleanup.parent.find(&cleanup.name);
+    let child_lock = child.as_ref().map(|child| ext4_inode_lock(child));
+    let _child_guard = child_lock.as_ref().map(|lock| lock.write());
+    if cleanup.parent.unlink(&cleanup.name).is_ok() {
+        clear_ext4_path_cache();
+    }
+}
+
+fn register_open_inode_description(key: (usize, u32)) {
+    let mut lifetimes = INODE_LIFETIMES.lock();
+    let state = lifetimes.entry(key).or_default();
+    state.open_descriptions = state.open_descriptions.saturating_add(1);
+}
+
+fn unregister_open_inode_description(key: (usize, u32)) -> Vec<TmpfileCleanup> {
+    let mut lifetimes = INODE_LIFETIMES.lock();
+    let (cleanups, remove_entry) = {
+        let state = lifetimes
+            .get_mut(&key)
+            .expect("open inode description lifetime is not registered");
+        debug_assert!(state.open_descriptions > 0);
+        state.open_descriptions = state.open_descriptions.saturating_sub(1);
+        let cleanups = if state.open_descriptions == 0 && state.unlink_reservations == 0 {
+            core::mem::take(&mut state.deferred_cleanups)
+        } else {
+            Vec::new()
+        };
+        let remove_entry = state.open_descriptions == 0
+            && state.unlink_reservations == 0
+            && state.deferred_cleanups.is_empty();
+        (cleanups, remove_entry)
+    };
+    if remove_entry {
+        lifetimes.remove(&key);
+    }
+    cleanups
+}
+
+/// Reservation covering the gap between deciding that an open inode must be
+/// preserved and publishing its hidden-name cleanup record.
+///
+/// Linux does not need this compatibility rename: the VFS inode and dentry
+/// references naturally keep an unlinked inode alive.  Until ext4-fs exposes
+/// that lifetime directly, this token supplies the same atomicity without the
+/// former O(processes * fds) scan on every unlink.
+pub(crate) struct DeferredUnlinkReservation {
+    key: (usize, u32),
+    active: bool,
+}
+
+impl DeferredUnlinkReservation {
+    fn finish(&mut self, new_cleanup: Option<TmpfileCleanup>) -> Vec<TmpfileCleanup> {
+        let mut lifetimes = INODE_LIFETIMES.lock();
+        let (cleanups, remove_entry) = {
+            let state = lifetimes
+                .get_mut(&self.key)
+                .expect("deferred unlink lifetime is not registered");
+            debug_assert!(state.unlink_reservations > 0);
+            state.unlink_reservations = state.unlink_reservations.saturating_sub(1);
+            if let Some(cleanup) = new_cleanup {
+                state.deferred_cleanups.push(cleanup);
+            }
+            let cleanups = if state.open_descriptions == 0 && state.unlink_reservations == 0 {
+                core::mem::take(&mut state.deferred_cleanups)
+            } else {
+                Vec::new()
+            };
+            let remove_entry = state.open_descriptions == 0
+                && state.unlink_reservations == 0
+                && state.deferred_cleanups.is_empty();
+            (cleanups, remove_entry)
+        };
+        if remove_entry {
+            lifetimes.remove(&self.key);
+        }
+        self.active = false;
+        cleanups
+    }
+
+    pub(crate) fn commit(mut self, parent: Arc<Inode>, name: String) {
+        for cleanup in self.finish(Some(TmpfileCleanup { parent, name })) {
+            cleanup_deferred_unlink(cleanup);
+        }
+    }
+}
+
+impl Drop for DeferredUnlinkReservation {
+    fn drop(&mut self) {
+        if self.active {
+            for cleanup in self.finish(None) {
+                cleanup_deferred_unlink(cleanup);
+            }
+        }
+    }
+}
+
+pub(crate) fn reserve_deferred_unlink(inode: &Inode) -> Option<DeferredUnlinkReservation> {
+    let key = (inode.device_id(), inode.inode_num());
+    let mut lifetimes = INODE_LIFETIMES.lock();
+    let state = lifetimes.get_mut(&key)?;
+    if state.open_descriptions == 0 {
+        return None;
+    }
+    state.unlink_reservations = state.unlink_reservations.saturating_add(1);
+    Some(DeferredUnlinkReservation { key, active: true })
+}
+
 /// The OS inode inner
 pub struct OSInodeInner {
     offset: usize,
@@ -629,6 +757,7 @@ impl OSInode {
                 read_buf: Vec::new(),
             })
         });
+        register_open_inode_description((inode_device_id, inode_num));
         Ok(Self {
             flock_owner_id: NEXT_FLOCK_OWNER_ID.fetch_add(1, Ordering::Relaxed),
             open_fd_refs: AtomicUsize::new(0),
@@ -1076,77 +1205,6 @@ impl OSInode {
 
     pub fn set_dir_offset(&self, offset: usize) {
         self.inner.lock().dir_offset = offset;
-    }
-}
-
-pub(crate) fn register_deferred_unlink_cleanup(
-    inode: &Arc<Inode>,
-    parent: Arc<Inode>,
-    name: String,
-) {
-    let key = (inode.device_id(), inode.inode_num());
-    DEFERRED_UNLINK_CLEANUP
-        .lock()
-        .insert(key, TmpfileCleanup { parent, name });
-}
-
-fn has_open_inode_fd_refs(device_id: usize, inode_num: u32) -> bool {
-    let processes = {
-        let map = PID2PCB.lock();
-        map.values().cloned().collect::<Vec<_>>()
-    };
-    let mut seen_tables = BTreeSet::new();
-    for process in processes {
-        let Some(inner) = process.try_borrow_mut() else {
-            // Cannot inspect this process (lock held) — conservatively assume
-            // it may reference the inode.  The cleanup will be retried on the
-            // next OSInode::drop for the same inode.
-            return true;
-        };
-        let files = Arc::clone(&inner.files);
-        drop(inner);
-        if !seen_tables.insert(Arc::as_ptr(&files) as usize) {
-            continue;
-        }
-        if files
-            .lock()
-            .iter_files_snapshot()
-            .into_iter()
-            .any(|(_fd, file)| {
-                file.as_any()
-                    .downcast_ref::<OSInode>()
-                    .map(|o| {
-                        let inode = o.ext4_inode();
-                        inode.inode_num() == inode_num && inode.device_id() == device_id
-                    })
-                    .unwrap_or(false)
-            })
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Attempt to clean up any lingering deferred-unlink entries whose inodes
-/// no longer have open file descriptors.  Called opportunistically after a
-/// successful cleanup to prevent orphan accumulation.
-fn sweep_deferred_unlinks() {
-    let keys: Vec<(usize, u32)> = { DEFERRED_UNLINK_CLEANUP.lock().keys().cloned().collect() };
-    for key in keys {
-        // Only proceed if we can definitively confirm no refs remain.
-        if !has_open_inode_fd_refs(key.0, key.1) {
-            if let Some(cleanup) = DEFERRED_UNLINK_CLEANUP.lock().remove(&key) {
-                let parent_lock = ext4_inode_lock(&cleanup.parent);
-                let _parent_guard = parent_lock.write();
-                let child = cleanup.parent.find(&cleanup.name);
-                let child_lock = child.as_ref().map(|child| ext4_inode_lock(child));
-                let _child_guard = child_lock.as_ref().map(|lock| lock.write());
-                if cleanup.parent.unlink(&cleanup.name).is_ok() {
-                    clear_ext4_path_cache();
-                }
-            }
-        }
     }
 }
 
@@ -1663,26 +1721,8 @@ impl Drop for OSInode {
                 clear_ext4_path_cache();
             }
         }
-        let deferred_cleanup = { DEFERRED_UNLINK_CLEANUP.lock().remove(&inode_key) };
-        if let Some(cleanup) = deferred_cleanup {
-            if has_open_inode_fd_refs(inode_key.0, inode_key.1) {
-                DEFERRED_UNLINK_CLEANUP.lock().insert(inode_key, cleanup);
-            } else {
-                if {
-                    let parent_lock = ext4_inode_lock(&cleanup.parent);
-                    let _parent_guard = parent_lock.write();
-                    let child = cleanup.parent.find(&cleanup.name);
-                    let child_lock = child.as_ref().map(|child| ext4_inode_lock(child));
-                    let _child_guard = child_lock.as_ref().map(|lock| lock.write());
-                    cleanup.parent.unlink(&cleanup.name)
-                }
-                .is_ok()
-                {
-                    clear_ext4_path_cache();
-                }
-                // Opportunistically clean up other lingering deferred entries.
-                sweep_deferred_unlinks();
-            }
+        for cleanup in unregister_open_inode_description(inode_key) {
+            cleanup_deferred_unlink(cleanup);
         }
         let key = {
             let mut write_open = self.write_open.lock();

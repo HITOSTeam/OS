@@ -254,31 +254,6 @@ impl MmRef {
         self.lock().has_writable_shared_memfd_mapping(memfd_id)
     }
 
-    pub fn file_vm_copy_targets(
-        &self,
-        dev: usize,
-        ino: u32,
-        write_off: usize,
-        len: usize,
-    ) -> Vec<(usize, usize, usize)> {
-        self.lock().file_vm_copy_targets(dev, ino, write_off, len)
-    }
-
-    pub fn update_file_vm_size(&self, dev: usize, ino: u32, file_size: usize) -> bool {
-        self.lock().update_file_vm_size(dev, ino, file_size)
-    }
-
-    pub fn mirror_shared_file_write_to_resident_mmaps(
-        &self,
-        dev: usize,
-        ino: u32,
-        write_off: usize,
-        data: &[u8],
-    ) {
-        self.lock()
-            .mirror_shared_file_write_to_resident_mmaps(dev, ino, write_off, data);
-    }
-
     /// 为栈区插入 Framed 映射（exec 时建立初始栈使用）。
     pub fn try_insert_stack_framed_range(
         &self,

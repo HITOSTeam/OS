@@ -151,7 +151,7 @@ pub use memory_set::{
 };
 pub(crate) use memory_set::{
     allocate_shared_anon_id, mirror_file_mmap_write, reclaim_file_page_cache, register_file_mmap,
-    resize_file_page_cache, update_file_mmap_sizes, update_file_page_cache,
+    update_file_mmap_sizes,
 };
 pub use page_table::{PTEFlags, PageTable, PageWalkCache};
 pub use page_table::{
