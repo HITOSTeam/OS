@@ -3,7 +3,6 @@
 
 use super::{PhysAddr, PhysPageNum};
 use crate::{config::phys_mem_end, println, sync::LocalIrqSaveGuard};
-use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{
@@ -159,7 +158,13 @@ pub struct StackFrameAllocator {
     current: usize,
     end: usize,
     recycled: Vec<usize>,
-    recycled_set: BTreeSet<usize>,
+    /// One bit per physical page, set while the page is on `recycled`.
+    ///
+    /// The old BTreeSet allocated and freed one heap node for every frame
+    /// recycle operation while holding FRAME_ALLOCATOR. Linux keeps buddy/free
+    /// state in preallocated `struct page` metadata; this bitmap is the minimal
+    /// equivalent needed for O(1) double-free validation in this allocator.
+    recycled_bitmap: Vec<usize>,
     managed_pages: usize,
 }
 
@@ -169,19 +174,66 @@ impl StackFrameAllocator {
         self.current = l.0;
         self.end = r.0;
         self.managed_pages = r.0.saturating_sub(l.0);
+        self.ensure_recycled_bitmap(r.0);
     }
 
     pub fn add_range(&mut self, l: PhysPageNum, r: PhysPageNum) {
         if r <= l {
             return;
         }
-        self.managed_pages = self.managed_pages.saturating_add(r.0.saturating_sub(l.0));
+        let pages = r.0.saturating_sub(l.0);
+        self.managed_pages = self.managed_pages.saturating_add(pages);
+        self.ensure_recycled_bitmap(r.0);
+        self.recycled.reserve(pages);
         for ppn in l.0..r.0 {
-            if !self.recycled_set.insert(ppn) {
+            if !self.mark_recycled(ppn) {
                 panic!("Frame ppn={:#x} has already been recycled!", ppn);
             }
             self.recycled.push(ppn);
         }
+    }
+
+    fn ensure_recycled_bitmap(&mut self, end_ppn: usize) {
+        const BITS: usize = usize::BITS as usize;
+        let words = end_ppn.saturating_add(BITS - 1) / BITS;
+        self.recycled_bitmap.resize(words, 0);
+    }
+
+    fn is_recycled(&self, ppn: usize) -> bool {
+        const BITS: usize = usize::BITS as usize;
+        let word = ppn / BITS;
+        let mask = 1usize << (ppn % BITS);
+        self.recycled_bitmap
+            .get(word)
+            .is_some_and(|bits| (*bits & mask) != 0)
+    }
+
+    /// Mark `ppn` free, returning false when it was already on the free stack.
+    fn mark_recycled(&mut self, ppn: usize) -> bool {
+        const BITS: usize = usize::BITS as usize;
+        let word = ppn / BITS;
+        let mask = 1usize << (ppn % BITS);
+        let bits = self
+            .recycled_bitmap
+            .get_mut(word)
+            .expect("frame ppn lies outside recycled bitmap");
+        let was_free = (*bits & mask) != 0;
+        *bits |= mask;
+        !was_free
+    }
+
+    /// Mark a recycled page allocated, returning false on free-stack corruption.
+    fn take_recycled(&mut self, ppn: usize) -> bool {
+        const BITS: usize = usize::BITS as usize;
+        let word = ppn / BITS;
+        let mask = 1usize << (ppn % BITS);
+        let bits = self
+            .recycled_bitmap
+            .get_mut(word)
+            .expect("frame ppn lies outside recycled bitmap");
+        let was_free = (*bits & mask) != 0;
+        *bits &= !mask;
+        was_free
     }
 
     pub fn alloc_contiguous(&mut self, pages: usize) -> Option<PhysPageNum> {
@@ -202,13 +254,17 @@ impl FrameAllocator for StackFrameAllocator {
             current: 0,
             end: 0,
             recycled: Vec::new(),
-            recycled_set: BTreeSet::new(),
+            recycled_bitmap: Vec::new(),
             managed_pages: 0,
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
         if let Some(ppn) = self.recycled.pop() {
-            self.recycled_set.remove(&ppn);
+            assert!(
+                self.take_recycled(ppn),
+                "Frame ppn={:#x} was on the free stack without a free bit!",
+                ppn
+            );
             Some(ppn.into())
         } else if self.current == self.end {
             None
@@ -220,11 +276,11 @@ impl FrameAllocator for StackFrameAllocator {
     fn dealloc(&mut self, ppn: PhysPageNum) {
         let ppn = ppn.0;
         // validity check
-        if ppn >= self.current || self.recycled_set.contains(&ppn) {
+        if ppn >= self.current || self.is_recycled(ppn) {
             panic!("Frame ppn={:#x} has not been allocated!", ppn);
         }
         // recycle
-        self.recycled_set.insert(ppn);
+        assert!(self.mark_recycled(ppn));
         self.recycled.push(ppn);
     }
 }
