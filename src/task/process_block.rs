@@ -2231,25 +2231,14 @@ impl ProcessControlBlock {
         let signals_actions = parent.signals_actions.clone();
         let argv = parent.argv.clone();
         let parent_memory_set = parent.memory_set.clone();
-        let parent_tasks = parent
-            .tasks
-            .iter()
-            .filter_map(|task| task.as_ref().map(Arc::clone))
-            .collect::<Vec<_>>();
+        // Linux keeps signal_struct::nr_threads up to date and reads that
+        // counter in fork/exec paths instead of walking and locking every
+        // task in the thread group. `live_threads` is the corresponding
+        // lifecycle counter here; TaskUserRes cleanup retires the thread.
+        let thread_count = self.live_thread_count();
         let parent_main_task = parent.tasks.first().and_then(|task| task.as_ref()).cloned();
         drop(parent);
 
-        let thread_count = parent_tasks
-            .iter()
-            .filter(|task| task.borrow_mut().res.is_some())
-            .count();
-        if thread_count != 1 {
-            log::warn!(
-                "[fork] pid={} thread_count={} (forking only current thread)",
-                self.getpid(),
-                thread_count
-            );
-        }
         let parent_ustack_base = caller_task_res.map(|(_, base)| base).unwrap_or_else(|| {
             parent_main_task
                 .expect("fork parent has no main task")
