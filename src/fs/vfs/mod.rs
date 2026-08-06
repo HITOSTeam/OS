@@ -188,8 +188,10 @@ mod tests {
     use super::*;
     use alloc::{
         collections::BTreeMap,
+        format,
         string::{String, ToString},
         sync::{Arc, Weak},
+        vec::Vec,
     };
     use core::any::Any;
     use spin::RwLock;
@@ -387,6 +389,161 @@ mod tests {
             LookupFlags(flags),
             VfsCredentials::default(),
         )
+    }
+
+    /// A positive cache entry owns the reusable dentry, while second-chance
+    /// reclaim bounds that ownership and releases invalidated objects without
+    /// leaving a `Weak` Arc allocation behind.
+    #[test]
+    fn positive_dentry_cache_retains_hot_entries_and_reclaims_cold_ones() {
+        let fs = TestFs::new(10);
+        fs.add(&fs.root, "a", 2, VfsNodeKind::Regular);
+        fs.add(&fs.root, "b", 3, VfsNodeKind::Regular);
+        fs.add(&fs.root, "c", 4, VfsNodeKind::Regular);
+        let root = fs.root_dentry();
+        let cache = PositiveDentryCache::with_capacity(2);
+
+        let a = cache.lookup(&root, "a").unwrap();
+        let weak_a = Arc::downgrade(&a);
+        let a_id = a.id();
+        drop(a);
+        assert_eq!(cache.lookup(&root, "a").unwrap().id(), a_id);
+
+        let b = cache.lookup(&root, "b").unwrap();
+        let weak_b = Arc::downgrade(&b);
+        drop(b);
+        // Mark `a` referenced after `b` entered the clock.  Inserting `c`
+        // gives `a` its second chance and reclaims the cold `b` entry.
+        drop(cache.lookup(&root, "a").unwrap());
+        drop(cache.lookup(&root, "c").unwrap());
+        assert!(weak_a.upgrade().is_some());
+        assert!(weak_b.upgrade().is_none());
+        assert_eq!(cache.len(), 2);
+
+        cache.invalidate(&root, "a");
+        assert!(weak_a.upgrade().is_none());
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// Stable inode identity deduplicates keys across reconstructed parent
+    /// dentries, but a cached child must never carry an obsolete parent chain
+    /// across rename/invalidation-style reconstruction.
+    #[test]
+    fn positive_dentry_cache_replaces_children_of_a_reconstructed_parent() {
+        let fs = TestFs::new(10);
+        let directory = fs.add(&fs.root, "dir", 2, VfsNodeKind::Directory);
+        fs.add(&directory, "child", 3, VfsNodeKind::Regular);
+        let root = fs.root_dentry();
+        let cache = PositiveDentryCache::with_capacity(8);
+
+        let old_parent = cache.lookup(&root, "dir").unwrap();
+        let old_child = cache.lookup(&old_parent, "child").unwrap();
+        cache.invalidate(&root, "dir");
+
+        let new_parent = cache.lookup(&root, "dir").unwrap();
+        assert_ne!(old_parent.id(), new_parent.id());
+        let new_child = cache.lookup(&new_parent, "child").unwrap();
+        assert_ne!(old_child.id(), new_child.id());
+        assert_eq!(
+            new_child.parent().expect("child has parent").id(),
+            new_parent.id()
+        );
+        // `dir` and `child` each occupy one stable key; the obsolete child
+        // was replaced rather than accumulated under a fresh dentry ID.
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// A full hot cache must not turn one foreground miss into an O(capacity)
+    /// write-lock hold. The reclaim budget is deliberately much smaller than
+    /// this test cache so the forced fallback path is exercised.
+    #[test]
+    fn positive_dentry_cache_bounds_all_hot_reclaim_scan() {
+        const CAPACITY: usize = 128;
+        let fs = TestFs::new(10);
+        let names = (0..CAPACITY)
+            .map(|index| format!("entry-{index}"))
+            .collect::<Vec<_>>();
+        for (index, name) in names.iter().enumerate() {
+            fs.add(&fs.root, name, index as u64 + 2, VfsNodeKind::Regular);
+        }
+        let root = fs.root_dentry();
+        let cache = PositiveDentryCache::with_capacity(CAPACITY);
+        for name in &names {
+            drop(cache.lookup(&root, name).unwrap());
+        }
+        for name in &names {
+            drop(cache.lookup(&root, name).unwrap());
+        }
+
+        let scans = cache.reclaim_one_for_test();
+        assert_eq!(scans, 64);
+        assert_eq!(cache.len(), CAPACITY - 1);
+    }
+
+    /// Cached children own their parent dentry. Reclaim a cache-only leaf
+    /// before that parent so the eviction both frees memory and preserves the
+    /// reusable parent identity.
+    #[test]
+    fn positive_dentry_cache_reclaims_child_before_child_owned_parent() {
+        let fs = TestFs::new(10);
+        let directory = fs.add(&fs.root, "dir", 2, VfsNodeKind::Directory);
+        fs.add(&directory, "child", 3, VfsNodeKind::Regular);
+        fs.add(&fs.root, "other", 4, VfsNodeKind::Regular);
+        let root = fs.root_dentry();
+        let cache = PositiveDentryCache::with_capacity(2);
+
+        let parent = cache.lookup(&root, "dir").unwrap();
+        let parent_id = parent.id();
+        let child = cache.lookup(&parent, "child").unwrap();
+        let weak_child = Arc::downgrade(&child);
+        drop(child);
+        drop(parent);
+
+        drop(cache.lookup(&root, "other").unwrap());
+        assert!(weak_child.upgrade().is_none());
+        assert_eq!(cache.lookup(&root, "dir").unwrap().id(), parent_id);
+    }
+
+    /// The bounded scanner also supports the smallest legal cache. Holding
+    /// its only candidate as the deterministic fallback temporarily empties
+    /// the clock and must not attempt another pop.
+    #[test]
+    fn positive_dentry_cache_reclaims_one_entry_hot_cache() {
+        let fs = TestFs::new(10);
+        fs.add(&fs.root, "a", 2, VfsNodeKind::Regular);
+        let root = fs.root_dentry();
+        let cache = PositiveDentryCache::with_capacity(1);
+        drop(cache.lookup(&root, "a").unwrap());
+        drop(cache.lookup(&root, "a").unwrap());
+
+        assert_eq!(cache.reclaim_one_for_test(), 1);
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// Invalidation leaves metadata-only clock records behind. A later insert
+    /// drops that stale record without evicting an unrelated live dentry.
+    #[test]
+    fn positive_dentry_cache_discards_stale_clock_record_first() {
+        let fs = TestFs::new(10);
+        for (name, id) in [("a", 2), ("b", 3), ("c", 4), ("d", 5)] {
+            fs.add(&fs.root, name, id, VfsNodeKind::Regular);
+        }
+        let root = fs.root_dentry();
+        let cache = PositiveDentryCache::with_capacity(3);
+        let a = cache.lookup(&root, "a").unwrap();
+        let b = cache.lookup(&root, "b").unwrap();
+        let c = cache.lookup(&root, "c").unwrap();
+        let weak_a = Arc::downgrade(&a);
+        let weak_b = Arc::downgrade(&b);
+        let weak_c = Arc::downgrade(&c);
+        drop((a, b, c));
+
+        cache.invalidate(&root, "a");
+        assert!(weak_a.upgrade().is_none());
+        drop(cache.lookup(&root, "d").unwrap());
+        assert!(weak_b.upgrade().is_some());
+        assert!(weak_c.upgrade().is_some());
+        assert_eq!(cache.len(), 3);
     }
 
     /// 验证绝对/相对路径、`.`、`..` 和文本符号链接的基础 REF-walk。

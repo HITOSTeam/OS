@@ -34,6 +34,18 @@ static ICACHE_DEFERRED_FENCES: AtomicU64 = AtomicU64::new(0);
 static ICACHE_REMOTE_FENCES: AtomicU64 = AtomicU64::new(0);
 static ICACHE_REMOTE_TARGETS: AtomicU64 = AtomicU64::new(0);
 
+static DCACHE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_REVALIDATED_HITS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_BACKEND_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_INSERTIONS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_REPLACEMENTS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_CLOCK_SCANS: AtomicU64 = AtomicU64::new(0);
+static DCACHE_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static DCACHE_PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
 #[inline]
 #[allow(dead_code)]
 pub fn enabled() -> bool {
@@ -167,6 +179,77 @@ pub fn record_icache_remote_fence(targets: usize) {
     ICACHE_REMOTE_TARGETS.fetch_add(targets as u64, Ordering::Relaxed);
 }
 
+#[inline]
+pub fn record_dcache_lookup() {
+    if DEBUG_PERF {
+        DCACHE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_dcache_backend_lookup() {
+    if DEBUG_PERF {
+        DCACHE_BACKEND_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_dcache_hit(revalidated: bool) {
+    if !DEBUG_PERF {
+        return;
+    }
+    DCACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    if revalidated {
+        DCACHE_REVALIDATED_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_dcache_insert(replacing: bool) {
+    if !DEBUG_PERF {
+        return;
+    }
+    DCACHE_INSERTIONS.fetch_add(1, Ordering::Relaxed);
+    if replacing {
+        DCACHE_REPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let entries = DCACHE_ENTRIES.fetch_add(1, Ordering::Relaxed) + 1;
+    DCACHE_PEAK_ENTRIES.fetch_max(entries, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_dcache_invalidations(count: usize) {
+    if !DEBUG_PERF || count == 0 {
+        return;
+    }
+    DCACHE_INVALIDATIONS.fetch_add(count as u64, Ordering::Relaxed);
+    DCACHE_ENTRIES.fetch_sub(count as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_dcache_drop(count: usize) {
+    if DEBUG_PERF && count != 0 {
+        DCACHE_ENTRIES.fetch_sub(count as u64, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_dcache_eviction() {
+    if !DEBUG_PERF {
+        return;
+    }
+    DCACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+    DCACHE_ENTRIES.fetch_sub(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_dcache_clock_scan() {
+    if DEBUG_PERF {
+        DCACHE_CLOCK_SCANS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn dump() -> String {
     if !DEBUG_PERF {
         return String::from("perf disabled (set DEBUG_PERF=true)\n");
@@ -193,6 +276,17 @@ pub fn dump() -> String {
     let icache_deferred_fences = ICACHE_DEFERRED_FENCES.load(Ordering::Relaxed);
     let icache_remote_fences = ICACHE_REMOTE_FENCES.load(Ordering::Relaxed);
     let icache_remote_targets = ICACHE_REMOTE_TARGETS.load(Ordering::Relaxed);
+    let dcache_lookups = DCACHE_LOOKUPS.load(Ordering::Relaxed);
+    let dcache_hits = DCACHE_HITS.load(Ordering::Relaxed);
+    let dcache_revalidated_hits = DCACHE_REVALIDATED_HITS.load(Ordering::Relaxed);
+    let dcache_backend_lookups = DCACHE_BACKEND_LOOKUPS.load(Ordering::Relaxed);
+    let dcache_insertions = DCACHE_INSERTIONS.load(Ordering::Relaxed);
+    let dcache_replacements = DCACHE_REPLACEMENTS.load(Ordering::Relaxed);
+    let dcache_invalidations = DCACHE_INVALIDATIONS.load(Ordering::Relaxed);
+    let dcache_evictions = DCACHE_EVICTIONS.load(Ordering::Relaxed);
+    let dcache_clock_scans = DCACHE_CLOCK_SCANS.load(Ordering::Relaxed);
+    let dcache_entries = DCACHE_ENTRIES.load(Ordering::Relaxed);
+    let dcache_peak_entries = DCACHE_PEAK_ENTRIES.load(Ordering::Relaxed);
     let (cache_hits, cache_misses) = ext4_fs::cache_stats();
     let cache_total = cache_hits.saturating_add(cache_misses);
     let cache_hit_pct = if cache_total == 0 {
@@ -224,6 +318,17 @@ icache_local_fences: {icache_local_fences}\n\
 icache_deferred_fences: {icache_deferred_fences}\n\
 icache_remote_fences: {icache_remote_fences}\n\
 icache_remote_targets: {icache_remote_targets}\n\
+dcache_lookups: {dcache_lookups}\n\
+dcache_hits: {dcache_hits}\n\
+dcache_revalidated_hits: {dcache_revalidated_hits}\n\
+dcache_backend_lookups: {dcache_backend_lookups}\n\
+dcache_insertions: {dcache_insertions}\n\
+dcache_replacements: {dcache_replacements}\n\
+dcache_invalidations: {dcache_invalidations}\n\
+dcache_evictions: {dcache_evictions}\n\
+dcache_clock_scans: {dcache_clock_scans}\n\
+dcache_entries: {dcache_entries}\n\
+dcache_peak_entries: {dcache_peak_entries}\n\
 ext4_cache_hits: {cache_hits}\n\
 ext4_cache_misses: {cache_misses}\n\
 ext4_cache_hit_pct: {cache_hit_pct}\n"
