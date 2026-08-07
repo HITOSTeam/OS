@@ -3,12 +3,12 @@ use super::{
     S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, SyscallError, VfsOpenedFile, align_up,
     apply_umask, current_effective_uid_gid, current_fsuid_gid, current_process,
     defer_unlink_open_file, do_renameat, do_renameat_exchange, dt_type_from_ext4, err,
-    ext4_err_to_errno, ext4_inode_lock, final_non_empty_component, get_current_token, get_fd_file,
-    gid_for_created_inode, inode_is_immutable_or_append, inode_mode_allows_uid_gid,
-    invalidate_ext4_path_cache_inode, invalidate_vfs_parent_entry, map_vfs_error,
-    maybe_update_inode_atime, min, mode_for_created_file, parent_forces_gid_inherit, read_u16_le,
-    read_u32_le, read_user_cstring, resolve_at_inode, resolve_at_path, resolve_at_vfs_path,
-    resolve_parent_and_name, resolve_parent_vfs_path, sticky_rename_allowed,
+    ext4_begin_namespace_mutation, ext4_err_to_errno, ext4_inode_lock, final_non_empty_component,
+    get_current_token, get_fd_file, gid_for_created_inode, inode_is_immutable_or_append,
+    inode_mode_allows_uid_gid, invalidate_ext4_path_cache_inode, invalidate_vfs_parent_entry,
+    map_vfs_error, maybe_update_inode_atime, min, mode_for_created_file, parent_forces_gid_inherit,
+    read_u16_le, read_u32_le, read_user_cstring, resolve_at_inode, resolve_at_path,
+    resolve_at_vfs_path, resolve_parent_and_name, resolve_parent_vfs_path, sticky_rename_allowed,
     translated_byte_buffer, try_copy_to_user, vfs_at_path_is_process_root,
 };
 use crate::fs::ext4::Ext4VfsNode;
@@ -187,6 +187,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
     if !inode_mode_allows_uid_gid(&parent, 3, fsuid, fsgid) {
         return err(SyscallError::EACCES);
     }
+    ext4_begin_namespace_mutation(&parent);
     match parent.create_symlink(&name, &target_path) {
         Ok(inode) => {
             let gid = gid_for_created_inode(Some(&parent), fsgid);
@@ -346,6 +347,7 @@ pub fn syscall_linkat(
     if parent.device_id() != source.device_id() {
         return err(SyscallError::EXDEV);
     }
+    ext4_begin_namespace_mutation(&parent);
     match parent.link_inode(&name, &source) {
         Ok(_) => 0,
         Err(ext4_fs::Ext4Error::Unsupported) => err(SyscallError::EPERM),
@@ -532,6 +534,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     let perm_bits = apply_umask(mode) & 0o7777;
     let create_mode = mode_for_created_file(file_type | perm_bits, gid);
 
+    ext4_begin_namespace_mutation(&parent);
     let create_result = match file_type {
         S_IFREG => parent.create_file(&name),
         S_IFIFO | S_IFSOCK => parent.create_special(&name, create_mode, 0),
@@ -637,6 +640,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     if parent.find(&name).is_some() {
         return err(SyscallError::EEXIST);
     }
+    ext4_begin_namespace_mutation(&parent);
     match parent.create_dir(&name) {
         Ok(dir) => {
             let gid = gid_for_created_inode(Some(&parent), fsgid);
@@ -812,6 +816,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
         }
     }
 
+    ext4_begin_namespace_mutation(&parent);
     match parent.unlink(&name) {
         Ok(_) => {
             invalidate_ext4_path_cache_inode(&child);

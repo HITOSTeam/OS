@@ -27,7 +27,15 @@ pub enum VfsLink {
 /// used in cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DentryCachePolicy {
+    /// Namespace mutations are fully mediated by the VFS and explicitly
+    /// invalidate affected dentries.
     Stable,
+    /// The backend publishes a per-directory namespace generation before any
+    /// child-name mutation.  A matching generation makes the cached positive
+    /// authoritative without repeating the filesystem lookup.
+    Versioned(usize),
+    /// Dynamic namespaces whose contents can change without a local mutation
+    /// notification must validate every positive lookup with the backend.
     Revalidate,
 }
 

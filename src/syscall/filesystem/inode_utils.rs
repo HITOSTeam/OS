@@ -3,8 +3,8 @@ use super::{
     Mutex, OSInode, Ordering, SIGXFSZ_NUM, String, SyscallError, TMPFILE_SEQ, Vec,
     apply_chmod_to_vfs_path, clear_ext4_path_cache, current_effective_uid_gid, current_files,
     current_fsuid_gid, current_in_group, current_process, current_timespec,
-    empty_path_fd_for_at_op, err, ext4_err_to_errno, ext4_topology_lock,
-    fchmod_fd_for_at_empty_path, get_current_token, inode_mode_allows_uid_gid,
+    empty_path_fd_for_at_op, err, ext4_begin_namespace_mutation, ext4_err_to_errno,
+    ext4_topology_lock, fchmod_fd_for_at_empty_path, get_current_token, inode_mode_allows_uid_gid,
     inode_visible_size_with_disk_size, map_vfs_error, queue_process_signal, read_user_cstring,
     reserve_deferred_unlink, resolve_at_inode, resolve_at_path, resolve_at_vfs_path,
     resolve_parent_and_name, resolve_parent_vfs_path, syscall_fchmod, try_copy_from_user,
@@ -265,6 +265,7 @@ pub(crate) fn sticky_rename_allowed(
 }
 
 pub(crate) fn remove_rename_target(parent: &Arc<ext4_fs::Inode>, name: &str) -> isize {
+    ext4_begin_namespace_mutation(parent);
     match parent.unlink(name) {
         Ok(()) => {
             clear_ext4_path_cache();
@@ -624,9 +625,11 @@ pub(crate) fn do_renameat(
                         return rc;
                     }
                 }
+                ext4_begin_namespace_mutation(&new_parent);
                 if let Err(e) = new_parent.link_inode(&new_name, &source) {
                     return ext4_err_to_errno(e);
                 }
+                ext4_begin_namespace_mutation(&old_parent);
                 if let Err(e) = old_parent.unlink(&old_name) {
                     let _ = new_parent.unlink(&new_name);
                     return ext4_err_to_errno(e);
@@ -640,6 +643,7 @@ pub(crate) fn do_renameat(
                     return rc;
                 }
             }
+            ext4_begin_namespace_mutation(&old_parent);
             match old_parent.rename(&old_name, &new_name) {
                 Ok(_) => 0,
                 Err(e) => ext4_err_to_errno(e),
@@ -737,6 +741,10 @@ pub(crate) fn do_renameat_exchange(
             }
 
             clear_ext4_path_cache();
+            ext4_begin_namespace_mutation(&old_parent);
+            if !inode_eq(&old_parent, &new_parent) {
+                ext4_begin_namespace_mutation(&new_parent);
+            }
             if let Err(e) = old_parent.link_inode(&tmp_name, &old_inode) {
                 return ext4_err_to_errno(e);
             }
@@ -920,6 +928,7 @@ pub(crate) fn defer_unlink_open_file(
             continue;
         }
         clear_ext4_path_cache();
+        ext4_begin_namespace_mutation(parent);
         match parent.rename(name, &hidden) {
             Ok(_) => {
                 reservation.commit(Arc::clone(parent), hidden);

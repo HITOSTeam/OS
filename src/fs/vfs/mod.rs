@@ -193,7 +193,10 @@ mod tests {
         sync::{Arc, Weak},
         vec::Vec,
     };
-    use core::any::Any;
+    use core::{
+        any::Any,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
     use spin::RwLock;
 
     /// 每个测试文件系统实例有独立 ID 和根 node。
@@ -216,6 +219,9 @@ mod tests {
                     metadata: RwLock::new(test_metadata(VfsNodeKind::Directory, 0o755)),
                     children: RwLock::new(BTreeMap::new()),
                     link: RwLock::new(None),
+                    versioned: AtomicBool::new(false),
+                    namespace_generation: AtomicUsize::new(0),
+                    lookup_count: AtomicUsize::new(0),
                 });
                 let vfs_state = VfsFileSystemState::new(Arc::clone(&root) as Arc<dyn VfsNode>);
                 Self {
@@ -247,6 +253,9 @@ mod tests {
                 )),
                 children: RwLock::new(BTreeMap::new()),
                 link: RwLock::new(None),
+                versioned: AtomicBool::new(false),
+                namespace_generation: AtomicUsize::new(0),
+                lookup_count: AtomicUsize::new(0),
             });
             parent
                 .children
@@ -310,6 +319,9 @@ mod tests {
         metadata: RwLock<VfsMetadata>,
         children: RwLock<BTreeMap<String, Arc<TestNode>>>,
         link: RwLock<Option<TestLink>>,
+        versioned: AtomicBool,
+        namespace_generation: AtomicUsize,
+        lookup_count: AtomicUsize,
     }
 
     /// 实现路径遍历所需的最小 node 接口。
@@ -330,7 +342,16 @@ mod tests {
             Ok(*self.metadata.read())
         }
 
+        fn dentry_cache_policy(&self) -> DentryCachePolicy {
+            if self.versioned.load(Ordering::Acquire) {
+                DentryCachePolicy::Versioned(self.namespace_generation.load(Ordering::Acquire))
+            } else {
+                DentryCachePolicy::Stable
+            }
+        }
+
         fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
+            self.lookup_count.fetch_add(1, Ordering::Relaxed);
             if self.metadata.read().kind != VfsNodeKind::Directory {
                 return Err(VfsError::NotDirectory);
             }
@@ -451,6 +472,31 @@ mod tests {
         // `dir` and `child` each occupy one stable key; the obsolete child
         // was replaced rather than accumulated under a fresh dentry ID.
         assert_eq!(cache.len(), 2);
+    }
+
+    /// A versioned local directory skips backend lookup while its namespace
+    /// generation is unchanged, then revalidates and replaces exactly the
+    /// affected positive after a mutation publishes a new generation.
+    #[test]
+    fn versioned_dentry_cache_revalidates_after_directory_mutation() {
+        let fs = TestFs::new(10);
+        fs.root.versioned.store(true, Ordering::Release);
+        fs.add(&fs.root, "file", 2, VfsNodeKind::Regular);
+        let root = fs.root_dentry();
+        let cache = PositiveDentryCache::with_capacity(8);
+
+        let old = cache.lookup(&root, "file").unwrap();
+        assert_eq!(fs.root.lookup_count.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.lookup(&root, "file").unwrap().id(), old.id());
+        assert_eq!(fs.root.lookup_count.load(Ordering::Relaxed), 1);
+
+        fs.root.namespace_generation.fetch_add(1, Ordering::Release);
+        fs.add(&fs.root, "file", 3, VfsNodeKind::Regular);
+        let new = cache.lookup(&root, "file").unwrap();
+        assert_eq!(fs.root.lookup_count.load(Ordering::Relaxed), 2);
+        assert_eq!(new.node().node_id(), 3);
+        assert_ne!(new.id(), old.id());
+        assert_eq!(cache.len(), 1);
     }
 
     /// A full hot cache must not turn one foreground miss into an O(capacity)

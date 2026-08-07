@@ -7,17 +7,18 @@ use super::{
     O_RDWR, O_TMPFILE, O_TRUNC, O_WRONLY, OSInode, Ordering, S_IFBLK, S_IFCHR, S_IFMT,
     SyscallError, TMPFILE_SEQ, VfsOpenedFile, apply_umask, clear_ext4_path_cache,
     current_effective_uid_gid, current_files, current_files_and_nofile_limit, current_fsuid_gid,
-    current_process, err, ext4_err_to_errno, ext4_inode_lock, fanotify_notify_close,
-    fanotify_notify_open, fanotify_permission_open, fifo_pipe_state_for_inode, file_lock_key,
-    file_lock_key_from_inode, get_current_token, gid_for_created_inode, inode_mode_allows,
-    inode_mode_allows_uid_gid, install_open_file_fd, invalidate_vfs_parent_entry,
-    is_privileged_or_owner, make_pipe, map_vfs_error, maybe_signal_lease_break,
-    mode_for_created_file, note_inode_path_hint, pin_legacy_file_path, read_user_cstring,
-    remove_owner_file_lease_for_key, remove_process_record_locks_for_key, resolve_abs_path,
-    resolve_at_inode_with_vfs_path_flags, resolve_at_path, resolve_at_vfs_path_with_flags,
-    resolve_openat2_path, resolve_parent_and_name_with_flags, resolve_parent_vfs_path_with_flags,
-    root_inode_for_device, set_inode_all_times_now, touch_inode_mtime_ctime_now,
-    truncate_regular_inode, try_copy_from_user, try_write_user_value, with_ext4_inode_read,
+    current_process, err, ext4_begin_namespace_mutation, ext4_err_to_errno, ext4_inode_lock,
+    fanotify_notify_close, fanotify_notify_open, fanotify_permission_open,
+    fifo_pipe_state_for_inode, file_lock_key, file_lock_key_from_inode, get_current_token,
+    gid_for_created_inode, inode_mode_allows, inode_mode_allows_uid_gid, install_open_file_fd,
+    invalidate_vfs_parent_entry, is_privileged_or_owner, make_pipe, map_vfs_error,
+    maybe_signal_lease_break, mode_for_created_file, note_inode_path_hint, pin_legacy_file_path,
+    read_user_cstring, remove_owner_file_lease_for_key, remove_process_record_locks_for_key,
+    resolve_abs_path, resolve_at_inode_with_vfs_path_flags, resolve_at_path,
+    resolve_at_vfs_path_with_flags, resolve_openat2_path, resolve_parent_and_name_with_flags,
+    resolve_parent_vfs_path_with_flags, root_inode_for_device, set_inode_all_times_now,
+    touch_inode_mtime_ctime_now, truncate_regular_inode, try_copy_from_user, try_write_user_value,
+    with_ext4_inode_read,
 };
 use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{LookupFlags, VfsMetadata, VfsNodeKind, VfsOpenOptions, VfsPath};
@@ -589,6 +590,7 @@ fn do_openat(
             }
             existing
         } else {
+            ext4_begin_namespace_mutation(&fs_root);
             match fs_root.create_dir(pool_name) {
                 Ok(d) => {
                     clear_ext4_path_cache();
@@ -611,6 +613,7 @@ fn do_openat(
             if pool_dir.find(&name).is_some() {
                 continue;
             }
+            ext4_begin_namespace_mutation(&pool_dir);
             match pool_dir.create_file(&name) {
                 Ok(i) => {
                     let child_lock = ext4_inode_lock(&i);
@@ -663,6 +666,7 @@ fn do_openat(
             }
             return err(SyscallError::EACCES);
         }
+        ext4_begin_namespace_mutation(&parent);
         inode = match parent.create_file(&name) {
             Ok(i) => {
                 let created_gid = gid_for_created_inode(Some(&parent), fsgid);

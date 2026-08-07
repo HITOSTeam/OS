@@ -92,6 +92,9 @@ impl DentryKey {
 
 struct CachedDentry {
     dentry: Arc<Dentry>,
+    /// Namespace generation of the parent directory when this positive was
+    /// validated. `None` is used by Stable and always-Revalidate backends.
+    parent_generation: Option<usize>,
     /// Set by shared-lock lookup and consumed by the reclaim clock.
     referenced: AtomicBool,
 }
@@ -152,26 +155,42 @@ impl PositiveDentryCache {
     pub fn lookup(&self, parent: &Arc<Dentry>, name: &str) -> VfsResult<Arc<Dentry>> {
         crate::perf::record_dcache_lookup();
         let key = DentryKey::new(parent, name);
-        if parent.node().dentry_cache_policy() == DentryCachePolicy::Stable
-            && let Some(found) = self.cached_for_parent(&key, parent, None)
-        {
-            return Ok(found);
+        let policy = parent.node().dentry_cache_policy();
+        match policy {
+            DentryCachePolicy::Stable => {
+                if let Some(found) = self.cached_for_parent(&key, parent, None, None) {
+                    return Ok(found);
+                }
+            }
+            DentryCachePolicy::Versioned(generation) => {
+                if let Some(found) = self.cached_for_parent(&key, parent, None, Some(generation)) {
+                    return Ok(found);
+                }
+            }
+            DentryCachePolicy::Revalidate => {}
         }
 
-        // For dynamic nodes, make sure the cached dentry still names the same node.
+        // Cold, generation-stale and dynamic lookups all consult the backend.
+        // Versioned parents acquire their inode read semaphore in lookup(), so
+        // a mutation that published a new generation before changing a name is
+        // complete before this result can be inserted.
         crate::perf::record_dcache_backend_lookup();
         let node = match parent.node().lookup(name) {
             Ok(node) => node,
             Err(error) => {
-                // Revalidated backends must not retain a positive entry after
+                // Non-stable backends must not retain a positive entry after
                 // the backend reports that the name has disappeared.
-                if parent.node().dentry_cache_policy() == DentryCachePolicy::Revalidate {
+                if !matches!(policy, DentryCachePolicy::Stable) {
                     self.remove_key(&key);
                 }
                 return Err(error);
             }
         };
-        if let Some(found) = self.cached_for_parent(&key, parent, Some(&node)) {
+        let parent_generation = match policy {
+            DentryCachePolicy::Versioned(generation) => Some(generation),
+            DentryCachePolicy::Stable | DentryCachePolicy::Revalidate => None,
+        };
+        if let Some(found) = self.cached_for_parent(&key, parent, Some(&node), parent_generation) {
             return Ok(found);
         }
 
@@ -180,7 +199,7 @@ impl PositiveDentryCache {
         // lock and preserve the already-published dentry identity when it
         // still names the same parent and node.
         let dentry = Dentry::child(parent, name, node);
-        Ok(self.insert_or_reuse(key, dentry))
+        Ok(self.insert_or_reuse(key, dentry, parent_generation))
     }
 
     /// Invalidate one name after a successful namespace mutation.
@@ -204,9 +223,13 @@ impl PositiveDentryCache {
         key: &DentryKey,
         parent: &Arc<Dentry>,
         expected_node: Option<&Arc<dyn VfsNode>>,
+        expected_generation: Option<usize>,
     ) -> Option<Arc<Dentry>> {
         let inner = self.inner.read();
         let cached = inner.entries.get(key)?;
+        if cached.parent_generation != expected_generation {
+            return None;
+        }
         let cached_parent = cached.dentry.parent.as_ref()?;
         if !Arc::ptr_eq(cached_parent, parent) {
             // A rename or an earlier parent eviction may reconstruct the
@@ -225,9 +248,14 @@ impl PositiveDentryCache {
         Some(Arc::clone(&cached.dentry))
     }
 
-    fn insert_or_reuse(&self, key: DentryKey, dentry: Arc<Dentry>) -> Arc<Dentry> {
+    fn insert_or_reuse(
+        &self,
+        key: DentryKey,
+        dentry: Arc<Dentry>,
+        parent_generation: Option<usize>,
+    ) -> Arc<Dentry> {
         let mut inner = self.inner.write();
-        if let Some(cached) = inner.entries.get(&key)
+        if let Some(cached) = inner.entries.get_mut(&key)
             && cached.dentry.parent.as_ref().is_some_and(|cached_parent| {
                 dentry
                     .parent
@@ -237,6 +265,10 @@ impl PositiveDentryCache {
             && cached.dentry.node().filesystem_id() == dentry.node().filesystem_id()
             && cached.dentry.node().node_id() == dentry.node().node_id()
         {
+            // A versioned miss may rediscover the same inode after an
+            // unrelated sibling mutation. Preserve dentry identity and only
+            // advance the validation generation.
+            cached.parent_generation = parent_generation;
             cached.referenced.store(true, Ordering::Relaxed);
             crate::perf::record_dcache_hit(true);
             return Arc::clone(&cached.dentry);
@@ -249,6 +281,7 @@ impl PositiveDentryCache {
             key.clone(),
             CachedDentry {
                 dentry: Arc::clone(&dentry),
+                parent_generation,
                 // Its place at the tail already grants one trip around the
                 // clock.  Only a later cache hit earns a second chance.
                 referenced: AtomicBool::new(false),

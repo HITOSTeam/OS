@@ -5,7 +5,10 @@ use super::{File, POLLIN, POLLOUT};
 use crate::drivers::BLOCK_DEVICES;
 use crate::mm::UserBuffer;
 use crate::println;
-use crate::sync::{KernelMutex, KernelMutexGuard, KernelRwSemaphore};
+use crate::sync::{
+    KernelMutex, KernelMutexGuard, KernelRwSemaphore, KernelRwSemaphoreReadGuard,
+    KernelRwSemaphoreWriteGuard,
+};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -34,7 +37,7 @@ lazy_static! {
     /// one Rust `Inode` object for the same on-disk inode (in particular for
     /// hard links), so object addresses cannot identify the lock.
     static ref EXT4_INODE_LOCKS:
-        Mutex<BTreeMap<(usize, u32), Weak<KernelRwSemaphore<()>>>> =
+        Mutex<BTreeMap<(usize, u32), Weak<Ext4InodeLock>>> =
         Mutex::new(BTreeMap::new());
     static ref DEBUG_IOZONE_INODES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static ref INODE_LIFETIMES: Mutex<BTreeMap<(usize, u32), InodeLifetimeState>> =
@@ -51,7 +54,44 @@ pub(crate) fn ext4_topology_lock() -> KernelMutexGuard<'static, ()> {
     EXT4_TOPOLOGY_LOCK.lock()
 }
 
-pub(crate) type Ext4InodeLock = KernelRwSemaphore<()>;
+/// Stable state associated with one ext4 inode identity.
+///
+/// Linux keeps both `i_rwsem` and namespace-change state on the persistent
+/// inode object. ext4-fs can materialize several Rust `Inode` wrappers for one
+/// disk inode, so keep the equivalent state in the keyed table above.
+pub(crate) struct Ext4InodeLock {
+    semaphore: KernelRwSemaphore<()>,
+    namespace_generation: AtomicUsize,
+}
+
+impl Ext4InodeLock {
+    fn new() -> Self {
+        Self {
+            semaphore: KernelRwSemaphore::new(()),
+            namespace_generation: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn read(&self) -> KernelRwSemaphoreReadGuard<'_, ()> {
+        self.semaphore.read()
+    }
+
+    pub(crate) fn write(&self) -> KernelRwSemaphoreWriteGuard<'_, ()> {
+        self.semaphore.write()
+    }
+
+    /// Publish invalidation before the caller changes any child name while it
+    /// owns the directory write semaphore. Readers observing the new value
+    /// miss the dcache and then wait on `read()` for the mutation to finish;
+    /// readers that observed the old value linearize before this publication.
+    pub(crate) fn begin_namespace_mutation(&self) {
+        self.namespace_generation.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn namespace_generation(&self) -> usize {
+        self.namespace_generation.load(Ordering::Acquire)
+    }
+}
 
 pub(crate) fn ext4_inode_key(inode: &Inode) -> (usize, u32) {
     (inode.device_id(), inode.inode_num())
@@ -65,7 +105,7 @@ fn ext4_inode_lock_by_key(key: (usize, u32)) -> Arc<Ext4InodeLock> {
     if locks.len() >= EXT4_INODE_LOCK_CACHE_MAX {
         locks.retain(|_, lock| lock.strong_count() != 0);
     }
-    let lock = Arc::new(KernelRwSemaphore::new(()));
+    let lock = Arc::new(Ext4InodeLock::new());
     locks.insert(key, Arc::downgrade(&lock));
     lock
 }
@@ -76,6 +116,16 @@ fn ext4_inode_lock_by_key(key: (usize, u32)) -> Arc<Ext4InodeLock> {
 /// active caller always owns a strong reference before acquiring the lock.
 pub(crate) fn ext4_inode_lock(inode: &Inode) -> Arc<Ext4InodeLock> {
     ext4_inode_lock_by_key(ext4_inode_key(inode))
+}
+
+/// Mark the beginning of a legacy ext4 directory mutation.
+///
+/// New object-VFS operations can publish through their retained inode state;
+/// legacy syscall adapters use this helper while they are migrated. The
+/// caller must already own the parent inode write semaphore and must call this
+/// before the first on-disk directory change.
+pub(crate) fn ext4_begin_namespace_mutation(inode: &Inode) {
+    ext4_inode_lock(inode).begin_namespace_mutation();
 }
 
 pub(crate) fn with_ext4_inode_read<R>(inode: &Inode, operation: impl FnOnce() -> R) -> R {
@@ -438,6 +488,7 @@ fn cleanup_deferred_unlink(cleanup: TmpfileCleanup) {
     let child = cleanup.parent.find(&cleanup.name);
     let child_lock = child.as_ref().map(|child| ext4_inode_lock(child));
     let _child_guard = child_lock.as_ref().map(|lock| lock.write());
+    parent_lock.begin_namespace_mutation();
     if cleanup.parent.unlink(&cleanup.name).is_ok() {
         clear_ext4_path_cache();
     }
@@ -1283,6 +1334,7 @@ pub(crate) fn ensure_root_mount_directory(name: &str) {
     if ROOT_INODE.find(name).is_some() {
         return;
     }
+    root_lock.begin_namespace_mutation();
     if let Ok(inode) = ROOT_INODE.create_dir(name) {
         inode.set_uid_gid(0, 0);
         inode.set_mode(0o755);
@@ -1453,6 +1505,7 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         };
         let parent_lock = ext4_inode_lock(&parent);
         let _parent_guard = parent_lock.write();
+        parent_lock.begin_namespace_mutation();
         inode = parent.create_file(file_name).ok();
         if inode.is_some() {
             clear_ext4_path_cache();
@@ -1729,6 +1782,7 @@ impl Drop for OSInode {
                 let child = cleanup.parent.find(&cleanup.name);
                 let child_lock = child.as_ref().map(|child| ext4_inode_lock(child));
                 let _child_guard = child_lock.as_ref().map(|lock| lock.write());
+                parent_lock.begin_namespace_mutation();
                 cleanup.parent.unlink(&cleanup.name)
             }
             .is_ok()

@@ -142,9 +142,11 @@ impl VfsNode for Ext4VfsNode {
     }
 
     fn dentry_cache_policy(&self) -> DentryCachePolicy {
-        // ext4 mutations can also arrive through the legacy syscall adapter
-        // during migration, so cached positives must be revalidated.
-        DentryCachePolicy::Revalidate
+        // Linux local filesystems treat an instantiated positive dentry as
+        // authoritative. During the legacy-syscall migration, use the stable
+        // per-directory namespace generation to retain that hot-path property
+        // without trusting mutation sites that have not removed a dentry.
+        DentryCachePolicy::Versioned(self.inode_lock.namespace_generation())
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
@@ -217,6 +219,7 @@ impl VfsNode for Ext4VfsNode {
     fn create(&self, name: &str, mode: u16) -> VfsResult<Arc<dyn VfsNode>> {
         let inode = {
             let _inode_guard = self.inode_lock.write();
+            self.inode_lock.begin_namespace_mutation();
             let inode = self.inode.create_file(name).map_err(map_ext4_error)?;
             inode.set_mode(mode);
             inode
@@ -227,6 +230,7 @@ impl VfsNode for Ext4VfsNode {
     fn mkdir(&self, name: &str, mode: u16) -> VfsResult<Arc<dyn VfsNode>> {
         let inode = {
             let _inode_guard = self.inode_lock.write();
+            self.inode_lock.begin_namespace_mutation();
             let inode = self.inode.create_dir(name).map_err(map_ext4_error)?;
             inode.set_mode(mode);
             inode
@@ -237,6 +241,7 @@ impl VfsNode for Ext4VfsNode {
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn VfsNode>> {
         let inode = {
             let _inode_guard = self.inode_lock.write();
+            self.inode_lock.begin_namespace_mutation();
             self.inode
                 .create_symlink(name, target)
                 .map_err(map_ext4_error)?
@@ -261,6 +266,7 @@ impl VfsNode for Ext4VfsNode {
         }
         let _parent_guard = self.inode_lock.write();
         let _target_guard = target.inode_lock.write();
+        self.inode_lock.begin_namespace_mutation();
         self.inode
             .link_inode(name, &target.inode)
             .map_err(map_ext4_error)
@@ -281,6 +287,7 @@ impl VfsNode for Ext4VfsNode {
                 VfsError::NotDirectory
             });
         }
+        self.inode_lock.begin_namespace_mutation();
         self.inode.unlink(name).map_err(map_ext4_error)
     }
 
@@ -308,6 +315,7 @@ impl VfsNode for Ext4VfsNode {
         let source = self.inode.find(old_name).ok_or(VfsError::NoEntry)?;
         let source_lock = ext4_inode_lock(&source);
         let _source_guard = source_lock.write();
+        self.inode_lock.begin_namespace_mutation();
         self.inode
             .rename(old_name, new_name)
             .map_err(map_ext4_error)
@@ -337,6 +345,7 @@ impl VfsNode for Ext4VfsNode {
         };
         let inode = {
             let _inode_guard = self.inode_lock.write();
+            self.inode_lock.begin_namespace_mutation();
             self.inode
                 .create_special(name, type_mode | (mode & 0o7777), rdev)
                 .map_err(map_ext4_error)?
