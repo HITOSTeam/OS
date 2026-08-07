@@ -215,10 +215,9 @@ impl MmRef {
     }
 
     /// Refresh a spurious missing-page fault after another thread published
-    /// the formerly absent PTE.  LoongArch mirrors Linux update_mmu_cache():
-    /// only the faulting hart can retain the recoverable invalid half.  Keep
-    /// the existing stronger RISC-V behavior until that architecture is
-    /// audited independently.
+    /// the formerly absent PTE.  Both architectures mirror Linux
+    /// update_mmu_cache(): only the faulting hart can retain a recoverable
+    /// invalid translation, so no cross-hart shootdown is required.
     #[cfg(target_arch = "loongarch64")]
     pub(super) fn refresh_new_pte_fault(&self, va: usize) {
         crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), va);
@@ -226,7 +225,7 @@ impl MmRef {
 
     #[cfg(target_arch = "riscv64")]
     pub(super) fn refresh_new_pte_fault(&self, va: usize) {
-        self.flush_user_page(va);
+        crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), va);
     }
 
     #[cfg(target_arch = "riscv64")]

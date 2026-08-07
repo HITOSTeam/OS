@@ -408,12 +408,16 @@ impl MemorySet {
             _ => candidate.clone(),
         };
 
-        // RISC-V keeps its existing PTE-publication transaction, including
-        // cross-hart fencing and executable-mapping I-cache synchronization.
-        // LoongArch follows Linux's missing-PTE path below and updates only
-        // the faulting hart's MMU cache after the leaf is installed.
+        // A non-executable missing PTE has no stale valid translation on a
+        // remote hart.  Match Linux update_mmu_cache_range() and refresh only
+        // the faulting hart after publication.  Executable mappings retain
+        // the existing transaction because instruction bytes must still be
+        // synchronized with every hart that can execute this mm.
         #[cfg(target_arch = "riscv64")]
-        let mut batch = self.begin_page_table_update();
+        let executable_batch = plan
+            .pte_flags
+            .contains(PTEFlags::X)
+            .then(|| self.begin_page_table_update());
         self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
         let shared_file_backing_frame = (plan.inode_backed && region.shared).then(|| frame.clone());
         self.areas[area_idx].insert_tracked_frame(plan.vpn, frame);
@@ -428,12 +432,15 @@ impl MemorySet {
             );
         }
         #[cfg(target_arch = "riscv64")]
-        {
-            batch.record_page(fault_va);
-            if plan.pte_flags.contains(PTEFlags::X) {
+        match executable_batch {
+            Some(mut batch) => {
+                batch.record_page(fault_va);
                 batch.mark_icache_stale();
+                batch.commit();
             }
-            batch.commit();
+            None => {
+                crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va)
+            }
         }
         #[cfg(target_arch = "loongarch64")]
         crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va);
