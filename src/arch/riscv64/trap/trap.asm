@@ -41,8 +41,8 @@ alltraps:
     # move to kernel_sp
     ld sp, 35*8(sp)
     # Stay on the current user SATP on trap entry. User page tables share the
-    # kernel roots needed for trap_handler and the current kstack; code that
-    # needs the full direct map switches explicitly with KernelPageTableGuard.
+    # kernel roots needed for trap_handler, the current kstack, RAM direct map,
+    # and the high-half device-MMIO window used by interrupt handlers/drivers.
     # jump to trap_handler
     jr t1
 #  0xfffffffffffff06c:

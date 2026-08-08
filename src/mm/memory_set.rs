@@ -17,7 +17,9 @@ use crate::arch::loongarch64::mm::{AsidContext, UserTlbInvalidationBatch};
 #[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::mm::{AsidContext, UserTlbInvalidationBatch};
 #[cfg(target_arch = "riscv64")]
-use crate::config::{KERNEL_STACK_TOP, phys_mem_start};
+use crate::config::{
+    KERNEL_MMIO_WINDOW_BASE, KERNEL_MMIO_WINDOW_SIZE, KERNEL_STACK_TOP, mmio_va, phys_mem_start,
+};
 use crate::config::{
     MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
     USER_STACK_SIZE, phys_mem_end,
@@ -2257,10 +2259,55 @@ impl MemorySet {
     #[cfg(target_arch = "riscv64")]
     fn riscv_kernel_direct_root_range() -> (usize, usize) {
         // Share only the physical direct-map roots actually covering RAM.
-        // Device/MMIO mappings stay kernel-only unless explicitly mapped.
+        // Device registers are reached through the high-half MMIO window below
+        // instead of their low identity addresses, which would collide with the
+        // user range.
         let start = PageTable::root_index_of_va(phys_mem_start());
         let end = PageTable::root_index_of_va(phys_mem_end().saturating_sub(1)) + 1;
         (start, end)
+    }
+
+    /// Root entries covering the high-half device MMIO window.
+    ///
+    /// This is the counterpart of Linux's `ioremap`/vmalloc range: it lives in
+    /// the kernel half, so it can be shared into every user page table and
+    /// drivers never have to switch SATP to reach a device register.
+    #[cfg(target_arch = "riscv64")]
+    fn riscv_kernel_mmio_root_range() -> (usize, usize) {
+        let start = PageTable::root_index_of_va(KERNEL_MMIO_WINDOW_BASE);
+        let end = PageTable::root_index_of_va(
+            KERNEL_MMIO_WINDOW_BASE.saturating_add(KERNEL_MMIO_WINDOW_SIZE) - 1,
+        ) + 1;
+        (start, end)
+    }
+
+    /// Map a device physical range into the shared kernel MMIO window.
+    ///
+    /// The local equivalent of Linux `ioremap()`. The device keeps its physical
+    /// address; the kernel reaches it through `mmio_va(pa)`, whose root entry is
+    /// shared into every user page table. Drivers and interrupt handlers can
+    /// then touch MMIO with any SATP active, so the per-access page-table switch
+    /// and `sfence.vma` disappear.
+    #[cfg(target_arch = "riscv64")]
+    fn map_mmio_window_range(&mut self, pa_start: usize, pa_end: usize, permission: MapPermission) {
+        if pa_end <= pa_start {
+            return;
+        }
+        let mut pa = pa_start & !(PAGE_SIZE - 1);
+        let end = Self::page_align_up(pa_end);
+        while pa < end {
+            let vpn = VirtAddr::from(mmio_va(pa)).floor();
+            let already_mapped = self
+                .page_table
+                .translate(vpn)
+                .map(|pte| pte.is_valid())
+                .unwrap_or(false);
+            if !already_mapped {
+                let ppn = PhysAddr::from(pa).floor();
+                self.page_table.map(vpn, ppn, PTEFlags::from(permission));
+            }
+            pa += PAGE_SIZE;
+        }
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -2294,6 +2341,12 @@ impl MemorySet {
         if Self::riscv_high_stack_window_overlaps(start, end) {
             return true;
         }
+        let (mmio_start, mmio_end) = Self::riscv_kernel_mmio_root_range();
+        for index in mmio_start..mmio_end {
+            if Self::riscv_root_range_overlaps(index, start, end) {
+                return true;
+            }
+        }
         false
     }
 
@@ -2325,6 +2378,13 @@ impl MemorySet {
         let stack_window_start = KERNEL_STACK_TOP.saturating_sub(stack_window_size);
         if end > stack_window_start && start < KERNEL_STACK_TOP {
             record(KERNEL_STACK_TOP);
+        }
+
+        let (mmio_root_start, mmio_root_end) = Self::riscv_kernel_mmio_root_range();
+        for index in mmio_root_start..mmio_root_end {
+            if Self::riscv_root_range_overlaps(index, start, end) {
+                record(PageTable::root_entry_end(index));
+            }
         }
 
         overlap_end
@@ -2369,6 +2429,15 @@ impl MemorySet {
                 return false;
             }
         }
+        let (mmio_start, mmio_end) = Self::riscv_kernel_mmio_root_range();
+        for index in mmio_start..mmio_end {
+            if !self.page_table.ensure_root_entry(index) {
+                return false;
+            }
+            if !self.page_table.mark_root_entry_global(index) {
+                return false;
+            }
+        }
         true
     }
 
@@ -2394,6 +2463,19 @@ impl MemorySet {
             }
             let (stack_start, stack_end) = Self::riscv_kernel_stack_root_range();
             for index in stack_start..stack_end {
+                if !self
+                    .page_table
+                    .share_root_entry_from(index, &kernel_space.page_table)
+                {
+                    return false;
+                }
+            }
+            // Device registers live in the high-half MMIO window, so sharing its
+            // root entry lets block I/O and PLIC claim/complete run on the user
+            // SATP.  This is what removes the per-access SATP switch and the
+            // ASID-wide `sfence.vma` that came with it.
+            let (mmio_start, mmio_end) = Self::riscv_kernel_mmio_root_range();
+            for index in mmio_start..mmio_end {
                 if !self
                     .page_table
                     .share_root_entry_from(index, &kernel_space.page_table)
@@ -2536,6 +2618,21 @@ impl MemorySet {
             let dtb_start = crate::config::DEVICE_TREE_ADDR;
             let dtb_end = dtb_start + crate::config::DEVICE_TREE_MAX_SIZE;
             memory_set.map_identical_range_skip_mapped(dtb_start, dtb_end, MapPermission::R);
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            // Mirror Linux ioremap(): publish every device register range in the
+            // shared high-half window as well.  The identity mappings above stay
+            // so early boot code that still uses physical addresses keeps
+            // working, but all hot-path drivers use the window.
+            println!("mapping device MMIO window");
+            for pair in MMIO {
+                memory_set.map_mmio_window_range(
+                    (*pair).0,
+                    (*pair).0 + (*pair).1,
+                    MapPermission::R | MapPermission::W | MapPermission::IO,
+                );
+            }
         }
         #[cfg(target_arch = "riscv64")]
         assert!(

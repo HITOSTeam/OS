@@ -7,7 +7,7 @@ use core::ptr::{read_volatile, write_volatile};
 use riscv::register::sie;
 use spin::Mutex;
 
-const PLIC_BASE: usize = 0x0c00_0000;
+const PLIC_BASE: usize = crate::config::mmio_va(0x0c00_0000);
 const PLIC_PRIORITY_BASE: usize = PLIC_BASE;
 const PLIC_ENABLE_BASE: usize = PLIC_BASE + 0x2000;
 const PLIC_ENABLE_CONTEXT_STRIDE: usize = 0x80;
@@ -63,11 +63,22 @@ fn complete(source: usize) {
 }
 
 pub fn handle_external_interrupt() {
-    // Linux enters do_irq()/handle_arch_irq() with the kernel mappings active.
-    // Our trampoline deliberately keeps the user SATP until kernel code needs
-    // the full direct map, and user roots do not include MMIO.  Establish the
-    // same invariant locally before touching the PLIC claim/complete registers
-    // or draining VirtIO DMA completions, then restore the interrupted SATP.
+    // Linux's hardirq entry keeps the interrupted address space resident
+    // (`irq_enter()` never touches `mm`); with the shared MMIO window and
+    // direct map the PLIC claim/complete and VirtIO DMA drains all work on the
+    // current SATP.  What *does* require the switch is this kernel's blocking
+    // block-queue wakeup, which takes `spin::Mutex`es that are also held with
+    // local interrupts disabled on the syscall path.  A ticket waiter holds an
+    // acquired-but-unserved ticket across an interrupt only while the handler
+    // keeps running on the user SATP, so a same-hart re-lock from the
+    // completion path deadlocks the virtqueue.  Linux avoids the equivalent by
+    // never sleeping or taking a contended scheduler lock in hardirq context.
+    //
+    // Keep the SATP switch (and its ASID-local `sfence.vma`) strictly around
+    // the PLIC dispatch until the block completion path is made
+    // hardirq-safe (defer wakeups to softirq/timer context).  All other guard
+    // sites are gone: submission, polling and driver entry points now rely on
+    // the shared mappings like Linux does.
     let _kernel_page_table = crate::mm::KernelPageTableGuard::enter();
     while let Some(source) = claim() {
         let _ = crate::drivers::block::handle_irq(source);

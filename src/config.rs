@@ -38,6 +38,23 @@ pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 #[cfg(target_arch = "riscv64")]
 pub const KERNEL_STACK_TOP: usize = TRAMPOLINE - 0x4000_0000;
 
+/// High-half kernel window for device MMIO, analogous to Linux `ioremap()`.
+///
+/// Root entry 509 covers `[0xffff_ffff_4000_0000,
+/// 0xffff_ffff_8000_0000)`, immediately below the shared kernel-stack root.
+/// Keeping device registers here lets the root be shared into every user page
+/// table without colliding with low-canonical user mappings.
+#[cfg(target_arch = "riscv64")]
+pub const KERNEL_MMIO_WINDOW_BASE: usize = 0xffff_ffff_4000_0000;
+#[cfg(target_arch = "riscv64")]
+pub const KERNEL_MMIO_WINDOW_SIZE: usize = 0x4000_0000;
+
+#[cfg(target_arch = "riscv64")]
+pub const fn mmio_va(pa: usize) -> usize {
+    debug_assert!(pa < KERNEL_MMIO_WINDOW_SIZE);
+    KERNEL_MMIO_WINDOW_BASE + pa
+}
+
 // LoongArch64 uses split PGDL/PGDH and a 3-level (Sv39-style) page walk here,
 // so the user-range VA width is 39 bits. Keep trap-related pages inside the
 // low canonical range (max 0x0000_003f_ffff_ffff) so PGDL can translate them.

@@ -66,8 +66,20 @@ pub fn activate_kernel_space() {
 }
 
 #[cfg(target_arch = "riscv64")]
-/// Temporarily switch to the full kernel page table for code that needs the
-/// physical direct map beyond the roots shared into user page tables.
+/// Switch to the full kernel page table for the one path that still needs it:
+/// `handle_external_interrupt()` runs the blocking block-queue wakeup, whose
+/// `spin::Mutex`es are also held with interrupts off on the syscall path.  A
+/// ticket waiter keeps its acquired-but-unserved ticket across an interrupt
+/// while the handler stays on the user SATP, so a same-hart re-lock deadlocks
+/// (this is why the MMIO-window experiment stalled without the IRQ guard).
+///
+/// Every other former call site (VirtIO submit/poll, MMIO reads, DMA) now runs
+/// on the interrupted address space like a Linux driver: device registers are
+/// in the shared high-half `KERNEL_MMIO_WINDOW_BASE` root and DMA buffers are
+/// in the shared direct map, so neither needs this guard.
+///
+/// Remove this once the block completion path is made hardirq-safe (defer its
+/// wait-queue wakeups out of PLIC context, e.g. onto the timer/softirq path).
 pub struct KernelPageTableGuard {
     previous_satp: usize,
     switched: bool,

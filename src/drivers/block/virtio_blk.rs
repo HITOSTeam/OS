@@ -56,10 +56,11 @@ mod virtio_mmio {
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
             let start = crate::perf::block_read_begin();
-            // The virtio driver dereferences physical/direct-map DMA buffers.
-            // RISC-V user page tables share only selected kernel roots, so enter
-            // the full kernel page table around the MMIO driver call.
-            let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
+            // Both operands are reachable from every page table: the transport
+            // registers through the shared high-half MMIO window, the DMA
+            // buffers through the shared physical direct map.  Like a Linux
+            // driver, this runs on the caller's address space with no SATP
+            // switch and no TLB invalidation.
             self.queue
                 .read_blocks(base_sector, buf)
                 .expect("Error when reading VirtIOBlk");
@@ -70,8 +71,7 @@ mod virtio_mmio {
             let sectors_per_block = ext4_fs::BLOCK_SZ / 512;
             let base_sector = block_id * sectors_per_block;
             let start = crate::perf::block_write_begin();
-            // See read path: the driver must run with the kernel direct map active.
-            let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
+            // See the read path: no page-table switch is required.
             self.queue
                 .write_blocks(base_sector, buf)
                 .expect("Error when writing VirtIOBlk");
@@ -94,8 +94,12 @@ mod virtio_mmio {
         }
 
         /// try to initalize a block device form the given address
+        ///
+        /// `base` stays the device *physical* address so the PLIC IRQ number can
+        /// be derived from the transport slot; the transport itself is reached
+        /// through the shared high-half MMIO window.
         pub fn try_new_with_base(base: usize) -> Option<Self> {
-            let header = NonNull::new(base as *mut VirtIOHeader)?;
+            let header = NonNull::new(crate::config::mmio_va(base) as *mut VirtIOHeader)?;
             // SAFETY: base is the MMIO address from device tree or known constant;
             // header is a valid non-null pointer to VirtIOHeader.
             let transport = unsafe { MmioTransport::new(header) }.ok()?;
@@ -116,20 +120,16 @@ mod virtio_mmio {
             if irq != self.irq {
                 return false;
             }
-            // Linux device interrupt handlers always run with kernel mappings
-            // active.  Keep that invariant at the driver boundary as well as
-            // at the PLIC entry so future dispatch paths cannot touch VirtIO
-            // MMIO or DMA buffers through a user page table.
-            let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
+            // VirtIO MMIO and DMA buffers are mapped in every page table, so
+            // like a Linux interrupt handler this runs on the interrupted
+            // address space without touching SATP.
             self.queue.handle_interrupt()
         }
 
         pub fn poll(&self) {
-            // Timer/watchdog fallback polling can run directly from a user
-            // trap, where this kernel deliberately retains the user SATP.
-            // Linux's block polling path still executes in kernel address
-            // space, so switch before acknowledging MMIO or draining DMA.
-            let _kernel_pt = crate::mm::KernelPageTableGuard::enter();
+            // Fallback polling can run directly from a user trap.  The shared
+            // MMIO window makes that safe on the user SATP, so no switch is
+            // needed before acknowledging MMIO or draining DMA.
             self.queue.poll();
         }
 
@@ -159,7 +159,9 @@ mod virtio_mmio {
         }
 
         unsafe fn mmio_phys_to_virt(paddr: usize, _size: usize) -> NonNull<u8> {
-            NonNull::new(paddr as *mut u8).unwrap()
+            // Device registers live in the shared high-half window; DMA buffers
+            // returned by `dma_alloc` keep their direct-map address.
+            NonNull::new(crate::config::mmio_va(paddr) as *mut u8).unwrap()
         }
 
         unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> usize {
