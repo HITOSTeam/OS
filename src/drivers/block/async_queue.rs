@@ -20,9 +20,12 @@ use virtio_drivers::{
 use crate::sync::{LocalIrqSaveGuard, WaitQueue};
 
 const MAX_TRACKED_REQUESTS: usize = 32;
-// Linux blk_hctx_poll() busy-polls only while the current task does not need
-// rescheduling.  A small fixed budget is sufficient for QEMU's short VirtIO
-// completion latency and avoids a sleep/wakeup cycle for every 4 KiB request.
+// Linux keeps `io_poll`/hybrid polling for queues whose completion latency is
+// shorter than a sleep/wake round trip, and `blk_mq_poll()` spins only while the
+// current task does not need rescheduling.  A QEMU VirtIO device completes in a
+// few microseconds, so a small fixed budget retires almost every request without
+// a context switch; anything still in flight afterwards falls through to a real
+// `bio_await()`-style sleep.
 const COMPLETION_POLL_SPINS: usize = 64;
 const STALL_WARNING_MS: usize = 1_000;
 // Linux blk-mq defaults to a 30-second request timeout when a driver does not
@@ -154,6 +157,7 @@ pub struct AsyncBlockDiagnostics {
     pub fallback_polls: u64,
     pub short_poll_completions: u64,
     pub cooperative_yields: u64,
+    pub completion_sleeps: u64,
     pub stall_warnings: u64,
     pub stuck_warnings: u64,
     pub in_flight: usize,
@@ -172,6 +176,7 @@ pub struct AsyncVirtIOBlock<H: Hal, T: Transport> {
     fallback_polls: AtomicU64,
     short_poll_completions: AtomicU64,
     cooperative_yields: AtomicU64,
+    completion_sleeps: AtomicU64,
     stall_warnings: AtomicU64,
     stuck_warnings: AtomicU64,
     in_flight: AtomicUsize,
@@ -197,6 +202,7 @@ impl<H: Hal, T: Transport> AsyncVirtIOBlock<H, T> {
             fallback_polls: AtomicU64::new(0),
             short_poll_completions: AtomicU64::new(0),
             cooperative_yields: AtomicU64::new(0),
+            completion_sleeps: AtomicU64::new(0),
             stall_warnings: AtomicU64::new(0),
             stuck_warnings: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
@@ -318,34 +324,43 @@ impl<H: Hal, T: Transport> AsyncVirtIOBlock<H, T> {
                 core::hint::spin_loop();
             }
         } else {
+            // Hybrid completion, in that order:
+            //
+            // 1. Poll briefly.  On an emulated device the request is normally
+            //    already in the used ring, so this retires it with no context
+            //    switch at all.  Sleeping unconditionally instead costs two
+            //    context switches and an interrupt per 4 KiB request, and each
+            //    of those switches rewrites SATP, which an emulator answers with
+            //    a full TLB and translation-cache flush.  That was measured to
+            //    dominate a compile storm.
+            // 2. Otherwise block like Linux `bio_await()`: leave the run queue
+            //    entirely so a genuinely slow request burns no CPU.  `wait_until`
+            //    rechecks the predicate after publishing the waiter, so an IRQ
+            //    racing with this transition cannot be lost.
             let mut polled_completions = 0;
-            while !request.completed.load(Ordering::Acquire) {
-                for spin in 0..COMPLETION_POLL_SPINS {
-                    if request.completed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    polled_completions += self.drain_used(InterruptAck::IfCompleted).1;
-                    if request.completed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    // Match Linux blk_hctx_poll(): stop burning CPU once the
-                    // scheduler has higher-priority work to run.
-                    if spin % 8 == 7 && crate::task::processor::should_resched_for_busy_poll() {
-                        break;
-                    }
-                    core::hint::spin_loop();
+            for spin in 0..COMPLETION_POLL_SPINS {
+                if request.completed.load(Ordering::Acquire) {
+                    break;
                 }
-                if !request.completed.load(Ordering::Acquire) {
-                    // Linux's poll loop returns at need_resched/budget expiry.
-                    // Our minimal block layer has no upper completion waiter,
-                    // so yield to the scheduler and resume polling. Keep the
-                    // request uninterruptible while DMA owns its buffers.
-                    self.cooperative_yields.fetch_add(1, Ordering::Relaxed);
-                    crate::task::processor::suspend_current_and_run_next_uninterruptible();
+                polled_completions += self.drain_used(InterruptAck::IfCompleted).1;
+                if request.completed.load(Ordering::Acquire) {
+                    break;
                 }
+                // Match Linux blk_mq_poll(): give the CPU back as soon as the
+                // scheduler has higher-priority work than this spin.
+                if spin % 8 == 7 && crate::task::processor::should_resched_for_busy_poll() {
+                    break;
+                }
+                core::hint::spin_loop();
             }
             self.short_poll_completions
                 .fetch_add(polled_completions as u64, Ordering::Relaxed);
+            if !request.completed.load(Ordering::Acquire) {
+                self.completion_sleeps.fetch_add(1, Ordering::Relaxed);
+                request
+                    .waiters
+                    .wait_until(|| request.completed.load(Ordering::Acquire));
+            }
         }
         request.result()
     }
@@ -507,6 +522,7 @@ impl<H: Hal, T: Transport> AsyncVirtIOBlock<H, T> {
             fallback_polls: self.fallback_polls.load(Ordering::Relaxed),
             short_poll_completions: self.short_poll_completions.load(Ordering::Relaxed),
             cooperative_yields: self.cooperative_yields.load(Ordering::Relaxed),
+            completion_sleeps: self.completion_sleeps.load(Ordering::Relaxed),
             stall_warnings: self.stall_warnings.load(Ordering::Relaxed),
             stuck_warnings: self.stuck_warnings.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
