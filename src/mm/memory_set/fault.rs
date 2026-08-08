@@ -408,16 +408,24 @@ impl MemorySet {
             _ => candidate.clone(),
         };
 
-        // A non-executable missing PTE has no stale valid translation on a
-        // remote hart.  Match Linux update_mmu_cache_range() and refresh only
-        // the faulting hart after publication.  Executable mappings retain
-        // the existing transaction because instruction bytes must still be
-        // synchronized with every hart that can execute this mm.
+        // A missing PTE has no stale valid translation on a remote hart,
+        // including when the new mapping is executable.  RISC-V still needs
+        // two distinct operations, in Linux's order:
+        //
+        // 1. `flush_icache_pte()` publishes the instruction bytes before
+        //    `set_pte_at()` makes them executable.  Active remote harts fence
+        //    now; inactive harts consume the deferred per-mm marker later.
+        // 2. `update_mmu_cache_range()` refreshes only the faulting hart after
+        //    the new PTE is visible, for implementations that cache invalid
+        //    entries.
+        //
+        // Do not put a new executable PTE through the replacement/unmap TLB
+        // transaction: that needlessly sends a synchronous SBI RFENCE for
+        // every code-page fault during exec and dynamic linking.
         #[cfg(target_arch = "riscv64")]
-        let executable_batch = plan
-            .pte_flags
-            .contains(PTEFlags::X)
-            .then(|| self.begin_page_table_update());
+        if plan.pte_flags.contains(PTEFlags::X) {
+            crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
+        }
         self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
         let shared_file_backing_frame = (plan.inode_backed && region.shared).then(|| frame.clone());
         self.areas[area_idx].insert_tracked_frame(plan.vpn, frame);
@@ -432,16 +440,7 @@ impl MemorySet {
             );
         }
         #[cfg(target_arch = "riscv64")]
-        match executable_batch {
-            Some(mut batch) => {
-                batch.record_page(fault_va);
-                batch.mark_icache_stale();
-                batch.commit();
-            }
-            None => {
-                crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va)
-            }
-        }
+        crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va);
         #[cfg(target_arch = "loongarch64")]
         crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va);
         LazyFaultCommit::Installed
