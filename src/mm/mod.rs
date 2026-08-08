@@ -382,6 +382,14 @@ pub fn init() {
     println!("[kernel] heap initialized.");
     frame_allocator::init_frame_allocator();
     println!("[kernel] frame allocator initialized.");
+    let physical_memory_bytes =
+        crate::config::phys_mem_end().saturating_sub(crate::config::phys_mem_start());
+    let ext4_cache_blocks = ext4_fs::configure_block_cache_for_memory(physical_memory_bytes);
+    println!(
+        "[kernel] ext4 block cache budget: {} blocks ({} MiB)",
+        ext4_cache_blocks,
+        ext4_cache_blocks.saturating_mul(ext4_fs::BLOCK_SZ) / (1024 * 1024)
+    );
     KERNEL_SPACE.lock().activate();
     KERNEL_SATP.store(kernel_token(), Ordering::Release);
     println!("[kernel] kernel space activated.");
