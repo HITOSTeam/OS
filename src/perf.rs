@@ -29,6 +29,9 @@ static TLB_EXACT_PAIRS: AtomicU64 = AtomicU64::new(0);
 static TLB_REMOTE_IPIS: AtomicU64 = AtomicU64::new(0);
 static TLB_SHOOTDOWN_WAIT_CYCLES: AtomicU64 = AtomicU64::new(0);
 static TLB_ASID_WRAPS: AtomicU64 = AtomicU64::new(0);
+static KSTACK_REUSES: AtomicU64 = AtomicU64::new(0);
+static KSTACK_MAPS: AtomicU64 = AtomicU64::new(0);
+static KSTACK_UNMAPS: AtomicU64 = AtomicU64::new(0);
 static ICACHE_LOCAL_FENCES: AtomicU64 = AtomicU64::new(0);
 static ICACHE_DEFERRED_FENCES: AtomicU64 = AtomicU64::new(0);
 static ICACHE_REMOTE_FENCES: AtomicU64 = AtomicU64::new(0);
@@ -159,6 +162,30 @@ pub fn record_tlb_asid_wrap() {
     }
 }
 
+/// A kernel stack served from the mapped-stack cache: no page-table work.
+#[inline]
+pub fn record_kstack_reuse() {
+    if DEBUG_PERF {
+        KSTACK_REUSES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A kernel stack mapping created while growing the live-thread high-water mark.
+#[inline]
+pub fn record_kstack_map() {
+    if DEBUG_PERF {
+        KSTACK_MAPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A kernel stack unmapped because the bounded reuse cache was full.
+#[inline]
+pub fn record_kstack_unmap() {
+    if DEBUG_PERF {
+        KSTACK_UNMAPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[inline]
 pub fn record_icache_local_fence(deferred: bool) {
     if !DEBUG_PERF {
@@ -272,6 +299,9 @@ pub fn dump() -> String {
     let tlb_remote_ipis = TLB_REMOTE_IPIS.load(Ordering::Relaxed);
     let tlb_shootdown_wait_cycles = TLB_SHOOTDOWN_WAIT_CYCLES.load(Ordering::Relaxed);
     let tlb_asid_wraps = TLB_ASID_WRAPS.load(Ordering::Relaxed);
+    let kstack_reuses = KSTACK_REUSES.load(Ordering::Relaxed);
+    let kstack_maps = KSTACK_MAPS.load(Ordering::Relaxed);
+    let kstack_unmaps = KSTACK_UNMAPS.load(Ordering::Relaxed);
     let icache_local_fences = ICACHE_LOCAL_FENCES.load(Ordering::Relaxed);
     let icache_deferred_fences = ICACHE_DEFERRED_FENCES.load(Ordering::Relaxed);
     let icache_remote_fences = ICACHE_REMOTE_FENCES.load(Ordering::Relaxed);
@@ -314,6 +344,9 @@ tlb_exact_pairs: {tlb_exact_pairs}\n\
 tlb_remote_ipis: {tlb_remote_ipis}\n\
 tlb_shootdown_wait_cycles: {tlb_shootdown_wait_cycles}\n\
 tlb_asid_wraps: {tlb_asid_wraps}\n\
+tlb_kstack_reuses: {kstack_reuses}\n\
+tlb_kstack_maps: {kstack_maps}\n\
+tlb_kstack_unmaps: {kstack_unmaps}\n\
 icache_local_fences: {icache_local_fences}\n\
 icache_deferred_fences: {icache_deferred_fences}\n\
 icache_remote_fences: {icache_remote_fences}\n\

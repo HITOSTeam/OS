@@ -1,7 +1,10 @@
-use alloc::{collections::BTreeSet, sync::Arc, sync::Weak};
+use alloc::{collections::BTreeSet, sync::Arc, sync::Weak, vec::Vec};
 
 use crate::{
-    config::{KERNEL_STACK_SIZE, KERNEL_STACK_TOP, PAGE_SIZE, TRAP_CONTEXT_BASE, USER_STACK_SIZE},
+    config::{
+        KERNEL_STACK_SIZE, KERNEL_STACK_TOP, MAX_HARTS, PAGE_SIZE, TRAP_CONTEXT_BASE,
+        USER_STACK_SIZE,
+    },
     mm::{KERNEL_SPACE, MapPermission, MmRef, PhysPageNum, VirtAddr},
     task::{lazy_static, process_block::ProcessControlBlock},
     utils::RecycleAllocator,
@@ -129,8 +132,23 @@ impl Drop for PidHandle {
         PID_ALLOCATOR.lock().dealloc(self.0);
     }
 }
+
+/// Aggregate equivalent of Linux's two cached VMAP stacks per CPU.
+///
+/// The cache is shared because CongCore has no NUMA placement to preserve. Its
+/// fixed budget retains at most 512 KiB on an 8-hart RISC-V release build and
+/// 768 KiB on a 12-hart LoongArch release build.
+const KSTACK_CACHE_MAX: usize = MAX_HARTS * 2;
+
 lazy_static! {
     static ref KSTACK_ALLOCATOR: Mutex<RecycleAllocator> = Mutex::new(RecycleAllocator::new());
+    /// Free kernel stacks whose high-half mappings remain installed.
+    ///
+    /// Linux caches VMAP stacks in `kernel/fork.c` so normal thread churn does
+    /// not repeatedly modify kernel page tables. Retaining a bounded set here
+    /// gives the same steady-state property: only growth beyond the cache's
+    /// mapped high-water mark needs a shared-kernel TLB shootdown.
+    static ref KSTACK_CACHE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 }
 pub struct KernelStack(pub usize);
 
@@ -152,6 +170,25 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 }
 
 pub fn kstack_alloc() -> Option<KernelStack> {
+    // End the cache-lock scope before clearing the retained stack. Clearing is
+    // bounded but still touches every stack page and must not serialize other
+    // harts trying to return or acquire a cached ID.
+    let cached_kstack_id = KSTACK_CACHE.lock().pop();
+    if let Some(kstack_id) = cached_kstack_id {
+        let (kstack_bottom, _) = kernel_stack_position(kstack_id);
+        // Linux clears a cached VMAP stack before assigning it to a new task.
+        // SAFETY: a cached ID is no longer owned by a task, its complete stack
+        // range remains mapped writable, and the cache lock transfers unique
+        // ownership of this ID to the caller before the bytes are cleared.
+        unsafe {
+            core::ptr::write_bytes(kstack_bottom as *mut u8, 0, KERNEL_STACK_SIZE);
+        }
+        crate::perf::record_kstack_reuse();
+        KSTACK_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        maybe_log_kstack_inflight("alloc");
+        return Some(KernelStack(kstack_id));
+    }
+
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
     let ok = KERNEL_SPACE.lock().try_insert_framed_area(
@@ -168,6 +205,7 @@ pub fn kstack_alloc() -> Option<KernelStack> {
     // running with the LoongArch kernel PGDH/ASID 0 (and the same distinction
     // applies to RISC-V global kernel mappings). Match the removal path and
     // complete a shared-kernel shootdown before the stack can be scheduled.
+    crate::perf::record_kstack_map();
     crate::mm::flush_kernel_shared_tlb();
     KSTACK_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
     maybe_log_kstack_inflight("alloc");
@@ -176,17 +214,29 @@ pub fn kstack_alloc() -> Option<KernelStack> {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
+        KSTACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+        maybe_log_kstack_inflight("drop");
+
+        // Keep the mapping installed while the bounded cache has room. A
+        // failed metadata allocation simply falls back to the ordinary unmap.
+        {
+            let mut cache = KSTACK_CACHE.lock();
+            if cache.len() < KSTACK_CACHE_MAX && cache.try_reserve(1).is_ok() {
+                cache.push(self.0);
+                return;
+            }
+        }
+
         let (kernel_stack_bottom, kernel_stack_top) = self.bounds();
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
         let kernel_stack_top_va: VirtAddr = kernel_stack_top.into();
+        crate::perf::record_kstack_unmap();
         KERNEL_SPACE
             .lock()
             .remove_area(kernel_stack_bottom_va.into(), kernel_stack_top_va.into());
         // MemorySet::remove_area completes the architecture-specific shared
         // kernel shootdown before releasing the stack frames.
         KSTACK_ALLOCATOR.lock().dealloc(self.0);
-        KSTACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-        maybe_log_kstack_inflight("drop");
     }
 }
 
