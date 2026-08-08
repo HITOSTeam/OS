@@ -2,6 +2,8 @@ use super::backing::{
     FilePageCacheLoadError, file_page_cache_get_or_load, shared_anon_page_cache_get,
     shared_anon_page_cache_insert_or_get,
 };
+#[cfg(target_arch = "riscv64")]
+use super::publish_executable_user_pte;
 use super::{
     LazyFaultResult, MapPermission, MapType, MemorySet, MmRef, PageTableUpdateBatch, VmRegion,
     vm_region_map_area_type_compatible,
@@ -232,18 +234,25 @@ impl MemorySet {
         new_flags.remove(PTEFlags::COW);
         new_flags.insert(PTEFlags::W | PTEFlags::D);
         let mut batch: PageTableUpdateBatch = self.begin_page_table_update();
-        let Some(changed) = self
+        #[cfg(target_arch = "riscv64")]
+        let changed = if new_flags.contains(PTEFlags::X) {
+            publish_executable_user_pte(Some(frame), self.asid.as_ref(), || {
+                self.page_table
+                    .remap_deferred_changed(plan.vpn, frame.ppn, new_flags)
+            })
+        } else {
+            self.page_table
+                .remap_deferred_changed(plan.vpn, frame.ppn, new_flags)
+        };
+        #[cfg(not(target_arch = "riscv64"))]
+        let changed = self
             .page_table
-            .remap_deferred_changed(plan.vpn, frame.ppn, new_flags)
-        else {
+            .remap_deferred_changed(plan.vpn, frame.ppn, new_flags);
+        let Some(changed) = changed else {
             return CowFaultCommit::Retry;
         };
         if changed {
             batch.record_page(fault_va);
-        }
-        #[cfg(target_arch = "riscv64")]
-        if new_flags.contains(PTEFlags::X) {
-            batch.mark_icache_stale();
         }
         // Keep the old frame pinned until every target hart has acknowledged
         // the invalidation for the newly installed PTE.
@@ -408,36 +417,31 @@ impl MemorySet {
             _ => candidate.clone(),
         };
 
-        // A missing PTE has no stale valid translation on a remote hart,
-        // including when the new mapping is executable.  RISC-V still needs
-        // two distinct operations, in Linux's order:
-        //
-        // 1. `flush_icache_pte()` publishes the instruction bytes before
-        //    `set_pte_at()` makes them executable.  Active remote harts fence
-        //    now; inactive harts consume the deferred per-mm marker later.
-        // 2. `update_mmu_cache_range()` refreshes only the faulting hart after
-        //    the new PTE is visible, for implementations that cache invalid
-        //    entries.
-        //
-        // Do not put a new executable PTE through the replacement/unmap TLB
-        // transaction: that needlessly sends a synchronous SBI RFENCE for
-        // every code-page fault during exec and dynamic linking.
         #[cfg(target_arch = "riscv64")]
-        if plan.pte_flags.contains(PTEFlags::X) {
-            crate::arch::riscv64::mm::mark_icache_stale(self.asid.as_ref());
+        {
+            if plan.pte_flags.contains(PTEFlags::X) {
+                publish_executable_user_pte(Some(&frame), self.asid.as_ref(), || {
+                    self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags)
+                });
+            } else {
+                self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
+            }
         }
+        #[cfg(not(target_arch = "riscv64"))]
         self.page_table.map(plan.vpn, frame.ppn, plan.pte_flags);
         let shared_file_backing_frame = (plan.inode_backed && region.shared).then(|| frame.clone());
         self.areas[area_idx].insert_tracked_frame(plan.vpn, frame);
-        if let (Some(backing), Some(file_page)) = (
-            self.mmap_backings.get_mut(&region.backing_id),
-            plan.file_page,
-        ) {
-            backing.add_resident_page_ref(
-                file_page,
-                shared_file_backing_frame.as_ref(),
-                plan.pte_flags.contains(PTEFlags::D),
-            );
+        if region.shared {
+            if let (Some(backing), Some(file_page)) = (
+                self.mmap_backings.get_mut(&region.backing_id),
+                plan.file_page,
+            ) {
+                backing.add_resident_page_ref(
+                    file_page,
+                    shared_file_backing_frame.as_ref(),
+                    plan.pte_flags.contains(PTEFlags::D),
+                );
+            }
         }
         #[cfg(target_arch = "riscv64")]
         crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va);

@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 
 struct LoadedExecImage {
     data: Vec<u8>,
+    inode: Arc<ext4_fs::Inode>,
     exec_inode: (usize, u32),
     exe_path: String,
     _reservation: crate::fs::ExecInodeReservation,
@@ -48,6 +49,7 @@ fn load_exec_inode_image(inode: Arc<ext4_fs::Inode>, path: &str) -> Result<Loade
     };
     Ok(LoadedExecImage {
         data,
+        inode,
         exec_inode,
         exe_path,
         _reservation: reservation,
@@ -700,21 +702,35 @@ fn execve_with_inode(
             if !is_elf(&interp_data.data) {
                 return ENOEXEC;
             }
-            let inode = Arc::clone(&inode);
-            let inode_lock = ext4_inode_lock(&inode);
-            let inode_guard = inode_lock.read();
-            let loader = |offset: usize, buf: &mut [u8]| inode.read_at(offset, buf);
+            let main_os_inode = match crate::fs::OSInode::new(true, false, Arc::clone(&inode)) {
+                Ok(file) => Arc::new(file),
+                Err(e) => return e,
+            };
+            let interp_os_inode =
+                match crate::fs::OSInode::new(true, false, Arc::clone(&interp_data.inode)) {
+                    Ok(file) => Arc::new(file),
+                    Err(e) => return e,
+                };
+            let main_file: Arc<dyn crate::fs::File + Send + Sync> = main_os_inode.clone();
+            let interp_file: Arc<dyn crate::fs::File + Send + Sync> = interp_os_inode.clone();
+            let main_loader = |offset: usize, buf: &mut [u8]| main_os_inode.pread_at(offset, buf);
+            let interp_loader =
+                |offset: usize, buf: &mut [u8]| interp_os_inode.pread_at(offset, buf);
             let (memory_set, ustack_base, interp_entry, main_entry, main_aux, interp_base) =
-                match MemorySet::from_elf_with_interp_info_reader(loader, &info, &interp_data.data)
-                {
+                match MemorySet::from_elf_with_interp_info_file_backed(
+                    main_loader,
+                    &info,
+                    main_file,
+                    exec_inode.0,
+                    exec_inode.1,
+                    interp_loader,
+                    interp_file,
+                    interp_data.exec_inode.0,
+                    interp_data.exec_inode.1,
+                ) {
                     Ok(v) => v,
                     Err(e) => return e,
                 };
-            // Linux does not carry an inode's i_rwsem into exec commit or
-            // vfork completion.  In particular, wake_vfork_parent_waiters()
-            // may contend on the parent's process lock, so retaining this
-            // read guard would make an inode -> parent lock edge.
-            drop(inode_guard);
             let process = current_process();
             process.exec_dyn_with_memory_set(
                 memory_set,
@@ -734,19 +750,23 @@ fn execve_with_inode(
             return 0;
         }
 
-        let inode = Arc::clone(&inode);
-        let inode_lock = ext4_inode_lock(&inode);
-        let inode_guard = inode_lock.read();
-        let loader = |offset: usize, buf: &mut [u8]| inode.read_at(offset, buf);
+        let os_inode = match crate::fs::OSInode::new(true, false, Arc::clone(&inode)) {
+            Ok(file) => Arc::new(file),
+            Err(e) => return e,
+        };
+        let backing_file: Arc<dyn crate::fs::File + Send + Sync> = os_inode.clone();
+        let loader = |offset: usize, buf: &mut [u8]| os_inode.pread_at(offset, buf);
         let (memory_set, ustack_base, entry_point, elf_aux) =
-            match MemorySet::from_elf_info_reader(loader, &info) {
+            match MemorySet::from_elf_info_file_backed(
+                loader,
+                &info,
+                backing_file,
+                exec_inode.0,
+                exec_inode.1,
+            ) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
-        // The ELF image has been materialized.  Drop the inode read side
-        // before replacing the mm and notifying a vfork parent, matching
-        // Linux's separation between file loading and exec commit.
-        drop(inode_guard);
         let process = current_process();
         process.exec_with_memory_set(
             memory_set,

@@ -120,54 +120,61 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
         return err(SyscallError::EINVAL);
     }
     let token = get_current_token();
-    let task = current_task().unwrap();
-    let mut inner = task.borrow_mut();
-    let old_mask = inner.signal_mask;
+    // Linux copies the requested mask from user space before taking
+    // sighand->siglock, then copies the old mask out after dropping it.  User
+    // access can fault and sleep on the mm mutex, so it must not run while our
+    // raw TaskControlBlockInner spin lock is held either.
     let new_mask = if set != 0 {
-        // Read new mask before writing oldset to support aliasing set/oldset.
+        // Read before writing oldset to preserve set/oldset aliasing semantics.
         let Some(v) = try_read_user_value(token, set as *const u64) else {
             return err(SyscallError::EFAULT);
         };
-        v
+        Some(v)
     } else {
+        None
+    };
+    let task = current_task().unwrap();
+    let old_mask = {
+        let mut inner = task.borrow_mut();
+        let old_mask = inner.signal_mask;
+        if let Some(new_mask) = new_mask {
+            if DEBUG_PTHREAD {
+                crate::println!(
+                    "[rt_sigprocmask] how={} new_mask={:#x} old_mask={:#x}",
+                    how,
+                    new_mask,
+                    old_mask
+                );
+            }
+            let sigalrm_bit = signal_bit(SIGALRM_NUM).unwrap_or(0);
+            let sigkill_bit = signal_bit(crate::task::signal::SIGKILL_NUM).unwrap_or(0);
+            let sigstop_bit = signal_bit(crate::task::signal::SIGSTOP_NUM).unwrap_or(0);
+            let mut updated = match how {
+                0 => old_mask | new_mask,  // SIG_BLOCK
+                1 => old_mask & !new_mask, // SIG_UNBLOCK
+                2 => new_mask,             // SIG_SETMASK
+                _ => return err(SyscallError::EINVAL),
+            };
+            updated &= !(sigkill_bit | sigstop_bit);
+            inner.signal_mask = updated;
+            if DEBUG_UNIXBENCH && sigalrm_bit != 0 && ((old_mask ^ updated) & sigalrm_bit) != 0 {
+                let pid = current_process().getpid();
+                let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+                crate::log_if!(
+                    DEBUG_UNIXBENCH,
+                    info,
+                    "[signal] sigmask pid={} tid={} how={} setsize={} old={:#x} new={:#x}",
+                    pid,
+                    tid,
+                    how,
+                    sigsetsize,
+                    old_mask,
+                    updated
+                );
+            }
+        }
         old_mask
     };
-    if set != 0 {
-        if DEBUG_PTHREAD {
-            crate::println!(
-                "[rt_sigprocmask] how={} new_mask={:#x} old_mask={:#x}",
-                how,
-                new_mask,
-                inner.signal_mask
-            );
-        }
-        let sigalrm_bit = signal_bit(SIGALRM_NUM).unwrap_or(0);
-        let sigkill_bit = signal_bit(crate::task::signal::SIGKILL_NUM).unwrap_or(0);
-        let sigstop_bit = signal_bit(crate::task::signal::SIGSTOP_NUM).unwrap_or(0);
-        let mut updated = match how {
-            0 => old_mask | new_mask,  // SIG_BLOCK
-            1 => old_mask & !new_mask, // SIG_UNBLOCK
-            2 => new_mask,             // SIG_SETMASK
-            _ => return err(SyscallError::EINVAL),
-        };
-        updated &= !(sigkill_bit | sigstop_bit);
-        inner.signal_mask = updated;
-        if DEBUG_UNIXBENCH && sigalrm_bit != 0 && ((old_mask ^ updated) & sigalrm_bit) != 0 {
-            let pid = current_process().getpid();
-            let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
-            crate::log_if!(
-                DEBUG_UNIXBENCH,
-                info,
-                "[signal] sigmask pid={} tid={} how={} setsize={} old={:#x} new={:#x}",
-                pid,
-                tid,
-                how,
-                sigsetsize,
-                old_mask,
-                updated
-            );
-        }
-    }
     if oldset != 0 {
         if try_write_user_value(token, oldset as *mut u64, &old_mask).is_err() {
             return err(SyscallError::EFAULT);
@@ -179,10 +186,20 @@ pub fn syscall_rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize:
 /// Linux `sigaltstack` (syscall 132).
 pub fn syscall_sigaltstack(ss: usize, old_ss: usize) -> isize {
     let token = get_current_token();
+    // Match Linux's sys_sigaltstack(): copy the new descriptor in before
+    // touching task state, commit a kernel-local value, and only then copy the
+    // old descriptor out.  Neither user copy may run under the TCB spin lock.
+    let new_ss = if ss != 0 {
+        let Some(stack) = try_read_user_value(token, ss as *const SigStack) else {
+            return err(SyscallError::EFAULT);
+        };
+        Some(stack)
+    } else {
+        None
+    };
     let task = current_task().unwrap();
-    let mut inner = task.borrow_mut();
-
-    if old_ss != 0 {
+    let old = {
+        let mut inner = task.borrow_mut();
         let flags = if !inner.sigaltstack_enabled {
             SS_DISABLE
         } else if inner.on_sigaltstack {
@@ -196,38 +213,34 @@ pub fn syscall_sigaltstack(ss: usize, old_ss: usize) -> isize {
             _pad: 0,
             ss_size: inner.sigaltstack_size,
         };
-        if try_write_user_value(token, old_ss as *mut SigStack, &old).is_err() {
-            return err(SyscallError::EFAULT);
+        if let Some(new_ss) = new_ss {
+            if inner.on_sigaltstack {
+                return err(SyscallError::EPERM);
+            }
+            if (new_ss.ss_flags & !(SS_DISABLE)) != 0 {
+                return err(SyscallError::EINVAL);
+            }
+            if (new_ss.ss_flags & SS_DISABLE) != 0 {
+                inner.sigaltstack_enabled = false;
+                inner.sigaltstack_sp = 0;
+                inner.sigaltstack_size = 0;
+            } else {
+                if new_ss.ss_sp == 0 {
+                    return err(SyscallError::EINVAL);
+                }
+                if new_ss.ss_size < MINSIGSTKSZ {
+                    return err(SyscallError::ENOMEM);
+                }
+                inner.sigaltstack_enabled = true;
+                inner.sigaltstack_sp = new_ss.ss_sp;
+                inner.sigaltstack_size = new_ss.ss_size;
+            }
         }
-    }
-
-    if ss == 0 {
-        return 0;
-    }
-    if inner.on_sigaltstack {
-        return err(SyscallError::EPERM);
-    }
-    let Some(new_ss) = try_read_user_value(token, ss as *const SigStack) else {
-        return err(SyscallError::EFAULT);
+        old
     };
-    if (new_ss.ss_flags & !(SS_DISABLE)) != 0 {
-        return err(SyscallError::EINVAL);
+    if old_ss != 0 && try_write_user_value(token, old_ss as *mut SigStack, &old).is_err() {
+        return err(SyscallError::EFAULT);
     }
-    if (new_ss.ss_flags & SS_DISABLE) != 0 {
-        inner.sigaltstack_enabled = false;
-        inner.sigaltstack_sp = 0;
-        inner.sigaltstack_size = 0;
-        return 0;
-    }
-    if new_ss.ss_sp == 0 {
-        return err(SyscallError::EINVAL);
-    }
-    if new_ss.ss_size < MINSIGSTKSZ {
-        return err(SyscallError::ENOMEM);
-    }
-    inner.sigaltstack_enabled = true;
-    inner.sigaltstack_sp = new_ss.ss_sp;
-    inner.sigaltstack_size = new_ss.ss_size;
     0
 }
 

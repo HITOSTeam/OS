@@ -21,11 +21,14 @@ pub fn dump_system_state() {
             continue;
         };
         log::warn!(
-            "[watchdog] pid={} zombie={} tasks_len={} children_len={} sems_len={}",
+            "[watchdog] pid={} zombie={} tasks_len={} children_len={} exited_children_len={} waiters={} vfork_waiters={} sems_len={}",
             pid,
             process_inner.is_zombie,
             process_inner.tasks.len(),
             process_inner.children.len(),
+            process_inner.exited_children.len(),
+            process_inner.wait_queue.len(),
+            process_inner.vfork_wait_queue.len(),
             process_inner.semaphore_list.len()
         );
         // 任务
@@ -41,13 +44,22 @@ pub fn dump_system_state() {
             let wp = tcb
                 .wakeup_pending
                 .load(core::sync::atomic::Ordering::Acquire);
-            let (status, exit_code, has_res) = if let Some(g) = tcb.try_borrow_mut() {
-                (Some(g.task_status), g.exit_code, Some(g.res.is_some()))
-            } else {
-                (None, None, None)
-            };
+            let (status, exit_code, has_res, pending, mask, last_syscall) =
+                if let Some(g) = tcb.try_borrow_mut() {
+                    (
+                        Some(g.task_status),
+                        g.exit_code,
+                        Some(g.res.is_some()),
+                        Some(g.pending_signals),
+                        Some(g.signal_mask),
+                        g.last_syscall_valid
+                            .then_some((g.last_syscall_id, g.last_syscall_args)),
+                    )
+                } else {
+                    (None, None, None, None, None, None)
+                };
             log::warn!(
-                "[watchdog]  tid={} status={:?} res={:?} on_cpu={} ready_hart={} in_rq={} wakeup_pending={} exec={} retired={} exit_code={:?}",
+                "[watchdog]  tid={} status={:?} res={:?} on_cpu={} ready_hart={} in_rq={} wakeup_pending={} exec={} retired={} exit_code={:?} pending={:?} mask={:?} last_syscall={:?}",
                 tid,
                 status,
                 has_res,
@@ -57,7 +69,10 @@ pub fn dump_system_state() {
                 wp,
                 tcb.exec_exit_requested(),
                 tcb.exit_lifecycle_retired(),
-                exit_code
+                exit_code,
+                pending,
+                mask,
+                last_syscall
             );
         }
         // 信号量

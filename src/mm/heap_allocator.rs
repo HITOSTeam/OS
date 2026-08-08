@@ -2,10 +2,13 @@
 
 use crate::{
     config::{KERNEL_HEAP_SIZE, MAX_HARTS, PAGE_SIZE},
+    mm::{
+        buddy_heap::{MIN_BLOCK_SIZE, ORDER_COUNT},
+        slab_heap::{SLAB_CLASS_COUNT, SLAB_CLASS_SIZES, SLAB_PAGE_SIZE, SlabHeap},
+    },
     println,
     sync::LocalIrqSaveGuard,
 };
-use buddy_system_allocator::Heap;
 use core::{
     alloc::{GlobalAlloc, Layout},
     ptr::{NonNull, addr_of, addr_of_mut},
@@ -15,6 +18,12 @@ use spin::mutex::SpinMutex;
 const HEAP_PAGE_COUNT: usize = KERNEL_HEAP_SIZE / PAGE_SIZE;
 const HEAP_SHARD_BASE_PAGES: usize = HEAP_PAGE_COUNT / MAX_HARTS;
 const HEAP_SHARD_EXTRA_PAGES: usize = HEAP_PAGE_COUNT % MAX_HARTS;
+const HEAP_SHARD_MAX_PAGES: usize = HEAP_SHARD_BASE_PAGES + (HEAP_SHARD_EXTRA_PAGES != 0) as usize;
+const HEAP_SHARD_FREE_BITMAP_WORDS: usize =
+    (HEAP_SHARD_MAX_PAGES * PAGE_SIZE / MIN_BLOCK_SIZE).div_ceil(u64::BITS as usize);
+const _: () = assert!(PAGE_SIZE == SLAB_PAGE_SIZE);
+
+type KernelHeap = SlabHeap<HEAP_SHARD_FREE_BITMAP_WORDS, HEAP_SHARD_MAX_PAGES>;
 
 const fn heap_shard_page_offset(index: usize) -> usize {
     index * HEAP_SHARD_BASE_PAGES
@@ -29,7 +38,7 @@ const fn heap_shard_page_count(index: usize) -> usize {
     HEAP_SHARD_BASE_PAGES + if index < HEAP_SHARD_EXTRA_PAGES { 1 } else { 0 }
 }
 
-/// Per-hart buddy heaps.
+/// Per-hart slab/buddy heaps.
 ///
 /// Rust's `buddy_system_allocator::LockedHeap` serializes every allocation and
 /// free through one ticket lock.  Fork-heavy builds create and destroy enough
@@ -39,7 +48,7 @@ const fn heap_shard_page_count(index: usize) -> usize {
 /// falls back to another arena when the local one is full; deallocation routes
 /// by address, so tasks may migrate freely between the two operations.
 struct ShardedHeap {
-    shards: [SpinMutex<Heap>; MAX_HARTS],
+    shards: [SpinMutex<KernelHeap>; MAX_HARTS],
 }
 
 impl ShardedHeap {
@@ -48,7 +57,7 @@ impl ShardedHeap {
             // Use the non-ticket spin mutex explicitly. A global allocator
             // cannot sleep, and ticket head-of-line blocking is especially
             // costly when QEMU schedules virtual harts cooperatively.
-            shards: [const { SpinMutex::new(Heap::new()) }; MAX_HARTS],
+            shards: [const { SpinMutex::new(KernelHeap::new()) }; MAX_HARTS],
         }
     }
 
@@ -85,7 +94,37 @@ impl ShardedHeap {
             })
     }
 
-    fn shard_for_ptr(&self, ptr: *mut u8) -> Option<&SpinMutex<Heap>> {
+    fn order_stats(&self, order: usize) -> (usize, usize, usize) {
+        self.shards
+            .iter()
+            .fold((0usize, 0usize, 0usize), |(live, user, free), shard| {
+                let _irq_guard = LocalIrqSaveGuard::new();
+                let shard = shard.lock();
+                let (shard_live, shard_user, shard_free) = shard.stats_order(order);
+                (
+                    live.saturating_add(shard_live),
+                    user.saturating_add(shard_user),
+                    free.saturating_add(shard_free),
+                )
+            })
+    }
+
+    fn slab_stats(&self, class_index: usize) -> (usize, usize, usize) {
+        self.shards
+            .iter()
+            .fold((0usize, 0usize, 0usize), |(live, user, pages), shard| {
+                let _irq_guard = LocalIrqSaveGuard::new();
+                let shard = shard.lock();
+                let (shard_live, shard_user, shard_pages) = shard.stats_slab_class(class_index);
+                (
+                    live.saturating_add(shard_live),
+                    user.saturating_add(shard_user),
+                    pages.saturating_add(shard_pages),
+                )
+            })
+    }
+
+    fn shard_for_ptr(&self, ptr: *mut u8) -> Option<&SpinMutex<KernelHeap>> {
         let heap_start = addr_of!(HEAP_SPACE) as usize;
         let offset = (ptr as usize).checked_sub(heap_start)?;
         if offset >= KERNEL_HEAP_SIZE {
@@ -113,15 +152,28 @@ unsafe impl GlobalAlloc for ShardedHeap {
             // the owning task on this hart until the shard lock is released;
             // otherwise a timer interrupt could schedule it out permanently
             // while another hart spins on the same allocator shard.
-            let allocation = {
+            let (allocation, actual_before, actual_after) = {
                 let _irq_guard = LocalIrqSaveGuard::new();
                 let mut shard = self.shards[index].lock();
-                shard.alloc(layout)
+                let actual_before = if crate::perf::enabled() {
+                    shard.stats_alloc_actual()
+                } else {
+                    0
+                };
+                let allocation = shard.alloc(layout);
+                let actual_after = if crate::perf::enabled() {
+                    shard.stats_alloc_actual()
+                } else {
+                    0
+                };
+                (allocation, actual_before, actual_after)
             };
             if let Ok(allocation) = allocation {
+                crate::perf::record_heap_actual_transition(actual_before, actual_after);
                 return allocation.as_ptr();
             }
         }
+        crate::perf::record_heap_allocation_failure();
         core::ptr::null_mut()
     }
 
@@ -132,9 +184,25 @@ unsafe impl GlobalAlloc for ShardedHeap {
         // SAFETY: GlobalAlloc requires `ptr` to come from a previous successful
         // allocation with the same layout. Address routing selects that
         // allocation's original, disjoint buddy arena.
-        let _irq_guard = LocalIrqSaveGuard::new();
-        let mut shard = shard.lock();
-        shard.dealloc(unsafe { NonNull::new_unchecked(ptr) }, layout);
+        let (actual_before, actual_after) = {
+            let _irq_guard = LocalIrqSaveGuard::new();
+            let mut shard = shard.lock();
+            let actual_before = if crate::perf::enabled() {
+                shard.stats_alloc_actual()
+            } else {
+                0
+            };
+            unsafe {
+                shard.dealloc(NonNull::new_unchecked(ptr), layout);
+            }
+            let actual_after = if crate::perf::enabled() {
+                shard.stats_alloc_actual()
+            } else {
+                0
+            };
+            (actual_before, actual_after)
+        };
+        crate::perf::record_heap_actual_transition(actual_before, actual_after);
     }
 }
 
@@ -163,6 +231,41 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
         args[5]
     );
     crate::fs::debug_net_socket_atomic_heap_state();
+    for order in 0..ORDER_COUNT {
+        let (live, user, free) = HEAP_ALLOCATOR.order_stats(order);
+        if live == 0 && free == 0 {
+            continue;
+        }
+        let block_size = 1usize << order;
+        crate::println!(
+            "[oom][heap-order] order={} block={} live={} user={} actual={} free_blocks={} free_bytes={}",
+            order,
+            block_size,
+            live,
+            user,
+            live.saturating_mul(block_size),
+            free,
+            free.saturating_mul(block_size)
+        );
+    }
+    for class_index in 0..SLAB_CLASS_COUNT {
+        let (live, user, pages) = HEAP_ALLOCATOR.slab_stats(class_index);
+        if live == 0 && pages == 0 {
+            continue;
+        }
+        let class_size = SLAB_CLASS_SIZES[class_index];
+        let capacity = pages.saturating_mul(SLAB_PAGE_SIZE / class_size);
+        crate::println!(
+            "[oom][heap-slab] class={} live={} user={} object_bytes={} pages={} reserved={} free_objects={}",
+            class_size,
+            live,
+            user,
+            live.saturating_mul(class_size),
+            pages,
+            pages.saturating_mul(SLAB_PAGE_SIZE),
+            capacity.saturating_sub(live)
+        );
+    }
     panic!("Heap allocation error, layout = {:?}", layout);
 }
 

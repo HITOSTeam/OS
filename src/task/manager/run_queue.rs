@@ -17,7 +17,7 @@ use super::fair::{
 use super::pick_online_hart;
 use super::rt::{
     dec_ready_fair_count, dec_ready_rt_count, inc_ready_fair_count, inc_ready_rt_count,
-    rt_bandwidth_throttled,
+    ready_fair_count, ready_rt_count, rt_bandwidth_throttled,
 };
 
 /// 全局任务管理器，每个 hart 维护一个独立就绪队列（包含 RT 和 EEVDF 公平两个调度类）
@@ -45,16 +45,12 @@ pub(super) fn resolve_enqueue_hart(
     } else {
         affinity_mask
     };
-    if matches!(task_queue_slot(task), ReadyQueueSlot::Fair) {
-        // Linux can correct fork placement through sched-domain balancing.
-        // Until this scheduler has an equivalent periodic balancer, pinning
-        // every new fair task to the forking CPU leaves parallel compiler
-        // children concentrated on a few harts. Use the same least-loaded
-        // placement as fair wakeups while still respecting affinity.
-        let picked = pick_least_loaded_hart_from_mask(allowed_mask);
-        task.set_cpu_id(picked);
-        return picked;
-    }
+    // Linux does not run CPU selection again when the current task is merely
+    // requeued after a tick/yield: migration is owned by the balancing paths.
+    // `Initial` tasks already carry the round-robin fork placement selected by
+    // `select_hart_for_new_task()`, so both cases should first retain task_cpu.
+    // Apart from matching that ownership boundary, this avoids taking every
+    // remote rq/processor lock on each context switch.
     let desired = task.get_cpu_id() % MAX_HARTS;
     if (allowed_mask & (1usize << desired)) != 0 {
         desired
@@ -66,34 +62,6 @@ pub(super) fn resolve_enqueue_hart(
         task.set_cpu_id(picked);
         picked
     }
-}
-
-pub(super) fn pick_least_loaded_hart_from_mask(mask: usize) -> usize {
-    let mut best_hart = None;
-    let mut best_len = usize::MAX;
-    for hart_id in 0..MAX_HARTS {
-        if (mask & (1usize << hart_id)) == 0 {
-            continue;
-        }
-        // A hart with an empty runqueue may still be executing a CPU-bound
-        // task. Counting only queued entities repeatedly selects the first
-        // such hart and defeats SMP distribution. Linux's rq load includes
-        // the current entity; approximate that here without blocking on a
-        // remote processor lock.
-        let running = usize::from(
-            crate::task::processor::current_task_on_hart(hart_id)
-                .is_some_and(|task| task.get_cpu_id() == hart_id),
-        );
-        let len = TASK_MANAGER.ready_queues[hart_id]
-            .lock()
-            .len()
-            .saturating_add(running);
-        if len < best_len {
-            best_len = len;
-            best_hart = Some(hart_id);
-        }
-    }
-    best_hart.unwrap_or_else(|| pick_online_hart(0))
 }
 
 pub(super) fn pick_online_hart_from_mask(mask: usize) -> usize {
@@ -139,14 +107,10 @@ pub(super) fn resolve_wakeup_hart(
 ) -> usize {
     let allowed_mask = allowed_hart_mask_for_task(task, mask);
     let previous = task.get_cpu_id() % MAX_HARTS;
-    if matches!(task_queue_slot(task), ReadyQueueSlot::Fair) {
-        // Linux 的 fair 唤醒放置可能会从 wake-affine 回退到调度域内的最空闲 CPU 搜索。
-        // 在完整建模 domain/idle-sibling 逻辑之前，保留已经验证过的负载分散路径：
-        // cyclictest worker 初始化不能被粘在 hackbench-heavy CPU 后面。
-        let picked = pick_least_loaded_hart_from_mask(allowed_mask);
-        task.set_cpu_id(picked);
-        return picked;
-    }
+    // Linux select_task_rq_fair() starts from prev_cpu and ordinary wakeups
+    // normally stay on its fast path; fork/exec and explicit balancing own the
+    // expensive cross-CPU search. Preserve that cache-affine default here and
+    // let pull_fair_task_for_idle() move queued work only when a CPU is idle.
     if (allowed_mask & hart_bit(previous)) != 0 {
         return previous;
     }
@@ -230,7 +194,10 @@ impl TaskManager {
             // that has already inserted the task on another hart.
             return None;
         }
-        let was_empty = hart_rq.len() == 0;
+        // Linux keeps rq->nr_running so enqueue does not walk every scheduling
+        // class just to detect the empty-to-runnable transition.  The exact
+        // per-hart counters are updated under this same rq lock.
+        let was_empty = ready_rt_count(hart_id) == 0 && ready_fair_count(hart_id) == 0;
         if DEBUG_SCHED {
             let tid = task
                 .borrow_mut()
@@ -556,7 +523,10 @@ impl TaskManager {
             let mut rq = self.ready_queues[hart_id].lock();
             let mut picked = None;
             // RT-RUNTIME 还没用完 ，那就直接从rt中拿取
-            if !rt_bandwidth_throttled(hart_id) {
+            // The BuildStorm/common case has no RT entities.  Avoid scanning
+            // all 99 empty priority queues on every fair scheduling decision,
+            // as Linux first gates its RT pick path on rt_nr_running.
+            if ready_rt_count(hart_id) != 0 && !rt_bandwidth_throttled(hart_id) {
                 for (rt_idx, rtq) in rq.rt_queues.iter_mut().enumerate() {
                     if let Some(task) = Self::pop_ready_rt_candidate(rtq, hart_id, rt_idx) {
                         picked = Some(task);
@@ -586,6 +556,90 @@ impl TaskManager {
             }
         }
         t
+    }
+
+    /// Pull one fair task when `idle_hart` is about to become idle.
+    ///
+    /// This is a compact counterpart of Linux `sched_balance_newidle()`: only
+    /// queued (never currently running) fair entities are eligible, a source
+    /// must retain at least one runnable entity, CPU affinity is mandatory,
+    /// and at most one task is moved per idle pass.  The task is enqueued on
+    /// the destination before being selected again so EEVDF placement is
+    /// normalized against the destination runqueue.
+    pub(super) fn pull_fair_task_for_idle(
+        &self,
+        idle_hart: usize,
+        online_mask: usize,
+    ) -> Option<Arc<TaskControlBlock>> {
+        let idle_hart = idle_hart % MAX_HARTS;
+        let mut unvisited = online_mask & !hart_bit(idle_hart);
+
+        while unvisited != 0 {
+            let mut busiest = None;
+            let mut busiest_load = 1usize;
+            for donor_hart in 0..MAX_HARTS {
+                if (unvisited & hart_bit(donor_hart)) == 0 {
+                    continue;
+                }
+                let queued_fair = ready_fair_count(donor_hart);
+                if queued_fair == 0 {
+                    continue;
+                }
+                // Linux's rq->nr_running includes `curr`.  A donor with one
+                // running and one queued task is therefore overloaded, while
+                // a CPU with only one queued task and no current task is not.
+                let running =
+                    usize::from(crate::task::processor::current_task_on_hart(donor_hart).is_some());
+                let load = queued_fair.saturating_add(running);
+                if load > busiest_load {
+                    busiest = Some(donor_hart);
+                    busiest_load = load;
+                }
+            }
+
+            let Some(donor_hart) = busiest else {
+                return None;
+            };
+            unvisited &= !hart_bit(donor_hart);
+
+            let task = {
+                let mut donor_rq = self.ready_queues[donor_hart].lock();
+                Self::pop_ready_fair_candidate(&mut donor_rq, donor_hart)
+            };
+            let Some(task) = task else {
+                continue;
+            };
+
+            let allowed_mask = allowed_hart_mask_for_task(&task, online_mask);
+            if (allowed_mask & hart_bit(idle_hart)) == 0 {
+                // Affinity changed or this task was pinned all along. Return
+                // it to an allowed queue and try another donor; never run it
+                // on the newly idle CPU as a balancing shortcut.
+                let return_hart = if (allowed_mask & hart_bit(donor_hart)) != 0 {
+                    donor_hart
+                } else {
+                    pick_online_hart_from_mask(allowed_mask)
+                };
+                if let Some(was_empty) = self.add(task, return_hart, EnqueueKind::Requeue)
+                    && was_empty
+                    && return_hart != idle_hart
+                {
+                    crate::arch::send_ipi(return_hart);
+                }
+                continue;
+            }
+
+            if self.add(task, idle_hart, EnqueueKind::Requeue).is_none() {
+                // A concurrent ownership transition won. Restart the local
+                // pick; the task remains owned by whichever enqueue won.
+                if let Some(local) = self.fetch(idle_hart) {
+                    return Some(local);
+                }
+                continue;
+            }
+            return self.fetch(idle_hart);
+        }
+        None
     }
     /// 从所有 hart 的就绪队列中移除指定任务（同时清理 RT 和 Fair 队列中可能存在的重复条目）
     pub fn remove(&self, task: Arc<TaskControlBlock>) -> usize {

@@ -11,7 +11,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use ext4_fs::{Ext4Error, Inode};
+use ext4_fs::{Ext4Error, Inode, InodeStatSnapshot};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -128,7 +128,7 @@ impl VfsNode for Ext4VfsNode {
             self.inode.stat_snapshot()
         };
         Ok(VfsMetadata {
-            kind: inode_kind(&self.inode),
+            kind: inode_kind_from_snapshot(&snapshot),
             mode: snapshot.mode & 0o7777,
             uid: snapshot.uid,
             gid: snapshot.gid,
@@ -155,10 +155,11 @@ impl VfsNode for Ext4VfsNode {
         }
         let inode = {
             let _inode_guard = self.inode_lock.read();
-            if !self.inode.is_dir() {
-                return Err(VfsError::NotDirectory);
+            match self.inode.find(name) {
+                Some(inode) => inode,
+                None if self.inode.is_dir() => return Err(VfsError::NoEntry),
+                None => return Err(VfsError::NotDirectory),
             }
-            self.inode.find(name).ok_or(VfsError::NoEntry)?
         };
         Ok(self.wrap(inode))
     }
@@ -452,17 +453,21 @@ impl VfsFileOperations for Ext4VfsFile {
 }
 
 fn inode_kind(inode: &Inode) -> VfsNodeKind {
-    if inode.is_dir() {
+    inode_kind_from_snapshot(&inode.stat_snapshot())
+}
+
+fn inode_kind_from_snapshot(snapshot: &InodeStatSnapshot) -> VfsNodeKind {
+    if snapshot.is_dir() {
         VfsNodeKind::Directory
-    } else if inode.is_symlink() {
+    } else if snapshot.is_symlink() {
         VfsNodeKind::Symlink
-    } else if inode.is_fifo() {
+    } else if snapshot.is_fifo() {
         VfsNodeKind::Fifo
-    } else if inode.is_chrdev() {
+    } else if snapshot.is_chrdev() {
         VfsNodeKind::CharacterDevice
-    } else if inode.is_blkdev() {
+    } else if snapshot.is_blkdev() {
         VfsNodeKind::BlockDevice
-    } else if inode.is_socket() {
+    } else if snapshot.is_socket() {
         VfsNodeKind::Socket
     } else {
         VfsNodeKind::Regular

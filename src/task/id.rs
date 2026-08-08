@@ -132,7 +132,6 @@ impl Drop for PidHandle {
         PID_ALLOCATOR.lock().dealloc(self.0);
     }
 }
-
 /// Aggregate equivalent of Linux's two cached VMAP stacks per CPU.
 ///
 /// The cache is shared because CongCore has no NUMA placement to preserve. Its
@@ -188,7 +187,6 @@ pub fn kstack_alloc() -> Option<KernelStack> {
         maybe_log_kstack_inflight("alloc");
         return Some(KernelStack(kstack_id));
     }
-
     let kstack_id = KSTACK_ALLOCATOR.lock().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
     let ok = KERNEL_SPACE.lock().try_insert_framed_area(
@@ -205,6 +203,7 @@ pub fn kstack_alloc() -> Option<KernelStack> {
     // running with the LoongArch kernel PGDH/ASID 0 (and the same distinction
     // applies to RISC-V global kernel mappings). Match the removal path and
     // complete a shared-kernel shootdown before the stack can be scheduled.
+    // Only reached when the live-thread high-water mark grows, not per thread.
     crate::perf::record_kstack_map();
     crate::mm::flush_kernel_shared_tlb();
     KSTACK_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -216,7 +215,6 @@ impl Drop for KernelStack {
     fn drop(&mut self) {
         KSTACK_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         maybe_log_kstack_inflight("drop");
-
         // Keep the mapping installed while the bounded cache has room. A
         // failed metadata allocation simply falls back to the ordinary unmap.
         {
@@ -226,7 +224,6 @@ impl Drop for KernelStack {
                 return;
             }
         }
-
         let (kernel_stack_bottom, kernel_stack_top) = self.bounds();
         let kernel_stack_bottom_va: VirtAddr = kernel_stack_bottom.into();
         let kernel_stack_top_va: VirtAddr = kernel_stack_top.into();

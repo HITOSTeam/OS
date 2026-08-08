@@ -20,6 +20,14 @@ use super::current_time_ns_usize;
 static READY_RT_COUNTS: [[AtomicUsize; RT_PRIO_LEVELS]; MAX_HARTS] =
     [const { [const { AtomicUsize::new(0) }; RT_PRIO_LEVELS] }; MAX_HARTS];
 
+/// Per-hart aggregate RT runnable count.
+///
+/// Linux keeps `rq->nr_running` next to each runqueue so idle and balancing
+/// paths do not have to scan every RT priority bucket merely to answer
+/// whether work exists.  The priority buckets above remain authoritative for
+/// priority comparisons; this aggregate is the O(1) presence/load fast path.
+static READY_RT_TOTAL_COUNTS: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
+
 /// 当前 RT 带宽周期的起始时间（纳秒），每个 hart 一份。
 ///
 /// 周期长度由 `sched_rt_period_us`（默认 1s）决定。当 `now - period_start >= period`
@@ -215,7 +223,9 @@ pub fn account_rt_runtime(hart_id: usize, delta_ns: u64) {
 /// （`has_ready_rt_count_*`）可以 O(1) 判断该 hart 是否有更高优先级
 /// RT 任务就绪，无需扫描 `rt_queues`。
 pub(super) fn inc_ready_rt_count(hart_id: usize, rt_idx: usize) {
-    READY_RT_COUNTS[hart_id % MAX_HARTS][rt_idx].fetch_add(1, Ordering::Release);
+    let hart = hart_id % MAX_HARTS;
+    READY_RT_COUNTS[hart][rt_idx].fetch_add(1, Ordering::Release);
+    READY_RT_TOTAL_COUNTS[hart].fetch_add(1, Ordering::Release);
 }
 
 /// 将一个 RT 任务移出某 hart 的就绪队列时，递减对应优先级桶的计数。
@@ -223,7 +233,8 @@ pub(super) fn inc_ready_rt_count(hart_id: usize, rt_idx: usize) {
 /// CAS 循环防止多核同时出队导致的下溢：若中间被改了就重载重试，
 /// 且不会减到负数（`while current > 0` 保护）。
 pub(super) fn dec_ready_rt_count(hart_id: usize, rt_idx: usize) {
-    let counter = &READY_RT_COUNTS[hart_id % MAX_HARTS][rt_idx];
+    let hart = hart_id % MAX_HARTS;
+    let counter = &READY_RT_COUNTS[hart][rt_idx];
     let mut current = counter.load(Ordering::Acquire);
     while current > 0 {
         match counter.compare_exchange_weak(
@@ -232,10 +243,31 @@ pub(super) fn dec_ready_rt_count(hart_id: usize, rt_idx: usize) {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => return,
+            Ok(_) => {
+                let total = &READY_RT_TOTAL_COUNTS[hart];
+                let mut total_current = total.load(Ordering::Acquire);
+                while total_current > 0 {
+                    match total.compare_exchange_weak(
+                        total_current,
+                        total_current - 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => total_current = observed,
+                    }
+                }
+                return;
+            }
             Err(observed) => current = observed,
         }
     }
+}
+
+/// Return the number of RT tasks physically represented in this hart's
+/// runnable queues, without scanning all priority buckets.
+pub(super) fn ready_rt_count(hart_id: usize) -> usize {
+    READY_RT_TOTAL_COUNTS[hart_id % MAX_HARTS].load(Ordering::Acquire)
 }
 
 /// 将一个 fair 任务加入某 hart 的就绪队列时，递增 fair 就绪计数。
@@ -281,6 +313,12 @@ pub(super) fn ready_fair_count(hart_id: usize) -> usize {
 ///
 /// 若 RT 被节流则直接返回 false——节流期间 RT 不应抢占任何人。
 pub(super) fn has_ready_rt_count_higher_than(hart_id: usize, priority: i32) -> bool {
+    // Match Linux's rt_rq->rt_nr_running fast path: the common fair-only
+    // workload must not refresh RT bandwidth state and scan 99 empty priority
+    // buckets on every scheduler tick / return-to-user check.
+    if ready_rt_count(hart_id) == 0 {
+        return false;
+    }
     if rt_bandwidth_throttled(hart_id) {
         return false;
     }
@@ -300,6 +338,9 @@ pub(super) fn has_ready_rt_count_higher_than(hart_id: usize, priority: i32) -> b
 ///
 /// 若 RT 被节流则直接返回 false。
 pub(super) fn has_ready_rt_count_at_or_above(hart_id: usize, priority: i32) -> bool {
+    if ready_rt_count(hart_id) == 0 {
+        return false;
+    }
     if rt_bandwidth_throttled(hart_id) {
         return false;
     }

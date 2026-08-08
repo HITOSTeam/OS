@@ -15,16 +15,43 @@ use spin::Mutex;
 static FRAME_ALLOC_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FRAME_OWNER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_arch = "riscv64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameIcacheState {
+    /// Frames outside the ordinary inode page cache stay untracked.
+    ///
+    /// Anonymous/COW and memfd/tmpfs frames keep using their existing explicit
+    /// per-mm I-cache flush boundaries; this state machine never claims their
+    /// contents have completed the reusable file-page synchronization.
+    Untracked,
+    Dirty,
+    Clean,
+}
+
+#[cfg(target_arch = "riscv64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcacheSyncOutcome {
+    Hit,
+    Miss,
+    Bypass,
+}
+
 struct FrameOwner {
     ppn: PhysPageNum,
     writable_uaccess_pins: AtomicUsize,
-    /// Serializes short-lived kernel views created for pinned user buffers.
+    /// Serializes short-lived slices created for pinned user buffers.
     ///
     /// A physical page can be mapped at more than one user virtual address and
-    /// can consequently appear in overlapping `UserBuffer`s.  Keeping this
-    /// lock in the shared owner makes those views mutually exclusive without
-    /// manufacturing long-lived aliased Rust references.
+    /// can consequently appear in overlapping `UserBuffer`s. This lock may be
+    /// held across arbitrary callbacks, so it is independent from I-cache
+    /// state and must always be acquired before `icache_state`.
     user_buffer_access: Mutex<()>,
+    /// Tracks Linux RISC-V's `PG_dcache_clean` equivalent and serializes it
+    /// against controlled page-cache writes and executable PTE publication.
+    ///
+    /// No path holding this lock may acquire `user_buffer_access`.
+    #[cfg(target_arch = "riscv64")]
+    icache_state: Mutex<FrameIcacheState>,
 }
 
 impl Drop for FrameOwner {
@@ -55,6 +82,8 @@ impl FrameTracker {
                 ppn,
                 writable_uaccess_pins: AtomicUsize::new(0),
                 user_buffer_access: Mutex::new(()),
+                #[cfg(target_arch = "riscv64")]
+                icache_state: Mutex::new(FrameIcacheState::Untracked),
             }),
         }
     }
@@ -77,6 +106,99 @@ impl FrameTracker {
             frame: self.clone(),
             writable,
         }
+    }
+
+    /// Start tracking a fully initialized ordinary inode page-cache frame.
+    ///
+    /// Linux guarantees that `PG_arch_1` is clear when a folio enters the page
+    /// cache. `Dirty` is the equivalent initial state here.
+    pub(crate) fn enable_file_icache_tracking(&self) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let mut state = self.owner.icache_state.lock();
+            if *state == FrameIcacheState::Untracked {
+                *state = FrameIcacheState::Dirty;
+            }
+        }
+    }
+
+    /// Apply Linux RISC-V's `flush_icache_pte()` ordering to one leaf PTE.
+    ///
+    /// The owner lock substitutes for the folio lock that serializes Linux
+    /// page-cache mutation against PTE installation. It prevents a writer from
+    /// clearing the clean state between the flush and the leaf-PTE store.
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) fn with_executable_mapping<R>(
+        &self,
+        sync: impl FnOnce(),
+        publish: impl FnOnce() -> R,
+    ) -> (IcacheSyncOutcome, R) {
+        let mut state = self.owner.icache_state.lock();
+        let outcome = match *state {
+            FrameIcacheState::Clean => IcacheSyncOutcome::Hit,
+            FrameIcacheState::Dirty => {
+                sync();
+                *state = FrameIcacheState::Clean;
+                IcacheSyncOutcome::Miss
+            }
+            FrameIcacheState::Untracked => {
+                // Keep anonymous, COW, tmpfs, and other non-page-cache frames
+                // on the existing per-mm synchronization path.
+                sync();
+                IcacheSyncOutcome::Bypass
+            }
+        };
+        let result = publish();
+        (outcome, result)
+    }
+
+    /// Perform a controlled frame mutation while the owner locks are held.
+    fn with_bytes_mut_locked<R>(
+        &self,
+        page_offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+        #[cfg(target_arch = "riscv64")] icache_state: &mut FrameIcacheState,
+    ) -> R {
+        debug_assert!(page_offset <= crate::config::PAGE_SIZE);
+        debug_assert!(len <= crate::config::PAGE_SIZE.saturating_sub(page_offset));
+        let page: PhysAddr = self.ppn.into();
+        // SAFETY: the tracker keeps the frame allocated, the range is bounded
+        // to this page, and user_buffer_access excludes every UserBuffer view.
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut((page.0 + page_offset) as *mut u8, len) };
+        let result = f(bytes);
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            // Linux calls flush_dcache_folio() after the kernel store and only
+            // clears PG_dcache_clean. The next executable PTE publication
+            // performs the deferred per-mm I-cache synchronization.
+            if *icache_state != FrameIcacheState::Untracked {
+                *icache_state = FrameIcacheState::Dirty;
+            }
+        }
+        result
+    }
+
+    /// Mutably borrow a frame fragment while maintaining tracked executable
+    /// aliases. The slice cannot escape this safe closure API.
+    pub(crate) fn with_bytes_mut<R>(
+        &self,
+        page_offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> R {
+        let _user_access = self.owner.user_buffer_access.lock();
+        #[cfg(target_arch = "riscv64")]
+        let mut icache_state = self.owner.icache_state.lock();
+        self.with_bytes_mut_locked(
+            page_offset,
+            len,
+            f,
+            #[cfg(target_arch = "riscv64")]
+            &mut icache_state,
+        )
     }
 }
 
@@ -118,13 +240,16 @@ impl UserFramePin {
     ) -> R {
         debug_assert!(page_offset <= crate::config::PAGE_SIZE);
         debug_assert!(len <= crate::config::PAGE_SIZE.saturating_sub(page_offset));
-        let _access = self.frame.owner.user_buffer_access.lock();
-        let page: PhysAddr = self.frame.ppn.into();
-        // SAFETY: as in `with_bytes`; the exclusive owner lock additionally
-        // ensures no other pinned UserBuffer creates a simultaneous view.
-        let bytes =
-            unsafe { core::slice::from_raw_parts_mut((page.0 + page_offset) as *mut u8, len) };
-        f(bytes)
+        let _user_access = self.frame.owner.user_buffer_access.lock();
+        #[cfg(target_arch = "riscv64")]
+        let mut icache_state = self.frame.owner.icache_state.lock();
+        self.frame.with_bytes_mut_locked(
+            page_offset,
+            len,
+            f,
+            #[cfg(target_arch = "riscv64")]
+            &mut icache_state,
+        )
     }
 }
 

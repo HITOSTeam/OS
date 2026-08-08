@@ -3,7 +3,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::any::Any;
+use core::{
+    any::Any,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use spin::Mutex;
 
 use crate::{
@@ -12,7 +15,7 @@ use crate::{
     syscall::error::{SyscallError, err},
     syscall::net::{ScmControl, SocketTimestamp, UCred, cbpf::ClassicBpfProgram},
     task::{
-        processor::{block_current_and_run_next, current_task},
+        processor::{PreparedWait, current_task},
         signal::has_wait_interrupting_pending,
         task_block::TaskControlBlock,
     },
@@ -26,22 +29,6 @@ use super::{
 
 const SOCK_DGRAM: usize = 2;
 const SOCK_SEQPACKET: usize = 5;
-
-fn wait_until_deadline(deadline_ms: Option<usize>) -> Result<(), isize> {
-    let Some(deadline_ms) = deadline_ms else {
-        block_current_and_run_next();
-        return Ok(());
-    };
-    let now = crate::time::get_time_ms();
-    if now >= deadline_ms {
-        return Err(err(SyscallError::EAGAIN));
-    }
-    if let Some(task) = current_task() {
-        crate::task::block_sleep::add_timer(task, deadline_ms.saturating_sub(now).max(1));
-    }
-    block_current_and_run_next();
-    Ok(())
-}
 
 /// A minimal full-duplex endpoint used to implement Unix socket pairs.
 pub struct SocketPairEnd {
@@ -83,6 +70,11 @@ struct StreamControlItem {
 
 struct DatagramQueue {
     inner: Mutex<DatagramQueueInner>,
+    /// Descriptor references owned by the endpoint whose receive queue this
+    /// is.  Linux AF_UNIX shutdown is tied to the last file reference, not to
+    /// eventual destruction of the socket object.
+    endpoint_fd_refs: AtomicUsize,
+    endpoint_fd_tracking: AtomicBool,
 }
 
 #[derive(Default)]
@@ -199,7 +191,42 @@ impl DatagramQueue {
     fn new() -> Self {
         Self {
             inner: Mutex::new(DatagramQueueInner::default()),
+            endpoint_fd_refs: AtomicUsize::new(0),
+            endpoint_fd_tracking: AtomicBool::new(false),
         }
+    }
+
+    fn install_fd_ref(&self) {
+        // Publish the count before enabling descriptor-based liveness so a
+        // peer can never transiently observe a newly installed endpoint as
+        // closed.
+        self.endpoint_fd_refs.fetch_add(1, Ordering::AcqRel);
+        self.endpoint_fd_tracking.store(true, Ordering::Release);
+    }
+
+    /// Drop one descriptor reference and report whether it was the last one.
+    fn close_fd_ref(&self) -> bool {
+        if !self.endpoint_fd_tracking.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut refs = self.endpoint_fd_refs.load(Ordering::Acquire);
+        while refs != 0 {
+            match self.endpoint_fd_refs.compare_exchange_weak(
+                refs,
+                refs - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return refs == 1,
+                Err(observed) => refs = observed,
+            }
+        }
+        false
+    }
+
+    fn endpoint_open(&self) -> bool {
+        !self.endpoint_fd_tracking.load(Ordering::Acquire)
+            || self.endpoint_fd_refs.load(Ordering::Acquire) != 0
     }
 
     fn poll_readable(&self) -> bool {
@@ -267,13 +294,27 @@ impl DatagramQueue {
                 Self::remove_reader(&mut inner.read_waiters, &task);
                 return Err(err(SyscallError::EINTR));
             }
+            let timeout_ms = if let Some(deadline_ms) = deadline_ms {
+                let now = crate::time::get_time_ms();
+                if now >= deadline_ms {
+                    Self::remove_reader(&mut inner.read_waiters, &task);
+                    return Err(EAGAIN);
+                }
+                Some(deadline_ms.saturating_sub(now).max(1))
+            } else {
+                None
+            };
             Self::push_reader_once(&mut inner.read_waiters, task.clone());
-            drop(inner);
-            if let Err(e) = wait_until_deadline(deadline_ms) {
-                let mut inner = self.inner.lock();
-                Self::remove_reader(&mut inner.read_waiters, &task);
-                return Err(e);
+            // Linux's unix_dgram_recvmsg() prepares its wait entry before
+            // releasing the receive-queue lock.  Publish Blocked in the same
+            // critical section so close/data/timer wakeups cannot be lost.
+            let prepared =
+                PreparedWait::new().expect("socketpair datagram reader lost its current task");
+            if let Some(timeout_ms) = timeout_ms {
+                crate::task::block_sleep::add_timer(task.clone(), timeout_ms);
             }
+            drop(inner);
+            prepared.sleep();
         }
     }
 
@@ -579,7 +620,7 @@ impl SocketPairEnd {
                 queued >= lowat.max(1) || read_end.all_write_ends_closed()
             }
             SocketPairBackend::Datagram { inbox, peer } => {
-                inbox.poll_readable() || peer.upgrade().is_none()
+                inbox.poll_readable() || !peer.upgrade().is_some_and(|peer| peer.endpoint_open())
             }
         }
     }
@@ -590,7 +631,9 @@ impl SocketPairEnd {
         }
         match &self.backend {
             SocketPairBackend::Stream { write_end, .. } => write_end.poll_writable(),
-            SocketPairBackend::Datagram { peer, .. } => peer.upgrade().is_some(),
+            SocketPairBackend::Datagram { peer, .. } => {
+                peer.upgrade().is_some_and(|peer| peer.endpoint_open())
+            }
         }
     }
 
@@ -643,7 +686,7 @@ impl SocketPairEnd {
             }
             SocketPairBackend::Datagram { inbox, peer } => {
                 inbox.recv_to_slice(out, nonblock, peek, deadline_ms, || {
-                    peer.upgrade().is_some()
+                    peer.upgrade().is_some_and(|peer| peer.endpoint_open())
                 })
             }
         }
@@ -702,7 +745,7 @@ impl SocketPairEnd {
                 Ok(written)
             }
             SocketPairBackend::Datagram { peer, .. } => {
-                let Some(peer) = peer.upgrade() else {
+                let Some(peer) = peer.upgrade().filter(|peer| peer.endpoint_open()) else {
                     let e = err(SyscallError::EPIPE);
                     self.set_socket_error(e);
                     return Err(e);
@@ -860,6 +903,53 @@ impl File for SocketPairEnd {
 
     fn writable(&self) -> bool {
         self.poll_writable()
+    }
+
+    fn on_fd_install(&self) {
+        match &self.backend {
+            SocketPairBackend::Stream {
+                read_end,
+                write_end,
+                ..
+            } => {
+                // One full-duplex socket descriptor owns one reader and one
+                // writer.  Forward descriptor ownership to both pipe halves so
+                // fork/dup and close/exit update the same endpoint counts that
+                // drive EOF, EPIPE, poll HUP, and waiter wakeups.
+                read_end.on_fd_install();
+                write_end.on_fd_install();
+            }
+            SocketPairBackend::Datagram { inbox, .. } => inbox.install_fd_ref(),
+        }
+    }
+
+    fn on_fd_close(&self) {
+        match &self.backend {
+            SocketPairBackend::Stream {
+                read_end,
+                write_end,
+                ..
+            } => {
+                // Linux closes every descriptor in exit_files() before publishing
+                // the zombie.  Do the semantic pipe close here as well: a stale
+                // implementation Arc retained by deferred task/file destruction
+                // must not keep the peer blocked in recvfrom after the last fd is
+                // gone.  Pipe::on_fd_close() performs the wake outside its lock.
+                read_end.on_fd_close();
+                write_end.on_fd_close();
+            }
+            SocketPairBackend::Datagram { inbox, peer } => {
+                // Cargo's posix_spawn fallback uses a CLOEXEC SOCK_SEQPACKET
+                // pair as an exec-error channel.  unix_release_sock() wakes the
+                // peer when the child's final file reference disappears; do
+                // the same even if deferred kernel Arcs retain this object.
+                if inbox.close_fd_ref()
+                    && let Some(peer) = peer.upgrade()
+                {
+                    peer.wake_all();
+                }
+            }
+        }
     }
 
     fn read(&self, mut buf: UserBuffer) -> usize {

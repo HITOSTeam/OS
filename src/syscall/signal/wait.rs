@@ -206,21 +206,25 @@ pub fn syscall_rt_sigsuspend(mask_ptr: usize, sigsetsize: usize) -> isize {
 #[cfg(target_arch = "riscv64")]
 pub fn syscall_rt_sigreturn() -> isize {
     let task = current_task().unwrap();
-    let mut inner = task.borrow_mut();
-    if DEBUG_PTHREAD {
-        crate::println!(
-            "[rt_sigreturn] tid={}",
-            inner.res.as_ref().map(|r| r.tid).unwrap_or(0)
-        );
-    }
-    let Some(saved) = inner.sig_saved_ctx.pop() else {
-        drop(inner);
-        exit_current_and_run_next(-1)
+    let (saved, sp, a2) = {
+        let mut inner = task.borrow_mut();
+        if DEBUG_PTHREAD {
+            crate::println!(
+                "[rt_sigreturn] tid={}",
+                inner.res.as_ref().map(|r| r.tid).unwrap_or(0)
+            );
+        }
+        let Some(saved) = inner.sig_saved_ctx.pop() else {
+            drop(inner);
+            exit_current_and_run_next(-1)
+        };
+        let cx = inner.get_trap_cx();
+        (saved, cx.x[REG_SP], cx.x[REG_A2])
     };
+    // Linux reads the user rt_sigframe without holding sighand->siglock.  The
+    // frame may fault, so keep our raw TCB lock out of that path as well.
     if saved.uses_ucontext && saved.ucontext_ptr != 0 {
         let token = get_current_token();
-        let sp = inner.get_trap_cx().x[REG_SP];
-        let a2 = inner.get_trap_cx().x[REG_A2];
         let uc = try_read_user_value(token, saved.ucontext_ptr as *const UContext)
             .or_else(|| try_read_user_value(token, sp as *const UContext));
         if let Some(uc) = uc {
@@ -251,23 +255,17 @@ pub fn syscall_rt_sigreturn() -> isize {
             let mut restored = saved.trap_cx;
             let sig_ctx = uc.uc_mcontext;
             sig_ctx.regs.write_to_trap(&mut restored);
+            let mut inner = task.borrow_mut();
             *inner.get_trap_cx() = restored;
             inner.signal_mask = uc.uc_sigmask;
             inner.on_sigaltstack = saved.was_on_sigaltstack;
-            #[cfg(target_arch = "loongarch64")]
-            {
-                inner.loongarch_fp = saved.loongarch_fp;
-            }
             return restored.x[REG_A0] as isize;
         }
     }
+    let mut inner = task.borrow_mut();
     *inner.get_trap_cx() = saved.trap_cx;
     inner.signal_mask = saved.mask;
     inner.on_sigaltstack = saved.was_on_sigaltstack;
-    #[cfg(target_arch = "loongarch64")]
-    {
-        inner.loongarch_fp = saved.loongarch_fp;
-    }
     saved.trap_cx.x[REG_A0] as isize
 }
 

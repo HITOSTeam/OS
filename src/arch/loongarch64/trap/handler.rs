@@ -370,6 +370,12 @@ pub fn trap_handler() {
             cx.x[super::super::REG_A5],
         ];
         let syscall_id = cx.x[super::super::REG_A7];
+        if let Some(task) = crate::task::processor::current_task() {
+            let mut inner = task.borrow_mut();
+            inner.last_syscall_id = syscall_id;
+            inner.last_syscall_args = args;
+            inner.last_syscall_valid = true;
+        }
         // Normal Linux syscall work is interruptible. This also prevents a
         // deadlock where another hart holds an mm lock and waits for our TLB
         // shootdown acknowledgement while this syscall waits for that lock.

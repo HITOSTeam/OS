@@ -5,7 +5,7 @@ use super::range::{align_down_to_page, align_up_to_page, normalize_ranges};
 use super::vma::VmRegion;
 use crate::config::PAGE_SIZE;
 use crate::fs::{File, OSInode};
-use crate::mm::{FrameTracker, PTEFlags, PhysAddr, PhysPageNum, VPNRange, VirtAddr, VirtPageNum};
+use crate::mm::{FrameTracker, PTEFlags, PhysPageNum, VPNRange, VirtAddr, VirtPageNum};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -52,8 +52,8 @@ impl MemorySet {
         Some((frame.clone(), flags, false))
     }
 
-    /// 从当前 MapArea/PTE 扫描，重建指定 backing 的 resident 页状态快照。
-    /// 用于 VMA 或物理页变化后刷新 MmapBacking.resident_pages。
+    /// 从当前 MapArea/PTE 扫描，重建指定 backing 的共享 resident 页状态快照。
+    /// 用于共享 VMA 或物理页变化后刷新 MmapBacking.resident_pages。
     fn collect_mmap_backing_resident_pages(
         &self,
         backing_id: usize,
@@ -63,7 +63,7 @@ impl MemorySet {
         for region in self
             .vm_regions
             .iter()
-            .filter(|region| region.backing_id == backing_id)
+            .filter(|region| region.backing_id == backing_id && region.shared)
         {
             let scan_start = region.start;
             let scan_end = core::cmp::min(region.end(), region.sigbus_start());
@@ -104,7 +104,7 @@ impl MemorySet {
                         .and_then(|backing| backing.resident_pages.get(&file_page))
                         .is_some_and(|old_state| old_state.dirty);
                     state.dirty |= flags.contains(PTEFlags::D);
-                    if region.shared && region.file_backed {
+                    if region.file_backed {
                         if let Some(existing) = state.frame.as_ref() {
                             debug_assert_eq!(
                                 existing.ppn, frame.ppn,
@@ -507,8 +507,9 @@ impl MemorySet {
                 if !flags.contains(PTEFlags::U) {
                     break;
                 }
-                frame.ppn.get_bytes_array()[page_off..page_off + len]
-                    .copy_from_slice(&data[copied..copied + len]);
+                frame.with_bytes_mut(page_off, len, |bytes| {
+                    bytes.copy_from_slice(&data[copied..copied + len]);
+                });
                 wrote_resident = true;
                 break;
             }
@@ -589,16 +590,20 @@ impl MemorySet {
             let vpn = va.floor();
             let page_off = va.page_offset();
             let len = core::cmp::min(PAGE_SIZE - page_off, end - cur);
-            if let Some(pte) = self.page_table.translate(vpn) {
-                if pte.is_valid() && pte.flags().contains(PTEFlags::U) {
-                    let pa: PhysAddr = pte.ppn().into();
-                    // SAFETY: The PTE is valid and user-accessible, and `len`
-                    // is bounded to the translated page.
-                    unsafe {
-                        core::ptr::write_bytes((pa.0 + page_off) as *mut u8, 0, len);
-                    }
-                    wrote_resident = true;
+            for area in self.areas.iter() {
+                if !area.contains_vpn(vpn) {
+                    continue;
                 }
+                let Some((frame, flags, has_valid_pte)) = self.resident_page_for_vpn(area, vpn)
+                else {
+                    continue;
+                };
+                if !has_valid_pte || !flags.contains(PTEFlags::U) {
+                    break;
+                }
+                frame.with_bytes_mut(page_off, len, |bytes| bytes.fill(0));
+                wrote_resident = true;
+                break;
             }
             cur += len;
         }

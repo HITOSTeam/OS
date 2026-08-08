@@ -235,6 +235,10 @@ where
         // We own this cache miss.  Fill the zeroed frame without holding the
         // global cache lock or an mm lock.
         fill.take().expect("file page fill called more than once")(candidate.ppn.get_bytes_array());
+        // Take and release the owner lock before reacquiring the inode cache
+        // lock. A candidate invalidated below is simply dropped; no shared
+        // winner is modified.
+        candidate.enable_file_icache_tracking();
 
         let published = {
             let mut cache = mapping.pages.lock();
@@ -303,18 +307,23 @@ pub(super) fn file_page_cache_write(dev: usize, ino: u32, write_off: usize, data
         let page_off = file_off & (PAGE_SIZE - 1);
         let chunk = core::cmp::min(PAGE_SIZE - page_off, data.len() - copied);
         loop {
-            let loading = {
+            let (frame, loading) = {
                 let cache = mapping.pages.lock();
                 match cache.get(&file_page) {
-                    Some(FilePageCacheSlot::Ready(frame)) => {
-                        frame.ppn.get_bytes_array()[page_off..page_off + chunk]
-                            .copy_from_slice(&data[copied..copied + chunk]);
-                        None
+                    Some(FilePageCacheSlot::Ready(frame)) => (Some(frame.clone()), None),
+                    Some(FilePageCacheSlot::Loading { state, .. }) => {
+                        (None, Some(Arc::clone(state)))
                     }
-                    Some(FilePageCacheSlot::Loading { state, .. }) => Some(Arc::clone(state)),
-                    None => None,
+                    None => (None, None),
                 }
             };
+            if let Some(frame) = frame {
+                // Match Linux's xarray/folio split: pin the page under the
+                // cache index lock, then lock and mutate its contents outside.
+                frame.with_bytes_mut(page_off, chunk, |bytes| {
+                    bytes.copy_from_slice(&data[copied..copied + chunk]);
+                });
+            }
             let Some(state) = loading else {
                 break;
             };
@@ -341,12 +350,13 @@ pub(super) fn file_page_cache_resize(dev: usize, ino: u32, file_size: usize) {
     };
 
     let mut invalidated = Vec::new();
+    let mut eof_frame = None;
     let mut cache = mapping.pages.lock();
     // truncate 后 EOF 页尾清零，EOF 之后的缓存页必须丢弃，避免 shrink/grow 复用旧脏页。
     if eof_off != 0 {
         match cache.get(&eof_page) {
             Some(FilePageCacheSlot::Ready(frame)) => {
-                frame.ppn.get_bytes_array()[eof_off..PAGE_SIZE].fill(0);
+                eof_frame = Some(frame.clone());
             }
             Some(FilePageCacheSlot::Loading { state, .. }) => {
                 invalidated.push(Arc::clone(state));
@@ -365,6 +375,11 @@ pub(super) fn file_page_cache_resize(dev: usize, ino: u32, file_size: usize) {
         }
     }
     drop(cache);
+    if let Some(frame) = eof_frame {
+        // The pin remains valid if a concurrent invalidation removes the slot;
+        // mapped aliases retaining the page still need to observe EOF zeros.
+        frame.with_bytes_mut(eof_off, PAGE_SIZE - eof_off, |bytes| bytes.fill(0));
+    }
     for state in invalidated {
         state.finish(FILE_PAGE_INVALIDATED);
     }
@@ -446,6 +461,13 @@ pub(super) struct MmapBacking {
     pub(super) kind: MmapBackingKind,
     pub(super) file: Arc<dyn File + Send + Sync>,
     pub(super) vm_state: MmapBackingVmState,
+    /// Per-mm state needed by MAP_SHARED writeback and frame accounting.
+    ///
+    /// Clean MAP_PRIVATE file pages live in the page table plus the inode page
+    /// cache and deliberately do not get a second per-mm index here.  This
+    /// mirrors Linux's split between `mm` page tables and
+    /// `address_space::i_pages`/`i_mmap`, and avoids cloning a derived page
+    /// tree across every fork before the child immediately execs.
     pub(super) resident_pages: BTreeMap<usize, MmapBackingPageState>,
 }
 
@@ -459,7 +481,7 @@ pub(super) struct MmapBackingVmState {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct MmapBackingPageState {
-    /// 当前 mm 内该 file page 的驻留引用数；这是统计值，不是回收 pin。
+    /// 当前 mm 内该 shared file page 的驻留引用数；这是统计值，不是回收 pin。
     pub(super) ref_count: usize,
     /// dirty 提示；尚未用于过滤 writeback。
     pub(super) dirty: bool,
@@ -499,7 +521,7 @@ impl MmapBacking {
         self.kind.matches_region(region)
     }
 
-    /// fault 路径：增加 file_page 的驻留引用计数，可选记录 frame 和 dirty 状态。
+    /// MAP_SHARED fault 路径：增加 file_page 的驻留引用计数，可选记录 frame 和 dirty 状态。
     pub(super) fn add_resident_page_ref(
         &mut self,
         file_page: usize,

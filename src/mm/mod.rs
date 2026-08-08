@@ -7,11 +7,13 @@
 //! Every task or process has a memory_set to control its virtual memory.
 
 mod address;
+mod buddy_heap;
 mod dtb;
 mod elf_loader;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;
+mod slab_heap;
 #[cfg(target_arch = "loongarch64")]
 pub use crate::arch::loongarch64::mm::page_table;
 #[cfg(target_arch = "riscv64")]
@@ -48,8 +50,9 @@ pub fn activate_kernel_space() {
     if cached != 0 {
         #[cfg(target_arch = "riscv64")]
         if riscv::register::satp::read().bits() == cached {
-            // RISC-V SATP switches require sfence.vma in activate_token(); skip
-            // that cost when the caller is already running on the kernel root.
+            // Avoid even the SATP CSR write when this hart already runs on the
+            // kernel root.  A real switch uses the ASID policy below to decide
+            // whether an invalidation is actually owed.
             return;
         }
         memory_set::activate_token(cached);
@@ -132,6 +135,7 @@ pub fn flush_kernel_shared_tlb() {
     }
     let remote_hart_mask =
         crate::task::manager::online_hart_mask() & !(1usize << crate::arch::hart_id());
+    crate::perf::record_kernel_shootdown(remote_hart_mask.count_ones() as usize);
     if remote_hart_mask != 0 {
         crate::sbi::remote_sfence_vma_all(remote_hart_mask);
     }

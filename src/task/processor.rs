@@ -10,11 +10,11 @@ use crate::{
         id::{KernelStack, LiveThreadRetirement, TaskUserRes},
         manager::{
             PID2PCB, account_rt_runtime, fair_current_deadline_expired, fair_task_is_next_on_hart,
-            fair_wakeup_preempts_current_on_hart, fetch_task, has_ready_rt_any_at_or_above,
-            has_ready_rt_at_or_above, has_ready_rt_higher_than, has_ready_tasks,
-            prime_fair_sync_wakeup_lag, ready_queue_lengths, record_fair_sleep_lag,
-            release_process_mm_owner, remove_inactive_task, remove_sched_timer_refs, requeue_task,
-            rt_bandwidth_throttled, wakeup_sync_task_on_hart, wakeup_task, wakeup_tasks,
+            fair_wakeup_preempts_current_on_hart, fetch_task, has_ready_rt_at_or_above,
+            has_ready_rt_higher_than, has_ready_tasks_on_hart, prime_fair_sync_wakeup_lag,
+            ready_queue_lengths, record_fair_sleep_lag, release_process_mm_owner,
+            remove_inactive_task, remove_sched_timer_refs, requeue_task, rt_bandwidth_throttled,
+            wakeup_sync_task_on_hart, wakeup_task, wakeup_tasks,
         },
         process_block::ProcessControlBlock,
         runtime::{monotonic_time_ns, start_task_runtime_slice},
@@ -247,14 +247,13 @@ fn drain_deferred_kernel_timer_work() {
 /// 先调 `drain_deferred_kernel_timer_work`：定时器可能刚唤醒了一批任务
 /// 使其变为就绪，不先排空定时器的话下面的就绪检查会漏掉这些新就绪任务。
 ///
-/// 然后检查两个条件（任一为 true 即应停止清理）：
-/// - `has_ready_rt_any_at_or_above(RT_PRIO_MIN)`：任意优先级的 RT 任务就绪。
-///   RT 应立即响应，不等清理。
-/// - `has_ready_tasks()`：任意 hart 的就绪队列有任务。fair 任务也应尽快调度，
-///   不能因为清理而无限延迟。
+/// 然后只检查当前 hart 的 O(1) runnable 计数。Linux 的 idle 清理和
+/// `schedule()` 都以本地 `rq->nr_running` 为快速判定；其他 hart 的 runnable
+/// 工作由其本地调度器处理，当前 hart 若真正空闲则在 pick 阶段执行一次
+/// `sched_balance_newidle()` 风格的 fair task pull。
 fn idle_cleanup_should_stop_for_runnable_work() -> bool {
     drain_deferred_kernel_timer_work();
-    has_ready_rt_any_at_or_above(RT_PRIO_MIN) || has_ready_tasks()
+    has_ready_tasks_on_hart(hart_id())
 }
 
 fn kill_pid_namespace_members_on_init_exit(process: &Arc<ProcessControlBlock>) {

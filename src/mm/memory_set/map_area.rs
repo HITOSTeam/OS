@@ -31,6 +31,13 @@ pub(super) fn pte_flags_for_mprotect(
     pte_flags
 }
 
+#[cfg(target_arch = "riscv64")]
+#[derive(Clone, Copy)]
+pub(super) enum UserExecutablePteMode<'a> {
+    Active(&'a AsidContext),
+    Inactive,
+}
+
 /// 已经物化的页范围。
 ///
 /// `MapArea` 不决定 mmap 语义；它只保存 resident frame 和页表相关状态。
@@ -299,25 +306,55 @@ impl MapArea {
     }
 
     /// map _one 两种映射类型.其中恒等映射 本人是不持有 frame 的.
-    pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) -> bool {
+    pub fn map_one(
+        &mut self,
+        page_table: &mut PageTable,
+        vpn: VirtPageNum,
+        #[cfg(target_arch = "riscv64")] executable_mode: UserExecutablePteMode<'_>,
+    ) -> bool {
         if self.is_lazy() {
             return true;
         }
-        let ppn: PhysPageNum = match self.map_type() {
-            MapType::Identical => PhysPageNum(vpn.0),
+        let frame = match self.map_type() {
+            MapType::Identical => None,
             MapType::Framed => {
                 let Some(frame) = frame_alloc() else {
                     crate::println!("[mm] OOM: frame_alloc failed for vpn={:?}", vpn);
                     return false;
                 };
-                let ppn = frame.ppn;
-                self.data_frames.insert(vpn, frame);
-                ppn
+                Some(frame)
             }
             MapType::Lazy => unreachable!(),
         };
+        let ppn = frame
+            .as_ref()
+            .map_or_else(|| PhysPageNum(vpn.0), |frame| frame.ppn);
         let pte_flags = self.pte_flags();
+        #[cfg(target_arch = "riscv64")]
+        if pte_flags.contains(PTEFlags::U) {
+            match executable_mode {
+                UserExecutablePteMode::Active(asid) => {
+                    if pte_flags.contains(PTEFlags::X) {
+                        publish_executable_user_pte(frame.as_ref(), asid, || {
+                            page_table.map(vpn, ppn, pte_flags)
+                        });
+                    } else {
+                        page_table.map(vpn, ppn, pte_flags);
+                    }
+                }
+                UserExecutablePteMode::Inactive => {
+                    prepare_inactive_user_pte(pte_flags);
+                    page_table.map(vpn, ppn, pte_flags);
+                }
+            }
+        } else {
+            page_table.map(vpn, ppn, pte_flags);
+        }
+        #[cfg(not(target_arch = "riscv64"))]
         page_table.map(vpn, ppn, pte_flags);
+        if let Some(frame) = frame {
+            self.data_frames.insert(vpn, frame);
+        }
         true
     }
     #[allow(unused)]
@@ -385,13 +422,22 @@ impl MapArea {
     }
 
     /// 清理内存,并且将内存进行映射,内部使用map_one 逐个映射.
-    pub fn map(&mut self, page_table: &mut PageTable) -> bool {
+    pub fn map(
+        &mut self,
+        page_table: &mut PageTable,
+        #[cfg(target_arch = "riscv64")] executable_mode: UserExecutablePteMode<'_>,
+    ) -> bool {
         if self.is_lazy() {
             return true;
         }
         let mut mapped: Vec<VirtPageNum> = Vec::new();
         for vpn in self.vpn_range {
-            if !self.map_one(page_table, vpn) {
+            if !self.map_one(
+                page_table,
+                vpn,
+                #[cfg(target_arch = "riscv64")]
+                executable_mode,
+            ) {
                 // Roll back any partial mappings to avoid leaving an invalid address space.
                 for vpn in mapped {
                     self.unmap_one_maybe(page_table, vpn);
@@ -408,13 +454,19 @@ impl MapArea {
         &mut self,
         page_table: &mut PageTable,
         batch: &mut PageTableUpdateBatch,
+        #[cfg(target_arch = "riscv64")] executable_mode: UserExecutablePteMode<'_>,
     ) -> bool {
         if self.is_lazy() {
             return true;
         }
         let mut mapped: Vec<VirtPageNum> = Vec::new();
         for vpn in self.vpn_range {
-            if !self.map_one(page_table, vpn) {
+            if !self.map_one(
+                page_table,
+                vpn,
+                #[cfg(target_arch = "riscv64")]
+                executable_mode,
+            ) {
                 // Keep frames from a partially installed mapping alive until
                 // any concurrently filled translations have been evicted.
                 for vpn in mapped {
@@ -439,7 +491,13 @@ impl MapArea {
             self.vpn_range.get_end().0 << 12,
         );
         #[cfg(target_arch = "riscv64")]
-        if self.contains_perm(MapPermission::U) && self.contains_perm(MapPermission::X) {
+        if self.contains_perm(MapPermission::U)
+            && self.contains_perm(MapPermission::X)
+            && matches!(executable_mode, UserExecutablePteMode::Inactive)
+        {
+            // This page table is not reachable by hardware yet. Constructors
+            // may populate bytes after installing the leaves, then coalesce
+            // the required per-mm synchronization at the batch boundary.
             batch.mark_icache_stale();
         }
         true
@@ -471,7 +529,12 @@ impl MapArea {
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
     #[allow(unused)]
-    pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) -> bool {
+    pub fn append_to(
+        &mut self,
+        page_table: &mut PageTable,
+        new_end: VirtPageNum,
+        #[cfg(target_arch = "riscv64")] executable_mode: UserExecutablePteMode<'_>,
+    ) -> bool {
         if self.is_lazy() {
             self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
             return true;
@@ -479,7 +542,12 @@ impl MapArea {
         let old_end = self.vpn_range.get_end();
         let mut mapped: Vec<VirtPageNum> = Vec::new();
         for vpn in VPNRange::new(old_end, new_end) {
-            if !self.map_one(page_table, vpn) {
+            if !self.map_one(
+                page_table,
+                vpn,
+                #[cfg(target_arch = "riscv64")]
+                executable_mode,
+            ) {
                 // Roll back the newly mapped suffix.
                 for vpn in mapped {
                     self.unmap_one_maybe(page_table, vpn);

@@ -32,7 +32,10 @@ pub use self::rt::{account_rt_runtime, rt_bandwidth_throttled};
 pub use self::run_queue::TaskManager;
 
 use self::fair::{EnqueueKind, ReadyQueueSlot, task_queue_slot};
-use self::rt::{has_ready_rt_count_at_or_above, has_ready_rt_count_higher_than, ready_fair_count};
+use self::rt::{
+    has_ready_rt_count_at_or_above, has_ready_rt_count_higher_than, ready_fair_count,
+    ready_rt_count,
+};
 use self::run_queue::{
     hart_bit, resolve_enqueue_hart, resolve_sync_wakeup_hart, resolve_wakeup_hart,
 };
@@ -72,7 +75,8 @@ pub(super) fn pick_online_hart(start: usize) -> usize {
     0
 }
 
-/// 为新任务选择一个负载最轻的在线 hart，返回其 hart_id
+/// 为新任务轮询选择一个在线 hart，作为简化的 fork-placement 候选。
+/// 后续入队会再次校验任务 affinity；普通唤醒和时间片重排不会复用这条迁移路径。
 pub fn select_hart_for_new_task() -> usize {
     let start = NEXT_HART.fetch_add(1, Ordering::Relaxed) % MAX_HARTS;
     pick_online_hart(start)
@@ -499,8 +503,13 @@ pub fn debug_count_task_refs_in_runqueues(task: &Arc<TaskControlBlock>) -> usize
 /// 从当前 hart 的就绪队列中取走下一个可运行的任务（RT 优先，其次在 EEVDF 公平组中选择 deadline 最早者）
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     let prev_sie = arch::disable_interrupts();
-    let hart_id = crate::task::processor::hart_id();
-    let t = TASK_MANAGER.fetch(hart_id);
+    let hart_id = crate::task::processor::hart_id() % MAX_HARTS;
+    let t = TASK_MANAGER.fetch(hart_id).or_else(|| {
+        // Linux's fair pick path calls sched_balance_newidle() immediately
+        // before accepting an idle task. Pull at most one queued fair entity;
+        // the balancer itself verifies source load and CPU affinity.
+        TASK_MANAGER.pull_fair_task_for_idle(hart_id, online_hart_mask())
+    });
     arch::restore_interrupts(prev_sie);
     t
 }
@@ -516,8 +525,16 @@ pub fn ready_queue_lengths() -> alloc::vec::Vec<usize> {
 
 /// 当前系统是否已有可运行任务在等待调度。
 pub fn has_ready_tasks() -> bool {
-    let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
-    TASK_MANAGER.has_ready_tasks()
+    (0..MAX_HARTS).any(has_ready_tasks_on_hart)
+}
+
+/// Return whether one hart has any queued runnable entity.
+///
+/// This is the local `rq->nr_running` equivalent used by idle cleanup.  It is
+/// deliberately O(1): an idle CPU must not repeatedly lock every runqueue or
+/// scan every RT priority bucket just because another CPU is busy.
+pub fn has_ready_tasks_on_hart(hart_id: usize) -> bool {
+    ready_fair_count(hart_id) != 0 || ready_rt_count(hart_id) != 0
 }
 
 /// 当前 hart 上等待运行的公平调度类任务数，不包含当前正在运行的任务。

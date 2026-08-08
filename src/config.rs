@@ -38,17 +38,32 @@ pub const TRAP_CONTEXT: usize = SIGRETURN_TRAMPOLINE - PAGE_SIZE;
 #[cfg(target_arch = "riscv64")]
 pub const KERNEL_STACK_TOP: usize = TRAMPOLINE - 0x4000_0000;
 
-/// High-half kernel window for device MMIO, analogous to Linux `ioremap()`.
+/// Kernel window that maps device MMIO into the high half, mirroring Linux
+/// `ioremap()`.
 ///
-/// Root entry 509 covers `[0xffff_ffff_4000_0000,
-/// 0xffff_ffff_8000_0000)`, immediately below the shared kernel-stack root.
-/// Keeping device registers here lets the root be shared into every user page
-/// table without colliding with low-canonical user mappings.
+/// Identity-mapping device registers at their low physical addresses puts them
+/// in Sv39 root entry 0, which is also where user programs live, so that root
+/// can never be shared into a user page table. Every driver or interrupt access
+/// then has to switch SATP and flush the TLB. Linux instead keeps the whole
+/// kernel half in every `pgd` (`sync_kernel_mappings()`) and places device
+/// registers in the kernel `ioremap`/vmalloc range, so an MMIO access needs no
+/// page-table change at all.
+///
+/// Root entry 509 covers `[0xffff_ffff_4000_0000, 0xffff_ffff_8000_0000)` and
+/// sits just below the shared kernel-stack root (510) and the trampoline root
+/// (511), so it can be shared into user page tables on its own.
 #[cfg(target_arch = "riscv64")]
 pub const KERNEL_MMIO_WINDOW_BASE: usize = 0xffff_ffff_4000_0000;
+/// Size of the MMIO window: exactly one Sv39 root entry. Every device physical
+/// address on the `virt` machine is below 1 GiB, so one root entry covers all
+/// of them and the window needs no allocator.
 #[cfg(target_arch = "riscv64")]
 pub const KERNEL_MMIO_WINDOW_SIZE: usize = 0x4000_0000;
 
+/// Kernel virtual address of a device physical address inside the MMIO window.
+///
+/// The mapping is a fixed offset, so this is usable in `const` context and no
+/// per-device bookkeeping is required.
 #[cfg(target_arch = "riscv64")]
 pub const fn mmio_va(pa: usize) -> usize {
     debug_assert!(pa < KERNEL_MMIO_WINDOW_SIZE);

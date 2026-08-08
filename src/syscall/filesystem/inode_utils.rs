@@ -264,7 +264,26 @@ pub(crate) fn sticky_rename_allowed(
     fsuid == 0 || fsuid == parent.uid() || fsuid == victim.uid()
 }
 
-pub(crate) fn remove_rename_target(parent: &Arc<ext4_fs::Inode>, name: &str) -> isize {
+/// Detach an existing rename destination without destroying an inode that is
+/// still referenced by an open file or VMA.
+///
+/// Linux vfs_rename() removes the destination dentry, while struct file and
+/// vm_area_struct references keep the replaced inode alive. ext4-fs currently
+/// couples its last directory entry to on-disk inode reclamation, so use the
+/// same hidden-name compatibility lifetime as unlink(2) until the final open
+/// description disappears.
+pub(crate) fn remove_rename_target(
+    parent: &Arc<ext4_fs::Inode>,
+    name: &str,
+    target: &Arc<ext4_fs::Inode>,
+) -> isize {
+    if target.is_file() {
+        match defer_unlink_open_file(parent, name, target) {
+            Ok(true) => return 0,
+            Ok(false) => {}
+            Err(error) => return error,
+        }
+    }
     ext4_begin_namespace_mutation(parent);
     match parent.unlink(name) {
         Ok(()) => {
@@ -620,7 +639,13 @@ pub(crate) fn do_renameat(
                 }
 
                 if target.is_some() {
-                    let rc = remove_rename_target(&new_parent, &new_name);
+                    let rc = remove_rename_target(
+                        &new_parent,
+                        &new_name,
+                        target
+                            .as_ref()
+                            .expect("rename target disappeared while locked"),
+                    );
                     if rc != 0 {
                         return rc;
                     }
@@ -638,7 +663,13 @@ pub(crate) fn do_renameat(
             }
 
             if target.is_some() {
-                let rc = remove_rename_target(&old_parent, &new_name);
+                let rc = remove_rename_target(
+                    &old_parent,
+                    &new_name,
+                    target
+                        .as_ref()
+                        .expect("rename target disappeared while locked"),
+                );
                 if rc != 0 {
                     return rc;
                 }

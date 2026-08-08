@@ -290,6 +290,29 @@ pub fn prepare_user_satp(ctx: &AsidContext, token: usize) -> (usize, bool, bool)
     }
 }
 
+/// Must installing `asid` on this hart be followed by a TLB invalidation?
+///
+/// Linux's `set_mm_asid()` reaches `switch_mm_fast` and writes SATP with no
+/// invalidation at all; it flushes only when this CPU still owes one after an
+/// ASID-version rollover (`context_tlb_flush_pending`).  This kernel used to
+/// invalidate unconditionally on every SATP write, which meant an ASID-wide
+/// `sfence.vma` on every context switch, discarding the entire point of
+/// hardware ASIDs.
+///
+/// Entering the kernel address space needs nothing: kernel roots are installed
+/// as global entries, so an ASID-scoped fence would not touch them anyway, the
+/// kernel ASID is never recycled, and kernel mapping changes are published
+/// separately by `flush_kernel_shared_tlb()`.  Any other ASID keeps the
+/// conservative invalidation, as does a machine with no usable hardware ASIDs,
+/// where every root collapses onto ASID 0 and stale non-global entries really
+/// can alias.
+pub fn satp_switch_needs_flush(asid: usize) -> bool {
+    if !ASID_ENABLED.load(Ordering::Acquire) {
+        return true;
+    }
+    asid != KERNEL_ASID
+}
+
 /// The trampoline has trapped out of userspace. The user SATP may remain
 /// installed while the kernel runs, so the hart stays in `resident_harts` and
 /// is still included in page-table shootdowns.
@@ -309,6 +332,7 @@ fn page_table_write_barrier() {
     }
 }
 
+/// if we can use a uniform (equal) ASID to do a efficiently flush
 fn uniform_target_asid(ctx: &AsidContext, hart_mask: usize) -> Option<usize> {
     let mut selected = None;
     for hart_id in 0..MAX_HARTS {

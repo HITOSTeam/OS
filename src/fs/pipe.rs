@@ -20,7 +20,7 @@ use crate::{
     task::{
         block_sleep::add_timer,
         manager::{PID2PCB, prime_fair_sync_wakeup_lag, wakeup_sync_task},
-        processor::{block_current_and_run_next, current_process, current_task},
+        processor::{PreparedWait, current_process, current_task},
         signal::{
             SIGPIPE_NUM, has_wait_interrupting_pending, queue_process_signal_info, signal_bit,
         },
@@ -190,17 +190,27 @@ impl Pipe {
                     Ok(())
                 };
             }
-            if let Some(deadline_ms) = deadline_ms {
+            let timeout_ms = if let Some(deadline_ms) = deadline_ms {
                 let now = crate::time::get_time_ms();
                 if now >= deadline_ms {
                     ring_buffer.remove_reader(&task);
                     return Err(EAGAIN);
                 }
-                add_timer(task.clone(), deadline_ms.saturating_sub(now).max(1));
-            }
+                Some(deadline_ms.saturating_sub(now).max(1))
+            } else {
+                None
+            };
             ring_buffer.push_reader(task.clone());
+            // Match Linux prepare_to_wait_event(): publish Blocked while the
+            // condition lock still excludes data/EOF wakeups.  Keeping local
+            // IRQs disabled through the scheduler hand-off also closes the
+            // timer-preemption window between enqueue and sleep.
+            let prepared = PreparedWait::new().expect("pipe reader lost its current task");
+            if let Some(timeout_ms) = timeout_ms {
+                add_timer(task.clone(), timeout_ms);
+            }
             drop(ring_buffer);
-            block_current_and_run_next();
+            prepared.sleep();
         }
     }
 
@@ -489,18 +499,25 @@ impl Pipe {
                         Ok(0)
                     };
                 }
-                if let Some(deadline_ms) = deadline_ms {
+                let timeout_ms = if let Some(deadline_ms) = deadline_ms {
                     let now = crate::time::get_time_ms();
                     if now >= deadline_ms {
                         ring_buffer.remove_reader(&task);
                         return Err(EAGAIN);
                     }
-                    add_timer(task.clone(), deadline_ms.saturating_sub(now).max(1));
-                }
+                    Some(deadline_ms.saturating_sub(now).max(1))
+                } else {
+                    None
+                };
                 // 阻塞写read，加入阻塞队列
                 ring_buffer.push_reader(task.clone());
+                let prepared =
+                    PreparedWait::new().expect("pipe slice reader lost its current task");
+                if let Some(timeout_ms) = timeout_ms {
+                    add_timer(task.clone(), timeout_ms);
+                }
                 drop(ring_buffer);
-                block_current_and_run_next();
+                prepared.sleep();
                 continue;
             }
             // 到这里说明可以读，我们即将写入
@@ -599,7 +616,7 @@ impl Pipe {
                         Ok(written)
                     };
                 }
-                if let Some(deadline_ms) = deadline_ms {
+                let timeout_ms = if let Some(deadline_ms) = deadline_ms {
                     let now = crate::time::get_time_ms();
                     if now >= deadline_ms {
                         ring_buffer.remove_writer(&task);
@@ -609,11 +626,18 @@ impl Pipe {
                             Err(EAGAIN)
                         };
                     }
-                    add_timer(task.clone(), deadline_ms.saturating_sub(now).max(1));
-                }
+                    Some(deadline_ms.saturating_sub(now).max(1))
+                } else {
+                    None
+                };
                 ring_buffer.push_writer(task.clone());
+                let prepared =
+                    PreparedWait::new().expect("pipe slice writer lost its current task");
+                if let Some(timeout_ms) = timeout_ms {
+                    add_timer(task.clone(), timeout_ms);
+                }
                 drop(ring_buffer);
-                block_current_and_run_next();
+                prepared.sleep();
                 continue;
             }
             let mut to_write = remaining.min(avail);
@@ -707,8 +731,9 @@ impl Pipe {
                     return Err(err(SyscallError::EINTR));
                 }
                 ring_buffer.push_reader(task.clone());
+                let prepared = PreparedWait::new().expect("pipe user reader lost its current task");
                 drop(ring_buffer);
-                block_current_and_run_next();
+                prepared.sleep();
                 continue;
             }
 
@@ -790,8 +815,9 @@ impl Pipe {
                     };
                 }
                 ring_buffer.push_writer(task.clone());
+                let prepared = PreparedWait::new().expect("pipe user writer lost its current task");
                 drop(ring_buffer);
-                block_current_and_run_next();
+                prepared.sleep();
                 continue;
             }
 
@@ -893,17 +919,23 @@ impl Pipe {
                         Ok(0)
                     };
                 }
-                if let Some(deadline_ms) = deadline_ms {
+                let timeout_ms = if let Some(deadline_ms) = deadline_ms {
                     let now = crate::time::get_time_ms();
                     if now >= deadline_ms {
                         ring_buffer.remove_reader(&task);
                         return Err(EAGAIN);
                     }
-                    add_timer(task.clone(), deadline_ms.saturating_sub(now).max(1));
-                }
+                    Some(deadline_ms.saturating_sub(now).max(1))
+                } else {
+                    None
+                };
                 ring_buffer.push_reader(task.clone());
+                let prepared = PreparedWait::new().expect("pipe peek reader lost its current task");
+                if let Some(timeout_ms) = timeout_ms {
+                    add_timer(task.clone(), timeout_ms);
+                }
                 drop(ring_buffer);
-                block_current_and_run_next();
+                prepared.sleep();
                 continue;
             }
             return Ok(ring_buffer.peek_into(out));
