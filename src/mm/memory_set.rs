@@ -261,6 +261,102 @@ fn sort_map_areas(areas: &mut [MapArea]) {
     areas.sort_unstable_by_key(|area| area.start_vpn().0);
 }
 
+/// Return the sorted `MapArea` slice that can overlap `[start, end)`.
+///
+/// `MemorySet::areas` is kept ordered and non-overlapping.  Like Linux's VMA
+/// iterator, start from the predecessor that may cover `start`, then stop at
+/// the first area beginning at or beyond `end`.  This keeps small mprotect
+/// operations local instead of rebuilding the complete resident-area list.
+fn overlapping_map_area_indices(
+    areas: &[MapArea],
+    start: VirtPageNum,
+    end: VirtPageNum,
+) -> (usize, usize) {
+    if start >= end || areas.is_empty() {
+        return (0, 0);
+    }
+
+    let mut first = areas.partition_point(|area| area.start_vpn() < start);
+    if first != 0 && areas[first - 1].end_vpn() > start {
+        first -= 1;
+    }
+    let count = areas[first..].partition_point(|area| area.start_vpn() < end);
+    (first, first + count)
+}
+
+/// Apply one already-isolated `MapArea` permission transition.
+///
+/// Keeping the PTE work separate lets the common case (mprotect boundaries
+/// already match existing areas) mutate the resident metadata in place.  A
+/// split and temporary replacement vector are needed only when a boundary
+/// cuts through an area.
+fn update_map_area_permissions(
+    page_table: &mut PageTable,
+    area: &mut MapArea,
+    new_perm: MapPermission,
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    batch: &mut PageTableUpdateBatch,
+) {
+    #[cfg(target_arch = "riscv64")]
+    let mut made_executable = false;
+
+    for vpn in area.vpn_range() {
+        if let Some(pte) = page_table.translate(vpn) {
+            if pte.is_valid() {
+                if new_perm == MapPermission::U {
+                    // PROT_NONE: unmap but keep the frame tracker.
+                    area.save_pte_flags(vpn, pte.flags());
+                    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                    if page_table.unmap_if_mapped_deferred(vpn) {
+                        batch.record_page(vpn.0 << 12);
+                    }
+                    #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+                    page_table.unmap(vpn);
+                    continue;
+                }
+                let old_flags = pte.flags();
+                let pte_flags = pte_flags_for_mprotect(new_perm, Some(old_flags));
+                #[cfg(target_arch = "riscv64")]
+                if pte_flags.contains(PTEFlags::X) && !old_flags.contains(PTEFlags::X) {
+                    made_executable = true;
+                }
+                let _ = area.take_saved_pte_flags(vpn);
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                if matches!(
+                    page_table.set_flags_deferred_changed(vpn, pte_flags),
+                    Some(true)
+                ) {
+                    batch.record_page(vpn.0 << 12);
+                }
+                #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+                let _ = page_table.set_flags(vpn, pte_flags);
+                continue;
+            }
+        }
+        if new_perm != MapPermission::U {
+            if let Some(ppn) = area.tracked_frame(vpn).map(|frame| frame.ppn) {
+                let old_flags = area.take_saved_pte_flags(vpn);
+                let pte_flags = pte_flags_for_mprotect(new_perm, old_flags);
+                #[cfg(target_arch = "riscv64")]
+                if pte_flags.contains(PTEFlags::X) {
+                    // A PROT_NONE page can be modified through a shared alias
+                    // while its executable PTE is absent.
+                    made_executable = true;
+                }
+                page_table.map(vpn, ppn, pte_flags);
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                batch.record_page(vpn.0 << 12);
+            }
+        }
+    }
+
+    area.set_map_perm(new_perm);
+    #[cfg(target_arch = "riscv64")]
+    if made_executable {
+        batch.mark_icache_stale();
+    }
+}
+
 fn vm_region_map_area_type_compatible(region: &VmRegion, area: &MapArea) -> bool {
     area.map_type() == region.map_type
         || (region.can_have_lazy_concrete() && area.map_type() == MapType::Lazy)
@@ -4127,99 +4223,63 @@ impl MemorySet {
         let start_vpn = start_va.floor();
         let end_vpn = end_va.ceil();
         let mut touched_area = false;
-        #[cfg(target_arch = "riscv64")]
-        let mut made_executable = false;
 
-        let mut new_areas: Vec<MapArea> = Vec::new();
-        let mut areas = core::mem::take(&mut self.areas);
-        for area in areas.drain(..) {
-            if !area.contains_perm(MapPermission::U) {
-                new_areas.push(area);
-                continue;
-            }
+        let (first_area, end_area) = overlapping_map_area_indices(&self.areas, start_vpn, end_vpn);
+        let needs_boundary_split = first_area < end_area
+            && (self.areas[first_area].start_vpn() < start_vpn
+                || self.areas[end_area - 1].end_vpn() > end_vpn);
 
-            let area_start = area.start_vpn();
-            let area_end = area.end_vpn();
-            if !area.overlaps_vpn_range(start_vpn, end_vpn) {
-                new_areas.push(area);
-                continue;
-            }
-            touched_area = true;
-
-            let ov_start = core::cmp::max(start_vpn, area_start);
-            let ov_end = core::cmp::min(end_vpn, area_end);
-
-            let (left, mut mid, right) = area.split_around(ov_start, ov_end);
-
-            for vpn in VPNRange::new(ov_start, ov_end) {
-                if let Some(pte) = self.page_table.translate(vpn) {
-                    if pte.is_valid() {
-                        if new_perm == MapPermission::U {
-                            // PROT_NONE: unmap but keep the frame tracker.
-                            mid.save_pte_flags(vpn, pte.flags());
-                            #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-                            if self.page_table.unmap_if_mapped_deferred(vpn) {
-                                batch.record_page(vpn.0 << 12);
-                            }
-                            #[cfg(not(any(
-                                target_arch = "loongarch64",
-                                target_arch = "riscv64"
-                            )))]
-                            self.page_table.unmap(vpn);
-                            continue;
-                        }
-                        let old_flags = pte.flags();
-                        let pte_flags = pte_flags_for_mprotect(new_perm, Some(old_flags));
-                        #[cfg(target_arch = "riscv64")]
-                        if pte_flags.contains(PTEFlags::X) && !old_flags.contains(PTEFlags::X) {
-                            made_executable = true;
-                        }
-                        let _ = mid.take_saved_pte_flags(vpn);
-                        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-                        if matches!(
-                            self.page_table.set_flags_deferred_changed(vpn, pte_flags),
-                            Some(true)
-                        ) {
-                            batch.record_page(vpn.0 << 12);
-                        }
-                        #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
-                        let _ = self.page_table.set_flags(vpn, pte_flags);
-                        continue;
-                    }
+        if !needs_boundary_split {
+            let page_table = &mut self.page_table;
+            for area in &mut self.areas[first_area..end_area] {
+                if !area.contains_perm(MapPermission::U)
+                    || !area.overlaps_vpn_range(start_vpn, end_vpn)
+                {
+                    continue;
                 }
-                if new_perm != MapPermission::U {
-                    if let Some(ppn) = mid.tracked_frame(vpn).map(|frame| frame.ppn) {
-                        let old_flags = mid.take_saved_pte_flags(vpn);
-                        let pte_flags = pte_flags_for_mprotect(new_perm, old_flags);
-                        #[cfg(target_arch = "riscv64")]
-                        if pte_flags.contains(PTEFlags::X) {
-                            // A PROT_NONE page can be modified through a
-                            // shared alias while its executable PTE is absent.
-                            made_executable = true;
-                        }
-                        self.page_table.map(vpn, ppn, pte_flags);
-                        #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
-                        batch.record_page(vpn.0 << 12);
-                    }
+                touched_area = true;
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                update_map_area_permissions(page_table, area, new_perm, batch);
+                #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+                update_map_area_permissions(page_table, area, new_perm);
+            }
+        } else {
+            let candidate_count = end_area - first_area;
+            let mut replacement_areas = Vec::with_capacity(candidate_count.saturating_add(2));
+            let page_table = &mut self.page_table;
+            let areas = &mut self.areas;
+            for area in areas.drain(first_area..end_area) {
+                if !area.contains_perm(MapPermission::U) {
+                    replacement_areas.push(area);
+                    continue;
+                }
+
+                let area_start = area.start_vpn();
+                let area_end = area.end_vpn();
+                if !area.overlaps_vpn_range(start_vpn, end_vpn) {
+                    replacement_areas.push(area);
+                    continue;
+                }
+                touched_area = true;
+
+                let ov_start = core::cmp::max(start_vpn, area_start);
+                let ov_end = core::cmp::min(end_vpn, area_end);
+                let (left, mut mid, right) = area.split_around(ov_start, ov_end);
+
+                #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+                update_map_area_permissions(page_table, &mut mid, new_perm, batch);
+                #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+                update_map_area_permissions(page_table, &mut mid, new_perm);
+
+                if let Some(left) = left {
+                    replacement_areas.push(left);
+                }
+                replacement_areas.push(mid);
+                if let Some(right) = right {
+                    replacement_areas.push(right);
                 }
             }
-
-            if let Some(left) = left {
-                new_areas.push(left);
-            }
-
-            mid.set_map_perm(new_perm);
-            new_areas.push(mid);
-
-            if let Some(right) = right {
-                new_areas.push(right);
-            }
-        }
-        self.areas = new_areas;
-        self.sort_user_areas();
-        #[cfg(target_arch = "riscv64")]
-        if made_executable {
-            batch.mark_icache_stale();
+            areas.splice(first_area..first_area, replacement_areas);
         }
         debug_assert!(
             touched_area || start_vpn >= end_vpn,
