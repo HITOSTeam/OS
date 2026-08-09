@@ -985,9 +985,14 @@ pub fn current_process() -> Arc<ProcessControlBlock> {
         })
 }
 
-/// 读取任务所属进程的调度类与实时优先级，供唤醒抢占比较使用。
+/// 尝试读取任务的调度类与实时优先级，供唤醒抢占比较使用。
+///
+/// Linux 的唤醒抢占判断读取的是由调度器锁保护的 `sched_entity` 字段，不会
+/// 为了观察另一个任务而等待它的宽 task lock。当前调度字段仍暂存在 TCB.inner
+/// 中，因此这里只允许非阻塞快照；拿不到时由调用方根据 RT 类或实际 rq 队首
+/// 做有界退化，不阻塞整个唤醒链。
 fn task_sched_class_and_priority(task: &Arc<TaskControlBlock>) -> Option<(SchedClass, i32)> {
-    let inner = task.borrow_mut();
+    let inner = task.try_borrow_mut()?;
     let class = sched_class(inner.scheduling.sched_policy).unwrap_or(SchedClass::Fair);
     Some((class, inner.scheduling.sched_priority))
 }
@@ -1012,11 +1017,17 @@ fn wakeup_should_preempt_task(
     if Arc::ptr_eq(&current, woken) {
         return false;
     }
-    let Some((current_class, current_priority)) = task_sched_class_and_priority(current) else {
+    let Some((woken_class, woken_priority)) = task_sched_class_and_priority(woken) else {
+        // The task is already runnable. Deferring one imprecise preemption is
+        // preferable to blocking every waker or forcing an unrelated switch.
         return false;
     };
-    let Some((woken_class, woken_priority)) = task_sched_class_and_priority(woken) else {
-        return false;
+    let Some((current_class, current_priority)) = task_sched_class_and_priority(current) else {
+        // Do not queue behind the running task's broad TCB lock. RT wakees
+        // retain strict priority; fair wakees use their actual rq position as
+        // the lock-free fallback instead of unconditionally forcing a switch.
+        return matches!(woken_class, SchedClass::Fifo | SchedClass::Rr)
+            || fair_task_is_next_on_hart(woken, target_hart);
     };
     match (woken_class, current_class) {
         (SchedClass::Fifo | SchedClass::Rr, SchedClass::Fair) => true,

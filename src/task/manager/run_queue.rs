@@ -12,7 +12,7 @@ use super::current_time_ns_usize;
 use super::fair::{
     EnqueueKind, FairGroupQueue, HartRunQueue, ReadyQueueSlot, current_fair_entity_for_group,
     fair_group_id_and_shares, fair_nice_weight, fair_task_id, place_fair_task_entity,
-    task_queue_slot,
+    task_queue_slot, task_queue_slot_from_inner,
 };
 use super::pick_online_hart;
 use super::rt::{
@@ -183,6 +183,37 @@ impl TaskManager {
             return None;
         }
         task.set_cpu_id(hart_id);
+
+        // Snapshot the target hart's running entity before taking either the
+        // enqueued task lock or rq lock. The snapshot only refines EEVDF's
+        // average; it may safely be omitted if the current TCB is contended.
+        // This ordering is essential: the old rq -> current TCB.inner path can
+        // deadlock against a running task that owns its TCB.inner and is
+        // enqueueing work onto the same rq.
+        let (slot_hint, group_hint) = {
+            let inner = task.borrow_mut();
+            (task_queue_slot_from_inner(&inner), inner.fair_group_id)
+        };
+        let now_ns = current_time_ns_usize() as u64;
+        let current_entity = matches!(slot_hint, ReadyQueueSlot::Fair)
+            .then(|| current_fair_entity_for_group(hart_id, group_hint, now_ns))
+            .flatten();
+
+        // Linux keeps sched_entity fields under rq ownership. Until those
+        // fields are split out of the broad TCB inner, establish the only safe
+        // transitional order: task inner -> rq. No code below may acquire a
+        // second task-inner lock while rq is held.
+        let mut task_inner = task.borrow_mut();
+        let queue_slot = task_queue_slot_from_inner(&task_inner);
+        let group_id = task_inner.fair_group_id;
+        let shares = task_inner.fair_group_shares.max(1);
+        let weight = fair_nice_weight(task_inner.nice);
+        let current_entity = (group_id == group_hint).then_some(current_entity).flatten();
+        let debug_tid = if DEBUG_SCHED {
+            Some(task_inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX))
+        } else {
+            None
+        };
         let mut hart_rq = self.ready_queues[hart_id].lock();
         if task
             .ready_queue_hart
@@ -198,13 +229,7 @@ impl TaskManager {
         // class just to detect the empty-to-runnable transition.  The exact
         // per-hart counters are updated under this same rq lock.
         let was_empty = ready_rt_count(hart_id) == 0 && ready_fair_count(hart_id) == 0;
-        if DEBUG_SCHED {
-            let tid = task
-                .borrow_mut()
-                .res
-                .as_ref()
-                .map(|r| r.tid)
-                .unwrap_or(usize::MAX);
+        if let Some(tid) = debug_tid {
             log::debug!(
                 "[sched] add_task tid={} hart={} ready_queue_len_before={}",
                 tid,
@@ -212,13 +237,12 @@ impl TaskManager {
                 hart_rq.len()
             );
         }
-        match task_queue_slot(&task) {
+        match queue_slot {
             ReadyQueueSlot::Rt(idx) => {
                 hart_rq.rt_queues[idx].push_back(Arc::clone(&task));
                 inc_ready_rt_count(hart_id, idx);
             }
             ReadyQueueSlot::Fair => {
-                let (group_id, shares) = fair_group_id_and_shares(&task);
                 let min_vruntime = hart_rq.min_fair_vruntime;
                 hart_rq.unlink_fair_group(group_id);
                 let group = hart_rq
@@ -226,14 +250,8 @@ impl TaskManager {
                     .entry(group_id)
                     .or_insert_with(|| FairGroupQueue::new(min_vruntime));
                 group.shares = shares.max(1);
-                let now_ns = current_time_ns_usize() as u64;
-                let current_entity = current_fair_entity_for_group(hart_id, group_id, now_ns);
                 let (task_vruntime, deadline) =
-                    place_fair_task_entity(group, &task, kind, current_entity);
-                let weight = {
-                    let inner = task.borrow_mut();
-                    fair_nice_weight(inner.nice)
-                };
+                    place_fair_task_entity(group, &mut task_inner, kind, current_entity);
                 let task_id = fair_task_id(&task);
                 group.insert_task(task_id, Arc::clone(&task), task_vruntime, deadline, weight);
                 hart_rq.relink_fair_group_if_runnable(group_id);
@@ -290,25 +308,8 @@ impl TaskManager {
             if !released {
                 continue;
             }
-            let status = candidate.borrow_mut().task_status;
-            if status == TaskStatus::Ready {
-                return Some(candidate);
-            }
-            if DEBUG_SCHED {
-                let tid = candidate
-                    .borrow_mut()
-                    .res
-                    .as_ref()
-                    .map(|r| r.tid)
-                    .unwrap_or(usize::MAX);
-                log::debug!(
-                    "[sched] drop stale entry tid={} hart={} status={:?} remaining_len={}",
-                    tid,
-                    hart_id,
-                    status,
-                    queue.len()
-                );
-            }
+            // TCB state is validated by fetch() after rq_lock is released.
+            return Some(candidate);
         }
         None
     }
@@ -322,7 +323,7 @@ impl TaskManager {
     /// tldr:
     /// 为hart 选择任务,同时移除所有非法的 group 内任务
     fn prune_fair_group_front(group: &mut FairGroupQueue, hart_id: usize) -> Option<u64> {
-        // 只有不足平均 的 才有资格 加入,
+        // 只有不足平均的实体才具备 EEVDF 资格。
         let eligible_vruntime = group.avg_task_vruntime().unwrap_or(group.min_task_vruntime);
         loop {
             // task order 按照 deadline ,runtime 顺序排列
@@ -345,12 +346,11 @@ impl TaskManager {
             }
 
             let candidate = Arc::clone(&entity.task);
-            let status = candidate.borrow_mut().task_status;
             let queued_here = candidate
                 .ready_queue_hart
                 .load(core::sync::atomic::Ordering::Acquire)
                 == hart_id;
-            if queued_here && status == TaskStatus::Ready {
+            if queued_here {
                 if entity.vruntime <= eligible_vruntime {
                     //deadline 已经是最小的了，task_order保证
                     return Some(task_id);
@@ -368,13 +368,12 @@ impl TaskManager {
                     if entity.vruntime != vruntime || entity.deadline != deadline {
                         continue;
                     }
-                    let candidate = Arc::clone(&entity.task);
-                    let status = candidate.borrow_mut().task_status;
+                    let candidate = &entity.task;
                     let queued_here = candidate
                         .ready_queue_hart
                         .load(core::sync::atomic::Ordering::Acquire)
                         == hart_id;
-                    if queued_here && status == TaskStatus::Ready {
+                    if queued_here {
                         if entity.vruntime <= eligible_vruntime {
                             return Some(task_id);
                         }
@@ -410,17 +409,10 @@ impl TaskManager {
                 );
             }
             if DEBUG_SCHED {
-                let tid = candidate
-                    .borrow_mut()
-                    .res
-                    .as_ref()
-                    .map(|r| r.tid)
-                    .unwrap_or(usize::MAX);
                 log::debug!(
-                    "[sched] drop stale fair entry tid={} hart={} status={:?} remaining_len={}",
-                    tid,
+                    "[sched] drop stale fair entry task_id={} hart={} remaining_len={}",
+                    task_id,
                     hart_id,
-                    status,
                     group.len()
                 );
             }
@@ -507,10 +499,6 @@ impl TaskManager {
             if !released {
                 continue;
             }
-            {
-                let mut inner = task.borrow_mut();
-                inner.fair_runtime_checkpoint_ns = inner.cpu_time_ns;
-            }
             return Some(task);
         }
     }
@@ -519,25 +507,50 @@ impl TaskManager {
     pub fn fetch(&self, hart_id: usize) -> Option<Arc<TaskControlBlock>> {
         // 跳过陈旧条目：SMP 下，bug 或竞态可能会暂时把非 Ready 任务
         // （Blocked/Running）留在就绪队列中。绝不能调度它们。
-        let t = {
-            let mut rq = self.ready_queues[hart_id].lock();
-            let mut picked = None;
-            // RT-RUNTIME 还没用完 ，那就直接从rt中拿取
-            // The BuildStorm/common case has no RT entities.  Avoid scanning
-            // all 99 empty priority queues on every fair scheduling decision,
-            // as Linux first gates its RT pick path on rt_nr_running.
-            if ready_rt_count(hart_id) != 0 && !rt_bandwidth_throttled(hart_id) {
-                for (rt_idx, rtq) in rq.rt_queues.iter_mut().enumerate() {
-                    if let Some(task) = Self::pop_ready_rt_candidate(rtq, hart_id, rt_idx) {
-                        picked = Some(task);
-                        break;
+        let t = loop {
+            let picked = {
+                let mut rq = self.ready_queues[hart_id].lock();
+                let mut picked = None;
+                // RT-RUNTIME 还没用完 ，那就直接从rt中拿取
+                // The BuildStorm/common case has no RT entities. Avoid scanning
+                // all 99 empty priority queues on every fair scheduling decision,
+                // as Linux first gates its RT pick path on rt_nr_running.
+                if ready_rt_count(hart_id) != 0 && !rt_bandwidth_throttled(hart_id) {
+                    for (rt_idx, rtq) in rq.rt_queues.iter_mut().enumerate() {
+                        if let Some(task) = Self::pop_ready_rt_candidate(rtq, hart_id, rt_idx) {
+                            picked = Some(task);
+                            break;
+                        }
                     }
                 }
+                if picked.is_none() {
+                    picked = Self::pop_ready_fair_candidate(&mut rq, hart_id);
+                }
+                picked
+            };
+            let Some(task) = picked else {
+                break None;
+            };
+
+            // Do the potentially blocking TCB access only after rq_lock has
+            // been released. This preserves the Ready-state invariant without
+            // recreating the rq -> TCB.inner inversion captured in BuildStorm.
+            let mut inner = task.borrow_mut();
+            if inner.task_status != TaskStatus::Ready {
+                if DEBUG_SCHED {
+                    let tid = inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX);
+                    log::debug!(
+                        "[sched] drop stale dequeued task tid={} hart={} status={:?}",
+                        tid,
+                        hart_id,
+                        inner.task_status
+                    );
+                }
+                continue;
             }
-            if picked.is_none() {
-                picked = Self::pop_ready_fair_candidate(&mut rq, hart_id);
-            }
-            picked
+            inner.fair_runtime_checkpoint_ns = inner.cpu_time_ns;
+            drop(inner);
+            break Some(task);
         };
         if DEBUG_SCHED {
             if let Some(ref task) = t {
@@ -643,6 +656,18 @@ impl TaskManager {
     }
     /// 从所有 hart 的就绪队列中移除指定任务（同时清理 RT 和 Fair 队列中可能存在的重复条目）
     pub fn remove(&self, task: Arc<TaskControlBlock>) -> usize {
+        let (group_hint, _) = fair_group_id_and_shares(&task);
+        let debug_tid = if crate::debug_config::DEBUG_TASK_LIFECYCLE {
+            Some(
+                task.borrow_mut()
+                    .res
+                    .as_ref()
+                    .map(|r| r.tid)
+                    .unwrap_or(usize::MAX),
+            )
+        } else {
+            None
+        };
         loop {
             let queued_hart = task
                 .ready_queue_hart
@@ -676,9 +701,8 @@ impl TaskManager {
             }
             let task_id = fair_task_id(&task);
             let mut fair_removed = 0usize;
-            let (group_id, _) = fair_group_id_and_shares(&task);
             fair_removed =
-                Self::remove_fair_task_from_group(&mut rq, group_id, task_id, queued_hart);
+                Self::remove_fair_task_from_group(&mut rq, group_hint, task_id, queued_hart);
             if fair_removed == 0 {
                 let fair_group_ids = rq
                     .fair_groups
@@ -713,13 +737,7 @@ impl TaskManager {
                 core::hint::spin_loop();
                 continue;
             }
-            if crate::debug_config::DEBUG_TASK_LIFECYCLE && removed > 1 {
-                let tid = task
-                    .borrow_mut()
-                    .res
-                    .as_ref()
-                    .map(|r| r.tid)
-                    .unwrap_or(usize::MAX);
+            if let Some(tid) = debug_tid.filter(|_| removed > 1) {
                 crate::println!("[sched-remove] tid={} removed_dup_entries={}", tid, removed);
             }
             // OFF is the release publication that the old physical entry has

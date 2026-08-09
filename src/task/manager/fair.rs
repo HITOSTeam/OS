@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 
 use crate::config::MAX_HARTS;
 use crate::task::sched::{RT_PRIO_LEVELS, SchedClass, rt_queue_index, sched_class};
-use crate::task::task_block::TaskControlBlock;
+use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
 
 use super::TASK_MANAGER;
 use super::current_time_ns_usize;
@@ -219,6 +219,7 @@ impl HartRunQueue {
 }
 
 /// 任务入队时的目标槽位：RT 队列（按优先级索引）或 EEVDF 公平队列
+#[derive(Clone, Copy)]
 pub(super) enum ReadyQueueSlot {
     Rt(usize),
     Fair,
@@ -227,13 +228,13 @@ pub(super) enum ReadyQueueSlot {
 /// 根据任务的调度策略和优先级，确定其应放入的就绪队列槽位（RT 或公平队列）
 
 pub(super) fn task_queue_slot(task: &Arc<TaskControlBlock>) -> ReadyQueueSlot {
-    let (policy, rt_priority) = {
-        let inner = task.borrow_mut();
-        (
-            inner.scheduling.sched_policy,
-            inner.scheduling.sched_priority,
-        )
-    };
+    let inner = task.borrow_mut();
+    task_queue_slot_from_inner(&inner)
+}
+
+pub(super) fn task_queue_slot_from_inner(inner: &TaskControlBlockInner) -> ReadyQueueSlot {
+    let policy = inner.scheduling.sched_policy;
+    let rt_priority = inner.scheduling.sched_priority;
     // 根据调度策略编号决定目标队列位置。
     // FIFO RR 都加入到 RT
     // 其余进入公平调度队列
@@ -316,14 +317,13 @@ fn inflate_fair_lag_ns(vlag: u128, load: u128, weight: u128) -> u128 {
 /// `deadline = vruntime + vslice` 参与 EEVDF 风格选择。
 pub(super) fn place_fair_task_entity(
     group: &mut FairGroupQueue,
-    task: &Arc<TaskControlBlock>,
+    inner: &mut TaskControlBlockInner,
     kind: EnqueueKind,
     current_entity: Option<(u128, u128)>,
 ) -> (u128, u128) {
     let avg_vruntime = group
         .avg_task_vruntime_with(current_entity)
         .unwrap_or(group.min_task_vruntime);
-    let mut inner = task.borrow_mut();
     // group 限制最低 vruntime,防止 新进入任务亏欠太多
     if inner.fair_vruntime_ns < group.min_task_vruntime {
         inner.fair_vruntime_ns = group.min_task_vruntime;
@@ -412,8 +412,11 @@ pub(super) fn place_fair_task_entity(
 ///
 /// 注意：这个函数**不修改** TCB 状态，只做只读估算。真正的 vruntime 累加
 /// 发生在下一次入队时的 `place_fair_task_entity`。
-fn fair_task_vruntime_deadline_at(task: &Arc<TaskControlBlock>, now_ns: u64) -> (u128, u128) {
-    let inner = task.borrow_mut();
+fn fair_task_vruntime_deadline_from_inner(
+    task: &TaskControlBlock,
+    inner: &TaskControlBlockInner,
+    now_ns: u64,
+) -> (u128, u128) {
     // 若任务正在运行，补上从 runtime_start_ns 到 now 的未记账片段。
     let current_runtime_ns =
         if task.on_cpu.load(core::sync::atomic::Ordering::Acquire) != TaskControlBlock::OFF_CPU {
@@ -430,6 +433,11 @@ fn fair_task_vruntime_deadline_at(task: &Arc<TaskControlBlock>, now_ns: u64) -> 
         .fair_vruntime_ns
         .saturating_add(scale_fair_delta(delta_ns, fair_nice_weight(inner.nice)));
     (vruntime, inner.fair_deadline_ns)
+}
+
+fn fair_task_vruntime_deadline_at(task: &Arc<TaskControlBlock>, now_ns: u64) -> (u128, u128) {
+    let inner = task.borrow_mut();
+    fair_task_vruntime_deadline_from_inner(task, &inner, now_ns)
 }
 
 /// 获取指定 hart 上当前正在运行的 fair 任务实体信息（vruntime, weight），
@@ -453,20 +461,23 @@ pub(super) fn current_fair_entity_for_group(
     if current.on_cpu.load(core::sync::atomic::Ordering::Acquire) == TaskControlBlock::OFF_CPU {
         return None;
     }
-    let weight = {
-        let inner = current.borrow_mut();
-        // 当前任务必须属于同一个 fair group 且是 fair 类，否则不纳入 avg。
-        if inner.fair_group_id != group_id
-            || !matches!(
-                sched_class(inner.scheduling.sched_policy),
-                Some(SchedClass::Fair)
-            )
-        {
-            return None;
-        }
-        fair_nice_weight(inner.nice)
-    };
-    let (vruntime, _) = fair_task_vruntime_deadline_at(&current, now_ns);
+    // Enqueue may already hold the target runqueue lock. Linux reads the
+    // current entity directly under rq ownership; our transitional TCB keeps
+    // that state behind a separate lock. Never wait for it while an rq can be
+    // held: the running task may itself be trying to acquire that rq while it
+    // owns TCB.inner. Omitting a contended current entity only makes the EEVDF
+    // average snapshot conservative and cannot lose runnable ownership.
+    let inner = current.try_borrow_mut()?;
+    if inner.fair_group_id != group_id
+        || !matches!(
+            sched_class(inner.scheduling.sched_policy),
+            Some(SchedClass::Fair)
+        )
+    {
+        return None;
+    }
+    let weight = fair_nice_weight(inner.nice);
+    let (vruntime, _) = fair_task_vruntime_deadline_from_inner(&current, &inner, now_ns);
     Some((vruntime, weight))
 }
 
@@ -481,13 +492,15 @@ fn peek_fair_group_task(group: &FairGroupQueue, hart_id: usize) -> Option<u64> {
         if entity.vruntime != vruntime {
             continue;
         }
-        let candidate = Arc::clone(&entity.task);
-        let status = candidate.borrow_mut().task_status;
+        let candidate = &entity.task;
         let queued_here = candidate
             .ready_queue_hart
             .load(core::sync::atomic::Ordering::Acquire)
             == hart_id;
-        if !queued_here || status != crate::task::task_block::TaskStatus::Ready {
+        // Physical rq membership plus ready_queue_hart is the authoritative
+        // runnable state, as Linux's rb-tree membership is under rq_lock. Do
+        // not take the broad TCB.inner lock while holding rq_lock.
+        if !queued_here {
             continue;
         }
         if entity.vruntime <= eligible_vruntime {
@@ -517,7 +530,6 @@ pub fn fair_task_is_next_on_hart(task: &Arc<TaskControlBlock>, hart_id: usize) -
     let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
     let hart_id = hart_id % MAX_HARTS;
     let task_id = fair_task_id(task);
-    let group_id = task.borrow_mut().fair_group_id;
     let rq = TASK_MANAGER.ready_queues[hart_id].lock();
 
     for (indexed_vruntime, candidate_group_id) in rq.fair_order.iter().copied() {
@@ -530,7 +542,9 @@ pub fn fair_task_is_next_on_hart(task: &Arc<TaskControlBlock>, hart_id: usize) -
         let Some(candidate_task_id) = peek_fair_group_task(group, hart_id) else {
             continue;
         };
-        return candidate_group_id == group_id && candidate_task_id == task_id;
+        // Task ids are globally unique, so the rq tree itself is sufficient;
+        // no TCB metadata lock is needed to recover the wakee's group id.
+        return candidate_task_id == task_id;
     }
 
     false
@@ -591,21 +605,30 @@ pub fn fair_wakeup_preempts_current_on_hart(
     now_ns: u64,
 ) -> bool {
     let _irq_guard = crate::sync::LocalIrqSaveGuard::new();
-    let (current_vruntime, current_deadline) = fair_task_vruntime_deadline_at(current, now_ns);
+    // `try_to_wake_up()` must not wait for either task's broad state lock.
+    // Snapshot each entity once before rq_lock. On contention this precise
+    // pairwise test is deferred; the caller still checks whether the wakee is
+    // the actual first entity in the rq tree without touching TCB.inner.
+    let Some(current_inner) = current.try_borrow_mut() else {
+        return false;
+    };
+    let (current_vruntime, current_deadline) =
+        fair_task_vruntime_deadline_from_inner(current, &current_inner, now_ns);
+    let current_group_id = current_inner.fair_group_id;
+    let current_weight = fair_nice_weight(current_inner.nice);
+    let current_full_slice = fair_entity_vslice_ns(current_inner.nice, EnqueueKind::Requeue);
+    drop(current_inner);
     // 步骤 1：当前任务自己的 deadline 已到 → 直接抢。
     if current_deadline == 0 || current_vruntime >= current_deadline {
         return true;
     }
-    let (woken_vruntime, woken_deadline) = fair_task_vruntime_deadline_at(woken, now_ns);
-    let (current_group_id, current_weight, current_full_slice) = {
-        let inner = current.borrow_mut();
-        (
-            inner.fair_group_id,
-            fair_nice_weight(inner.nice),
-            fair_entity_vslice_ns(inner.nice, EnqueueKind::Requeue),
-        )
+    let Some(woken_inner) = woken.try_borrow_mut() else {
+        return false;
     };
-    let woken_group_id = woken.borrow_mut().fair_group_id;
+    let (woken_vruntime, woken_deadline) =
+        fair_task_vruntime_deadline_from_inner(woken, &woken_inner, now_ns);
+    let woken_group_id = woken_inner.fair_group_id;
+    drop(woken_inner);
     // 步骤 2：判定被唤醒者是否 eligible。
     let woken_eligible = {
         let rq = TASK_MANAGER.ready_queues[hart_id % MAX_HARTS].lock();
