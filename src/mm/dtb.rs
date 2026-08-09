@@ -27,11 +27,13 @@ impl HartTopology {
     }
 }
 
-/// Discover the physical CPU IDs advertised by QEMU's `/cpus` FDT node.
+/// Discover the available physical CPU IDs advertised by the `/cpus` FDT node.
 ///
 /// The returned mask deliberately stays physical-ID based. Both QEMU virt
 /// machines advertise IDs that fit in `MAX_HARTS`; sparse IDs in that bounded
 /// range remain representable without inventing a logical/physical mapping.
+/// As in Linux's `of_device_is_available()`, a missing status is enabled and
+/// only `okay` or `ok` explicitly enables a node with a status property.
 pub fn hart_topology_from_dtb(dtb_pa: usize, boot_hart_id: usize) -> HartTopology {
     if dtb_pa == 0 {
         return HartTopology::boot_hart_only(boot_hart_id);
@@ -45,6 +47,14 @@ pub fn hart_topology_from_dtb(dtb_pa: usize, boot_hart_id: usize) -> HartTopolog
     let mut ignored = 0usize;
     for cpu in fdt.cpus() {
         discovered = discovered.saturating_add(1);
+        let available = cpu
+            .property("status")
+            .map(|property| matches!(property.as_str(), Some("okay" | "ok")))
+            .unwrap_or(true);
+        if !available {
+            ignored = ignored.saturating_add(1);
+            continue;
+        }
         let hart_id = cpu.ids().first();
         if hart_id < MAX_HARTS && hart_id < usize::BITS as usize {
             present_mask |= 1usize << hart_id;

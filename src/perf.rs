@@ -29,6 +29,10 @@ static TLB_EXACT_PAIRS: AtomicU64 = AtomicU64::new(0);
 static TLB_REMOTE_IPIS: AtomicU64 = AtomicU64::new(0);
 static TLB_SHOOTDOWN_WAIT_CYCLES: AtomicU64 = AtomicU64::new(0);
 static TLB_ASID_WRAPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "riscv64")]
+static TLB_NEW_PTE_FENCES: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "riscv64")]
+static TLB_NEW_PTE_SVVPTC_SKIPS: AtomicU64 = AtomicU64::new(0);
 // The two RISC-V paths that dominated a compile storm were invisible to the
 // batched `TLB_*` counters above: `activate_token()` writing SATP with an
 // unconditional ASID-wide `sfence.vma`, and `flush_kernel_shared_tlb()` doing a
@@ -179,6 +183,19 @@ pub fn record_tlb_shootdown(remote_ipis: usize, wait_cycles: usize) {
 pub fn record_tlb_asid_wrap() {
     if DEBUG_PERF {
         TLB_ASID_WRAPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub fn record_tlb_new_pte_refresh(svvptc_skip: bool) {
+    if !DEBUG_PERF {
+        return;
+    }
+    if svvptc_skip {
+        TLB_NEW_PTE_SVVPTC_SKIPS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TLB_NEW_PTE_FENCES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -401,6 +418,17 @@ pub fn dump() -> String {
     let tlb_remote_ipis = TLB_REMOTE_IPIS.load(Ordering::Relaxed);
     let tlb_shootdown_wait_cycles = TLB_SHOOTDOWN_WAIT_CYCLES.load(Ordering::Relaxed);
     let tlb_asid_wraps = TLB_ASID_WRAPS.load(Ordering::Relaxed);
+    #[cfg(target_arch = "riscv64")]
+    let new_pte_tlb = {
+        let tlb_new_pte_fences = TLB_NEW_PTE_FENCES.load(Ordering::Relaxed);
+        let tlb_new_pte_svvptc_skips = TLB_NEW_PTE_SVVPTC_SKIPS.load(Ordering::Relaxed);
+        alloc::format!(
+            "tlb_new_pte_fences: {tlb_new_pte_fences}\n\
+tlb_new_pte_svvptc_skips: {tlb_new_pte_svvptc_skips}\n"
+        )
+    };
+    #[cfg(not(target_arch = "riscv64"))]
+    let new_pte_tlb = "";
     let satp_switches = SATP_SWITCHES.load(Ordering::Relaxed);
     let satp_switch_flushes = SATP_SWITCH_FLUSHES.load(Ordering::Relaxed);
     let kernel_shootdowns = KERNEL_SHOOTDOWNS.load(Ordering::Relaxed);
@@ -503,6 +531,7 @@ tlb_exact_pairs: {tlb_exact_pairs}\n\
 tlb_remote_ipis: {tlb_remote_ipis}\n\
 tlb_shootdown_wait_cycles: {tlb_shootdown_wait_cycles}\n\
 tlb_asid_wraps: {tlb_asid_wraps}\n\
+{new_pte_tlb}\
 tlb_satp_switches: {satp_switches}\n\
 tlb_satp_switch_flushes: {satp_switch_flushes}\n\
 tlb_kernel_shootdowns: {kernel_shootdowns}\n\

@@ -585,12 +585,12 @@ pub fn flush_user_range(ctx: &Arc<AsidContext>, start: usize, end: usize) {
 /// Publish a leaf PTE that was non-present before the current page fault.
 ///
 /// Linux's RISC-V `update_mmu_cache_range()` performs only a local
-/// `SFENCE.VMA` for this transition.  There is no stale valid translation to
-/// remove from another hart; at most, a hart can retain an invalid PTE cache
-/// entry and take a spurious fault, after which it refreshes that entry
-/// locally.  Existing-PTE replacement, permission changes, unmap, and
-/// executable-page publication continue to use the synchronous mm-wide
-/// invalidation paths.
+/// `SFENCE.VMA` for this transition when the system lacks Svvptc. Svvptc makes
+/// a newly valid PTE visible within a bounded time, so Linux skips the fence on
+/// systems where every available hart supports the extension. Existing-PTE
+/// replacement, permission changes, and unmap continue to use the synchronous
+/// mm-wide invalidation paths. Executable publication still performs its
+/// separate instruction-cache synchronization before publishing the PTE.
 pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
     let hart_id = super::super::hart_id();
     if hart_id >= MAX_HARTS {
@@ -606,10 +606,16 @@ pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
         return;
     }
 
+    if super::super::has_svvptc() {
+        crate::perf::record_tlb_new_pte_refresh(true);
+        return;
+    }
+
     // Order the new PTE store before the address/ASID-scoped fence.  This is
     // local by design: a remote hart that raced the missing PTE resolves its
     // own possible invalid-entry cache after observing the published leaf.
     page_table_write_barrier();
+    crate::perf::record_tlb_new_pte_refresh(false);
     local_flush_range(
         Some(context_asid(context)),
         vaddr,

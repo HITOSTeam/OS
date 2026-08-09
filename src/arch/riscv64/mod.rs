@@ -15,6 +15,7 @@ use spin::MutexGuard;
 use crate::task::task_block::{TaskControlBlock, TaskControlBlockInner};
 
 static RISCV_HAS_SSTC: AtomicBool = AtomicBool::new(false);
+static RISCV_HAS_SVVPTC: AtomicBool = AtomicBool::new(false);
 // Detect Sstc for future use, but keep SBI set_timer as the active clockevent
 // path while this branch is focused on scheduler/mm latency changes.
 const RISCV_USE_SSTC_CLOCKEVENT: bool = false;
@@ -31,6 +32,38 @@ fn detect_timebase_frequency(dtb_pa: usize) -> Option<usize> {
         .filter(|freq| *freq != 0)
 }
 
+fn string_list_contains(value: &[u8], expected: &[u8]) -> bool {
+    value
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == expected)
+}
+
+fn isa_string_contains(value: &[u8], expected: &[u8]) -> bool {
+    let value = value.strip_suffix(&[0]).unwrap_or(value);
+    value.split(|byte| *byte == b'_').skip(1).any(|extension| {
+        // Linux's legacy riscv,isa parser ignores a multi-letter
+        // extension's optional major or major/minor version suffix.
+        let mut name_end = extension.len();
+        if extension.last().is_some_and(u8::is_ascii_digit) {
+            while name_end > 0 && extension[name_end - 1].is_ascii_digit() {
+                name_end -= 1;
+            }
+            if name_end >= 2
+                && extension[name_end - 1].eq_ignore_ascii_case(&b'p')
+                && extension[name_end - 2].is_ascii_digit()
+            {
+                name_end -= 1;
+                while name_end > 0 && extension[name_end - 1].is_ascii_digit() {
+                    name_end -= 1;
+                }
+            }
+        }
+        extension[..name_end].eq_ignore_ascii_case(expected)
+    })
+}
+
+/// Match Linux's host ISA bitmap: an extension is globally usable only when
+/// every available hart supported by this kernel advertises it.
 fn detect_isa_extension(dtb_pa: usize, extension: &[u8]) -> bool {
     if dtb_pa == 0 {
         return false;
@@ -38,26 +71,36 @@ fn detect_isa_extension(dtb_pa: usize, extension: &[u8]) -> bool {
     let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(dtb_pa as *const u8) }) else {
         return false;
     };
-    let Some(cpus) = fdt.find_node("/cpus") else {
+    if fdt.find_node("/cpus").is_none() {
         return false;
-    };
-    for cpu in cpus.children() {
-        if cpu.property("riscv,isa").is_some_and(|prop| {
-            prop.value
-                .windows(extension.len())
-                .any(|window| window == extension)
-        }) {
-            return true;
+    }
+
+    let mut saw_available_hart = false;
+    for cpu in fdt.cpus() {
+        let hart_id = cpu.ids().first();
+        if hart_id >= crate::config::MAX_HARTS || hart_id >= usize::BITS as usize {
+            continue;
         }
-        if cpu.property("riscv,isa-extensions").is_some_and(|prop| {
-            prop.value
-                .windows(extension.len())
-                .any(|window| window == extension)
-        }) {
-            return true;
+        let available = cpu
+            .property("status")
+            .map(|property| matches!(property.as_str(), Some("okay" | "ok")))
+            .unwrap_or(true);
+        if !available {
+            continue;
+        }
+
+        saw_available_hart = true;
+        let present = if let Some(property) = cpu.property("riscv,isa-extensions") {
+            string_list_contains(property.value, extension)
+        } else {
+            cpu.property("riscv,isa")
+                .is_some_and(|property| isa_string_contains(property.value, extension))
+        };
+        if !present {
+            return false;
         }
     }
-    false
+    saw_available_hart
 }
 
 #[allow(dead_code)]
@@ -72,6 +115,16 @@ pub fn bootstrap_init(dtb_pa: usize) {
     if has_sstc {
         crate::println!("[kernel] riscv sstc timer enabled");
     }
+    let has_svvptc = detect_isa_extension(dtb_pa, b"svvptc");
+    RISCV_HAS_SVVPTC.store(has_svvptc, Ordering::Release);
+    if has_svvptc {
+        crate::println!("[kernel] riscv svvptc enabled");
+    }
+}
+
+#[inline]
+pub(crate) fn has_svvptc() -> bool {
+    RISCV_HAS_SVVPTC.load(Ordering::Acquire)
 }
 
 /// Discard firmware/boot-time translations and instruction-cache state before
