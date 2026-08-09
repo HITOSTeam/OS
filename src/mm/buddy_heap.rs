@@ -11,7 +11,9 @@ use core::{alloc::Layout, ptr::NonNull};
 pub(crate) const MIN_BLOCK_SIZE: usize = 8;
 const MIN_ORDER: usize = MIN_BLOCK_SIZE.trailing_zeros() as usize;
 pub(crate) const ORDER_COUNT: usize = usize::BITS as usize;
-const LINK_BITS: usize = 25;
+// A full 512-MiB kernel zone contains 2^26 minimum-size slots. Links are
+// one-based, so 27 bits are required to represent the final slot as well.
+const LINK_BITS: usize = 27;
 const LINK_MASK: u64 = (1u64 << LINK_BITS) - 1;
 const NEXT_LINK_SHIFT: usize = LINK_BITS;
 const ORDER_SHIFT: usize = LINK_BITS * 2;
@@ -21,10 +23,10 @@ const MAX_LINK: usize = LINK_MASK as usize;
 
 /// Intrusive free-list metadata packed into one minimum-sized block.
 ///
-/// Links are one-based indices of 8-byte slots relative to the shard start;
-/// zero is the null link. A 25-bit link covers 256 MiB, including the shared
-/// high-order arena used by the kernel heap. Six order bits cover every order
-/// on a 64-bit target.
+/// Links are one-based indices of 8-byte slots relative to the zone start;
+/// zero is the null link. A 27-bit link covers the full 512-MiB kernel zone,
+/// including the final one-based slot. Six order bits cover every order on a
+/// 64-bit target.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 struct FreeNode(u64);
