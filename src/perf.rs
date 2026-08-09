@@ -72,6 +72,11 @@ static DCACHE_PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static HEAP_ACTUAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static HEAP_PEAK_ACTUAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static HEAP_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static HEAP_SHARED_ACTUAL_BYTES: AtomicU64 = AtomicU64::new(0);
+static HEAP_SHARED_PEAK_ACTUAL_BYTES: AtomicU64 = AtomicU64::new(0);
+static HEAP_SHARED_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static HEAP_SHARED_SMALL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static HEAP_LARGE_SHARD_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 #[allow(dead_code)]
@@ -389,6 +394,42 @@ pub fn record_heap_actual_transition(before: usize, after: usize) {
     }
 }
 
+/// Track bytes reserved from the shared high-order arena separately from the
+/// aggregate heap gauge. This confirms that costly allocations are isolated
+/// from the per-hart small-object heaps during real workloads.
+#[inline]
+pub fn record_heap_shared_actual_transition(before: usize, after: usize) {
+    if !DEBUG_PERF || before == after {
+        return;
+    }
+    if after > before {
+        let current = HEAP_SHARED_ACTUAL_BYTES
+            .fetch_add((after - before) as u64, Ordering::Relaxed)
+            + (after - before) as u64;
+        HEAP_SHARED_PEAK_ACTUAL_BYTES.fetch_max(current, Ordering::Relaxed);
+    } else {
+        HEAP_SHARED_ACTUAL_BYTES.fetch_sub((before - after) as u64, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_heap_shared_allocation(small_fallback: bool) {
+    if !DEBUG_PERF {
+        return;
+    }
+    HEAP_SHARED_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    if small_fallback {
+        HEAP_SHARED_SMALL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_heap_large_shard_fallback() {
+    if DEBUG_PERF {
+        HEAP_LARGE_SHARD_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[inline]
 pub fn record_heap_allocation_failure() {
     if DEBUG_PERF {
@@ -467,6 +508,11 @@ icache_clean_bypasses: {icache_clean_bypasses}\n"
     let heap_actual_bytes = HEAP_ACTUAL_BYTES.load(Ordering::Relaxed);
     let heap_peak_actual_bytes = HEAP_PEAK_ACTUAL_BYTES.load(Ordering::Relaxed);
     let heap_allocation_failures = HEAP_ALLOCATION_FAILURES.load(Ordering::Relaxed);
+    let heap_shared_actual_bytes = HEAP_SHARED_ACTUAL_BYTES.load(Ordering::Relaxed);
+    let heap_shared_peak_actual_bytes = HEAP_SHARED_PEAK_ACTUAL_BYTES.load(Ordering::Relaxed);
+    let heap_shared_allocations = HEAP_SHARED_ALLOCATIONS.load(Ordering::Relaxed);
+    let heap_shared_small_fallbacks = HEAP_SHARED_SMALL_FALLBACKS.load(Ordering::Relaxed);
+    let heap_large_shard_fallbacks = HEAP_LARGE_SHARD_FALLBACKS.load(Ordering::Relaxed);
     let cache = ext4_fs::cache_diagnostics();
     let cache_hits = cache.hits;
     let cache_misses = cache.misses;
@@ -558,6 +604,11 @@ dcache_peak_entries: {dcache_peak_entries}\n\
 heap_actual_bytes: {heap_actual_bytes}\n\
 heap_peak_actual_bytes: {heap_peak_actual_bytes}\n\
 heap_allocation_failures: {heap_allocation_failures}\n\
+heap_shared_actual_bytes: {heap_shared_actual_bytes}\n\
+heap_shared_peak_actual_bytes: {heap_shared_peak_actual_bytes}\n\
+heap_shared_allocations: {heap_shared_allocations}\n\
+heap_shared_small_fallbacks: {heap_shared_small_fallbacks}\n\
+heap_large_shard_fallbacks: {heap_large_shard_fallbacks}\n\
 ext4_cache_hits: {cache_hits}\n\
 ext4_cache_misses: {cache_misses}\n\
 ext4_cache_hit_pct: {cache_hit_pct}\n\

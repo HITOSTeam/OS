@@ -11,7 +11,7 @@ use core::{alloc::Layout, ptr::NonNull};
 pub(crate) const MIN_BLOCK_SIZE: usize = 8;
 const MIN_ORDER: usize = MIN_BLOCK_SIZE.trailing_zeros() as usize;
 pub(crate) const ORDER_COUNT: usize = usize::BITS as usize;
-const LINK_BITS: usize = 24;
+const LINK_BITS: usize = 25;
 const LINK_MASK: u64 = (1u64 << LINK_BITS) - 1;
 const NEXT_LINK_SHIFT: usize = LINK_BITS;
 const ORDER_SHIFT: usize = LINK_BITS * 2;
@@ -22,9 +22,9 @@ const MAX_LINK: usize = LINK_MASK as usize;
 /// Intrusive free-list metadata packed into one minimum-sized block.
 ///
 /// Links are one-based indices of 8-byte slots relative to the shard start;
-/// zero is the null link. A 24-bit link covers 128 MiB, while the largest
-/// current shard is 64 MiB. Six order bits cover every order on a 64-bit
-/// target.
+/// zero is the null link. A 25-bit link covers 256 MiB, including the shared
+/// high-order arena used by the kernel heap. Six order bits cover every order
+/// on a 64-bit target.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 struct FreeNode(u64);
@@ -660,5 +660,84 @@ mod tests {
             heap.alloc(whole).expect("coalesced after churn"),
             region.ptr
         );
+    }
+
+    #[test]
+    fn shared_high_order_arena_survives_fragmented_local_heaps() {
+        const LOCAL_SIZE: usize = 1 << 20;
+        const SHARED_SIZE: usize = 1 << 21;
+        // Match Linux's largest PCP-eligible order: 32 KiB for 4-KiB pages.
+        const SMALL_BLOCK: usize = 1 << 15;
+        const LARGE_BLOCK: usize = 1 << 18;
+        const LOCAL_COUNT: usize = 4;
+        const LOCAL_BITMAP_WORDS: usize = LOCAL_SIZE / MIN_BLOCK_SIZE / u64::BITS as usize;
+        const SHARED_BITMAP_WORDS: usize = SHARED_SIZE / MIN_BLOCK_SIZE / u64::BITS as usize;
+
+        let local_regions =
+            core::array::from_fn::<_, LOCAL_COUNT, _>(|_| TestRegion::new(LOCAL_SIZE, LOCAL_SIZE));
+        let shared_region = TestRegion::new(SHARED_SIZE, SHARED_SIZE);
+        let mut local_heaps = core::array::from_fn::<_, LOCAL_COUNT, _>(|index| {
+            let mut heap = BuddyHeap::<LOCAL_BITMAP_WORDS>::new();
+            // SAFETY: every test region is disjoint and remains alive for the
+            // whole test.
+            unsafe {
+                heap.init(local_regions[index].ptr.as_ptr() as usize, LOCAL_SIZE);
+            }
+            heap
+        });
+        let mut shared_heap = BuddyHeap::<SHARED_BITMAP_WORDS>::new();
+        // SAFETY: the shared test region is disjoint and remains alive.
+        unsafe {
+            shared_heap.init(shared_region.ptr.as_ptr() as usize, SHARED_SIZE);
+        }
+
+        let small = Layout::from_size_align(SMALL_BLOCK, SMALL_BLOCK).expect("small layout");
+        let large = Layout::from_size_align(LARGE_BLOCK, LARGE_BLOCK).expect("large layout");
+        let mut local_allocations = core::array::from_fn::<_, LOCAL_COUNT, _>(|_| Vec::new());
+        for (heap, allocations) in local_heaps.iter_mut().zip(local_allocations.iter_mut()) {
+            while let Ok(allocation) = heap.alloc(small) {
+                allocations.push(allocation);
+            }
+            assert_eq!(allocations.len(), LOCAL_SIZE / SMALL_BLOCK);
+            for index in (0..allocations.len()).step_by(2) {
+                // SAFETY: alternating live allocations are returned exactly
+                // once, leaving isolated 64-KiB holes between live blocks.
+                unsafe {
+                    heap.dealloc(allocations[index], small);
+                }
+            }
+        }
+
+        let aggregate_local_free = LOCAL_COUNT * LOCAL_SIZE / 2;
+        assert!(aggregate_local_free >= SHARED_SIZE);
+        assert!(
+            local_heaps
+                .iter_mut()
+                .all(|heap| heap.alloc(large).is_err())
+        );
+
+        let allocation = shared_heap
+            .alloc(large)
+            .expect("shared arena must preserve a high-order block");
+        assert_eq!(allocation.as_ptr() as usize % LARGE_BLOCK, 0);
+        // SAFETY: this is the live shared-arena allocation.
+        unsafe {
+            shared_heap.dealloc(allocation, large);
+        }
+
+        for (heap, allocations) in local_heaps.iter_mut().zip(local_allocations) {
+            for (index, allocation) in allocations.into_iter().enumerate() {
+                if index % 2 == 0 {
+                    continue;
+                }
+                // SAFETY: every remaining local allocation is live and is
+                // returned exactly once with its original layout.
+                unsafe {
+                    heap.dealloc(allocation, small);
+                }
+            }
+            assert_eq!(heap.stats_alloc_actual(), 0);
+        }
+        assert_eq!(shared_heap.stats_alloc_actual(), 0);
     }
 }
