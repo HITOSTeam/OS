@@ -9,9 +9,7 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, PageTable, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
-use crate::task::block_sleep::{
-    check_timer, take_deferred_kernel_timer_tick, timer_work_pending_for_user_return,
-};
+use crate::task::block_sleep::check_timer;
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
@@ -348,40 +346,7 @@ pub fn trap_handler() {
         }
     }
 
-    if let Some((errno, msg)) = check_if_current_signals_error() {
-        crate::task::signal::log_signal_exit(msg);
-        exit_group_and_run_next(errno);
-    }
-    // Progress timers even if S-mode timer interrupts are deferred during syscalls.
-    // When a tick did arrive in kernel mode, mirror the user-mode timer interrupt
-    // scheduler work before returning: charge runtime, process RT bandwidth/fair
-    // deadline expiry, and reschedule if needed.  This is the local equivalent of
-    // Linux's scheduler_tick() setting TIF_NEED_RESCHED for syscall-heavy tasks.
-    let deferred_scheduler_tick = take_deferred_kernel_timer_tick();
-    let timer_work_pending = timer_work_pending_for_user_return();
-    if deferred_scheduler_tick || timer_work_pending {
-        check_timer();
-    }
-    if deferred_scheduler_tick {
-        crate::task::processor::account_current_task_tick();
-        crate::syscall::misc::check_current_rlimit_cpu();
-        if let Some((errno, msg)) = check_if_current_signals_error() {
-            crate::task::signal::log_signal_exit(msg);
-            exit_group_and_run_next(errno);
-        }
-        crate::fs::cgroup_maybe_block_current();
-        if crate::task::processor::should_preempt_current_on_tick() {
-            suspend_current_and_run_next();
-        }
-    }
-    crate::syscall::signal::maybe_deliver_signal();
-    crate::fs::cgroup_maybe_block_current();
-    if syscall_return && crate::task::processor::should_preempt_current_on_syscall_return() {
-        suspend_current_and_run_next();
-    }
-    // 返回用户态前的抢占点：消费本 hart 的 NEED_RESCHED，让刚唤醒的高优先级
-    // 任务尽快运行（见 processor::reschedule_before_user_return_if_needed）。
-    crate::task::processor::reschedule_before_user_return_if_needed();
+    crate::trap::exit_to_user_mode_loop(syscall_return);
     trap_return();
 }
 

@@ -9,9 +9,7 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
-use crate::task::block_sleep::{
-    check_timer, take_deferred_kernel_timer_tick, timer_work_pending_for_user_return,
-};
+use crate::task::block_sleep::check_timer;
 use crate::task::processor::{
     exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
 };
@@ -422,39 +420,7 @@ pub fn trap_handler() {
         super::super::disable_interrupts();
     }
 
-    if let Some((errno, msg)) = check_if_current_signals_error() {
-        crate::task::signal::log_signal_exit(msg);
-        exit_group_and_run_next(errno);
-    }
-    let deferred_scheduler_tick = take_deferred_kernel_timer_tick();
-    if deferred_scheduler_tick || timer_work_pending_for_user_return() {
-        check_timer();
-        crate::task::processor::account_current_task_tick();
-        crate::syscall::misc::check_current_rlimit_cpu();
-        if crate::task::processor::should_preempt_current_on_tick() {
-            suspend_current_and_run_next();
-        }
-    }
-    if deferred_scheduler_tick {
-        crate::task::processor::account_current_task_tick();
-        crate::syscall::misc::check_current_rlimit_cpu();
-        if let Some((errno, msg)) = check_if_current_signals_error() {
-            crate::task::signal::log_signal_exit(msg);
-            exit_group_and_run_next(errno);
-        }
-        crate::fs::cgroup_maybe_block_current();
-        if crate::task::processor::should_preempt_current_on_tick() {
-            suspend_current_and_run_next();
-        }
-    }
-    crate::syscall::signal::maybe_deliver_signal();
-    crate::fs::cgroup_maybe_block_current();
-    if syscall_return && crate::task::processor::should_preempt_current_on_syscall_return() {
-        suspend_current_and_run_next();
-    }
-    // 返回用户态前的抢占点：消费本 hart 的 NEED_RESCHED，让刚唤醒的高优先级
-    // 任务尽快运行（见 processor::reschedule_before_user_return_if_needed）。
-    crate::task::processor::reschedule_before_user_return_if_needed();
+    crate::trap::exit_to_user_mode_loop(syscall_return);
     trap_return();
 }
 pub fn trap_return() -> ! {
