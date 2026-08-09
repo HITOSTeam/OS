@@ -1,6 +1,6 @@
 use super::backing::{
-    FilePageCacheLoadError, file_page_cache_get_or_load, shared_anon_page_cache_get,
-    shared_anon_page_cache_insert_or_get,
+    FilePageCacheLoadError, FilePageCachePage, file_page_cache_get_or_load,
+    shared_anon_page_cache_get, shared_anon_page_cache_insert_or_get,
 };
 #[cfg(target_arch = "riscv64")]
 use super::publish_executable_user_pte;
@@ -10,10 +10,19 @@ use super::{
 };
 use crate::config::{PAGE_SIZE, USER_STACK_GUARD_GAP};
 use crate::fs::{OSInode, cgroup_charge_anon_current};
-use crate::mm::{FrameTracker, PTEFlags, PageTableEntry, VirtAddr, VirtPageNum, frame_alloc};
+use crate::mm::{
+    FrameTracker, PTEFlags, PageTableEntry, PageWalkCache, VirtAddr, VirtPageNum, frame_alloc,
+};
 use crate::task::processor::current_process;
 
 const FAULT_FAST_RETRIES: usize = 3;
+/// Linux defaults `fault_around_bytes` to 64 KiB and maps only already-ready
+/// folios.  Keep the first implementation at the same 16 base pages.
+const FILE_FAULT_AROUND_PAGES: usize = 16;
+/// Both supported architectures use a 512-entry final-level page table.
+const PTE_LEAF_PAGES: usize = 512;
+const _: () = assert!(FILE_FAULT_AROUND_PAGES.is_power_of_two());
+const _: () = assert!(FILE_FAULT_AROUND_PAGES <= PTE_LEAF_PAGES);
 
 struct CowFaultPlan {
     vpn: VirtPageNum,
@@ -35,6 +44,8 @@ enum CowFaultCommit {
 
 struct LazyFaultPlan {
     vpn: VirtPageNum,
+    area_start_vpn: VirtPageNum,
+    area_end_vpn: VirtPageNum,
     region: VmRegion,
     perm: MapPermission,
     pte_flags: PTEFlags,
@@ -45,6 +56,47 @@ struct LazyFaultPlan {
     shared_anon_backed: bool,
     file: Option<alloc::sync::Arc<dyn crate::fs::File + Send + Sync>>,
     file_off: usize,
+}
+
+struct FileFaultReadyPage {
+    vpn: VirtPageNum,
+    file_page: usize,
+    frame: FrameTracker,
+}
+
+/// Stack-resident ready-page batch.  Avoiding a `Vec` here matters because the
+/// purpose of fault-around is to remove per-page slab/BTree work, not replace
+/// it with one heap allocation per hardware fault.
+struct FileFaultReadyBatch {
+    pages: [Option<FileFaultReadyPage>; FILE_FAULT_AROUND_PAGES],
+    len: usize,
+}
+
+impl FileFaultReadyBatch {
+    fn new() -> Self {
+        Self {
+            pages: [const { None }; FILE_FAULT_AROUND_PAGES],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, page: FileFaultReadyPage) {
+        debug_assert!(self.len < self.pages.len());
+        if self.len < self.pages.len() {
+            self.pages[self.len] = Some(page);
+            self.len += 1;
+        }
+    }
+
+    fn get(&self, index: usize) -> &FileFaultReadyPage {
+        self.pages[index]
+            .as_ref()
+            .expect("ready fault batch has a dense initialized prefix")
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 enum LazyFaultPrepare {
@@ -78,6 +130,71 @@ fn private_file_cache_pte_flags(region: &VmRegion, mut flags: PTEFlags) -> (PTEF
         flags.insert(PTEFlags::COW);
     }
     (flags, private_file_cow)
+}
+
+/// Build a Linux-style ready-only fault-around batch for one regular-file
+/// fault.  The current page is always first so a page-table allocation failure
+/// cannot leave only speculative neighbours installed.
+fn prepare_file_fault_ready_batch(
+    plan: &LazyFaultPlan,
+    access: MapPermission,
+    cached: &FilePageCachePage,
+) -> FileFaultReadyBatch {
+    let current_file_page = plan
+        .file_page
+        .expect("inode-backed lazy fault must carry a file-page index");
+    let mut batch = FileFaultReadyBatch::new();
+    batch.push(FileFaultReadyPage {
+        vpn: plan.vpn,
+        file_page: current_file_page,
+        frame: cached.frame().clone(),
+    });
+
+    // Linux invokes map_pages() only for read faults.  Store faults can need
+    // private COW or dirty accounting, so keep their first implementation on
+    // the existing single-page path.
+    if access.contains(MapPermission::W) {
+        return batch;
+    }
+
+    let aligned_start = plan.vpn.0 & !(FILE_FAULT_AROUND_PAGES - 1);
+    let leaf_start = plan.vpn.0 & !(PTE_LEAF_PAGES - 1);
+    let region_start = VirtAddr::from(plan.region.start).floor().0;
+    let valid_end = plan.region.end().min(plan.region.sigbus_start());
+    let region_end = VirtAddr::from(valid_end).ceil().0;
+    let start_vpn = aligned_start
+        .max(leaf_start)
+        .max(region_start)
+        .max(plan.area_start_vpn.0);
+    let end_vpn = aligned_start
+        .saturating_add(FILE_FAULT_AROUND_PAGES)
+        .min(leaf_start.saturating_add(PTE_LEAF_PAGES))
+        .min(region_end)
+        .min(plan.area_end_vpn.0);
+    let preceding_pages = plan.vpn.0.saturating_sub(start_vpn);
+    let Some(start_file_page) = current_file_page.checked_sub(preceding_pages) else {
+        return batch;
+    };
+    let window_pages = end_vpn.saturating_sub(start_vpn);
+    if window_pages <= 1 {
+        return batch;
+    }
+    let end_file_page = start_file_page.saturating_add(window_pages);
+    cached.for_each_ready_page(start_file_page, end_file_page, |file_page, frame| {
+        if file_page == current_file_page {
+            return;
+        }
+        let vpn_delta = file_page.saturating_sub(start_file_page);
+        if vpn_delta < window_pages {
+            batch.push(FileFaultReadyPage {
+                vpn: VirtPageNum(start_vpn.saturating_add(vpn_delta)),
+                file_page,
+                frame: frame.clone(),
+            });
+        }
+    });
+    crate::perf::record_file_fault_around(window_pages, batch.len());
+    batch
 }
 
 impl MemorySet {
@@ -329,6 +446,8 @@ impl MemorySet {
         let file_off = region.file_offset.saturating_add(region_delta);
         LazyFaultPrepare::Ready(LazyFaultPlan {
             vpn,
+            area_start_vpn: area.start_vpn(),
+            area_end_vpn: area.end_vpn(),
             region,
             perm,
             pte_flags,
@@ -348,6 +467,7 @@ impl MemorySet {
         access: MapPermission,
         plan: &LazyFaultPlan,
         candidate: &FrameTracker,
+        file_batch: Option<&FileFaultReadyBatch>,
         pid: usize,
     ) -> LazyFaultCommit {
         let Some(region) = self.vm_region_containing_addr(fault_va) else {
@@ -388,6 +508,11 @@ impl MemorySet {
             &region,
             &self.areas[area_idx]
         ));
+        if self.areas[area_idx].start_vpn() != plan.area_start_vpn
+            || self.areas[area_idx].end_vpn() != plan.area_end_vpn
+        {
+            return LazyFaultCommit::Retry;
+        }
 
         let total_pages = self.areas[area_idx].page_count();
         let accounted_pages = self.areas[area_idx].charged_or_tracked_pages();
@@ -403,6 +528,110 @@ impl MemorySet {
             }
             self.areas[area_idx]
                 .set_charged_pages(accounted_pages.saturating_add(new_charge_pages));
+        }
+
+        if let Some(file_batch) = file_batch {
+            debug_assert!(file_batch.len() > 0);
+            debug_assert_eq!(file_batch.get(0).vpn, plan.vpn);
+            let mut walk = PageWalkCache::new();
+            let mut installed = 0usize;
+
+            for index in 0..file_batch.len() {
+                let ready = file_batch.get(index);
+                debug_assert!(self.areas[area_idx].contains_vpn(ready.vpn));
+                if self
+                    .page_table
+                    .translate_cached(ready.vpn, &mut walk)
+                    .is_some_and(|pte| pte.is_valid())
+                {
+                    continue;
+                }
+
+                if index == 0 {
+                    #[cfg(target_arch = "riscv64")]
+                    let mapped = if plan.pte_flags.contains(PTEFlags::X) {
+                        publish_executable_user_pte(Some(&ready.frame), self.asid.as_ref(), || {
+                            self.page_table.try_map_cached(
+                                ready.vpn,
+                                ready.frame.ppn,
+                                plan.pte_flags,
+                                &mut walk,
+                            )
+                        })
+                    } else {
+                        self.page_table.try_map_cached(
+                            ready.vpn,
+                            ready.frame.ppn,
+                            plan.pte_flags,
+                            &mut walk,
+                        )
+                    };
+                    #[cfg(not(target_arch = "riscv64"))]
+                    let mapped = self.page_table.try_map_cached(
+                        ready.vpn,
+                        ready.frame.ppn,
+                        plan.pte_flags,
+                        &mut walk,
+                    );
+                    if !mapped {
+                        return LazyFaultCommit::Oom;
+                    }
+                } else {
+                    // All pages are constrained to one leaf PTE table.  The
+                    // current page above has therefore allocated every upper
+                    // level needed by the speculative neighbours.
+                    #[cfg(target_arch = "riscv64")]
+                    if plan.pte_flags.contains(PTEFlags::X) {
+                        publish_executable_user_pte(Some(&ready.frame), self.asid.as_ref(), || {
+                            self.page_table.map_cached(
+                                ready.vpn,
+                                ready.frame.ppn,
+                                plan.pte_flags,
+                                &mut walk,
+                            )
+                        });
+                    } else {
+                        self.page_table.map_cached(
+                            ready.vpn,
+                            ready.frame.ppn,
+                            plan.pte_flags,
+                            &mut walk,
+                        );
+                    }
+                    #[cfg(not(target_arch = "riscv64"))]
+                    self.page_table.map_cached(
+                        ready.vpn,
+                        ready.frame.ppn,
+                        plan.pte_flags,
+                        &mut walk,
+                    );
+                }
+
+                self.areas[area_idx].insert_tracked_frame(ready.vpn, ready.frame.clone());
+                if region.shared
+                    && let Some(backing) = self.mmap_backings.get_mut(&region.backing_id)
+                {
+                    backing.add_resident_page_ref(
+                        ready.file_page,
+                        Some(&ready.frame),
+                        plan.pte_flags.contains(PTEFlags::D),
+                    );
+                }
+                let mapped_va = ready.vpn.0.saturating_mul(PAGE_SIZE);
+                #[cfg(target_arch = "riscv64")]
+                crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(
+                    self.asid.as_ref(),
+                    mapped_va,
+                );
+                #[cfg(target_arch = "loongarch64")]
+                crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(
+                    self.asid.as_ref(),
+                    mapped_va,
+                );
+                installed = installed.saturating_add(1);
+            }
+            crate::perf::record_file_fault_ptes_mapped(installed);
+            return LazyFaultCommit::Installed;
         }
 
         // Shared-anonymous cache arbitration is intentionally delayed until
@@ -521,6 +750,7 @@ impl MmRef {
     ) -> LazyFaultResult {
         let mut retries = 0usize;
         let mut slow_guard = None;
+        let mut recorded_file_fault = false;
         loop {
             let plan =
                 match self.lock().prepare_lazy_fault(fault_va, access) {
@@ -548,7 +778,7 @@ impl MmRef {
             // Consult shared caches without nesting them under the mm lock.
             // Regular-file pages use a locked/loading cache slot so only one
             // concurrent fault performs filesystem I/O.
-            let file_cache_frame = if plan.inode_backed {
+            let file_cache_page = if plan.inode_backed {
                 let Some(file_page) = plan.file_page else {
                     return LazyFaultResult::Invalid;
                 };
@@ -570,7 +800,13 @@ impl MmRef {
                         let _ = os_inode.pread_at(plan.file_off, page);
                     },
                 ) {
-                    Ok(frame) => Some(frame),
+                    Ok(page) => {
+                        if !recorded_file_fault {
+                            crate::perf::record_file_fault(page.cache_hit());
+                            recorded_file_fault = true;
+                        }
+                        Some(page)
+                    }
                     Err(FilePageCacheLoadError::Oom) => return LazyFaultResult::Oom,
                     Err(FilePageCacheLoadError::Invalidated) => {
                         retries = retries.saturating_add(1);
@@ -583,11 +819,14 @@ impl MmRef {
             } else {
                 None
             };
+            let file_batch = file_cache_page
+                .as_ref()
+                .map(|page| prepare_file_fault_ready_batch(&plan, access, page));
             let cached_frame = if plan.shared_anon_backed {
                 plan.anon_page
                     .and_then(|page| shared_anon_page_cache_get(plan.region.anon_shared_id, page))
             } else {
-                file_cache_frame
+                file_cache_page.as_ref().map(|page| page.frame().clone())
             };
 
             let (frame, needs_file_fill) = if let Some(frame) = cached_frame {
@@ -602,9 +841,14 @@ impl MmRef {
 
             debug_assert!(!needs_file_fill || !plan.region.file_backed);
 
-            let commit = self
-                .lock()
-                .commit_lazy_fault(fault_va, access, &plan, &frame, charge_pid);
+            let commit = self.lock().commit_lazy_fault(
+                fault_va,
+                access,
+                &plan,
+                &frame,
+                file_batch.as_ref(),
+                charge_pid,
+            );
             match commit {
                 LazyFaultCommit::Installed => {
                     // A write fault on a clean MAP_PRIVATE file page follows

@@ -77,6 +77,51 @@ impl FilePageCacheMapping {
     }
 }
 
+/// One pinned regular-file cache page together with its inode-local index.
+///
+/// Keeping the mapping handle returned by the lookup lets fault-around scan
+/// nearby Ready pages without resolving `(dev, ino)` through the global
+/// mapping tree a second time.  The handle is short-lived and does not retain
+/// any page by itself.
+pub(super) struct FilePageCachePage {
+    frame: FrameTracker,
+    mapping: Arc<FilePageCacheMapping>,
+    cache_hit: bool,
+}
+
+impl FilePageCachePage {
+    pub(super) fn frame(&self) -> &FrameTracker {
+        &self.frame
+    }
+
+    pub(super) fn cache_hit(&self) -> bool {
+        self.cache_hit
+    }
+
+    /// Pin all already-published pages in `[start_page, end_page)`.
+    ///
+    /// This is the small-kernel equivalent of Linux
+    /// `filemap_map_pages()` walking only uptodate, unlocked folios.  Loading
+    /// slots are deliberately skipped: fault-around must never start or wait
+    /// for additional I/O.
+    pub(super) fn for_each_ready_page(
+        &self,
+        start_page: usize,
+        end_page: usize,
+        mut visit: impl FnMut(usize, &FrameTracker),
+    ) {
+        if start_page >= end_page {
+            return;
+        }
+        let pages = self.mapping.pages.lock();
+        for (&page, slot) in pages.range(start_page..end_page) {
+            if let FilePageCacheSlot::Ready(frame) = slot {
+                visit(page, frame);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FilePageCacheLoadError {
     Oom,
@@ -172,7 +217,7 @@ pub(super) fn file_page_cache_get_or_load<F>(
     ino: u32,
     file_page: usize,
     fill: F,
-) -> Result<FrameTracker, FilePageCacheLoadError>
+) -> Result<FilePageCachePage, FilePageCacheLoadError>
 where
     F: FnOnce(&mut [u8]),
 {
@@ -185,7 +230,13 @@ where
         let loading = {
             let cache = mapping.pages.lock();
             match cache.get(&file_page) {
-                Some(FilePageCacheSlot::Ready(frame)) => return Ok(frame.clone()),
+                Some(FilePageCacheSlot::Ready(frame)) => {
+                    return Ok(FilePageCachePage {
+                        frame: frame.clone(),
+                        mapping: Arc::clone(&mapping),
+                        cache_hit: true,
+                    });
+                }
                 Some(FilePageCacheSlot::Loading { state, .. }) => Some(Arc::clone(state)),
                 None if must_observe_published => {
                     return Err(FilePageCacheLoadError::Invalidated);
@@ -210,7 +261,13 @@ where
         let competing_load = {
             let mut cache = mapping.pages.lock();
             match cache.get(&file_page) {
-                Some(FilePageCacheSlot::Ready(frame)) => return Ok(frame.clone()),
+                Some(FilePageCacheSlot::Ready(frame)) => {
+                    return Ok(FilePageCachePage {
+                        frame: frame.clone(),
+                        mapping: Arc::clone(&mapping),
+                        cache_hit: true,
+                    });
+                }
                 Some(FilePageCacheSlot::Loading { state, .. }) => Some(Arc::clone(state)),
                 None => {
                     cache.insert(
@@ -254,7 +311,11 @@ where
         };
         if published {
             state.finish(FILE_PAGE_READY);
-            return Ok(candidate);
+            return Ok(FilePageCachePage {
+                frame: candidate,
+                mapping,
+                cache_hit: false,
+            });
         }
 
         // truncate removed the loading slot while filesystem I/O was in

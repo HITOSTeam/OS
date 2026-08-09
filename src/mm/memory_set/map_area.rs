@@ -182,6 +182,7 @@ impl MapArea {
     }
 
     pub(super) fn insert_tracked_frame(&mut self, vpn: VirtPageNum, frame: FrameTracker) {
+        crate::perf::record_mm_data_frame_insert();
         self.data_frames.insert(vpn, frame);
     }
 

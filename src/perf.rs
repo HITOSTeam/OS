@@ -57,6 +57,15 @@ static ICACHE_CLEAN_MISSES: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "riscv64")]
 static ICACHE_CLEAN_BYPASSES: AtomicU64 = AtomicU64::new(0);
 
+static FILE_FAULT_EVENTS: AtomicU64 = AtomicU64::new(0);
+static FILE_FAULT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static FILE_FAULT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static FILE_FAULT_AROUND_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static FILE_FAULT_AROUND_WINDOW_PAGES: AtomicU64 = AtomicU64::new(0);
+static FILE_FAULT_AROUND_READY_PAGES: AtomicU64 = AtomicU64::new(0);
+static FILE_FAULT_PTES_MAPPED: AtomicU64 = AtomicU64::new(0);
+static MM_DATA_FRAME_INSERTS: AtomicU64 = AtomicU64::new(0);
+
 static DCACHE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 static DCACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static DCACHE_REVALIDATED_HITS: AtomicU64 = AtomicU64::new(0);
@@ -305,6 +314,43 @@ pub fn record_icache_clean_bypass() {
 }
 
 #[inline]
+pub fn record_file_fault(cache_hit: bool) {
+    if !DEBUG_PERF {
+        return;
+    }
+    FILE_FAULT_EVENTS.fetch_add(1, Ordering::Relaxed);
+    if cache_hit {
+        FILE_FAULT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FILE_FAULT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_file_fault_around(window_pages: usize, ready_pages: usize) {
+    if !DEBUG_PERF {
+        return;
+    }
+    FILE_FAULT_AROUND_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    FILE_FAULT_AROUND_WINDOW_PAGES.fetch_add(window_pages as u64, Ordering::Relaxed);
+    FILE_FAULT_AROUND_READY_PAGES.fetch_add(ready_pages as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_file_fault_ptes_mapped(pages: usize) {
+    if DEBUG_PERF && pages != 0 {
+        FILE_FAULT_PTES_MAPPED.fetch_add(pages as u64, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn record_mm_data_frame_insert() {
+    if DEBUG_PERF {
+        MM_DATA_FRAME_INSERTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
 pub fn record_dcache_lookup() {
     if DEBUG_PERF {
         DCACHE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
@@ -494,6 +540,14 @@ icache_clean_bypasses: {icache_clean_bypasses}\n"
     };
     #[cfg(not(target_arch = "riscv64"))]
     let icache_clean = "";
+    let file_fault_events = FILE_FAULT_EVENTS.load(Ordering::Relaxed);
+    let file_fault_cache_hits = FILE_FAULT_CACHE_HITS.load(Ordering::Relaxed);
+    let file_fault_cache_misses = FILE_FAULT_CACHE_MISSES.load(Ordering::Relaxed);
+    let file_fault_around_attempts = FILE_FAULT_AROUND_ATTEMPTS.load(Ordering::Relaxed);
+    let file_fault_around_window_pages = FILE_FAULT_AROUND_WINDOW_PAGES.load(Ordering::Relaxed);
+    let file_fault_around_ready_pages = FILE_FAULT_AROUND_READY_PAGES.load(Ordering::Relaxed);
+    let file_fault_ptes_mapped = FILE_FAULT_PTES_MAPPED.load(Ordering::Relaxed);
+    let mm_data_frame_inserts = MM_DATA_FRAME_INSERTS.load(Ordering::Relaxed);
     let dcache_lookups = DCACHE_LOOKUPS.load(Ordering::Relaxed);
     let dcache_hits = DCACHE_HITS.load(Ordering::Relaxed);
     let dcache_revalidated_hits = DCACHE_REVALIDATED_HITS.load(Ordering::Relaxed);
@@ -590,6 +644,14 @@ icache_deferred_fences: {icache_deferred_fences}\n\
 icache_remote_fences: {icache_remote_fences}\n\
 icache_remote_targets: {icache_remote_targets}\n\
 {icache_clean}\
+file_fault_events: {file_fault_events}\n\
+file_fault_cache_hits: {file_fault_cache_hits}\n\
+file_fault_cache_misses: {file_fault_cache_misses}\n\
+file_fault_around_attempts: {file_fault_around_attempts}\n\
+file_fault_around_window_pages: {file_fault_around_window_pages}\n\
+file_fault_around_ready_pages: {file_fault_around_ready_pages}\n\
+file_fault_ptes_mapped: {file_fault_ptes_mapped}\n\
+mm_data_frame_inserts: {mm_data_frame_inserts}\n\
 dcache_lookups: {dcache_lookups}\n\
 dcache_hits: {dcache_hits}\n\
 dcache_revalidated_hits: {dcache_revalidated_hits}\n\
