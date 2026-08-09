@@ -5,8 +5,8 @@ use super::backing::{
 #[cfg(target_arch = "riscv64")]
 use super::publish_executable_user_pte;
 use super::{
-    LazyFaultResult, MapPermission, MapType, MemorySet, MmRef, PageTableUpdateBatch, VmRegion,
-    vm_region_map_area_type_compatible,
+    LazyFaultResult, MapPermission, MapType, MemorySet, MmRef, NewPtePublicationBatch,
+    PageTableUpdateBatch, VmRegion, vm_region_map_area_type_compatible,
 };
 use crate::config::{PAGE_SIZE, USER_STACK_GUARD_GAP};
 use crate::fs::{OSInode, cgroup_charge_anon_current};
@@ -535,6 +535,7 @@ impl MemorySet {
             debug_assert_eq!(file_batch.get(0).vpn, plan.vpn);
             let mut walk = PageWalkCache::new();
             let mut installed = 0usize;
+            let mut publication = NewPtePublicationBatch::new(self.asid.as_ref());
 
             for index in 0..file_batch.len() {
                 let ready = file_batch.get(index);
@@ -618,18 +619,10 @@ impl MemorySet {
                     );
                 }
                 let mapped_va = ready.vpn.0.saturating_mul(PAGE_SIZE);
-                #[cfg(target_arch = "riscv64")]
-                crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(
-                    self.asid.as_ref(),
-                    mapped_va,
-                );
-                #[cfg(target_arch = "loongarch64")]
-                crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(
-                    self.asid.as_ref(),
-                    mapped_va,
-                );
+                publication.record_page(mapped_va);
                 installed = installed.saturating_add(1);
             }
+            publication.commit();
             crate::perf::record_file_fault_ptes_mapped(installed);
             return LazyFaultCommit::Installed;
         }
@@ -672,10 +665,9 @@ impl MemorySet {
                 );
             }
         }
-        #[cfg(target_arch = "riscv64")]
-        crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va);
-        #[cfg(target_arch = "loongarch64")]
-        crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), fault_va);
+        let mut publication = NewPtePublicationBatch::new(self.asid.as_ref());
+        publication.record_page(fault_va);
+        publication.commit();
         LazyFaultCommit::Installed
     }
 }

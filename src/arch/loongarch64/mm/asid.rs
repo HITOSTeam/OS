@@ -491,7 +491,10 @@ pub fn flush_user_range(ctx: &Arc<AsidContext>, start: usize, end: usize) {
 /// is valid.  Scope that invalidation to this mm's current-hart ASID and pair.
 /// Existing-PTE replacement, permission demotion, unmap, and supervisor-only
 /// trap-context publication continue to use the synchronous mm-wide batch.
-pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
+pub(crate) fn update_mmu_cache_for_new_pte_range(ctx: &AsidContext, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
     let hart_id = super::super::hart_id();
     if hart_id >= MAX_HARTS {
         return;
@@ -505,15 +508,22 @@ pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
         return;
     }
 
-    // Publish the PTE before invalidating a possibly cached invalid half, then
-    // keep the invalidation ordered before the subsequent return to userspace.
+    // Publish every PTE before invalidating possibly cached invalid halves,
+    // then keep the batched invalidation ordered before user return. One
+    // LoongArch TLB entry covers an even/odd 8-KiB pair; the range helper
+    // aligns once and visits each affected pair exactly once.
     full_memory_barrier();
-    local_flush_tlb_range(
-        context_asid(context),
-        vaddr,
-        vaddr.saturating_add(PAGE_SIZE),
+    let aligned_start = start & !(TLB_PAIR_SIZE - 1);
+    let aligned_end = end.saturating_add(TLB_PAIR_SIZE - 1) & !(TLB_PAIR_SIZE - 1);
+    crate::perf::record_tlb_new_pte_pairs(
+        aligned_end.saturating_sub(aligned_start) / TLB_PAIR_SIZE,
     );
+    local_flush_tlb_range(context_asid(context), start, end);
     full_memory_barrier();
+}
+
+pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
+    update_mmu_cache_for_new_pte_range(ctx, vaddr, vaddr.saturating_add(PAGE_SIZE));
 }
 
 #[inline(always)]

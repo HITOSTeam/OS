@@ -204,28 +204,16 @@ impl MmRef {
         crate::arch::riscv64::mm::prepare_user_satp(&self.asid, self.token)
     }
 
-    #[cfg(target_arch = "loongarch64")]
     pub(super) fn flush_user_page(&self, va: usize) {
-        crate::arch::loongarch64::mm::flush_user_page(&self.asid, va);
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    pub(super) fn flush_user_page(&self, va: usize) {
-        crate::arch::riscv64::mm::flush_user_page(&self.asid, va);
+        crate::arch::flush_user_page(&self.asid, va);
     }
 
     /// Refresh a spurious missing-page fault after another thread published
     /// the formerly absent PTE.  Both architectures mirror Linux
     /// update_mmu_cache(): only the faulting hart can retain a recoverable
     /// invalid translation, so no cross-hart shootdown is required.
-    #[cfg(target_arch = "loongarch64")]
     pub(super) fn refresh_new_pte_fault(&self, va: usize) {
-        crate::arch::loongarch64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), va);
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    pub(super) fn refresh_new_pte_fault(&self, va: usize) {
-        crate::arch::riscv64::mm::update_mmu_cache_for_new_pte(self.asid.as_ref(), va);
+        crate::arch::update_mmu_cache_for_new_pte(self.asid.as_ref(), va);
     }
 
     #[cfg(target_arch = "riscv64")]

@@ -591,7 +591,10 @@ pub fn flush_user_range(ctx: &Arc<AsidContext>, start: usize, end: usize) {
 /// replacement, permission changes, and unmap continue to use the synchronous
 /// mm-wide invalidation paths. Executable publication still performs its
 /// separate instruction-cache synchronization before publishing the PTE.
-pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
+pub(crate) fn update_mmu_cache_for_new_pte_range(ctx: &AsidContext, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
     let hart_id = super::super::hart_id();
     if hart_id >= MAX_HARTS {
         return;
@@ -616,11 +619,11 @@ pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
     // own possible invalid-entry cache after observing the published leaf.
     page_table_write_barrier();
     crate::perf::record_tlb_new_pte_refresh(false);
-    local_flush_range(
-        Some(context_asid(context)),
-        vaddr,
-        vaddr.saturating_add(PAGE_SIZE),
-    );
+    local_flush_range(Some(context_asid(context)), start, end);
+}
+
+pub(crate) fn update_mmu_cache_for_new_pte(ctx: &AsidContext, vaddr: usize) {
+    update_mmu_cache_for_new_pte_range(ctx, vaddr, vaddr.saturating_add(PAGE_SIZE));
 }
 
 pub fn mark_icache_stale(ctx: &AsidContext) {

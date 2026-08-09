@@ -14,10 +14,7 @@ use super::{FrameTracker, UserBuffer, UserBufferSegment, frame_alloc, try_copy_t
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-#[cfg(target_arch = "loongarch64")]
-use crate::arch::loongarch64::mm::{AsidContext, UserTlbInvalidationBatch};
-#[cfg(target_arch = "riscv64")]
-use crate::arch::riscv64::mm::{AsidContext, UserTlbInvalidationBatch};
+use crate::arch::{AsidContext, UserTlbInvalidationBatch};
 #[cfg(target_arch = "riscv64")]
 use crate::config::{KERNEL_MMIO_WINDOW_BASE, KERNEL_MMIO_WINDOW_SIZE, mmio_va};
 #[cfg(target_arch = "riscv64")]
@@ -91,14 +88,68 @@ pub(super) struct PageTableUpdateBatch {
     icache_stale: bool,
 }
 
+/// Architecture-neutral publication transaction for leaf PTEs that changed
+/// from non-present to present.
+///
+/// Unlike replacement/unmap, this transition never starts an mm-wide TLB
+/// invalidation or waits for remote harts. A racing remote hart can take a
+/// harmless spurious missing-page fault and refresh its own translation. The
+/// local architecture hook is invoked once after all PTE stores, mirroring
+/// Linux `update_mmu_cache_range()`.
+pub(super) struct NewPtePublicationBatch<'a> {
+    asid: &'a AsidContext,
+    start: usize,
+    end: usize,
+    installed_pages: usize,
+    committed: bool,
+}
+
+impl<'a> NewPtePublicationBatch<'a> {
+    pub(super) fn new(asid: &'a AsidContext) -> Self {
+        Self {
+            asid,
+            start: usize::MAX,
+            end: 0,
+            installed_pages: 0,
+            committed: false,
+        }
+    }
+
+    pub(super) fn record_page(&mut self, vaddr: usize) {
+        let start = vaddr & !(PAGE_SIZE - 1);
+        self.start = self.start.min(start);
+        self.end = self.end.max(start.saturating_add(PAGE_SIZE));
+        self.installed_pages = self.installed_pages.saturating_add(1);
+    }
+
+    fn finish(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.installed_pages != 0 && self.start < self.end {
+            let range_pages = self.end.saturating_sub(self.start) / PAGE_SIZE;
+            crate::perf::record_tlb_new_pte_publication(self.installed_pages, range_pages);
+            crate::arch::update_mmu_cache_for_new_pte_range(self.asid, self.start, self.end);
+        }
+        self.committed = true;
+    }
+
+    pub(super) fn commit(mut self) {
+        self.finish();
+    }
+}
+
+impl Drop for NewPtePublicationBatch<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
 impl PageTableUpdateBatch {
     fn new(asid: &Arc<AsidContext>) -> Self {
         Self {
-            #[cfg(target_arch = "riscv64")]
-            tlb: Some(crate::arch::riscv64::mm::begin_user_tlb_batch(asid)),
-            #[cfg(target_arch = "loongarch64")]
-            tlb: Some(crate::arch::loongarch64::mm::begin_user_tlb_batch(asid)),
+            tlb: Some(crate::arch::begin_user_tlb_batch(asid)),
             deferred_frames: Vec::new(),
             kernel_full: false,
             icache_stale: false,
