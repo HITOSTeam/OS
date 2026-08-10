@@ -1,3 +1,4 @@
+pub mod dtb;
 mod irq;
 pub mod mm;
 pub mod task;
@@ -21,101 +22,19 @@ static RISCV_HAS_SVVPTC: AtomicBool = AtomicBool::new(false);
 const RISCV_USE_SSTC_CLOCKEVENT: bool = false;
 
 #[allow(dead_code)]
-fn detect_timebase_frequency(dtb_pa: usize) -> Option<usize> {
-    if dtb_pa == 0 {
-        return None;
-    }
-    let fdt = unsafe { fdt::Fdt::from_ptr(dtb_pa as *const u8).ok()? };
-    fdt.find_node("/cpus")
-        .and_then(|node| node.property("timebase-frequency"))
-        .and_then(|property| property.as_usize())
-        .filter(|freq| *freq != 0)
-}
-
-fn string_list_contains(value: &[u8], expected: &[u8]) -> bool {
-    value
-        .split(|byte| *byte == 0)
-        .any(|entry| entry == expected)
-}
-
-fn isa_string_contains(value: &[u8], expected: &[u8]) -> bool {
-    let value = value.strip_suffix(&[0]).unwrap_or(value);
-    value.split(|byte| *byte == b'_').skip(1).any(|extension| {
-        // Linux's legacy riscv,isa parser ignores a multi-letter
-        // extension's optional major or major/minor version suffix.
-        let mut name_end = extension.len();
-        if extension.last().is_some_and(u8::is_ascii_digit) {
-            while name_end > 0 && extension[name_end - 1].is_ascii_digit() {
-                name_end -= 1;
-            }
-            if name_end >= 2
-                && extension[name_end - 1].eq_ignore_ascii_case(&b'p')
-                && extension[name_end - 2].is_ascii_digit()
-            {
-                name_end -= 1;
-                while name_end > 0 && extension[name_end - 1].is_ascii_digit() {
-                    name_end -= 1;
-                }
-            }
-        }
-        extension[..name_end].eq_ignore_ascii_case(expected)
-    })
-}
-
-/// Match Linux's host ISA bitmap: an extension is globally usable only when
-/// every available hart supported by this kernel advertises it.
-fn detect_isa_extension(dtb_pa: usize, extension: &[u8]) -> bool {
-    if dtb_pa == 0 {
-        return false;
-    }
-    let Ok(fdt) = (unsafe { fdt::Fdt::from_ptr(dtb_pa as *const u8) }) else {
-        return false;
-    };
-    if fdt.find_node("/cpus").is_none() {
-        return false;
-    }
-
-    let mut saw_available_hart = false;
-    for cpu in fdt.cpus() {
-        let hart_id = cpu.ids().first();
-        if hart_id >= crate::config::MAX_HARTS || hart_id >= usize::BITS as usize {
-            continue;
-        }
-        let available = cpu
-            .property("status")
-            .map(|property| matches!(property.as_str(), Some("okay" | "ok")))
-            .unwrap_or(true);
-        if !available {
-            continue;
-        }
-
-        saw_available_hart = true;
-        let present = if let Some(property) = cpu.property("riscv,isa-extensions") {
-            string_list_contains(property.value, extension)
-        } else {
-            cpu.property("riscv,isa")
-                .is_some_and(|property| isa_string_contains(property.value, extension))
-        };
-        if !present {
-            return false;
-        }
-    }
-    saw_available_hart
-}
-
-#[allow(dead_code)]
 pub fn bootstrap_init(dtb_pa: usize) {
     crate::sbi::init();
-    if let Some(freq) = detect_timebase_frequency(dtb_pa) {
+    dtb::init(dtb_pa);
+    if let Some(freq) = dtb::timebase_frequency() {
         crate::config::set_clock_freq(freq);
         crate::println!("[kernel] riscv timebase frequency: {} Hz", freq);
     }
-    let has_sstc = detect_isa_extension(dtb_pa, b"sstc");
+    let has_sstc = dtb::all_harts_have_sstc();
     RISCV_HAS_SSTC.store(has_sstc, Ordering::Release);
     if has_sstc {
         crate::println!("[kernel] riscv sstc timer enabled");
     }
-    let has_svvptc = detect_isa_extension(dtb_pa, b"svvptc");
+    let has_svvptc = dtb::all_harts_have_svvptc();
     RISCV_HAS_SVVPTC.store(has_svvptc, Ordering::Release);
     if has_svvptc {
         crate::println!("[kernel] riscv svvptc enabled");

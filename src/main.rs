@@ -364,6 +364,9 @@ fn rust_main(hart_id: usize) -> ! {
     {
         clear_bss();
         BOOT_BSS_CLEARED.store(true, Ordering::Release);
+        // 先发布 LoongArch 的 DTB 缓存，之后的串口、关机和 PCI 路径均不再
+        // 依赖固定 QEMU 地址或重新解析设备树。
+        arch::loongarch64::dtb::init(crate::config::DEVICE_TREE_ADDR);
         let topology = mm::hart_topology_from_dtb(crate::config::DEVICE_TREE_ADDR, hart_id);
         BOOT_PRESENT_HART_MASK.store(topology.present_mask, Ordering::Release);
         println!(

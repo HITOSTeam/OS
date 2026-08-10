@@ -1,4 +1,5 @@
 pub mod csr_defs;
+pub mod dtb;
 mod irq;
 pub mod mm;
 pub mod task;
@@ -73,10 +74,10 @@ const UART_BASE: usize = 0x8000_0000_1fe2_0000;
 #[cfg(not(feature = "loongarch_board"))]
 const UART_BASE: usize = 0x1fe0_01e0;
 
-const UART_RBR_THR: usize = UART_BASE + 0x0;
-const UART_FCR: usize = UART_BASE + 0x2;
-const UART_LCR: usize = UART_BASE + 0x3;
-const UART_LSR: usize = UART_BASE + 0x5;
+const UART_RBR_THR: usize = 0;
+const UART_FCR: usize = 2;
+const UART_LCR: usize = 3;
+const UART_LSR: usize = 5;
 pub const UART_FIFO_DEPTH: usize = 16;
 
 static UART_INITED: AtomicBool = AtomicBool::new(false);
@@ -96,43 +97,78 @@ pub(crate) unsafe fn csr_write<const CSR: usize>(value: usize) {
     }
 }
 
-fn uart_init_once() {
+/// 根据 DTB 的寄存器间距和访问宽度计算 UART MMIO 地址。
+fn uart_address(console: dtb::ConsoleInfo, register: usize) -> usize {
+    let offset = register
+        .checked_shl(console.reg_shift as u32)
+        .expect("DTB UART register offset overflows");
+    let end = offset
+        .checked_add(console.reg_io_width as usize)
+        .expect("DTB UART register width overflows");
+    assert!(end <= console.size, "DTB UART register lies outside its reg range");
+    console.base.checked_add(offset).expect("DTB UART address overflows")
+}
+
+/// 按 DTB 指定宽度写入 16550 UART 的一个寄存器。
+fn uart_write(console: dtb::ConsoleInfo, register: usize, value: u8) {
+    let address = uart_address(console, register);
+    unsafe {
+        match console.reg_io_width {
+            1 => write_volatile(address as *mut u8, value),
+            2 => write_volatile(address as *mut u16, value as u16),
+            4 => write_volatile(address as *mut u32, value as u32),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// 按 DTB 指定宽度读取 16550 UART 的一个寄存器。
+fn uart_read(console: dtb::ConsoleInfo, register: usize) -> u8 {
+    let address = uart_address(console, register);
+    unsafe {
+        match console.reg_io_width {
+            1 => read_volatile(address as *const u8),
+            2 => read_volatile(address as *const u16) as u8,
+            4 => read_volatile(address as *const u32) as u8,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// 仅由首次访问串口的 hart 初始化 16550 的 8N1 和 FIFO 设置。
+fn uart_init_once(console: dtb::ConsoleInfo) {
     if UART_INITED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        // SAFETY: UART_LCR and UART_FCR are MMIO addresses for 16550-compatible UART.
-        unsafe {
-            // 8N1 + enable FIFO, clear RX/TX queues.
-            write_volatile(UART_LCR as *mut u8, 0x03);
-            write_volatile(UART_FCR as *mut u8, 0x07);
-        }
+        // 8N1 + enable FIFO, clear RX/TX queues.
+        uart_write(console, UART_LCR, 0x03);
+        uart_write(console, UART_FCR, 0x07);
     }
 }
 
 pub fn console_putchar(c: usize) {
-    uart_init_once();
-    // SAFETY: UART_RBR_THR is the MMIO address for UART transmit hold register.
-    unsafe {
-        write_volatile(UART_RBR_THR as *mut u8, c as u8);
-    }
+    let console = dtb::console_info().unwrap_or(dtb::ConsoleInfo {
+        base: UART_BASE, size: 0x1000, reg_shift: 0, reg_io_width: 1,
+    });
+    uart_init_once(console);
+    uart_write(console, UART_RBR_THR, c as u8);
 }
 
 pub fn console_flush() {
-    uart_init_once();
-    // SAFETY: UART_LSR is the MMIO address for UART line status register.
-    unsafe { while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {} }
+    let console = dtb::console_info().unwrap_or(dtb::ConsoleInfo {
+        base: UART_BASE, size: 0x1000, reg_shift: 0, reg_io_width: 1,
+    });
+    uart_init_once(console);
+    while uart_read(console, UART_LSR) & 0x20 == 0 {}
 }
 
 pub fn console_getchar() -> usize {
-    uart_init_once();
-    // SAFETY: UART_LSR and UART_RBR_THR are MMIO addresses for UART status and data registers.
-    unsafe {
-        if read_volatile(UART_LSR as *const u8) & 0x01 == 0 {
-            return usize::MAX;
-        }
-        read_volatile(UART_RBR_THR as *const u8) as usize
-    }
+    let console = dtb::console_info().unwrap_or(dtb::ConsoleInfo {
+        base: UART_BASE, size: 0x1000, reg_shift: 0, reg_io_width: 1,
+    });
+    uart_init_once(console);
+    if uart_read(console, UART_LSR) & 0x01 == 0 { usize::MAX } else { uart_read(console, UART_RBR_THR) as usize }
 }
 
 pub fn disable_interrupts() -> bool {
@@ -577,9 +613,19 @@ pub fn hart_start(hart_id: usize, start_addr: usize, _opaque: usize) -> usize {
 }
 
 pub fn shutdown() -> ! {
-    // SAFETY: 0x100e_001c is the power control MMIO address on LoongArch QEMU virt.
+    let poweroff = dtb::poweroff_info().unwrap_or(dtb::PoweroffInfo {
+        base: 0x100e_0000, offset: 0x1c, value: 0x34, reg_io_width: 1,
+    });
+    let address = poweroff.base + poweroff.offset;
+    // 访问宽度和值已由 DTB 校验；固定地址仅是无 DTB 时的旧平台回退。
     unsafe {
-        (0x100e_001c as *mut u8).write_volatile(0x34);
+        match poweroff.reg_io_width {
+            1 => write_volatile(address as *mut u8, poweroff.value as u8),
+            2 => write_volatile(address as *mut u16, poweroff.value as u16),
+            4 => write_volatile(address as *mut u32, poweroff.value as u32),
+            8 => write_volatile(address as *mut u64, poweroff.value as u64),
+            _ => unreachable!(),
+        }
     }
     loop {}
 }

@@ -123,6 +123,10 @@ pub fn clock_freq() -> usize {
 pub const DEFAULT_MEMORY_START: usize = 0x8000_0000;
 pub const DEFAULT_MEMORY_END: usize = 0xA000_0000;
 
+/// 启动 DTB 中允许保存的内存和设备区间上限。QEMU virt 的实际条目远少于
+/// 此值；固定数组保证早期启动无需依赖动态分配。
+pub const MAX_VIRTIO_MMIO_DEVICES: usize = 8;
+
 #[cfg(target_arch = "loongarch64")]
 pub const DEVICE_TREE_ADDR: usize = 0x100000;
 #[cfg(target_arch = "loongarch64")]

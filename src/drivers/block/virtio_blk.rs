@@ -86,11 +86,22 @@ mod virtio_mmio {
         }
 
         pub fn probe_all() -> Vec<Self> {
-            (0..VIRTIO_MMIO_SLOTS)
-                .filter_map(|index| {
-                    Self::try_new_with_base(VIRTIO_MMIO_BASE + index * VIRTIO_MMIO_STRIDE)
-                })
-                .collect()
+            let mut devices = Vec::new();
+            // 设备顺序由 DTB 的 reg 地址决定，避免把 QEMU 的固定槽位布局当成 ABI。
+            crate::arch::riscv64::dtb::for_each_virtio_mmio_device(|base, _size| {
+                if let Some(device) = Self::try_new_with_base(base) {
+                    devices.push(device);
+                }
+            });
+            if devices.is_empty() {
+                // 保留没有 DTB 的旧平台兼容路径。
+                devices = (0..VIRTIO_MMIO_SLOTS)
+                    .filter_map(|index| {
+                        Self::try_new_with_base(VIRTIO_MMIO_BASE + index * VIRTIO_MMIO_STRIDE)
+                    })
+                    .collect();
+            }
+            devices
         }
 
         /// try to initalize a block device form the given address
@@ -201,7 +212,8 @@ mod virtio_mmio {
 mod virtio_pci {
     use super::super::async_queue::{AsyncBlockDiagnostics, AsyncVirtIOBlock};
     use crate::{
-        config::{DEVICE_TREE_ADDR, PAGE_SIZE, phys_mem_end, phys_mem_start},
+        arch::loongarch64::dtb::{self, PciHostInfo},
+        config::{PAGE_SIZE, phys_mem_end, phys_mem_start},
         mm::{
             FrameTracker, KERNEL_SPACE, MapPermission, PTEFlags, PhysAddr, VirtAddr,
             frame_alloc_contiguous,
@@ -219,7 +231,6 @@ mod virtio_pci {
         sync::atomic::{AtomicBool, Ordering},
     };
     use ext4_fs::BlockDevice;
-    use fdt::{Fdt, node::FdtNode};
     use lazy_static::lazy_static;
     use spin::Mutex;
     use virtio_drivers::{
@@ -399,55 +410,12 @@ mod virtio_pci {
         end: u32,
     }
 
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    enum PciRangeType {
-        ConfigurationSpace,
-        IoSpace,
-        Memory32,
-        Memory64,
-    }
-
-    impl From<u8> for PciRangeType {
-        fn from(value: u8) -> Self {
-            match value {
-                0 => Self::ConfigurationSpace,
-                1 => Self::IoSpace,
-                2 => Self::Memory32,
-                3 => Self::Memory64,
-                _ => panic!("invalid PCI range type {}", value),
-            }
-        }
-    }
-
     impl PciMemory32Allocator {
-        fn for_pci_ranges(pci_node: &FdtNode) -> Self {
-            let ranges = pci_node
-                .property("ranges")
-                .expect("PCI node missing ranges property.");
-            let mut memory_32_address = 0;
-            let mut memory_32_size = 0;
-            for i in 0..ranges.value.len() / 28 {
-                let range = &ranges.value[i * 28..(i + 1) * 28];
-                let prefetchable = range[0] & 0x80 != 0;
-                let range_type = PciRangeType::from(range[0] & 0x3);
-                let cpu_physical = u64::from_be_bytes(range[12..20].try_into().unwrap());
-                let bus_address = u64::from_be_bytes(range[4..12].try_into().unwrap());
-                let size = u64::from_be_bytes(range[20..28].try_into().unwrap());
-                if !prefetchable
-                    && matches!(range_type, PciRangeType::Memory32 | PciRangeType::Memory64)
-                    && size > memory_32_size.into()
-                    && bus_address + size < u32::MAX.into()
-                {
-                    memory_32_address = u32::try_from(cpu_physical).unwrap();
-                    memory_32_size = u32::try_from(size).unwrap();
-                }
-            }
-            if memory_32_size == 0 {
-                panic!("no 32-bit PCI memory region found");
-            }
+        /// DTB 缓存已验证 PCI aperture 可被 32 位 BAR 分配器表示。
+        fn for_pci_host(pci_host: PciHostInfo) -> Self {
             Self {
-                start: memory_32_address,
-                end: memory_32_address + memory_32_size,
+                start: pci_host.mem32_base as u32,
+                end: (pci_host.mem32_base + pci_host.mem32_size) as u32,
             }
         }
 
@@ -554,30 +522,20 @@ mod virtio_pci {
         }
     }
 
-    fn ensure_pci_allocator(pci_node: &FdtNode) {
+    fn ensure_pci_allocator(pci_host: PciHostInfo) {
         let mut allocator = PCI_ALLOCATOR.lock();
         if allocator.is_none() {
-            *allocator = Some(PciMemory32Allocator::for_pci_ranges(pci_node));
+            *allocator = Some(PciMemory32Allocator::for_pci_host(pci_host));
         }
     }
 
-    fn ensure_pci_ecam_mapped(pci_node: &FdtNode) {
+    fn ensure_pci_ecam_mapped(pci_host: PciHostInfo) {
         if PCI_ECAM_MAPPED.load(Ordering::SeqCst) {
             return;
         }
-        let mut mapped = false;
-        if let Some(reg) = pci_node.reg() {
-            for region in reg {
-                if let Some(size) = region.size {
-                    log_pci_range("PCI ECAM", region.starting_address as usize, size);
-                    map_identical_range(region.starting_address as usize, size);
-                    mapped = true;
-                }
-            }
-        }
-        if mapped {
-            PCI_ECAM_MAPPED.store(true, Ordering::SeqCst);
-        }
+        log_pci_range("PCI ECAM", pci_host.ecam_base, pci_host.ecam_size);
+        map_identical_range(pci_host.ecam_base, pci_host.ecam_size);
+        PCI_ECAM_MAPPED.store(true, Ordering::SeqCst);
     }
 
     fn virtio_blk_pci(transport: PciTransport, irq: usize) -> VirtIOBlock {
@@ -607,18 +565,15 @@ mod virtio_pci {
         }
 
         fn try_new_with_index(index: usize) -> Option<Self> {
-            // SAFETY: DEVICE_TREE_ADDR is the FDT address passed by bootloader; valid during init.
-            let fdt = unsafe { Fdt::from_ptr(DEVICE_TREE_ADDR as *const u8).ok()? };
-            let pci_node = fdt.find_compatible(&["pci-host-ecam-generic"])?;
-            ensure_pci_ecam_mapped(&pci_node);
-            ensure_pci_allocator(&pci_node);
-            let reg = pci_node.reg()?;
-            for region in reg {
-                // SAFETY: region.starting_address is the ECAM base from FDT; mapped by ensure_pci_ecam_mapped.
-                let mut pci_root =
-                    unsafe { PciRoot::new(region.starting_address as *mut u8, Cam::Ecam) };
-                let mut blk_index = 0usize;
-                for (device_function, info) in pci_root.enumerate_bus(0) {
+            let pci_host = dtb::pci_host_info()?;
+            ensure_pci_ecam_mapped(pci_host);
+            ensure_pci_allocator(pci_host);
+            let bus_offset = (pci_host.bus_start as usize).checked_shl(20)?;
+            let ecam_root = pci_host.ecam_base.checked_sub(bus_offset)?;
+            // 安全性：ECAM 基址来自启动期已经校验并缓存的 DTB，且已完成页表映射。
+            let mut pci_root = unsafe { PciRoot::new(ecam_root as *mut u8, Cam::Ecam) };
+            let mut blk_index = 0usize;
+            for (device_function, info) in pci_root.enumerate_bus(pci_host.bus_start) {
                     let Some(virtio_type) = virtio_device_type(&info) else {
                         continue;
                     };
@@ -668,7 +623,6 @@ mod virtio_pci {
                         return Some(virtio_blk_pci(transport, irq));
                     }
                     blk_index += 1;
-                }
             }
             None
         }
