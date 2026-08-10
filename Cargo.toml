@@ -33,7 +33,7 @@ bitflags = "1.2.1"
 xmas-elf = "0.7.0"
 fdt = "0.1.5"
 virtio-drivers = { path = "../vendor/virtio-drivers-pci" }
-ext4-fs = { path = "../ext4-fs" }
+ext4-fs = { path = "../ext4-fs", default-features = false }
 log = "0.4"
 spin = "0.7.0"
 # WireGuard Noise handshake 与 data message 加密。
@@ -63,6 +63,7 @@ loongArch64 = "0.2.4"
 
 [features]
 loongarch_board = []
+perf_diagnostics = ["ext4-fs/block-cache-stats"]
 
 [profile.dev]
 panic = "abort"

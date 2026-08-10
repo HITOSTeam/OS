@@ -1,4 +1,6 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use crate::config::MAX_HARTS;
 pub mod error;
 pub(crate) mod filesystem;
 
@@ -25,13 +27,49 @@ mod thread;
 mod time_sys;
 pub(crate) use time_sys::timer_clock_now_ns;
 static CYCLIC_SYSCALL_LOGS: AtomicUsize = AtomicUsize::new(1024);
-static LAST_SYSCALL_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
-static LAST_SYSCALL_A0: AtomicUsize = AtomicUsize::new(0);
-static LAST_SYSCALL_A1: AtomicUsize = AtomicUsize::new(0);
-static LAST_SYSCALL_A2: AtomicUsize = AtomicUsize::new(0);
-static LAST_SYSCALL_A3: AtomicUsize = AtomicUsize::new(0);
-static LAST_SYSCALL_A4: AtomicUsize = AtomicUsize::new(0);
-static LAST_SYSCALL_A5: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-hart fallback for allocation-failure diagnostics.
+///
+/// The trap path already keeps restartable syscall state in the current task.
+/// OOM reporting cannot safely take that task lock, so retain a lock-free copy
+/// without bouncing one shared diagnostic cacheline between every CPU.
+#[repr(align(128))]
+struct LastSyscallSlot {
+    id: AtomicUsize,
+    args: [AtomicUsize; 6],
+}
+
+impl LastSyscallSlot {
+    const fn new() -> Self {
+        Self {
+            id: AtomicUsize::new(usize::MAX),
+            args: [const { AtomicUsize::new(0) }; 6],
+        }
+    }
+
+    #[inline]
+    fn record(&self, id: usize, args: &[usize; 6]) {
+        self.id.store(id, Ordering::Relaxed);
+        for (slot, value) in self.args.iter().zip(args.iter().copied()) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> (usize, [usize; 6]) {
+        (
+            self.id.load(Ordering::Relaxed),
+            core::array::from_fn(|index| self.args[index].load(Ordering::Relaxed)),
+        )
+    }
+}
+
+static LAST_SYSCALL_BY_HART: [LastSyscallSlot; MAX_HARTS] =
+    [const { LastSyscallSlot::new() }; MAX_HARTS];
+
+#[inline]
+fn local_last_syscall_slot() -> &'static LastSyscallSlot {
+    &LAST_SYSCALL_BY_HART[crate::arch::hart_id().min(MAX_HARTS.saturating_sub(1))]
+}
 static CYCLIC_DIAG_PID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CYCLIC_DIAG_CLONES: AtomicUsize = AtomicUsize::new(0);
 static CYCLIC_DIAG_AFFINITY: AtomicUsize = AtomicUsize::new(0);
@@ -149,17 +187,7 @@ pub(crate) fn busybox_applet_allowed(name: &str) -> bool {
 }
 
 pub fn last_syscall_snapshot() -> (usize, [usize; 6]) {
-    (
-        LAST_SYSCALL_ID.load(Ordering::Relaxed),
-        [
-            LAST_SYSCALL_A0.load(Ordering::Relaxed),
-            LAST_SYSCALL_A1.load(Ordering::Relaxed),
-            LAST_SYSCALL_A2.load(Ordering::Relaxed),
-            LAST_SYSCALL_A3.load(Ordering::Relaxed),
-            LAST_SYSCALL_A4.load(Ordering::Relaxed),
-            LAST_SYSCALL_A5.load(Ordering::Relaxed),
-        ],
-    )
+    local_last_syscall_slot().snapshot()
 }
 
 const SYSCALL_EVENTFD2: usize = 19;
@@ -579,13 +607,7 @@ fn trace_syscall_entry(id: usize, args: &[usize; 6]) {
 }
 
 pub fn syscall(id: usize, args: [usize; 6]) -> isize {
-    LAST_SYSCALL_ID.store(id, Ordering::Relaxed);
-    LAST_SYSCALL_A0.store(args[0], Ordering::Relaxed);
-    LAST_SYSCALL_A1.store(args[1], Ordering::Relaxed);
-    LAST_SYSCALL_A2.store(args[2], Ordering::Relaxed);
-    LAST_SYSCALL_A3.store(args[3], Ordering::Relaxed);
-    LAST_SYSCALL_A4.store(args[4], Ordering::Relaxed);
-    LAST_SYSCALL_A5.store(args[5], Ordering::Relaxed);
+    local_last_syscall_slot().record(id, &args);
     trace_syscall_entry(id, &args);
     let ret = match id {
         SYSCALL_GETCWD => filesystem::syscall_getcwd(args[0], args[1]),
