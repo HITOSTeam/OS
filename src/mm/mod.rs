@@ -34,7 +34,7 @@ pub use dtb::hart_topology_from_dtb;
 pub use dtb::init_phys_mem_from_dtb;
 pub use frame_allocator::{
     FrameTracker, UserFramePin, frame_alloc, frame_alloc_contiguous, frame_available_pages,
-    frame_managed_pages, frame_refcount_entries,
+    frame_managed_pages, frame_metadata_bytes, frame_metadata_chunks, frame_refcount_entries,
 };
 pub use memory_set::kernel_token;
 /// Cached kernel SATP after `init` so secondary harts don't borrow `KERNEL_SPACE`.

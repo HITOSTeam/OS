@@ -2,20 +2,28 @@
 //! controls all the frames in the operating system.
 
 use super::{PhysAddr, PhysPageNum};
-use crate::{config::phys_mem_end, println, sync::LocalIrqSaveGuard};
-use alloc::sync::Arc;
+use crate::{
+    config::{phys_mem_end, phys_mem_start},
+    println,
+    sync::LocalIrqSaveGuard,
+};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::{
     fmt::{self, Debug, Formatter},
-    sync::atomic::{AtomicUsize, Ordering},
+    hint::spin_loop,
+    ptr,
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering, fence},
 };
 use lazy_static::*;
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 static FRAME_ALLOC_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
-static FRAME_OWNER_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FRAME_LIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PAGE_DESC_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_arch = "riscv64")]
+#[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FrameIcacheState {
     /// Frames outside the ordinary inode page cache stay untracked.
@@ -36,71 +44,327 @@ pub(crate) enum IcacheSyncOutcome {
     Bypass,
 }
 
-struct FrameOwner {
-    ppn: PhysPageNum,
-    writable_uaccess_pins: AtomicUsize,
-    /// Serializes short-lived slices created for pinned user buffers.
-    ///
-    /// A physical page can be mapped at more than one user virtual address and
-    /// can consequently appear in overlapping `UserBuffer`s. This lock may be
-    /// held across arbitrary callbacks, so it is independent from I-cache
-    /// state and must always be acquired before `icache_state`.
-    user_buffer_access: Mutex<()>,
-    /// Tracks Linux RISC-V's `PG_dcache_clean` equivalent and serializes it
-    /// against controlled page-cache writes and executable PTE publication.
-    ///
-    /// No path holding this lock may acquire `user_buffer_access`.
-    #[cfg(target_arch = "riscv64")]
-    icache_state: Mutex<FrameIcacheState>,
+const PAGE_DESC_CHUNK_SHIFT: usize = 9;
+const PAGE_DESCS_PER_CHUNK: usize = 1 << PAGE_DESC_CHUNK_SHIFT;
+const PAGE_DESC_CHUNK_MASK: usize = PAGE_DESCS_PER_CHUNK - 1;
+
+const PAGE_STATE_USER_LOCK: u32 = 1 << 0;
+const PAGE_STATE_ICACHE_LOCK: u32 = 1 << 1;
+#[cfg(target_arch = "riscv64")]
+const PAGE_STATE_ICACHE_SHIFT: u32 = 2;
+#[cfg(target_arch = "riscv64")]
+const PAGE_STATE_ICACHE_MASK: u32 = 0b11 << PAGE_STATE_ICACHE_SHIFT;
+const PAGE_STATE_PIN_SHIFT: u32 = 4;
+const PAGE_STATE_PIN_ONE: u32 = 1 << PAGE_STATE_PIN_SHIFT;
+const PAGE_STATE_PIN_MASK: u32 = !((1 << PAGE_STATE_PIN_SHIFT) - 1);
+const PAGE_STATE_PIN_MAX: u32 = PAGE_STATE_PIN_MASK >> PAGE_STATE_PIN_SHIFT;
+
+/// Compact Linux-like metadata for one managed physical page.
+///
+/// Linux keeps refcount and page flags in a preallocated `struct page`
+/// array.  The two low lock bits here replace the much larger per-page ticket
+/// mutexes that used to live in every `Arc<FrameOwner>` allocation. Writable
+/// uaccess pins occupy the high 28 bits of `state`; RISC-V uses two remaining
+/// bits for its PG_dcache_clean-equivalent state.
+struct PageDesc {
+    refcount: AtomicU32,
+    state: AtomicU32,
 }
 
-impl Drop for FrameOwner {
-    fn drop(&mut self) {
-        FRAME_OWNER_COUNT.fetch_sub(1, Ordering::Relaxed);
-        frame_dealloc(self.ppn);
+const _: () = assert!(core::mem::size_of::<PageDesc>() == 8);
+
+impl PageDesc {
+    const fn new() -> Self {
+        Self {
+            refcount: AtomicU32::new(0),
+            state: AtomicU32::new(0),
+        }
+    }
+
+    fn claim(&self) {
+        assert_eq!(
+            self.state.load(Ordering::Acquire),
+            0,
+            "claiming a frame with stale PageDesc state"
+        );
+        assert!(
+            self.refcount
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "claiming a frame whose PageDesc is still referenced"
+        );
+    }
+
+    fn get(&self) {
+        let mut current = self.refcount.load(Ordering::Relaxed);
+        loop {
+            assert!(
+                current > 0 && current < u32::MAX,
+                "invalid PageDesc refcount increment from {}",
+                current
+            );
+            match self.refcount.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Drop one reference and return true when the physical page may be freed.
+    fn put(&self) -> bool {
+        let previous = self.refcount.fetch_sub(1, Ordering::Release);
+        assert!(previous > 0, "PageDesc refcount underflow");
+        if previous != 1 {
+            return false;
+        }
+        fence(Ordering::Acquire);
+        let state = self.state.swap(0, Ordering::AcqRel);
+        let busy = PAGE_STATE_USER_LOCK | PAGE_STATE_ICACHE_LOCK | PAGE_STATE_PIN_MASK;
+        assert_eq!(state & busy, 0, "freeing a pinned or locked PageDesc");
+        true
+    }
+
+    fn refcount(&self) -> usize {
+        self.refcount.load(Ordering::Acquire) as usize
+    }
+
+    fn writable_uaccess_pins(&self) -> usize {
+        ((self.state.load(Ordering::Acquire) & PAGE_STATE_PIN_MASK) >> PAGE_STATE_PIN_SHIFT)
+            as usize
+    }
+
+    fn pin_writable_uaccess(&self) {
+        let mut current = self.state.load(Ordering::Relaxed);
+        loop {
+            let pins = (current & PAGE_STATE_PIN_MASK) >> PAGE_STATE_PIN_SHIFT;
+            assert!(pins < PAGE_STATE_PIN_MAX, "writable uaccess pin overflow");
+            let next = current + PAGE_STATE_PIN_ONE;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn unpin_writable_uaccess(&self) {
+        let mut current = self.state.load(Ordering::Relaxed);
+        loop {
+            let pins = (current & PAGE_STATE_PIN_MASK) >> PAGE_STATE_PIN_SHIFT;
+            assert!(pins > 0, "writable uaccess pin underflow");
+            match self.state.compare_exchange_weak(
+                current,
+                current - PAGE_STATE_PIN_ONE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn lock_user_access(&self) -> PageStateBitGuard<'_> {
+        self.lock_state_bit(PAGE_STATE_USER_LOCK)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn lock_icache_state(&self) -> PageStateBitGuard<'_> {
+        self.lock_state_bit(PAGE_STATE_ICACHE_LOCK)
+    }
+
+    fn lock_state_bit(&self, bit: u32) -> PageStateBitGuard<'_> {
+        let mut current = self.state.load(Ordering::Relaxed);
+        loop {
+            if current & bit != 0 {
+                while self.state.load(Ordering::Relaxed) & bit != 0 {
+                    spin_loop();
+                }
+                current = self.state.load(Ordering::Relaxed);
+                continue;
+            }
+            match self.state.compare_exchange_weak(
+                current,
+                current | bit,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return PageStateBitGuard { desc: self, bit },
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn icache_state_locked(&self) -> FrameIcacheState {
+        match (self.state.load(Ordering::Relaxed) & PAGE_STATE_ICACHE_MASK)
+            >> PAGE_STATE_ICACHE_SHIFT
+        {
+            0 => FrameIcacheState::Untracked,
+            1 => FrameIcacheState::Dirty,
+            2 => FrameIcacheState::Clean,
+            value => panic!("invalid PageDesc I-cache state {}", value),
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn set_icache_state_locked(&self, value: FrameIcacheState) {
+        let encoded = (value as u32) << PAGE_STATE_ICACHE_SHIFT;
+        let _ = self
+            .state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                Some((state & !PAGE_STATE_ICACHE_MASK) | encoded)
+            });
     }
 }
 
+struct PageStateBitGuard<'a> {
+    desc: &'a PageDesc,
+    bit: u32,
+}
+
+impl Drop for PageStateBitGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.desc.state.fetch_and(!self.bit, Ordering::Release);
+        debug_assert_ne!(previous & self.bit, 0);
+    }
+}
+
+struct PageDescChunk {
+    entries: [PageDesc; PAGE_DESCS_PER_CHUNK],
+}
+
+impl PageDescChunk {
+    fn new() -> Self {
+        Self {
+            entries: [const { PageDesc::new() }; PAGE_DESCS_PER_CHUNK],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<PageDescChunk>() == crate::config::PAGE_SIZE);
+
+/// Sparse vmemmap-style PFN index. The top table is fixed at boot; one 4-KiB
+/// descriptor chunk is allocated on first use for each 2-MiB physical range.
+struct PageDescTable {
+    start_ppn: usize,
+    end_ppn: usize,
+    chunks: Box<[AtomicPtr<PageDescChunk>]>,
+}
+
+impl PageDescTable {
+    fn new(start_ppn: usize, end_ppn: usize) -> Self {
+        assert!(end_ppn > start_ppn);
+        let pages = end_ppn - start_ppn;
+        let chunk_count = pages.div_ceil(PAGE_DESCS_PER_CHUNK);
+        let mut chunks = Vec::with_capacity(chunk_count);
+        chunks.resize_with(chunk_count, || AtomicPtr::new(ptr::null_mut()));
+        Self {
+            start_ppn,
+            end_ppn,
+            chunks: chunks.into_boxed_slice(),
+        }
+    }
+
+    fn get_or_init(&self, ppn: PhysPageNum) -> &'static PageDesc {
+        assert!(
+            ppn.0 >= self.start_ppn && ppn.0 < self.end_ppn,
+            "PPN {:#x} lies outside PageDesc table [{:#x}, {:#x})",
+            ppn.0,
+            self.start_ppn,
+            self.end_ppn
+        );
+        let relative = ppn.0 - self.start_ppn;
+        let chunk_index = relative >> PAGE_DESC_CHUNK_SHIFT;
+        let entry_index = relative & PAGE_DESC_CHUNK_MASK;
+        let slot = &self.chunks[chunk_index];
+        let mut chunk = slot.load(Ordering::Acquire);
+        if chunk.is_null() {
+            let candidate = Box::into_raw(Box::new(PageDescChunk::new()));
+            match slot.compare_exchange(
+                ptr::null_mut(),
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    PAGE_DESC_CHUNK_COUNT.fetch_add(1, Ordering::Relaxed);
+                    chunk = candidate;
+                }
+                Err(existing) => {
+                    // SAFETY: this allocation was never published; the CAS
+                    // winner owns the distinct chunk stored in `slot`.
+                    unsafe {
+                        drop(Box::from_raw(candidate));
+                    }
+                    chunk = existing;
+                }
+            }
+        }
+        // SAFETY: descriptor chunks are leaked for the kernel lifetime after
+        // publication, and `entry_index` is masked to the array bounds.
+        unsafe { &(*chunk).entries[entry_index] }
+    }
+
+    fn top_level_bytes(&self) -> usize {
+        self.chunks
+            .len()
+            .saturating_mul(core::mem::size_of::<AtomicPtr<PageDescChunk>>())
+    }
+}
+
+static PAGE_DESC_TABLE: Once<PageDescTable> = Once::new();
+
+fn init_page_desc_table(start_ppn: PhysPageNum, end_ppn: PhysPageNum) {
+    PAGE_DESC_TABLE.call_once(|| PageDescTable::new(start_ppn.0, end_ppn.0));
+}
+
+fn page_desc(ppn: PhysPageNum) -> &'static PageDesc {
+    PAGE_DESC_TABLE
+        .get()
+        .expect("PageDesc table is not initialized")
+        .get_or_init(ppn)
+}
+
 /// manage a frame which has the same lifecycle as the tracker
-#[derive(Clone)]
 pub struct FrameTracker {
     pub ppn: PhysPageNum,
-    owner: Arc<FrameOwner>,
+    desc: &'static PageDesc,
 }
 
 impl FrameTracker {
     pub fn new(ppn: PhysPageNum) -> Self {
+        let desc = page_desc(ppn);
+        desc.claim();
+        FRAME_LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
         // page cleaning
         let bytes_array = ppn.get_bytes_array();
         for i in bytes_array {
             *i = 0;
         }
-        FRAME_OWNER_COUNT.fetch_add(1, Ordering::Relaxed);
-        Self {
-            ppn,
-            owner: Arc::new(FrameOwner {
-                ppn,
-                writable_uaccess_pins: AtomicUsize::new(0),
-                user_buffer_access: Mutex::new(()),
-                #[cfg(target_arch = "riscv64")]
-                icache_state: Mutex::new(FrameIcacheState::Untracked),
-            }),
-        }
+        Self { ppn, desc }
     }
 
     pub fn refcount(&self) -> usize {
-        Arc::strong_count(&self.owner)
+        self.desc.refcount()
     }
 
     pub fn writable_uaccess_pins(&self) -> usize {
-        self.owner.writable_uaccess_pins.load(Ordering::Acquire)
+        self.desc.writable_uaccess_pins()
     }
 
     pub fn pin_user_buffer(&self, writable: bool) -> UserFramePin {
         if writable {
-            self.owner
-                .writable_uaccess_pins
-                .fetch_add(1, Ordering::AcqRel);
+            self.desc.pin_writable_uaccess();
         }
         UserFramePin {
             frame: self.clone(),
@@ -115,9 +379,9 @@ impl FrameTracker {
     pub(crate) fn enable_file_icache_tracking(&self) {
         #[cfg(target_arch = "riscv64")]
         {
-            let mut state = self.owner.icache_state.lock();
-            if *state == FrameIcacheState::Untracked {
-                *state = FrameIcacheState::Dirty;
+            let _state_guard = self.desc.lock_icache_state();
+            if self.desc.icache_state_locked() == FrameIcacheState::Untracked {
+                self.desc.set_icache_state_locked(FrameIcacheState::Dirty);
             }
         }
     }
@@ -133,12 +397,12 @@ impl FrameTracker {
         sync: impl FnOnce(),
         publish: impl FnOnce() -> R,
     ) -> (IcacheSyncOutcome, R) {
-        let mut state = self.owner.icache_state.lock();
-        let outcome = match *state {
+        let _state_guard = self.desc.lock_icache_state();
+        let outcome = match self.desc.icache_state_locked() {
             FrameIcacheState::Clean => IcacheSyncOutcome::Hit,
             FrameIcacheState::Dirty => {
                 sync();
-                *state = FrameIcacheState::Clean;
+                self.desc.set_icache_state_locked(FrameIcacheState::Clean);
                 IcacheSyncOutcome::Miss
             }
             FrameIcacheState::Untracked => {
@@ -158,7 +422,7 @@ impl FrameTracker {
         page_offset: usize,
         len: usize,
         f: impl FnOnce(&mut [u8]) -> R,
-        #[cfg(target_arch = "riscv64")] icache_state: &mut FrameIcacheState,
+        #[cfg(target_arch = "riscv64")] _icache_guard: &PageStateBitGuard<'_>,
     ) -> R {
         debug_assert!(page_offset <= crate::config::PAGE_SIZE);
         debug_assert!(len <= crate::config::PAGE_SIZE.saturating_sub(page_offset));
@@ -174,8 +438,8 @@ impl FrameTracker {
             // Linux calls flush_dcache_folio() after the kernel store and only
             // clears PG_dcache_clean. The next executable PTE publication
             // performs the deferred per-mm I-cache synchronization.
-            if *icache_state != FrameIcacheState::Untracked {
-                *icache_state = FrameIcacheState::Dirty;
+            if self.desc.icache_state_locked() != FrameIcacheState::Untracked {
+                self.desc.set_icache_state_locked(FrameIcacheState::Dirty);
             }
         }
         result
@@ -189,16 +453,35 @@ impl FrameTracker {
         len: usize,
         f: impl FnOnce(&mut [u8]) -> R,
     ) -> R {
-        let _user_access = self.owner.user_buffer_access.lock();
+        let _user_access = self.desc.lock_user_access();
         #[cfg(target_arch = "riscv64")]
-        let mut icache_state = self.owner.icache_state.lock();
+        let icache_state = self.desc.lock_icache_state();
         self.with_bytes_mut_locked(
             page_offset,
             len,
             f,
             #[cfg(target_arch = "riscv64")]
-            &mut icache_state,
+            &icache_state,
         )
+    }
+}
+
+impl Clone for FrameTracker {
+    fn clone(&self) -> Self {
+        self.desc.get();
+        Self {
+            ppn: self.ppn,
+            desc: self.desc,
+        }
+    }
+}
+
+impl Drop for FrameTracker {
+    fn drop(&mut self) {
+        if self.desc.put() {
+            FRAME_LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
+            frame_dealloc(self.ppn);
+        }
     }
 }
 
@@ -220,7 +503,7 @@ impl UserFramePin {
     ) -> R {
         debug_assert!(page_offset <= crate::config::PAGE_SIZE);
         debug_assert!(len <= crate::config::PAGE_SIZE.saturating_sub(page_offset));
-        let _access = self.frame.owner.user_buffer_access.lock();
+        let _access = self.frame.desc.lock_user_access();
         let page: PhysAddr = self.frame.ppn.into();
         // SAFETY: the pin keeps the frame allocated, bounds were validated by
         // the UserBuffer constructor, and the owner lock excludes every other
@@ -240,15 +523,15 @@ impl UserFramePin {
     ) -> R {
         debug_assert!(page_offset <= crate::config::PAGE_SIZE);
         debug_assert!(len <= crate::config::PAGE_SIZE.saturating_sub(page_offset));
-        let _user_access = self.frame.owner.user_buffer_access.lock();
+        let _user_access = self.frame.desc.lock_user_access();
         #[cfg(target_arch = "riscv64")]
-        let mut icache_state = self.frame.owner.icache_state.lock();
+        let icache_state = self.frame.desc.lock_icache_state();
         self.frame.with_bytes_mut_locked(
             page_offset,
             len,
             f,
             #[cfg(target_arch = "riscv64")]
-            &mut icache_state,
+            &icache_state,
         )
     }
 }
@@ -256,12 +539,7 @@ impl UserFramePin {
 impl Drop for UserFramePin {
     fn drop(&mut self) {
         if self.writable {
-            let previous = self
-                .frame
-                .owner
-                .writable_uaccess_pins
-                .fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(previous > 0, "writable uaccess pin underflow");
+            self.frame.desc.unpin_writable_uaccess();
         }
     }
 }
@@ -435,9 +713,12 @@ pub fn init_frame_allocator() {
         safe fn ekernel();
         safe fn stext();
     }
+    let memory_start = PhysAddr::from(phys_mem_start()).ceil();
+    let memory_end = PhysAddr::from(phys_mem_end()).floor();
+    init_page_desc_table(memory_start, memory_end);
     let kernel_end = PhysAddr::from(ekernel as usize).ceil();
     with_frame_allocator(|allocator| {
-        allocator.init(kernel_end, PhysAddr::from(phys_mem_end()).floor());
+        allocator.init(kernel_end, memory_end);
         #[cfg(target_arch = "loongarch64")]
         {
             use crate::config::phys_mem_start;
@@ -475,7 +756,7 @@ pub fn frame_alloc() -> Option<FrameTracker> {
             (allocator.current, allocator.end, allocator.recycled.len())
         });
         let fails = FRAME_ALLOC_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        let refcnt_entries = FRAME_OWNER_COUNT.load(Ordering::Relaxed);
+        let refcnt_entries = FRAME_LIVE_COUNT.load(Ordering::Relaxed);
         println!(
             "[mm-debug] frame_alloc failed count={} current={:#x} end={:#x} recycled={} refcnt_entries={}",
             fails, current, end, recycled, refcnt_entries
@@ -485,7 +766,21 @@ pub fn frame_alloc() -> Option<FrameTracker> {
 }
 
 pub fn frame_refcount_entries() -> usize {
-    FRAME_OWNER_COUNT.load(Ordering::Relaxed)
+    FRAME_LIVE_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn frame_metadata_chunks() -> usize {
+    PAGE_DESC_CHUNK_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn frame_metadata_bytes() -> usize {
+    let top_level = PAGE_DESC_TABLE
+        .get()
+        .map(PageDescTable::top_level_bytes)
+        .unwrap_or(0);
+    top_level.saturating_add(
+        frame_metadata_chunks().saturating_mul(core::mem::size_of::<PageDescChunk>()),
+    )
 }
 
 pub fn frame_available_pages() -> usize {

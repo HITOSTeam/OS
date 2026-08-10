@@ -601,6 +601,11 @@ icache_clean_bypasses: {icache_clean_bypasses}\n"
     let heap_shared_allocations = HEAP_SHARED_ALLOCATIONS.load(Ordering::Relaxed);
     let heap_shared_small_fallbacks = HEAP_SHARED_SMALL_FALLBACKS.load(Ordering::Relaxed);
     let heap_large_shard_fallbacks = HEAP_LARGE_SHARD_FALLBACKS.load(Ordering::Relaxed);
+    let frame_refcount_entries = crate::mm::frame_refcount_entries();
+    let frame_available_pages = crate::mm::frame_available_pages();
+    let frame_managed_pages = crate::mm::frame_managed_pages();
+    let frame_metadata_chunks = crate::mm::frame_metadata_chunks();
+    let frame_metadata_bytes = crate::mm::frame_metadata_bytes();
     let cache = ext4_fs::cache_diagnostics();
     let cache_hits = cache.hits;
     let cache_misses = cache.misses;
@@ -710,6 +715,11 @@ heap_shared_peak_actual_bytes: {heap_shared_peak_actual_bytes}\n\
 heap_shared_allocations: {heap_shared_allocations}\n\
 heap_shared_small_fallbacks: {heap_shared_small_fallbacks}\n\
 heap_large_shard_fallbacks: {heap_large_shard_fallbacks}\n\
+frame_refcount_entries: {frame_refcount_entries}\n\
+frame_available_pages: {frame_available_pages}\n\
+frame_managed_pages: {frame_managed_pages}\n\
+frame_metadata_chunks: {frame_metadata_chunks}\n\
+frame_metadata_bytes: {frame_metadata_bytes}\n\
 ext4_cache_hits: {cache_hits}\n\
 ext4_cache_misses: {cache_misses}\n\
 ext4_cache_hit_pct: {cache_hit_pct}\n\
