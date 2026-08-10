@@ -416,7 +416,7 @@ pub fn maybe_deliver_signal() {
     #[cfg(target_arch = "loongarch64")]
     crate::arch::save_user_fp_state(&task);
     #[cfg(target_arch = "loongarch64")]
-    let mut saved_loongarch_fp = crate::task::task_block::LoongArchFpState::new();
+    let saved_loongarch_fp;
     let (
         saved_trap,
         saved_mask,

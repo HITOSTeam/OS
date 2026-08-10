@@ -6,25 +6,36 @@ use core::{arch::global_asm, panic};
 extern crate alloc;
 use crate::fs::list_apps;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+// 这些模块同时承载不同架构、文件系统选项与诊断功能；final 配置不会调用其中
+// 所有公开接口，保留接口以支持其它评测组合，因此只在这些可选子系统内忽略死代码。
+#[allow(dead_code)]
 mod arch;
 mod bpf;
+#[allow(dead_code)]
 mod config;
 mod console;
 mod debug_config;
+#[allow(dead_code)]
 mod drivers;
+#[allow(dead_code)]
 mod fs;
 mod klog;
 mod lang_items;
 mod log;
+#[allow(dead_code)]
 mod mm;
 mod net;
+#[allow(dead_code)]
 mod perf;
 #[cfg(target_arch = "riscv64")]
 mod sbi;
+#[allow(dead_code)]
 mod sync;
+#[allow(dead_code)]
 mod syscall;
 mod task;
 mod time;
+#[allow(dead_code)]
 mod trap;
 mod utils;
 

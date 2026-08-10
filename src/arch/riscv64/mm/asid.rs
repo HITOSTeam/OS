@@ -524,10 +524,6 @@ impl UserTlbInvalidationBatch {
         }
     }
 
-    pub fn force_full_mm(&mut self) {
-        self.full_mm = true;
-    }
-
     pub fn mark_icache_stale(&self) {
         self.ctx.mark_icache_stale();
     }

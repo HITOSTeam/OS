@@ -405,7 +405,7 @@ pub(crate) fn inode_path_in_roots(target: &Arc<Inode>) -> Option<String> {
         let Some(root) = root.as_ref() else {
             continue;
         };
-        let base = if index == 0 {
+        let base = if index == ROOT_SELECTION.primary_index {
             String::from("/")
         } else {
             alloc::format!("/dev/vd{}", (b'a' + index as u8) as char)
@@ -1274,6 +1274,57 @@ impl OSInode {
     }
 }
 
+/// 评测双盘布局的根目录选择结果。
+///
+/// 本地最小盘只保存 `/user` 中的内核用户程序，官方盘包含完整 rootfs。通过
+/// `/home` 这个完整 rootfs 标记区分两者，避免把官方脚本与本地引导程序混在同一盘。
+struct RootSelection {
+    primary_index: usize,
+    secondary_index: Option<usize>,
+}
+
+impl RootSelection {
+    /// 根据两个 ext4 根目录选择主根；普通单盘或旧双盘布局继续以 disk0 为主。
+    fn from_roots(roots: &[Option<Arc<Inode>>]) -> Self {
+        let disk0_has_home = roots
+            .first()
+            .and_then(|root| root.as_ref())
+            .and_then(|root| root.find_path("/home"))
+            .is_some();
+        let disk1_has_home = roots
+            .get(1)
+            .and_then(|root| root.as_ref())
+            .and_then(|root| root.find_path("/home"))
+            .is_some();
+
+        if !disk0_has_home && disk1_has_home {
+            Self {
+                primary_index: 1,
+                secondary_index: Some(0),
+            }
+        } else {
+            Self {
+                primary_index: 0,
+                secondary_index: roots.get(1).and_then(|root| root.as_ref()).map(|_| 1),
+            }
+        }
+    }
+}
+
+/// 返回当前 VFS 应使用的主根 inode。
+///
+/// 普通布局使用 disk0；评测双盘布局中 disk1 是官方完整 rootfs。
+pub(crate) fn initial_root_inode() -> Arc<Inode> {
+    ROOT_INODE.clone()
+}
+
+/// 返回评测最小引导盘的设备序号；非评测布局没有该盘。
+pub(crate) fn local_boot_disk_index() -> Option<usize> {
+    (ROOT_SELECTION.primary_index == 1)
+        .then_some(0)
+        .filter(|index| BLOCK_ROOTS.get(*index).and_then(|root| root.as_ref()).is_some())
+}
+
 lazy_static! {
     /// One optional ext4 instance per registered block device.  Keeping the
     /// vector aligned with `/dev/vdX` preserves stable device identities even
@@ -1291,27 +1342,44 @@ lazy_static! {
         })
         .collect();
 
+    /// 同时兼容普通双盘启动和“本地引导盘 + 官方评测盘”布局。
+    static ref ROOT_SELECTION: RootSelection = RootSelection::from_roots(&BLOCK_ROOTS);
+
     /// ext4 filesystem handle (primary root device).
     pub static ref EXT4_FS: Arc<Ext4FileSystemHandle> = BLOCK_FILESYSTEMS
-        .first()
+        .get(ROOT_SELECTION.primary_index)
         .and_then(|fs| fs.as_ref())
         .cloned()
         .expect("[ext4] /dev/vda is not a valid ext4 filesystem");
 
     /// Root inode of the primary filesystem.
     pub static ref ROOT_INODE: Arc<Inode> = BLOCK_ROOTS
-        .first()
+        .get(ROOT_SELECTION.primary_index)
         .and_then(|root| root.as_ref())
         .cloned()
         .expect("[ext4] /dev/vda has no ext4 root inode");
 
-    /// User-app filesystem root.  The split layout stores app binaries at the
-    /// root of `/dev/vdb` and mounts that filesystem at `/user`.
+    /// 用户程序优先来自本地 disk0 的 `/user`。评测模式中它保存 init_proc 和
+    /// 0final_init；若旧布局没有该目录，则保持原有的 disk1 根目录回退行为。
     pub static ref USER_INODE: Arc<Inode> = BLOCK_ROOTS
-        .get(1)
+        .first()
         .and_then(|root| root.as_ref())
-        .cloned()
-        .expect("[ext4] /dev/vdb has no user ext4 root inode");
+        .and_then(|root| root.find("user"))
+        .or_else(|| ROOT_INODE.find("user"))
+        .or_else(|| {
+            ROOT_SELECTION
+                .secondary_index
+                .and_then(|index| BLOCK_ROOTS.get(index))
+                .and_then(|root| root.as_ref())
+                .and_then(|root| root.find("user"))
+        })
+        .or_else(|| {
+            BLOCK_ROOTS
+                .get(1)
+                .and_then(|root| root.as_ref())
+                .cloned()
+        })
+        .expect("[ext4] no user application filesystem found");
 }
 
 fn root_inode_for_path(path: &str) -> Arc<Inode> {

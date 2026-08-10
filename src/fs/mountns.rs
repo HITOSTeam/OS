@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-use super::block_root;
+use super::{block_root, initial_root_inode, local_boot_disk_index};
 use super::ext4::Ext4Vfs;
 use super::vfs::{
     FsStruct, LookupFlags, PathWalker, VfsCredentials, VfsFileSystem, VfsMountFlags,
@@ -112,7 +112,27 @@ impl MountNamespaceState {
             access_seq: 0,
             expire_mark_seq: None,
         });
-        if let Some(source) = super::block_device_source_path("/dev/vdb") {
+        if let Some(local_index) = local_boot_disk_index() {
+            let source_display = alloc::format!("/dev/vd{}", (b'a' + local_index as u8) as char);
+            let source = super::block_device_source_path(&source_display)
+                .expect("[vfs] local evaluation disk disappeared");
+            super::ensure_root_mount_directory("local");
+            mounts.push(MountRecord {
+                target: String::from("/local"),
+                source,
+                source_display,
+                fs_type: String::from("ext4"),
+                backend: MountBackend::Storage,
+                flags: 0,
+                stack_seq: 2,
+                event_id: 2,
+                propagation: MountPropagation::Private,
+                peer_group_id: None,
+                master_group_id: None,
+                access_seq: 0,
+                expire_mark_seq: None,
+            });
+        } else if let Some(source) = super::block_device_source_path("/dev/vdb") {
             super::ensure_root_mount_directory("user");
             mounts.push(MountRecord {
                 target: String::from("/user"),
@@ -369,7 +389,7 @@ impl MountNamespaceState {
 }
 
 fn build_initial_vfs_namespace() -> Arc<VfsMountNamespace> {
-    let root_inode = block_root(0).expect("[vfs] /dev/vda has no ext4 root inode");
+    let root_inode = initial_root_inode();
     let root_fs: Arc<dyn VfsFileSystem> = Ext4Vfs::new(root_inode);
     let namespace = VfsMountNamespace::new(root_fs);
     let root = namespace.root_path();
@@ -382,7 +402,20 @@ fn build_initial_vfs_namespace() -> Arc<VfsMountNamespace> {
         )
         .expect("[vfs] failed to mark the initial root mount shared");
 
-    if let Some(user_root) = block_root(1) {
+    if let Some(local_index) = local_boot_disk_index() {
+        let target = vfs_lookup_absolute(&namespace, "/local")
+            .expect("[vfs] initial /local mountpoint is missing");
+        let local_root = block_root(local_index).expect("[vfs] local evaluation disk is missing");
+        let filesystem: Arc<dyn VfsFileSystem> = Ext4Vfs::new(local_root);
+        let source = alloc::format!("/dev/vd{}", (b'a' + local_index as u8) as char);
+        let mounted = namespace
+            .mount_with_source(&target, filesystem, VfsMountFlags::default(), source)
+            .expect("[vfs] failed to mount the local evaluation disk at /local");
+        let mounted_root = VfsPath::new(Arc::clone(&mounted), Arc::clone(mounted.root()));
+        namespace
+            .set_propagation(&mounted_root, VfsMountPropagation::Private)
+            .expect("[vfs] failed to make /local private");
+    } else if let Some(user_root) = block_root(1) {
         let target = vfs_lookup_absolute(&namespace, "/user")
             .expect("[vfs] initial /user mountpoint is missing");
         let filesystem: Arc<dyn VfsFileSystem> = Ext4Vfs::new(user_root);

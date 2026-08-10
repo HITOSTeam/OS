@@ -2705,6 +2705,7 @@ impl MemorySet {
     }
 
     fn place_initial_user_stack_bottom(&self, requested_bottom: usize) -> usize {
+        #[cfg_attr(not(target_arch = "riscv64"), allow(unused_mut))]
         let mut bottom = requested_bottom;
         #[cfg(target_arch = "riscv64")]
         if self.has_user_kernel_mappings {
@@ -2819,6 +2820,7 @@ impl MemorySet {
     }
 
     fn try_map_trampoline(&mut self) -> bool {
+        #[cfg_attr(not(target_arch = "riscv64"), allow(unused_mut))]
         let mut flags = PTEFlags::from(MapPermission::R | MapPermission::X);
         #[cfg(target_arch = "riscv64")]
         {
@@ -4497,6 +4499,7 @@ impl MemorySet {
             }
             #[cfg(target_arch = "riscv64")]
             let frame = self.tracked_frame_for_user_pte(vpn, old_pte.ppn());
+            #[cfg(target_arch = "riscv64")]
             let final_executable = pte_flags_executable(flags);
 
             let mut batch = self.begin_page_table_update();

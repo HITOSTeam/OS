@@ -9,3 +9,5 @@ kernel_release.elf
 .cargo
 src/link_app.asm
 kernel_debug.bin
+
+*.log
