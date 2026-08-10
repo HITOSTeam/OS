@@ -221,7 +221,7 @@ impl PageDesc {
         let encoded = (value as u32) << PAGE_STATE_ICACHE_SHIFT;
         let _ = self
             .state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
                 Some((state & !PAGE_STATE_ICACHE_MASK) | encoded)
             });
     }
@@ -716,14 +716,14 @@ pub fn init_frame_allocator() {
     let memory_start = PhysAddr::from(phys_mem_start()).ceil();
     let memory_end = PhysAddr::from(phys_mem_end()).floor();
     init_page_desc_table(memory_start, memory_end);
-    let kernel_end = PhysAddr::from(ekernel as usize).ceil();
+    let kernel_end = PhysAddr::from(ekernel as *const () as usize).ceil();
     with_frame_allocator(|allocator| {
         allocator.init(kernel_end, memory_end);
         #[cfg(target_arch = "loongarch64")]
         {
             use crate::config::phys_mem_start;
             let low_start = PhysAddr::from(phys_mem_start()).ceil();
-            let kernel_start = PhysAddr::from(stext as usize).floor();
+            let kernel_start = PhysAddr::from(stext as *const () as usize).floor();
             allocator.add_range(low_start, kernel_start);
         }
     });

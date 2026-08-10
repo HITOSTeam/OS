@@ -1,6 +1,5 @@
 #![no_std]
 #![feature(alloc_error_handler)]
-#![feature(str_from_raw_parts)]
 pub mod utils;
 extern crate alloc;
 mod arch;

@@ -499,7 +499,7 @@ fn adjust_active_counter(counter: &AtomicUsize, was_active: bool, is_active: boo
         }
         (true, false) => {
             counter
-                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .ok();
@@ -735,7 +735,7 @@ fn process_delayed_tid_clears(current_ms: usize) {
             if clears[i].deadline_ms <= current_ms {
                 due.push(clears.swap_remove(i));
                 DELAYED_TID_CLEAR_COUNT
-                    .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                    .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
                         value.checked_sub(1)
                     })
                     .ok();
@@ -939,7 +939,7 @@ pub fn set_itimer_timer(
         if let Some(idx) = timers.iter().position(|t| t.pid == pid && t.which == which) {
             let old = timers.swap_remove(idx);
             ALARM_TIMER_ACTIVE_COUNT
-                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .ok();
@@ -1060,7 +1060,7 @@ fn process_alarm_timers(current_ms: usize) {
             {
                 let timer = timers.swap_remove(idx);
                 ALARM_TIMER_ACTIVE_COUNT
-                    .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                    .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
                         value.checked_sub(1)
                     })
                     .ok();
@@ -1290,7 +1290,7 @@ pub fn check_timer() {
 
         if let Some(timer) = popped {
             SLEEP_TIMER_ACTIVE_COUNT
-                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .ok();

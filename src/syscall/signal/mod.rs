@@ -49,7 +49,7 @@ fn sigreturn_trampoline_va() -> usize {
         fn alltraps();
         fn sigreturn_trampoline();
     }
-    sigreturn_trampoline as usize - alltraps as usize + SIGRETURN_TRAMPOLINE
+    sigreturn_trampoline as *const () as usize - alltraps as *const () as usize + SIGRETURN_TRAMPOLINE
 }
 
 fn translate_sender_pid_for_receiver(sender_pid: i32) -> i32 {

@@ -1113,7 +1113,7 @@ pub fn bootstrap_init() {
         csr_write::<0x0>(crmd);
 
         // TLB refill entry (must be 4K aligned).
-        csr_write::<0x88>(__rfill as usize);
+        csr_write::<0x88>(__rfill as *const () as usize);
 
         // STLB page size and refill page size (4KB).
         let page_bits = crate::config::PAGE_SIZE_BITS;

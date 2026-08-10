@@ -645,7 +645,7 @@ impl TaskControlBlock {
                 res: Some(res),
                 trap_cx_ppn,
                 //创建应用的时候把它设置为 trap_return，这样第一次切换时会从 trap_return 进入
-                task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
+                task_cx: TaskContext::set_for_app(trap_return as *const () as usize, kstack_top),
                 task_status: TaskStatus::Ready,
                 exit_code: None,
                 join_waiters: VecDeque::new(),
@@ -762,7 +762,7 @@ impl TaskControlBlock {
                 res: Some(res),
                 trap_cx_ppn,
                 // 任务切换上下文：首次被调度时从 trap_return 入口返回用户态，sp 指向新内核栈顶
-                task_cx: TaskContext::set_for_app(trap_return as usize, kstack_top),
+                task_cx: TaskContext::set_for_app(trap_return as *const () as usize, kstack_top),
                 // 进入就绪状态，等待调度器拣选
                 task_status: TaskStatus::Ready,
                 exit_code: None,

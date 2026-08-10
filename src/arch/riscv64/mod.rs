@@ -4,6 +4,8 @@ pub mod mm;
 pub mod task;
 pub mod trap;
 
+// 此重导出仅在内核二进制目标中调用；库目标会将其判定为未使用。
+#[allow(unused_imports)]
 pub use irq::{enable_external_irq, handle_external_interrupt, init_external_interrupts};
 
 use alloc::sync::Arc;

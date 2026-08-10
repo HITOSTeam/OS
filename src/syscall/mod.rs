@@ -461,7 +461,7 @@ fn trace_syscall_entry(id: usize, args: &[usize; 6]) {
         };
         if is_cyclic {
             let left = CYCLIC_SYSCALL_LOGS
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
                     if val == 0 { None } else { Some(val - 1) }
                 })
                 .unwrap_or(0);

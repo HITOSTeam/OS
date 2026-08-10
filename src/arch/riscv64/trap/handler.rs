@@ -71,7 +71,7 @@ fn set_kernel_trap_entry() {
         fn alltraps();
         fn alltraps_k();
     }
-    let alltraps_k_va = alltraps_k as usize;
+    let alltraps_k_va = alltraps_k as *const () as usize;
     // SAFETY: stvec write is valid in S-mode; alltraps_k_va is a valid kernel trap entry address.
     unsafe {
         let to_write = riscv::register::stvec::Stvec::new(
@@ -743,7 +743,7 @@ pub fn trap_return() -> ! {
         fn alltraps();
         fn restore();
     }
-    let restore_va = restore as usize - alltraps as usize + TRAMPOLINE;
+    let restore_va = restore as *const () as usize - alltraps as *const () as usize + TRAMPOLINE;
     // SAFETY: restore_va points to valid trampoline code; trap_cx_ptr and user_satp are valid.
     // This asm block never returns; control transfers to user mode via sret in the trampoline.
     if need_icache_flush {

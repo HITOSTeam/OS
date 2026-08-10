@@ -254,7 +254,7 @@ fn clone_from_parts(
             // 内核陷入相关字段：内核页表、内核栈顶、陷入入口
             trap_cx.kernel_satp = kernel_token();
             trap_cx.kernel_sp = new_task.kstack_top();
-            trap_cx.trap_handler = trap_handler as usize;
+            trap_cx.trap_handler = trap_handler as *const () as usize;
             // CLONE_CHILD_CLEARTID：记录退出时要清零并 futex 唤醒的用户地址
             if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
                 new_inner.clear_child_tid = Some(_ctid);
@@ -464,7 +464,7 @@ fn clone_from_parts(
         // 内核态相关字段：内核页表、内核栈、陷入入口
         trap_cx.kernel_satp = kernel_token();
         trap_cx.kernel_sp = task.kstack_top();
-        trap_cx.trap_handler = trap_handler as usize;
+        trap_cx.trap_handler = trap_handler as *const () as usize;
         // CLONE_CHILD_CLEARTID：子退出时清零 _ctid 并 futex 唤醒等待者
         if (flags & CLONE_CHILD_CLEARTID) != 0 && _ctid != 0 {
             task_inner.clear_child_tid = Some(_ctid);

@@ -1826,7 +1826,7 @@ impl ProcessControlBlock {
             user_sp,
             KERNEL_SPACE.lock().token(),
             kstack_top,
-            trap_handler as usize,
+            trap_handler as *const () as usize,
         );
         tcx.x[REG_A0] = args.len();
         tcx.x[REG_A1] = argv_base;
@@ -2015,7 +2015,7 @@ impl ProcessControlBlock {
             user_sp,
             KERNEL_SPACE.lock().token(),
             task.kstack_top(),
-            trap_handler as usize,
+            trap_handler as *const () as usize,
         );
         trap_cx.x[REG_A0] = args.len();
         trap_cx.x[REG_A1] = argv_base;
@@ -2140,7 +2140,7 @@ impl ProcessControlBlock {
             user_sp,
             KERNEL_SPACE.lock().token(),
             task.kstack_top(),
-            trap_handler as usize,
+            trap_handler as *const () as usize,
         );
         trap_cx.x[REG_A0] = args.len();
         trap_cx.x[REG_A1] = argv_base;

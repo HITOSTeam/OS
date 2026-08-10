@@ -238,7 +238,7 @@ impl File for UserfaultfdFile {
 
     fn on_fd_close(&self) {
         let result =
-            ACTIVE_USERFAULTFD_REFS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |refs| {
+            ACTIVE_USERFAULTFD_REFS.try_update(Ordering::AcqRel, Ordering::Acquire, |refs| {
                 refs.checked_sub(1)
             });
         debug_assert!(result.is_ok(), "userfaultfd descriptor reference underflow");

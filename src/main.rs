@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
-#![feature(str_from_raw_parts)]
 #![allow(unreachable_code)]
 use core::{arch::global_asm, panic};
 extern crate alloc;
@@ -70,8 +69,8 @@ fn clear_bss() {
         safe fn ebss();
     }
     unsafe {
-        let bss_start = sbss as usize;
-        let bss_end = ebss as usize;
+        let bss_start = sbss as *const () as usize;
+        let bss_end = ebss as *const () as usize;
         let bss_size = bss_end - bss_start;
         core::ptr::write_bytes(bss_start as *mut u8, 0, bss_size);
     }
@@ -317,7 +316,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         let num_of_apps = unsafe { *(num_user_apps as *const i64) };
         println!(
             "Number of user apps: {}, from adress {}",
-            num_of_apps, num_user_apps as usize
+            num_of_apps, num_user_apps as *const () as usize
         );
         println!(
             "[kernel] bootstrap hart {} starting with dtb @ {:#x}",

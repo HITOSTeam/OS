@@ -662,7 +662,7 @@ pub fn heap_test() {
         safe fn sbss();
         safe fn ebss();
     }
-    let bss_range = sbss as usize..ebss as usize;
+    let bss_range = sbss as *const () as usize..ebss as *const () as usize;
     let a = Box::new(5);
     assert_eq!(*a, 5);
     assert!(bss_range.contains(&(a.as_ref() as *const _ as usize)));

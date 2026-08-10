@@ -97,7 +97,7 @@ fn set_kernel_trap_entry() {
     unsafe extern "C" {
         fn alltraps_k();
     }
-    write_eentry(alltraps_k as usize);
+    write_eentry(alltraps_k as *const () as usize);
 }
 
 fn set_user_trap_entry() {
@@ -429,7 +429,7 @@ pub fn trap_return() -> ! {
             println!(
                 "[trap_return] enter hart={} trap_return_va={:#x}",
                 super::super::hart_id(),
-                trap_return as usize
+                trap_return as *const () as usize
             );
         }
     }
@@ -520,7 +520,7 @@ pub fn trap_return() -> ! {
     }
 
     //利用TRAMPOLINE相对于大家的地址都是一样的,每个 TRAMPOLINE 内部结构也是一样的
-    let restore_va = restore as usize - alltraps as usize + TRAMPOLINE;
+    let restore_va = restore as *const () as usize - alltraps as *const () as usize + TRAMPOLINE;
     // SAFETY: `restore_va` points at the trampoline restore stub, and the argument registers are
     // loaded with the trap context pointer and user token expected by that stub. Jumping to the
     // wrong address or with mismatched registers would not return to userspace correctly.

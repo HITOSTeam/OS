@@ -1634,7 +1634,7 @@ pub fn idle_task() {
                     task_inner.task_cx.ra,
                     task_inner.task_cx.sp,
                     trap_cx,
-                    crate::trap::trap_return as usize
+                    crate::trap::trap_return as *const () as usize
                 );
             }
             if DEBUG_SCHED {
