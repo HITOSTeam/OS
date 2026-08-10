@@ -56,6 +56,7 @@ mod layout;
 mod map_area;
 mod mm_ref;
 mod range;
+mod resident_page_map;
 mod rollback;
 mod vma;
 

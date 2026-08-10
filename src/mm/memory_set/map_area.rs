@@ -1,3 +1,4 @@
+use super::resident_page_map::ResidentPageMap;
 use super::*;
 use bitflags::*;
 
@@ -45,7 +46,7 @@ pub(super) enum UserExecutablePteMode<'a> {
 pub(super) struct MapArea {
     vpn_range: VPNRange,
     /// 已经分配或共享到本地址空间的物理页。
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    data_frames: ResidentPageMap<FrameTracker>,
     /// mprotect(PROT_NONE) 等场景下暂存被拿掉的 PTE 标志。
     saved_pte_flags: BTreeMap<VirtPageNum, PTEFlags>,
     charged_pages: usize,
@@ -65,7 +66,7 @@ impl MapArea {
         let end_vpn: VirtPageNum = end_va.ceil();
         Self {
             vpn_range: VPNRange::new(start_vpn, end_vpn),
-            data_frames: BTreeMap::new(),
+            data_frames: ResidentPageMap::new(),
             saved_pte_flags: BTreeMap::new(),
             charged_pages: 0,
             map_type,
@@ -76,7 +77,7 @@ impl MapArea {
     pub fn from_another(another: &MapArea) -> Self {
         Self {
             vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
-            data_frames: BTreeMap::new(),
+            data_frames: ResidentPageMap::new(),
             saved_pte_flags: BTreeMap::new(),
             charged_pages: another.charged_pages,
             map_type: another.map_type,
@@ -133,11 +134,11 @@ impl MapArea {
     }
 
     pub(super) fn tracked_vpns(&self) -> impl Iterator<Item = VirtPageNum> + '_ {
-        self.data_frames.keys().copied()
+        self.data_frames.keys()
     }
 
     pub(super) fn tracked_frames(&self) -> impl Iterator<Item = (VirtPageNum, &FrameTracker)> + '_ {
-        self.data_frames.iter().map(|(&vpn, frame)| (vpn, frame))
+        self.data_frames.iter()
     }
 
     #[cfg(debug_assertions)]
@@ -224,7 +225,7 @@ impl MapArea {
         &self,
         start: VirtPageNum,
         end: VirtPageNum,
-        data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+        data_frames: ResidentPageMap<FrameTracker>,
         saved_pte_flags: BTreeMap<VirtPageNum, PTEFlags>,
     ) -> Self {
         let mut area = MapArea::from_another(self);
@@ -249,11 +250,11 @@ impl MapArea {
         let area_end = self.end_vpn();
         debug_assert!(start >= area_start && end <= area_end && start < end);
 
-        let mut left_frames = BTreeMap::new();
-        let mut mid_frames = BTreeMap::new();
-        let mut right_frames = BTreeMap::new();
+        let mut left_frames = ResidentPageMap::new();
+        let mut mid_frames = ResidentPageMap::new();
+        let mut right_frames = ResidentPageMap::new();
         if !self.is_identical() {
-            // Framed 映射才有独立 frame，按切割点拆分 BTreeMap。
+            // Framed 映射才有独立 frame，按切割点拆分 resident-page sidecar。
             // split_off(key) 返回 >= key 的部分，原 map 保留 < key 的部分。
             let mut remaining = core::mem::take(&mut self.data_frames);
             right_frames = remaining.split_off(&end); // [end, ...)
@@ -281,8 +282,8 @@ impl MapArea {
         self.vpn_range = VPNRange::new(new_start, new_end);
 
         if !self.is_identical() {
-            let mut remapped = BTreeMap::new();
-            for (vpn, frame) in self.data_frames {
+            let mut remapped = ResidentPageMap::new();
+            for (vpn, frame) in self.data_frames.into_entries() {
                 remapped.insert(shift_vpn_by_delta(vpn, delta)?, frame);
             }
             self.data_frames = remapped;

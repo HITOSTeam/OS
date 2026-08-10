@@ -69,6 +69,7 @@ static FILE_FAULT_AROUND_WINDOW_PAGES: AtomicU64 = AtomicU64::new(0);
 static FILE_FAULT_AROUND_READY_PAGES: AtomicU64 = AtomicU64::new(0);
 static FILE_FAULT_PTES_MAPPED: AtomicU64 = AtomicU64::new(0);
 static MM_DATA_FRAME_INSERTS: AtomicU64 = AtomicU64::new(0);
+static MM_RESIDENT_CHUNK_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 static DCACHE_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 static DCACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -498,6 +499,13 @@ pub fn record_heap_large_shard_fallback() {
 }
 
 #[inline]
+pub fn record_mm_resident_chunk_allocation() {
+    if DEBUG_PERF {
+        MM_RESIDENT_CHUNK_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
 pub fn record_heap_allocation_failure() {
     if DEBUG_PERF {
         HEAP_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -573,6 +581,7 @@ icache_clean_bypasses: {icache_clean_bypasses}\n"
     let file_fault_around_ready_pages = FILE_FAULT_AROUND_READY_PAGES.load(Ordering::Relaxed);
     let file_fault_ptes_mapped = FILE_FAULT_PTES_MAPPED.load(Ordering::Relaxed);
     let mm_data_frame_inserts = MM_DATA_FRAME_INSERTS.load(Ordering::Relaxed);
+    let mm_resident_chunk_allocations = MM_RESIDENT_CHUNK_ALLOCATIONS.load(Ordering::Relaxed);
     let dcache_lookups = DCACHE_LOOKUPS.load(Ordering::Relaxed);
     let dcache_hits = DCACHE_HITS.load(Ordering::Relaxed);
     let dcache_revalidated_hits = DCACHE_REVALIDATED_HITS.load(Ordering::Relaxed);
@@ -681,6 +690,7 @@ file_fault_around_window_pages: {file_fault_around_window_pages}\n\
 file_fault_around_ready_pages: {file_fault_around_ready_pages}\n\
 file_fault_ptes_mapped: {file_fault_ptes_mapped}\n\
 mm_data_frame_inserts: {mm_data_frame_inserts}\n\
+mm_resident_chunk_allocations: {mm_resident_chunk_allocations}\n\
 dcache_lookups: {dcache_lookups}\n\
 dcache_hits: {dcache_hits}\n\
 dcache_revalidated_hits: {dcache_revalidated_hits}\n\
