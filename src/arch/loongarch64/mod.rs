@@ -73,7 +73,7 @@ const FPU_CSR_ALL_E: u32 = 0x0000_001f;
 static ELF_HWCAP_INTERSECTION: AtomicUsize = AtomicUsize::new(ELF_HWCAP_FEATURE_MASK);
 
 #[cfg(feature = "loongarch_board")]
-const UART_BASE: usize = 0x1fe2_0000;
+const UART_BASE: usize = 0x8000_0000_1fe2_0000;
 #[cfg(not(feature = "loongarch_board"))]
 const UART_BASE: usize = 0x1fe0_01e0;
 
@@ -116,8 +116,12 @@ fn uart_init_once() {
 
 pub fn console_putchar(c: usize) {
     uart_init_once();
-    // SAFETY: UART_RBR_THR is the MMIO address for UART transmit hold register.
+    // SAFETY: UART_RBR_THR/LSR are MMIO registers for the 16550-compatible UART.
     unsafe {
+        #[cfg(feature = "loongarch_board")]
+        while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {
+            core::hint::spin_loop();
+        }
         write_volatile(UART_RBR_THR as *mut u8, c as u8);
     }
 }
@@ -125,7 +129,11 @@ pub fn console_putchar(c: usize) {
 pub fn console_flush() {
     uart_init_once();
     // SAFETY: UART_LSR is the MMIO address for UART line status register.
-    unsafe { while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {} }
+    unsafe {
+        while read_volatile(UART_LSR as *const u8) & 0x20 == 0 {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 pub fn console_getchar() -> usize {
@@ -173,6 +181,8 @@ pub fn wait_for_interrupt() {
 
 pub fn disable_direct_map_windows() {
     // SAFETY: DMW0/DMW1 (CSR 0x180/0x181) write and invtlb are valid in kernel mode.
+    // The LS2K1000LA entry deliberately keeps its PLV0-only, load/store-only
+    // DMW2 uncached device window alive for early and runtime UART MMIO.
     unsafe {
         csr_write::<0x180>(0);
         csr_write::<0x181>(0);

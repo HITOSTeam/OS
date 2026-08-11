@@ -169,13 +169,18 @@ pub fn trap_from_kernel(trap_cx: &mut TrapContext) {
             return;
         }
     }
+    let badv = read_badv();
+    let badi = read_badi();
+    if ecode == ECODE_ADDR_ALIGN && super::unaligned::emulate_kernel(trap_cx, badv, badi as u32) {
+        return;
+    }
     panic!(
         "Unhandled kernel trap: hart={} estat={:#x} ecode={} badv={:#x} badi={:#x} era={:#x}",
         super::super::hart_id(),
         estat,
         ecode,
-        read_badv(),
-        read_badi(),
+        badv,
+        badi,
         trap_cx.sepc
     );
 }
@@ -411,12 +416,23 @@ pub fn trap_handler() {
         };
         let era = get_trap_context().sepc;
         crate::task::signal::force_current_fault_signal(SIGILL, si_code, era);
+    } else if ecode == ECODE_ADDR_ALIGN {
+        // Match Linux CONFIG_ARCH_STRICT_ALIGN and the example LoongArch
+        // kernels: emulate ordinary integer loads/stores, but preserve SIGBUS
+        // for unsupported instructions or inaccessible user memory.
+        super::super::enable_interrupts();
+        let token = get_current_token();
+        let emulated = {
+            let cx = get_trap_context();
+            super::unaligned::emulate_user(cx, token, badv, badi as u32)
+        };
+        if !emulated {
+            handle_user_exception(ecode, badv);
+        }
+        super::super::disable_interrupts();
     } else {
         super::super::enable_interrupts();
-        match ecode {
-            ECODE_ADDR_ERROR | ECODE_ADDR_ALIGN => handle_user_exception(ecode, badv),
-            _ => handle_user_exception(ecode, badv),
-        }
+        handle_user_exception(ecode, badv);
         super::super::disable_interrupts();
     }
 

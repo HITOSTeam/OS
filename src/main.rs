@@ -94,26 +94,6 @@ fn clear_bss() {
     }
 }
 
-#[cfg(all(
-    target_arch = "loongarch64",
-    feature = "loongarch_board",
-    not(feature = "loongarch_board_smoke")
-))]
-#[inline(always)]
-fn board_early_uart_marker(byte: u8) {
-    const UART_THR: usize = 0x1fe2_0000;
-    const UART_LSR: usize = UART_THR + 5;
-    // SAFETY: U-Boot configured UART0, and the board entry establishes the
-    // low-address DMW before entering Rust. This is temporary early-boot
-    // instrumentation and touches only UART status/transmit registers.
-    unsafe {
-        while core::ptr::read_volatile(UART_LSR as *const u8) & 0x20 == 0 {
-            core::hint::spin_loop();
-        }
-        core::ptr::write_volatile(UART_THR as *mut u8, byte);
-    }
-}
-
 // boot hart will run this
 #[cfg(target_arch = "riscv64")]
 fn start_other_harts(boot_hart_id: usize, dtb_pa: usize, present_mask: usize) {
@@ -399,8 +379,6 @@ fn loongarch_main(hart_id: usize, firmware_args: Option<[usize; 4]>) -> ! {
         .is_ok()
     {
         clear_bss();
-        #[cfg(feature = "loongarch_board")]
-        board_early_uart_marker(b'S');
         BOOT_BSS_CLEARED.store(true, Ordering::Release);
         if let Some([a0, a1, a2, a3]) = firmware_args {
             println!(
@@ -461,6 +439,5 @@ extern "C" fn rust_main(
     boot_a3: usize,
     hart_id: usize,
 ) -> ! {
-    board_early_uart_marker(b'R');
     loongarch_main(hart_id, Some([boot_a0, boot_a1, boot_a2, boot_a3]))
 }

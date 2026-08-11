@@ -142,6 +142,17 @@ BOARD_USER_IMG          := $(BOARD_RAM_IMAGE_DIR)/congcore-2k1000la-user.ext4
 BOARD_SYSTEM_UIMAGE     := $(BOARD_SYSTEM_IMG).uimg
 BOARD_USER_UIMAGE       := $(BOARD_USER_IMG).uimg
 BOARD_UIMAGE_TOOL       := $(ROOT_DIR)/tools/mk_legacy_uimage.py
+# LA264 does not provide the transparent unaligned-access behavior assumed by
+# Rust's generic LoongArch bare-metal target. Keep these flags board-local so
+# QEMU builds retain their existing feature policy, and apply the same ABI/code
+# generation constraints to the kernel and every userspace binary in the RAM
+# bundle.
+BOARD_RUSTFLAGS         := -Cforce-frame-pointers=yes -Ctarget-feature=-ual,-lsx,-lasx,-lvz
+# The distributed LoongArch bare-metal `core` is built with `+ual`. Rebuild the
+# board sysroot crates under BOARD_RUSTFLAGS as well; otherwise routines such as
+# core::fmt can still issue unaligned word loads before the kernel trap handler
+# exists, even though CongCore itself was compiled with `-ual`.
+BOARD_BUILD_STD         := -Z build-std=core,alloc,compiler_builtins
 LLVM_STRIP              ?= llvm-strip
 
 # Only pass -b <base> to the packer when a base image path is configured.
@@ -255,8 +266,10 @@ board_smoke:
 		exit 2; \
 	fi
 	@mkdir -p "$(ROOT_DIR)/.tmp" "$(BOARD_SMOKE_ARTIFACT_DIR)"
-	@TMPDIR="$(ROOT_DIR)/.tmp" CARGO_TARGET_DIR="$(BOARD_SMOKE_TARGET_DIR)" \
-		cargo build --release --bin os --target "$(TARGET)" --features loongarch_board_smoke
+	@RUSTFLAGS="$(BOARD_RUSTFLAGS)" TMPDIR="$(ROOT_DIR)/.tmp" \
+		CARGO_TARGET_DIR="$(BOARD_SMOKE_TARGET_DIR)" \
+		cargo build $(BOARD_BUILD_STD) --release --bin os --target "$(TARGET)" \
+		--features loongarch_board_smoke
 	@$(LLVM_STRIP) --strip-all -o "$(BOARD_SMOKE_ELF)" "$(BOARD_SMOKE_BUILD_ELF)"
 	@echo "✅ LS2K1000LA smoke ELF: $(BOARD_SMOKE_ELF)"
 	@sha256sum "$(BOARD_SMOKE_ELF)"
@@ -269,8 +282,10 @@ board_kernel:
 		exit 2; \
 	fi
 	@mkdir -p "$(ROOT_DIR)/.tmp" "$(BOARD_KERNEL_ARTIFACT_DIR)"
-	@TMPDIR="$(ROOT_DIR)/.tmp" CARGO_TARGET_DIR="$(BOARD_KERNEL_TARGET_DIR)" \
-		cargo build --release --bin os --target "$(TARGET)" --features loongarch_board
+	@RUSTFLAGS="$(BOARD_RUSTFLAGS)" TMPDIR="$(ROOT_DIR)/.tmp" \
+		CARGO_TARGET_DIR="$(BOARD_KERNEL_TARGET_DIR)" \
+		cargo build $(BOARD_BUILD_STD) --release --bin os --target "$(TARGET)" \
+		--features loongarch_board
 	@$(LLVM_STRIP) --strip-all -o "$(BOARD_KERNEL_ELF)" "$(BOARD_KERNEL_BUILD_ELF)"
 	@gzip -k -f -n -9 "$(BOARD_KERNEL_ELF)"
 	@python3 "$(BOARD_UIMAGE_TOOL)" --input "$(BOARD_KERNEL_ELF).gz" \
@@ -284,13 +299,15 @@ board_kernel:
 # the interactive shell, and the first manual-inspection utilities. The
 # deterministic legacy-image wrappers let U-Boot's `bootm start` + `bootm
 # loados` decompress them even when the board firmware omits `unzip`.
-board_ram_images: prepare-cargo
+board_ram_images:
 	@if [ "$(ARCH)" != "loongarch64" ]; then \
 		echo "❌ board_ram_images requires ARCH=loongarch64"; \
 		exit 2; \
 	fi
-	@cd "$(USER_DIR)" && CARGO_TARGET_DIR=target \
-		cargo build --release --target "$(TARGET)" \
+	@# Pass the target and board flags explicitly. Do not run prepare-cargo here:
+	@# board bundles must not overwrite a developer's user/.cargo/config.toml.
+	@cd "$(USER_DIR)" && RUSTFLAGS="$(BOARD_RUSTFLAGS)" CARGO_TARGET_DIR=target \
+		cargo build $(BOARD_BUILD_STD) --release --target "$(TARGET)" \
 		$(foreach bin,$(BOARD_MIN_USER_BINS),--bin $(bin))
 	@rm -rf "$(BOARD_MIN_USER_DIR)"
 	@mkdir -p "$(BOARD_MIN_USER_DIR)" "$(BOARD_RAM_IMAGE_DIR)"

@@ -113,7 +113,9 @@ sigreturn_trampoline:
     syscall 0
 
     .section .text
-    .align 2
+    # EENTRY stores only a page base; keep the kernel vector page-aligned just
+    # like the user trampoline and the reference LoongArch kernels.
+    .align 12
 alltraps_k:
     addi.d $sp, $sp, -38*8
     st.d $r1, $sp, 1*8
@@ -131,6 +133,10 @@ alltraps_k:
     st.d $r0, $sp, 35*8
     st.d $r0, $sp, 36*8
     st.d $r0, $sp, 37*8
+    # The register array also represents r3. Save the pre-exception SP so an
+    # emulated load/store can use or update it like any other GPR.
+    addi.d $t0, $sp, 38*8
+    st.d $t0, $sp, 3*8
     add.d $a0, $sp, $r0
     bl trap_from_kernel
 
@@ -146,5 +152,5 @@ restore_k:
         LOAD_GP %n
         .set n, n+1
     .endr
-    addi.d $sp, $sp, 38*8
+    ld.d $sp, $sp, 3*8
     ertn
