@@ -1,7 +1,13 @@
 mod async_queue;
+#[cfg(feature = "loongarch_board")]
+mod ram_block;
+#[cfg(not(feature = "loongarch_board"))]
 mod virtio_blk;
 
 pub use async_queue::AsyncBlockDiagnostics;
+#[cfg(feature = "loongarch_board")]
+pub use ram_block::RamBlockDevice;
+#[cfg(not(feature = "loongarch_board"))]
 pub use virtio_blk::VirtIOBlock;
 
 use alloc::sync::Arc;
@@ -12,17 +18,20 @@ use lazy_static::*;
 
 use crate::println;
 
+#[cfg(feature = "loongarch_board")]
+pub type BlockDeviceImpl = crate::drivers::block::RamBlockDevice;
+#[cfg(not(feature = "loongarch_board"))]
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 static BLOCK_REGISTRY_READY: AtomicBool = AtomicBool::new(false);
 static NEXT_FALLBACK_POLL_MS: AtomicUsize = AtomicUsize::new(0);
 const FALLBACK_POLL_INTERVAL_MS: usize = 10;
 
-// VirtIO block devices in stable discovery order.
+// Platform block devices in stable discovery order.
 //
 // QEMU attaches the first drive as `/dev/vda`, the second as `/dev/vdb`, and
-// so on. Keep the registry independent from filesystem roles: whether a
-// device is the system root, `/user`, or a test-data disk is decided by the
-// mount configuration rather than by the block driver.
+// so on. LS2K1000LA exposes the two fixed RAM images in the same order. Keep
+// the registry independent from filesystem roles: whether a device is the
+// system root, `/user`, or a test-data disk is decided by mount configuration.
 lazy_static! {
     static ref BLOCK_DRIVER_DEVICES: Vec<Arc<BlockDeviceImpl>> = {
         let devices = BlockDeviceImpl::probe_all()
@@ -39,7 +48,7 @@ lazy_static! {
         .collect();
 }
 
-/// Dispatch a platform interrupt to the matching VirtIO block device.
+/// Dispatch a platform interrupt to the matching block device.
 pub fn handle_irq(irq: usize) -> bool {
     let mut handled = false;
     for device in BLOCK_DRIVER_DEVICES.iter() {
@@ -89,7 +98,7 @@ pub fn block_device_test() {
     let block_device = BLOCK_DEVICES
         .first()
         .cloned()
-        .expect("VirtIO root block device not found");
+        .expect("root block device not found");
     let mut write_buffer = [0u8; 512];
     let mut read_buffer = [0u8; 512];
     for i in 0..512 {

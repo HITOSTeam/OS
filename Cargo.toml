@@ -63,6 +63,7 @@ loongArch64 = "0.2.4"
 
 [features]
 loongarch_board = []
+loongarch_board_smoke = ["loongarch_board"]
 perf_diagnostics = ["ext4-fs/block-cache-stats"]
 
 [profile.dev]

@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 /// 默认一秒钟执行 100 个时钟中断。
 const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
-const NSEC_PER_SEC: u128 = 1_000_000_000;
+const NSEC_PER_SEC: u64 = 1_000_000_000;
 const DEFAULT_REALTIME_EPOCH_NS: i64 = 1_700_000_000_000_000_000;
 
 /// Difference between the monotonic clocksource and `CLOCK_REALTIME`.
@@ -50,10 +50,64 @@ pub fn get_time() -> usize {
     read_time()
 }
 
+/// Saturating `value * multiplier / divisor` without putting a software
+/// 128-bit divide on the common path.
+///
+/// Linux clock and scheduler code keeps hot scaling in native-width
+/// arithmetic (`mul_u64_u32_div`, clocksource mult/shift) and uses wider
+/// arithmetic only for ranges whose products are proven to fit. Splitting at
+/// the divisor keeps every current clock and scheduler caller in that range.
+/// A precise, out-of-line wide fallback preserves the contract for future
+/// callers without copying a software u128 divide into every inlined hot path.
+#[cold]
+#[inline(never)]
+fn wide_remainder_div_u64(remainder: u64, multiplier: u64, divisor: u64) -> (u64, bool) {
+    let product = u128::from(remainder) * u128::from(multiplier);
+    let divisor = u128::from(divisor);
+    let quotient = product / divisor;
+    let has_fraction = product % divisor != 0;
+    (quotient.min(u128::from(u64::MAX)) as u64, has_fraction)
+}
+
+#[inline]
+fn mul_div_floor_and_fraction_u64(value: u64, multiplier: u64, divisor: u64) -> (u64, bool) {
+    if divisor == 0 {
+        return (u64::MAX, false);
+    }
+    let quotient = value / divisor;
+    let remainder = value % divisor;
+    let Some(whole) = quotient.checked_mul(multiplier) else {
+        return (u64::MAX, false);
+    };
+    let (tail, has_fraction) = match remainder.checked_mul(multiplier) {
+        Some(product) => (product / divisor, product % divisor != 0),
+        None => wide_remainder_div_u64(remainder, multiplier, divisor),
+    };
+    match whole.checked_add(tail) {
+        Some(floor) => (floor, has_fraction),
+        None => (u64::MAX, false),
+    }
+}
+
+/// Saturating floor variant of [`mul_div_floor_and_fraction_u64`].
+#[inline]
+pub(crate) fn mul_div_floor_u64(value: u64, multiplier: u64, divisor: u64) -> u64 {
+    mul_div_floor_and_fraction_u64(value, multiplier, divisor).0
+}
+
+/// Saturating ceil variant of [`mul_div_floor_u64`].
+#[inline]
+fn mul_div_ceil_u64(value: u64, multiplier: u64, divisor: u64) -> u64 {
+    let (floor, has_fraction) = mul_div_floor_and_fraction_u64(value, multiplier, divisor);
+    if floor == u64::MAX {
+        return floor;
+    }
+    floor.saturating_add(u64::from(has_fraction))
+}
+
 /// get current time in nanoseconds from the monotonic clock source
 pub fn get_time_ns() -> u64 {
-    let freq = clock_freq() as u128;
-    ((read_time() as u128).saturating_mul(1_000_000_000u128) / freq) as u64
+    mul_div_floor_u64(read_time() as u64, NSEC_PER_SEC, clock_freq() as u64)
 }
 
 /// Return the current Unix wall-clock time in nanoseconds.
@@ -134,26 +188,19 @@ fn riscv_tick_delta() -> usize {
 
 #[cfg(target_arch = "loongarch64")]
 fn ns_delta_to_ticks_ceil(delta_ns: u64) -> usize {
-    let rdtime_ticks = (delta_ns as u128)
-        .saturating_mul(clock_freq() as u128)
-        .saturating_add(NSEC_PER_SEC - 1)
-        / NSEC_PER_SEC;
-    let rdtime_period = loongarch_rdtime_tick_delta() as u128;
-    let timer_period = loongarch_timer_tick_delta() as u128;
-    let ticks = rdtime_ticks
-        .saturating_mul(timer_period)
-        .saturating_add(rdtime_period.saturating_sub(1))
-        / rdtime_period.max(1);
-    ticks.clamp(1, usize::MAX as u128) as usize
+    let rdtime_ticks = mul_div_ceil_u64(delta_ns, clock_freq() as u64, NSEC_PER_SEC);
+    let ticks = mul_div_ceil_u64(
+        rdtime_ticks,
+        loongarch_timer_tick_delta() as u64,
+        loongarch_rdtime_tick_delta().max(1) as u64,
+    );
+    ticks.clamp(1, usize::MAX as u64) as usize
 }
 
 #[cfg(target_arch = "riscv64")]
 fn riscv_ns_delta_to_ticks_ceil(delta_ns: u64) -> usize {
-    let ticks = (delta_ns as u128)
-        .saturating_mul(clock_freq() as u128)
-        .saturating_add(NSEC_PER_SEC - 1)
-        / NSEC_PER_SEC;
-    ticks.clamp(1, usize::MAX as u128) as usize
+    let ticks = mul_div_ceil_u64(delta_ns, clock_freq() as u64, NSEC_PER_SEC);
+    ticks.clamp(1, usize::MAX as u64) as usize
 }
 
 /// Program the timer for a sub-tick sleep deadline when it is earlier than the

@@ -14,14 +14,12 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::config::clock_freq;
 use crate::mm::try_read_user_value;
 use crate::syscall::error::{SyscallError, err};
 use crate::task::block_sleep::add_timer;
 use crate::task::processor::{current_process, current_task};
 use crate::task::signal::{RT_SIG_MAX, has_wait_interrupting_pending, signal_bit};
 use crate::task::task_block::TaskControlBlock;
-use crate::time::get_time;
 use crate::trap::get_current_token;
 
 // --- 文件打开标志（与 Linux open(2) 标志位一致）---
@@ -90,12 +88,7 @@ pub(super) struct SigeventUser {
 
 /// 单调时钟当前时间（纳秒），基于硬件 tick 计数换算
 fn monotonic_now_ns() -> u64 {
-    let ticks = get_time() as u128;
-    let freq = clock_freq() as u128;
-    if freq == 0 {
-        return 0;
-    }
-    (ticks.saturating_mul(NSEC_PER_SEC as u128) / freq) as u64
+    crate::time::get_time_ns()
 }
 
 /// 实时时钟当前时间（纳秒），与超时参数使用相同的时钟基准（CLOCK_REALTIME）

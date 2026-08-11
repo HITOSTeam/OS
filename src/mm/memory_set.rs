@@ -2915,6 +2915,17 @@ impl MemorySet {
             ),
             None,
         );
+        #[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
+        {
+            println!("mapping LS2K1000LA RAM filesystems");
+            for &(start, size) in crate::config::BOARD_RAM_DISKS {
+                memory_set.map_identical_range_skip_mapped(
+                    start,
+                    start.saturating_add(size),
+                    MapPermission::R | MapPermission::W,
+                );
+            }
+        }
         println!("mapping memory-mapped registers");
         for pair in MMIO {
             memory_set.push(
@@ -2931,7 +2942,9 @@ impl MemorySet {
         {
             let dtb_start = crate::config::DEVICE_TREE_ADDR;
             let dtb_end = dtb_start + crate::config::DEVICE_TREE_MAX_SIZE;
-            memory_set.map_identical_range_skip_mapped(dtb_start, dtb_end, MapPermission::R);
+            if dtb_start != 0 {
+                memory_set.map_identical_range_skip_mapped(dtb_start, dtb_end, MapPermission::R);
+            }
         }
         #[cfg(target_arch = "riscv64")]
         {

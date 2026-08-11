@@ -16,7 +16,7 @@ pub(super) struct FairTaskEntity {
     /// 下一次退出的时间点
     pub(super) deadline: u128,
     /// 参与计算 averrage vuntime 时候的权重
-    pub(super) weight: u128,
+    pub(super) weight: u64,
     pub(super) task: Arc<TaskControlBlock>,
 }
 
@@ -27,7 +27,7 @@ pub(super) struct FairGroupQueue {
     pub(super) vruntime: u128, // 虚拟运行时间，用于 EEVDF 调度决策（值越小越优先）
     pub(super) min_task_vruntime: u128, // group 内 task entity 的单调 vruntime 基线
     pub(super) vruntime_weighted_sum: u128, // Σ(vruntime * weight), for avg_vruntime
-    pub(super) weight_sum: u128, // Σ(weight) of runnable task entities
+    pub(super) weight_sum: u64, // Σ(weight) of runnable task entities
     pub(super) tasks: BTreeMap<u64, FairTaskEntity>, // 属于该 group 的就绪任务实体
     pub(super) task_order: BTreeSet<(u128, u128, u64)>, // 按 EEVDF deadline/vruntime 排序的实体索引
 }
@@ -76,7 +76,7 @@ impl FairGroupQueue {
             .remove(&(entity.deadline, entity.vruntime, task_id));
         self.vruntime_weighted_sum = self
             .vruntime_weighted_sum
-            .saturating_sub(entity.vruntime.saturating_mul(entity.weight));
+            .saturating_sub(entity.vruntime.saturating_mul(u128::from(entity.weight)));
         self.weight_sum = self.weight_sum.saturating_sub(entity.weight);
         Some(entity)
     }
@@ -96,7 +96,7 @@ impl FairGroupQueue {
         task: Arc<TaskControlBlock>,
         vruntime: u128,
         deadline: u128,
-        weight: u128,
+        weight: u64,
     ) {
         if let Some(old) = self.tasks.insert(
             task_id,
@@ -111,12 +111,12 @@ impl FairGroupQueue {
                 .remove(&(old.deadline, old.vruntime, task_id));
             self.vruntime_weighted_sum = self
                 .vruntime_weighted_sum
-                .saturating_sub(old.vruntime.saturating_mul(old.weight));
+                .saturating_sub(old.vruntime.saturating_mul(u128::from(old.weight)));
             self.weight_sum = self.weight_sum.saturating_sub(old.weight);
         }
         self.vruntime_weighted_sum = self
             .vruntime_weighted_sum
-            .saturating_add(vruntime.saturating_mul(weight));
+            .saturating_add(vruntime.saturating_mul(u128::from(weight)));
         self.weight_sum = self.weight_sum.saturating_add(weight);
         self.task_order.insert((deadline, vruntime, task_id));
     }
@@ -133,17 +133,35 @@ impl FairGroupQueue {
     ///
     /// 结果不会低于 `min_task_vruntime`，保持单调性，防止 avg 倒退。
     /// 若组内没有任何实体且未提供 `current`，返回 `None`。
-    pub(super) fn avg_task_vruntime_with(&self, current: Option<(u128, u128)>) -> Option<u128> {
+    pub(super) fn avg_task_vruntime_with(&self, current: Option<(u128, u64)>) -> Option<u128> {
         let mut weighted_sum = self.vruntime_weighted_sum;
         let mut weight_sum = self.weight_sum;
         if let Some((vruntime, weight)) = current {
-            weighted_sum = weighted_sum.saturating_add(vruntime.saturating_mul(weight));
+            weighted_sum = weighted_sum.saturating_add(vruntime.saturating_mul(u128::from(weight)));
             weight_sum = weight_sum.saturating_add(weight);
         }
         if weight_sum == 0 {
             return None;
         }
-        Some((weighted_sum / weight_sum).max(self.min_task_vruntime))
+        // Linux maintains avg_vruntime relative to min_vruntime so the hot
+        // quotient stays native-width. Keep the existing absolute sum for a
+        // small transition, but center it before dividing. Runnable lag is
+        // bounded, so this is the normal path even with a large absolute
+        // uptime; only an extreme centered sum needs software u128 division.
+        let baseline_sum = self
+            .min_task_vruntime
+            .saturating_mul(u128::from(weight_sum));
+        if weighted_sum <= baseline_sum {
+            return Some(self.min_task_vruntime);
+        }
+        let centered_sum = weighted_sum - baseline_sum;
+        if centered_sum <= u64::MAX as u128 {
+            return Some(
+                self.min_task_vruntime
+                    .saturating_add(u128::from(centered_sum as u64 / weight_sum)),
+            );
+        }
+        Some((weighted_sum / u128::from(weight_sum)).max(self.min_task_vruntime))
     }
 
     /// 计算该组内就绪任务实体的加权平均虚拟运行时间（不包含当前正在运行的任务）。
@@ -258,7 +276,7 @@ pub(super) fn fair_task_id(task: &Arc<TaskControlBlock>) -> u64 {
 
 /// nice weight 转换，越nice 越倾向于给别人，所以运行时的 vruntime要积攒的比较快，对应weight(分母
 /// 就要小)
-pub(super) fn fair_nice_weight(nice: i32) -> u128 {
+pub(super) fn fair_nice_weight(nice: i32) -> u64 {
     // Linux sched_prio_to_weight[-20..19]。
     const NICE_WEIGHTS: [u32; 40] = [
         88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100,
@@ -266,13 +284,18 @@ pub(super) fn fair_nice_weight(nice: i32) -> u128 {
         137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
     ];
     let idx = (nice.clamp(-20, 19) + 20) as usize;
-    u128::from(NICE_WEIGHTS[idx])
+    u64::from(NICE_WEIGHTS[idx])
 }
 
 /// 计算vruntime = 时间 /weight
-fn scale_fair_delta(delta_ns: u64, weight: u128) -> u128 {
-    const NICE_0_LOAD: u128 = 1024;
-    ((u128::from(delta_ns) * NICE_0_LOAD) / weight.max(1)).max(1)
+fn scale_fair_delta(delta_ns: u64, weight: u64) -> u128 {
+    const NICE_0_LOAD: u64 = 1024;
+    u128::from(crate::time::mul_div_floor_u64(
+        delta_ns,
+        NICE_0_LOAD,
+        weight.max(1),
+    ))
+    .max(1)
 }
 
 fn fair_entity_vslice_ns(nice: i32, kind: EnqueueKind) -> u128 {
@@ -304,11 +327,18 @@ fn fair_startup_credit_cap_ns() -> u128 {
     50_000_000
 }
 
-fn inflate_fair_lag_ns(vlag: u128, load: u128, weight: u128) -> u128 {
+fn inflate_fair_lag_ns(vlag: u128, load: u64, weight: u64) -> u128 {
     // Linux PLACE_LAG compensates the entity's contribution to avg_vruntime:
     // lag = vlag * (W + w_i) / W.
-    vlag.saturating_mul(load.saturating_add(weight))
-        .checked_div(load)
+    if load == 0 {
+        return vlag;
+    }
+    if vlag <= u64::MAX as u128 {
+        let extra = crate::time::mul_div_floor_u64(vlag as u64, weight, load);
+        return vlag.saturating_add(u128::from(extra));
+    }
+    vlag.saturating_mul(u128::from(load.saturating_add(weight)))
+        .checked_div(u128::from(load))
         .unwrap_or(vlag)
 }
 
@@ -319,7 +349,7 @@ pub(super) fn place_fair_task_entity(
     group: &mut FairGroupQueue,
     inner: &mut TaskControlBlockInner,
     kind: EnqueueKind,
-    current_entity: Option<(u128, u128)>,
+    current_entity: Option<(u128, u64)>,
 ) -> (u128, u128) {
     let avg_vruntime = group
         .avg_task_vruntime_with(current_entity)
@@ -335,7 +365,7 @@ pub(super) fn place_fair_task_entity(
         // vruntime += delta_ns * 1024 / shares，即权重越大 vruntime 增长越慢，从而获得更多 CPU
         group.vruntime = group
             .vruntime
-            .saturating_add(scale_fair_delta(delta_ns, u128::from(group.shares.max(1))));
+            .saturating_add(scale_fair_delta(delta_ns, group.shares.max(1)));
         inner.fair_vruntime_ns = inner
             .fair_vruntime_ns
             .saturating_add(scale_fair_delta(delta_ns, fair_nice_weight(inner.nice)));
@@ -456,7 +486,7 @@ pub(super) fn current_fair_entity_for_group(
     hart_id: usize,
     group_id: u64,
     now_ns: u64,
-) -> Option<(u128, u128)> {
+) -> Option<(u128, u64)> {
     let current = crate::task::processor::current_task_on_hart(hart_id)?;
     if current.on_cpu.load(core::sync::atomic::Ordering::Acquire) == TaskControlBlock::OFF_CPU {
         return None;

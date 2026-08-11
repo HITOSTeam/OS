@@ -1,4 +1,8 @@
 pub mod csr_defs;
+#[cfg(not(feature = "loongarch_board"))]
+mod irq;
+#[cfg(feature = "loongarch_board")]
+#[path = "irq_ls2k1000la.rs"]
 mod irq;
 pub mod mm;
 pub mod task;
@@ -69,7 +73,7 @@ const FPU_CSR_ALL_E: u32 = 0x0000_001f;
 static ELF_HWCAP_INTERSECTION: AtomicUsize = AtomicUsize::new(ELF_HWCAP_FEATURE_MASK);
 
 #[cfg(feature = "loongarch_board")]
-const UART_BASE: usize = 0x8000_0000_1fe2_0000;
+const UART_BASE: usize = 0x1fe2_0000;
 #[cfg(not(feature = "loongarch_board"))]
 const UART_BASE: usize = 0x1fe0_01e0;
 
@@ -577,11 +581,21 @@ pub fn hart_start(hart_id: usize, start_addr: usize, _opaque: usize) -> usize {
 }
 
 pub fn shutdown() -> ! {
-    // SAFETY: 0x100e_001c is the power control MMIO address on LoongArch QEMU virt.
-    unsafe {
-        (0x100e_001c as *mut u8).write_volatile(0x34);
+    #[cfg(feature = "loongarch_board")]
+    {
+        let _ = disable_interrupts();
+        loop {
+            core::hint::spin_loop();
+        }
     }
-    loop {}
+    #[cfg(not(feature = "loongarch_board"))]
+    {
+        // SAFETY: 0x100e_001c is the power control MMIO address on LoongArch QEMU virt.
+        unsafe {
+            (0x100e_001c as *mut u8).write_volatile(0x34);
+        }
+        loop {}
+    }
 }
 
 pub fn enable_timer_interrupt() {

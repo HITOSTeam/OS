@@ -6,6 +6,13 @@ use std::{env, path::PathBuf};
 fn main() {
     emit_linker_script_arg();
 
+    // The first LS2K1000LA payload deliberately contains no userspace.  Apart
+    // from keeping the image small, skipping app discovery prevents a board
+    // smoke build from rewriting the normal QEMU app manifest.
+    if env::var_os("CARGO_FEATURE_LOONGARCH_BOARD_SMOKE").is_some() {
+        return;
+    }
+
     // 告诉 Cargo 编译时需要重新运行 build.rs 的条件
     println!("cargo:rerun-if-changed=../user/src/bin");
 
@@ -70,9 +77,13 @@ fn main() {
 fn emit_linker_script_arg() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let linker_script = match arch.as_str() {
-        "riscv64" => "src/linker.ld",
-        "loongarch64" => "src/linker_loongarch.ld",
+    let board = env::var_os("CARGO_FEATURE_LOONGARCH_BOARD").is_some();
+    let board_smoke = env::var_os("CARGO_FEATURE_LOONGARCH_BOARD_SMOKE").is_some();
+    let linker_script = match (arch.as_str(), board, board_smoke) {
+        ("loongarch64", _, true) => "src/linker_loongarch_2k1000la.ld",
+        ("loongarch64", true, false) => "src/linker_loongarch_2k1000la_kernel.ld",
+        ("riscv64", _, _) => "src/linker.ld",
+        ("loongarch64", false, false) => "src/linker_loongarch.ld",
         _ => return,
     };
     let linker_script = manifest_dir.join(linker_script);

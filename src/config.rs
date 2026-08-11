@@ -17,6 +17,10 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 16; // 64 KiB
 pub const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 // Kernel heap must be large enough for fork-heavy LTP runs on glibc.
 // 256 MiB reduces allocator OOMs in long `fork13` stress loops.
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
+#[allow(dead_code)]
+pub const KERNEL_HEAP_SIZE: usize = 0x0200_0000; // 32 MiB for the RAM-only board image
+#[cfg(not(all(target_arch = "loongarch64", feature = "loongarch_board")))]
 #[allow(dead_code)]
 pub const KERNEL_HEAP_SIZE: usize = 0x2000_0000; // 512 MiB
 pub const PAGE_SIZE: usize = 0x1000;
@@ -119,11 +123,28 @@ pub fn clock_freq() -> usize {
     if freq == 0 { DEFAULT_CLOCK_FREQ } else { freq }
 }
 
+// The first full board image intentionally manages only the contiguous low
+// bank. The final 16 MiB of that bank holds two RAM-backed ext4 filesystems and
+// is mapped but never handed to the frame allocator.
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
+pub const DEFAULT_MEMORY_START: usize = 0x0020_0000;
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
+pub const DEFAULT_MEMORY_END: usize = 0x0a00_0000;
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
+pub const BOARD_RAM_DISKS: &[(usize, usize)] = &[
+    (0x0a00_0000, 0x0080_0000), // 8 MiB system root
+    (0x0a80_0000, 0x0080_0000), // 8 MiB /user
+];
+
 // QEMU virt RAM starts at 0x8000_0000. Default to 512MiB to match common `-m 512M`.
+#[cfg(not(all(target_arch = "loongarch64", feature = "loongarch_board")))]
 pub const DEFAULT_MEMORY_START: usize = 0x8000_0000;
+#[cfg(not(all(target_arch = "loongarch64", feature = "loongarch_board")))]
 pub const DEFAULT_MEMORY_END: usize = 0xA000_0000;
 
-#[cfg(target_arch = "loongarch64")]
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
+pub const DEVICE_TREE_ADDR: usize = 0;
+#[cfg(all(target_arch = "loongarch64", not(feature = "loongarch_board")))]
 pub const DEVICE_TREE_ADDR: usize = 0x100000;
 #[cfg(target_arch = "loongarch64")]
 pub const DEVICE_TREE_MAX_SIZE: usize = 0x200000;
@@ -155,17 +176,15 @@ pub const MMIO: &[(usize, usize)] = &[
     (0x1000_1000, 0x00_8000),
 ];
 #[cfg(all(target_arch = "loongarch64", feature = "loongarch_board"))]
-const UART_MMIO_BASE: usize = 0x8000_0000_1fe2_0000;
+pub const MMIO: &[(usize, usize)] = &[(0x1fe2_0000, 0x1000)];
 #[cfg(all(target_arch = "loongarch64", not(feature = "loongarch_board")))]
-const UART_MMIO_BASE: usize = 0x1fe0_01e0;
-#[cfg(target_arch = "loongarch64")]
 pub const MMIO: &[(usize, usize)] = &[
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
     (0x1000_0000, 0x00_1000), // LoongArch PCH-PIC
     (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
     (0x1000_2000, 0x00_1000), // Virtio Block (bus 1) in virt machine
     (0x100e_0000, 0x00_1000), // QEMU virt poweroff device (shutdown register)
-    (UART_MMIO_BASE, 0x1000), // UART for console output
+    (0x1fe0_01e0, 0x1000),    // UART for console output
 ];
 
 pub const TRAP_CONTEXT_BASE: usize = TRAP_CONTEXT;

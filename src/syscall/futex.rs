@@ -10,7 +10,6 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 use crate::{
-    config::clock_freq,
     debug_config::DEBUG_FUTEX,
     mm::{
         MapPermission, PageTable, UserBuffer, VirtAddr, read_user_value, try_current_user_buffer,
@@ -24,7 +23,6 @@ use crate::{
         signal::has_wait_interrupting_pending,
         task_block::TaskControlBlock,
     },
-    time::get_time,
     trap::get_current_token,
 };
 
@@ -101,9 +99,7 @@ fn timespec_to_ns(ts: TimeSpec) -> Option<u64> {
 }
 
 fn monotonic_now_ns() -> u64 {
-    let ticks = get_time() as u64;
-    let freq = clock_freq() as u128;
-    ((ticks as u128).saturating_mul(NSEC_PER_SEC as u128) / freq) as u64
+    crate::time::get_time_ns()
 }
 
 fn realtime_now_ns() -> u64 {

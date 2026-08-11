@@ -9,6 +9,8 @@
 #   make run_final   final layout: official final root + user disk
 #   make debug       start QEMU halted, waiting for GDB on :1234
 #   make client_gdb  attach the bundled GDB client to `make debug`
+#   make board_smoke  build a RAM-only LS2K1000LA UART bring-up ELF
+#   make board_kernel build the full RAM-only LS2K1000LA kernel ELF
 #   make clean       wipe kernel, user apps and cached artefacts
 #
 # Overridable variables (VAR=value on the command line):
@@ -120,6 +122,28 @@ PACKER_DIR      := $(ROOT_DIR)/ext4-fs-packer
 SYSTEM_IMG      ?= $(PACKER_DIR)/target/system.ext4
 USER_IMG        ?= $(PACKER_DIR)/target/user.ext4
 
+# The LS2K1000LA smoke payload has its own Cargo target directory so enabling
+# board-only code cannot perturb normal QEMU build artefacts.
+BOARD_SMOKE_TARGET_DIR  := $(ROOT_DIR)/target/ls2k1000la-smoke
+BOARD_SMOKE_BUILD_ELF   := $(BOARD_SMOKE_TARGET_DIR)/$(TARGET)/release/os
+BOARD_SMOKE_ARTIFACT_DIR := $(BOARD_SMOKE_TARGET_DIR)/artifacts
+BOARD_SMOKE_ELF         := $(BOARD_SMOKE_ARTIFACT_DIR)/congcore-2k1000la-smoke.elf
+BOARD_KERNEL_TARGET_DIR := $(ROOT_DIR)/target/ls2k1000la-kernel
+BOARD_KERNEL_BUILD_ELF  := $(BOARD_KERNEL_TARGET_DIR)/$(TARGET)/release/os
+BOARD_KERNEL_ARTIFACT_DIR := $(BOARD_KERNEL_TARGET_DIR)/artifacts
+BOARD_KERNEL_ELF        := $(BOARD_KERNEL_ARTIFACT_DIR)/congcore-2k1000la-kernel.elf
+BOARD_KERNEL_UIMAGE     := $(BOARD_KERNEL_ELF).uimg
+BOARD_RAM_IMAGE_SIZE    ?= 8M
+BOARD_RAM_IMAGE_DIR     := $(BOARD_KERNEL_ARTIFACT_DIR)
+BOARD_MIN_USER_DIR      := $(BOARD_KERNEL_TARGET_DIR)/minimal-user
+BOARD_MIN_USER_BINS     := init_proc 00shell ls cat ps
+BOARD_SYSTEM_IMG        := $(BOARD_RAM_IMAGE_DIR)/congcore-2k1000la-system.ext4
+BOARD_USER_IMG          := $(BOARD_RAM_IMAGE_DIR)/congcore-2k1000la-user.ext4
+BOARD_SYSTEM_UIMAGE     := $(BOARD_SYSTEM_IMG).uimg
+BOARD_USER_UIMAGE       := $(BOARD_USER_IMG).uimg
+BOARD_UIMAGE_TOOL       := $(ROOT_DIR)/tools/mk_legacy_uimage.py
+LLVM_STRIP              ?= llvm-strip
+
 # Only pass -b <base> to the packer when a base image path is configured.
 # `ext4_base_img` will lazily extract it from a tarball if needed.
 ifneq ($(strip $(EXT4_BASE_IMG)),)
@@ -170,7 +194,7 @@ endif
 .PHONY: all run run_ext4 run_preliminary run_final debug debug_ext4 \
         debug_final client_gdb clean help prepare-cargo kernel user_apps \
         ext4_img system_img user_img ext4_base_img check_final_img \
-        KERNEL USER_APPS
+        board_smoke board_kernel board_ram_images board_bundle KERNEL USER_APPS
 
 .DEFAULT_GOAL := run_ext4
 
@@ -222,6 +246,81 @@ user_apps: prepare-cargo
 # Backward-compat aliases for the old upper-case target names.
 KERNEL:    kernel
 USER_APPS: user_apps
+
+# Minimal, non-persistent LS2K1000LA bring-up payload.  It does not build or
+# embed userspace and is intended for U-Boot `loady` + `bootelf -p` + `go`.
+board_smoke:
+	@if [ "$(ARCH)" != "loongarch64" ]; then \
+		echo "❌ board_smoke requires ARCH=loongarch64"; \
+		exit 2; \
+	fi
+	@mkdir -p "$(ROOT_DIR)/.tmp" "$(BOARD_SMOKE_ARTIFACT_DIR)"
+	@TMPDIR="$(ROOT_DIR)/.tmp" CARGO_TARGET_DIR="$(BOARD_SMOKE_TARGET_DIR)" \
+		cargo build --release --bin os --target "$(TARGET)" --features loongarch_board_smoke
+	@$(LLVM_STRIP) --strip-all -o "$(BOARD_SMOKE_ELF)" "$(BOARD_SMOKE_BUILD_ELF)"
+	@echo "✅ LS2K1000LA smoke ELF: $(BOARD_SMOKE_ELF)"
+	@sha256sum "$(BOARD_SMOKE_ELF)"
+
+# Full single-core LS2K1000LA kernel. PT_LOAD physical addresses use U-Boot's
+# cached DMW alias while ELF virtual addresses remain low physical addresses.
+board_kernel:
+	@if [ "$(ARCH)" != "loongarch64" ]; then \
+		echo "❌ board_kernel requires ARCH=loongarch64"; \
+		exit 2; \
+	fi
+	@mkdir -p "$(ROOT_DIR)/.tmp" "$(BOARD_KERNEL_ARTIFACT_DIR)"
+	@TMPDIR="$(ROOT_DIR)/.tmp" CARGO_TARGET_DIR="$(BOARD_KERNEL_TARGET_DIR)" \
+		cargo build --release --bin os --target "$(TARGET)" --features loongarch_board
+	@$(LLVM_STRIP) --strip-all -o "$(BOARD_KERNEL_ELF)" "$(BOARD_KERNEL_BUILD_ELF)"
+	@gzip -k -f -n -9 "$(BOARD_KERNEL_ELF)"
+	@python3 "$(BOARD_UIMAGE_TOOL)" --input "$(BOARD_KERNEL_ELF).gz" \
+		--output "$(BOARD_KERNEL_UIMAGE)" --load 0x98400000 --name CongCore-kernel-ELF
+	@echo "✅ LS2K1000LA kernel ELF: $(BOARD_KERNEL_ELF)"
+	@ls -lh "$(BOARD_KERNEL_ELF)" "$(BOARD_KERNEL_ELF).gz" "$(BOARD_KERNEL_UIMAGE)"
+	@sha256sum "$(BOARD_KERNEL_ELF)" "$(BOARD_KERNEL_ELF).gz" "$(BOARD_KERNEL_UIMAGE)"
+
+# Two compact writable ext4 images loaded into reserved low RAM. The system
+# image contains only the common minimal root overlay; /user contains init,
+# the interactive shell, and the first manual-inspection utilities. The
+# deterministic legacy-image wrappers let U-Boot's `bootm start` + `bootm
+# loados` decompress them even when the board firmware omits `unzip`.
+board_ram_images: prepare-cargo
+	@if [ "$(ARCH)" != "loongarch64" ]; then \
+		echo "❌ board_ram_images requires ARCH=loongarch64"; \
+		exit 2; \
+	fi
+	@cd "$(USER_DIR)" && CARGO_TARGET_DIR=target \
+		cargo build --release --target "$(TARGET)" \
+		$(foreach bin,$(BOARD_MIN_USER_BINS),--bin $(bin))
+	@rm -rf "$(BOARD_MIN_USER_DIR)"
+	@mkdir -p "$(BOARD_MIN_USER_DIR)" "$(BOARD_RAM_IMAGE_DIR)"
+	@for bin in $(BOARD_MIN_USER_BINS); do \
+		cp "$(USER_TARGET_DIR)/$$bin" "$(BOARD_MIN_USER_DIR)/$$bin.bin"; \
+	done
+	@cd "$(PACKER_DIR)" && CARGO_BUILD_TARGET=$(HOST_TRIPLE) cargo run --release -- \
+		--kind system -e extra -t "$(BOARD_RAM_IMAGE_DIR)" \
+		-o "$(notdir $(BOARD_SYSTEM_IMG))" -L congcore-board-root -S "$(BOARD_RAM_IMAGE_SIZE)"
+	@cd "$(PACKER_DIR)" && CARGO_BUILD_TARGET=$(HOST_TRIPLE) cargo run --release -- \
+		--kind user -u "$(BOARD_MIN_USER_DIR)" -t "$(BOARD_RAM_IMAGE_DIR)" \
+		-o "$(notdir $(BOARD_USER_IMG))" -L congcore-board-user -S "$(BOARD_RAM_IMAGE_SIZE)"
+	@e2fsck -f -n "$(BOARD_SYSTEM_IMG)"
+	@e2fsck -f -n "$(BOARD_USER_IMG)"
+	@gzip -k -f -n -9 "$(BOARD_SYSTEM_IMG)"
+	@gzip -k -f -n -9 "$(BOARD_USER_IMG)"
+	@python3 "$(BOARD_UIMAGE_TOOL)" --input "$(BOARD_SYSTEM_IMG).gz" \
+		--output "$(BOARD_SYSTEM_UIMAGE)" --load 0x0a000000 --name CongCore-system
+	@python3 "$(BOARD_UIMAGE_TOOL)" --input "$(BOARD_USER_IMG).gz" \
+		--output "$(BOARD_USER_UIMAGE)" --load 0x0a800000 --name CongCore-user
+	@echo "✅ LS2K1000LA RAM filesystems:"
+	@ls -lh "$(BOARD_SYSTEM_IMG)" "$(BOARD_SYSTEM_IMG).gz" \
+		"$(BOARD_SYSTEM_UIMAGE)" "$(BOARD_USER_IMG)" \
+		"$(BOARD_USER_IMG).gz" "$(BOARD_USER_UIMAGE)"
+	@sha256sum "$(BOARD_SYSTEM_IMG)" "$(BOARD_SYSTEM_IMG).gz" \
+		"$(BOARD_SYSTEM_UIMAGE)" "$(BOARD_USER_IMG)" \
+		"$(BOARD_USER_IMG).gz" "$(BOARD_USER_UIMAGE)"
+
+board_bundle: board_kernel board_ram_images
+	@echo "✅ LS2K1000LA RAM-only bundle is ready in $(BOARD_KERNEL_ARTIFACT_DIR)"
 
 # ======================================================================
 # Ext4 filesystem images
@@ -370,6 +469,9 @@ help:
 	@echo "  make run_final   final: FINAL_IMG as root + standalone user disk"
 	@echo "  make debug       start QEMU halted, waiting for GDB on :1234"
 	@echo "  make client_gdb  connect the bundled GDB client to a running debug"
+	@echo "  make board_smoke ARCH=loongarch64  build LS2K1000LA RAM smoke ELF"
+	@echo "  make board_kernel ARCH=loongarch64 build full LS2K1000LA RAM kernel ELF"
+	@echo "  make board_bundle ARCH=loongarch64 build kernel and two RAM ext4 images"
 	@echo "  make clean       wipe kernel, user apps and cached artefacts"
 	@echo "  make help        show this message"
 	@echo "  QEMU_EXTRA_ARGS  append extra QEMU flags, such as -snapshot"

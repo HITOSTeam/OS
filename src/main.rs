@@ -8,6 +8,8 @@ extern crate alloc;
 use crate::fs::list_apps;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 mod arch;
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board_smoke"))]
+mod board_smoke;
 mod bpf;
 mod config;
 mod console;
@@ -34,11 +36,26 @@ global_asm!(
     include_str!("entry.asm"),
     max_harts = const config::MAX_HARTS,
 );
-#[cfg(target_arch = "loongarch64")]
+#[cfg(all(
+    target_arch = "loongarch64",
+    not(feature = "loongarch_board"),
+    not(feature = "loongarch_board_smoke")
+))]
 global_asm!(
     include_str!("entry_loongarch.S"),
     max_harts = const config::MAX_HARTS,
 );
+#[cfg(all(
+    target_arch = "loongarch64",
+    feature = "loongarch_board",
+    not(feature = "loongarch_board_smoke")
+))]
+global_asm!(
+    include_str!("entry_loongarch_2k1000la_kernel.S"),
+    max_harts = const config::MAX_HARTS,
+);
+#[cfg(all(target_arch = "loongarch64", feature = "loongarch_board_smoke"))]
+global_asm!(include_str!("entry_loongarch_2k1000la.S"));
 global_asm!(include_str!("link_app.asm"));
 
 // Keep this flag in .data so clearing .bss doesn't reset it after the
@@ -74,6 +91,26 @@ fn clear_bss() {
         let bss_end = ebss as usize;
         let bss_size = bss_end - bss_start;
         core::ptr::write_bytes(bss_start as *mut u8, 0, bss_size);
+    }
+}
+
+#[cfg(all(
+    target_arch = "loongarch64",
+    feature = "loongarch_board",
+    not(feature = "loongarch_board_smoke")
+))]
+#[inline(always)]
+fn board_early_uart_marker(byte: u8) {
+    const UART_THR: usize = 0x1fe2_0000;
+    const UART_LSR: usize = UART_THR + 5;
+    // SAFETY: U-Boot configured UART0, and the board entry establishes the
+    // low-address DMW before entering Rust. This is temporary early-boot
+    // instrumentation and touches only UART status/transmit registers.
+    unsafe {
+        while core::ptr::read_volatile(UART_LSR as *const u8) & 0x20 == 0 {
+            core::hint::spin_loop();
+        }
+        core::ptr::write_volatile(UART_THR as *mut u8, byte);
     }
 }
 
@@ -353,9 +390,8 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
     panic!("shouldn't be here");
 }
 
-#[cfg(target_arch = "loongarch64")]
-#[unsafe(no_mangle)]
-fn rust_main(hart_id: usize) -> ! {
+#[cfg(all(target_arch = "loongarch64", not(feature = "loongarch_board_smoke")))]
+fn loongarch_main(hart_id: usize, firmware_args: Option<[usize; 4]>) -> ! {
     arch::set_tp(hart_id);
     let _ = arch::disable_interrupts();
     if BOOT_HART_INITED
@@ -363,15 +399,24 @@ fn rust_main(hart_id: usize) -> ! {
         .is_ok()
     {
         clear_bss();
+        #[cfg(feature = "loongarch_board")]
+        board_early_uart_marker(b'S');
         BOOT_BSS_CLEARED.store(true, Ordering::Release);
-        let topology = mm::hart_topology_from_dtb(crate::config::DEVICE_TREE_ADDR, hart_id);
+        if let Some([a0, a1, a2, a3]) = firmware_args {
+            println!(
+                "[kernel] LS2K1000LA U-Boot args: a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                a0, a1, a2, a3
+            );
+        }
+        let dtb_pa = crate::config::DEVICE_TREE_ADDR;
+        let topology = mm::hart_topology_from_dtb(dtb_pa, hart_id);
         BOOT_PRESENT_HART_MASK.store(topology.present_mask, Ordering::Release);
         println!(
             "[kernel] loongarch64 boot hart {}, FDT harts={} mask={:#x} ignored={}",
             hart_id, topology.discovered, topology.present_mask, topology.ignored
         );
         arch::bootstrap_init();
-        mm::init_phys_mem_from_dtb(crate::config::DEVICE_TREE_ADDR);
+        mm::init_phys_mem_from_dtb(dtb_pa);
         mm::init();
         arch::disable_direct_map_windows();
         log::init();
@@ -391,4 +436,31 @@ fn rust_main(hart_id: usize) -> ! {
         loongarch_secondary_main(hart_id);
     }
     panic!("shouldn't be here");
+}
+
+#[cfg(all(
+    target_arch = "loongarch64",
+    not(feature = "loongarch_board"),
+    not(feature = "loongarch_board_smoke")
+))]
+#[unsafe(no_mangle)]
+fn rust_main(hart_id: usize) -> ! {
+    loongarch_main(hart_id, None)
+}
+
+#[cfg(all(
+    target_arch = "loongarch64",
+    feature = "loongarch_board",
+    not(feature = "loongarch_board_smoke")
+))]
+#[unsafe(no_mangle)]
+extern "C" fn rust_main(
+    boot_a0: usize,
+    boot_a1: usize,
+    boot_a2: usize,
+    boot_a3: usize,
+    hart_id: usize,
+) -> ! {
+    board_early_uart_marker(b'R');
+    loongarch_main(hart_id, Some([boot_a0, boot_a1, boot_a2, boot_a3]))
 }
