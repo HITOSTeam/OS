@@ -86,7 +86,7 @@ impl TimerFdScheduleState {
         } else {
             *armed = armed.saturating_sub(1);
             TIMERFD_ARMED_TOTAL
-                .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
                     value.checked_sub(1)
                 })
                 .ok();

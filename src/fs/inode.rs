@@ -1281,6 +1281,9 @@ impl OSInode {
 struct RootSelection {
     primary_index: usize,
     secondary_index: Option<usize>,
+    /// 本地引导盘由两个启动 ELF 和缺少完整 rootfs 标记共同识别，避免依赖 QEMU
+    /// 传入磁盘的固定顺序。
+    local_boot_index: Option<usize>,
 }
 
 impl RootSelection {
@@ -1297,15 +1300,24 @@ impl RootSelection {
             .and_then(|root| root.find_path("/home"))
             .is_some();
 
+        let local_boot_index = roots.iter().enumerate().find_map(|(index, root)| {
+            let root = root.as_ref()?;
+            let has_bootstrap = root.find_path("/user/init_proc.bin").is_some()
+                && root.find_path("/user/0final_init.bin").is_some();
+            (has_bootstrap && root.find_path("/home").is_none()).then_some(index)
+        });
+
         if !disk0_has_home && disk1_has_home {
             Self {
                 primary_index: 1,
                 secondary_index: Some(0),
+                local_boot_index,
             }
         } else {
             Self {
                 primary_index: 0,
                 secondary_index: roots.get(1).and_then(|root| root.as_ref()).map(|_| 1),
+                local_boot_index,
             }
         }
     }
@@ -1320,8 +1332,8 @@ pub(crate) fn initial_root_inode() -> Arc<Inode> {
 
 /// 返回评测最小引导盘的设备序号；非评测布局没有该盘。
 pub(crate) fn local_boot_disk_index() -> Option<usize> {
-    (ROOT_SELECTION.primary_index == 1)
-        .then_some(0)
+    ROOT_SELECTION
+        .local_boot_index
         .filter(|index| BLOCK_ROOTS.get(*index).and_then(|root| root.as_ref()).is_some())
 }
 
@@ -1359,12 +1371,18 @@ lazy_static! {
         .cloned()
         .expect("[ext4] /dev/vda has no ext4 root inode");
 
-    /// 用户程序优先来自本地 disk0 的 `/user`。评测模式中它保存 init_proc 和
-    /// 0final_init；若旧布局没有该目录，则保持原有的 disk1 根目录回退行为。
-    pub static ref USER_INODE: Arc<Inode> = BLOCK_ROOTS
-        .first()
+    /// 用户程序优先来自识别出的本地引导盘 `/user`。评测模式中它保存 init_proc 和
+    /// 0final_init；若旧布局没有该目录，则保持原有的磁盘顺序回退行为。
+    pub static ref USER_INODE: Arc<Inode> = local_boot_disk_index()
+        .and_then(|index| BLOCK_ROOTS.get(index))
         .and_then(|root| root.as_ref())
         .and_then(|root| root.find("user"))
+        .or_else(|| {
+            BLOCK_ROOTS
+                .first()
+                .and_then(|root| root.as_ref())
+                .and_then(|root| root.find("user"))
+        })
         .or_else(|| ROOT_INODE.find("user"))
         .or_else(|| {
             ROOT_SELECTION

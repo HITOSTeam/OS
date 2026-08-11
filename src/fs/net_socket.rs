@@ -52,7 +52,9 @@ const TCP_KEEPALIVE_DEFAULT_SECS: u64 = 7_200;
 const TCP_KEEPINTVL_DEFAULT_SECS: u32 = 75;
 const TCP_KEEPCNT_DEFAULT: u32 = 9;
 const TCP_BUFFER_BYTES_PER_HANDLE: usize = TCP_RX_BUF_LEN_IPERF + TCP_TX_BUF_LEN_IPERF;
-const TCP_LISTEN_BACKLOG_PREALLOC_LIMIT: usize = 8;
+// CAgent 会同时向同一 HTTP 服务发起 10 个连接；上限必须覆盖这一波连接，
+// 否则快机器会在服务进程来得及 accept 前丢弃尾部连接。
+const TCP_LISTEN_BACKLOG_PREALLOC_LIMIT: usize = 32;
 //
 // 网络阻塞等待被未屏蔽信号打断时，统一向上层返回 Linux 风格的 EINTR。
 const EINTR: isize = -4;

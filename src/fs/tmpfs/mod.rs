@@ -257,7 +257,7 @@ impl TmpFs {
     ) -> VfsResult<Arc<TmpFsNode>> {
         // uodate inodes used
         self.used_inodes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 (used < self.options.inode_limit).then_some(used + 1)
             })
             .map_err(|_| VfsError::NoSpace)?;
@@ -279,7 +279,7 @@ impl TmpFs {
     fn reserve_page(&self) -> bool {
         let page_limit = self.options.size_bytes / PAGE_SIZE;
         self.used_pages
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 (used < page_limit).then_some(used + 1)
             })
             .is_ok()

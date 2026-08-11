@@ -1,6 +1,13 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+// 决赛镜像的 nightly-2025-01-18 仍要求显式启用 let-chain，
+// 内核中的条件匹配依赖该语法以保持原有的短路求值语义。
+#![feature(let_chains)]
+// 该 nightly 已提供整数对齐判断接口，但尚未稳定，需显式开启。
+#![feature(unsigned_is_multiple_of)]
+// LoongArch 的 LSX 上下文保存函数使用 target_feature，旧 nightly 需显式开启。
+#![feature(loongarch_target_feature)]
 #![allow(unreachable_code)]
 use core::{arch::global_asm, panic};
 extern crate alloc;

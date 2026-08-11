@@ -27,6 +27,10 @@ const MAX_TRACKED_REQUESTS: usize = 32;
 // a context switch; anything still in flight afterwards falls through to a real
 // `bio_await()`-style sleep.
 const COMPLETION_POLL_SPINS: usize = 64;
+// 正常的 QEMU VirtIO 请求会在微秒级完成。若 100 ms 内仍未观察到 used ring
+// 的进展，则无条件补发一次恢复通知。这个时机远离正常快速路径，也早于用户可见的
+// 一秒阻塞告警。
+const RECOVERY_KICK_MS: usize = 100;
 const STALL_WARNING_MS: usize = 1_000;
 // Linux blk-mq defaults to a 30-second request timeout when a driver does not
 // provide one.  CongCore does not yet have blk-mq-style queue reset/recovery,
@@ -65,6 +69,7 @@ struct BlockRequest {
     result: AtomicU8,
     completed: AtomicBool,
     submitted_at_ms: AtomicUsize,
+    recovery_kicked: AtomicBool,
     stall_warned: AtomicBool,
     stuck_warned: AtomicBool,
     waiters: WaitQueue,
@@ -92,6 +97,7 @@ impl BlockRequest {
             result: AtomicU8::new(RESULT_PENDING),
             completed: AtomicBool::new(false),
             submitted_at_ms: AtomicUsize::new(0),
+            recovery_kicked: AtomicBool::new(false),
             stall_warned: AtomicBool::new(false),
             stuck_warned: AtomicBool::new(false),
             waiters: WaitQueue::new(),
@@ -451,10 +457,25 @@ impl<H: Hal, T: Transport> AsyncVirtIOBlock<H, T> {
             (count, state.device.queue_state())
         };
         let now_ms = crate::time::get_time_ms();
+        let mut recovery_count = 0usize;
+        let mut recovery_sector = 0usize;
+        let mut recovery_elapsed_ms = 0usize;
         for request in active.into_iter().take(active_count).flatten() {
             let Some(elapsed_ms) = request.elapsed_ms(now_ms) else {
                 continue;
             };
+            if elapsed_ms >= RECOVERY_KICK_MS
+                && request
+                    .recovery_kicked
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                recovery_count += 1;
+                if elapsed_ms >= recovery_elapsed_ms {
+                    recovery_sector = request.sector;
+                    recovery_elapsed_ms = elapsed_ms;
+                }
+            }
             if elapsed_ms >= STUCK_WARNING_MS
                 && request
                     .stuck_warned
@@ -492,6 +513,22 @@ impl<H: Hal, T: Transport> AsyncVirtIOBlock<H, T> {
                     queue_state.descriptors_in_use
                 );
             }
+        }
+        if recovery_count != 0 {
+            // 用与提交/完成路径相同的本地中断保护序列化传输层 doorbell。
+            // 快照完成后请求可能已结束；VirtIO 明确允许冗余通知。
+            {
+                let _irq_guard = LocalIrqSaveGuard::new();
+                let mut state = self.state.lock();
+                state.device.force_notify();
+            }
+            crate::println!(
+                "[virtio-blk][recover] sector={} pending={}ms q={} requests={} action=re-kick",
+                recovery_sector,
+                recovery_elapsed_ms,
+                queue_state.queue_index,
+                recovery_count
+            );
         }
     }
 

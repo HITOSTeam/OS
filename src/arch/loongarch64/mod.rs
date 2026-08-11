@@ -436,7 +436,7 @@ pub fn handle_ipi_interrupt() -> u32 {
 
 fn next_tlb_shootdown_sequence(source_hart: usize) -> usize {
     let previous = TLB_SHOOTDOWN_SEQUENCE[source_hart]
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             Some(if value == usize::MAX { 1 } else { value + 1 })
         })
         .unwrap();

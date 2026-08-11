@@ -221,7 +221,7 @@ impl PageDesc {
         let encoded = (value as u32) << PAGE_STATE_ICACHE_SHIFT;
         let _ = self
             .state
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
                 Some((state & !PAGE_STATE_ICACHE_MASK) | encoded)
             });
     }

@@ -45,9 +45,8 @@ ifeq ($(ARCH),riscv64)
     NORMAL_IMG      := $(ROOT_DIR)/sdcard-rv.img
     FINAL_IMG       := /images_host/final_img/sdcard-rv-pub.img
 else ifeq ($(ARCH),loongarch64)
-    # dev_final 的 LoongArch 代码及用户态程序按 soft-float ABI 构建，
-    # 这里保持与其 Cargo 配置一致，避免链接阶段混用硬浮点目标。
-    TARGET          := loongarch64-unknown-none-softfloat
+    # 决赛镜像仅提供该 LoongArch bare-metal 标准库；同时与 Cargo 配置保持一致。
+    TARGET          := loongarch64-unknown-none
     CARGO_CONFIG    := $(ROOT_DIR)/cargo-config/config_loongarch64.toml
     QEMU_BIN        := qemu-system-loongarch64
     QEMU_BIOS_ARGS  :=
