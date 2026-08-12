@@ -94,8 +94,14 @@ impl FileDescription {
         self.status_flags.load(Ordering::Acquire)
     }
 
-    pub fn set_status_flags(&self, flags: usize) {
-        self.status_flags.store(flags, Ordering::Release);
+    pub fn set_append(&self, enabled: bool) {
+        if enabled {
+            self.status_flags
+                .fetch_or(VFS_STATUS_APPEND, Ordering::AcqRel);
+        } else {
+            self.status_flags
+                .fetch_and(!VFS_STATUS_APPEND, Ordering::AcqRel);
+        }
     }
 
     pub fn position(&self) -> FilePosition {

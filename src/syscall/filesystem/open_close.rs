@@ -20,8 +20,8 @@ use super::{
     touch_inode_mtime_ctime_now, truncate_regular_inode, try_copy_from_user, try_write_user_value,
     with_ext4_inode_read,
 };
-use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{LookupFlags, VfsMetadata, VfsNodeKind, VfsOpenOptions, VfsPath};
+use crate::fs::vfs_path_is_ext4;
 
 fn vfs_metadata_allows(metadata: VfsMetadata, mask: u16, uid: u32, gid: u32) -> bool {
     if uid == 0 {
@@ -63,10 +63,7 @@ fn try_open_non_ext4_vfs(
         Err(error) if error == err(SyscallError::ENOENT) => None,
         Err(error) => return Some(error),
     };
-    if path
-        .as_ref()
-        .is_some_and(|path| path.node().as_any().is::<Ext4VfsNode>())
-    {
+    if path.as_ref().is_some_and(vfs_path_is_ext4) {
         return None;
     }
 
@@ -75,7 +72,7 @@ fn try_open_non_ext4_vfs(
             Ok(parent) => parent,
             Err(error) => return Some(error),
         };
-        if parent.parent.node().as_any().is::<Ext4VfsNode>() {
+        if vfs_path_is_ext4(&parent.parent) {
             return None;
         }
         if (flags & O_CREAT) == 0 || tmpfile_requested || parent.trailing_slash {

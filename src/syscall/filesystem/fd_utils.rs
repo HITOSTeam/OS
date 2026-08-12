@@ -2,8 +2,8 @@ use super::{
     Arc, BTreeMap, DIRECT_IO_ALIGN, FD_CLOEXEC, File, MemfdFile, Mutex, O_APPEND, O_ASYNC,
     O_CLOEXEC, O_DIRECT, O_NOATIME, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe,
     ProcPseudoFile, PseudoFile, SocketPairEnd, SyscallError, TaskControlBlock, UserBuffer,
-    VfsOpenedFile, current_files, current_files_and_nofile_limit, err, get_current_token,
-    make_pipe, try_read_user_value, try_write_user_value, with_ext4_inode_read,
+    current_files, current_files_and_nofile_limit, err, get_current_token, make_pipe,
+    try_read_user_value, try_write_user_value, with_ext4_inode_read,
 };
 use lazy_static::lazy_static;
 
@@ -199,12 +199,9 @@ pub(crate) fn write_proc_pseudo_fd(fd: usize, data: &[u8], offset: Option<usize>
 pub(crate) fn file_is_seekable_for_preadwrite(
     file: &alloc::sync::Arc<dyn File + Send + Sync>,
 ) -> bool {
-    if file.as_any().downcast_ref::<OSInode>().is_some() {
-        return true;
-    }
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+    if let Some(path_file) = file.path_file() {
         return matches!(
-            vfs_file.kind(),
+            path_file.kind(),
             crate::fs::vfs::VfsNodeKind::Regular | crate::fs::vfs::VfsNodeKind::Directory
         );
     }

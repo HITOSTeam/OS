@@ -8,7 +8,7 @@ use crate::fs::vfs::{
     FileDescription, PinnedPath, VFS_STATUS_APPEND, VfsError, VfsFileOperations, VfsMetadata,
     VfsNodeKind, VfsOpenOptions, VfsPath, VfsResult,
 };
-use crate::fs::{File, POLLIN, POLLOUT};
+use crate::fs::{File, POLLIN, POLLOUT, PathFileDescription};
 use crate::mm::UserBuffer;
 use crate::task::task_block::TaskControlBlock;
 use alloc::string::String;
@@ -118,6 +118,10 @@ impl File for PathPinnedFile {
 
     fn logical_path_hint(&self) -> Option<&str> {
         Some(&self.logical_path)
+    }
+
+    fn path_file(&self) -> Option<&dyn PathFileDescription> {
+        self.backing.path_file()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -301,6 +305,65 @@ impl VfsOpenedFile {
     }
 }
 
+impl PathFileDescription for VfsOpenedFile {
+    fn kind(&self) -> VfsNodeKind {
+        VfsOpenedFile::kind(self)
+    }
+
+    fn offset(&self) -> u64 {
+        VfsOpenedFile::offset(self)
+    }
+
+    fn set_offset(&self, offset: u64) -> VfsResult<()> {
+        VfsOpenedFile::set_offset(self, offset);
+        Ok(())
+    }
+
+    fn directory_cookie(&self) -> u64 {
+        VfsOpenedFile::directory_cookie(self)
+    }
+
+    fn set_directory_cookie(&self, cookie: u64) -> VfsResult<()> {
+        VfsOpenedFile::set_directory_cookie(self, cookie);
+        Ok(())
+    }
+
+    fn size(&self) -> VfsResult<u64> {
+        VfsOpenedFile::size(self)
+    }
+
+    fn seek_end(&self) -> VfsResult<u64> {
+        if self.kind == VfsNodeKind::Directory {
+            return self
+                .path()
+                .node()
+                .readdir()
+                .map(|entries| entries.len().saturating_add(2) as u64);
+        }
+        VfsOpenedFile::size(self)
+    }
+
+    fn is_append(&self) -> bool {
+        VfsOpenedFile::is_append(self)
+    }
+
+    fn set_append(&self, enabled: bool) {
+        self.description.set_append(enabled);
+    }
+
+    fn sync(&self, data_only: bool) -> VfsResult<()> {
+        self.description.sync(data_only)
+    }
+
+    fn sync_range(&self, offset: u64, length: u64, flags: u32) -> VfsResult<()> {
+        self.description.sync_range(offset, length, flags)
+    }
+
+    fn advise(&self, offset: u64, length: u64, advice: u32) -> VfsResult<()> {
+        self.description.advise(offset, length, advice)
+    }
+}
+
 impl File for VfsOpenedFile {
     fn readable(&self) -> bool {
         self.description.operations().readable()
@@ -329,6 +392,10 @@ impl File for VfsOpenedFile {
 
     fn logical_path_hint(&self) -> Option<&str> {
         Some(self.logical_path())
+    }
+
+    fn path_file(&self) -> Option<&dyn PathFileDescription> {
+        Some(self)
     }
 
     fn as_any(&self) -> &dyn Any {

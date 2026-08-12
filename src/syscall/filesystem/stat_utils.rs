@@ -1,14 +1,13 @@
 use super::{
     CgroupFile, FS_APPEND_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL, File, MemfdFile, NamespaceFile,
     OSInode, Pipe, ProcMagicLinkFile, ProcPseudoFile, PseudoBlock, PseudoDir, PseudoFile,
-    PtyMasterFile, PtySlaveFile, RtcFile, SyscallError, TtyFile, VfsOpenedFile, err,
-    get_current_token, get_fd_file, get_inode_times, inode_fs_flags,
-    inode_visible_size_with_disk_size, linux_dev_major, linux_dev_minor, translated_mutref,
-    try_read_user_value, try_write_user_value, with_ext4_inode_read,
+    PtyMasterFile, PtySlaveFile, RtcFile, SyscallError, TtyFile, err, get_current_token,
+    get_fd_file, get_inode_times, inode_fs_flags, inode_visible_size_with_disk_size,
+    linux_dev_major, linux_dev_minor, translated_mutref, try_read_user_value, try_write_user_value,
+    with_ext4_inode_read,
 };
-use crate::fs::TunTapFile;
-use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{VfsNodeKind, VfsPath, VfsStatFs};
+use crate::fs::{TunTapFile, ext4_inode_from_vfs_path};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -367,14 +366,13 @@ pub(crate) fn kstat_from_ext4_snapshot(
 
 /// Build inode metadata directly from an object-VFS path.
 pub(crate) fn kstat_from_vfs_path(path: &VfsPath) -> Result<KStat, isize> {
-    if let Some(node) = path.node().as_any().downcast_ref::<Ext4VfsNode>() {
+    if let Some(inode) = ext4_inode_from_vfs_path(path) {
         // Linux obtains pathname and descriptor metadata through the same
         // inode/superblock getattr path.  During this migration ext4 still
         // has a legacy stat device number, so do not leak the VFS-internal
         // filesystem identity through fstat(2) or a proc magic link.
-        let inode = node.inode();
-        let meta = with_ext4_inode_read(inode, || inode.stat_snapshot());
-        let visible_size = inode_visible_size_with_disk_size(inode, meta.size as usize);
+        let meta = with_ext4_inode_read(&inode, || inode.stat_snapshot());
+        let visible_size = inode_visible_size_with_disk_size(&inode, meta.size as usize);
         return Ok(kstat_from_ext4_snapshot(meta, visible_size));
     }
     let metadata = path.node().metadata().map_err(super::map_vfs_error)?;
@@ -442,10 +440,6 @@ pub(crate) fn kstat_from_file(
     if let Some(path) = file.object_path() {
         return kstat_from_vfs_path(path);
     }
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        return kstat_from_vfs_path(vfs_file.path());
-    }
-
     if file.as_any().downcast_ref::<PseudoDir>().is_some()
         || file.as_any().downcast_ref::<PseudoFile>().is_some()
         || file.as_any().downcast_ref::<ProcPseudoFile>().is_some()

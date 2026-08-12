@@ -16,9 +16,8 @@ use super::{
     try_write_user_value, update_current_inode_mmaps_size, update_current_os_inode_mmaps_size,
     vfs_mode_allows_uid_gid, with_ext4_inode_read, with_ext4_inode_write, write_zeros_range,
 };
-use crate::fs::TunTapFile;
-use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::VfsPath;
+use crate::fs::{TunTapFile, vfs_path_is_ext4};
 
 /// Preallocates file space or punches holes on supported file types.
 pub fn syscall_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
@@ -227,7 +226,7 @@ pub fn syscall_truncate(pathname: usize, length: usize) -> isize {
     };
     let (fsuid, fsgid) = current_fsuid_gid();
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, true) {
-        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !vfs_path_is_ext4(&path) => {
             if path.mount().flags().is_read_only() {
                 return err(SyscallError::EROFS);
             }
@@ -292,19 +291,7 @@ pub fn syscall_fstatfs(fd: usize, st_ptr: usize) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return err(SyscallError::EBADF);
     };
-    let vfs_path = file
-        .object_path()
-        .or_else(|| {
-            file.as_any()
-                .downcast_ref::<VfsOpenedFile>()
-                .map(VfsOpenedFile::path)
-        })
-        .or_else(|| {
-            file.as_any()
-                .downcast_ref::<OSInode>()
-                .and_then(OSInode::vfs_path)
-                .map(|path| path.path())
-        });
+    let vfs_path = file.object_path();
     if let Some(path) = vfs_path {
         let filesystem = path.mount().filesystem();
         let stat = match filesystem.statfs() {
@@ -536,8 +523,8 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
                 apply_utimens_to_inode(&inode, spec)
             });
         }
-        if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-            return apply_utimens_to_vfs_path(vfs_file.path(), spec);
+        if let Some(path) = file.object_path() {
+            return apply_utimens_to_vfs_path(path, spec);
         }
         return 0;
     }
@@ -581,8 +568,8 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
                 apply_utimens_to_inode(&inode, spec)
             });
         }
-        if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-            return apply_utimens_to_vfs_path(vfs_file.path(), spec);
+        if let Some(path) = file.object_path() {
+            return apply_utimens_to_vfs_path(path, spec);
         }
         return 0;
     }
@@ -596,7 +583,7 @@ pub fn syscall_utimensat(dirfd: isize, pathname: usize, _times: usize, _flags: u
     let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (_flags & AT_SYMLINK_NOFOLLOW) == 0;
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
-        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !vfs_path_is_ext4(&path) => {
             return apply_utimens_to_vfs_path(&path, spec);
         }
         Ok(path) => path,
@@ -703,40 +690,27 @@ pub fn syscall_fsync(fd: usize) -> isize {
         return err(SyscallError::EBADF);
     }
     let file = require_fd_file!(fd);
-    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-        let inode = os_inode.ext4_inode();
-        if !with_ext4_inode_read(&inode, || inode.is_file() || inode.is_dir()) {
-            return err(SyscallError::EINVAL);
+    let Some(path_file) = file.path_file() else {
+        return err(SyscallError::EINVAL);
+    };
+    match path_file.sync(false) {
+        Ok(()) => {
+            pseudo_block_note_sync();
+            0
         }
-        if os_inode.readonly_fs() {
-            return 0;
-        }
-        // A full ext4 sync for every call is prohibitively expensive for
-        // micro-benchmarks like iozone. Flush per-fd buffered writes instead.
-        let _ = os_inode.flush();
-        pseudo_block_note_sync();
-        return 0;
+        Err(crate::fs::vfs::VfsError::NotSupported) => err(SyscallError::EINVAL),
+        Err(error) => map_vfs_error(error),
     }
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        return match vfs_file.description().sync(false) {
-            Ok(()) => 0,
-            Err(crate::fs::vfs::VfsError::NotSupported) => err(SyscallError::EINVAL),
-            Err(error) => map_vfs_error(error),
-        };
-    }
-    err(SyscallError::EINVAL)
 }
 
-/// Flushes dirty file data across currently open descriptors and the ext4 backend.
-pub fn syscall_sync() -> isize {
+fn open_file_descriptions_snapshot() -> Vec<alloc::sync::Arc<dyn File + Send + Sync>> {
     let mut files: Vec<alloc::sync::Arc<dyn File + Send + Sync>> = Vec::new();
-    let mut object_filesystems: Vec<alloc::sync::Arc<dyn crate::fs::vfs::VfsFileSystem>> =
-        Vec::new();
     let processes: Vec<alloc::sync::Arc<ProcessControlBlock>> = {
         let map = PID2PCB.lock();
         map.values().cloned().collect()
     };
     let mut seen_tables = BTreeSet::new();
+    let mut seen_files = BTreeSet::new();
     for process in processes {
         let Some(inner) = process.try_borrow_mut() else {
             continue;
@@ -746,24 +720,29 @@ pub fn syscall_sync() -> isize {
         if !seen_tables.insert(alloc::sync::Arc::as_ptr(&table) as usize) {
             continue;
         }
-        files.extend(
-            table
-                .lock()
-                .iter_files_snapshot()
-                .into_iter()
-                .map(|(_, file)| file),
-        );
+        for (_, file) in table.lock().iter_files_snapshot() {
+            let identity = alloc::sync::Arc::as_ptr(&file) as *const () as usize;
+            if seen_files.insert(identity) {
+                files.push(file);
+            }
+        }
     }
+    files
+}
+
+/// Flushes dirty file data across currently open descriptors and the ext4 backend.
+pub fn syscall_sync() -> isize {
+    let files = open_file_descriptions_snapshot();
+    let mut object_filesystems: Vec<alloc::sync::Arc<dyn crate::fs::vfs::VfsFileSystem>> =
+        Vec::new();
 
     let mut seen_object_filesystems = BTreeSet::new();
     for file in files {
-        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-            if !os_inode.readonly_fs() {
-                let _ = os_inode.flush();
-            }
+        if let Some(path_file) = file.path_file() {
+            let _ = path_file.sync(false);
         }
-        if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-            let filesystem = vfs_file.path().mount().filesystem();
+        if let Some(path) = file.object_path() {
+            let filesystem = path.mount().filesystem();
             if seen_object_filesystems.insert(filesystem.filesystem_id()) {
                 object_filesystems.push(alloc::sync::Arc::clone(filesystem));
             }
@@ -783,13 +762,22 @@ pub fn syscall_syncfs(fd: usize) -> isize {
         return err(SyscallError::EBADF);
     }
     let file = require_fd_file!(fd);
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        return match vfs_file.path().mount().filesystem().sync() {
+    if let Some(path) = file.object_path() {
+        // ext4 keeps a small per-description write buffer until its data path
+        // is fully moved behind VFS operations. Flush every open description
+        // before the filesystem-wide barrier so syncfs cannot miss those
+        // buffers; this is backend-neutral and deduplicates dup/fork aliases.
+        for open_file in open_file_descriptions_snapshot() {
+            if let Some(path_file) = open_file.path_file() {
+                let _ = path_file.sync(false);
+            }
+        }
+        return match path.mount().filesystem().sync() {
             Ok(()) => 0,
             Err(error) => map_vfs_error(error),
         };
     }
-    if file.as_any().downcast_ref::<OSInode>().is_some() {
+    if file.path_file().is_some() {
         return syscall_sync();
     }
     err(SyscallError::EINVAL)
@@ -812,18 +800,18 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
     if (offset as i64) < 0 || (nbytes as i64) < 0 || offset.checked_add(nbytes).is_none() {
         return err(SyscallError::EINVAL);
     }
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
+    if let Some(path_file) = file.path_file() {
         if !matches!(
-            vfs_file.kind(),
+            path_file.kind(),
             crate::fs::vfs::VfsNodeKind::Regular | crate::fs::vfs::VfsNodeKind::Directory
         ) {
             return err(SyscallError::ESPIPE);
         }
-        return match vfs_file
-            .description()
-            .sync_range(offset as u64, nbytes as u64, flags as u32)
-        {
-            Ok(()) => 0,
+        return match path_file.sync_range(offset as u64, nbytes as u64, flags as u32) {
+            Ok(()) => {
+                pseudo_block_note_sync();
+                0
+            }
             Err(crate::fs::vfs::VfsError::NotSupported) => err(SyscallError::EINVAL),
             Err(error) => map_vfs_error(error),
         };
@@ -841,19 +829,7 @@ pub fn syscall_sync_file_range(fd: usize, offset: usize, nbytes: usize, flags: u
     {
         return err(SyscallError::ESPIPE);
     }
-    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
-        return err(SyscallError::EINVAL);
-    };
-    let inode = os_inode.ext4_inode();
-    if !with_ext4_inode_read(&inode, || inode.is_file()) {
-        return err(SyscallError::EINVAL);
-    }
-    if os_inode.readonly_fs() {
-        return 0;
-    }
-    let _ = os_inode.flush();
-    pseudo_block_note_sync();
-    0
+    err(SyscallError::EINVAL)
 }
 
 /// Accepts advisory access-pattern hints for regular files.
@@ -890,27 +866,16 @@ pub fn syscall_fadvise64(fd: usize, offset: usize, len: usize, advice: usize) ->
         return err(SyscallError::ESPIPE);
     }
 
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        if vfs_file.kind() != crate::fs::vfs::VfsNodeKind::Regular {
-            return err(SyscallError::ESPIPE);
-        }
-        return match vfs_file
-            .description()
-            .advise(offset as u64, len as u64, advice as u32)
-        {
-            Ok(()) => 0,
-            Err(error) => map_vfs_error(error),
-        };
-    }
-
-    let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+    let Some(path_file) = file.path_file() else {
         return err(SyscallError::EINVAL);
     };
-    let inode = os_inode.ext4_inode();
-    if !with_ext4_inode_read(&inode, || inode.is_file()) {
+    if path_file.kind() != crate::fs::vfs::VfsNodeKind::Regular {
         return err(SyscallError::ESPIPE);
     }
-    0
+    match path_file.advise(offset as u64, len as u64, advice as u32) {
+        Ok(()) => 0,
+        Err(error) => map_vfs_error(error),
+    }
 }
 
 fn kstat_from_ext4_inode(inode: &alloc::sync::Arc<ext4_fs::Inode>) -> KStat {

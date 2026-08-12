@@ -6,7 +6,7 @@ use super::{
     logical_path_for_open_fd, touch_inode_mtime_ctime_now, try_copy_from_user, try_copy_to_user,
     try_read_user_value,
 };
-use crate::fs::ext4::Ext4VfsNode;
+use crate::fs::ext4_inode_from_vfs_path;
 use crate::fs::vfs::{
     LookupFlags, PathWalker, VfsCredentials, VfsError, VfsMountNamespace, VfsPath,
 };
@@ -611,11 +611,7 @@ pub(crate) fn resolve_at_inode(
     follow_final: bool,
 ) -> Result<alloc::sync::Arc<ext4_fs::Inode>, isize> {
     let path = resolve_at_vfs_path(at, uid, gid, follow_final)?;
-    path.node()
-        .as_any()
-        .downcast_ref::<Ext4VfsNode>()
-        .map(|node| Arc::clone(node.inode()))
-        .ok_or_else(|| err(SyscallError::EOPNOTSUPP))
+    ext4_inode_from_vfs_path(&path).ok_or_else(|| err(SyscallError::EOPNOTSUPP))
 }
 
 pub(crate) fn resolve_at_inode_with_vfs_path(
@@ -643,12 +639,7 @@ pub(crate) fn resolve_at_inode_with_vfs_path_flags(
     flags: LookupFlags,
 ) -> Result<(Arc<ext4_fs::Inode>, VfsPath), isize> {
     let path = resolve_at_vfs_path_with_flags(at, uid, gid, flags)?;
-    let inode = path
-        .node()
-        .as_any()
-        .downcast_ref::<Ext4VfsNode>()
-        .map(|node| Arc::clone(node.inode()))
-        .ok_or_else(|| err(SyscallError::EOPNOTSUPP))?;
+    let inode = ext4_inode_from_vfs_path(&path).ok_or_else(|| err(SyscallError::EOPNOTSUPP))?;
     Ok((inode, path))
 }
 
@@ -778,13 +769,8 @@ pub(crate) fn resolve_parent_and_name_with_flags(
             VfsCredentials { uid, gid },
         )
         .map_err(map_vfs_error)?;
-    let inode = parent
-        .parent
-        .node()
-        .as_any()
-        .downcast_ref::<Ext4VfsNode>()
-        .map(|node| Arc::clone(node.inode()))
-        .ok_or_else(|| err(SyscallError::EOPNOTSUPP))?;
+    let inode =
+        ext4_inode_from_vfs_path(&parent.parent).ok_or_else(|| err(SyscallError::EOPNOTSUPP))?;
     Ok((inode, parent.name))
 }
 

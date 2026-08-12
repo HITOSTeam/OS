@@ -10,8 +10,8 @@ use super::{
     resolve_parent_and_name, resolve_parent_vfs_path, syscall_fchmod, try_copy_from_user,
     with_ext4_inode_write, with_ext4_inode_write_set,
 };
-use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{VfsMetadata, VfsNodeKind, VfsPath, VfsRenameFlags};
+use crate::fs::vfs_path_is_ext4;
 use crate::mm::{mirror_file_mmap_write, update_file_mmap_sizes};
 use alloc::vec;
 use lazy_static::lazy_static;
@@ -157,7 +157,7 @@ pub(crate) fn do_fchmodat(
     let (euid, _egid) = current_effective_uid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
-        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !vfs_path_is_ext4(&path) => {
             return apply_chmod_to_vfs_path(&path, mode);
         }
         Ok(path) => path,
@@ -352,13 +352,13 @@ fn try_do_non_ext4_vfs_rename(
         Ok(parent) => parent,
         Err(error) => return Some(error),
     };
-    let has_non_ext4_parent = !old_parent.parent.node().as_any().is::<Ext4VfsNode>()
-        || !new_parent.parent.node().as_any().is::<Ext4VfsNode>();
+    let has_non_ext4_parent =
+        !vfs_path_is_ext4(&old_parent.parent) || !vfs_path_is_ext4(&new_parent.parent);
     if !has_non_ext4_parent {
         return None;
     }
-    if old_parent.parent.node().as_any().is::<Ext4VfsNode>()
-        || new_parent.parent.node().as_any().is::<Ext4VfsNode>()
+    if vfs_path_is_ext4(&old_parent.parent)
+        || vfs_path_is_ext4(&new_parent.parent)
         || old_parent.parent.mount().id() != new_parent.parent.mount().id()
     {
         // Linux filename_renameat2() requires the same vfsmount, even when

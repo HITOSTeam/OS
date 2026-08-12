@@ -1,14 +1,14 @@
 use super::{
     Arc, FD_CLOEXEC, FcntlFlock, FcntlOwnerEx, File, MemfdFile, O_APPEND, O_ASYNC, O_DIRECT,
     O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, OSInode, Pipe, RECORD_LOCKS, RecordLockOwner,
-    SyscallError, Vec, VfsOpenedFile, WaitingRecordLock, apply_record_lock_for_owner,
-    block_current_and_run_next, clear_record_lock_waiting, collect_conflict_process_owners,
-    current_files, current_files_and_nofile_limit, current_process, current_task,
-    detect_record_lock_deadlock, enqueue_record_lock_waiter, err, file_lock_key,
-    first_conflicting_lock, flock_has_conflict, get_current_token, get_file_lease_type,
-    has_pending_unmasked_signal, lock_conflicts, lock_range_from_flock, ofd_lock_owner_id,
-    release_flock_owner, remove_record_lock_waiter, set_file_lease, set_record_lock_waiting,
-    try_apply_flock, try_read_user_value, try_write_user_value, wake_record_lock_waiters,
+    SyscallError, Vec, WaitingRecordLock, apply_record_lock_for_owner, block_current_and_run_next,
+    clear_record_lock_waiting, collect_conflict_process_owners, current_files,
+    current_files_and_nofile_limit, current_process, current_task, detect_record_lock_deadlock,
+    enqueue_record_lock_waiter, err, file_lock_key, first_conflicting_lock, flock_has_conflict,
+    get_current_token, get_file_lease_type, has_pending_unmasked_signal, lock_conflicts,
+    lock_range_from_flock, ofd_lock_owner_id, release_flock_owner, remove_record_lock_waiter,
+    set_file_lease, set_record_lock_waiting, try_apply_flock, try_read_user_value,
+    try_write_user_value, wake_record_lock_waiters,
 };
 
 fn get_fcntl_file(fd: usize) -> Result<Arc<dyn File + Send + Sync>, isize> {
@@ -170,14 +170,8 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
             let _ = files.set_flags(fd, cur);
             drop(files);
-            if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-                let mut status = vfs_file.description().status_flags();
-                if (arg & O_APPEND) != 0 {
-                    status |= crate::fs::vfs::VFS_STATUS_APPEND;
-                } else {
-                    status &= !crate::fs::vfs::VFS_STATUS_APPEND;
-                }
-                vfs_file.description().set_status_flags(status);
+            if let Some(path_file) = file.path_file() {
+                path_file.set_append((arg & O_APPEND) != 0);
             }
             if let Some(pipe) = file.as_any().downcast_ref::<Pipe>() {
                 pipe.set_async_enabled((cur & O_ASYNC as u32) != 0);
@@ -208,15 +202,11 @@ pub fn syscall_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             if (cur_flags & O_DIRECT as u32) != 0 {
                 flags |= O_DIRECT;
             }
-            if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-                if os_inode.append() {
-                    flags |= O_APPEND;
-                }
-            }
-            if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-                if vfs_file.is_append() {
-                    flags |= O_APPEND;
-                }
+            if file
+                .path_file()
+                .is_some_and(|path_file| path_file.is_append())
+            {
+                flags |= O_APPEND;
             }
             flags as isize
         }

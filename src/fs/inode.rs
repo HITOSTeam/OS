@@ -1,8 +1,9 @@
 //! Inode abstraction for ext4 filesystem
 
-use super::vfs::{PinnedPath, VfsPath};
-use super::{File, POLLIN, POLLOUT};
+use super::vfs::{PinnedPath, VfsError, VfsNodeKind, VfsPath, VfsResult};
+use super::{File, POLLIN, POLLOUT, PathFileDescription};
 use crate::drivers::BLOCK_DEVICES;
+use crate::fs::ext4::ext4_snapshot_vfs_kind;
 use crate::mm::UserBuffer;
 use crate::println;
 use crate::sync::{
@@ -14,7 +15,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use bitflags::*;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ext4_fs::{Ext4FileSystem, Ext4FileSystemHandle, Inode};
 use lazy_static::*;
 use spin::Mutex;
@@ -447,7 +448,7 @@ pub struct OSInode {
     readable: bool,
     writable: bool,
     regular_file_poll_ready: bool,
-    append: bool,
+    append: AtomicBool,
     readonly_fs: bool,
     replace_on_write: bool,
     fanotify_silent: bool,
@@ -822,7 +823,7 @@ impl OSInode {
             readable,
             writable,
             regular_file_poll_ready,
-            append,
+            append: AtomicBool::new(append),
             readonly_fs,
             replace_on_write,
             fanotify_silent: false,
@@ -849,7 +850,11 @@ impl OSInode {
     }
 
     pub fn append(&self) -> bool {
-        self.append
+        self.append.load(Ordering::Acquire)
+    }
+
+    pub fn set_append(&self, enabled: bool) {
+        self.append.store(enabled, Ordering::Release);
     }
 
     pub(crate) fn flock_owner_id(&self) -> usize {
@@ -1043,7 +1048,7 @@ impl OSInode {
     pub fn pwrite_at(&self, offset: usize, buf: &[u8]) -> Result<usize, ()> {
         let _inode_guard = self.inode_lock.write();
         let mut inner = self.inner.lock();
-        let offset = if self.append {
+        let offset = if self.append() {
             let disk_end = inner.inode.size() as usize;
             let pending_end =
                 pending_inode_write_end(inner.inode.device_id(), inner.inode.inode_num())
@@ -1271,6 +1276,76 @@ impl OSInode {
 
     pub fn set_dir_offset(&self, offset: usize) {
         self.inner.lock().dir_offset = offset;
+    }
+}
+
+impl PathFileDescription for OSInode {
+    fn kind(&self) -> VfsNodeKind {
+        let snapshot = {
+            let _inode_guard = self.inode_lock.read();
+            self.inode.stat_snapshot()
+        };
+        ext4_snapshot_vfs_kind(&snapshot)
+    }
+
+    fn offset(&self) -> u64 {
+        OSInode::offset(self) as u64
+    }
+
+    fn set_offset(&self, offset: u64) -> VfsResult<()> {
+        let offset = usize::try_from(offset).map_err(|_| VfsError::Invalid)?;
+        OSInode::set_offset(self, offset);
+        Ok(())
+    }
+
+    fn directory_cookie(&self) -> u64 {
+        OSInode::dir_offset(self) as u64
+    }
+
+    fn set_directory_cookie(&self, cookie: u64) -> VfsResult<()> {
+        let cookie = usize::try_from(cookie).map_err(|_| VfsError::Invalid)?;
+        OSInode::set_dir_offset(self, cookie);
+        Ok(())
+    }
+
+    fn size(&self) -> VfsResult<u64> {
+        Ok(self.visible_end() as u64)
+    }
+
+    fn is_append(&self) -> bool {
+        self.append()
+    }
+
+    fn set_append(&self, enabled: bool) {
+        OSInode::set_append(self, enabled);
+    }
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        if !matches!(self.kind(), VfsNodeKind::Regular | VfsNodeKind::Directory) {
+            return Err(VfsError::Invalid);
+        }
+        if self.readonly_fs() {
+            return Ok(());
+        }
+        self.flush_with_error().map_err(|_| VfsError::Io)
+    }
+
+    fn sync_range(&self, _offset: u64, _length: u64, _flags: u32) -> VfsResult<()> {
+        if self.kind() != VfsNodeKind::Regular {
+            return Err(VfsError::Invalid);
+        }
+        if self.readonly_fs() {
+            return Ok(());
+        }
+        self.flush_with_error().map_err(|_| VfsError::Io)
+    }
+
+    fn advise(&self, _offset: u64, _length: u64, _advice: u32) -> VfsResult<()> {
+        if self.kind() == VfsNodeKind::Regular {
+            Ok(())
+        } else {
+            Err(VfsError::Invalid)
+        }
     }
 }
 
@@ -1599,6 +1674,10 @@ impl File for OSInode {
         self.fanotify_path.as_deref()
     }
 
+    fn path_file(&self) -> Option<&dyn PathFileDescription> {
+        Some(self)
+    }
+
     fn read(&self, mut buf: UserBuffer) -> usize {
         let output_len = buf.len();
         let mut read_locked = || {
@@ -1680,7 +1759,7 @@ impl File for OSInode {
         let mut input = alloc::vec![0u8; core::cmp::min(input_len, crate::config::PAGE_SIZE)];
         let _inode_guard = self.inode_lock.write();
         let mut inner = self.inner.lock();
-        if self.append {
+        if self.append() {
             if !inner.write_buf.is_empty() {
                 if Self::flush_inner_locked(&mut inner).is_err() {
                     println!("[ext4] Warning: write failed");

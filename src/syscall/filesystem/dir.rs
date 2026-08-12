@@ -11,7 +11,7 @@ use super::{
     resolve_at_vfs_path, resolve_parent_and_name, resolve_parent_vfs_path, sticky_rename_allowed,
     translated_byte_buffer, try_copy_to_user, vfs_at_path_is_process_root,
 };
-use crate::fs::ext4::Ext4VfsNode;
+use crate::fs::vfs_path_is_ext4;
 
 fn vfs_metadata_allows(
     metadata: crate::fs::vfs::VfsMetadata,
@@ -73,30 +73,30 @@ pub fn syscall_readlinkat(dirfd: isize, pathname: usize, buf: usize, bufsiz: usi
             }
             return len as isize;
         }
-        if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-            let target = match vfs_readlink_target(vfs_file.path()) {
-                Ok(target) => target,
-                Err(error) => return error,
-            };
-            let bytes = target.as_bytes();
-            let len = min(bytes.len(), bufsiz);
-            if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            let inode = os_inode.ext4_inode();
+            let inode_lock = ext4_inode_lock(&inode);
+            let _inode_guard = inode_lock.read();
+            if !inode.is_symlink() {
+                return err(SyscallError::EINVAL);
+            }
+            let target = inode.read_all();
+            let len = min(target.len(), bufsiz);
+            if try_copy_to_user(token, buf as *mut u8, &target[..len]).is_err() {
                 return err(SyscallError::EFAULT);
             }
             return len as isize;
         }
-        let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        let Some(path) = file.object_path() else {
             return err(SyscallError::EINVAL);
         };
-        let inode = os_inode.ext4_inode();
-        let inode_lock = ext4_inode_lock(&inode);
-        let _inode_guard = inode_lock.read();
-        if !inode.is_symlink() {
-            return err(SyscallError::EINVAL);
-        }
-        let target = inode.read_all();
-        let len = min(target.len(), bufsiz);
-        if try_copy_to_user(token, buf as *mut u8, &target[..len]).is_err() {
+        let target = match vfs_readlink_target(path) {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
+        let bytes = target.as_bytes();
+        let len = min(bytes.len(), bufsiz);
+        if try_copy_to_user(token, buf as *mut u8, &bytes[..len]).is_err() {
             return err(SyscallError::EFAULT);
         }
         return len as isize;
@@ -151,7 +151,7 @@ pub fn syscall_symlinkat(target: usize, newdirfd: isize, linkpath: usize) -> isi
     if vfs_parent.parent.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
-    if !vfs_parent.parent.node().as_any().is::<Ext4VfsNode>() {
+    if !vfs_path_is_ext4(&vfs_parent.parent) {
         let parent = vfs_parent;
         let metadata = match parent.parent.node().metadata() {
             Ok(metadata) => metadata,
@@ -269,15 +269,15 @@ pub fn syscall_linkat(
     }
     let source_is_non_ext4 = source_vfs
         .as_ref()
-        .is_some_and(|path| !path.node().as_any().is::<Ext4VfsNode>());
-    let parent_is_non_ext4 = !new_parent_vfs.parent.node().as_any().is::<Ext4VfsNode>();
+        .is_some_and(|path| !vfs_path_is_ext4(path));
+    let parent_is_non_ext4 = !vfs_path_is_ext4(&new_parent_vfs.parent);
     if source_is_non_ext4 || parent_is_non_ext4 {
         let Some(source) = source_vfs else {
             return err(SyscallError::EXDEV);
         };
         let parent = new_parent_vfs;
-        if source.node().as_any().is::<Ext4VfsNode>()
-            || parent.parent.node().as_any().is::<Ext4VfsNode>()
+        if vfs_path_is_ext4(&source)
+            || vfs_path_is_ext4(&parent.parent)
             || source.mount().id() != parent.parent.mount().id()
         {
             // Linux filename_linkat() rejects different vfsmount objects,
@@ -457,7 +457,7 @@ pub fn syscall_mknodat(dirfd: isize, pathname: usize, mode: usize, dev: usize) -
     if vfs_parent.parent.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
-    if !vfs_parent.parent.node().as_any().is::<Ext4VfsNode>() {
+    if !vfs_path_is_ext4(&vfs_parent.parent) {
         let parent = vfs_parent;
         let parent_metadata = match parent.parent.node().metadata() {
             Ok(metadata) => metadata,
@@ -596,7 +596,7 @@ pub fn syscall_mkdirat(dirfd: isize, pathname: usize, mode: usize) -> isize {
     if vfs_parent.parent.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
-    if !vfs_parent.parent.node().as_any().is::<Ext4VfsNode>() {
+    if !vfs_path_is_ext4(&vfs_parent.parent) {
         let parent = vfs_parent;
         let metadata = match parent.parent.node().metadata() {
             Ok(metadata) => metadata,
@@ -735,7 +735,7 @@ pub fn syscall_unlinkat(dirfd: isize, pathname: usize, flags: usize) -> isize {
     if vfs_parent.parent.mount().flags().is_read_only() {
         return err(SyscallError::EROFS);
     }
-    if !vfs_parent.parent.node().as_any().is::<Ext4VfsNode>() {
+    if !vfs_path_is_ext4(&vfs_parent.parent) {
         let parent = vfs_parent;
         let target = target_vfs;
         let parent_metadata = match parent.parent.node().metadata() {

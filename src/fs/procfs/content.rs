@@ -87,7 +87,7 @@ pub(super) fn proc_file_content(kind: &ProcFileKind) -> String {
     match kind {
         ProcFileKind::Mounts => proc_mounts_current(),
         ProcFileKind::Mountinfo => proc_mountinfo_current(),
-        ProcFileKind::Filesystems => crate::syscall::filesystem::proc_filesystems_snapshot(),
+        ProcFileKind::Filesystems => crate::fs::registered_filesystems_snapshot(),
         ProcFileKind::PidMounts(pid) => proc_mounts_for_pid(*pid),
         ProcFileKind::PidMountinfo(pid) => proc_mountinfo_for_pid(*pid),
         ProcFileKind::Cgroups => crate::fs::cgroup_proc_cgroups_content(),

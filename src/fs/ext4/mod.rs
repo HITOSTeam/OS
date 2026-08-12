@@ -3,7 +3,8 @@
 use crate::fs::inode::{Ext4InodeLock, ext4_inode_lock};
 use crate::fs::vfs::{
     DentryCachePolicy, VfsDirEntry, VfsError, VfsFileOperations, VfsFileSystem, VfsFileSystemState,
-    VfsLink, VfsMetadata, VfsNode, VfsNodeKind, VfsOpenOptions, VfsResult, VfsStatFs, VfsTimes,
+    VfsLink, VfsMetadata, VfsNode, VfsNodeKind, VfsOpenOptions, VfsPath, VfsResult, VfsStatFs,
+    VfsTimes,
 };
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -109,6 +110,38 @@ impl Ext4VfsNode {
     }
 }
 
+/// Whether an object-VFS path is backed by the transitional ext4 adapter.
+pub(crate) fn vfs_path_is_ext4(path: &VfsPath) -> bool {
+    path.node().as_any().is::<Ext4VfsNode>()
+}
+
+/// Recover the ext4 inode needed by legacy-only operations at one explicit
+/// migration boundary. Syscall code must not downcast VFS nodes directly.
+pub(crate) fn ext4_inode_from_vfs_path(path: &VfsPath) -> Option<Arc<Inode>> {
+    path.node()
+        .as_any()
+        .downcast_ref::<Ext4VfsNode>()
+        .map(|node| Arc::clone(node.inode()))
+}
+
+pub(crate) fn ext4_snapshot_vfs_kind(snapshot: &InodeStatSnapshot) -> VfsNodeKind {
+    if snapshot.is_dir() {
+        VfsNodeKind::Directory
+    } else if snapshot.is_symlink() {
+        VfsNodeKind::Symlink
+    } else if snapshot.is_fifo() {
+        VfsNodeKind::Fifo
+    } else if snapshot.is_chrdev() {
+        VfsNodeKind::CharacterDevice
+    } else if snapshot.is_blkdev() {
+        VfsNodeKind::BlockDevice
+    } else if snapshot.is_socket() {
+        VfsNodeKind::Socket
+    } else {
+        VfsNodeKind::Regular
+    }
+}
+
 impl VfsNode for Ext4VfsNode {
     fn as_any(&self) -> &dyn Any {
         self
@@ -128,7 +161,7 @@ impl VfsNode for Ext4VfsNode {
             self.inode.stat_snapshot()
         };
         Ok(VfsMetadata {
-            kind: inode_kind_from_snapshot(&snapshot),
+            kind: ext4_snapshot_vfs_kind(&snapshot),
             mode: snapshot.mode & 0o7777,
             uid: snapshot.uid,
             gid: snapshot.gid,
@@ -453,25 +486,7 @@ impl VfsFileOperations for Ext4VfsFile {
 }
 
 fn inode_kind(inode: &Inode) -> VfsNodeKind {
-    inode_kind_from_snapshot(&inode.stat_snapshot())
-}
-
-fn inode_kind_from_snapshot(snapshot: &InodeStatSnapshot) -> VfsNodeKind {
-    if snapshot.is_dir() {
-        VfsNodeKind::Directory
-    } else if snapshot.is_symlink() {
-        VfsNodeKind::Symlink
-    } else if snapshot.is_fifo() {
-        VfsNodeKind::Fifo
-    } else if snapshot.is_chrdev() {
-        VfsNodeKind::CharacterDevice
-    } else if snapshot.is_blkdev() {
-        VfsNodeKind::BlockDevice
-    } else if snapshot.is_socket() {
-        VfsNodeKind::Socket
-    } else {
-        VfsNodeKind::Regular
-    }
+    ext4_snapshot_vfs_kind(&inode.stat_snapshot())
 }
 
 fn map_ext4_error(error: Ext4Error) -> VfsError {

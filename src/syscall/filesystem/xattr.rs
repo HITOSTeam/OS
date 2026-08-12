@@ -1,12 +1,12 @@
 use super::{
-    Arc, OSInode, SyscallError, VfsOpenedFile, XATTR_CREATE, XATTR_REPLACE, current_fsuid_gid,
-    do_getxattr, do_listxattr, do_removexattr, do_setxattr, err, fd_has_o_path, get_current_token,
-    get_fd_file, map_vfs_error, read_user_cstring, read_user_xattr_name, read_user_xattr_value,
+    Arc, OSInode, SyscallError, XATTR_CREATE, XATTR_REPLACE, current_fsuid_gid, do_getxattr,
+    do_listxattr, do_removexattr, do_setxattr, err, fd_has_o_path, get_current_token, get_fd_file,
+    map_vfs_error, read_user_cstring, read_user_xattr_name, read_user_xattr_value,
     resolve_at_inode, resolve_at_path, resolve_at_vfs_path, try_copy_to_user,
     xattr_is_user_namespace,
 };
-use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{VfsError, VfsNodeKind, VfsPath};
+use crate::fs::vfs_path_is_ext4;
 use alloc::vec::Vec;
 
 enum XattrTarget {
@@ -24,7 +24,7 @@ fn resolve_xattr_path_target(path_ptr: usize, follow_final: bool) -> Result<Xatt
     let at = resolve_at_path(super::AT_FDCWD, &path)?;
     let (fsuid, fsgid) = current_fsuid_gid();
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
-        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !vfs_path_is_ext4(&path) => {
             return Ok(XattrTarget::Vfs(path));
         }
         Ok(path) => path,
@@ -41,14 +41,14 @@ fn resolve_xattr_fd_target(fd: usize) -> Result<XattrTarget, isize> {
     let Some(file) = get_fd_file(fd) else {
         return Err(err(SyscallError::EBADF));
     };
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        return Ok(XattrTarget::Vfs(vfs_file.path().clone()));
-    }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         return Ok(XattrTarget::Ext4(
             os_inode.ext4_inode(),
             os_inode.vfs_path().map(|path| path.path().clone()),
         ));
+    }
+    if let Some(path) = file.object_path() {
+        return Ok(XattrTarget::Vfs(path.clone()));
     }
     Ok(XattrTarget::Other)
 }

@@ -1,19 +1,18 @@
 use super::{
     ACCT_COMM, ACCT_STATE, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, Acct,
     AcctState, Arc, FILE_LEASES, FileLockKey, OSInode, ProcessControlBlock, RECORD_LOCK_WAITERS,
-    RECORD_LOCKS, String, SyscallError, TaskControlBlock, Vec, VfsOpenedFile,
-    apply_chmod_to_vfs_path, apply_chown_to_inode, apply_chown_to_vfs_path, apply_process_root,
-    busybox_exists, clear_ext4_path_cache, clear_record_lock_waiting, current_cwd_path,
-    current_effective_uid_gid, current_fsuid_gid, current_in_group, current_process,
-    current_real_uid_gid, do_fchmodat, empty_path_fd_for_at_op, err, fd_has_o_path,
-    find_path_in_roots, get_current_token, get_fd_file, get_time_ms, inode_mode_allows_uid_gid,
-    is_privileged_or_owner, mount_note_path_access, normalize_path, read_user_cstring,
-    resolve_abs_path, resolve_at_inode, resolve_at_path, resolve_at_vfs_path,
-    should_try_busybox_applet_path, vfs_mode_allows_uid_gid, wake_record_lock_waiters,
-    with_ext4_inode_read, with_ext4_inode_write,
+    RECORD_LOCKS, String, SyscallError, TaskControlBlock, Vec, apply_chmod_to_vfs_path,
+    apply_chown_to_inode, apply_chown_to_vfs_path, apply_process_root, busybox_exists,
+    clear_ext4_path_cache, clear_record_lock_waiting, current_cwd_path, current_effective_uid_gid,
+    current_fsuid_gid, current_in_group, current_process, current_real_uid_gid, do_fchmodat,
+    empty_path_fd_for_at_op, err, fd_has_o_path, find_path_in_roots, get_current_token,
+    get_fd_file, get_time_ms, inode_mode_allows_uid_gid, is_privileged_or_owner,
+    mount_note_path_access, normalize_path, read_user_cstring, resolve_abs_path, resolve_at_inode,
+    resolve_at_path, resolve_at_vfs_path, should_try_busybox_applet_path, vfs_mode_allows_uid_gid,
+    wake_record_lock_waiters, with_ext4_inode_read, with_ext4_inode_write,
 };
-use crate::fs::ext4::Ext4VfsNode;
 use crate::fs::vfs::{VfsNodeKind, VfsPath};
+use crate::fs::vfs_path_is_ext4;
 
 fn validate_vfs_directory(path: &VfsPath, uid: u32, gid: u32) -> Result<(), isize> {
     let metadata = path.node().metadata().map_err(super::map_vfs_error)?;
@@ -246,29 +245,30 @@ fn do_faccessat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isi
         } else {
             current_real_uid_gid()
         };
-        if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-            if mode & 2 != 0 && vfs_file.path().mount().flags().is_read_only() {
+        if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
+            if mode & 2 != 0 && os_inode.readonly_fs() {
                 return err(SyscallError::EROFS);
             }
-            let metadata = match vfs_file.path().node().metadata() {
-                Ok(metadata) => metadata,
-                Err(error) => return super::map_vfs_error(error),
-            };
-            return if vfs_mode_allows_uid_gid(metadata, mode, uid, gid) {
+            let inode = os_inode.ext4_inode();
+            return if with_ext4_inode_read(&inode, || {
+                inode_mode_allows_uid_gid(&inode, mode, uid, gid)
+            }) {
                 0
             } else {
                 err(SyscallError::EACCES)
             };
         }
-        let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() else {
+        let Some(path) = file.object_path() else {
             return 0;
         };
-        if mode & 2 != 0 && os_inode.readonly_fs() {
+        if mode & 2 != 0 && path.mount().flags().is_read_only() {
             return err(SyscallError::EROFS);
         }
-        let inode = os_inode.ext4_inode();
-        return if with_ext4_inode_read(&inode, || inode_mode_allows_uid_gid(&inode, mode, uid, gid))
-        {
+        let metadata = match path.node().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => return super::map_vfs_error(error),
+        };
+        return if vfs_mode_allows_uid_gid(metadata, mode, uid, gid) {
             0
         } else {
             err(SyscallError::EACCES)
@@ -290,7 +290,7 @@ fn do_faccessat(dirfd: isize, pathname: usize, mode: usize, flags: usize) -> isi
     };
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let vfs_path = match resolve_at_vfs_path(&at, uid, gid, follow_final) {
-        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !vfs_path_is_ext4(&path) => {
             if mode & 2 != 0 && path.mount().flags().is_read_only() {
                 return err(SyscallError::EROFS);
             }
@@ -368,9 +368,6 @@ fn chmod_fd(fd: usize, mode: usize, allow_o_path: bool) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return err(SyscallError::EBADF);
     };
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        return apply_chmod_to_vfs_path(vfs_file.path(), mode);
-    }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
             return err(SyscallError::EROFS);
@@ -393,6 +390,10 @@ fn chmod_fd(fd: usize, mode: usize, allow_o_path: bool) -> isize {
         if result != 0 {
             return result;
         }
+        return 0;
+    }
+    if let Some(path) = file.object_path() {
+        return apply_chmod_to_vfs_path(path, mode);
     }
     0
 }
@@ -423,9 +424,6 @@ fn chown_fd(fd: usize, uid: usize, gid: usize, allow_o_path: bool) -> isize {
     let Some(file) = get_fd_file(fd) else {
         return err(SyscallError::EBADF);
     };
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        return apply_chown_to_vfs_path(vfs_file.path(), uid, gid);
-    }
     if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
         if os_inode.readonly_fs() {
             return err(SyscallError::EROFS);
@@ -435,6 +433,10 @@ fn chown_fd(fd: usize, uid: usize, gid: usize, allow_o_path: bool) -> isize {
         if ret != 0 {
             return ret;
         }
+        return 0;
+    }
+    if let Some(path) = file.object_path() {
+        return apply_chown_to_vfs_path(path, uid, gid);
     }
     0
 }
@@ -486,7 +488,7 @@ pub fn syscall_fchownat(
     let (fsuid, fsgid) = current_fsuid_gid();
     let follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let vfs_path = match resolve_at_vfs_path(&at, fsuid, fsgid, follow_final) {
-        Ok(path) if !path.node().as_any().is::<Ext4VfsNode>() => {
+        Ok(path) if !vfs_path_is_ext4(&path) => {
             return apply_chown_to_vfs_path(&path, uid, gid);
         }
         Ok(path) => path,

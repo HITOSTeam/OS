@@ -6,115 +6,18 @@ use super::{
     MountNamespaceState, MountPropagation, MountRecord, NEXT_MOUNT_EVENT_ID,
     NEXT_MOUNT_PEER_GROUP_ID, NEXT_MOUNT_STACK_SEQ, OSInode, Ordering, PID2PCB,
     ProcessControlBlock, PseudoDir, PseudoFile, RtcFile, ST_NOSYMFOLLOW, String, SyscallError,
-    UMOUNT_NOFOLLOW, Vec, VfsOpenedFile, block_device_source_path, current_fsuid_gid,
-    current_process, current_timespec, err, find_path_in_roots, get_current_token, get_inode_times,
+    UMOUNT_NOFOLLOW, Vec, block_device_source_path, current_fsuid_gid, current_process,
+    current_timespec, err, find_path_in_roots, get_current_token, get_inode_times,
     inode_logical_path, inode_raw_logical_path, map_vfs_error, mount_namespace_id, normalize_path,
     pseudo_block_is_read_only, read_user_cstring, resolve_at_inode, resolve_at_path,
     resolve_at_vfs_path, set_inode_times, with_ext4_inode_read,
 };
-use crate::fs::ext4::Ext4Vfs;
-use crate::fs::tmpfs::TmpFs;
+use crate::fs::create_registered_vfs_filesystem;
 use crate::fs::vfs::{
-    LookupFlags, PathWalker, VfsCredentials, VfsError, VfsFileSystem, VfsFileSystemFactory,
-    VfsFileSystemRegistry, VfsMountContext, VfsMountFlags, VfsMountPropagation, VfsNodeKind,
-    VfsPath, VfsResult,
-};
-use crate::fs::{
-    Cgroup2FsFactory, CgroupV1FsFactory, DevTmpFsFactory, ProcFsFactory, SysFsFactory,
-    block_root_for_source,
+    LookupFlags, PathWalker, VfsCredentials, VfsMountFlags, VfsMountPropagation, VfsNodeKind,
+    VfsPath,
 };
 use alloc::vec;
-use lazy_static::lazy_static;
-
-struct Ext4MountFactory;
-
-impl VfsFileSystemFactory for Ext4MountFactory {
-    fn create(&self, context: &VfsMountContext) -> VfsResult<Arc<dyn VfsFileSystem>> {
-        let source = context.source.as_deref().ok_or(VfsError::Invalid)?;
-        let root = block_root_for_source(source).ok_or(VfsError::NoDevice)?;
-        Ok(Ext4Vfs::new(root))
-    }
-
-    fn requires_device(&self) -> bool {
-        true
-    }
-}
-
-struct TmpFsMountFactory;
-
-impl VfsFileSystemFactory for TmpFsMountFactory {
-    fn create(&self, context: &VfsMountContext) -> VfsResult<Arc<dyn VfsFileSystem>> {
-        let memory_bytes =
-            crate::config::phys_mem_end().saturating_sub(crate::config::phys_mem_start());
-        TmpFs::new(memory_bytes, &context.data)
-            .map(|filesystem| filesystem as Arc<dyn VfsFileSystem>)
-    }
-}
-
-lazy_static! {
-    static ref VFS_FILESYSTEM_REGISTRY: VfsFileSystemRegistry = {
-        let registry = VfsFileSystemRegistry::default();
-        registry
-            .register("ext4", Arc::new(Ext4MountFactory))
-            .expect("register ext4 VFS factory");
-        registry
-            .register("tmpfs", Arc::new(TmpFsMountFactory))
-            .expect("register tmpfs VFS factory");
-        registry
-            .register("proc", Arc::new(ProcFsFactory))
-            .expect("register procfs VFS factory");
-        registry
-            .register("sysfs", Arc::new(SysFsFactory))
-            .expect("register sysfs VFS factory");
-        registry
-            .register("devtmpfs", Arc::new(DevTmpFsFactory))
-            .expect("register devtmpfs VFS factory");
-        registry
-            .register("cgroup2", Arc::new(Cgroup2FsFactory))
-            .expect("register cgroup2 VFS factory");
-        registry
-            .register("cgroup", Arc::new(CgroupV1FsFactory))
-            .expect("register cgroup VFS factory");
-        registry
-    };
-}
-
-pub(crate) fn create_registered_vfs_filesystem(
-    fs_type: &str,
-    source: Option<&str>,
-    data: &str,
-    pid_namespace_id: u64,
-    cgroup_namespace_root: &str,
-) -> Result<Arc<dyn VfsFileSystem>, isize> {
-    VFS_FILESYSTEM_REGISTRY
-        .create(
-            fs_type,
-            &VfsMountContext {
-                source: source.map(String::from),
-                data: String::from(data),
-                pid_namespace_id: Some(pid_namespace_id),
-                cgroup_namespace_root: Some(String::from(cgroup_namespace_root)),
-            },
-        )
-        .map_err(map_vfs_error)
-}
-
-/// Render the registered filesystem types using Linux `/proc/filesystems`
-/// syntax.  Device-less filesystems carry the `nodev` marker; ext4 is backed
-/// by a block device and therefore has an empty first column.
-pub(crate) fn proc_filesystems_snapshot() -> String {
-    let mut output = String::new();
-    for (filesystem_type, requires_device) in VFS_FILESYSTEM_REGISTRY.filesystem_types() {
-        if requires_device {
-            output.push('\t');
-        } else {
-            output.push_str("nodev\t");
-        }
-        output.push_str(&filesystem_type);
-        output.push('\n');
-    }
-    output
-}
 
 pub(crate) fn mount_flags_to_proc_opts(flags: usize) -> String {
     let mut opts = Vec::new();
@@ -527,9 +430,6 @@ pub(crate) fn logical_path_for_open_fd(
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         return String::from(pdir.path());
     }
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        return String::from(vfs_file.logical_path());
-    }
     crate::fs::proc_readlink(&proc_self_fd_path(fd)).unwrap_or_else(|| String::from(cwd_fallback))
 }
 
@@ -539,9 +439,6 @@ pub(crate) fn mount_file_logical_path(file: &Arc<dyn File + Send + Sync>) -> Opt
     }
     if let Some(pdir) = file.as_any().downcast_ref::<PseudoDir>() {
         return Some(String::from(pdir.path()));
-    }
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        return Some(String::from(vfs_file.logical_path()));
     }
     if let Some(pf) = file.as_any().downcast_ref::<PseudoFile>() {
         return match pf.kind_tag() {
@@ -729,7 +626,8 @@ fn object_vfs_registered_mount(
         data,
         pid_namespace_id,
         &cgroup_namespace_root,
-    )?;
+    )
+    .map_err(map_vfs_error)?;
     let namespace = current_mount_namespace().lock().vfs_namespace();
     namespace
         .mount_with_source(

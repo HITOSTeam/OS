@@ -1576,72 +1576,22 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         return new;
     }
 
-    if let Some(vfs_file) = file.as_any().downcast_ref::<VfsOpenedFile>() {
-        let (cur, end, directory) = match vfs_file.kind() {
-            crate::fs::vfs::VfsNodeKind::Directory => {
-                let end = match vfs_file.path().node().readdir() {
-                    Ok(entries) => entries.len().saturating_add(2) as isize,
-                    Err(error) => return map_vfs_error(error),
-                };
-                (vfs_file.directory_cookie() as isize, end, true)
-            }
-            crate::fs::vfs::VfsNodeKind::Regular => {
-                let end = match vfs_file.size() {
-                    Ok(size) => size.min(isize::MAX as u64) as isize,
-                    Err(error) => return map_vfs_error(error),
-                };
-                (
-                    vfs_file.offset().min(isize::MAX as u64) as isize,
-                    end,
-                    false,
-                )
-            }
+    if let Some(path_file) = file.path_file() {
+        let directory = match path_file.kind() {
+            crate::fs::vfs::VfsNodeKind::Directory => true,
+            crate::fs::vfs::VfsNodeKind::Regular => false,
             _ => return err(SyscallError::ESPIPE),
         };
-        let new = match whence {
-            SEEK_SET => offset,
-            SEEK_CUR => cur.saturating_add(offset),
-            SEEK_END => end.saturating_add(offset),
-            _ => return err(SyscallError::EINVAL),
-        };
-        if new < 0 {
-            return err(SyscallError::EINVAL);
-        }
-        if directory {
-            vfs_file.set_directory_cookie(new as u64);
+        let cur = if directory {
+            path_file.directory_cookie()
         } else {
-            vfs_file.set_offset(new as u64);
+            path_file.offset()
         }
-        return new;
-    }
-
-    if let Some(os_inode) = file.as_any().downcast_ref::<OSInode>() {
-        let inode = os_inode.ext4_inode();
-        let (is_dir, is_fifo, disk_end) = with_ext4_inode_read(&inode, || {
-            (inode.is_dir(), inode.is_fifo(), inode.size() as usize)
-        });
-        let end = inode_visible_size_with_disk_size(&inode, disk_end) as isize;
-        if is_fifo {
-            return err(SyscallError::ESPIPE);
-        }
-
-        if is_dir {
-            let cur = os_inode.dir_offset() as isize;
-            let new = match whence {
-                SEEK_SET => offset,
-                SEEK_CUR => cur.saturating_add(offset),
-                SEEK_END => end.saturating_add(offset),
-                _ => return err(SyscallError::EINVAL),
-            };
-            if new < 0 {
-                return err(SyscallError::EINVAL);
-            }
-            os_inode.set_dir_offset(new as usize);
-            return new;
-        }
-
-        // Regular files: adjust read/write offset.
-        let cur = os_inode.offset() as isize;
+        .min(isize::MAX as u64) as isize;
+        let end = match path_file.seek_end() {
+            Ok(end) => end.min(isize::MAX as u64) as isize,
+            Err(error) => return map_vfs_error(error),
+        };
         let new = match whence {
             SEEK_SET => offset,
             SEEK_CUR => cur.saturating_add(offset),
@@ -1651,8 +1601,15 @@ pub fn syscall_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         if new < 0 {
             return err(SyscallError::EINVAL);
         }
-        os_inode.set_offset(new as usize);
-        return new;
+        let result = if directory {
+            path_file.set_directory_cookie(new as u64)
+        } else {
+            path_file.set_offset(new as u64)
+        };
+        return match result {
+            Ok(()) => new,
+            Err(error) => map_vfs_error(error),
+        };
     }
 
     if let Some(pblk) = file.as_any().downcast_ref::<PseudoBlock>() {

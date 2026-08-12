@@ -8,13 +8,12 @@ use super::{
     MOVE_MOUNT_F_EMPTY_PATH, MOVE_MOUNT_T_SYMLINKS, MS_PRIVATE, MS_RDONLY, MS_REC, MS_SHARED,
     MS_SLAVE, MS_UNBINDABLE, MountHandleFile, MountHandleObject, O_CLOEXEC, O_PATH,
     OPEN_TREE_CLONE, String, SyscallError, alloc_internal_fd, apply_mount_propagation_change,
-    attach_or_move_mount_handle, block_device_source_path, create_registered_vfs_filesystem,
-    current_fsuid_gid, err, get_current_token, get_fd_file, map_vfs_error,
-    mount_attr_bits_to_legacy_flags, read_user_cstring, reconfigure_mount_flags, resolve_abs_path,
-    resolve_at_path, resolve_at_vfs_path, syscall_mount_impl, syscall_umount2_impl,
-    try_read_user_value,
+    attach_or_move_mount_handle, block_device_source_path, current_fsuid_gid, err,
+    get_current_token, get_fd_file, map_vfs_error, mount_attr_bits_to_legacy_flags,
+    read_user_cstring, reconfigure_mount_flags, resolve_abs_path, resolve_at_path,
+    resolve_at_vfs_path, syscall_mount_impl, syscall_umount2_impl, try_read_user_value,
 };
-use crate::fs::{CgroupMountSpec, tmpfs::TmpFsOptions};
+use crate::fs::{CgroupMountSpec, create_registered_vfs_filesystem, tmpfs::TmpFsOptions};
 
 /// Add one filesystem-specific parameter to the legacy option representation
 /// shared by `fsconfig(2)` and `mount(2)`.
@@ -223,7 +222,7 @@ pub fn syscall_fsconfig(fd: usize, cmd: usize, key: usize, value: usize, aux: us
                 &state.cgroup_namespace_root,
             ) {
                 Ok(filesystem) => filesystem,
-                Err(e) => return e,
+                Err(error) => return map_vfs_error(error),
             };
             state.created_filesystem = Some(filesystem);
             state.created = true;

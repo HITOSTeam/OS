@@ -24,6 +24,7 @@ mod pidfd; // pidfd
 mod pipe; // 匿名/命名管道
 mod procfs; // /proc 伪文件系统
 mod pseudo; // 通用伪文件/伪目录（/sys、/dev 等）
+mod registry; // 文件系统类型注册与实例构造
 mod socketpair; // socketpair 两端
 mod stdio; // 标准输入输出
 mod sysfs; // /sys 内核对象文件系统视图
@@ -64,6 +65,29 @@ pub(crate) const POLLHUP: i16 = 0x0010;
 pub(crate) const POLLNVAL: i16 = 0x0020;
 /// 对端关闭了写方向（半关闭）。
 pub(crate) const POLLRDHUP: i16 = 0x2000;
+
+/// Common open-file-description semantics for pathname-backed files.
+///
+/// ext4 still uses `OSInode` for its page-cache, mmap, lock and fanotify
+/// integration, while the other filesystems use `VfsOpenedFile`.  Syscalls
+/// that only need Linux `struct file` state must use this capability instead
+/// of selecting either concrete adapter.
+pub trait PathFileDescription: Send + Sync {
+    fn kind(&self) -> vfs::VfsNodeKind;
+    fn offset(&self) -> u64;
+    fn set_offset(&self, offset: u64) -> vfs::VfsResult<()>;
+    fn directory_cookie(&self) -> u64;
+    fn set_directory_cookie(&self, cookie: u64) -> vfs::VfsResult<()>;
+    fn size(&self) -> vfs::VfsResult<u64>;
+    fn seek_end(&self) -> vfs::VfsResult<u64> {
+        self.size()
+    }
+    fn is_append(&self) -> bool;
+    fn set_append(&self, enabled: bool);
+    fn sync(&self, data_only: bool) -> vfs::VfsResult<()>;
+    fn sync_range(&self, offset: u64, length: u64, flags: u32) -> vfs::VfsResult<()>;
+    fn advise(&self, offset: u64, length: u64, advice: u32) -> vfs::VfsResult<()>;
+}
 
 /// File trait
 pub trait File: Send + Sync {
@@ -117,6 +141,10 @@ pub trait File: Send + Sync {
     }
     /// User-visible spelling captured when the pathname was opened.
     fn logical_path_hint(&self) -> Option<&str> {
+        None
+    }
+    /// Pathname-backed open-file-description state, when this object has it.
+    fn path_file(&self) -> Option<&dyn PathFileDescription> {
         None
     }
     /// 向下转型支持：返回 `&dyn Any`，便于按具体文件类型 downcast。
@@ -228,6 +256,7 @@ pub use cgroupfs::{
 pub(crate) use devtmpfs::vfs::{DevTmpFsFactory, open_devtmpfs_path};
 pub use dummy::{DummyFile, SignalfdFile};
 pub use eventfd::EventFdFile;
+pub(crate) use ext4::{ext4_inode_from_vfs_path, vfs_path_is_ext4};
 pub(crate) use fanotify::{
     FanotifyFile, fanotify_descriptor_flags,
     max_queued_events_for_procfs as fanotify_max_queued_events_for_procfs,
@@ -292,6 +321,7 @@ pub(crate) use pseudo::{
     pseudo_dev_dir_exists, pseudo_dev_dir_mkdir, pseudo_dev_dir_rmdir,
 };
 pub(crate) use pseudo::{tuntap_link_owner_group, tuntap_link_sysfs_info};
+pub(crate) use registry::{create_registered_vfs_filesystem, registered_filesystems_snapshot};
 pub use socketpair::{SocketPairEnd, make_socketpair, make_socketpair_with_type};
 pub use stdio::{Stdin, Stdout};
 pub(crate) use sysfs::vfs::SysFsFactory;
