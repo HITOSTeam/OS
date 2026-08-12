@@ -49,12 +49,14 @@ pub const REG_A7: usize = 11;
 const EUEN_FPEN: usize = 1 << 0;
 const EUEN_LSXEN: usize = 1 << 1;
 const EUEN_LASXEN: usize = 1 << 2;
+const CPUCFG1_UAL: u32 = 1 << 20;
 const CPUCFG2_FP: u32 = 1 << 0;
 const CPUCFG2_LSX: u32 = 1 << 6;
 const HWCAP_CPUCFG: usize = 1 << 0;
+const HWCAP_UAL: usize = 1 << 2;
 const HWCAP_FPU: usize = 1 << 3;
 const HWCAP_LSX: usize = 1 << 4;
-const ELF_HWCAP_FEATURE_MASK: usize = HWCAP_CPUCFG | HWCAP_FPU | HWCAP_LSX;
+const ELF_HWCAP_FEATURE_MASK: usize = HWCAP_CPUCFG | HWCAP_UAL | HWCAP_FPU | HWCAP_LSX;
 const ELF_HWCAP_FROZEN: usize = 1usize << (usize::BITS as usize - 1);
 
 const FPU_CSR_INV_X: u32 = 0x1000_0000;
@@ -1026,8 +1028,12 @@ fn read_cpucfg(index: u32) -> u32 {
 }
 
 fn local_elf_hwcap() -> usize {
+    let cpucfg1 = read_cpucfg(1);
     let cpucfg2 = read_cpucfg(2);
     let mut hwcap = HWCAP_CPUCFG;
+    if cpucfg1 & CPUCFG1_UAL != 0 {
+        hwcap |= HWCAP_UAL;
+    }
     if cpucfg2 & CPUCFG2_FP != 0 {
         hwcap |= HWCAP_FPU;
     }
