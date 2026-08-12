@@ -213,7 +213,7 @@ mod virtio_pci {
     use super::super::async_queue::{AsyncBlockDiagnostics, AsyncVirtIOBlock};
     use crate::{
         arch::loongarch64::dtb::{self, PciHostInfo},
-        config::{PAGE_SIZE, phys_mem_end, phys_mem_start},
+        config::{PAGE_SIZE, phys_mem_end, phys_mem_start, phys_range_in_ram},
         mm::{
             FrameTracker, KERNEL_SPACE, MapPermission, PTEFlags, PhysAddr, VirtAddr,
             frame_alloc_contiguous,
@@ -267,11 +267,7 @@ mod virtio_pci {
         if len == 0 {
             return false;
         }
-        let end = match vaddr.checked_add(len) {
-            Some(v) => v,
-            None => return false,
-        };
-        vaddr >= phys_mem_start() && end <= phys_mem_end()
+        phys_range_in_ram(vaddr, len)
     }
 
     fn set_dma_page_flags(paddr: usize, pages: usize, io: bool) {
@@ -574,55 +570,54 @@ mod virtio_pci {
             let mut pci_root = unsafe { PciRoot::new(ecam_root as *mut u8, Cam::Ecam) };
             let mut blk_index = 0usize;
             for (device_function, info) in pci_root.enumerate_bus(pci_host.bus_start) {
-                    let Some(virtio_type) = virtio_device_type(&info) else {
-                        continue;
-                    };
-                    if virtio_type != DeviceType::Block {
-                        continue;
+                let Some(virtio_type) = virtio_device_type(&info) else {
+                    continue;
+                };
+                if virtio_type != DeviceType::Block {
+                    continue;
+                }
+                let device_key = (
+                    device_function.bus,
+                    device_function.device,
+                    device_function.function,
+                );
+                let need_alloc = {
+                    let mut allocated = ALLOCATED_BARS.lock();
+                    if allocated.contains(&device_key) {
+                        false
+                    } else {
+                        allocated.insert(device_key);
+                        true
                     }
-                    let device_key = (
-                        device_function.bus,
-                        device_function.device,
-                        device_function.function,
-                    );
-                    let need_alloc = {
-                        let mut allocated = ALLOCATED_BARS.lock();
-                        if allocated.contains(&device_key) {
-                            false
-                        } else {
-                            allocated.insert(device_key);
-                            true
-                        }
-                    };
-                    if need_alloc {
-                        let mut allocator = PCI_ALLOCATOR.lock();
-                        let allocator = allocator.as_mut().expect("PCI allocator not initialized");
-                        allocate_bars(&mut pci_root, device_function, allocator);
-                    }
-                    map_device_bars(&mut pci_root, device_function);
-                    if blk_index == index {
-                        let pin = pci_root.interrupt_pin(device_function);
-                        if !(1..=4).contains(&pin) {
-                            println!(
-                                "[virtio_pci] invalid INTx pin {} for {}, skipping",
-                                pin, device_function
-                            );
-                            return None;
-                        }
-                        // QEMU's LoongArch virt host bridge follows the PCI
-                        // INTx swizzle encoded by its FDT interrupt-map:
-                        // input = 16 + (device + pin - 1) mod 4.
-                        let irq =
-                            16 + (usize::from(device_function.device) + usize::from(pin) - 1) % 4;
-                        let transport =
-                            PciTransport::new::<HalImpl>(&mut pci_root, device_function).ok()?;
+                };
+                if need_alloc {
+                    let mut allocator = PCI_ALLOCATOR.lock();
+                    let allocator = allocator.as_mut().expect("PCI allocator not initialized");
+                    allocate_bars(&mut pci_root, device_function, allocator);
+                }
+                map_device_bars(&mut pci_root, device_function);
+                if blk_index == index {
+                    let pin = pci_root.interrupt_pin(device_function);
+                    if !(1..=4).contains(&pin) {
                         println!(
-                            "[virtio_pci] block {} pin {} routed to irq {}",
-                            device_function, pin, irq
+                            "[virtio_pci] invalid INTx pin {} for {}, skipping",
+                            pin, device_function
                         );
-                        return Some(virtio_blk_pci(transport, irq));
+                        return None;
                     }
-                    blk_index += 1;
+                    // QEMU's LoongArch virt host bridge follows the PCI
+                    // INTx swizzle encoded by its FDT interrupt-map:
+                    // input = 16 + (device + pin - 1) mod 4.
+                    let irq = 16 + (usize::from(device_function.device) + usize::from(pin) - 1) % 4;
+                    let transport =
+                        PciTransport::new::<HalImpl>(&mut pci_root, device_function).ok()?;
+                    println!(
+                        "[virtio_pci] block {} pin {} routed to irq {}",
+                        device_function, pin, irq
+                    );
+                    return Some(virtio_blk_pci(transport, irq));
+                }
+                blk_index += 1;
             }
             None
         }

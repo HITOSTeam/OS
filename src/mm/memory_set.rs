@@ -10,7 +10,10 @@ use super::elf_loader::{
 };
 #[cfg(target_arch = "riscv64")]
 use super::frame_allocator::IcacheSyncOutcome;
-use super::{FrameTracker, UserBuffer, UserBufferSegment, frame_alloc, try_copy_to_user_unchecked};
+use super::{
+    FrameTracker, UserBuffer, UserBufferSegment, for_each_mmio_range, for_each_phys_mem_range,
+    frame_alloc, try_copy_to_user_unchecked,
+};
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -18,10 +21,9 @@ use crate::arch::{AsidContext, UserTlbInvalidationBatch};
 #[cfg(target_arch = "riscv64")]
 use crate::config::{KERNEL_MMIO_WINDOW_BASE, KERNEL_MMIO_WINDOW_SIZE, mmio_va};
 #[cfg(target_arch = "riscv64")]
-use crate::config::{KERNEL_STACK_TOP, phys_mem_start};
+use crate::config::{KERNEL_STACK_TOP, phys_mem_end, phys_mem_start};
 use crate::config::{
-    MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP,
-    USER_STACK_SIZE, phys_mem_end,
+    MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP, USER_STACK_SIZE,
 };
 use crate::fs::File;
 use crate::println;
@@ -2118,10 +2120,10 @@ impl MemorySet {
             return false;
         }
 
-        let rollback = UserRangeRollback::capture(
-            self,
-            &[(old_addr, old_end), (target_start, target_new_end)],
-        );
+        let rollback = UserRangeRollback::capture(self, &[
+            (old_addr, old_end),
+            (target_start, target_new_end),
+        ]);
         let relocated = target_start != old_addr;
         if relocated && !self.move_user_vma_range(old_addr, old_len, target_start) {
             rollback.restore(self);
@@ -2850,9 +2852,18 @@ impl MemorySet {
         // map trampoline (kernel-only)
         memory_set.map_trampoline();
         // map kernel sections
-        println!(".text [{:#x}, {:#x})", stext as *const () as usize, etext as *const () as usize);
-        println!(".rodata [{:#x}, {:#x})", srodata as *const () as usize, erodata as *const () as usize);
-        println!(".data [{:#x}, {:#x})", sdata as *const () as usize, edata as *const () as usize);
+        println!(
+            ".text [{:#x}, {:#x})",
+            stext as *const () as usize, etext as *const () as usize
+        );
+        println!(
+            ".rodata [{:#x}, {:#x})",
+            srodata as *const () as usize, erodata as *const () as usize
+        );
+        println!(
+            ".data [{:#x}, {:#x})",
+            sdata as *const () as usize, edata as *const () as usize
+        );
         println!(
             ".bss [{:#x}, {:#x})",
             sbss_with_stack as *const () as usize, ebss as *const () as usize
@@ -2897,26 +2908,16 @@ impl MemorySet {
             ),
             None,
         );
-        #[cfg(target_arch = "loongarch64")]
-        {
-            // Map low physical memory below the kernel image so the frame allocator
-            // can safely use it on LoongArch.
-            memory_set.map_identical_range(
-                crate::config::phys_mem_start(),
-                stext as *const () as usize,
+        println!("mapping DTB physical memory ranges");
+        // Each DTB RAM segment is mapped independently.  In particular, do
+        // not turn an address hole between two `reg` entries into writable RAM.
+        for_each_phys_mem_range(|start, end| {
+            memory_set.map_identical_range_skip_mapped(
+                start,
+                end,
                 MapPermission::R | MapPermission::W,
             );
-        }
-        println!("mapping physical memory");
-        memory_set.push(
-            MapArea::new(
-                (ekernel as *const () as usize).into(),
-                phys_mem_end().into(),
-                MapType::Identical,
-                MapPermission::R | MapPermission::W,
-            ),
-            None,
-        );
+        });
         println!("mapping memory-mapped registers");
         for pair in MMIO {
             memory_set.push(
@@ -2929,12 +2930,15 @@ impl MemorySet {
                 None,
             );
         }
-        #[cfg(target_arch = "loongarch64")]
-        {
-            let dtb_start = crate::config::DEVICE_TREE_ADDR;
-            let dtb_end = dtb_start + crate::config::DEVICE_TREE_MAX_SIZE;
-            memory_set.map_identical_range_skip_mapped(dtb_start, dtb_end, MapPermission::R);
-        }
+        // Include DTB-described platform ranges that are not part of the
+        // historical QEMU fallback list. Existing fixed mappings are skipped.
+        for_each_mmio_range(|start, end| {
+            memory_set.map_identical_range_skip_mapped(
+                start,
+                end,
+                MapPermission::R | MapPermission::W | MapPermission::IO,
+            );
+        });
         #[cfg(target_arch = "riscv64")]
         {
             // Mirror Linux ioremap(): publish every device register range in the
@@ -2949,6 +2953,13 @@ impl MemorySet {
                     MapPermission::R | MapPermission::W | MapPermission::IO,
                 );
             }
+            for_each_mmio_range(|start, end| {
+                memory_set.map_mmio_window_range(
+                    start,
+                    end,
+                    MapPermission::R | MapPermission::W | MapPermission::IO,
+                );
+            });
         }
         #[cfg(target_arch = "riscv64")]
         assert!(
@@ -3328,14 +3339,11 @@ impl MemorySet {
             }
         }
 
-        Ok((
-            load_bias + elf.header.pt2.entry_point() as usize,
-            ElfAux {
-                phdr: phdr_vaddr,
-                phent: ph_entry_size,
-                phnum: ph_count as usize,
-            },
-        ))
+        Ok((load_bias + elf.header.pt2.entry_point() as usize, ElfAux {
+            phdr: phdr_vaddr,
+            phent: ph_entry_size,
+            phnum: ph_count as usize,
+        }))
     }
 
     fn map_elf_segments_from_reader<F>(
@@ -5268,9 +5276,12 @@ pub fn activate_token(token: usize) {
 #[allow(unused)]
 pub fn remap_test() {
     let mut kernel_space = KERNEL_SPACE.lock();
-    let mid_text: VirtAddr = ((stext as *const () as usize + etext as *const () as usize) / 2).into();
-    let mid_rodata: VirtAddr = ((srodata as *const () as usize + erodata as *const () as usize) / 2).into();
-    let mid_data: VirtAddr = ((sdata as *const () as usize + edata as *const () as usize) / 2).into();
+    let mid_text: VirtAddr =
+        ((stext as *const () as usize + etext as *const () as usize) / 2).into();
+    let mid_rodata: VirtAddr =
+        ((srodata as *const () as usize + erodata as *const () as usize) / 2).into();
+    let mid_data: VirtAddr =
+        ((sdata as *const () as usize + edata as *const () as usize) / 2).into();
     assert!(
         !kernel_space
             .page_table

@@ -1,5 +1,6 @@
 pub mod csr_defs;
 pub mod dtb;
+pub mod efi;
 mod irq;
 pub mod mm;
 pub mod task;

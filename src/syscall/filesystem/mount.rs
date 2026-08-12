@@ -166,8 +166,7 @@ pub fn syscall_fsconfig(fd: usize, cmd: usize, key: usize, value: usize, aux: us
                     candidate.push_str(key_s);
                     candidate.push('=');
                     candidate.push_str(value_s);
-                    let memory_bytes = crate::config::phys_mem_end()
-                        .saturating_sub(crate::config::phys_mem_start());
+                    let memory_bytes = crate::config::phys_mem_total();
                     if let Err(error) = TmpFsOptions::parse(memory_bytes, &candidate) {
                         return map_vfs_error(error);
                     }

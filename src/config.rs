@@ -123,32 +123,44 @@ pub fn clock_freq() -> usize {
 pub const DEFAULT_MEMORY_START: usize = 0x8000_0000;
 pub const DEFAULT_MEMORY_END: usize = 0xA000_0000;
 
-/// 启动 DTB 中允许保存的内存和设备区间上限。QEMU virt 的实际条目远少于
-/// 此值；固定数组保证早期启动无需依赖动态分配。
+/// 启动期一次性解析 DTB 时保存的区间上限。固定数组保证分页和堆初始化前
+/// 不依赖动态分配；每段 RAM 都被保留，不能把中间的物理地址空洞当作可用内存。
+pub const MAX_PHYS_MEMORY_REGIONS: usize = 16;
+pub const MAX_RESERVED_MEMORY_REGIONS: usize = 16;
+pub const MAX_DTB_MMIO_REGIONS: usize = 32;
 pub const MAX_VIRTIO_MMIO_DEVICES: usize = 8;
 
-#[cfg(target_arch = "loongarch64")]
-pub const DEVICE_TREE_ADDR: usize = 0x100000;
-#[cfg(target_arch = "loongarch64")]
-pub const DEVICE_TREE_MAX_SIZE: usize = 0x200000;
-
-static PHYS_MEM_START: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_START);
-static PHYS_MEM_END: AtomicUsize = AtomicUsize::new(DEFAULT_MEMORY_END);
-
-#[allow(dead_code)]
-pub fn set_phys_mem_range(start: usize, end: usize) {
-    if end > start {
-        PHYS_MEM_START.store(start, Ordering::SeqCst);
-        PHYS_MEM_END.store(end, Ordering::SeqCst);
-    }
-}
-
 pub fn phys_mem_start() -> usize {
-    PHYS_MEM_START.load(Ordering::SeqCst)
+    let mut minimum = usize::MAX;
+    crate::mm::for_each_phys_mem_range(|start, _| minimum = minimum.min(start));
+    assert_ne!(minimum, usize::MAX, "DTB contains no physical memory range");
+    minimum
 }
 
 pub fn phys_mem_end() -> usize {
-    PHYS_MEM_END.load(Ordering::SeqCst)
+    let mut maximum = 0usize;
+    crate::mm::for_each_phys_mem_range(|_, end| maximum = maximum.max(end));
+    assert_ne!(maximum, 0, "DTB contains no physical memory range");
+    maximum
+}
+
+/// RAM 总量不计入 DTB 多段内存之间的物理地址空洞。
+pub fn phys_mem_total() -> usize {
+    let mut total = 0usize;
+    crate::mm::for_each_phys_mem_range(|start, end| total = total.saturating_add(end - start));
+    total
+}
+
+/// 判断一个物理区间是否完整落在同一段 DTB RAM 内。
+pub fn phys_range_in_ram(start: usize, len: usize) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let mut contained = false;
+    crate::mm::for_each_phys_mem_range(|range_start, range_end| {
+        contained |= start >= range_start && end <= range_end;
+    });
+    contained
 }
 
 #[cfg(not(target_arch = "loongarch64"))]

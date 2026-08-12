@@ -30,8 +30,7 @@ use alloc::vec::Vec;
 pub use dtb::HartTopology;
 #[allow(unused_imports)]
 pub use dtb::hart_topology_from_dtb;
-#[allow(unused_imports)]
-pub use dtb::init_phys_mem_from_dtb;
+pub use dtb::{for_each_mmio_range, for_each_phys_mem_range, for_each_reserved_range};
 pub use frame_allocator::{
     FrameTracker, UserFramePin, frame_alloc, frame_alloc_contiguous, frame_available_pages,
     frame_managed_pages, frame_metadata_bytes, frame_metadata_chunks, frame_refcount_entries,
@@ -398,8 +397,7 @@ pub fn init() {
     println!("[kernel] heap initialized.");
     frame_allocator::init_frame_allocator();
     println!("[kernel] frame allocator initialized.");
-    let physical_memory_bytes =
-        crate::config::phys_mem_end().saturating_sub(crate::config::phys_mem_start());
+    let physical_memory_bytes = crate::config::phys_mem_total();
     let ext4_cache_blocks = ext4_fs::configure_block_cache_for_memory(physical_memory_bytes);
     println!(
         "[kernel] ext4 block cache budget: {} blocks ({} MiB)",

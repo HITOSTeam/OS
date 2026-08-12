@@ -340,14 +340,16 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
             "[kernel] bootstrap hart {} starting with dtb @ {:#x}",
             hart_id, dtb_pa
         );
-        arch::bootstrap_init(dtb_pa);
-        let topology = mm::hart_topology_from_dtb(dtb_pa, hart_id);
+        // 一次性复制 DTB 中的 CPU、内存、保留区和设备信息；后续启动路径只
+        // 查询这份固定缓存，绝不重新遍历固件提供的设备树。
+        arch::riscv64::dtb::init(dtb_pa, hart_id);
+        arch::bootstrap_init();
+        let topology = mm::hart_topology_from_dtb();
         BOOT_PRESENT_HART_MASK.store(topology.present_mask, Ordering::Release);
         println!(
             "[kernel] riscv64 boot hart {}, FDT harts={} mask={:#x} ignored={}",
             hart_id, topology.discovered, topology.present_mask, topology.ignored
         );
-        mm::init_phys_mem_from_dtb(dtb_pa);
         mm::init();
         arch::mm::init_asid_allocator(topology.present_mask);
         mm::remap_test();
@@ -372,7 +374,7 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
 
 #[cfg(target_arch = "loongarch64")]
 #[unsafe(no_mangle)]
-fn rust_main(hart_id: usize) -> ! {
+fn rust_main(hart_id: usize, efi_system_table_pa: usize) -> ! {
     arch::set_tp(hart_id);
     let _ = arch::disable_interrupts();
     if BOOT_HART_INITED
@@ -381,17 +383,18 @@ fn rust_main(hart_id: usize) -> ! {
     {
         clear_bss();
         BOOT_BSS_CLEARED.store(true, Ordering::Release);
-        // 先发布 LoongArch 的 DTB 缓存，之后的串口、关机和 PCI 路径均不再
-        // 依赖固定 QEMU 地址或重新解析设备树。
-        arch::loongarch64::dtb::init(crate::config::DEVICE_TREE_ADDR);
-        let topology = mm::hart_topology_from_dtb(crate::config::DEVICE_TREE_ADDR, hart_id);
+        let dtb_pa = arch::loongarch64::efi::dtb_address(efi_system_table_pa)
+            .expect("LoongArch EFI configuration table has no device-tree pointer");
+        // 先发布从 EFI 配置表定位的 DTB 缓存，之后的串口、关机、PCI 和内存
+        // 路径均不再依赖固定 QEMU 地址或重新解析设备树。
+        arch::loongarch64::dtb::init(dtb_pa, hart_id);
+        let topology = mm::hart_topology_from_dtb();
         BOOT_PRESENT_HART_MASK.store(topology.present_mask, Ordering::Release);
         println!(
             "[kernel] loongarch64 boot hart {}, FDT harts={} mask={:#x} ignored={}",
             hart_id, topology.discovered, topology.present_mask, topology.ignored
         );
         arch::bootstrap_init();
-        mm::init_phys_mem_from_dtb(crate::config::DEVICE_TREE_ADDR);
         mm::init();
         arch::disable_direct_map_windows();
         log::init();

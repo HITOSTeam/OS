@@ -6,6 +6,9 @@
 .equ CSR_DMW1, 0x181
 
 _start:
+    # LoongArch EFI boot protocol: a2 is the physical EFI system table.
+    # Preserve it as Rust's second argument before replacing a0 with hart ID.
+    move        $a1,    $a2
     csrrd $a0, CSR_CPUID
 
     # The physical CPU ID indexes the statically reserved early stack array.

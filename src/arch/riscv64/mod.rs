@@ -24,13 +24,11 @@ static RISCV_HAS_SVVPTC: AtomicBool = AtomicBool::new(false);
 const RISCV_USE_SSTC_CLOCKEVENT: bool = false;
 
 #[allow(dead_code)]
-pub fn bootstrap_init(dtb_pa: usize) {
+pub fn bootstrap_init() {
     crate::sbi::init();
-    dtb::init(dtb_pa);
-    if let Some(freq) = dtb::timebase_frequency() {
-        crate::config::set_clock_freq(freq);
-        crate::println!("[kernel] riscv timebase frequency: {} Hz", freq);
-    }
+    let freq = dtb::timebase_frequency();
+    crate::config::set_clock_freq(freq);
+    crate::println!("[kernel] riscv timebase frequency: {} Hz", freq);
     let has_sstc = dtb::all_harts_have_sstc();
     RISCV_HAS_SSTC.store(has_sstc, Ordering::Release);
     if has_sstc {

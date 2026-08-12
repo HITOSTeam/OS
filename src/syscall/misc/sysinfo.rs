@@ -1,6 +1,6 @@
 use crate::{
     arch,
-    config::{PAGE_SIZE, phys_mem_end, phys_mem_start},
+    config::{PAGE_SIZE, phys_mem_total},
     mm::{frame_available_pages, try_copy_from_user, try_write_user_value},
     syscall::error::{SyscallError, err},
     task::{manager::PID2PCB, processor::current_process},
@@ -152,7 +152,7 @@ pub fn syscall_sysinfo(info: usize) -> isize {
         return err(SyscallError::EFAULT);
     }
 
-    let totalram = phys_mem_end().saturating_sub(phys_mem_start());
+    let totalram = phys_mem_total();
     let freeram = frame_available_pages()
         .saturating_mul(PAGE_SIZE)
         .min(totalram);

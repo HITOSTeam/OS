@@ -44,8 +44,7 @@ struct TmpFsMountFactory;
 
 impl VfsFileSystemFactory for TmpFsMountFactory {
     fn create(&self, context: &VfsMountContext) -> VfsResult<Arc<dyn VfsFileSystem>> {
-        let memory_bytes =
-            crate::config::phys_mem_end().saturating_sub(crate::config::phys_mem_start());
+        let memory_bytes = crate::config::phys_mem_total();
         TmpFs::new(memory_bytes, &context.data)
             .map(|filesystem| filesystem as Arc<dyn VfsFileSystem>)
     }
@@ -87,15 +86,12 @@ pub(crate) fn create_registered_vfs_filesystem(
     cgroup_namespace_root: &str,
 ) -> Result<Arc<dyn VfsFileSystem>, isize> {
     VFS_FILESYSTEM_REGISTRY
-        .create(
-            fs_type,
-            &VfsMountContext {
-                source: source.map(String::from),
-                data: String::from(data),
-                pid_namespace_id: Some(pid_namespace_id),
-                cgroup_namespace_root: Some(String::from(cgroup_namespace_root)),
-            },
-        )
+        .create(fs_type, &VfsMountContext {
+            source: source.map(String::from),
+            data: String::from(data),
+            pid_namespace_id: Some(pid_namespace_id),
+            cgroup_namespace_root: Some(String::from(cgroup_namespace_root)),
+        })
         .map_err(map_vfs_error)
 }
 

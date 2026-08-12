@@ -3,7 +3,8 @@
 
 use super::{PhysAddr, PhysPageNum};
 use crate::{
-    config::{phys_mem_end, phys_mem_start},
+    config::MAX_RESERVED_MEMORY_REGIONS,
+    mm::{for_each_phys_mem_range, for_each_reserved_range},
     println,
     sync::LocalIrqSaveGuard,
 };
@@ -556,10 +557,16 @@ trait FrameAllocator {
     fn dealloc(&mut self, ppn: PhysPageNum);
 }
 
-/// an implementation for frame allocator
-pub struct StackFrameAllocator {
+#[derive(Clone, Copy)]
+struct FrameRange {
+    start: usize,
     current: usize,
     end: usize,
+}
+
+/// 按 DTB 报告的多段 RAM 管理页帧，绝不把段间空洞作为可分配内存。
+pub struct StackFrameAllocator {
+    ranges: Vec<FrameRange>,
     recycled: Vec<usize>,
     /// One bit per physical page, set while the page is on `recycled`.
     ///
@@ -574,26 +581,24 @@ pub struct StackFrameAllocator {
 #[allow(dead_code)]
 impl StackFrameAllocator {
     pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
-        self.current = l.0;
-        self.end = r.0;
-        self.managed_pages = r.0.saturating_sub(l.0);
-        self.ensure_recycled_bitmap(r.0);
+        self.ranges.clear();
+        self.recycled.clear();
+        self.recycled_bitmap.clear();
+        self.managed_pages = 0;
+        self.add_range(l, r);
     }
 
     pub fn add_range(&mut self, l: PhysPageNum, r: PhysPageNum) {
         if r <= l {
             return;
         }
-        let pages = r.0.saturating_sub(l.0);
-        self.managed_pages = self.managed_pages.saturating_add(pages);
+        self.managed_pages = self.managed_pages.saturating_add(r.0.saturating_sub(l.0));
         self.ensure_recycled_bitmap(r.0);
-        self.recycled.reserve(pages);
-        for ppn in l.0..r.0 {
-            if !self.mark_recycled(ppn) {
-                panic!("Frame ppn={:#x} has already been recycled!", ppn);
-            }
-            self.recycled.push(ppn);
-        }
+        self.ranges.push(FrameRange {
+            start: l.0,
+            current: l.0,
+            end: r.0,
+        });
     }
 
     fn ensure_recycled_bitmap(&mut self, end_ppn: usize) {
@@ -643,19 +648,26 @@ impl StackFrameAllocator {
         if pages == 0 {
             return None;
         }
-        if self.current.saturating_add(pages) > self.end {
-            return None;
+        for range in &mut self.ranges {
+            if range.current.saturating_add(pages) <= range.end {
+                let start = range.current;
+                range.current += pages;
+                return Some(start.into());
+            }
         }
-        let start = self.current;
-        self.current += pages;
-        Some(start.into())
+        None
+    }
+
+    fn was_allocated(&self, ppn: usize) -> bool {
+        self.ranges
+            .iter()
+            .any(|range| range.start <= ppn && ppn < range.current)
     }
 }
 impl FrameAllocator for StackFrameAllocator {
     fn new() -> Self {
         Self {
-            current: 0,
-            end: 0,
+            ranges: Vec::new(),
             recycled: Vec::new(),
             recycled_bitmap: Vec::new(),
             managed_pages: 0,
@@ -669,17 +681,21 @@ impl FrameAllocator for StackFrameAllocator {
                 ppn
             );
             Some(ppn.into())
-        } else if self.current == self.end {
-            None
         } else {
-            self.current += 1;
-            Some((self.current - 1).into())
+            for range in &mut self.ranges {
+                if range.current < range.end {
+                    let ppn = range.current;
+                    range.current += 1;
+                    return Some(ppn.into());
+                }
+            }
+            None
         }
     }
     fn dealloc(&mut self, ppn: PhysPageNum) {
         let ppn = ppn.0;
         // validity check
-        if ppn >= self.current || self.is_recycled(ppn) {
+        if !self.was_allocated(ppn) || self.is_recycled(ppn) {
             panic!("Frame ppn={:#x} has not been allocated!", ppn);
         }
         // recycle
@@ -705,7 +721,7 @@ fn with_frame_allocator<R>(f: impl FnOnce(&mut FrameAllocatorImpl) -> R) -> R {
     f(&mut allocator)
 }
 
-/// initiate the frame allocator using `ekernel` and detected physical memory end
+/// 按 DTB 的每段 RAM 建立分配器，并排除内核镜像和 DTB 保留区。
 #[allow(dead_code)]
 pub fn init_frame_allocator() {
     #[allow(dead_code)]
@@ -713,19 +729,77 @@ pub fn init_frame_allocator() {
         safe fn ekernel();
         safe fn stext();
     }
-    let memory_start = PhysAddr::from(phys_mem_start()).ceil();
-    let memory_end = PhysAddr::from(phys_mem_end()).floor();
-    init_page_desc_table(memory_start, memory_end);
-    let kernel_end = PhysAddr::from(ekernel as *const () as usize).ceil();
-    with_frame_allocator(|allocator| {
-        allocator.init(kernel_end, memory_end);
-        #[cfg(target_arch = "loongarch64")]
-        {
-            use crate::config::phys_mem_start;
-            let low_start = PhysAddr::from(phys_mem_start()).ceil();
-            let kernel_start = PhysAddr::from(stext as *const () as usize).floor();
-            allocator.add_range(low_start, kernel_start);
+    let mut exclusions = [(0usize, 0usize); MAX_RESERVED_MEMORY_REGIONS + 1];
+    let mut exclusion_count = 0usize;
+    let mut add_exclusion = |start: usize, end: usize| {
+        let start = PhysAddr::from(start).floor().0;
+        let end = PhysAddr::from(end).ceil().0;
+        if end <= start {
+            return;
         }
+        assert!(
+            exclusion_count < exclusions.len(),
+            "too many frame allocator exclusion ranges"
+        );
+        exclusions[exclusion_count] = (start, end);
+        exclusion_count += 1;
+    };
+    add_exclusion(stext as usize, ekernel as usize);
+    for_each_reserved_range(|start, end| add_exclusion(start, end));
+    drop(add_exclusion);
+    exclusions[..exclusion_count].sort_unstable_by_key(|range| range.0);
+    let mut merged_count = 0usize;
+    for index in 0..exclusion_count {
+        let (start, end) = exclusions[index];
+        if merged_count != 0 && start <= exclusions[merged_count - 1].1 {
+            exclusions[merged_count - 1].1 = exclusions[merged_count - 1].1.max(end);
+        } else {
+            exclusions[merged_count] = (start, end);
+            merged_count += 1;
+        }
+    }
+    let mut min_ppn = usize::MAX;
+    let mut max_ppn = 0usize;
+    for_each_phys_mem_range(|start, end| {
+        min_ppn = min_ppn.min(PhysAddr::from(start).ceil().0);
+        max_ppn = max_ppn.max(PhysAddr::from(end).floor().0);
+    });
+    assert!(
+        min_ppn < max_ppn,
+        "DTB contains no allocatable physical pages"
+    );
+    init_page_desc_table(PhysPageNum(min_ppn), PhysPageNum(max_ppn));
+    with_frame_allocator(|allocator| {
+        allocator.init(PhysPageNum(0), PhysPageNum(0));
+        for_each_phys_mem_range(|start, end| {
+            let start_ppn = PhysAddr::from(start).ceil().0;
+            let end_ppn = PhysAddr::from(end).floor().0;
+            if end_ppn <= start_ppn {
+                return;
+            }
+            let mut cursor = start_ppn;
+            for &(excluded_start, excluded_end) in &exclusions[..merged_count] {
+                if excluded_end <= cursor {
+                    continue;
+                }
+                if excluded_start >= end_ppn {
+                    break;
+                }
+                if cursor < excluded_start {
+                    allocator.add_range(
+                        PhysPageNum(cursor),
+                        PhysPageNum(excluded_start.min(end_ppn)),
+                    );
+                }
+                cursor = cursor.max(excluded_end);
+                if cursor >= end_ppn {
+                    break;
+                }
+            }
+            if cursor < end_ppn {
+                allocator.add_range(PhysPageNum(cursor), PhysPageNum(end_ppn));
+            }
+        });
     });
 }
 
@@ -752,14 +826,21 @@ pub fn frame_alloc() -> Option<FrameTracker> {
     }
 
     if crate::debug_config::DEBUG_PERF {
-        let (current, end, recycled) = with_frame_allocator(|allocator| {
-            (allocator.current, allocator.end, allocator.recycled.len())
+        let (remaining, recycled) = with_frame_allocator(|allocator| {
+            (
+                allocator
+                    .ranges
+                    .iter()
+                    .map(|range| range.end.saturating_sub(range.current))
+                    .sum::<usize>(),
+                allocator.recycled.len(),
+            )
         });
         let fails = FRAME_ALLOC_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         let refcnt_entries = FRAME_LIVE_COUNT.load(Ordering::Relaxed);
         println!(
-            "[mm-debug] frame_alloc failed count={} current={:#x} end={:#x} recycled={} refcnt_entries={}",
-            fails, current, end, recycled, refcnt_entries
+            "[mm-debug] frame_alloc failed count={} remaining={} recycled={} refcnt_entries={}",
+            fails, remaining, recycled, refcnt_entries
         );
     }
     None
@@ -785,7 +866,12 @@ pub fn frame_metadata_bytes() -> usize {
 
 pub fn frame_available_pages() -> usize {
     with_frame_allocator(|allocator| {
-        allocator.recycled.len() + allocator.end.saturating_sub(allocator.current)
+        allocator.recycled.len()
+            + allocator
+                .ranges
+                .iter()
+                .map(|range| range.end.saturating_sub(range.current))
+                .sum::<usize>()
     })
 }
 
