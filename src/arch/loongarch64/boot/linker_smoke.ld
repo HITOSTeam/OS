@@ -1,6 +1,6 @@
 /*
  * LS2K1000LA U-Boot exposes RAM through the cached DMW alias beginning at
- * 0x9000_0000_0000_0000.  Keep the smoke payload in the first low-memory
+ * 0x9000_0000_0000_0000. Keep the smoke payload in the first low-memory
  * bank, away from U-Boot's relocation, framebuffer and boot-parameter area.
  */
 BASE_ADDRESS = 0x9000000000200000;

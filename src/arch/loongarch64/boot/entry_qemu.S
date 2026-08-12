@@ -44,7 +44,7 @@ _start:
     .section .bss.stack
     .globl boot_stack
 boot_stack:
-    # `max_harts` is supplied by global_asm! from config::MAX_HARTS.
+    # `max_harts` is supplied by the LoongArch QEMU boot module.
     .space 4096 * 16 * {max_harts}
     .globl boot_stack_top
 boot_stack_top:

@@ -1,3 +1,4 @@
+mod boot;
 pub mod csr_defs;
 #[cfg(not(feature = "loongarch_board"))]
 mod irq;

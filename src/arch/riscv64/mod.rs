@@ -1,3 +1,4 @@
+mod boot;
 mod irq;
 pub mod mm;
 pub mod task;

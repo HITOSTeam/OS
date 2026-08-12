@@ -80,10 +80,10 @@ fn emit_linker_script_arg() {
     let board = env::var_os("CARGO_FEATURE_LOONGARCH_BOARD").is_some();
     let board_smoke = env::var_os("CARGO_FEATURE_LOONGARCH_BOARD_SMOKE").is_some();
     let linker_script = match (arch.as_str(), board, board_smoke) {
-        ("loongarch64", _, true) => "src/linker_loongarch_2k1000la.ld",
-        ("loongarch64", true, false) => "src/linker_loongarch_2k1000la_kernel.ld",
-        ("riscv64", _, _) => "src/linker.ld",
-        ("loongarch64", false, false) => "src/linker_loongarch.ld",
+        ("loongarch64", _, true) => "src/arch/loongarch64/boot/linker_smoke.ld",
+        ("loongarch64", true, false) => "src/arch/loongarch64/boot/linker_ls2k1000la.ld",
+        ("riscv64", _, _) => "src/arch/riscv64/boot/linker.ld",
+        ("loongarch64", false, false) => "src/arch/loongarch64/boot/linker_qemu.ld",
         _ => return,
     };
     let linker_script = manifest_dir.join(linker_script);

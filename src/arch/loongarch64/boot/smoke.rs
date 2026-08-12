@@ -1,13 +1,15 @@
 //! Destructive-operation-free LS2K1000LA bring-up payload.
 //!
 //! This path intentionally avoids the allocator, page tables, interrupts,
-//! device tree and block devices.  Its only job is to prove that U-Boot can
+//! device tree and block devices. Its only job is to prove that U-Boot can
 //! load the ELF, enter Rust on a private stack and reach the board UART.
 
 use core::{
-    arch::asm,
+    arch::{asm, global_asm},
     ptr::{read_volatile, write_volatile},
 };
+
+global_asm!(include_str!("entry_smoke.S"));
 
 const UART_BASE: usize = 0x8000_0000_1fe2_0000;
 const UART_THR: usize = UART_BASE;

@@ -4,7 +4,7 @@
 .equ CSR_CPUID, 0x20
 
 /*
- * U-Boot enters through its cached DMW mapping.  Keep that mapping intact for
+ * U-Boot enters through its cached DMW mapping. Keep that mapping intact for
  * the smoke test, preserve a0-a3 verbatim, and pass the hardware CPU ID in a4.
  */
 _start:

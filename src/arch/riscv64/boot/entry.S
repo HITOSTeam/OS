@@ -20,7 +20,7 @@ _start:
 
 .section .bss.stack
 boot_stack_top:
-    # Keep the assembly allocation in sync with config::MAX_HARTS via the
-    # global_asm const operand in main.rs.
+    # Keep this allocation synchronized with config::MAX_HARTS through the
+    # const operand in the RISC-V boot module.
     .space 4096*16*{max_harts}
 boot_stack_bottom:
