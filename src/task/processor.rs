@@ -227,9 +227,14 @@ fn charge_task_runtime_for_scheduler(task: &Arc<TaskControlBlock>) {
 /// - `has_due_sleep_timer()`：有 sleep 定时器已到期（可能在 idle 空转时
 ///   被硬件定时器触发，但 tick 还没到）。
 fn drain_deferred_kernel_timer_work() {
-    if crate::task::block_sleep::take_deferred_kernel_timer_tick()
-        || crate::task::block_sleep::has_due_sleep_timer()
-    {
+    // 每 hart 的延迟位只表示发生过调度 tick，不代表墙钟定时器已经到期。
+    // 旧逻辑会让所有 idle hart 在每个 100 Hz tick 上完整扫描全局定时器表；
+    // LoongArch 使用 12 个 hart 时，即使只有一个 CPU 在运行内层 QEMU，也会
+    // 把全局锁访问放大约 12 倍。
+    let deferred_tick = crate::task::block_sleep::take_deferred_kernel_timer_tick();
+    // 没有硬件 tick 时不读取全局 deadline。idle 循环一次会经过多个安全点，
+    // 若每个安全点都读取时钟和全局原子变量，会在 12 hart 上放大空转开销。
+    if deferred_tick && crate::task::block_sleep::timer_work_pending_for_user_return() {
         // 内核态定时器中断只置延迟位，因为被中断的 syscall 可能持有
         // 定时器唤醒路径会用到的自旋锁。idle 调度循环是安全点：没有
         // 任务锁或 syscall 锁被持有，在此处理定时器对应 Linux 的
@@ -1691,14 +1696,11 @@ pub fn idle_task() {
             // 4c：处理内核态定时器中断延迟的 tick。
             // 内核态定时器中断只置位，不立即处理（避免在持锁 syscall 上下文里
             // 做唤醒/分配）。这里在无就绪任务时安全处理。
-            if crate::task::block_sleep::take_deferred_kernel_timer_tick() {
-                crate::task::block_sleep::check_timer();
-                core::hint::spin_loop();
-                continue;
-            }
+            let deferred_tick = crate::task::block_sleep::take_deferred_kernel_timer_tick();
             // 4d：检查已过期的 sleep 定时器。
-            // 在进 wfi 之前 poll 已到期的 sleep timer，未来的留给硬件定时器。
-            if crate::task::block_sleep::has_due_sleep_timer() {
+            // 在进 wfi 之前只处理真正到期的 timer；普通 scheduler tick
+            // 不再触发一次完整的全局 timer 扫描。
+            if deferred_tick && crate::task::block_sleep::timer_work_pending_for_user_return() {
                 crate::task::block_sleep::check_timer();
                 core::hint::spin_loop();
                 continue;

@@ -9,9 +9,8 @@ use crate::debug_config::DEBUG_TRAP;
 use crate::mm::{LazyFaultResult, MapPermission, VirtAddr};
 use crate::println;
 use crate::syscall::syscall;
-use crate::task::block_sleep::check_timer;
 use crate::task::processor::{
-    exit_current_and_run_next, exit_group_and_run_next, suspend_current_and_run_next,
+    exit_current_and_run_next, exit_group_and_run_next,
 };
 use crate::task::signal::{check_if_current_signals_error, check_task_signals_error};
 use crate::time::set_next_trigger;
@@ -304,44 +303,10 @@ pub fn trap_handler() {
             super::super::clear_timer_interrupt();
             crate::time::loongarch_record_timer_tick();
             set_next_trigger();
-            // Linux keeps lengthy timer work interruptible. Nested timer
-            // interrupts are converted to deferred work by trap_from_kernel,
-            // while call-function IPIs must remain serviceable for TLB acks.
-            super::super::enable_interrupts();
-            crate::drivers::block::poll_all();
-            check_timer();
-            crate::task::processor::account_current_task_tick();
-            crate::syscall::misc::check_current_rlimit_cpu();
-            if crate::debug_config::DEBUG_SIGNAL {
-                static LAST_SLEEP_TIMER_LOG: AtomicUsize = AtomicUsize::new(0);
-                let proc = crate::task::processor::current_process();
-                let inner = proc.borrow_mut();
-                let argv0 = inner.argv.first().map(|s| s.as_str()).unwrap_or("");
-                if argv0 == "sleep" {
-                    let now_ms = crate::time::get_time_ms();
-                    let last = LAST_SLEEP_TIMER_LOG.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last) >= 200 {
-                        LAST_SLEEP_TIMER_LOG.store(now_ms, Ordering::Relaxed);
-                        crate::log_if!(
-                            crate::debug_config::DEBUG_SIGNAL,
-                            info,
-                            "[timer_irq_sleep] pid={} now_ms={}",
-                            proc.getpid(),
-                            now_ms
-                        );
-                    }
-                }
-            }
-            crate::syscall::signal::maybe_deliver_signal();
-            if let Some((errno, msg)) = check_if_current_signals_error() {
-                crate::task::signal::log_signal_exit(msg);
-                exit_group_and_run_next(errno);
-            }
-            crate::fs::cgroup_maybe_block_current();
-            if crate::task::processor::should_preempt_current_on_tick() {
-                suspend_current_and_run_next();
-            }
-            super::super::disable_interrupts();
+            // 架构层 IRQ 路径只做清中断、重编程和置延迟位。公共的返回用户态
+            // 路径会且只会消费一次该 tick，完成记账/抢占；只有已发布的最近
+            // deadline 真正到期时才扫描全局定时器表。
+            crate::task::block_sleep::note_kernel_timer_tick();
         } else if (estat & ESTAT_IS_EIOINTC) != 0 {
             crate::arch::handle_external_interrupt();
         } else if (estat & ESTAT_IS_IPI) != 0 {

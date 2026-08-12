@@ -4,6 +4,7 @@ set -eu
 # 无论从仓库根目录还是 os/ 目录调用，都以脚本所在目录为准。
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ARCH=${ARCH:-riscv64}
+PREBUILT_ONLY=${PREBUILT_ONLY:-0}
 
 case "$ARCH" in
     riscv64)
@@ -31,9 +32,19 @@ START_EPOCH=$(date +%s)
 START_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 echo "[final-run] host_start_utc=$START_UTC"
 echo "启动决赛测试：架构=$ARCH 核心数=$SMP 内存=$MEM 镜像=$TEST_IMG"
-echo "测试顺序：CAgent -> BuildStorm"
+if [ "$PREBUILT_ONLY" = "1" ]; then
+    if [ "$ARCH" != "loongarch64" ]; then
+        echo "PREBUILT_ONLY=1 目前仅用于 LoongArch 内层 QEMU 诊断" >&2
+        exit 2
+    fi
+    echo "测试模式：跳过 CAgent/BuildStorm 编译，直接运行预编译 ArceOS UEFI 测试"
+    PREBUILT_MAKE_ARG="FINAL_PREBUILT_ONLY=1"
+else
+    echo "测试顺序：CAgent -> BuildStorm"
+    PREBUILT_MAKE_ARG=""
+fi
 
-if make -C "$SCRIPT_DIR" run ARCH="$ARCH" FINAL_TEST=1 TEST_IMG="$TEST_IMG" SMP="$SMP" MEM="$MEM"; then
+if make -C "$SCRIPT_DIR" run ARCH="$ARCH" FINAL_TEST=1 TEST_IMG="$TEST_IMG" SMP="$SMP" MEM="$MEM" $PREBUILT_MAKE_ARG; then
     RUN_STATUS=0
 else
     RUN_STATUS=$?

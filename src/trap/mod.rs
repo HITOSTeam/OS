@@ -41,12 +41,12 @@ pub(crate) fn exit_to_user_mode_loop(syscall_return: bool) {
         exit_group_and_run_next(errno);
     }
 
-    // A kernel-mode timer interrupt only sets this per-hart bit. Consume it at
-    // the common safe point, then separately check for non-scheduler timer work
-    // such as sleep timers and timerfd expiry. The latter must not charge a
-    // scheduler tick merely because it is due.
+    // 硬件 tick 有两个相互独立的职责：调度记账，以及使墙钟定时器到期。
+    // 消费一个普通调度 tick 不应该强制扫描全局 sleep/alarm/POSIX/timerfd 表；
+    // 这些表已经发布了活跃计数和最近 deadline，只有 O(1) 快速判断确认有
+    // 定时器真正到期时才进入 `check_timer()`。
     let deferred_scheduler_tick = take_deferred_kernel_timer_tick();
-    if deferred_scheduler_tick || timer_work_pending_for_user_return() {
+    if timer_work_pending_for_user_return() {
         check_timer();
     }
     if deferred_scheduler_tick {
