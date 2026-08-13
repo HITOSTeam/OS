@@ -18,6 +18,7 @@ CARGO_TARGET_DIR := $(ROOT_DIR)/target
 
 # 这个可以被外界赋值的变量，所以使用?修饰等于号
 ARCH          ?= riscv64
+BOARD         ?= qemu
 MODE          ?= release
 FINAL_TEST    ?= 0
 SMP           ?= 12
@@ -26,6 +27,16 @@ MEM           ?= $(if $(filter 1,$(FINAL_TEST)),4G,1G)
 DISK_SIZE     ?= 1G
 QEMU_TIMEOUT  ?= 0
 QEMU_EXTRA_ARGS ?=
+
+# VisionFive 2 使用 U-Boot 的 TFTP/booti 启动路径。
+# `os` 是带调试信息的 ELF，只用于调试，不能由本板的启动跳板直接执行。
+TFTP_ROOT     ?= $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)
+TFTP_BIND     ?= 0.0.0.0
+TFTP_PORT     ?= 69
+TFTP_KERNEL_FILE ?= os.bin
+TFTP_BOOT_FILE ?= vf2_booti.img
+OBJCOPY        ?= llvm-objcopy
+VF2_AS         ?= riscv64-unknown-elf-as
 
 ifneq ($(filter 0 1,$(FINAL_TEST)),$(FINAL_TEST))
     $(error FINAL_TEST 只能取 0 或 1)
@@ -62,10 +73,23 @@ else
     $(error ARCH 只能取 riscv64 或 loongarch64)
 endif
 
+ifeq ($(BOARD),visionfive2)
+    ifneq ($(ARCH),riscv64)
+        $(error BOARD=visionfive2 仅支持 ARCH=riscv64)
+    endif
+    KERNEL_FEATURES := --features riscv-board
+else ifneq ($(BOARD),qemu)
+    $(error BOARD 只能取 qemu 或 visionfive2)
+endif
+
 GDB_BIN          ?= $(GDB_DEFAULT)
 CARGO_MODE_FLAG := $(if $(filter release,$(MODE)),--release,)
 HOST_TRIPLE      ?= $(shell rustc -vV | sed -n 's/^host: //p')
 KERNEL_ELF       := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)/os
+KERNEL_BIN       := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)/os.bin
+VF2_BOOTI_IMAGE  := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)/vf2_booti.img
+VF2_BOOTI_OBJECT := $(CARGO_TARGET_DIR)/$(TARGET)/$(MODE)/vf2_booti_trampoline.o
+VF2_BOOTI_SOURCE := $(MAKEFILE_DIR)tools/vf2_booti_trampoline.S
 USER_TARGET_DIR  := $(USER_DIR)/target/$(TARGET)/$(MODE)
 APP_DIR          := $(MAKEFILE_DIR)results
 DISK_NAME        := fs-$(ARCH).ext4
@@ -93,7 +117,7 @@ endif
 .NOTPARALLEL:
 
 .PHONY: all elf kernel user_apps disk ext4_img run run_ext4 \
-        debug gdb client_gdb clean help prepare-cargo
+        debug gdb client_gdb vf2-image tftp-root tftp-server clean help prepare-cargo
 
 # all只是编译镜像还有内核elf
 all: elf disk
@@ -117,8 +141,9 @@ user_apps: prepare-cargo
 
 # 编译可由 QEMU 直接加载的内核 ELF。
 elf: prepare-cargo user_apps
-	@cargo build $(CARGO_MODE_FLAG) --target $(TARGET) --bin os
+	@cargo build $(CARGO_MODE_FLAG) $(KERNEL_FEATURES) --target $(TARGET) --bin os
 	@echo "内核 ELF：$(KERNEL_ELF)"
+
 
 # 制作与架构绑定的本地磁盘，避免两个架构共用同一个输出文件。
 disk: user_apps
@@ -180,9 +205,44 @@ clean:
 	@rm -f $(ROOT_DIR)/ext4-fs-packer/target/fs-loongarch64.ext4
 
 help:
-	@echo "make elf  ARCH=riscv64|loongarch64"
+	@echo "make elf  ARCH=riscv64|loongarch64 BOARD=qemu|visionfive2"
+	@echo "BOARD=visionfive2 会启用 Cargo feature riscv-board"
 	@echo "make disk ARCH=riscv64|loongarch64"
 	@echo "make run  ARCH=riscv64|loongarch64 FINAL_TEST=0|1"
 	@echo "make debug ARCH=riscv64|loongarch64"
 	@echo "make gdb   ARCH=riscv64|loongarch64"
+	@echo "make tftp-root ARCH=riscv64"
+	@echo "  构建 VisionFive 2 内核，并生成 os.bin 与 vf2_booti.img"
+	@echo "make tftp-server ARCH=riscv64"
+	@echo "  构建 VisionFive 2 内核后，在 UDP/69 前台启动 TFTP 服务"
 	@echo "FINAL_TEST=1：先运行 CAgent，再运行 BuildStorm"
+
+
+# 生成 VisionFive 2 可启动文件。内核原始二进制必须放在 0x80200000，
+# 跳板由 booti 迁移到安全地址后再跳回该内核入口。
+# 用法：make vf2-image ARCH=riscv64 BOARD=visionfive2。
+vf2-image: elf
+	@if [ "$(ARCH)" != "riscv64" ] || [ "$(BOARD)" != "visionfive2" ]; then \
+		echo "vf2-image 仅支持 ARCH=riscv64 BOARD=visionfive2"; exit 2; \
+	fi
+	@$(OBJCOPY) -O binary --strip-all $(KERNEL_ELF) $(KERNEL_BIN)
+	@$(VF2_AS) -march=rv64gc -mabi=lp64d -o $(VF2_BOOTI_OBJECT) $(VF2_BOOTI_SOURCE)
+	@$(OBJCOPY) -O binary --strip-all $(VF2_BOOTI_OBJECT) $(VF2_BOOTI_IMAGE)
+	@echo "板端内核：$(KERNEL_BIN)（$$(stat -c%s $(KERNEL_BIN)) 字节，U-Boot 文件名：$(TFTP_KERNEL_FILE)）"
+	@echo "启动跳板：$(VF2_BOOTI_IMAGE)（$$(stat -c%s $(VF2_BOOTI_IMAGE)) 字节，U-Boot 文件名：$(TFTP_BOOT_FILE)）"
+
+# 将两个可启动文件放在 Cargo 编译产物目录中，作为 TFTP 根目录。
+# 用法：make tftp-root ARCH=riscv64；用于只构建和核对下载文件。
+tftp-root:
+	@$(MAKE) --no-print-directory vf2-image ARCH=$(ARCH) BOARD=visionfive2 MODE=$(MODE)
+	@test -f $(KERNEL_BIN) -a -f $(VF2_BOOTI_IMAGE)
+	@echo "TFTP 根目录：$(TFTP_ROOT)"
+	@echo "U-Boot 下载：tftpboot 0x80200000 $(TFTP_KERNEL_FILE)"
+	@echo "U-Boot 下载：tftpboot 0xc0000000 $(TFTP_BOOT_FILE)"
+
+# 在前台运行 TFTP 服务；69 端口通常需要 root 权限。
+# 用法：make tftp-server ARCH=riscv64；保持命令运行，不要另起旧服务。
+tftp-server: tftp-root
+	@command -v in.tftpd >/dev/null || { echo "缺少 in.tftpd，请安装 tftpd-hpa"; exit 127; }
+	@echo "TFTP 根目录：$(TFTP_ROOT)，监听 $(TFTP_BIND):$(TFTP_PORT)，按 Ctrl-C 停止"
+	in.tftpd --foreground --listen --secure --address $(TFTP_BIND):$(TFTP_PORT) $(TFTP_ROOT)

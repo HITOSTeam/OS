@@ -2,6 +2,7 @@ mod async_queue;
 mod virtio_blk;
 
 pub use async_queue::AsyncBlockDiagnostics;
+#[cfg(not(all(target_arch = "riscv64", feature = "visionfive2")))]
 pub use virtio_blk::VirtIOBlock;
 
 use alloc::sync::Arc;
@@ -12,6 +13,9 @@ use lazy_static::*;
 
 use crate::println;
 
+#[cfg(all(target_arch = "riscv64", feature = "visionfive2"))]
+pub type BlockDeviceImpl = crate::arch::riscv64::board::VisionFiveSdCard;
+#[cfg(not(all(target_arch = "riscv64", feature = "visionfive2")))]
 pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 static BLOCK_REGISTRY_READY: AtomicBool = AtomicBool::new(false);
 static NEXT_FALLBACK_POLL_MS: AtomicUsize = AtomicUsize::new(0);
@@ -25,6 +29,9 @@ const FALLBACK_POLL_INTERVAL_MS: usize = 10;
 // mount configuration rather than by the block driver.
 lazy_static! {
     static ref BLOCK_DRIVER_DEVICES: Vec<Arc<BlockDeviceImpl>> = {
+        #[cfg(all(target_arch = "riscv64", feature = "visionfive2"))]
+        let devices = Vec::new();
+        #[cfg(not(all(target_arch = "riscv64", feature = "visionfive2")))]
         let devices = BlockDeviceImpl::probe_all()
             .into_iter()
             .map(Arc::new)
@@ -32,24 +39,34 @@ lazy_static! {
         BLOCK_REGISTRY_READY.store(true, Ordering::Release);
         devices
     };
-    pub static ref BLOCK_DEVICES: Vec<Arc<dyn BlockDevice>> = BLOCK_DRIVER_DEVICES
-        .iter()
-        .cloned()
-        .map(|dev| dev as Arc<dyn BlockDevice>)
-        .collect();
+    pub static ref BLOCK_DEVICES: Vec<Arc<dyn BlockDevice>> = {
+        #[cfg(all(target_arch = "riscv64", feature = "visionfive2"))]
+        { crate::arch::riscv64::board::block_devices() }
+        #[cfg(not(all(target_arch = "riscv64", feature = "visionfive2")))]
+        { BLOCK_DRIVER_DEVICES.iter().cloned().map(|dev| dev as Arc<dyn BlockDevice>).collect() }
+    };
 }
 
 /// Dispatch a platform interrupt to the matching VirtIO block device.
 pub fn handle_irq(irq: usize) -> bool {
+    #[cfg(all(target_arch = "riscv64", feature = "visionfive2"))]
+    { let _ = irq; return false; }
+    #[cfg(not(all(target_arch = "riscv64", feature = "visionfive2")))]
+    {
     let mut handled = false;
     for device in BLOCK_DRIVER_DEVICES.iter() {
         handled |= device.handle_irq(irq);
     }
     handled
+    }
 }
 
 /// Poll used rings as an early-boot/lost-interrupt fallback.
 pub fn poll_all() {
+    #[cfg(all(target_arch = "riscv64", feature = "visionfive2"))]
+    { return; }
+    #[cfg(not(all(target_arch = "riscv64", feature = "visionfive2")))]
+    {
     if !BLOCK_REGISTRY_READY.load(Ordering::Acquire) {
         return;
     }
@@ -75,13 +92,19 @@ pub fn poll_all() {
     for device in BLOCK_DRIVER_DEVICES.iter() {
         device.poll();
     }
+    }
 }
 
 pub fn diagnostics() -> Vec<AsyncBlockDiagnostics> {
+    #[cfg(all(target_arch = "riscv64", feature = "visionfive2"))]
+    { return Vec::new(); }
+    #[cfg(not(all(target_arch = "riscv64", feature = "visionfive2")))]
+    {
     BLOCK_DRIVER_DEVICES
         .iter()
         .map(|device| device.diagnostics())
         .collect()
+    }
 }
 
 #[allow(unused)]

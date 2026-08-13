@@ -1,4 +1,6 @@
 pub mod dtb;
+#[cfg(feature = "visionfive2")]
+pub mod board;
 mod irq;
 pub mod mm;
 pub mod task;

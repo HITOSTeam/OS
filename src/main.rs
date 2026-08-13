@@ -107,6 +107,13 @@ fn start_other_harts(boot_hart_id: usize, dtb_pa: usize, present_mask: usize) {
         if hart_id == boot_hart_id || present_mask & hart_bit == 0 {
             continue;
         }
+        // VisionFive 2 固件把 hart1 作为启动核；当前 OpenSBI 版本无法使 hart0
+        // 从 S-mode 入口稳定返回，跳过它以保证其余从核和用户态测试正常运行。
+        #[cfg(feature = "visionfive2")]
+        if hart_id == 0 {
+            failed_mask |= hart_bit;
+            continue;
+        }
         let error = arch::hart_start(hart_id, config::KERNEL_ENTRY_PA, dtb_pa);
         if error != 0 {
             println!(
@@ -166,6 +173,8 @@ fn secondary_main(hart_id: usize, dtb_pa: usize) -> ! {
     mm::activate_kernel_space();
     arch::init_secondary_mmu_state();
     trap::init_trap();
+    // VisionFive 2 尚未接入 JH7110 PLIC，不能让从核访问 QEMU 的 PLIC 寄存器布局。
+    #[cfg(not(feature = "visionfive2"))]
     arch::init_external_interrupts();
     trap::trap::enable_timer_interrupt();
     time::set_next_trigger();
@@ -354,6 +363,9 @@ fn rust_main(hart_id: usize, dtb_pa: usize) -> ! {
         arch::mm::init_asid_allocator(topology.present_mask);
         mm::remap_test();
         log::init();
+        // 星光 VisionFive 2 的 SDIO 启动路径仅使用轮询。通用 RISC-V 外部中断
+        // 代码目前使用 QEMU PLIC 寄存器布局；在实现 JH7110 PLIC 驱动前不访问它。
+        #[cfg(not(feature = "visionfive2"))]
         arch::init_external_interrupts();
         if debug_config::DEBUG_LOG_TEST {
             log::test();

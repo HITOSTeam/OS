@@ -404,7 +404,10 @@ pub fn init() {
         ext4_cache_blocks,
         ext4_cache_blocks.saturating_mul(ext4_fs::BLOCK_SZ) / (1024 * 1024)
     );
-    KERNEL_SPACE.lock().activate();
+    let kernel_space = KERNEL_SPACE.lock();
+    kernel_space.activate();
+    // 释放页表锁后再由 kernel_token 重新借用，避免启动期自锁。
+    drop(kernel_space);
     KERNEL_SATP.store(kernel_token(), Ordering::Release);
     println!("[kernel] kernel space activated.");
 }

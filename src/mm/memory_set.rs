@@ -11,9 +11,11 @@ use super::elf_loader::{
 #[cfg(target_arch = "riscv64")]
 use super::frame_allocator::IcacheSyncOutcome;
 use super::{
-    FrameTracker, UserBuffer, UserBufferSegment, for_each_mmio_range, for_each_phys_mem_range,
-    frame_alloc, try_copy_to_user_unchecked,
+    FrameTracker, UserBuffer, UserBufferSegment, for_each_phys_mem_range, frame_alloc,
+    try_copy_to_user_unchecked,
 };
+#[cfg(not(feature = "visionfive2"))]
+use super::for_each_mmio_range;
 use super::{PTEFlags, PageTable, PageTableEntry, PageWalkCache};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
@@ -23,8 +25,10 @@ use crate::config::{KERNEL_MMIO_WINDOW_BASE, KERNEL_MMIO_WINDOW_SIZE, mmio_va};
 #[cfg(target_arch = "riscv64")]
 use crate::config::{KERNEL_STACK_TOP, phys_mem_end, phys_mem_start};
 use crate::config::{
-    MMIO, PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP, USER_STACK_SIZE,
+    PAGE_SIZE, SIGRETURN_TRAMPOLINE, TRAMPOLINE, TRAP_CONTEXT, USER_HEAP_GAP, USER_STACK_SIZE,
 };
+#[cfg(not(feature = "visionfive2"))]
+use crate::config::MMIO;
 use crate::fs::File;
 use crate::println;
 use crate::utils::RecycleAllocator;
@@ -2919,6 +2923,10 @@ impl MemorySet {
             );
         });
         println!("mapping memory-mapped registers");
+        // 默认 MMIO 表包含 QEMU virt 的 PLIC 和 VirtIO 范围。星光 VisionFive 2
+        // 的启动期只需访问轮询 SDIO1；其余设备由 SBI 使用，避免把 DTB 中较宽的
+        // PLIC/syscon 区域逐页建表而阻塞启动。
+        #[cfg(not(feature = "visionfive2"))]
         for pair in MMIO {
             memory_set.push(
                 MapArea::new(
@@ -2930,8 +2938,17 @@ impl MemorySet {
                 None,
             );
         }
+        #[cfg(feature = "visionfive2")]
+        memory_set.map_mmio_window_range(
+            0x1602_0000,
+            0x1602_1000,
+            MapPermission::R | MapPermission::W | MapPermission::IO,
+        );
+        #[cfg(feature = "visionfive2")]
+        println!("[vf2-mm] SDIO1 高半 MMIO 映射完成");
         // Include DTB-described platform ranges that are not part of the
         // historical QEMU fallback list. Existing fixed mappings are skipped.
+        #[cfg(not(feature = "visionfive2"))]
         for_each_mmio_range(|start, end| {
             memory_set.map_identical_range_skip_mapped(
                 start,
@@ -2939,7 +2956,10 @@ impl MemorySet {
                 MapPermission::R | MapPermission::W | MapPermission::IO,
             );
         });
-        #[cfg(target_arch = "riscv64")]
+        // 星光 VisionFive 2 当前 SDIO 使用轮询，且启动期沿用设备的低地址恒等映射。
+        // 该板 DTB 的外设范围比 QEMU virt 更宽，将全部范围镜像到高半窗口会在
+        // SATP 安装前长时间停滞；因此真板暂不启用这项仅服务于 QEMU VirtIO 的优化。
+        #[cfg(all(target_arch = "riscv64", not(feature = "visionfive2")))]
         {
             // Mirror Linux ioremap(): publish every device register range in the
             // shared high-half window as well.  The identity mappings above stay

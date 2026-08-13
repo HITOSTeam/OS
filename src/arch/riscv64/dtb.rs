@@ -66,6 +66,8 @@ fn node_should_map_mmio(node: FdtNode<'_, '_>) -> bool {
     compatible(node, VIRTIO_MMIO_COMPATIBLE)
         || compatible(node, b"ns16550a")
         || compatible(node, b"qemu,fw-cfg-mmio")
+        || compatible(node, b"snps,dw-mshc")
+        || compatible(node, b"snps,dw-apb-uart")
         || compatible(node, b"syscon")
         || compatible(node, b"riscv,plic0")
         || compatible(node, b"sifive,plic-1.0.0")

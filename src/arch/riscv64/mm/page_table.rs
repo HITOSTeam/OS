@@ -52,6 +52,16 @@ impl From<MapPermission> for PTEFlags {
         if perm.contains(MapPermission::U) {
             flags |= PTEFlags::U;
         }
+        // VisionFive 2 的 JH7110 不会像 QEMU 一样自动置位 A/D；缺少 A 的
+        // 可执行页会在 SATP 切换后的首条取指触发异常。可写页同时预置 D，
+        // 避免首次内核栈写入再次落入启动期尚未可用的缺页处理路径。
+        #[cfg(feature = "visionfive2")]
+        {
+            flags |= PTEFlags::A;
+            if perm.contains(MapPermission::W) {
+                flags |= PTEFlags::D;
+            }
+        }
         flags
     }
 }

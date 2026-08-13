@@ -65,4 +65,8 @@ loongArch64 = "0.2.4"
 
 [features]
 loongarch_board = []
+visionfive2 = []
+# Public board-build feature.  Keep the board name as an implementation detail
+# so callers consistently use `riscv-board` for the physical RISC-V target.
+riscv-board = ["visionfive2"]
 perf_diagnostics = ["ext4-fs/block-cache-stats"]
